@@ -10,20 +10,23 @@ use nom::{
 use core::fmt::{Formatter, Debug};
 use std::{ops::RangeFrom, fmt::Display};
 use bitfield::bitfield;
-
-type Number = f64;
+use crate::vm::{Opcode, Number};
 
 fn lua_number(input: &[u8]) -> IResult<&[u8], Number> {
-    f64(Endianness::Little)(input)
+    map(f64(Endianness::Little), |f| Number(f))(input)
 }
 
+#[derive(Clone)]
 pub struct PackedString<'a> {
     len: usize,
-    data: &'a [u8],
+    pub data: &'a [u8],
 }
 
 impl<'a> Debug for PackedString<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.len == 0 {
+            return write!(f, "\"\"")
+        }
         if let Ok(s) = std::ffi::CStr::from_bytes_with_nul(self.data) {
             write!(f, "{:?}", s)
         } else {
@@ -38,9 +41,9 @@ pub fn packed_string(input: &[u8]) -> IResult<&[u8], PackedString<'_>> {
     Ok((input, PackedString { len, data }))
 }
 
-struct PackedList<T> {
+pub struct PackedList<T> {
     count: u32,
-    items: Vec<T>,
+    pub items: Vec<T>,
 }
 
 impl<T> Debug for PackedList<T> where T: Debug {
@@ -65,21 +68,30 @@ where
 bitfield! {
     pub struct InstBits(u32);
     impl Debug;
-    pub Opcode, _: 6, 0;
-    pub A, _: 15, 7;
-    pub C, _: 23, 15;
+    pub u8, into Opcode, Opcode, _: 6, 0;
+    pub A, _: 14, 6;
+    pub C, _: 23, 14;
     pub B, _: 31, 23;
 
-    pub Bx, _: 31, 15;
+    pub Bx, _: 31, 14;
 
-    pub sBx, _: 31, 15;
+    pub sBx, _: 31, 14;
 }
 
-pub struct Instruction(InstBits);
+impl Clone for InstBits {
+    fn clone(&self) -> Self {
+        InstBits(self.0)
+    }
+}
+
+impl Copy for InstBits {
+}
+
+pub struct Instruction(pub InstBits);
 
 impl Debug for Instruction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:x}", self.0.0)
+        write!(f, "{:08x}", self.0.0)
     }
 }
 
@@ -87,7 +99,8 @@ fn instruction(input: &[u8]) -> IResult<&[u8], Instruction> {
     map(le_u32, |i| Instruction(InstBits(i)))(input)
 }
 
-enum Constant<'a> {
+#[derive(Clone)]
+pub enum Constant<'a> {
     Nil,
     Bool(bool),
     Number(Number),
@@ -99,7 +112,7 @@ impl<'a> Debug for Constant<'a> {
         match self {
             Constant::Nil => write!(f, "nil"),
             Constant::Bool(b) => write!(f, "{}", b),
-            Constant::Number(i) => write!(f, "{}", i),
+            Constant::Number(i) => write!(f, "{}", i.0),
             Constant::String(s) => write!(f, "{:?}", s),
         }
     }
@@ -145,21 +158,22 @@ fn local_info(input: &[u8]) -> IResult<&[u8], LocalInfo<'_>> {
 
 #[derive(Debug)]
 pub struct Header<'a> {
-    top_level: FunctionBlock<'a>
+    pub top_level: FunctionBlock<'a>
 }
 
 #[derive(Debug)]
 pub struct FunctionBlock<'a> {
-    source: PackedString<'a>,
-    upval_count: u8,
-    param_count: u8,
-    is_vararg: u8,
-    max_stack: u8,
-    instructions: PackedList<Instruction>,
-    constants: PackedList<Constant<'a>>,
-    line_info: PackedList<u32>, // Empty list if stripped
-    local_info: PackedList<LocalInfo<'a>>, // Empty list if stripped
-    upvalues: PackedList<PackedString<'a>>,
+    pub source: PackedString<'a>,
+    pub upval_count: u8,
+    pub param_count: u8,
+    pub is_vararg: u8,
+    pub max_stack: u8,
+    pub instructions: PackedList<Instruction>,
+    pub constants: PackedList<Constant<'a>>,
+    pub line_info: PackedList<u32>, // Empty list if stripped
+    pub local_info: PackedList<LocalInfo<'a>>, // Empty list if stripped
+    pub upvalues: PackedList<PackedString<'a>>,
+    pub prototypes: PackedList<FunctionBlock<'a>>,
 }
 
 pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock> {
@@ -167,7 +181,7 @@ pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock> {
         tuple((packed_string, le_u32, le_u32, le_u8, le_u8, le_u8, le_u8))(input)?;
     dbg!(&source);
     let (input, instructions) = packed_list(instruction)(input)?;
-    dbg!(&instructions);
+    dbg!(&instructions.items.iter().map(|inst| inst.0.Opcode()).collect::<Vec<_>>());
     let (input, constants) = packed_list(constant)(input)?;
     dbg!(&constants);
     let (input, prototypes) = packed_list(function_block)(input)?;
@@ -187,6 +201,7 @@ pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock> {
         max_stack,
         instructions,
         constants,
+        prototypes,
         line_info,
         local_info,
         upvalues,
