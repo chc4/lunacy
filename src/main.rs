@@ -28,7 +28,7 @@ impl Instruction for MOVE { type Unpack = AB; }
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("Hello, world!");
-    for i in 1..=2 {
+    for i in 1..=3 {
         let mut dumped = std::fs::File::open(format!("./dumped_{}.bin", i))?;
         let mut dumped_bytes = vec![];
         dumped.read_to_end(&mut dumped_bytes)?;

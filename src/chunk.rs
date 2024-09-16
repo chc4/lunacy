@@ -2,7 +2,7 @@ use nom::{
   bytes::complete::{tag, take_while_m_n, take},
   number::{complete::{le_u8, le_u32, le_u64, f64}, Endianness},
   branch::alt,
-  combinator::{map, map_res, verify},
+  combinator::{map, map_res, verify, opt},
   sequence::tuple,
   IResult,
   Parser, error::ParseError, InputLength, InputIter, Slice,
@@ -32,14 +32,10 @@ impl<'a> Debug for PackedString<'a> {
     }
 }
 
-pub fn packed_string(input: &[u8]) -> IResult<&[u8], Option<PackedString<'_>>> {
+pub fn packed_string(input: &[u8]) -> IResult<&[u8], PackedString<'_>> {
     let (input, len) = map_res(le_u64, |i| usize::try_from(i))(input)?;
-    if len == 0 {
-        Ok((input, None))
-    } else {
-        let (input, data) = take(len)(input)?;
-        Ok((input, Some(PackedString { len, data })))
-    }
+    let (input, data) = take(len)(input)?;
+    Ok((input, PackedString { len, data }))
 }
 
 struct PackedList<T> {
@@ -126,14 +122,25 @@ fn constant(input: &[u8]) -> IResult<&[u8], Constant<'_>> {
             map(lua_number, |i| Constant::Number(i))(input)
         },
         4 => {
-            map(verify(packed_string, |s| {
-                s.is_some()
-            }), |s| {
-                Constant::String(s.unwrap())
+            map(packed_string, |s| {
+                Constant::String(s)
             })(input)
         },
         _ => unreachable!()
     }
+}
+
+#[derive(Debug)]
+struct LocalInfo<'a> {
+    name: PackedString<'a>,
+    start_pc: u32,
+    end_pc: u32,
+}
+
+fn local_info(input: &[u8]) -> IResult<&[u8], LocalInfo<'_>> {
+    map(tuple((packed_string, le_u32, le_u32)), |(name, start_pc, end_pc)| {
+        LocalInfo { name: name, start_pc, end_pc }
+    })(input)
 }
 
 #[derive(Debug)]
@@ -143,11 +150,16 @@ pub struct Header<'a> {
 
 #[derive(Debug)]
 pub struct FunctionBlock<'a> {
-    source: Option<PackedString<'a>>,
+    source: PackedString<'a>,
     upval_count: u8,
     param_count: u8,
     is_vararg: u8,
     max_stack: u8,
+    instructions: PackedList<Instruction>,
+    constants: PackedList<Constant<'a>>,
+    line_info: PackedList<u32>, // Empty list if stripped
+    local_info: PackedList<LocalInfo<'a>>, // Empty list if stripped
+    upvalues: PackedList<PackedString<'a>>,
 }
 
 pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock> {
@@ -160,6 +172,12 @@ pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock> {
     dbg!(&constants);
     let (input, prototypes) = packed_list(function_block)(input)?;
     dbg!(&prototypes);
+    let (input, line_info) = packed_list(le_u32)(input)?;
+    dbg!(&line_info);
+    let (input, local_info) = packed_list(local_info)(input)?;
+    dbg!(&local_info);
+    let (input, upvalues) = packed_list(packed_string)(input)?;
+    dbg!(&upvalues);
     Ok((input, FunctionBlock {
         source,
         // lines,
@@ -167,6 +185,11 @@ pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock> {
         param_count,
         is_vararg,
         max_stack,
+        instructions,
+        constants,
+        line_info,
+        local_info,
+        upvalues,
     }))
 }
 

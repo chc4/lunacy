@@ -2,7 +2,8 @@ require "io"
 
 test_cases = {
     "do end",
-    "a = 6",
+    "local a = 6",
+    "local function foo() print('hi') end",
 }
 
 for i,v in pairs(test_cases) do
