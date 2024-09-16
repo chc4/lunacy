@@ -1,6 +1,6 @@
 use crate::chunk::FunctionBlock;
 use core::hash::Hash;
-use std::{error::Error, rc::Rc};
+use std::{error::Error, rc::Rc, ops::Deref};
 use crate::chunk::{Constant, InstBits};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -173,6 +173,14 @@ impl<T> Clone for Gc<T> {
     }
 }
 
+impl<T> Deref for Gc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum LValue<'lua, 'src> {
     Nil,
@@ -235,10 +243,12 @@ impl<'src> Vm<'src> {
 
     pub fn run<'a>(&'a mut self) -> Result<Vec<LValue<'a, 'src>>, Box<dyn Error>> {
         // we should create a new closure for the top_level and run that instead
-        let clos = Closure::new(&self.top_level);
+        let mut clos = Gc::new(Closure::new(&self.top_level));
         let mut vals: Vec<LValue> = vec![LValue::from(Constant::Nil); clos.prototype.max_stack as usize];
         let mut globals = std::collections::HashMap::<LValue, LValue>::new();
         let mut pc = 0;
+        // we need to track where to return to
+        let mut callstack: Vec<(Gc<Closure>, usize)> = vec![];
         let r_vals = 'int: loop {
             let inst = &clos.prototype.instructions.items[pc];
             pc += 1;
@@ -307,24 +317,42 @@ impl<'src> Vm<'src> {
                     dbg!(a, b, c);
                     let to_call = &vals[a as usize];
                     dbg!(to_call);
+                    // push where to return to once we RETURN
+                    if let LValue::Closure(to_call) = to_call {
+                        callstack.push((clos, pc));
+                        clos = to_call.clone();
+                        pc = 0;
+                    } else {
+                        // FIXME(metatables): __call
+                        println!("oh no");
+                    }
+                    dbg!(to_call);
                 },
                 Opcode::RETURN => {
                     let (a, b) = <RETURN as Instruction>::Unpack::unpack(inst.0);
                     dbg!(a, b);
-                    if b == 1 {
+                    let r_vals = if b == 1 {
                         // no return values
-                        break 'int vec![];
+                        vec![]
                     } else if b >= 2 {
                         // there are b-1 return values from R(A) onwards
                         let r_count = b-1;
                         let r_vals = &vals[a as usize..(a as u16 + r_count) as usize];
                         dbg!(r_vals);
-                        break 'int Vec::from(r_vals);
+                        Vec::from(r_vals)
                     } else if b == 0 {
                         // return all values from R(A) to the ToS
                         let r_vals = &vals[a as usize..];
                         dbg!(r_vals);
-                        break 'int Vec::from(r_vals);
+                        Vec::from(r_vals)
+                    } else {
+                        unreachable!()
+                    };
+                    if let Some((ret_clos, caller)) = callstack.pop() {
+                        clos = ret_clos;
+                        pc = caller;
+                    } else {
+                        break 'int r_vals;
                     }
                 },
                 Opcode::INVALID => unreachable!(),
