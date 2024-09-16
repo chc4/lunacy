@@ -210,8 +210,8 @@ impl<'src> Vm<'src> {
 
     pub fn run<'a>(&'a mut self) -> Result<Vec<LValue<'a, 'src>>, Box<dyn Error>> {
         // we should create a new closure for the top_level and run that instead
-        let clos = &self.top_level;
-        let mut vals: Vec<LValue> = vec![LValue::from(Constant::Nil); clos.max_stack as usize];
+        let clos = Closure::new(&self.top_level);
+        let mut vals: Vec<LValue> = vec![LValue::from(Constant::Nil); clos.prototype.max_stack as usize];
         let mut globals = std::collections::HashMap::<LValue, LValue>::new();
         let r_vals = 'int: { for inst in &self.top_level.instructions.items {
             println!("inst {:?}", inst.0.Opcode());
@@ -223,27 +223,29 @@ impl<'src> Vm<'src> {
                 },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
-                    dbg!(a, bx, &clos.constants.items[bx as usize]);
-                    vals[a as usize] = clos.constants.items[bx as usize].clone().into();
+                    dbg!(a, bx, &clos.prototype.constants.items[bx as usize]);
+                    vals[a as usize] = clos.prototype.constants.items[bx as usize].clone().into();
                     ()
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = &clos.constants.items[bx as usize];
+                    let kst = &clos.prototype.constants.items[bx as usize];
                     dbg!(a, bx, &kst);
                     globals.insert(kst.clone().into(), vals[a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = &clos.constants.items[bx as usize];
+                    let kst = &clos.prototype.constants.items[bx as usize];
                     dbg!(a, bx, &kst);
                     // FIXME(error handling)
                     vals[a as usize] = globals.get(&kst.clone().into()).unwrap_or(&Constant::Nil.into()).clone();
                 },
                 Opcode::CLOSURE => {
                     let (a, bx) = <CLOSURE as Instruction>::Unpack::unpack(inst.0);
-                    let proto = &clos.prototypes.items[bx as usize];
+                    let proto = &clos.prototype.prototypes.items[bx as usize];
                     dbg!(a, bx, proto);
+                    // we'd need to handle the MOVE/GETUPVALUE pseudoinstructions
+                    assert_eq!(proto.upval_count, 0);
                     vals[a as usize] = LValue::Closure(Gc::new(Closure::new(proto)));
                 },
                 Opcode::CALL => {
@@ -261,7 +263,7 @@ impl<'src> Vm<'src> {
                     } else if b >= 2 {
                         // there are b-1 return values from R(A) onwards
                         let r_count = b-1;
-                        let r_vals = &vals[a as usize..(a as u16 + r_count - 1) as usize];
+                        let r_vals = &vals[a as usize..=(a as u16 + r_count - 1) as usize];
                         dbg!(r_vals);
                         break 'int Vec::from(r_vals);
                     } else if b == 0 {

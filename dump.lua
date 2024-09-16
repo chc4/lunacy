@@ -3,9 +3,10 @@ require "io"
 test_cases = {
     "do end",
     "local a = 6",
-    "local function foo() print('hi') end",
     "if true then print(1) end",
-    "a = 3 return a",
+    "a = 5 return a",
+    "local function foo() print('hi') end foo()",
+    "local a, b, c = 1, 2, 3; return b, c, a;",
 }
 
 for i,v in pairs(test_cases) do
@@ -15,16 +16,7 @@ for i,v in pairs(test_cases) do
         print(dumped:sub(i,i):byte())
     end
 
-    dump_out = io.open("./dumped_"..i..".bin", "wb")
+    dump_out = io.open("./dumped_"..i..".bin", "wb+")
     dump_out:write(dumped)
     dump_out:flush()
 end
-
-a = 0
-do
-    function foo()
-        b = 2
-    end
-    foo()
-end
-print(b)
