@@ -100,11 +100,11 @@ fn instruction(input: &[u8]) -> IResult<&[u8], Instruction> {
 }
 
 #[derive(Clone)]
-pub enum Constant<'a> {
+pub enum Constant<'src> {
     Nil,
     Bool(bool),
     Number(Number),
-    String(PackedString<'a>)
+    String(PackedString<'src>)
 }
 
 impl<'a> Debug for Constant<'a> {

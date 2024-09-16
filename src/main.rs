@@ -11,6 +11,7 @@ use vm::Vm;
 fn main() -> Result<(), Box<dyn Error>> {
     println!("Hello, world!");
     for i in 1..=6 {
+        println!("---------------------");
         let mut dumped = std::fs::File::open(format!("./dumped_{}.bin", i))?;
         let mut dumped_bytes = vec![];
         dumped.read_to_end(&mut dumped_bytes)?;

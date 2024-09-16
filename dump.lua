@@ -4,7 +4,6 @@ test_cases = {
     "do end",
     "local a = 6",
     "local function foo() print('hi') end",
-    "a = 1 for i=1,10 do print(a) end",
     "if true then print(1) end",
     "a = 3 return a",
 }

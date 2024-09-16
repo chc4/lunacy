@@ -1,6 +1,6 @@
 use crate::chunk::FunctionBlock;
 use core::hash::Hash;
-use std::error::Error;
+use std::{error::Error, rc::Rc};
 use crate::chunk::{Constant, InstBits};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,9 +96,17 @@ impl Unpacker for AB {
 
 struct ABx;
 impl Unpacker for ABx {
-    type Unpacked = (u8, u16); // A: 8, B: 9
+    type Unpacked = (u8, u32); // A: 8, Bx: 18
     fn unpack(inst: InstBits) -> Self::Unpacked {
-        (inst.A() as u8, inst.Bx() as u16)
+        (inst.A() as u8, inst.Bx() as u32)
+    }
+}
+
+struct ABC;
+impl Unpacker for ABC {
+    type Unpacked = (u8, u16, u16); // A: 8, B: 9, C: 9
+    fn unpack(inst: InstBits) -> Self::Unpacked {
+        (inst.A() as u8, inst.B() as u16, inst.C() as u16)
     }
 }
 
@@ -117,16 +125,49 @@ impl Instruction for CLOSURE { type Unpack = ABx; }
 struct SETGLOBAL;
 impl Instruction for SETGLOBAL { type Unpack = ABx; }
 
+struct CALL;
+impl Instruction for CALL { type Unpack = ABC; }
+
+#[derive(Debug)]
+struct Gc<T>(Rc<T>);
+
+impl<T> PartialEq for Gc<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::as_ptr(&self.0) == Rc::as_ptr(&other.0)
+    }
+}
+
+impl<T> Eq for Gc<T> { }
+
+impl<T> Hash for Gc<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(Rc::as_ptr(&self.0) as usize)
+    }
+}
+
+impl<T> Gc<T> {
+    fn new(val: T) -> Self {
+        Self(Rc::new(val))
+    }
+}
+
+impl<T> Clone for Gc<T> {
+    fn clone(&self) -> Self {
+        Gc(self.0.clone())
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum LValue {
+pub enum LValue<'lua, 'src> {
     Nil,
     Bool(bool),
     Number(Number),
     String(String),
+    Closure(Gc<Closure<'lua, 'src>>),
     //Table(Table),
 }
 
-impl<'a> From<Constant<'a>> for LValue {
+impl<'lua, 'src> From<Constant<'src>> for LValue<'src, 'src> {
     fn from(value: Constant) -> Self {
         match value {
             Constant::Nil => LValue::Nil,
@@ -137,27 +178,36 @@ impl<'a> From<Constant<'a>> for LValue {
     }
 }
 
-enum Upvalue<'lua> {
-    Open(&'lua LValue),
-    Closed(LValue),
+enum Upvalue<'lua, 'src> {
+    Open(&'lua LValue<'lua, 'src>),
+    Closed(LValue<'lua, 'src>),
 }
 
+#[derive(Debug)]
 struct Closure<'lua, 'src> {
     prototype: &'lua FunctionBlock<'src>,
     //environment: LTable<'src>,
     //upvalues: Vec<Upvalue<'lua>>,
 }
 
-pub struct Vm<'a> {
-    top_level: FunctionBlock<'a>
+impl<'lua, 'src> Closure<'lua, 'src> {
+    fn new(prototype: &'lua FunctionBlock<'src>) -> Self {
+        Self {
+            prototype
+        }
+    }
 }
 
-impl<'a> Vm<'a> {
-    pub fn new(top_level: FunctionBlock<'a>) -> Self {
+pub struct Vm<'src> {
+    top_level: FunctionBlock<'src>
+}
+
+impl<'src> Vm<'src> {
+    pub fn new(top_level: FunctionBlock<'src>) -> Self {
         Self { top_level }
     }
 
-    pub fn run(&mut self) -> Result<Vec<LValue>, Box<dyn Error>> {
+    pub fn run<'a>(&'a mut self) -> Result<Vec<LValue<'a, 'src>>, Box<dyn Error>> {
         // we should create a new closure for the top_level and run that instead
         let clos = &self.top_level;
         let mut vals: Vec<LValue> = vec![LValue::from(Constant::Nil); clos.max_stack as usize];
@@ -188,6 +238,13 @@ impl<'a> Vm<'a> {
                     let (a, bx) = <CLOSURE as Instruction>::Unpack::unpack(inst.0);
                     let proto = &clos.prototypes.items[bx as usize];
                     dbg!(a, bx, proto);
+                    vals[a as usize] = LValue::Closure(Gc::new(Closure::new(proto)));
+                },
+                Opcode::CALL => {
+                    let (a, b, c) = <CALL as Instruction>::Unpack::unpack(inst.0);
+                    dbg!(a, b, c);
+                    let to_call = &vals[a as usize];
+                    dbg!(to_call);
                 },
                 Opcode::RETURN => {
                     let (a, b) = <RETURN as Instruction>::Unpack::unpack(inst.0);
@@ -208,7 +265,7 @@ impl<'a> Vm<'a> {
                         break 'int Vec::from(r_vals);
                     }
                 },
-                //x => unimplemented!("opcode {:?}", x),
+                x => unimplemented!("opcode {:?}", x),
                 _ => (),
             }
         } vec![] };
