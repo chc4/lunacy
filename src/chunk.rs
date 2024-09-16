@@ -16,7 +16,7 @@ fn lua_number(input: &[u8]) -> IResult<&[u8], Number> {
     map(f64(Endianness::Little), |f| Number(f))(input)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct PackedString<'a> {
     len: usize,
     pub data: &'a [u8],
@@ -99,7 +99,7 @@ fn instruction(input: &[u8]) -> IResult<&[u8], Instruction> {
     map(le_u32, |i| Instruction(InstBits(i)))(input)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum Constant<'src> {
     Nil,
     Bool(bool),

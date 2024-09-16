@@ -110,6 +110,15 @@ impl Unpacker for ABC {
     }
 }
 
+struct sBx;
+impl Unpacker for sBx {
+    type Unpacked = i32; // A: 8, B: 9, C: 9
+    fn unpack(inst: InstBits) -> Self::Unpacked {
+        // 131071 = 2^18-1 >> 1, aka half the bias
+        (inst.Bx() - 131071) as i32
+    }
+}
+
 struct MOVE;
 impl Instruction for MOVE { type Unpack = AB; }
 
@@ -127,6 +136,12 @@ impl Instruction for SETGLOBAL { type Unpack = ABx; }
 
 struct CALL;
 impl Instruction for CALL { type Unpack = ABC; }
+
+struct EQ;
+impl Instruction for EQ { type Unpack = ABC; }
+
+struct JMP;
+impl Instruction for JMP { type Unpack = sBx; }
 
 
 #[derive(Debug)]
@@ -208,12 +223,25 @@ impl<'src> Vm<'src> {
         Self { top_level }
     }
 
+    fn rk<'a>(proto: &'a FunctionBlock<'src>, vals: &'a Vec<LValue<'a, 'src>>, r: u16) -> Result<Constant<'a>, LValue<'a, 'src>> {
+        if (r & 2^9)!=0 {
+            let r_const = r & ((2^8)-1);
+            dbg!(r_const);
+            Ok(proto.constants.items[r_const as usize].clone())
+        } else {
+            Err(vals[r as usize].clone())
+        }
+    }
+
     pub fn run<'a>(&'a mut self) -> Result<Vec<LValue<'a, 'src>>, Box<dyn Error>> {
         // we should create a new closure for the top_level and run that instead
         let clos = Closure::new(&self.top_level);
         let mut vals: Vec<LValue> = vec![LValue::from(Constant::Nil); clos.prototype.max_stack as usize];
         let mut globals = std::collections::HashMap::<LValue, LValue>::new();
-        let r_vals = 'int: { for inst in &self.top_level.instructions.items {
+        let mut pc = 0;
+        let r_vals = 'int: loop {
+            let inst = &clos.prototype.instructions.items[pc];
+            pc += 1;
             println!("inst {:?}", inst.0.Opcode());
             match inst.0.Opcode() {
                 Opcode::MOVE => {
@@ -240,6 +268,32 @@ impl<'src> Vm<'src> {
                     // FIXME(error handling)
                     vals[a as usize] = globals.get(&kst.clone().into()).unwrap_or(&Constant::Nil.into()).clone();
                 },
+                Opcode::EQ => {
+                    let (a, b, c) = ABC::unpack(inst.0);
+                    dbg!(b, c);
+                    let kb = Self::rk(clos.prototype, &vals, b);
+                    let kc = Self::rk(clos.prototype, &vals, c);
+                    dbg!(&kb, &kc);
+                    let cond = match (kb, kc) {
+                        (Ok(const_b), Ok(const_c)) => const_b == const_c,
+                        (Err(dyn_val), Ok(const_val)) | (Ok(const_val), Err(dyn_val)) => {
+                            dyn_val == const_val.into()
+                        },
+                        (Err(dyn_b), Err(dyn_c)) => {
+                            dyn_b == dyn_c
+                        }
+                    };
+                    dbg!(cond, a);
+                    if (cond as u8) != a {
+                        pc += 1;
+                    }
+                },
+                Opcode::JMP => {
+                    dbg!(inst.0);
+                    let sbx = <JMP as Instruction>::Unpack::unpack(inst.0);
+                    dbg!(sbx);
+                    pc += sbx as usize;
+                },
                 Opcode::CLOSURE => {
                     let (a, bx) = <CLOSURE as Instruction>::Unpack::unpack(inst.0);
                     let proto = &clos.prototype.prototypes.items[bx as usize];
@@ -263,7 +317,7 @@ impl<'src> Vm<'src> {
                     } else if b >= 2 {
                         // there are b-1 return values from R(A) onwards
                         let r_count = b-1;
-                        let r_vals = &vals[a as usize..=(a as u16 + r_count - 1) as usize];
+                        let r_vals = &vals[a as usize..(a as u16 + r_count) as usize];
                         dbg!(r_vals);
                         break 'int Vec::from(r_vals);
                     } else if b == 0 {
@@ -276,8 +330,8 @@ impl<'src> Vm<'src> {
                 Opcode::INVALID => unreachable!(),
                 x => unimplemented!("opcode {:?}", x),
                 _ => (),
-            }
-        } vec![] };
+            };
+        };
         Ok(r_vals)
     }
 }
