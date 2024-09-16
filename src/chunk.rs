@@ -68,9 +68,9 @@ where
 bitfield! {
     pub struct InstBits(u32);
     impl Debug;
-    pub u8, into Opcode, Opcode, _: 6, 0;
-    pub A, _: 14, 6;
-    pub C, _: 23, 14;
+    pub u8, into Opcode, Opcode, _: 5, 0;
+    pub A, _: 13, 6;
+    pub C, _: 22, 14;
     pub B, _: 31, 23;
 
     pub Bx, _: 31, 14;

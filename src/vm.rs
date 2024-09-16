@@ -128,6 +128,7 @@ impl Instruction for SETGLOBAL { type Unpack = ABx; }
 struct CALL;
 impl Instruction for CALL { type Unpack = ABC; }
 
+
 #[derive(Debug)]
 struct Gc<T>(Rc<T>);
 
@@ -215,6 +216,11 @@ impl<'src> Vm<'src> {
         let r_vals = 'int: { for inst in &self.top_level.instructions.items {
             println!("inst {:?}", inst.0.Opcode());
             match inst.0.Opcode() {
+                Opcode::MOVE => {
+                    let (a, b) = <MOVE as Instruction>::Unpack::unpack(inst.0);
+                    dbg!(a, b);
+                    vals[a as usize] = vals[b as usize].clone();
+                },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
                     dbg!(a, bx, &clos.constants.items[bx as usize]);
@@ -255,7 +261,7 @@ impl<'src> Vm<'src> {
                     } else if b >= 2 {
                         // there are b-1 return values from R(A) onwards
                         let r_count = b-1;
-                        let r_vals = &vals[a as usize..(a as u16 + r_count) as usize];
+                        let r_vals = &vals[a as usize..(a as u16 + r_count - 1) as usize];
                         dbg!(r_vals);
                         break 'int Vec::from(r_vals);
                     } else if b == 0 {
@@ -265,6 +271,7 @@ impl<'src> Vm<'src> {
                         break 'int Vec::from(r_vals);
                     }
                 },
+                Opcode::INVALID => unreachable!(),
                 x => unimplemented!("opcode {:?}", x),
                 _ => (),
             }
