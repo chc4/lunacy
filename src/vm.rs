@@ -251,7 +251,7 @@ impl<'lua, 'src> From<Constant<'src>> for LValue<'src, 'src> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Upvalue<'lua, 'src> {
     Open(usize), // stack index
     Closed(LValue<'lua, 'src>),
@@ -477,12 +477,14 @@ impl<'src> Vm<'src> {
                                     // we can't just copy vals[b], because we need
                                     // to reference the stack slot not the value.
                                     fresh_clos.upvalues.push(Upvalue::Open(b as usize));
+                                    upvals.push(Upvalue::Open(b as usize));
                                     "move"
                                 },
                                 Opcode::GETUPVAL => {
                                     let (_, b) = <GETUPVAL as Instruction>::Unpack::unpack(pseudo.0);
                                     //fresh_clos.upvalues
-                                    unimplemented!();
+                                    fresh_clos.upvalues.push(
+                                        upvals[b as usize].clone());
                                     "getupvval"
                                 },
                                 _ => panic!(),
