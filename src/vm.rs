@@ -254,7 +254,7 @@ impl<'lua, 'src> From<Constant<'src>> for LValue<'src, 'src> {
 #[derive(Debug)]
 enum Upvalue<'lua, 'src> {
     Open(usize), // stack index
-    Closed(Gc<LValue<'lua, 'src>>),
+    Closed(LValue<'lua, 'src>),
 }
 
 #[derive(Debug)]
@@ -329,13 +329,13 @@ impl<'src> Vm<'src> {
         })
     }
 
-    fn rk<'a, 'b>(proto: &'a FunctionBlock<'src>, vals: &'b Vec<LValue<'a, 'src>>, r: u16) -> Result<Constant<'a>, LValue<'a, 'src>> {
+    fn rk<'a, 'b>(proto: &'a FunctionBlock<'src>, base: usize, vals: &'b Vec<LValue<'a, 'src>>, r: u16) -> Result<Constant<'a>, LValue<'a, 'src>> {
         if (r & 0x100)!=0 {
             let r_const = r & (0xff);
             dbg!(r_const);
             Ok(proto.constants.items[r_const as usize].clone())
         } else {
-            Err(vals[r as usize].clone())
+            Err(vals[base + r as usize].clone())
         }
     }
 
@@ -345,6 +345,7 @@ impl<'src> Vm<'src> {
         let mut clos = Closure::from_lua(&self.top_level);
         let mut vals: Vec<LValue> = vec![LValue::from(Constant::Nil); clos.into_lua().prototype.max_stack as usize];
         let mut upvals: Vec<Upvalue> = vec![];
+        let mut base = 0;
         let mut pc = 0;
         // we need to track where to return to
         let mut callstack: Vec<(Closure, usize)> = vec![];
@@ -357,38 +358,43 @@ impl<'src> Vm<'src> {
                 Opcode::MOVE => {
                     let (a, b) = <MOVE as Instruction>::Unpack::unpack(inst.0);
                     dbg!(a, b);
-                    vals[a as usize] = vals[b as usize].clone();
+                    vals[base + a as usize] = vals[base + b as usize].clone();
                 },
                 Opcode::GETUPVAL => {
                     let (a, b) = <GETUPVAL as Instruction>::Unpack::unpack(inst.0);
-                    //match clos.into_lua().upvalues[b as usize] {
-
-                    //}
-                    //vals[a as usize] = clos.into_lua().upvalues[b as usize];
+                    let upval = match &clos.into_lua().upvalues[b as usize] {
+                        Upvalue::Open(o) => {
+                            vals[*o as usize].clone()
+                        },
+                        Upvalue::Closed(c) => {
+                            c.clone()
+                        },
+                    };
+                    vals[base + a as usize] = upval.clone();
                 },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
                     dbg!(a, bx, &clos.into_lua().prototype.constants.items[bx as usize]);
-                    vals[a as usize] = clos.into_lua().prototype.constants.items[bx as usize].clone().into();
+                    vals[base + a as usize] = clos.into_lua().prototype.constants.items[bx as usize].clone().into();
                     ()
                 },
                 Opcode::NEWTABLE => {
                     let (a, b, c) = <NEWTABLE as Instruction>::Unpack::unpack(inst.0);
-                    vals[a as usize] = LValue::Table(Gc::new(Table::new(b as usize, c as usize)));
+                    vals[base + a as usize] = LValue::Table(Gc::new(Table::new(b as usize, c as usize)));
                 },
                 Opcode::SETLIST => {
                     let (a, b, c) = <SETLIST as Instruction>::Unpack::unpack(inst.0);
-                    match vals[a as usize].clone() {
+                    match vals[base + a as usize].clone() {
                         LValue::Table(tab) => {
                             assert_ne!(c, 0);
                             if b == 0 {
-                                let src = vals[a as usize+1..].iter().cloned();
+                                let src = vals[base + a as usize+1..].iter().cloned();
                                 tab.borrow_mut().array.splice(
                                     (c as usize-1)*50..,
                                     src
                                 ).for_each(drop);
                             } else {
-                                let src = vals[a as usize+1..=a as usize+b as usize as usize].iter().cloned();
+                                let src = vals[base + a as usize+1..=base + a as usize+b as usize as usize].iter().cloned();
                                 tab.borrow_mut().array.splice(
                                     (c as usize-1)*50..,
                                     src
@@ -402,12 +408,12 @@ impl<'src> Vm<'src> {
                     let (a, b, c) = <GETTABLE as Instruction>::Unpack::unpack(inst.0);
                     dbg!(a, b, c);
                     let clos = clos.into_lua();
-                    let kc = match Self::rk(clos.prototype, &vals, c) {
+                    let kc = match Self::rk(clos.prototype, base, &vals, c) {
                         Ok(c) => c.into(),
                         Err(lv) => lv,
                     };
                     dbg!(&kc);
-                    let val_b = match &vals[b as usize] {
+                    let val_b = match &vals[base + b as usize] {
                         LValue::Table(tab) => {
                             tab.get(kc).unwrap()
                         },
@@ -419,20 +425,20 @@ impl<'src> Vm<'src> {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
                     let kst = &clos.into_lua().prototype.constants.items[bx as usize];
                     dbg!(a, bx, &kst);
-                    _G.set(kst.clone().into(), vals[a as usize].clone());
+                    _G.set(kst.clone().into(), vals[base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
                     let kst = &clos.into_lua().prototype.constants.items[bx as usize];
                     dbg!(a, bx, &kst);
                     // FIXME(error handling)
-                    vals[a as usize] = _G.get(kst.clone().into()).unwrap_or(Constant::Nil.into()).clone();
+                    vals[base + a as usize] = _G.get(kst.clone().into()).unwrap_or(Constant::Nil.into()).clone();
                 },
                 Opcode::EQ => {
                     let (a, b, c) = ABC::unpack(inst.0);
                     dbg!(b, c);
-                    let kb = Self::rk(clos.into_lua().prototype, &vals, b);
-                    let kc = Self::rk(clos.into_lua().prototype, &vals, c);
+                    let kb = Self::rk(clos.into_lua().prototype, base, &vals, b);
+                    let kc = Self::rk(clos.into_lua().prototype, base, &vals, c);
                     dbg!(&kb, &kc);
                     let cond = match (kb, kc) {
                         (Ok(const_b), Ok(const_c)) => const_b == const_c,
@@ -483,30 +489,35 @@ impl<'src> Vm<'src> {
                             };
                             println!("pseudo: {:?} ({})", pseudo, label);
                         }
+                        pc += proto.upval_count as usize;
                         //assert_eq!(proto.upval_count, 0);
                     }
-                    vals[a as usize] = LValue::Closure(fresh);
+                    vals[base + a as usize] = LValue::Closure(fresh);
                 },
                 Opcode::CALL => {
                     let (a, b, c) = <CALL as Instruction>::Unpack::unpack(inst.0);
                     dbg!(a, b, c);
-                    let to_call = &vals[a as usize];
+                    let to_call = &vals[base + a as usize];
                     dbg!(to_call);
                     // push where to return to once we RETURN
-                    if let LValue::Closure(lcall @ Closure::Lua(_)) = to_call {
+                    if let LValue::Closure(ref lcall @ Closure::Lua(ref lclos)) = to_call.clone() {
                         callstack.push((clos.clone(), pc));
                         clos = lcall.clone();
+                        base = vals.len();
+                        vals.extend_from_slice(
+                            vec![LValue::Nil; lcall.into_lua().prototype.max_stack as usize].as_slice());
                         pc = 0;
                     } else if let LValue::Closure(Closure::Native(ncall)) = to_call {
                         let args = if b == 0 {
                             &[]
                         } else {
-                            &vals[a as usize+1..=(a as usize + b as usize - 1)]
+                            &vals[base + a as usize+1..=(base + a as usize + b as usize - 1)]
                         };
+                        dbg!(args);
                         let ret = (ncall.borrow_mut().native)(args);
                         assert_ne!(c, 0);
                         if c != 1 {
-                            vals.splice(a as usize..a as usize + c as usize - 2, ret).for_each(drop);
+                            vals.splice(base + a as usize..a as usize + c as usize - 2, ret).for_each(drop);
                         }
                         // FIXME(metatables): __call
                     }
@@ -520,12 +531,12 @@ impl<'src> Vm<'src> {
                     } else if b >= 2 {
                         // there are b-1 return values from R(A) onwards
                         let r_count = b-1;
-                        let r_vals = &vals[a as usize..(a as u16 + r_count) as usize];
+                        let r_vals = &vals[base + a as usize..(base + a as usize + r_count as usize)];
                         dbg!(r_vals);
                         Vec::from(r_vals)
                     } else if b == 0 {
                         // return all values from R(A) to the ToS
-                        let r_vals = &vals[a as usize..];
+                        let r_vals = &vals[base + a as usize..];
                         dbg!(r_vals);
                         Vec::from(r_vals)
                     } else {
