@@ -17,7 +17,7 @@ for i,v in pairs(test_cases) do
         print(dumped:sub(i,i):byte())
     end
 
-    dump_out = io.open("./dumped_"..i..".bin", "wb+")
+    dump_out = io.open("./dumped/dumped_"..i..".bin", "wb+")
     dump_out:write(dumped)
     dump_out:flush()
 end
