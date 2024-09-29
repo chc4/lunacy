@@ -3,7 +3,7 @@ use core::fmt::Debug;
 use core::hash::Hash;
 use std::{error::Error, rc::Rc, ops::Deref};
 use std::collections::HashMap;
-use std::cell::RefCell;
+use std::cell::{RefCell, Cell};
 use crate::chunk::{Constant, InstBits};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -254,14 +254,14 @@ impl<'lua, 'src> From<Constant<'src>> for LValue<'src, 'src> {
 #[derive(Debug, Clone)]
 enum Upvalue<'lua, 'src> {
     Open(usize), // stack index
-    Closed(LValue<'lua, 'src>),
+    Closed(Gc<LValue<'lua, 'src>>),
 }
 
 #[derive(Debug)]
 struct LClosure<'lua, 'src> {
     prototype: &'lua FunctionBlock<'src>,
     //environment: LTable<'src>,
-    upvalues: Vec<Upvalue<'lua, 'src>>,
+    upvalues: Vec<Gc<Upvalue<'lua, 'src>>>,
 }
 
 trait NativeFunc = for<'a, 'lua, 'src> FnMut(&'a [LValue<'lua, 'src>]) -> Vec<LValue<'lua, 'src>>;
@@ -339,12 +339,27 @@ impl<'src> Vm<'src> {
         }
     }
 
+    fn close_upvalues<'lua>(&self, upvals: &mut Vec<(Upvalue<'lua, 'src>, Vec<Gc<Upvalue<'lua, 'src>>>)>, vals: &Vec<LValue<'lua, 'src>>) {
+        for upval in upvals {
+            let idx = match &upval.0 {
+                Upvalue::Open(o) => o,
+                Upvalue::Closed(u) => panic!(), // we shouldn't have any closed upvals
+            };
+            // migrate all the stack references to be GC references, since we're
+            // going to be removing it from the stack
+            let closed = Gc::new(vals[*idx].clone());
+            for up_use in &upval.1 {
+                up_use.deref().replace(Upvalue::Closed(closed.clone()));
+            }
+        }
+    }
+
     pub fn run<'a>(&'a mut self) -> Result<Vec<LValue<'a, 'src>>, Box<dyn Error>> where 'a: 'src {
         let mut _G = self.global_env();
         // we should create a new closure for the top_level and run that instead
         let mut clos = Closure::from_lua(&self.top_level);
         let mut vals: Vec<LValue> = vec![LValue::from(Constant::Nil); clos.into_lua().prototype.max_stack as usize];
-        let mut upvals: Vec<Upvalue> = vec![];
+        let mut upvals: Vec<(Upvalue, Vec<Gc<Upvalue>>)> = vec![];
         let mut base = 0;
         let mut pc = 0;
         // we need to track where to return to
@@ -353,7 +368,7 @@ impl<'src> Vm<'src> {
             let inst = clos.into_lua().prototype.instructions.items[pc];
             pc += 1;
             println!("inst {:?}", inst.0.Opcode());
-            println!("stack: {}, {:?}", base, vals);
+            println!("stack: {}, {:?}", base, &vals);
             match inst.0.Opcode() {
                 Opcode::MOVE => {
                     let (a, b) = <MOVE as Instruction>::Unpack::unpack(inst.0);
@@ -362,12 +377,12 @@ impl<'src> Vm<'src> {
                 },
                 Opcode::GETUPVAL => {
                     let (a, b) = <GETUPVAL as Instruction>::Unpack::unpack(inst.0);
-                    let upval = match &clos.into_lua().upvalues[b as usize] {
+                    let upval = match clos.into_lua().upvalues[b as usize].borrow().deref() {
                         Upvalue::Open(o) => {
                             vals[*o as usize].clone()
                         },
                         Upvalue::Closed(c) => {
-                            c.clone()
+                            c.borrow().clone()
                         },
                     };
                     vals[base + a as usize] = upval.clone();
@@ -476,15 +491,24 @@ impl<'src> Vm<'src> {
                                     let (_, b) = <MOVE as Instruction>::Unpack::unpack(pseudo.0);
                                     // we can't just copy vals[b], because we need
                                     // to reference the stack slot not the value.
-                                    fresh_clos.upvalues.push(Upvalue::Open(b as usize));
-                                    upvals.push(Upvalue::Open(b as usize));
+                                    // instead we reference the stack slot, and add
+                                    // this new use to the list of uses. on CLOSE
+                                    // we will iterate over all these uses and close
+                                    // them - but only then.
+                                    let fresh_upval = Upvalue::Open(b as usize);
+                                    let fresh_use = Gc::new(fresh_upval.clone());
+                                    fresh_clos.upvalues.push(fresh_use.clone());
+                                    upvals.push((fresh_upval, vec![fresh_use]));
                                     "move"
                                 },
                                 Opcode::GETUPVAL => {
                                     let (_, b) = <GETUPVAL as Instruction>::Unpack::unpack(pseudo.0);
-                                    //fresh_clos.upvalues
-                                    fresh_clos.upvalues.push(
-                                        upvals[b as usize].clone());
+                                    // the upvalue already exists in our current
+                                    // scope. add ourselves to the existing
+                                    // use list.
+                                    let fresh_use = Gc::new(upvals[b as usize].clone().0);
+                                    fresh_clos.upvalues.push(fresh_use.clone());
+                                    upvals[b as usize].1.push(fresh_use);
                                     "getupvval"
                                 },
                                 _ => panic!(),
@@ -525,8 +549,11 @@ impl<'src> Vm<'src> {
                     }
                 },
                 Opcode::RETURN => {
-                    // TODO: implement CLOSE
-                    //close();
+                    // we're going to be removing this frame, so close any open
+                    // upvalues.
+                    self.close_upvalues(&mut upvals, &vals);
+                    upvals = vec![];
+
                     let (a, b) = <RETURN as Instruction>::Unpack::unpack(inst.0);
                     dbg!(a, b);
                     let r_vals = if b == 1 {
