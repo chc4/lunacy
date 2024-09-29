@@ -9,6 +9,7 @@ test_cases = {
     "local a, b, c = 1, 2, 3; return b, c, a;",
     "if true==true then a = 1 else a = 2 end return a",
     "local a = 1; local function foo(b) print(b, 'bye') end foo(a)",
+    "local a = {4,5,6,7} print(a)",
 }
 
 for i,v in pairs(test_cases) do

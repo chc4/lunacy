@@ -1,5 +1,6 @@
 #![feature(trait_alias)]
 use std::error::Error;
+use std::ffi::OsString;
 use std::io::Read;
 use std::fmt::Debug;
 
@@ -11,12 +12,18 @@ use vm::Vm;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("Hello, world!");
-    let mut dumped = std::fs::read_dir("./dumped")?;
-    let mut dumped_sorted = dumped.flatten().collect::<Vec<_>>();
-    dumped_sorted.sort_by_key(|v| v.path());
-    for bytecode_file in dumped_sorted {
-        println!("--------------------- {:?}", bytecode_file.path());
-        let bytecode = std::fs::read(bytecode_file.path())?;
+    let input = std::env::args().nth(1);
+    let inputs = if let Some(input) = input {
+        vec![OsString::from(input)]
+    } else {
+        let mut dumped = std::fs::read_dir("./dumped")?;
+        let mut dumped_sorted = dumped.flatten().map(|v| v.path().into_os_string()).collect::<Vec<_>>();
+        dumped_sorted.sort();
+        dumped_sorted
+    };
+    for bytecode_file in inputs {
+        println!("--------------------- {:?}", bytecode_file);
+        let bytecode = std::fs::read(bytecode_file)?;
         let header = chunk::header(&bytecode[..]);
         dbg!(&header);
         if let Ok((rest, header)) = header {

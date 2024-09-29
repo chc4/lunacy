@@ -1,0 +1,3 @@
+[submodule "lua_benchmarking"]
+	path = lua_benchmarking
+	url = https://github.com/softdevteam/lua_benchmarking.git
