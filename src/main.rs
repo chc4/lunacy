@@ -1,3 +1,4 @@
+#![feature(trait_alias)]
 use std::error::Error;
 use std::io::Read;
 use std::fmt::Debug;
@@ -11,9 +12,10 @@ use vm::Vm;
 fn main() -> Result<(), Box<dyn Error>> {
     println!("Hello, world!");
     let mut dumped = std::fs::read_dir("./dumped")?;
-    for bytecode_file in dumped {
-        let bytecode_file = bytecode_file?;
-        println!("---------------------");
+    let mut dumped_sorted = dumped.flatten().collect::<Vec<_>>();
+    dumped_sorted.sort_by_key(|v| v.path());
+    for bytecode_file in dumped_sorted {
+        println!("--------------------- {:?}", bytecode_file.path());
         let bytecode = std::fs::read(bytecode_file.path())?;
         let header = chunk::header(&bytecode[..]);
         dbg!(&header);

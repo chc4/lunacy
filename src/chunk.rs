@@ -87,6 +87,7 @@ impl Clone for InstBits {
 impl Copy for InstBits {
 }
 
+#[derive(Copy, Clone)]
 pub struct Instruction(pub InstBits);
 
 impl Debug for Instruction {
