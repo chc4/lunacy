@@ -353,7 +353,7 @@ impl<'src> Vm<'src> {
             let inst = clos.into_lua().prototype.instructions.items[pc];
             pc += 1;
             println!("inst {:?}", inst.0.Opcode());
-            println!("stack: {:?}", vals);
+            println!("stack: {}, {:?}", base, vals);
             match inst.0.Opcode() {
                 Opcode::MOVE => {
                     let (a, b) = <MOVE as Instruction>::Unpack::unpack(inst.0);
@@ -525,6 +525,8 @@ impl<'src> Vm<'src> {
                     }
                 },
                 Opcode::RETURN => {
+                    // TODO: implement CLOSE
+                    //close();
                     let (a, b) = <RETURN as Instruction>::Unpack::unpack(inst.0);
                     dbg!(a, b);
                     let r_vals = if b == 1 {
@@ -546,6 +548,7 @@ impl<'src> Vm<'src> {
                     };
                     if let Some((ret_clos, caller)) = callstack.pop() {
                         clos = ret_clos;
+                        base -= clos.into_lua().prototype.max_stack as usize;
                         pc = caller;
                     } else {
                         break 'int r_vals;
