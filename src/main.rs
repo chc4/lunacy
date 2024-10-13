@@ -12,6 +12,9 @@ use chunk::InstBits;
 mod vm;
 use vm::Vm;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<(), Box<dyn Error>> {
     println!("Hello, world!");
     let input = std::env::args().nth(1);
