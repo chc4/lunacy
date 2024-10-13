@@ -123,6 +123,16 @@ impl Unpacker for sBx {
     }
 }
 
+struct AsBx;
+impl Unpacker for AsBx {
+    type Unpacked = (u8, i32); // A: 8, sBx: 18
+    fn unpack(inst: InstBits) -> Self::Unpacked {
+        // 131071 = 2^18-1 >> 1, aka half the bias
+        (inst.A() as u8, (inst.Bx() as isize - 131071) as i32)
+    }
+}
+
+
 struct MOVE;
 impl Instruction for MOVE { type Unpack = AB; }
 
@@ -156,8 +166,17 @@ impl Instruction for NEWTABLE { type Unpack = ABC; }
 struct GETTABLE;
 impl Instruction for GETTABLE { type Unpack = ABC; }
 
+struct SETTABLE;
+impl Instruction for SETTABLE { type Unpack = ABC; }
+
 struct SETLIST;
 impl Instruction for SETLIST { type Unpack = ABC; }
+
+struct FORPREP;
+impl Instruction for FORPREP { type Unpack = AsBx; }
+
+struct FORLOOP;
+impl Instruction for FORLOOP { type Unpack = AsBx; }
 
 
 #[derive(Debug)]
@@ -284,6 +303,47 @@ impl<'lua, 'src> LValue<'lua, 'src> {
             _ => panic!()
         }
     }
+
+    pub fn numeric_op(&self, opcode: Opcode, right: Self) -> Result<LValue<'lua, 'src>, String> {
+        // TODO: metamethods
+        match (self, &right) {
+            (LValue::Nil, LValue::Nil) => {
+                return Err("attempt to compare nil".into())
+            },
+            (LValue::Table(left_tab), LValue::Table(right_tab)) => {
+                unimplemented!("metamethod")
+            },
+            (LValue::Closure(left_c), LValue::Closure(right_c)) => {
+                return Err("attempt to compare functions".into())
+            },
+            _ => (),
+        }
+
+        match opcode {
+            Opcode::ADD => {
+                match (self, &right) {
+                    (LValue::Number(left_n), LValue::Number(right_n)) =>
+                        Ok(LValue::Number(Number(left_n.0 + right_n.0))),
+                    _ => unimplemented!(),
+                }
+            },
+            Opcode::SUB => {
+                match (self, &right) {
+                    (LValue::Number(left_n), LValue::Number(right_n)) =>
+                        Ok(LValue::Number(Number(left_n.0 - right_n.0))),
+                    _ => unimplemented!(),
+                }
+            },
+            Opcode::MUL => {
+                match (self, &right) {
+                    (LValue::Number(left_n), LValue::Number(right_n)) =>
+                        Ok(LValue::Number(Number(left_n.0 * right_n.0))),
+                    _ => unimplemented!(),
+                }
+            },
+            _ => unimplemented!(),
+        }
+    }
 }
 
 impl<'lua, 'src> From<Constant<'src>> for LValue<'src, 'src> {
@@ -369,13 +429,33 @@ impl<'src> Vm<'src> {
     }
 
     fn global_env(&self) -> Gc<Table> {
+        let mut math_tab = Table::new(0, 0);
+        math_tab.hash.insert(LValue::String("floor\0".into()), LValue::Closure(Closure::from_native(|f| {
+            let f = match f {
+                [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
+                _ => unimplemented!()
+            };
+            return [f].to_vec()
+        })));
+        math_tab.hash.insert(LValue::String("sqrt\0".into()), LValue::Closure(Closure::from_native(|f| {
+            let f = match f {
+                [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
+                _ => unimplemented!()
+            };
+            return [f].to_vec()
+        })));
+
+        let math = (LValue::String("math\0".into()), LValue::Table(Gc::new(math_tab)));
         Gc::new(Table {
             array: vec![],
             hash: HashMap::from_iter(
-                vec![(LValue::String("print\0".into()), LValue::Closure(Closure::from_native(|v| {
+                vec![
+                (LValue::String("print\0".into()), LValue::Closure(Closure::from_native(|v| {
                     println!("> {:?}", v);
                     vec![LValue::Nil]
-                })))].drain(..)
+                }))),
+                math,
+                ].drain(..)
             )
         })
     }
@@ -488,6 +568,26 @@ impl<'src> Vm<'src> {
                     };
                     vals[a as usize] = val_b;
                 },
+                Opcode::SETTABLE => {
+                    let (a, b, c) = <SETTABLE as Instruction>::Unpack::unpack(inst.0);
+                    dbg!(a, b, c);
+                    let clos = clos.into_lua();
+                    let kb = match Self::rk(clos.prototype, base, &vals, b) {
+                        Ok(b) => b.into(),
+                        Err(lv) => lv,
+                    };
+                    dbg!(&kb);
+                    let kc = match Self::rk(clos.prototype, base, &vals, c) {
+                        Ok(c) => c.into(),
+                        Err(lv) => lv,
+                    };
+                    match &mut vals[base + a as usize] {
+                        LValue::Table(tab) => {
+                            tab.set(kb, kc)
+                        },
+                        _ => unimplemented!(),
+                    };
+                },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
                     let kst = &clos.into_lua().prototype.constants.items[bx as usize];
@@ -512,19 +612,86 @@ impl<'src> Vm<'src> {
                         (Opcode::LT, Ok(const_b), Ok(const_c)) => const_b < const_c,
                         (Opcode::LE, Ok(const_b), Ok(const_c)) => const_b <= const_c,
 
-                        (_, Err(dyn_val), Ok(const_val)) => {
-                            dyn_val.compare(opcode.clone(), const_val.into()).unwrap()
+                        (_, Err(dyn_b), Ok(const_c)) => {
+                            dyn_b.compare(opcode.clone(), const_c.into()).unwrap()
+                        },
+
+                        (_, Ok(const_b), Err(dyn_c)) => {
+                            LValue::from(const_b).compare(opcode, dyn_c).unwrap()
                         },
 
                         (_, Err(dyn_b), Err(dyn_c)) => {
                             dyn_b.compare(opcode, dyn_c).unwrap()
-                        }
+                        },
+
                         _ => panic!()
 
                     };
                     dbg!(cond, a);
                     if (cond as u8) != a {
                         pc += 1;
+                    }
+                },
+                opcode @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW)
+                => {
+                    let (a, b, c) = ABC::unpack(inst.0);
+                    dbg!(a, b, c);
+                    let kb = Self::rk(clos.into_lua().prototype, base, &vals, b);
+                    let kc = Self::rk(clos.into_lua().prototype, base, &vals, c);
+                    dbg!(&kb, &kc);
+                    let res = match (opcode, kb, kc) {
+                        (Opcode::ADD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
+                            LValue::Number(Number(const_b.0 + const_c.0)),
+                        (Opcode::SUB, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
+                            LValue::Number(Number(const_b.0 - const_c.0)),
+                        (Opcode::MUL, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
+                            LValue::Number(Number(const_b.0 * const_c.0)),
+                        (Opcode::DIV, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
+                            LValue::Number(Number(const_b.0 / const_c.0)),
+                        (Opcode::MOD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
+                            LValue::Number(Number(const_b.0 % const_c.0)),
+                        (Opcode::POW, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
+                            LValue::Number(Number(const_b.0.powf(const_c.0))),
+
+                        (_, Ok(const_b), Err(dyn_c)) => {
+                            LValue::from(const_b).numeric_op(opcode, dyn_c.into())?
+                        },
+
+                        (_, Err(dyn_b), Ok(const_c)) => {
+                            dyn_b.numeric_op(opcode, const_c.into())?
+                        },
+
+                        (_, Err(dyn_b), Err(dyn_c)) => {
+                            dyn_b.numeric_op(opcode, dyn_c.into())?
+                        },
+
+                        _ => unimplemented!(),
+                    };
+                    dbg!(&res);
+                    vals[base + a as usize] = res;
+                },
+                Opcode::FORPREP => {
+                    let (a, sbx) = <FORPREP as Instruction>::Unpack::unpack(inst.0);
+                    dbg!(a, sbx);
+                    vals[base + a as usize] =
+                        vals[base + a as usize].numeric_op(Opcode::SUB, vals[base + a as usize + 2].clone()).unwrap();
+                    pc += sbx as usize;
+                },
+                Opcode::FORLOOP => {
+                    let (a, sbx) = <FORLOOP as Instruction>::Unpack::unpack(inst.0);
+                    dbg!(a, sbx);
+                    let step = vals[base + a as usize + 2].clone();
+                    let idx = vals[base + a as usize].numeric_op(Opcode::ADD, step.clone()).unwrap();
+                    let limit = vals[base + a as usize + 1].clone();
+                    let comp = if step.compare(Opcode::LT, LValue::from(Constant::Number(Number(0.0))))? {
+                        limit.compare(Opcode::LE, idx.clone())
+                    } else {
+                        idx.clone().compare(Opcode::LE, limit)
+                    };
+                    if comp? {
+                        pc = (pc as isize + sbx as isize) as usize;
+                        vals[base + a as usize] = idx.clone();
+                        vals[base + a as usize + 3] = idx;
                     }
                 },
                 Opcode::JMP => {
@@ -602,9 +769,16 @@ impl<'src> Vm<'src> {
                         };
                         dbg!(args);
                         let ret = (ncall.borrow_mut().native)(args);
-                        assert_ne!(c, 0);
-                        if c != 1 {
+                        if c == 0 {
+                            // save all returned
+                            vals.splice(base + a as usize.., ret).for_each(drop);
+                        }
+                        else if c == 1 {
+                            // nothing saved
+                        } else if c != 1 {
                             vals.splice(base + a as usize..a as usize + c as usize - 2, ret).for_each(drop);
+                        } else {
+                            unimplemented!()
                         }
                         // FIXME(metatables): __call
                     }
@@ -639,7 +813,7 @@ impl<'src> Vm<'src> {
                     if let Some((ret_clos, caller, frame, ret)) = callstack.pop() {
                         dbg!(&ret_clos.into_lua().prototype.instructions, caller);
                         clos = ret_clos;
-                        // copy the return values to the previous frame's end of the stack,
+                        // copy the return values to the previous frame's return location,
                         // then clean up the popped stack frame
                         base = frame;
                         let parent_stack = clos.into_lua().prototype.max_stack as usize;
