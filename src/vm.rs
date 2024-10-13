@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 use crate::chunk::FunctionBlock;
 use core::fmt::Debug;
 use core::hash::Hash;
@@ -6,7 +7,7 @@ use std::collections::HashMap;
 use std::cell::{RefCell, Cell};
 use crate::chunk::{Constant, InstBits};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Number(pub f64);
 
 impl Hash for Number {
@@ -19,7 +20,7 @@ impl Eq for Number {
 }
 
 #[repr(u8)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Opcode {
     MOVE = 0,
     LOADK,
@@ -240,6 +241,51 @@ pub enum LValue<'lua, 'src> {
     Table(Gc<Table<'lua, 'src>>),
 }
 
+impl<'lua, 'src> LValue<'lua, 'src> {
+    pub fn compare(&self, opcode: Opcode, right: Self) -> Result<bool, String> {
+        // TODO: metamethods
+        if std::mem::discriminant(self) != std::mem::discriminant(&right) {
+            panic!("bad compare");
+        }
+        match (self, &right) {
+            (LValue::Nil, LValue::Nil) => {
+                return Err("attempt to compare nil".into())
+            },
+            (LValue::Table(left_tab), LValue::Table(right_tab)) => {
+                unimplemented!("metamethod")
+            },
+            (LValue::Closure(left_c), LValue::Closure(right_c)) => {
+                return Err("attempt to compare functions".into())
+            },
+            _ => (),
+        }
+
+        match opcode {
+            Opcode::EQ => {
+                Ok(*self == right)
+            },
+            Opcode::LT => {
+                match (self, &right) {
+                    (LValue::Bool(left_b), LValue::Bool(right_b)) => Ok(left_b < right_b),
+                    (LValue::Number(left_n), LValue::Number(right_n)) => Ok(left_n < right_n),
+                    (LValue::String(left_s), LValue::String(right_s)) => Ok(left_s < right_s),
+                    _ => panic!()
+                }
+            },
+            Opcode::LE => {
+                match (self, &right) {
+                    (LValue::Bool(left_b), LValue::Bool(right_b)) => Ok(left_b <= right_b),
+                    (LValue::Number(left_n), LValue::Number(right_n)) => Ok(left_n <= right_n),
+                    (LValue::String(left_s), LValue::String(right_s)) => Ok(left_s <= right_s),
+                    _ => panic!()
+                }
+
+            },
+            _ => panic!()
+        }
+    }
+}
+
 impl<'lua, 'src> From<Constant<'src>> for LValue<'src, 'src> {
     fn from(value: Constant) -> Self {
         match value {
@@ -257,11 +303,16 @@ enum Upvalue<'lua, 'src> {
     Closed(Gc<LValue<'lua, 'src>>),
 }
 
-#[derive(Debug)]
 struct LClosure<'lua, 'src> {
     prototype: &'lua FunctionBlock<'src>,
     //environment: LTable<'src>,
     upvalues: Vec<Gc<Upvalue<'lua, 'src>>>,
+}
+
+impl<'lua, 'src> Debug for LClosure<'lua, 'src> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "closure(upvalues={:?})", self.upvalues)
+    }
 }
 
 trait NativeFunc = for<'a, 'lua, 'src> FnMut(&'a [LValue<'lua, 'src>]) -> Vec<LValue<'lua, 'src>>;
@@ -362,12 +413,13 @@ impl<'src> Vm<'src> {
         let mut upvals: Vec<(Upvalue, Vec<Gc<Upvalue>>)> = vec![];
         let mut base = 0;
         let mut pc = 0;
-        // we need to track where to return to
-        let mut callstack: Vec<(Closure, usize)> = vec![];
+        // we need to track where to return to, along with the base pointer and where to put return
+        // values
+        let mut callstack: Vec<(Closure, usize, usize, usize)> = vec![];
         let r_vals = 'int: loop {
             let inst = clos.into_lua().prototype.instructions.items[pc];
             pc += 1;
-            println!("inst {:?}", inst.0.Opcode());
+            println!("pc {} inst {:?}", pc, inst.0.Opcode());
             println!("stack: {}, {:?}", base, &vals);
             match inst.0.Opcode() {
                 Opcode::MOVE => {
@@ -449,20 +501,26 @@ impl<'src> Vm<'src> {
                     // FIXME(error handling)
                     vals[base + a as usize] = _G.get(kst.clone().into()).unwrap_or(Constant::Nil.into()).clone();
                 },
-                Opcode::EQ => {
+                opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);
                     dbg!(b, c);
                     let kb = Self::rk(clos.into_lua().prototype, base, &vals, b);
                     let kc = Self::rk(clos.into_lua().prototype, base, &vals, c);
                     dbg!(&kb, &kc);
-                    let cond = match (kb, kc) {
-                        (Ok(const_b), Ok(const_c)) => const_b == const_c,
-                        (Err(dyn_val), Ok(const_val)) | (Ok(const_val), Err(dyn_val)) => {
-                            dyn_val == const_val.into()
+                    let cond = match (opcode, kb, kc) {
+                        (Opcode::EQ, Ok(const_b), Ok(const_c)) => const_b == const_c,
+                        (Opcode::LT, Ok(const_b), Ok(const_c)) => const_b < const_c,
+                        (Opcode::LE, Ok(const_b), Ok(const_c)) => const_b <= const_c,
+
+                        (_, Err(dyn_val), Ok(const_val)) => {
+                            dyn_val.compare(opcode.clone(), const_val.into()).unwrap()
                         },
-                        (Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b == dyn_c
+
+                        (_, Err(dyn_b), Err(dyn_c)) => {
+                            dyn_b.compare(opcode, dyn_c).unwrap()
                         }
+                        _ => panic!()
+
                     };
                     dbg!(cond, a);
                     if (cond as u8) != a {
@@ -527,15 +585,18 @@ impl<'src> Vm<'src> {
                     dbg!(to_call);
                     // push where to return to once we RETURN
                     if let LValue::Closure(ref lcall @ Closure::Lua(ref lclos)) = to_call.clone() {
-                        callstack.push((clos.clone(), pc));
+                        // record call stack: we say where to return to and where to put the values
+                        callstack.push((clos.clone(), pc, base, base + a as usize));
                         clos = lcall.clone();
-                        base = vals.len();
+                        let next_stack = lcall.into_lua().prototype.max_stack as usize;
+                        base = base + a as usize + 1;
+                        // push empty stack frame
                         vals.extend_from_slice(
-                            vec![LValue::Nil; lcall.into_lua().prototype.max_stack as usize].as_slice());
+                            vec![LValue::Nil; next_stack].as_slice());
                         pc = 0;
                     } else if let LValue::Closure(Closure::Native(ncall)) = to_call {
                         let args = if b == 0 {
-                            &[]
+                            &vals[base + a as usize+1..]
                         } else {
                             &vals[base + a as usize+1..=(base + a as usize + b as usize - 1)]
                         };
@@ -556,26 +617,37 @@ impl<'src> Vm<'src> {
 
                     let (a, b) = <RETURN as Instruction>::Unpack::unpack(inst.0);
                     dbg!(a, b);
-                    let r_vals = if b == 1 {
+                    let mut r_count = 0 as usize;
+                    let mut r_vals = if b == 1 {
                         // no return values
                         vec![]
                     } else if b >= 2 {
                         // there are b-1 return values from R(A) onwards
-                        let r_count = b-1;
+                        r_count = b as usize-1;
                         let r_vals = &vals[base + a as usize..(base + a as usize + r_count as usize)];
                         dbg!(r_vals);
                         Vec::from(r_vals)
                     } else if b == 0 {
                         // return all values from R(A) to the ToS
                         let r_vals = &vals[base + a as usize..];
+                        r_count = r_vals.len() as usize;
                         dbg!(r_vals);
                         Vec::from(r_vals)
                     } else {
                         unreachable!()
                     };
-                    if let Some((ret_clos, caller)) = callstack.pop() {
+                    if let Some((ret_clos, caller, frame, ret)) = callstack.pop() {
+                        dbg!(&ret_clos.into_lua().prototype.instructions, caller);
                         clos = ret_clos;
-                        base -= clos.into_lua().prototype.max_stack as usize;
+                        // copy the return values to the previous frame's end of the stack,
+                        // then clean up the popped stack frame
+                        base = frame;
+                        let parent_stack = clos.into_lua().prototype.max_stack as usize;
+                        //vals.extend_from_slice(r_vals.as_slice());
+                        for (i, v) in r_vals.drain(..).enumerate() {
+                            vals[ret + i] = v;
+                        }
+                        vals.truncate(frame + parent_stack);
                         pc = caller;
                     } else {
                         break 'int r_vals;

@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 use nom::{
   bytes::complete::{tag, take_while_m_n, take},
   number::{complete::{le_u8, le_u32, le_u64, f64}, Endianness},
@@ -16,7 +17,7 @@ fn lua_number(input: &[u8]) -> IResult<&[u8], Number> {
     map(f64(Endianness::Little), |f| Number(f))(input)
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, PartialOrd)]
 pub struct PackedString<'a> {
     len: usize,
     pub data: &'a [u8],
@@ -100,7 +101,7 @@ fn instruction(input: &[u8]) -> IResult<&[u8], Instruction> {
     map(le_u32, |i| Instruction(InstBits(i)))(input)
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, PartialOrd)]
 pub enum Constant<'src> {
     Nil,
     Bool(bool),
