@@ -13,6 +13,8 @@ use std::{ops::RangeFrom, fmt::Display};
 use bitfield::bitfield;
 use crate::vm::{Opcode, Number};
 
+use log::debug;
+
 fn lua_number(input: &[u8]) -> IResult<&[u8], Number> {
     map(f64(Endianness::Little), |f| Number(f))(input)
 }
@@ -181,19 +183,19 @@ pub struct FunctionBlock<'a> {
 pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock> {
     let (input, (source, line_defined, last_line, upval_count, param_count, is_vararg, max_stack)) =
         tuple((packed_string, le_u32, le_u32, le_u8, le_u8, le_u8, le_u8))(input)?;
-    dbg!(&source);
+    debug!("source {:?}", &source);
     let (input, instructions) = packed_list(instruction)(input)?;
-    dbg!(&instructions.items.iter().map(|inst| inst.0.Opcode()).collect::<Vec<_>>());
+    debug!("instructions {:?}", &instructions.items.iter().map(|inst| inst.0.Opcode()).collect::<Vec<_>>());
     let (input, constants) = packed_list(constant)(input)?;
-    dbg!(&constants);
+    debug!("constants {:?}", &constants);
     let (input, prototypes) = packed_list(function_block)(input)?;
-    dbg!(&prototypes);
+    debug!("prototypes {:?}", &prototypes);
     let (input, line_info) = packed_list(le_u32)(input)?;
-    dbg!(&line_info);
+    debug!("line_info {:?}", &line_info);
     let (input, local_info) = packed_list(local_info)(input)?;
-    dbg!(&local_info);
+    debug!("local_info {:?}", &local_info);
     let (input, upvalues) = packed_list(packed_string)(input)?;
-    dbg!(&upvalues);
+    debug!("upvalues {:?}", &upvalues);
     Ok((input, FunctionBlock {
         source,
         // lines,

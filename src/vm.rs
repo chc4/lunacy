@@ -3,7 +3,7 @@ use crate::chunk::FunctionBlock;
 use core::fmt::Debug;
 use core::hash::Hash;
 use std::{error::Error, rc::Rc, ops::Deref};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::cell::{RefCell, Cell};
 use crate::chunk::{Constant, InstBits};
 
@@ -227,12 +227,15 @@ impl<T> Deref for Gc<T> {
 #[derive(Debug)]
 struct Table<'lua, 'src> {
     array: Vec<LValue<'lua, 'src>>,
-    hash: HashMap<LValue<'lua, 'src>, LValue<'lua, 'src>>,
+    hash: FxHashMap<LValue<'lua, 'src>, LValue<'lua, 'src>>,
 }
 
 impl<'lua, 'src> Table<'lua, 'src> {
     pub fn new(array: usize, hash: usize) -> Self {
-        Self { array: vec![LValue::Nil; array], hash: HashMap::with_capacity(hash) }
+        Self {
+            array: vec![LValue::Nil; array],
+            hash: FxHashMap::with_capacity_and_hasher(hash, Default::default())
+        }
     }
 }
 
@@ -499,7 +502,7 @@ impl<'src> Vm<'src> {
         let math = (LValue::String("math\0".into()), LValue::Table(Gc::new(math_tab)));
         Gc::new(Table {
             array: vec![],
-            hash: HashMap::from_iter(
+            hash: FxHashMap::from_iter(
                 vec![
                 (LValue::String("print\0".into()), LValue::Closure(Closure::from_native(|v| {
                     println!("> {:?}", v);
@@ -511,11 +514,11 @@ impl<'src> Vm<'src> {
         })
     }
 
-    fn rk<'a, 'b>(proto: &'a FunctionBlock<'src>, base: usize, vals: &'b Vec<LValue<'a, 'src>>, r: u16) -> Result<Constant<'a>, LValue<'a, 'src>> {
+    fn rk<'a, 'b>(proto: &'a FunctionBlock<'src>, base: usize, vals: &'b Vec<LValue<'a, 'src>>, r: u16) -> Result<&'a Constant<'a>, LValue<'a, 'src>> {
         if (r & 0x100)!=0 {
             let r_const = r & (0xff);
             debug!("rk {}", r_const);
-            Ok(proto.constants.items[r_const as usize].clone())
+            Ok(&proto.constants.items[r_const as usize])
         } else {
             Err(vals[base + r as usize].clone())
         }
@@ -607,7 +610,7 @@ impl<'src> Vm<'src> {
                     debug!("gettable {} {} {}", a, b, c);
                     let clos = clos.into_lua();
                     let kc = match Self::rk(clos.prototype, base, &vals, c) {
-                        Ok(c) => c.into(),
+                        Ok(c) => c.clone().into(),
                         Err(lv) => lv,
                     };
                     debug!("gettable {:?}", &kc);
@@ -626,12 +629,12 @@ impl<'src> Vm<'src> {
                     debug!("settable {} {} {}", a, b, c);
                     let clos = clos.into_lua();
                     let kb = match Self::rk(clos.prototype, base, &vals, b) {
-                        Ok(b) => b.into(),
+                        Ok(b) => b.clone().into(),
                         Err(lv) => lv,
                     };
                     debug!("settable {:?}", &kb);
                     let kc = match Self::rk(clos.prototype, base, &vals, c) {
-                        Ok(c) => c.into(),
+                        Ok(c) => c.clone().into(),
                         Err(lv) => lv,
                     };
                     match &mut vals[base + a as usize] {
@@ -666,11 +669,11 @@ impl<'src> Vm<'src> {
                         (Opcode::LE, Ok(const_b), Ok(const_c)) => const_b <= const_c,
 
                         (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.compare(opcode.clone(), const_c.into()).unwrap()
+                            dyn_b.compare(opcode.clone(), const_c.clone().into()).unwrap()
                         },
 
                         (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).compare(opcode, dyn_c).unwrap()
+                            LValue::from(const_b.clone()).compare(opcode, dyn_c).unwrap()
                         },
 
                         (_, Err(dyn_b), Err(dyn_c)) => {
@@ -707,11 +710,11 @@ impl<'src> Vm<'src> {
                             LValue::Number(Number(const_b.0.powf(const_c.0))),
 
                         (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).numeric_op(opcode, dyn_c.into())?
+                            LValue::from(const_b.clone()).numeric_op(opcode, dyn_c.into())?
                         },
 
                         (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.numeric_op(opcode, const_c.into())?
+                            dyn_b.numeric_op(opcode, const_c.clone().into())?
                         },
 
                         (_, Err(dyn_b), Err(dyn_c)) => {
@@ -805,7 +808,7 @@ impl<'src> Vm<'src> {
                                 },
                                 _ => panic!(),
                             };
-                            println!("pseudo: {:?} ({})", pseudo, label);
+                            debug!("pseudo: {:?} ({})", pseudo, label);
                         }
                         pc += proto.upval_count as usize;
                         //assert_eq!(proto.upval_count, 0);

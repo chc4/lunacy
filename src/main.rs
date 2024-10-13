@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::fmt::Debug;
 
+use log::debug;
+
 mod chunk;
 use chunk::InstBits;
 
@@ -25,7 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("--------------------- {:?}", bytecode_file);
         let bytecode = std::fs::read(bytecode_file)?;
         let header = chunk::header(&bytecode[..]);
-        dbg!(&header);
+        debug!("header {:?}", &header);
         if let Ok((rest, header)) = header {
             let mut vm = Vm::new(header.top_level);
             let r_vals = vm.run()?;
