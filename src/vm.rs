@@ -178,6 +178,9 @@ impl Instruction for FORPREP { type Unpack = AsBx; }
 struct FORLOOP;
 impl Instruction for FORLOOP { type Unpack = AsBx; }
 
+struct LEN;
+impl Instruction for LEN { type Unpack = AB; }
+
 
 #[derive(Debug)]
 struct Gc<T>(Rc<RefCell<T>>);
@@ -340,6 +343,18 @@ impl<'lua, 'src> LValue<'lua, 'src> {
                         Ok(LValue::Number(Number(left_n.0 * right_n.0))),
                     _ => unimplemented!(),
                 }
+            },
+            _ => unimplemented!(),
+        }
+    }
+
+    pub fn len(&self) -> Result<LValue<'lua, 'src>, String> {
+        // TODO: metamethods
+        match self {
+            LValue::String(s) => Ok(LValue::Number(Number(s.len() as _))),
+            LValue::Table(t) => {
+                // TODO: sparse arrays
+                Ok(LValue::Number(Number(t.0.borrow_mut().array.len() as _)))
             },
             _ => unimplemented!(),
         }
@@ -562,11 +577,13 @@ impl<'src> Vm<'src> {
                     dbg!(&kc);
                     let val_b = match &vals[base + b as usize] {
                         LValue::Table(tab) => {
+                            dbg!(tab);
                             tab.get(kc).unwrap()
                         },
-                        _ => unimplemented!(),
+                        x => unimplemented!("gettable on {:?}", x),
                     };
-                    vals[a as usize] = val_b;
+                    dbg!(&val_b);
+                    vals[base + a as usize] = val_b;
                 },
                 Opcode::SETTABLE => {
                     let (a, b, c) = <SETTABLE as Instruction>::Unpack::unpack(inst.0);
@@ -669,6 +686,11 @@ impl<'src> Vm<'src> {
                     };
                     dbg!(&res);
                     vals[base + a as usize] = res;
+                },
+                Opcode::LEN => {
+                    let (a, b) = <LEN as Instruction>::Unpack::unpack(inst.0);
+                    dbg!(a, b);
+                    vals[base + a as usize] = vals[base + b as usize].len()?;
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = <FORPREP as Instruction>::Unpack::unpack(inst.0);
