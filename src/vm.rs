@@ -5,6 +5,7 @@ use core::hash::Hash;
 use std::{error::Error, rc::Rc, ops::Deref};
 use rustc_hash::FxHashMap;
 use std::cell::{RefCell, Cell};
+use std::borrow::Cow;
 use crate::chunk::{Constant, InstBits};
 
 use log::debug;
@@ -266,7 +267,7 @@ pub enum LValue<'lua, 'src> {
     Nil,
     Bool(bool),
     Number(Number),
-    String(String),
+    String(Cow<'src, [u8]>),
     Closure(Closure<'lua, 'src>),
     Table(Gc<Table<'lua, 'src>>),
 }
@@ -393,12 +394,12 @@ impl<'lua, 'src> LValue<'lua, 'src> {
 }
 
 impl<'lua, 'src> From<Constant<'src>> for LValue<'src, 'src> {
-    fn from(value: Constant) -> Self {
+    fn from(value: Constant<'src>) -> Self {
         match value {
             Constant::Nil => LValue::Nil,
             Constant::Bool(b) => LValue::Bool(b),
             Constant::Number(i) => LValue::Number(i),
-            Constant::String(s) => LValue::String(String::from_utf8_lossy(s.data).into_owned()),
+            Constant::String(s) => LValue::String(Cow::Borrowed(s.data)),
         }
     }
 }
@@ -476,21 +477,21 @@ impl<'src> Vm<'src> {
 
     fn global_env(&self) -> Gc<Table> {
         let mut math_tab = Table::new(0, 0);
-        math_tab.hash.insert(LValue::String("floor\0".into()), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(LValue::String("floor\0".as_bytes().into()), LValue::Closure(Closure::from_native(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
                 _ => unimplemented!()
             };
             return [f].to_vec()
         })));
-        math_tab.hash.insert(LValue::String("sqrt\0".into()), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(LValue::String("sqrt\0".as_bytes().into()), LValue::Closure(Closure::from_native(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
                 _ => unimplemented!()
             };
             return [f].to_vec()
         })));
-        math_tab.hash.insert(LValue::String("abs\0".into()), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(LValue::String("abs\0".as_bytes().into()), LValue::Closure(Closure::from_native(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.abs())),
                 _ => unimplemented!()
@@ -499,12 +500,12 @@ impl<'src> Vm<'src> {
         })));
 
 
-        let math = (LValue::String("math\0".into()), LValue::Table(Gc::new(math_tab)));
+        let math = (LValue::String("math\0".as_bytes().into()), LValue::Table(Gc::new(math_tab)));
         Gc::new(Table {
             array: vec![],
             hash: FxHashMap::from_iter(
                 vec![
-                (LValue::String("print\0".into()), LValue::Closure(Closure::from_native(|v| {
+                (LValue::String("print\0".as_bytes().into()), LValue::Closure(Closure::from_native(|v| {
                     println!("> {:?}", v);
                     vec![LValue::Nil]
                 }))),
