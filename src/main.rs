@@ -16,7 +16,8 @@ use vm::Vm;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("Hello, world!");
+    env_logger::init();
+
     let input = std::env::args().nth(1);
     let inputs = if let Some(input) = input {
         vec![OsString::from(input)]
@@ -32,6 +33,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let header = chunk::header(&bytecode[..]);
         debug!("header {:?}", &header);
         if let Ok((rest, header)) = header {
+            let mut intern = internment::Arena::new();
+            let k = &intern;
+            let header = header.globally_intern(k);
             let mut vm = Vm::new(header.top_level);
             let r_vals = vm.run()?;
             dbg!(r_vals);

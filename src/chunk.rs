@@ -13,13 +13,15 @@ use std::{ops::RangeFrom, fmt::Display};
 use bitfield::bitfield;
 use crate::vm::{Opcode, Number};
 
+use internment::Arena;
+
 use log::debug;
 
 fn lua_number(input: &[u8]) -> IResult<&[u8], Number> {
     map(f64(Endianness::Little), |f| Number(f))(input)
 }
 
-#[derive(Clone, PartialEq, PartialOrd)]
+#[derive(Clone, PartialEq, Eq, PartialOrd)]
 pub struct PackedString<'a> {
     len: usize,
     pub data: &'a [u8],
@@ -103,15 +105,15 @@ fn instruction(input: &[u8]) -> IResult<&[u8], Instruction> {
     map(le_u32, |i| Instruction(InstBits(i)))(input)
 }
 
-#[derive(Clone, PartialEq, PartialOrd)]
-pub enum Constant<'src> {
+#[derive(Clone, Eq, PartialEq)]
+pub enum Constant<S: PartialEq + Eq> {
     Nil,
     Bool(bool),
     Number(Number),
-    String(PackedString<'src>)
+    String(S)
 }
 
-impl<'a> Debug for Constant<'a> {
+impl<S: Debug + PartialEq + Eq> Debug for Constant<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Constant::Nil => write!(f, "nil"),
@@ -122,7 +124,7 @@ impl<'a> Debug for Constant<'a> {
     }
 }
 
-fn constant(input: &[u8]) -> IResult<&[u8], Constant<'_>> {
+fn constant(input: &[u8]) -> IResult<&[u8], Constant<PackedString<'_>>> {
     let (input, ctype) = le_u8(input)?;
     match ctype {
         0 => Ok((input, Constant::Nil)),
@@ -161,26 +163,26 @@ fn local_info(input: &[u8]) -> IResult<&[u8], LocalInfo<'_>> {
 }
 
 #[derive(Debug)]
-pub struct Header<'a> {
-    pub top_level: FunctionBlock<'a>
+pub struct Header<'a, C> {
+    pub top_level: FunctionBlock<'a, C>
 }
 
 #[derive(Debug)]
-pub struct FunctionBlock<'a> {
+pub struct FunctionBlock<'a, C> {
     pub source: PackedString<'a>,
     pub upval_count: u8,
     pub param_count: u8,
     pub is_vararg: u8,
     pub max_stack: u8,
     pub instructions: PackedList<Instruction>,
-    pub constants: PackedList<Constant<'a>>,
+    pub constants: PackedList<C>,
     pub line_info: PackedList<u32>, // Empty list if stripped
     pub local_info: PackedList<LocalInfo<'a>>, // Empty list if stripped
     pub upvalues: PackedList<PackedString<'a>>,
-    pub prototypes: PackedList<FunctionBlock<'a>>,
+    pub prototypes: PackedList<FunctionBlock<'a, C>>,
 }
 
-pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock> {
+pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock<Constant<PackedString<'_>>>> {
     let (input, (source, line_defined, last_line, upval_count, param_count, is_vararg, max_stack)) =
         tuple((packed_string, le_u32, le_u32, le_u8, le_u8, le_u8, le_u8))(input)?;
     debug!("source {:?}", &source);
@@ -212,7 +214,7 @@ pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock> {
     }))
 }
 
-pub fn header(input: &[u8]) -> IResult<&[u8], Header> {
+pub fn header(input: &[u8]) -> IResult<&[u8], Header<Constant<PackedString<'_>>>> {
     let (input, _) = tag("\x1bLua")(input)?;
     let (input, (version, format, endianness, int_size, sizet_size, inst_size, number_size, integral)) =
         tuple((le_u8, le_u8, le_u8, le_u8, le_u8, le_u8, le_u8, le_u8))(input)?;
@@ -223,4 +225,70 @@ pub fn header(input: &[u8]) -> IResult<&[u8], Header> {
     Ok((input, Header {
         top_level
     }))
+}
+
+impl<'src> Constant<PackedString<'src>> {
+    pub fn globally_intern<'intern>(self, intern: &'intern Arena<&'src [u8]>)
+        -> Constant<internment::ArenaIntern<'intern, &'src [u8]>>
+    {
+        match self {
+            Constant::Nil => Constant::Nil,
+            Constant::Bool(b) => Constant::Bool(b),
+            Constant::Number(n) => Constant::Number(n),
+            Constant::String(s) => Constant::String(intern.intern(s.data)),
+            _ => unimplemented!()
+        }
+    }
+}
+
+impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
+    pub fn globally_intern<'intern>(self, intern: &'intern Arena<&'src [u8]>)
+        -> FunctionBlock<'src, Constant<internment::ArenaIntern<'intern, &'src [u8]>>>
+    {
+        let FunctionBlock {
+            source,
+            upval_count,
+            param_count,
+            is_vararg,
+            max_stack,
+            instructions,
+            constants,
+            prototypes,
+            line_info,
+            local_info,
+            upvalues
+        } = self;
+        // intern all the constants
+        let PackedList::<_> { count: const_count, items: mut const_items } = constants;
+        let const_items = const_items.drain(..).map(|con| con.globally_intern(intern)).collect();
+        // intern all the nested prototypes
+        let PackedList::<Self> { count: proto_count, items: mut proto_items } = prototypes;
+        let proto_items = proto_items.drain(..).map(|proto| proto.globally_intern(intern)).collect();
+        let new_self = FunctionBlock::<'src, Constant<internment::ArenaIntern<'intern, &'src [u8]>>> {
+            source,
+            upval_count,
+            param_count,
+            is_vararg,
+            max_stack,
+            instructions,
+            constants: PackedList { count: const_count, items: const_items },
+            prototypes: PackedList { count: proto_count, items: proto_items },
+            line_info,
+            local_info,
+            upvalues
+        };
+
+        new_self
+    }
+}
+
+impl<'src> Header<'src, Constant<PackedString<'src>>> {
+    pub fn globally_intern<'intern>(self, intern: &'intern Arena<&'src [u8]>)
+        -> Header<'src, Constant<internment::ArenaIntern<'intern, &'src [u8]>>>
+        where 'src: 'intern
+    {
+        Header::<'src, _> {
+            top_level: self.top_level.globally_intern(intern),
+        }
+    }
 }

@@ -6,9 +6,11 @@ use std::{error::Error, rc::Rc, ops::Deref};
 use rustc_hash::FxHashMap;
 use std::cell::{RefCell, Cell};
 use std::borrow::Cow;
-use crate::chunk::{Constant, InstBits};
+use crate::chunk::{InstBits, Constant};
 
 use log::debug;
+
+type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, &'src [u8]>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Number(pub f64);
@@ -187,7 +189,6 @@ impl Instruction for LEN { type Unpack = AB; }
 struct UNM;
 impl Instruction for UNM { type Unpack = AB; }
 
-
 #[derive(Debug)]
 struct Gc<T>(Rc<RefCell<T>>);
 
@@ -226,12 +227,12 @@ impl<T> Deref for Gc<T> {
 }
 
 #[derive(Debug)]
-struct Table<'lua, 'src> {
-    array: Vec<LValue<'lua, 'src>>,
-    hash: FxHashMap<LValue<'lua, 'src>, LValue<'lua, 'src>>,
+struct Table<'lua, 'src, 'intern> {
+    array: Vec<LValue<'lua, 'src, 'intern>>,
+    hash: FxHashMap<LValue<'lua, 'src, 'intern>, LValue<'lua, 'src, 'intern>>,
 }
 
-impl<'lua, 'src> Table<'lua, 'src> {
+impl<'lua, 'src, 'intern> Table<'lua, 'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
             array: vec![LValue::Nil; array],
@@ -240,8 +241,8 @@ impl<'lua, 'src> Table<'lua, 'src> {
     }
 }
 
-impl<'lua, 'src> Gc<Table<'lua, 'src>> {
-    fn get(&self, key: LValue<'lua, 'src>) -> Option<LValue<'lua, 'src>> {
+impl<'lua, 'src, 'intern> Gc<Table<'lua, 'src, 'intern>> {
+    fn get(&self, key: LValue<'lua, 'src, 'intern>) -> Option<LValue<'lua, 'src, 'intern>> {
         match key {
             LValue::Number(n) => Some(self.borrow().array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
             LValue::String(_) => {
@@ -251,7 +252,7 @@ impl<'lua, 'src> Gc<Table<'lua, 'src>> {
         }
     }
 
-    fn set(&mut self, key: LValue<'lua, 'src>, value: LValue<'lua, 'src>) {
+    fn set(&mut self, key: LValue<'lua, 'src, 'intern>, value: LValue<'lua, 'src, 'intern>) {
         match key {
             LValue::Number(n) => unimplemented!(),
             LValue::String(_) => {
@@ -262,17 +263,69 @@ impl<'lua, 'src> Gc<Table<'lua, 'src>> {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum LValue<'lua, 'src> {
+#[derive(Debug, Hash)]
+pub enum LValue<'lua, 'src, 'intern> {
     Nil,
     Bool(bool),
     Number(Number),
     String(Cow<'src, [u8]>),
-    Closure(Closure<'lua, 'src>),
-    Table(Gc<Table<'lua, 'src>>),
+    Closure(Closure<'lua, 'src, 'intern>),
+    Table(Gc<Table<'lua, 'src, 'intern>>),
 }
 
-impl<'lua, 'src> LValue<'lua, 'src> {
+impl<'lua, 'src, 'intern> Clone for LValue<'lua, 'src, 'intern> {
+    fn clone(&self) -> Self {
+        match self {
+            LValue::Nil => LValue::Nil,
+            LValue::Bool(self_b) => LValue::Bool(*self_b),
+            LValue::Number(self_n) => LValue::Number(*self_n),
+            LValue::String(self_c) => {
+                if let Cow::Owned(owned_c) = self_c {
+                    panic!("owned?? {:?}", owned_c);
+                }
+                let our_ptr = self_c.deref().as_ptr();
+                println!("huh {:p}", our_ptr);
+                let new_cow = self_c.clone();
+                let their_ptr = new_cow.deref().as_ptr();
+                println!("huh2 {:p}", their_ptr);
+                assert_eq!(our_ptr, their_ptr);
+                LValue::String(new_cow)
+            },
+            LValue::Closure(self_c) => LValue::Closure(self_c.clone()),
+            LValue::Table(self_t) => LValue::Table(self_t.clone()),
+        }
+    }
+}
+
+impl<'lua, 'src, 'intern> PartialEq for LValue<'lua, 'src, 'intern> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (LValue::Nil, LValue::Nil) => true,
+            (LValue::Bool(self_b), LValue::Bool(other_b)) => self_b == other_b,
+            (LValue::Number(self_n), LValue::Number(other_n)) => self_n == other_n,
+            (LValue::String(Cow::Borrowed(self_c)), LValue::String(Cow::Borrowed(other_c))) => {
+                if (*self_c).as_ptr() == (*other_c).as_ptr() {
+                    println!("fast equals");
+                    return true;
+                } else {
+                    println!("{:p} {:?} {:p} {:?}", (**self_c).as_ptr(), self_c, (**other_c).as_ptr(), other_c);
+                    return self_c == other_c;
+                }
+            },
+            (LValue::String(Cow::Owned(self_c)), LValue::String(Cow::Borrowed(other_c))) => {
+                panic!("huh???")
+            },
+            (LValue::Closure(self_c), LValue::Closure(other_c)) => self_c == other_c,
+            (LValue::Table(self_t), LValue::Table(other_t)) => self_t == other_t,
+            _ => false,
+        }
+    }
+}
+
+impl<'lua, 'src, 'intern> Eq for LValue<'lua, 'src, 'intern> {
+}
+
+impl<'lua, 'src, 'intern> LValue<'lua, 'src, 'intern> {
     #[inline]
     pub fn compare(&self, opcode: Opcode, right: Self) -> Result<bool, String> {
         // TODO: metamethods
@@ -318,7 +371,7 @@ impl<'lua, 'src> LValue<'lua, 'src> {
     }
 
     #[inline]
-    pub fn numeric_op(&self, opcode: Opcode, right: Self) -> Result<LValue<'lua, 'src>, String> {
+    pub fn numeric_op(&self, opcode: Opcode, right: Self) -> Result<LValue<'lua, 'src, 'intern>, String> {
         // TODO: metamethods
         match (self, &right) {
             (LValue::Nil, LValue::Nil) => {
@@ -380,7 +433,7 @@ impl<'lua, 'src> LValue<'lua, 'src> {
         }
     }
 
-    pub fn len(&self) -> Result<LValue<'lua, 'src>, String> {
+    pub fn len(&self) -> Result<LValue<'lua, 'src, 'intern>, String> {
         // TODO: metamethods
         match self {
             LValue::String(s) => Ok(LValue::Number(Number(s.len() as _))),
@@ -393,36 +446,42 @@ impl<'lua, 'src> LValue<'lua, 'src> {
     }
 }
 
-impl<'lua, 'src> From<Constant<'src>> for LValue<'src, 'src> {
-    fn from(value: Constant<'src>) -> Self {
+impl<'lua, 'src, 'intern> From<&LConstant<'src, 'intern>> for LValue<'src, 'src, 'intern> {
+    fn from(value: &LConstant<'src, 'intern>) -> Self {
         match value {
             Constant::Nil => LValue::Nil,
-            Constant::Bool(b) => LValue::Bool(b),
-            Constant::Number(i) => LValue::Number(i),
-            Constant::String(s) => LValue::String(Cow::Borrowed(s.data)),
+            Constant::Bool(b) => LValue::Bool(*b),
+            Constant::Number(i) => LValue::Number(*i),
+            Constant::String(s) => LValue::String(Cow::Borrowed(s)),
         }
     }
 }
 
+impl<'src, 'intern> PartialOrd for LConstant<'src, 'intern> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        todo!()
+    }
+}
+
 #[derive(Debug, Clone)]
-enum Upvalue<'lua, 'src> {
+enum Upvalue<'lua, 'src, 'intern> {
     Open(usize), // stack index
-    Closed(Gc<LValue<'lua, 'src>>),
+    Closed(Gc<LValue<'lua, 'src, 'intern>>),
 }
 
-struct LClosure<'lua, 'src> {
-    prototype: &'lua FunctionBlock<'src>,
+struct LClosure<'lua, 'src, 'intern> {
+    prototype: &'lua FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
-    upvalues: Vec<Gc<Upvalue<'lua, 'src>>>,
+    upvalues: Vec<Gc<Upvalue<'lua, 'src, 'intern>>>,
 }
 
-impl<'lua, 'src> Debug for LClosure<'lua, 'src> {
+impl<'lua, 'src, 'intern> Debug for LClosure<'lua, 'src, 'intern> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "closure(upvalues={:?})", self.upvalues)
     }
 }
 
-trait NativeFunc = for<'a, 'lua, 'src> FnMut(&'a [LValue<'lua, 'src>]) -> Vec<LValue<'lua, 'src>>;
+trait NativeFunc = for<'a, 'lua, 'src, 'intern> FnMut(&'a [LValue<'lua, 'src, 'intern>]) -> Vec<LValue<'lua, 'src, 'intern>>;
 struct NClosure {
     native: Box<dyn NativeFunc>,
 }
@@ -433,8 +492,8 @@ impl<'lua, 'src> Debug for NClosure {
     }
 }
 
-impl<'lua, 'src> LClosure<'lua, 'src> {
-    fn new(prototype: &'lua FunctionBlock<'src>) -> Self {
+impl<'lua, 'src, 'intern> LClosure<'lua, 'src, 'intern> {
+    fn new(prototype: &'lua FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
         Self {
             prototype,
             upvalues: vec![],
@@ -443,17 +502,17 @@ impl<'lua, 'src> LClosure<'lua, 'src> {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-enum Closure<'lua, 'src> {
-    Lua(Gc<LClosure<'lua, 'src>>),
+enum Closure<'lua, 'src, 'intern> {
+    Lua(Gc<LClosure<'lua, 'src, 'intern>>),
     Native(Gc<NClosure>),
 }
 
-impl<'lua, 'src> Closure<'lua, 'src> {
-    pub fn from_lua(prototype: &'lua FunctionBlock<'src>) -> Self {
+impl<'lua, 'src, 'intern> Closure<'lua, 'src, 'intern> {
+    pub fn from_lua(prototype: &'lua FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
         Self::Lua(Gc::new(LClosure::new(prototype)))
     }
 
-    pub fn into_lua(&self) -> std::cell::RefMut<'_, LClosure<'lua, 'src>> {
+    pub fn into_lua(&self) -> std::cell::RefMut<'_, LClosure<'lua, 'src, 'intern>> {
         if let Closure::Lua(clos) = self {
             clos.borrow_mut()
         } else {
@@ -466,12 +525,12 @@ impl<'lua, 'src> Closure<'lua, 'src> {
     }
 }
 
-pub struct Vm<'src> {
-    top_level: FunctionBlock<'src>,
+pub struct Vm<'src, 'intern> {
+    top_level: FunctionBlock<'src, LConstant<'src, 'intern>>,
 }
 
-impl<'src> Vm<'src> {
-    pub fn new(top_level: FunctionBlock<'src>) -> Self {
+impl<'src, 'intern> Vm<'src, 'intern> {
+    pub fn new(top_level: FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
         Self { top_level }
     }
 
@@ -498,6 +557,9 @@ impl<'src> Vm<'src> {
             };
             return [f].to_vec()
         })));
+        math_tab.hash.insert(LValue::String("huge\0".as_bytes().into()), LValue::Closure(Closure::from_native(|f| {
+            return [LValue::Number(Number(f64::INFINITY))].to_vec()
+        })));
 
 
         let math = (LValue::String("math\0".as_bytes().into()), LValue::Table(Gc::new(math_tab)));
@@ -515,7 +577,7 @@ impl<'src> Vm<'src> {
         })
     }
 
-    fn rk<'a, 'b>(proto: &'a FunctionBlock<'src>, base: usize, vals: &'b Vec<LValue<'a, 'src>>, r: u16) -> Result<&'a Constant<'a>, LValue<'a, 'src>> {
+    fn rk<'a, 'b>(proto: &'a FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'b Vec<LValue<'a, 'src, 'intern>>, r: u16) -> Result<&'a LConstant<'a, 'intern>, LValue<'a, 'src, 'intern>> {
         if (r & 0x100)!=0 {
             let r_const = r & (0xff);
             debug!("rk {}", r_const);
@@ -525,7 +587,7 @@ impl<'src> Vm<'src> {
         }
     }
 
-    fn close_upvalues<'lua>(&self, upvals: &mut Vec<(Upvalue<'lua, 'src>, Vec<Gc<Upvalue<'lua, 'src>>>)>, vals: &Vec<LValue<'lua, 'src>>) {
+    fn close_upvalues<'lua>(&self, upvals: &mut Vec<(Upvalue<'lua, 'src, 'intern>, Vec<Gc<Upvalue<'lua, 'src, 'intern>>>)>, vals: &Vec<LValue<'lua, 'src, 'intern>>) {
         for upval in upvals {
             let idx = match &upval.0 {
                 Upvalue::Open(o) => o,
@@ -540,11 +602,11 @@ impl<'src> Vm<'src> {
         }
     }
 
-    pub fn run<'a>(&'a mut self) -> Result<Vec<LValue<'a, 'src>>, Box<dyn Error>> where 'a: 'src {
+    pub fn run<'lua>(&'lua mut self) -> Result<Vec<LValue<'lua, 'src, 'intern>>, Box<dyn Error>> where 'lua: 'src {
         let mut _G = self.global_env();
         // we should create a new closure for the top_level and run that instead
         let mut clos = Closure::from_lua(&self.top_level);
-        let mut vals: Vec<LValue> = vec![LValue::from(Constant::Nil); clos.into_lua().prototype.max_stack as usize];
+        let mut vals: Vec<LValue> = vec![LValue::from(&Constant::Nil); clos.into_lua().prototype.max_stack as usize];
         let mut upvals: Vec<(Upvalue, Vec<Gc<Upvalue>>)> = vec![];
         let mut base = 0;
         let mut pc = 0;
@@ -577,7 +639,7 @@ impl<'src> Vm<'src> {
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
                     debug!("loadk {} {} {:?}", a, bx, &clos.into_lua().prototype.constants.items[bx as usize]);
-                    vals[base + a as usize] = clos.into_lua().prototype.constants.items[bx as usize].clone().into();
+                    vals[base + a as usize] = (&clos.into_lua().prototype.constants.items[bx as usize]).into();
                     ()
                 },
                 Opcode::NEWTABLE => {
@@ -611,7 +673,7 @@ impl<'src> Vm<'src> {
                     debug!("gettable {} {} {}", a, b, c);
                     let clos = clos.into_lua();
                     let kc = match Self::rk(clos.prototype, base, &vals, c) {
-                        Ok(c) => c.clone().into(),
+                        Ok(c) => LValue::from(c),
                         Err(lv) => lv,
                     };
                     debug!("gettable {:?}", &kc);
@@ -630,12 +692,12 @@ impl<'src> Vm<'src> {
                     debug!("settable {} {} {}", a, b, c);
                     let clos = clos.into_lua();
                     let kb = match Self::rk(clos.prototype, base, &vals, b) {
-                        Ok(b) => b.clone().into(),
+                        Ok(b) => b.into(),
                         Err(lv) => lv,
                     };
                     debug!("settable {:?}", &kb);
                     let kc = match Self::rk(clos.prototype, base, &vals, c) {
-                        Ok(c) => c.clone().into(),
+                        Ok(c) => c.into(),
                         Err(lv) => lv,
                     };
                     match &mut vals[base + a as usize] {
@@ -649,14 +711,14 @@ impl<'src> Vm<'src> {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
                     let kst = &clos.into_lua().prototype.constants.items[bx as usize];
                     debug!("setglobal {} {} {:?}", a, bx, &kst);
-                    _G.set(kst.clone().into(), vals[base + a as usize].clone());
+                    _G.set(kst.into(), vals[base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
                     let kst = &clos.into_lua().prototype.constants.items[bx as usize];
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
-                    vals[base + a as usize] = _G.get(kst.clone().into()).unwrap_or(Constant::Nil.into()).clone();
+                    vals[base + a as usize] = _G.get(kst.into()).unwrap_or((&Constant::Nil).into()).clone();
                 },
                 opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);
@@ -670,11 +732,11 @@ impl<'src> Vm<'src> {
                         (Opcode::LE, Ok(const_b), Ok(const_c)) => const_b <= const_c,
 
                         (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.compare(opcode.clone(), const_c.clone().into()).unwrap()
+                            dyn_b.compare(opcode.clone(), const_c.into()).unwrap()
                         },
 
                         (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b.clone()).compare(opcode, dyn_c).unwrap()
+                            LValue::from(const_b).compare(opcode, dyn_c).unwrap()
                         },
 
                         (_, Err(dyn_b), Err(dyn_c)) => {
@@ -711,11 +773,11 @@ impl<'src> Vm<'src> {
                             LValue::Number(Number(const_b.0.powf(const_c.0))),
 
                         (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b.clone()).numeric_op(opcode, dyn_c.into())?
+                            LValue::from(const_b).numeric_op(opcode, dyn_c.into())?
                         },
 
                         (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.numeric_op(opcode, const_c.clone().into())?
+                            dyn_b.numeric_op(opcode, const_c.into())?
                         },
 
                         (_, Err(dyn_b), Err(dyn_c)) => {
@@ -754,7 +816,7 @@ impl<'src> Vm<'src> {
                     let step = vals[base + a as usize + 2].clone();
                     let idx = vals[base + a as usize].numeric_op(Opcode::ADD, step.clone()).unwrap();
                     let limit = vals[base + a as usize + 1].clone();
-                    let comp = if step.compare(Opcode::LT, LValue::from(Constant::Number(Number(0.0))))? {
+                    let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0))))? {
                         limit.compare(Opcode::LE, idx.clone())
                     } else {
                         idx.clone().compare(Opcode::LE, limit)
