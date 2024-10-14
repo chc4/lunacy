@@ -8,6 +8,8 @@ use std::cell::{RefCell, Cell};
 use std::borrow::Cow;
 use crate::chunk::{InstBits, Constant};
 
+use internment::ArenaIntern;
+
 use log::debug;
 
 type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, &'src [u8]>>;
@@ -190,7 +192,7 @@ struct UNM;
 impl Instruction for UNM { type Unpack = AB; }
 
 #[derive(Debug)]
-struct Gc<T>(Rc<RefCell<T>>);
+pub struct Gc<T>(Rc<RefCell<T>>);
 
 impl<T> PartialEq for Gc<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -227,12 +229,12 @@ impl<T> Deref for Gc<T> {
 }
 
 #[derive(Debug)]
-struct Table<'lua, 'src, 'intern> {
-    array: Vec<LValue<'lua, 'src, 'intern>>,
-    hash: FxHashMap<LValue<'lua, 'src, 'intern>, LValue<'lua, 'src, 'intern>>,
+pub struct Table<'src, 'intern> {
+    array: Vec<LValue<'src, 'intern>>,
+    hash: FxHashMap<LValue<'src, 'intern>, LValue<'src, 'intern>>,
 }
 
-impl<'lua, 'src, 'intern> Table<'lua, 'src, 'intern> {
+impl<'src, 'intern> Table<'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
             array: vec![LValue::Nil; array],
@@ -241,8 +243,8 @@ impl<'lua, 'src, 'intern> Table<'lua, 'src, 'intern> {
     }
 }
 
-impl<'lua, 'src, 'intern> Gc<Table<'lua, 'src, 'intern>> {
-    fn get(&self, key: LValue<'lua, 'src, 'intern>) -> Option<LValue<'lua, 'src, 'intern>> {
+impl<'src, 'intern> Gc<Table<'src, 'intern>> {
+    fn get(&self, key: LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
             LValue::Number(n) => Some(self.borrow().array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
             LValue::String(_) => {
@@ -252,7 +254,7 @@ impl<'lua, 'src, 'intern> Gc<Table<'lua, 'src, 'intern>> {
         }
     }
 
-    fn set(&mut self, key: LValue<'lua, 'src, 'intern>, value: LValue<'lua, 'src, 'intern>) {
+    fn set(&mut self, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
         match key {
             LValue::Number(n) => unimplemented!(),
             LValue::String(_) => {
@@ -263,70 +265,96 @@ impl<'lua, 'src, 'intern> Gc<Table<'lua, 'src, 'intern>> {
     }
 }
 
-#[derive(Debug, Hash)]
-pub enum LValue<'lua, 'src, 'intern> {
+#[derive(Hash, Clone)]
+pub enum InternString<'intern, 'src> {
+    Interned(ArenaIntern<'intern, &'src [u8]>),
+    Owned(Rc<Vec<u8>>),
+}
+
+impl<'intern, 'src> PartialEq for InternString<'intern, 'src> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (InternString::Interned(self_s), InternString::Interned(other_s)) => {
+                if self_s.deref().as_ptr() == other_s.deref().as_ptr() {
+                    return true
+                } else {
+                    return self_s == other_s
+                }
+            },
+            (InternString::Interned(inter), InternString::Owned(own)) |
+            (InternString::Owned(own), InternString::Interned(inter)) => {
+                *inter.deref() == own.as_slice()
+            },
+            (InternString::Owned(self_o), InternString::Owned(other_o)) => {
+                self_o == other_o
+            }
+        }
+    }
+}
+
+impl<'intern, 'src> PartialOrd for InternString<'intern, 'src> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (InternString::Interned(self_s), InternString::Interned(other_s)) => {
+                if self_s.deref().as_ptr() == other_s.deref().as_ptr() {
+                    self_s.partial_cmp(self_s)
+                } else {
+                    self_s.partial_cmp(other_s)
+                }
+            },
+            (InternString::Interned(inter), InternString::Owned(own)) |
+            (InternString::Owned(own), InternString::Interned(inter)) => {
+                inter.partial_cmp(own.as_slice())
+            },
+            (InternString::Owned(self_o), InternString::Owned(other_o)) => {
+                self_o.partial_cmp(other_o)
+            }
+        }
+    }
+}
+
+impl<'intern, 'src> Eq for InternString<'intern, 'src> { }
+
+impl<'intern, 'src> Debug for InternString<'intern, 'src> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InternString::Interned(i) => write!(f, "{}", String::from_utf8_lossy(i)),
+            InternString::Owned(o) => write!(f, "{}", String::from_utf8_lossy(o)),
+        }
+    }
+}
+
+impl<'intern, 'src> InternString<'intern, 'src> {
+    fn intern<S: Into<String>>(intern: &'intern internment::Arena<&'src [u8]>, s: S) -> Self {
+        // this is stupid: we probably actually need to intern Cow<'src, [u8]>
+        let s: String = s.into();
+        let static_s: &'static [u8] = Box::leak(s.into_boxed_str().into());
+        InternString::Interned(intern.intern(static_s.as_ref()))
+    }
+}
+
+impl<'intern, 'src> Deref for InternString<'intern, 'src> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            InternString::Interned(i) => i.deref(),
+            InternString::Owned(o) => o.as_ref(),
+        }
+    }
+}
+
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
+pub enum LValue<'src, 'intern> {
     Nil,
     Bool(bool),
     Number(Number),
-    String(Cow<'src, [u8]>),
-    Closure(Closure<'lua, 'src, 'intern>),
-    Table(Gc<Table<'lua, 'src, 'intern>>),
+    String(InternString<'intern, 'src>),
+    Closure(Closure<'src, 'intern>),
+    Table(Gc<Table<'src, 'intern>>),
 }
 
-impl<'lua, 'src, 'intern> Clone for LValue<'lua, 'src, 'intern> {
-    fn clone(&self) -> Self {
-        match self {
-            LValue::Nil => LValue::Nil,
-            LValue::Bool(self_b) => LValue::Bool(*self_b),
-            LValue::Number(self_n) => LValue::Number(*self_n),
-            LValue::String(self_c) => {
-                if let Cow::Owned(owned_c) = self_c {
-                    panic!("owned?? {:?}", owned_c);
-                }
-                let our_ptr = self_c.deref().as_ptr();
-                println!("huh {:p}", our_ptr);
-                let new_cow = self_c.clone();
-                let their_ptr = new_cow.deref().as_ptr();
-                println!("huh2 {:p}", their_ptr);
-                assert_eq!(our_ptr, their_ptr);
-                LValue::String(new_cow)
-            },
-            LValue::Closure(self_c) => LValue::Closure(self_c.clone()),
-            LValue::Table(self_t) => LValue::Table(self_t.clone()),
-        }
-    }
-}
-
-impl<'lua, 'src, 'intern> PartialEq for LValue<'lua, 'src, 'intern> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (LValue::Nil, LValue::Nil) => true,
-            (LValue::Bool(self_b), LValue::Bool(other_b)) => self_b == other_b,
-            (LValue::Number(self_n), LValue::Number(other_n)) => self_n == other_n,
-            (LValue::String(Cow::Borrowed(self_c)), LValue::String(Cow::Borrowed(other_c))) => {
-                if (*self_c).as_ptr() == (*other_c).as_ptr() {
-                    println!("fast equals");
-                    return true;
-                } else {
-                    println!("{:p} {:?} {:p} {:?}", (**self_c).as_ptr(), self_c, (**other_c).as_ptr(), other_c);
-                    return self_c == other_c;
-                }
-            },
-            (LValue::String(Cow::Owned(self_c)), LValue::String(Cow::Borrowed(other_c))) => {
-                panic!("huh???")
-            },
-            (LValue::Closure(self_c), LValue::Closure(other_c)) => self_c == other_c,
-            (LValue::Table(self_t), LValue::Table(other_t)) => self_t == other_t,
-            _ => false,
-        }
-    }
-}
-
-impl<'lua, 'src, 'intern> Eq for LValue<'lua, 'src, 'intern> {
-}
-
-impl<'lua, 'src, 'intern> LValue<'lua, 'src, 'intern> {
-    #[inline]
+impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn compare(&self, opcode: Opcode, right: Self) -> Result<bool, String> {
         // TODO: metamethods
         if std::mem::discriminant(self) != std::mem::discriminant(&right) {
@@ -370,8 +398,7 @@ impl<'lua, 'src, 'intern> LValue<'lua, 'src, 'intern> {
         }
     }
 
-    #[inline]
-    pub fn numeric_op(&self, opcode: Opcode, right: Self) -> Result<LValue<'lua, 'src, 'intern>, String> {
+    pub fn numeric_op(&self, opcode: Opcode, right: Self) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match (self, &right) {
             (LValue::Nil, LValue::Nil) => {
@@ -433,7 +460,7 @@ impl<'lua, 'src, 'intern> LValue<'lua, 'src, 'intern> {
         }
     }
 
-    pub fn len(&self) -> Result<LValue<'lua, 'src, 'intern>, String> {
+    pub fn len(&self) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match self {
             LValue::String(s) => Ok(LValue::Number(Number(s.len() as _))),
@@ -446,13 +473,14 @@ impl<'lua, 'src, 'intern> LValue<'lua, 'src, 'intern> {
     }
 }
 
-impl<'lua, 'src, 'intern> From<&LConstant<'src, 'intern>> for LValue<'src, 'src, 'intern> {
+impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LValue<'src, 'intern>
+{
     fn from(value: &LConstant<'src, 'intern>) -> Self {
         match value {
             Constant::Nil => LValue::Nil,
             Constant::Bool(b) => LValue::Bool(*b),
             Constant::Number(i) => LValue::Number(*i),
-            Constant::String(s) => LValue::String(Cow::Borrowed(s)),
+            Constant::String(s) => LValue::String(InternString::Interned(s.clone())),
         }
     }
 }
@@ -464,36 +492,36 @@ impl<'src, 'intern> PartialOrd for LConstant<'src, 'intern> {
 }
 
 #[derive(Debug, Clone)]
-enum Upvalue<'lua, 'src, 'intern> {
+enum Upvalue<'src, 'intern> {
     Open(usize), // stack index
-    Closed(Gc<LValue<'lua, 'src, 'intern>>),
+    Closed(Gc<LValue<'src, 'intern>>),
 }
 
-struct LClosure<'lua, 'src, 'intern> {
-    prototype: &'lua FunctionBlock<'src, LConstant<'src, 'intern>>,
+struct LClosure<'src, 'intern> {
+    prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
-    upvalues: Vec<Gc<Upvalue<'lua, 'src, 'intern>>>,
+    upvalues: Vec<Gc<Upvalue<'src, 'intern>>>,
 }
 
-impl<'lua, 'src, 'intern> Debug for LClosure<'lua, 'src, 'intern> {
+impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "closure(upvalues={:?})", self.upvalues)
     }
 }
 
-trait NativeFunc = for<'a, 'lua, 'src, 'intern> FnMut(&'a [LValue<'lua, 'src, 'intern>]) -> Vec<LValue<'lua, 'src, 'intern>>;
+trait NativeFunc = for<'a, 'src, 'intern> FnMut(&'a [LValue<'src, 'intern>]) -> Vec<LValue<'src, 'intern>>;
 struct NClosure {
     native: Box<dyn NativeFunc>,
 }
 
-impl<'lua, 'src> Debug for NClosure {
+impl<'src> Debug for NClosure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "<native function {:p}>", self.native.as_ref())
     }
 }
 
-impl<'lua, 'src, 'intern> LClosure<'lua, 'src, 'intern> {
-    fn new(prototype: &'lua FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
+impl<'src, 'intern> LClosure<'src, 'intern> {
+    fn new(prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
         Self {
             prototype,
             upvalues: vec![],
@@ -502,17 +530,19 @@ impl<'lua, 'src, 'intern> LClosure<'lua, 'src, 'intern> {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-enum Closure<'lua, 'src, 'intern> {
-    Lua(Gc<LClosure<'lua, 'src, 'intern>>),
+pub enum Closure<'src, 'intern> {
+    Lua(Gc<LClosure<'src, 'intern>>),
     Native(Gc<NClosure>),
 }
 
-impl<'lua, 'src, 'intern> Closure<'lua, 'src, 'intern> {
-    pub fn from_lua(prototype: &'lua FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
+impl<'src, 'intern> Closure<'src, 'intern> {
+    pub fn from_lua(prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>)
+        -> Closure<'src, 'intern>
+    {
         Self::Lua(Gc::new(LClosure::new(prototype)))
     }
 
-    pub fn into_lua(&self) -> std::cell::RefMut<'_, LClosure<'lua, 'src, 'intern>> {
+    pub fn into_lua(&self) -> std::cell::RefMut<'_, LClosure<'src, 'intern>> {
         if let Closure::Lua(clos) = self {
             clos.borrow_mut()
         } else {
@@ -526,48 +556,51 @@ impl<'lua, 'src, 'intern> Closure<'lua, 'src, 'intern> {
 }
 
 pub struct Vm<'src, 'intern> {
-    top_level: FunctionBlock<'src, LConstant<'src, 'intern>>,
+    // This is terrible, but because we reference FunctionBlocks in Gc<T> types,
+    // we can't use proper lifetimes for it: Rust doesn't know that a Gc<T> won't
+    // stick around past 'src
+    top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
 }
 
 impl<'src, 'intern> Vm<'src, 'intern> {
-    pub fn new(top_level: FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
+    pub fn new(top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
         Self { top_level }
     }
 
-    fn global_env(&self) -> Gc<Table> {
+    pub fn global_env(&self, intern: &'intern internment::Arena<&'src [u8]>) -> Gc<Table<'src, 'intern>> {
         let mut math_tab = Table::new(0, 0);
-        math_tab.hash.insert(LValue::String("floor\0".as_bytes().into()), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(LValue::String(InternString::intern(intern, "floor\0")), LValue::Closure(Closure::from_native(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
                 _ => unimplemented!()
             };
             return [f].to_vec()
         })));
-        math_tab.hash.insert(LValue::String("sqrt\0".as_bytes().into()), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(LValue::String(InternString::intern(intern, "sqrt\0")), LValue::Closure(Closure::from_native(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
                 _ => unimplemented!()
             };
             return [f].to_vec()
         })));
-        math_tab.hash.insert(LValue::String("abs\0".as_bytes().into()), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(LValue::String(InternString::intern(intern, "abs\0")), LValue::Closure(Closure::from_native(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.abs())),
                 _ => unimplemented!()
             };
             return [f].to_vec()
         })));
-        math_tab.hash.insert(LValue::String("huge\0".as_bytes().into()), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(LValue::String(InternString::intern(intern, "huge\0")), LValue::Closure(Closure::from_native(|f| {
             return [LValue::Number(Number(f64::INFINITY))].to_vec()
         })));
 
 
-        let math = (LValue::String("math\0".as_bytes().into()), LValue::Table(Gc::new(math_tab)));
+        let math = (LValue::String(InternString::intern(intern, "math\0")), LValue::Table(Gc::new(math_tab)));
         Gc::new(Table {
             array: vec![],
             hash: FxHashMap::from_iter(
                 vec![
-                (LValue::String("print\0".as_bytes().into()), LValue::Closure(Closure::from_native(|v| {
+                (LValue::String(InternString::intern(intern, "print\0")), LValue::Closure(Closure::from_native(|v| {
                     println!("> {:?}", v);
                     vec![LValue::Nil]
                 }))),
@@ -577,17 +610,22 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         })
     }
 
-    fn rk<'a, 'b>(proto: &'a FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'b Vec<LValue<'a, 'src, 'intern>>, r: u16) -> Result<&'a LConstant<'a, 'intern>, LValue<'a, 'src, 'intern>> {
+    fn rk<'exec>(proto: *const FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'exec Vec<LValue<'src, 'intern>>, r: u16)
+        -> Result<&'exec LConstant<'src, 'intern>, LValue<'src, 'intern>>
+    {
         if (r & 0x100)!=0 {
             let r_const = r & (0xff);
             debug!("rk {}", r_const);
-            Ok(&proto.constants.items[r_const as usize])
+            Ok(unsafe { &(*proto).constants.items[r_const as usize] })
         } else {
             Err(vals[base + r as usize].clone())
         }
     }
 
-    fn close_upvalues<'lua>(&self, upvals: &mut Vec<(Upvalue<'lua, 'src, 'intern>, Vec<Gc<Upvalue<'lua, 'src, 'intern>>>)>, vals: &Vec<LValue<'lua, 'src, 'intern>>) {
+    fn close_upvalues<'exec>(&self,
+        upvals: &'exec mut Vec<(Upvalue<'src, 'intern>, Vec<Gc<Upvalue<'src, 'intern>>>)>,
+        vals: &'exec Vec<LValue<'src, 'intern>>)
+    {
         for upval in upvals {
             let idx = match &upval.0 {
                 Upvalue::Open(o) => o,
@@ -602,11 +640,15 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
     }
 
-    pub fn run<'lua>(&'lua mut self) -> Result<Vec<LValue<'lua, 'src, 'intern>>, Box<dyn Error>> where 'lua: 'src {
-        let mut _G = self.global_env();
+    pub fn run<'lua>(&'lua self, mut _G: Gc<Table<'src, 'intern>>)
+        -> Result<Vec<LValue<'src, 'intern>>, Box<dyn Error>>
+        where 'src: 'lua
+    {
         // we should create a new closure for the top_level and run that instead
-        let mut clos = Closure::from_lua(&self.top_level);
-        let mut vals: Vec<LValue> = vec![LValue::from(&Constant::Nil); clos.into_lua().prototype.max_stack as usize];
+        let mut clos = Closure::from_lua(self.top_level);
+        let mut vals: Vec<LValue> = vec![LValue::from(&Constant::Nil); unsafe {
+            (*clos.into_lua().prototype).max_stack as usize
+        }];
         let mut upvals: Vec<(Upvalue, Vec<Gc<Upvalue>>)> = vec![];
         let mut base = 0;
         let mut pc = 0;
@@ -614,7 +656,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         // values
         let mut callstack: Vec<(Closure, usize, usize, usize)> = vec![];
         let r_vals = 'int: loop {
-            let inst = clos.into_lua().prototype.instructions.items[pc];
+            let inst = unsafe { clos.into_lua().prototype.as_ref().unwrap().instructions.items[pc] };
             pc += 1;
             debug!("pc {} inst {:?}", pc, inst.0.Opcode());
             debug!("stack: {}, {:?}", base, &vals);
@@ -638,8 +680,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
-                    debug!("loadk {} {} {:?}", a, bx, &clos.into_lua().prototype.constants.items[bx as usize]);
-                    vals[base + a as usize] = (&clos.into_lua().prototype.constants.items[bx as usize]).into();
+                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(*clos.into_lua().prototype).constants.items[bx as usize] });
+                    vals[base + a as usize] = unsafe { (&(*clos.into_lua().prototype).constants.items[bx as usize]).into() };
                     ()
                 },
                 Opcode::NEWTABLE => {
@@ -709,13 +751,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = &clos.into_lua().prototype.constants.items[bx as usize];
+                    let kst = unsafe { &(*clos.into_lua().prototype).constants.items[bx as usize] };
                     debug!("setglobal {} {} {:?}", a, bx, &kst);
                     _G.set(kst.into(), vals[base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = &clos.into_lua().prototype.constants.items[bx as usize];
+                    let kst = unsafe { &(*clos.into_lua().prototype).constants.items[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
                     vals[base + a as usize] = _G.get(kst.into()).unwrap_or((&Constant::Nil).into()).clone();
@@ -836,14 +878,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::CLOSURE => {
                     let (a, bx) = <CLOSURE as Instruction>::Unpack::unpack(inst.0);
                     let clos = clos.into_lua();
-                    let proto = &clos.prototype.prototypes.items[bx as usize];
+                    let proto = unsafe { &(*clos.prototype).prototypes.items[bx as usize] };
                     debug!("{} {} {:?}", a, bx, proto);
                     // handle the MOVE/GETUPVALUE pseudoinstructions
-                    let fresh = Closure::from_lua(proto);
+                    let fresh = Closure::from_lua(proto as *const _);
                     {
                         let mut fresh_clos = fresh.into_lua();
                         for upval in 0..proto.upval_count {
-                            let pseudo = clos.prototype.instructions.items[pc+upval as usize];
+                            let pseudo = unsafe { (*clos.prototype).instructions.items[pc+upval as usize] };
                             let label = match pseudo.0.Opcode() {
                                 Opcode::MOVE => {
                                     let (_, b) = <MOVE as Instruction>::Unpack::unpack(pseudo.0);
@@ -888,7 +930,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         // record call stack: we say where to return to and where to put the values
                         callstack.push((clos.clone(), pc, base, base + a as usize));
                         clos = lcall.clone();
-                        let next_stack = lcall.into_lua().prototype.max_stack as usize;
+                        let next_stack = unsafe { (*lcall.into_lua().prototype).max_stack as usize };
                         base = base + a as usize + 1;
                         // push empty stack frame
                         vals.extend_from_slice(
@@ -944,12 +986,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         unreachable!()
                     };
                     if let Some((ret_clos, caller, frame, ret)) = callstack.pop() {
-                        debug!("{:?} {:?}", &ret_clos.into_lua().prototype.instructions, caller);
+                        debug!("{:?} {:?}", unsafe { &(*ret_clos.into_lua().prototype).instructions }, caller);
                         clos = ret_clos;
                         // copy the return values to the previous frame's return location,
                         // then clean up the popped stack frame
                         base = frame;
-                        let parent_stack = clos.into_lua().prototype.max_stack as usize;
+                        let parent_stack = unsafe { (*clos.into_lua().prototype).max_stack as usize };
                         //vals.extend_from_slice(r_vals.as_slice());
                         for (i, v) in r_vals.drain(..).enumerate() {
                             vals[ret + i] = v;

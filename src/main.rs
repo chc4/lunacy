@@ -32,13 +32,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         let bytecode = std::fs::read(bytecode_file)?;
         let header = chunk::header(&bytecode[..]);
         debug!("header {:?}", &header);
+        let mut intern_strings = internment::Arena::new();
         if let Ok((rest, header)) = header {
-            let mut intern = internment::Arena::new();
-            let k = &intern;
-            let header = header.globally_intern(k);
-            let mut vm = Vm::new(header.top_level);
-            let r_vals = vm.run()?;
-            dbg!(r_vals);
+            let header = header.globally_intern(&intern_strings);
+            let mut vm = Vm::new(&header.top_level as *const _);
+            {
+                let _G = vm.global_env(&intern_strings);
+                let r_vals = vm.run(_G.clone())?;
+                dbg!(&r_vals);
+            }
         }
     }
 

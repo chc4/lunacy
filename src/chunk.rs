@@ -21,7 +21,7 @@ fn lua_number(input: &[u8]) -> IResult<&[u8], Number> {
     map(f64(Endianness::Little), |f| Number(f))(input)
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd)]
+#[derive(Clone, Hash, PartialEq, Eq, PartialOrd)]
 pub struct PackedString<'a> {
     len: usize,
     pub data: &'a [u8],
@@ -46,6 +46,7 @@ pub fn packed_string(input: &[u8]) -> IResult<&[u8], PackedString<'_>> {
     Ok((input, PackedString { len, data }))
 }
 
+#[derive(Hash, PartialEq, Eq, Clone)]
 pub struct PackedList<T> {
     count: u32,
     pub items: Vec<T>,
@@ -83,6 +84,20 @@ bitfield! {
     pub sBx, _: 31, 14;
 }
 
+impl std::hash::Hash for InstBits {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u32(self.0)
+    }
+}
+
+impl PartialEq for InstBits {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for InstBits { }
+
 impl Clone for InstBits {
     fn clone(&self) -> Self {
         InstBits(self.0)
@@ -92,7 +107,7 @@ impl Clone for InstBits {
 impl Copy for InstBits {
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub struct Instruction(pub InstBits);
 
 impl Debug for Instruction {
@@ -105,7 +120,7 @@ fn instruction(input: &[u8]) -> IResult<&[u8], Instruction> {
     map(le_u32, |i| Instruction(InstBits(i)))(input)
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 pub enum Constant<S: PartialEq + Eq> {
     Nil,
     Bool(bool),
@@ -149,7 +164,7 @@ fn constant(input: &[u8]) -> IResult<&[u8], Constant<PackedString<'_>>> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct LocalInfo<'a> {
     name: PackedString<'a>,
     start_pc: u32,
@@ -167,7 +182,7 @@ pub struct Header<'a, C> {
     pub top_level: FunctionBlock<'a, C>
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct FunctionBlock<'a, C> {
     pub source: PackedString<'a>,
     pub upval_count: u8,
@@ -228,6 +243,7 @@ pub fn header(input: &[u8]) -> IResult<&[u8], Header<Constant<PackedString<'_>>>
 }
 
 impl<'src> Constant<PackedString<'src>> {
+    #[inline]
     pub fn globally_intern<'intern>(self, intern: &'intern Arena<&'src [u8]>)
         -> Constant<internment::ArenaIntern<'intern, &'src [u8]>>
     {
@@ -242,6 +258,7 @@ impl<'src> Constant<PackedString<'src>> {
 }
 
 impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
+    #[inline]
     pub fn globally_intern<'intern>(self, intern: &'intern Arena<&'src [u8]>)
         -> FunctionBlock<'src, Constant<internment::ArenaIntern<'intern, &'src [u8]>>>
     {
