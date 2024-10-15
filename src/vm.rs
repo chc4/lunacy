@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::cell::{RefCell, Cell};
 use std::collections::HashMap;
 use std::hash::BuildHasher;
-use std::{error::Error, rc::Rc, ops::Deref};
+use std::{error::Error, ops::Deref};
 
 use internment::ArenaIntern;
 
@@ -194,6 +194,44 @@ impl Instruction for LEN { type Unpack = AB; }
 
 struct UNM;
 impl Instruction for UNM { type Unpack = AB; }
+
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Hash)]
+struct FakeRc<T> {
+    val: std::ptr::NonNull<T>,
+}
+
+impl<T> FakeRc<T> {
+    fn new(val: T) -> Self {
+        let bo = Box::leak(Box::new(val));
+        let bo_ptr = std::ptr::NonNull::from(bo);
+        Self { val: bo_ptr }
+    }
+    fn as_ptr(val: &Self) -> *const T {
+        val.val.as_ptr()
+    }
+}
+
+impl<T> Deref for FakeRc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        // safety: just trust me bro
+        unsafe { self.val.as_ref() }
+    }
+}
+
+impl<T> Clone for FakeRc<T> {
+    fn clone(&self) -> Self {
+        Self { val: self.val.clone() }
+    }
+}
+
+// For testing RC overhead
+#[cfg(skip_rc)]
+type Rc<T> = FakeRc<T>;
+#[cfg(not(skip_rc))]
+use std::rc::Rc;
 
 #[derive(Debug)]
 pub struct Gc<T>(Rc<RefCell<T>>);
@@ -467,7 +505,7 @@ pub enum LValue<'src, 'intern> {
     InternedString(ArenaIntern<'intern, (&'src [u8], u64)>),
     OwnedString(Rc<Vec<u8>>),
     LClosure(Tc<LClosure<'src, 'intern>>),
-    NClosure(Gc<NClosure>),
+    NClosure(Tc<NClosure>),
     Table(Tc<Table<'src, 'intern>>),
 }
 
@@ -666,8 +704,8 @@ pub enum Closure<'src, 'intern> {
 }
 
 impl NClosure {
-    pub fn new(native: impl NativeFunc + 'static) -> Gc<Self> {
-        Gc::new(NClosure { native: Box::new(native) })
+    pub fn new(native: impl NativeFunc + 'static) -> Tc<Self> {
+        Tc::new(NClosure { native: Box::new(native) })
     }
 }
 
@@ -1078,7 +1116,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             &vals[base + a as usize+1..=(base + a as usize + b as usize - 1)]
                         };
                         debug!("{:?}", args);
-                        let ret = (ncall.borrow_mut().native)(args);
+                        let ret = (ncall.rw(owner).native)(args);
                         if c == 0 {
                             // save all returned
                             vals.splice(base + a as usize.., ret).for_each(drop);
