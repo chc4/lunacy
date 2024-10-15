@@ -6,6 +6,8 @@ use std::fmt::Debug;
 
 use log::debug;
 
+use qcell::TCellOwner;
+
 mod chunk;
 use chunk::InstBits;
 
@@ -17,6 +19,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
+    let owner = TCellOwner::new();
+
 
     let input = std::env::args().nth(1);
     let inputs = if let Some(input) = input {
@@ -38,7 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut vm = Vm::new(&header.top_level as *const _);
             {
                 let _G = vm.global_env(&intern_strings);
-                let r_vals = vm.run(_G.clone())?;
+                let r_vals = vm.run(&owner, _G.clone())?;
                 dbg!(&r_vals);
             }
         }

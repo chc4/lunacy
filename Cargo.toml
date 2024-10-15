@@ -14,6 +14,7 @@ mimalloc = "0.1"
 env_logger = "0.11.5"
 internment = { version = "0.8.6", features = ["arena"] }
 typewit = "1.9.0"
+qcell = "0.5.4"
 
 [target.sandbox]
 

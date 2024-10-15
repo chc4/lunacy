@@ -1,16 +1,18 @@
 #![allow(non_snake_case)]
-use crate::chunk::FunctionBlock;
 use core::fmt::Debug;
 use core::hash::Hash;
+use crate::chunk::FunctionBlock;
+use crate::chunk::{InstBits, Constant};
+use rustc_hash::FxBuildHasher;
+use std::borrow::Cow;
+use std::cell::{RefCell, Cell};
+use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::{error::Error, rc::Rc, ops::Deref};
-use std::cell::{RefCell, Cell};
-use std::borrow::Cow;
-use rustc_hash::FxBuildHasher;
-use crate::chunk::{InstBits, Constant};
-use std::collections::HashMap;
 
 use internment::ArenaIntern;
+
+use qcell::{TCell, TCellOwner};
 
 use log::debug;
 
@@ -230,6 +232,49 @@ impl<T> Deref for Gc<T> {
     }
 }
 
+pub struct TcOwner;
+pub struct Tc<T>(Rc<TCell<TcOwner, T>>);
+
+impl<T> Debug for Tc<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tc({:p})", Rc::as_ptr(&self.0))
+    }
+}
+
+impl<T> PartialEq for Tc<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::as_ptr(&self.0) == Rc::as_ptr(&other.0)
+    }
+}
+
+impl<T> Eq for Tc<T> { }
+
+impl<T> Hash for Tc<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(Rc::as_ptr(&self.0) as usize)
+    }
+}
+
+impl<T> Tc<T> {
+    fn new(val: T) -> Self {
+        Self(Rc::new(TCell::new(val)))
+    }
+}
+
+impl<T> Clone for Tc<T> {
+    fn clone(&self) -> Self {
+        Tc(self.0.clone())
+    }
+}
+
+impl<T> Deref for Tc<T> {
+    type Target = TCell<TcOwner, T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
 #[derive(Default)]
 struct InternedHasher {
     hasher: FxBuildHasher,
@@ -421,7 +466,7 @@ pub enum LValue<'src, 'intern> {
     Number(Number),
     InternedString(ArenaIntern<'intern, (&'src [u8], u64)>),
     OwnedString(Rc<Vec<u8>>),
-    LClosure(Gc<LClosure<'src, 'intern>>),
+    LClosure(Tc<LClosure<'src, 'intern>>),
     NClosure(Gc<NClosure>),
     Table(Gc<Table<'src, 'intern>>),
 }
@@ -477,6 +522,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
+    #[inline]
     pub fn numeric_op(&self, opcode: Opcode, right: Self) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match (self, &right) {
@@ -580,7 +626,7 @@ enum Upvalue<'src, 'intern> {
     Closed(Gc<LValue<'src, 'intern>>),
 }
 
-struct LClosure<'src, 'intern> {
+pub struct LClosure<'src, 'intern> {
     prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
     upvalues: Vec<Gc<Upvalue<'src, 'intern>>>,
@@ -732,23 +778,23 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
     }
 
-    pub fn run<'lua>(&'lua self, mut _G: Gc<Table<'src, 'intern>>)
+    pub fn run<'lua>(&'lua self, owner: &TCellOwner<TcOwner>, mut _G: Gc<Table<'src, 'intern>>)
         -> Result<Vec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
         // we should create a new closure for the top_level and run that instead
-        let mut clos = Gc::new(LClosure::new(self.top_level));
+        let mut clos = Tc::new(LClosure::new(self.top_level));
         let mut vals: Vec<LValue> = vec![LValue::from(&Constant::Nil); unsafe {
-            (*clos.0.borrow().prototype).max_stack as usize
+            (*clos.ro(owner).prototype).max_stack as usize
         }];
         let mut upvals: Vec<(Upvalue, Vec<Gc<Upvalue>>)> = vec![];
         let mut base = 0;
         let mut pc = 0;
         // we need to track where to return to, along with the base pointer and where to put return
         // values
-        let mut callstack: Vec<(Gc<LClosure>, usize, usize, usize)> = vec![];
+        let mut callstack: Vec<(Tc<LClosure>, usize, usize, usize)> = vec![];
         let r_vals = 'int: loop {
-            let inst = unsafe { clos.0.borrow().prototype.as_ref().unwrap().instructions.items[pc] };
+            let inst = unsafe { clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc] };
             pc += 1;
             debug!("pc {} inst {:?}", pc, inst.0.Opcode());
             debug!("stack: {}, {:?}", base, &vals);
@@ -760,7 +806,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::GETUPVAL => {
                     let (a, b) = <GETUPVAL as Instruction>::Unpack::unpack(inst.0);
-                    let upval = match clos.0.borrow().upvalues[b as usize].borrow().deref() {
+                    let upval = match clos.ro(owner).upvalues[b as usize].borrow().deref() {
                         Upvalue::Open(o) => {
                             vals[*o as usize].clone()
                         },
@@ -772,8 +818,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
-                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(*clos.0.borrow().prototype).constants.items[bx as usize] });
-                    vals[base + a as usize] = unsafe { (&(*clos.0.borrow().prototype).constants.items[bx as usize]).into() };
+                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(*clos.ro(owner).prototype).constants.items[bx as usize] });
+                    vals[base + a as usize] = unsafe { (&(*clos.ro(owner).prototype).constants.items[bx as usize]).into() };
                     ()
                 },
                 Opcode::NEWTABLE => {
@@ -806,7 +852,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::GETTABLE => {
                     let (a, b, c) = <GETTABLE as Instruction>::Unpack::unpack(inst.0);
                     debug!("gettable {} {} {}", a, b, c);
-                    let kc = match Self::rk(clos.0.borrow().prototype, base, &vals, c) {
+                    let kc = match Self::rk(clos.ro(owner).prototype, base, &vals, c) {
                         Ok(c) => LValue::from(c),
                         Err(lv) => lv.clone(),
                     };
@@ -824,12 +870,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::SETTABLE => {
                     let (a, b, c) = <SETTABLE as Instruction>::Unpack::unpack(inst.0);
                     debug!("settable {} {} {}", a, b, c);
-                    let kb = match Self::rk(clos.0.borrow().prototype, base, &vals, b) {
+                    let kb = match Self::rk(clos.ro(owner).prototype, base, &vals, b) {
                         Ok(b) => b.into(),
                         Err(lv) => lv.clone(),
                     };
                     debug!("settable {:?}", &kb);
-                    let kc = match Self::rk(clos.0.borrow().prototype, base, &vals, c) {
+                    let kc = match Self::rk(clos.ro(owner).prototype, base, &vals, c) {
                         Ok(c) => c.into(),
                         Err(lv) => lv.clone(),
                     };
@@ -842,13 +888,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(*clos.0.borrow().prototype).constants.items[bx as usize] };
+                    let kst = unsafe { &(*clos.ro(owner).prototype).constants.items[bx as usize] };
                     debug!("setglobal {} {} {:?}", a, bx, &kst);
                     _G.set(kst.into(), vals[base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(*clos.0.borrow().prototype).constants.items[bx as usize] };
+                    let kst = unsafe { &(*clos.ro(owner).prototype).constants.items[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
                     vals[base + a as usize] = _G.get(kst.into()).unwrap_or((&Constant::Nil).into()).clone();
@@ -856,8 +902,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);
                     debug!("numeric op {} {}", b, c);
-                    let kb = Self::rk(clos.0.borrow().prototype, base, &vals, b);
-                    let kc = Self::rk(clos.0.borrow().prototype, base, &vals, c);
+                    let kb = Self::rk(clos.ro(owner).prototype, base, &vals, b);
+                    let kc = Self::rk(clos.ro(owner).prototype, base, &vals, c);
                     debug!("{:?} {:?}", &kb, &kc);
                     let cond = match (opcode, kb, kc) {
                         (Opcode::EQ, Ok(const_b), Ok(const_c)) => const_b == const_c,
@@ -888,8 +934,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 => {
                     let (a, b, c) = ABC::unpack(inst.0);
                     debug!("{} {} {}", a, b, c);
-                    let kb = Self::rk(clos.0.borrow().prototype, base, &vals, b);
-                    let kc = Self::rk(clos.0.borrow().prototype, base, &vals, c);
+                    let kb = Self::rk(clos.ro(owner).prototype, base, &vals, b);
+                    let kc = Self::rk(clos.ro(owner).prototype, base, &vals, c);
                     debug!("{:?} {:?}", &kb, &kc);
                     let res = match (opcode, kb, kc) {
                         (Opcode::ADD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
@@ -968,13 +1014,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::CLOSURE => {
                     let (a, bx) = <CLOSURE as Instruction>::Unpack::unpack(inst.0);
-                    let proto = unsafe { &(*clos.0.borrow().prototype).prototypes.items[bx as usize] };
+                    let proto = unsafe { &(*clos.ro(owner).prototype).prototypes.items[bx as usize] };
                     debug!("{} {} {:?}", a, bx, proto);
                     // handle the MOVE/GETUPVALUE pseudoinstructions
                     let mut fresh = LClosure::new(proto as *const _);
                     {
                         for upval in 0..proto.upval_count {
-                            let pseudo = unsafe { (*clos.0.borrow().prototype).instructions.items[pc+upval as usize] };
+                            let pseudo = unsafe { (*clos.ro(owner).prototype).instructions.items[pc+upval as usize] };
                             let label = match pseudo.0.Opcode() {
                                 Opcode::MOVE => {
                                     let (_, b) = <MOVE as Instruction>::Unpack::unpack(pseudo.0);
@@ -1007,7 +1053,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         pc += proto.upval_count as usize;
                         //assert_eq!(proto.upval_count, 0);
                     }
-                    vals[base + a as usize] = LValue::LClosure(Gc::new(fresh));
+                    vals[base + a as usize] = LValue::LClosure(Tc::new(fresh));
                 },
                 Opcode::CALL => {
                     let (a, b, c) = <CALL as Instruction>::Unpack::unpack(inst.0);
@@ -1019,7 +1065,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         // record call stack: we say where to return to and where to put the values
                         callstack.push((clos.clone(), pc, base, base + a as usize));
                         clos = lclos.clone();
-                        let next_stack = unsafe { (*lclos.borrow_mut().prototype).max_stack as usize };
+                        let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
                         base = base + a as usize + 1;
                         // push empty stack frame
                         vals.extend_from_slice(
@@ -1075,12 +1121,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         unreachable!()
                     };
                     if let Some((ret_clos, caller, frame, ret)) = callstack.pop() {
-                        debug!("{:?} {:?}", unsafe { &(*ret_clos.0.borrow().prototype).instructions }, caller);
+                        debug!("{:?} {:?}", unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller);
                         clos = ret_clos.clone();
                         // copy the return values to the previous frame's return location,
                         // then clean up the popped stack frame
                         base = frame;
-                        let parent_stack = unsafe { (*clos.0.borrow().prototype).max_stack as usize };
+                        let parent_stack = unsafe { (*clos.ro(owner).prototype).max_stack as usize };
                         //vals.extend_from_slice(r_vals.as_slice());
                         for (i, v) in r_vals.drain(..).enumerate() {
                             vals[ret + i] = v;
