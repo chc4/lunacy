@@ -17,6 +17,8 @@ use vm::Vm;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+const TIMES: f64 = 10.0;
+
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     let mut owner = TCellOwner::new();
@@ -42,7 +44,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut vm = Vm::new(&header.top_level as *const _);
             {
                 let _G = vm.global_env(&mut owner, &intern_strings);
-                let r_vals = vm.run(&mut owner, _G.clone())?;
+                let mut clos = vm::Tc::new(vm::LClosure::new(vm.top_level));
+                let r_vals = vm.run(&mut owner, _G.clone(), clos, vec![])?;
+                if let Some(vm::LValue::LClosure(run_iter)) = _G.get(&owner, vm::InternString::intern(&intern_strings, "run_iter\0")) {
+                    println!("> starting benchmark");
+                    vm.run(&mut owner, _G.clone(), run_iter, vec![vm::LValue::Number(vm::Number(TIMES))]);
+                }
                 dbg!(&r_vals);
             }
         }

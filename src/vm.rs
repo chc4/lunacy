@@ -294,7 +294,7 @@ impl<T> Hash for Tc<T> {
 }
 
 impl<T> Tc<T> {
-    fn new(val: T) -> Self {
+    pub fn new(val: T) -> Self {
         Self(Rc::new(TCell::new(val)))
     }
 }
@@ -380,7 +380,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
 }
 
 impl<'src, 'intern> Tc<Table<'src, 'intern>> {
-    fn get(&self, owner: &TCellOwner<TcOwner>, key: LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
+    pub fn get(&self, owner: &TCellOwner<TcOwner>, key: LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
             LValue::Number(n) => Some(self.ro(owner).array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
             LValue::InternedString(ref s) => {
@@ -393,7 +393,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
         }
     }
 
-    fn set(&mut self, owner: &mut TCellOwner<TcOwner>, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
+    pub fn set(&mut self, owner: &mut TCellOwner<TcOwner>, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
         match key {
             LValue::Number(n) => {
                 // TODO: sparse arrays
@@ -474,7 +474,7 @@ impl<'intern, 'src> Debug for InternString<'intern, 'src> {
 }
 
 impl<'intern, 'src> InternString<'intern, 'src> {
-    fn intern<S: Into<String>>(intern: &'intern internment::Arena<(&'src [u8], u64)>, s: S) -> LValue<'src, 'intern> {
+    pub fn intern<S: Into<String>>(intern: &'intern internment::Arena<(&'src [u8], u64)>, s: S) -> LValue<'src, 'intern> {
         // this is stupid: we probably actually need to intern Cow<'src, [u8]>
         let s: String = s.into();
         let static_s: &'static [u8] = Box::leak(s.into_boxed_str().into());
@@ -688,7 +688,7 @@ impl<'src> Debug for NClosure {
 }
 
 impl<'src, 'intern> LClosure<'src, 'intern> {
-    fn new(prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
+    pub fn new(prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
         Self {
             prototype,
             upvalues: vec![],
@@ -713,7 +713,7 @@ pub struct Vm<'src, 'intern> {
     // This is terrible, but because we reference FunctionBlocks in Gc<T> types,
     // we can't use proper lifetimes for it: Rust doesn't know that a Gc<T> won't
     // stick around past 'src
-    top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
+    pub top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
 }
 
 impl<'src, 'intern> Vm<'src, 'intern> {
@@ -816,15 +816,19 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
     }
 
-    pub fn run<'lua>(&'lua self, owner: &mut TCellOwner<TcOwner>, mut _G: Tc<Table<'src, 'intern>>)
+    pub fn run<'lua>(&'lua self,
+        owner: &mut TCellOwner<TcOwner>,
+        mut _G: Tc<Table<'src, 'intern>>,
+        mut clos: Tc<LClosure<'src, 'intern>>,
+        mut args: Vec<LValue<'src, 'intern>>,
+    )
         -> Result<Vec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
-        // we should create a new closure for the top_level and run that instead
-        let mut clos = Tc::new(LClosure::new(self.top_level));
-        let mut vals: Vec<LValue> = vec![LValue::from(&Constant::Nil); unsafe {
+        args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
-        }];
+        }, || LValue::Nil);
+        let mut vals = args;
         let mut upvals: Vec<(Upvalue, Vec<Gc<Upvalue>>)> = vec![];
         let mut base = 0;
         let mut pc = 0;
