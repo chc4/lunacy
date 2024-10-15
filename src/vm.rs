@@ -312,7 +312,13 @@ impl<'src, 'intern> Gc<Table<'src, 'intern>> {
 
     fn set(&mut self, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
         match key {
-            LValue::Number(n) => unimplemented!(),
+            LValue::Number(n) => {
+                // TODO: sparse arrays
+                if self.borrow_mut().array.len() <= n.0 as usize {
+                    self.borrow_mut().array.resize_with(n.0 as usize, || LValue::Nil);
+                }
+                self.borrow_mut().array[n.0 as usize-1] = value
+            },
             LValue::InternedString(ref s) => {
                 self.borrow_mut().hash.insert(key, value);
             },
@@ -508,7 +514,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 match (self, &right) {
                     (LValue::Number(left_n), LValue::Number(right_n)) =>
                         Ok(LValue::Number(Number(left_n.0 * right_n.0))),
-                    _ => unimplemented!(),
+                    x => unimplemented!(),
                 }
             },
             Opcode::DIV => {
@@ -656,6 +662,28 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         })));
         math_tab.hash.insert(InternString::intern(intern, "huge\0"), LValue::NClosure(NClosure::new(|f| {
             return [LValue::Number(Number(f64::INFINITY))].to_vec()
+        })));
+        math_tab.hash.insert(InternString::intern(intern, "pi\0"), LValue::Number(Number(std::f64::consts::PI)));
+        math_tab.hash.insert(InternString::intern(intern, "sin\0"), LValue::NClosure(NClosure::new(|f| {
+            let f = match f {
+                [LValue::Number(f)] => LValue::Number(Number(f.0.sin())),
+                _ => unimplemented!()
+            };
+            return [f].to_vec()
+        })));
+        math_tab.hash.insert(InternString::intern(intern, "cos\0"), LValue::NClosure(NClosure::new(|f| {
+            let f = match f {
+                [LValue::Number(f)] => LValue::Number(Number(f.0.cos())),
+                _ => unimplemented!()
+            };
+            return [f].to_vec()
+        })));
+        math_tab.hash.insert(InternString::intern(intern, "tan\0"), LValue::NClosure(NClosure::new(|f| {
+            let f = match f {
+                [LValue::Number(f)] => LValue::Number(Number(f.0.tan())),
+                _ => unimplemented!()
+            };
+            return [f].to_vec()
         })));
 
 
