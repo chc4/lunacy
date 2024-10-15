@@ -12,8 +12,8 @@ use chunk::InstBits;
 mod vm;
 use vm::Vm;
 
-//#[global_allocator]
-//static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
@@ -27,9 +27,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         dumped_sorted.sort();
         dumped_sorted
     };
-    dbg!(std::mem::size_of::<vm::LValue<'_, '_>>());
-    dbg!(std::mem::size_of::<vm::InternString<'_, '_>>());
-    dbg!(std::mem::size_of::<vm::Closure<'_, '_>>());
     for bytecode_file in inputs {
         println!("--------------------- {:?}", bytecode_file);
         let bytecode = std::fs::read(bytecode_file)?;

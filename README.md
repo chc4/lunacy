@@ -11,6 +11,6 @@ PUC Lua:
 Lunacy:
 > export TESTCASE=lua_benchmarking/benchmarks/nbody/bench && cargo build --release --bin=lunacy && time ./target/release/lunacy $TESTCASE.bin
 
-> ./target/release/lunacy $TESTCASE.bin  1.56s user 0.00s system 99% cpu 1.569 total
+> RUST_LOG=debug ./target/release/lunacy $TESTCASE.bin  1.26s user 0.00s system 99% cpu 1.261 total
 
 so yeah it's kinda slow

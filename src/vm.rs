@@ -613,26 +613,6 @@ pub enum Closure<'src, 'intern> {
     Native(Gc<NClosure>),
 }
 
-impl<'src, 'intern> Closure<'src, 'intern> {
-    pub fn from_lua(prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>)
-        -> Closure<'src, 'intern>
-    {
-        Self::Lua(Gc::new(LClosure::new(prototype)))
-    }
-
-    pub fn into_lua(&self) -> std::cell::RefMut<'_, LClosure<'src, 'intern>> {
-        if let Closure::Lua(clos) = self {
-            clos.borrow_mut()
-        } else {
-            panic!()
-        }
-    }
-
-    pub fn from_native(native: impl NativeFunc + 'static) -> Self {
-        Self::Native(Gc::new(NClosure { native: Box::new(native) }))
-    }
-}
-
 impl NClosure {
     pub fn new(native: impl NativeFunc + 'static) -> Gc<Self> {
         Gc::new(NClosure { native: Box::new(native) })
@@ -729,18 +709,18 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         where 'src: 'lua
     {
         // we should create a new closure for the top_level and run that instead
-        let mut clos = Closure::from_lua(self.top_level);
+        let mut clos = Gc::new(LClosure::new(self.top_level));
         let mut vals: Vec<LValue> = vec![LValue::from(&Constant::Nil); unsafe {
-            (*clos.into_lua().prototype).max_stack as usize
+            (*clos.0.borrow().prototype).max_stack as usize
         }];
         let mut upvals: Vec<(Upvalue, Vec<Gc<Upvalue>>)> = vec![];
         let mut base = 0;
         let mut pc = 0;
         // we need to track where to return to, along with the base pointer and where to put return
         // values
-        let mut callstack: Vec<(Closure, usize, usize, usize)> = vec![];
+        let mut callstack: Vec<(Gc<LClosure>, usize, usize, usize)> = vec![];
         let r_vals = 'int: loop {
-            let inst = unsafe { clos.into_lua().prototype.as_ref().unwrap().instructions.items[pc] };
+            let inst = unsafe { clos.0.borrow().prototype.as_ref().unwrap().instructions.items[pc] };
             pc += 1;
             debug!("pc {} inst {:?}", pc, inst.0.Opcode());
             debug!("stack: {}, {:?}", base, &vals);
@@ -752,7 +732,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::GETUPVAL => {
                     let (a, b) = <GETUPVAL as Instruction>::Unpack::unpack(inst.0);
-                    let upval = match clos.into_lua().upvalues[b as usize].borrow().deref() {
+                    let upval = match clos.0.borrow().upvalues[b as usize].borrow().deref() {
                         Upvalue::Open(o) => {
                             vals[*o as usize].clone()
                         },
@@ -764,12 +744,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
-                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(*clos.into_lua().prototype).constants.items[bx as usize] });
-                    vals[base + a as usize] = unsafe { (&(*clos.into_lua().prototype).constants.items[bx as usize]).into() };
+                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(*clos.0.borrow().prototype).constants.items[bx as usize] });
+                    vals[base + a as usize] = unsafe { (&(*clos.0.borrow().prototype).constants.items[bx as usize]).into() };
                     ()
                 },
                 Opcode::NEWTABLE => {
                     let (a, b, c) = <NEWTABLE as Instruction>::Unpack::unpack(inst.0);
+                    // TODO: properly decode the "floating point byte" size hints instead
                     vals[base + a as usize] = LValue::Table(Gc::new(Table::new(b as usize, c as usize)));
                 },
                 Opcode::SETLIST => {
@@ -797,8 +778,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::GETTABLE => {
                     let (a, b, c) = <GETTABLE as Instruction>::Unpack::unpack(inst.0);
                     debug!("gettable {} {} {}", a, b, c);
-                    let clos = clos.into_lua();
-                    let kc = match Self::rk(clos.prototype, base, &vals, c) {
+                    let kc = match Self::rk(clos.0.borrow().prototype, base, &vals, c) {
                         Ok(c) => LValue::from(c),
                         Err(lv) => lv.clone(),
                     };
@@ -816,13 +796,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::SETTABLE => {
                     let (a, b, c) = <SETTABLE as Instruction>::Unpack::unpack(inst.0);
                     debug!("settable {} {} {}", a, b, c);
-                    let clos = clos.into_lua();
-                    let kb = match Self::rk(clos.prototype, base, &vals, b) {
+                    let kb = match Self::rk(clos.0.borrow().prototype, base, &vals, b) {
                         Ok(b) => b.into(),
                         Err(lv) => lv.clone(),
                     };
                     debug!("settable {:?}", &kb);
-                    let kc = match Self::rk(clos.prototype, base, &vals, c) {
+                    let kc = match Self::rk(clos.0.borrow().prototype, base, &vals, c) {
                         Ok(c) => c.into(),
                         Err(lv) => lv.clone(),
                     };
@@ -830,18 +809,18 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         LValue::Table(tab) => {
                             tab.set(kb, kc)
                         },
-                        _ => unimplemented!(),
+                        x => { debug!("huh {:?}", x); unimplemented!() },
                     };
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(*clos.into_lua().prototype).constants.items[bx as usize] };
+                    let kst = unsafe { &(*clos.0.borrow().prototype).constants.items[bx as usize] };
                     debug!("setglobal {} {} {:?}", a, bx, &kst);
                     _G.set(kst.into(), vals[base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(*clos.into_lua().prototype).constants.items[bx as usize] };
+                    let kst = unsafe { &(*clos.0.borrow().prototype).constants.items[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
                     vals[base + a as usize] = _G.get(kst.into()).unwrap_or((&Constant::Nil).into()).clone();
@@ -849,8 +828,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);
                     debug!("numeric op {} {}", b, c);
-                    let kb = Self::rk(clos.into_lua().prototype, base, &vals, b);
-                    let kc = Self::rk(clos.into_lua().prototype, base, &vals, c);
+                    let kb = Self::rk(clos.0.borrow().prototype, base, &vals, b);
+                    let kc = Self::rk(clos.0.borrow().prototype, base, &vals, c);
                     debug!("{:?} {:?}", &kb, &kc);
                     let cond = match (opcode, kb, kc) {
                         (Opcode::EQ, Ok(const_b), Ok(const_c)) => const_b == const_c,
@@ -881,8 +860,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 => {
                     let (a, b, c) = ABC::unpack(inst.0);
                     debug!("{} {} {}", a, b, c);
-                    let kb = Self::rk(clos.into_lua().prototype, base, &vals, b);
-                    let kc = Self::rk(clos.into_lua().prototype, base, &vals, c);
+                    let kb = Self::rk(clos.0.borrow().prototype, base, &vals, b);
+                    let kc = Self::rk(clos.0.borrow().prototype, base, &vals, c);
                     debug!("{:?} {:?}", &kb, &kc);
                     let res = match (opcode, kb, kc) {
                         (Opcode::ADD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
@@ -961,14 +940,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::CLOSURE => {
                     let (a, bx) = <CLOSURE as Instruction>::Unpack::unpack(inst.0);
-                    let clos = clos.into_lua();
-                    let proto = unsafe { &(*clos.prototype).prototypes.items[bx as usize] };
+                    let proto = unsafe { &(*clos.0.borrow().prototype).prototypes.items[bx as usize] };
                     debug!("{} {} {:?}", a, bx, proto);
                     // handle the MOVE/GETUPVALUE pseudoinstructions
                     let mut fresh = LClosure::new(proto as *const _);
                     {
                         for upval in 0..proto.upval_count {
-                            let pseudo = unsafe { (*clos.prototype).instructions.items[pc+upval as usize] };
+                            let pseudo = unsafe { (*clos.0.borrow().prototype).instructions.items[pc+upval as usize] };
                             let label = match pseudo.0.Opcode() {
                                 Opcode::MOVE => {
                                     let (_, b) = <MOVE as Instruction>::Unpack::unpack(pseudo.0);
@@ -1012,7 +990,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     if let LValue::LClosure(ref lclos) = to_call.clone() {
                         // record call stack: we say where to return to and where to put the values
                         callstack.push((clos.clone(), pc, base, base + a as usize));
-                        clos = Closure::Lua(lclos.clone());
+                        clos = lclos.clone();
                         let next_stack = unsafe { (*lclos.borrow_mut().prototype).max_stack as usize };
                         base = base + a as usize + 1;
                         // push empty stack frame
@@ -1069,12 +1047,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         unreachable!()
                     };
                     if let Some((ret_clos, caller, frame, ret)) = callstack.pop() {
-                        debug!("{:?} {:?}", unsafe { &(*ret_clos.into_lua().prototype).instructions }, caller);
-                        clos = ret_clos;
+                        debug!("{:?} {:?}", unsafe { &(*ret_clos.0.borrow().prototype).instructions }, caller);
+                        clos = ret_clos.clone();
                         // copy the return values to the previous frame's return location,
                         // then clean up the popped stack frame
                         base = frame;
-                        let parent_stack = unsafe { (*clos.into_lua().prototype).max_stack as usize };
+                        let parent_stack = unsafe { (*clos.0.borrow().prototype).max_stack as usize };
                         //vals.extend_from_slice(r_vals.as_slice());
                         for (i, v) in r_vals.drain(..).enumerate() {
                             vals[ret + i] = v;
