@@ -22,8 +22,5 @@ typewit = "1.9.0"
 codegen-units = 1
 panic = "abort"
 lto = "fat"
-
-[profile.flamegraph]
-inherits = "release"
 strip = false
 debug = true
