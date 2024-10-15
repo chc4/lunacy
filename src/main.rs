@@ -19,7 +19,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
-    let owner = TCellOwner::new();
+    let mut owner = TCellOwner::new();
 
 
     let input = std::env::args().nth(1);
@@ -41,8 +41,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let header = header.globally_intern(&intern_strings);
             let mut vm = Vm::new(&header.top_level as *const _);
             {
-                let _G = vm.global_env(&intern_strings);
-                let r_vals = vm.run(&owner, _G.clone())?;
+                let _G = vm.global_env(&mut owner, &intern_strings);
+                let r_vals = vm.run(&mut owner, _G.clone())?;
                 dbg!(&r_vals);
             }
         }

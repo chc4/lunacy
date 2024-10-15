@@ -341,34 +341,34 @@ impl<'src, 'intern> Table<'src, 'intern> {
     }
 }
 
-impl<'src, 'intern> Gc<Table<'src, 'intern>> {
-    fn get(&self, key: LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
+impl<'src, 'intern> Tc<Table<'src, 'intern>> {
+    fn get(&self, owner: &TCellOwner<TcOwner>, key: LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
-            LValue::Number(n) => Some(self.borrow().array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
+            LValue::Number(n) => Some(self.ro(owner).array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
             LValue::InternedString(ref s) => {
-                self.borrow().hash.get(&key).cloned()
+                self.ro(owner).hash.get(&key).cloned()
             },
             LValue::OwnedString(ref s) => {
-                self.borrow().hash.get(&key).cloned()
+                self.ro(owner).hash.get(&key).cloned()
             },
             _ => unimplemented!()
         }
     }
 
-    fn set(&mut self, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
+    fn set(&mut self, owner: &mut TCellOwner<TcOwner>, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
         match key {
             LValue::Number(n) => {
                 // TODO: sparse arrays
-                if self.borrow_mut().array.len() <= n.0 as usize {
-                    self.borrow_mut().array.resize_with(n.0 as usize, || LValue::Nil);
+                if self.rw(owner).array.len() <= n.0 as usize {
+                    self.rw(owner).array.resize_with(n.0 as usize, || LValue::Nil);
                 }
-                self.borrow_mut().array[n.0 as usize-1] = value
+                self.rw(owner).array[n.0 as usize-1] = value
             },
             LValue::InternedString(ref s) => {
-                self.borrow_mut().hash.insert(key, value);
+                self.rw(owner).hash.insert(key, value);
             },
             LValue::OwnedString(ref s) => {
-                self.borrow_mut().hash.insert(key, value);
+                self.rw(owner).hash.insert(key, value);
             },
             _ => unimplemented!()
         }
@@ -468,7 +468,7 @@ pub enum LValue<'src, 'intern> {
     OwnedString(Rc<Vec<u8>>),
     LClosure(Tc<LClosure<'src, 'intern>>),
     NClosure(Gc<NClosure>),
-    Table(Gc<Table<'src, 'intern>>),
+    Table(Tc<Table<'src, 'intern>>),
 }
 
 impl<'src, 'intern> LValue<'src, 'intern> {
@@ -588,14 +588,14 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn len(&self) -> Result<LValue<'src, 'intern>, String> {
+    pub fn len(&self, owner: &TCellOwner<TcOwner>) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match self {
             LValue::InternedString(s) => Ok(LValue::Number(Number(s.0.len() as _))),
             LValue::OwnedString(s) => Ok(LValue::Number(Number(s.len() as _))),
             LValue::Table(t) => {
                 // TODO: sparse arrays
-                Ok(LValue::Number(Number(t.0.borrow_mut().array.len() as _)))
+                Ok(LValue::Number(Number(t.ro(owner).array.len() as _)))
             },
             _ => unimplemented!(),
         }
@@ -683,7 +683,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         Self { top_level }
     }
 
-    pub fn global_env(&self, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Gc<Table<'src, 'intern>> {
+    pub fn global_env(&self, owner: &mut TCellOwner<TcOwner>, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Tc<Table<'src, 'intern>> {
         let mut math_tab = Table::new(0, 0);
         math_tab.hash.insert(InternString::intern(intern, "floor\0"), LValue::NClosure(NClosure::new(|f| {
             let f = match f {
@@ -733,8 +733,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         })));
 
 
-        let math = (InternString::intern(intern, "math\0"), LValue::Table(Gc::new(math_tab)));
-        Gc::new(Table {
+        let math = (InternString::intern(intern, "math\0"), LValue::Table(Tc::new(math_tab)));
+        Tc::new(Table {
             array: vec![],
             hash: HashMap::<_, _, InternedHasher>::from_iter(
                 vec![
@@ -778,7 +778,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
     }
 
-    pub fn run<'lua>(&'lua self, owner: &TCellOwner<TcOwner>, mut _G: Gc<Table<'src, 'intern>>)
+    pub fn run<'lua>(&'lua self, owner: &mut TCellOwner<TcOwner>, mut _G: Tc<Table<'src, 'intern>>)
         -> Result<Vec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
@@ -825,7 +825,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::NEWTABLE => {
                     let (a, b, c) = <NEWTABLE as Instruction>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
-                    vals[base + a as usize] = LValue::Table(Gc::new(Table::new(b as usize, c as usize)));
+                    vals[base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
                 },
                 Opcode::SETLIST => {
                     let (a, b, c) = <SETLIST as Instruction>::Unpack::unpack(inst.0);
@@ -834,13 +834,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             assert_ne!(c, 0);
                             if b == 0 {
                                 let src = vals[base + a as usize+1..].iter().cloned();
-                                tab.borrow_mut().array.splice(
+                                tab.rw(owner).array.splice(
                                     (c as usize-1)*50..,
                                     src
                                 ).for_each(drop);
                             } else {
                                 let src = vals[base + a as usize+1..=base + a as usize+b as usize as usize].iter().cloned();
-                                tab.borrow_mut().array.splice(
+                                tab.rw(owner).array.splice(
                                     (c as usize-1)*50..,
                                     src
                                 ).for_each(drop);
@@ -860,7 +860,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let val_b = match &vals[base + b as usize] {
                         LValue::Table(tab) => {
                             debug!("table {:?}", tab);
-                            tab.get(kc.clone()).ok_or_else(|| Err::<LValue, String>(format!("{:?}", kc))).unwrap()
+                            tab.get(owner, kc.clone()).ok_or_else(|| Err::<LValue, String>(format!("{:?}", kc))).unwrap()
                         },
                         x => unimplemented!("gettable on {:?}", x),
                     };
@@ -881,7 +881,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                     match &mut vals[base + a as usize] {
                         LValue::Table(tab) => {
-                            tab.set(kb, kc)
+                            tab.set(owner, kb, kc)
                         },
                         x => { debug!("huh {:?}", x); unimplemented!() },
                     };
@@ -890,14 +890,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
                     let kst = unsafe { &(*clos.ro(owner).prototype).constants.items[bx as usize] };
                     debug!("setglobal {} {} {:?}", a, bx, &kst);
-                    _G.set(kst.into(), vals[base + a as usize].clone());
+                    _G.set(owner, kst.into(), vals[base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
                     let kst = unsafe { &(*clos.ro(owner).prototype).constants.items[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
-                    vals[base + a as usize] = _G.get(kst.into()).unwrap_or((&Constant::Nil).into()).clone();
+                    vals[base + a as usize] = _G.get(owner, kst.into()).unwrap_or((&Constant::Nil).into()).clone();
                 },
                 opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);
@@ -980,7 +980,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::LEN => {
                     let (a, b) = <LEN as Instruction>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
-                    vals[base + a as usize] = vals[base + b as usize].len()?;
+                    vals[base + a as usize] = vals[base + b as usize].len(owner)?;
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = <FORPREP as Instruction>::Unpack::unpack(inst.0);
