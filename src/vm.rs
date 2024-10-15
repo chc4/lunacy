@@ -269,7 +269,7 @@ impl std::hash::BuildHasher for InternedHasher {
         if type_eq::<T, &LValue<'_, '_>>() {
             let lv: &&LValue<'_, '_> = unsafe { std::mem::transmute(&x) };
             match lv {
-                LValue::String(InternString::Interned(i)) => {
+                LValue::InternedString(i) => {
                     debug!("interned hash {:?} {}", i.0, i.1);
                     //assert_eq!(self.hasher.hash_one(i.0), i.1);
                     return i.1
@@ -300,7 +300,10 @@ impl<'src, 'intern> Gc<Table<'src, 'intern>> {
     fn get(&self, key: LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
             LValue::Number(n) => Some(self.borrow().array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
-            LValue::String(ref s) => {
+            LValue::InternedString(ref s) => {
+                self.borrow().hash.get(&key).cloned()
+            },
+            LValue::OwnedString(ref s) => {
                 self.borrow().hash.get(&key).cloned()
             },
             _ => unimplemented!()
@@ -310,7 +313,10 @@ impl<'src, 'intern> Gc<Table<'src, 'intern>> {
     fn set(&mut self, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
         match key {
             LValue::Number(n) => unimplemented!(),
-            LValue::String(ref s) => {
+            LValue::InternedString(ref s) => {
+                self.borrow_mut().hash.insert(key, value);
+            },
+            LValue::OwnedString(ref s) => {
                 self.borrow_mut().hash.insert(key, value);
             },
             _ => unimplemented!()
@@ -318,6 +324,7 @@ impl<'src, 'intern> Gc<Table<'src, 'intern>> {
     }
 }
 
+#[repr(u8)]
 #[derive(Hash, Clone)]
 pub enum InternString<'intern, 'src> {
     Interned(ArenaIntern<'intern, (&'src [u8], u64)>),
@@ -378,14 +385,14 @@ impl<'intern, 'src> Debug for InternString<'intern, 'src> {
 }
 
 impl<'intern, 'src> InternString<'intern, 'src> {
-    fn intern<S: Into<String>>(intern: &'intern internment::Arena<(&'src [u8], u64)>, s: S) -> Self {
+    fn intern<S: Into<String>>(intern: &'intern internment::Arena<(&'src [u8], u64)>, s: S) -> LValue<'src, 'intern> {
         // this is stupid: we probably actually need to intern Cow<'src, [u8]>
         let s: String = s.into();
         let static_s: &'static [u8] = Box::leak(s.into_boxed_str().into());
         use std::hash::BuildHasher;
         let hash = FxBuildHasher::default().hash_one(static_s);
         debug!("interning hash {} for {:?}", hash, static_s);
-        InternString::Interned(intern.intern((static_s.as_ref(), hash)))
+        LValue::InternedString(intern.intern((static_s.as_ref(), hash)))
     }
 }
 
@@ -400,13 +407,16 @@ impl<'intern, 'src> Deref for InternString<'intern, 'src> {
     }
 }
 
+#[repr(u8)]
 #[derive(Debug, Hash, Clone, PartialEq, Eq)]
 pub enum LValue<'src, 'intern> {
     Nil,
     Bool(bool),
     Number(Number),
-    String(InternString<'intern, 'src>),
-    Closure(Closure<'src, 'intern>),
+    InternedString(ArenaIntern<'intern, (&'src [u8], u64)>),
+    OwnedString(Rc<Vec<u8>>),
+    LClosure(Gc<LClosure<'src, 'intern>>),
+    NClosure(Gc<NClosure>),
     Table(Gc<Table<'src, 'intern>>),
 }
 
@@ -423,7 +433,10 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             (LValue::Table(left_tab), LValue::Table(right_tab)) => {
                 unimplemented!("metamethod")
             },
-            (LValue::Closure(left_c), LValue::Closure(right_c)) => {
+            (LValue::LClosure(left_c), LValue::LClosure(right_c)) => {
+                return Err("attempt to compare functions".into())
+            },
+            (LValue::NClosure(left_c), LValue::NClosure(right_c)) => {
                 return Err("attempt to compare functions".into())
             },
             _ => (),
@@ -437,7 +450,10 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 match (self, &right) {
                     (LValue::Bool(left_b), LValue::Bool(right_b)) => Ok(left_b < right_b),
                     (LValue::Number(left_n), LValue::Number(right_n)) => Ok(left_n < right_n),
-                    (LValue::String(left_s), LValue::String(right_s)) => Ok(left_s < right_s),
+                    (LValue::InternedString(left_s), LValue::InternedString(right_s)) =>
+                        Ok(left_s.0 < right_s.0),
+                    (LValue::OwnedString(left_s), LValue::OwnedString(right_s)) =>
+                        Ok(left_s < right_s),
                     _ => panic!()
                 }
             },
@@ -445,7 +461,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 match (self, &right) {
                     (LValue::Bool(left_b), LValue::Bool(right_b)) => Ok(left_b <= right_b),
                     (LValue::Number(left_n), LValue::Number(right_n)) => Ok(left_n <= right_n),
-                    (LValue::String(left_s), LValue::String(right_s)) => Ok(left_s <= right_s),
+                    (LValue::InternedString(left_s), LValue::InternedString(right_s)) =>
+                        Ok(left_s.0 <= right_s.0),
                     _ => panic!()
                 }
 
@@ -463,7 +480,10 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             (LValue::Table(left_tab), LValue::Table(right_tab)) => {
                 unimplemented!("metamethod")
             },
-            (LValue::Closure(left_c), LValue::Closure(right_c)) => {
+            (LValue::LClosure(left_c), LValue::LClosure(right_c)) => {
+                return Err("attempt to compare functions".into())
+            },
+            (LValue::NClosure(left_c), LValue::NClosure(right_c)) => {
                 return Err("attempt to compare functions".into())
             },
             _ => (),
@@ -519,7 +539,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn len(&self) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match self {
-            LValue::String(s) => Ok(LValue::Number(Number(s.len() as _))),
+            LValue::InternedString(s) => Ok(LValue::Number(Number(s.0.len() as _))),
+            LValue::OwnedString(s) => Ok(LValue::Number(Number(s.len() as _))),
             LValue::Table(t) => {
                 // TODO: sparse arrays
                 Ok(LValue::Number(Number(t.0.borrow_mut().array.len() as _)))
@@ -536,7 +557,7 @@ impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LValue<'src, 'intern>
             Constant::Nil => LValue::Nil,
             Constant::Bool(b) => LValue::Bool(*b),
             Constant::Number(i) => LValue::Number(*i),
-            Constant::String(s) => LValue::String(InternString::Interned(s.clone())),
+            Constant::String(s) => LValue::InternedString(s.clone()),
         }
     }
 }
@@ -585,6 +606,7 @@ impl<'src, 'intern> LClosure<'src, 'intern> {
     }
 }
 
+#[repr(u8)]
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Closure<'src, 'intern> {
     Lua(Gc<LClosure<'src, 'intern>>),
@@ -611,6 +633,12 @@ impl<'src, 'intern> Closure<'src, 'intern> {
     }
 }
 
+impl NClosure {
+    pub fn new(native: impl NativeFunc + 'static) -> Gc<Self> {
+        Gc::new(NClosure { native: Box::new(native) })
+    }
+}
+
 pub struct Vm<'src, 'intern> {
     // This is terrible, but because we reference FunctionBlocks in Gc<T> types,
     // we can't use proper lifetimes for it: Rust doesn't know that a Gc<T> won't
@@ -625,38 +653,38 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
     pub fn global_env(&self, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Gc<Table<'src, 'intern>> {
         let mut math_tab = Table::new(0, 0);
-        math_tab.hash.insert(LValue::String(InternString::intern(intern, "floor\0")), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "floor\0"), LValue::NClosure(NClosure::new(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
                 _ => unimplemented!()
             };
             return [f].to_vec()
         })));
-        math_tab.hash.insert(LValue::String(InternString::intern(intern, "sqrt\0")), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "sqrt\0"), LValue::NClosure(NClosure::new(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
                 _ => unimplemented!()
             };
             return [f].to_vec()
         })));
-        math_tab.hash.insert(LValue::String(InternString::intern(intern, "abs\0")), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "abs\0"), LValue::NClosure(NClosure::new(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.abs())),
                 _ => unimplemented!()
             };
             return [f].to_vec()
         })));
-        math_tab.hash.insert(LValue::String(InternString::intern(intern, "huge\0")), LValue::Closure(Closure::from_native(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "huge\0"), LValue::NClosure(NClosure::new(|f| {
             return [LValue::Number(Number(f64::INFINITY))].to_vec()
         })));
 
 
-        let math = (LValue::String(InternString::intern(intern, "math\0")), LValue::Table(Gc::new(math_tab)));
+        let math = (InternString::intern(intern, "math\0"), LValue::Table(Gc::new(math_tab)));
         Gc::new(Table {
             array: vec![],
             hash: HashMap::<_, _, InternedHasher>::from_iter(
                 vec![
-                (LValue::String(InternString::intern(intern, "print\0")), LValue::Closure(Closure::from_native(|v| {
+                (InternString::intern(intern, "print\0"), LValue::NClosure(NClosure::new(|v| {
                     println!("> {:?}", v);
                     vec![LValue::Nil]
                 }))),
@@ -937,9 +965,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let proto = unsafe { &(*clos.prototype).prototypes.items[bx as usize] };
                     debug!("{} {} {:?}", a, bx, proto);
                     // handle the MOVE/GETUPVALUE pseudoinstructions
-                    let fresh = Closure::from_lua(proto as *const _);
+                    let mut fresh = LClosure::new(proto as *const _);
                     {
-                        let mut fresh_clos = fresh.into_lua();
                         for upval in 0..proto.upval_count {
                             let pseudo = unsafe { (*clos.prototype).instructions.items[pc+upval as usize] };
                             let label = match pseudo.0.Opcode() {
@@ -953,7 +980,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                     // them - but only then.
                                     let fresh_upval = Upvalue::Open(b as usize);
                                     let fresh_use = Gc::new(fresh_upval.clone());
-                                    fresh_clos.upvalues.push(fresh_use.clone());
+                                    fresh.upvalues.push(fresh_use.clone());
                                     upvals.push((fresh_upval, vec![fresh_use]));
                                     "move"
                                 },
@@ -963,7 +990,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                     // scope. add ourselves to the existing
                                     // use list.
                                     let fresh_use = Gc::new(upvals[b as usize].clone().0);
-                                    fresh_clos.upvalues.push(fresh_use.clone());
+                                    fresh.upvalues.push(fresh_use.clone());
                                     upvals[b as usize].1.push(fresh_use);
                                     "getupvval"
                                 },
@@ -974,7 +1001,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         pc += proto.upval_count as usize;
                         //assert_eq!(proto.upval_count, 0);
                     }
-                    vals[base + a as usize] = LValue::Closure(fresh);
+                    vals[base + a as usize] = LValue::LClosure(Gc::new(fresh));
                 },
                 Opcode::CALL => {
                     let (a, b, c) = <CALL as Instruction>::Unpack::unpack(inst.0);
@@ -982,17 +1009,17 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let to_call = &vals[base + a as usize];
                     debug!("{:?}", to_call);
                     // push where to return to once we RETURN
-                    if let LValue::Closure(ref lcall @ Closure::Lua(ref lclos)) = to_call.clone() {
+                    if let LValue::LClosure(ref lclos) = to_call.clone() {
                         // record call stack: we say where to return to and where to put the values
                         callstack.push((clos.clone(), pc, base, base + a as usize));
-                        clos = lcall.clone();
-                        let next_stack = unsafe { (*lcall.into_lua().prototype).max_stack as usize };
+                        clos = Closure::Lua(lclos.clone());
+                        let next_stack = unsafe { (*lclos.borrow_mut().prototype).max_stack as usize };
                         base = base + a as usize + 1;
                         // push empty stack frame
                         vals.extend_from_slice(
                             vec![LValue::Nil; next_stack].as_slice());
                         pc = 0;
-                    } else if let LValue::Closure(Closure::Native(ncall)) = to_call {
+                    } else if let LValue::NClosure(ncall) = to_call {
                         let args = if b == 0 {
                             &vals[base + a as usize+1..]
                         } else {
