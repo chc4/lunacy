@@ -380,14 +380,14 @@ impl<'src, 'intern> Table<'src, 'intern> {
 }
 
 impl<'src, 'intern> Tc<Table<'src, 'intern>> {
-    pub fn get(&self, owner: &TCellOwner<TcOwner>, key: LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
+    pub fn get(&self, owner: &TCellOwner<TcOwner>, key: &LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
             LValue::Number(n) => Some(self.ro(owner).array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
             LValue::InternedString(ref s) => {
-                self.ro(owner).hash.get(&key).cloned()
+                self.ro(owner).hash.get(key).cloned()
             },
             LValue::OwnedString(ref s) => {
-                self.ro(owner).hash.get(&key).cloned()
+                self.ro(owner).hash.get(key).cloned()
             },
             _ => unimplemented!()
         }
@@ -560,7 +560,6 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    #[inline]
     pub fn numeric_op(&self, opcode: Opcode, right: Self) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match (self, &right) {
@@ -642,6 +641,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
 
 impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LValue<'src, 'intern>
 {
+    #[inline]
     fn from(value: &LConstant<'src, 'intern>) -> Self {
         match value {
             Constant::Nil => LValue::Nil,
@@ -895,14 +895,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, b, c) = <GETTABLE as Instruction>::Unpack::unpack(inst.0);
                     debug!("gettable {} {} {}", a, b, c);
                     let kc = match Self::rk(clos.ro(owner).prototype, base, &vals, c) {
-                        Ok(c) => LValue::from(c),
-                        Err(lv) => lv.clone(),
+                        Ok(c) => Cow::Owned(LValue::from(c)),
+                        Err(lv) => Cow::Borrowed(lv),
                     };
                     debug!("gettable {:?}", &kc);
                     let val_b = match &vals[base + b as usize] {
                         LValue::Table(tab) => {
                             debug!("table {:?}", tab);
-                            tab.get(owner, kc.clone()).ok_or_else(|| Err::<LValue, String>(format!("{:?}", kc))).unwrap()
+                            tab.get(owner, kc.deref()).ok_or_else(|| Err::<LValue, String>(format!("{:?}", kc))).unwrap()
                         },
                         x => unimplemented!("gettable on {:?}", x),
                     };
@@ -939,7 +939,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let kst = unsafe { &(*clos.ro(owner).prototype).constants.items[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
-                    vals[base + a as usize] = _G.get(owner, kst.into()).unwrap_or((&Constant::Nil).into()).clone();
+                    vals[base + a as usize] = _G.get(owner, &kst.into()).unwrap_or((&Constant::Nil).into()).clone();
                 },
                 opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);

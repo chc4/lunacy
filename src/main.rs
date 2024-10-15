@@ -38,17 +38,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         let bytecode = std::fs::read(bytecode_file)?;
         let header = chunk::header(&bytecode[..]);
         debug!("header {:?}", &header);
-        let mut intern_strings = internment::Arena::new();
+        let intern_strings = internment::Arena::new();
         if let Ok((rest, header)) = header {
             let header = header.globally_intern(&intern_strings);
-            let mut vm = Vm::new(&header.top_level as *const _);
+            let vm = Vm::new(&header.top_level as *const _);
             {
                 let _G = vm.global_env(&mut owner, &intern_strings);
-                let mut clos = vm::Tc::new(vm::LClosure::new(vm.top_level));
+                let clos = vm::Tc::new(vm::LClosure::new(vm.top_level));
                 let r_vals = vm.run(&mut owner, _G.clone(), clos, vec![])?;
-                if let Some(vm::LValue::LClosure(run_iter)) = _G.get(&owner, vm::InternString::intern(&intern_strings, "run_iter\0")) {
+                if let Some(vm::LValue::LClosure(run_iter)) = _G.get(&owner, &vm::InternString::intern(&intern_strings, "run_iter\0")) {
                     println!("> starting benchmark");
-                    vm.run(&mut owner, _G.clone(), run_iter, vec![vm::LValue::Number(vm::Number(TIMES))]);
+                    vm.run(&mut owner, _G.clone(), run_iter, vec![vm::LValue::Number(vm::Number(TIMES))]).unwrap();
                 }
                 dbg!(&r_vals);
             }
