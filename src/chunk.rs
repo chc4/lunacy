@@ -244,14 +244,21 @@ pub fn header(input: &[u8]) -> IResult<&[u8], Header<Constant<PackedString<'_>>>
 
 impl<'src> Constant<PackedString<'src>> {
     #[inline]
-    pub fn globally_intern<'intern>(self, intern: &'intern Arena<&'src [u8]>)
-        -> Constant<internment::ArenaIntern<'intern, &'src [u8]>>
+    pub fn globally_intern<'intern>(self, intern: &'intern Arena<(&'src [u8], u64)>)
+        -> Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>
     {
         match self {
             Constant::Nil => Constant::Nil,
             Constant::Bool(b) => Constant::Bool(b),
             Constant::Number(n) => Constant::Number(n),
-            Constant::String(s) => Constant::String(intern.intern(s.data)),
+            Constant::String(s) => Constant::String(
+                {
+                    use std::hash::{BuildHasher};
+                    let hash = rustc_hash::FxBuildHasher::default().hash_one(s.data);
+                    debug!("computed hash {} for {:?}", hash, s.data);
+                    intern.intern((s.data, hash))
+                }
+            ),
             _ => unimplemented!()
         }
     }
@@ -259,8 +266,8 @@ impl<'src> Constant<PackedString<'src>> {
 
 impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
     #[inline]
-    pub fn globally_intern<'intern>(self, intern: &'intern Arena<&'src [u8]>)
-        -> FunctionBlock<'src, Constant<internment::ArenaIntern<'intern, &'src [u8]>>>
+    pub fn globally_intern<'intern>(self, intern: &'intern Arena<(&'src [u8], u64)>)
+        -> FunctionBlock<'src, Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>>
     {
         let FunctionBlock {
             source,
@@ -277,11 +284,15 @@ impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
         } = self;
         // intern all the constants
         let PackedList::<_> { count: const_count, items: mut const_items } = constants;
-        let const_items = const_items.drain(..).map(|con| con.globally_intern(intern)).collect();
+        let const_items = const_items.drain(..).map(|con|
+            con.globally_intern(intern)
+        ).collect();
         // intern all the nested prototypes
         let PackedList::<Self> { count: proto_count, items: mut proto_items } = prototypes;
-        let proto_items = proto_items.drain(..).map(|proto| proto.globally_intern(intern)).collect();
-        let new_self = FunctionBlock::<'src, Constant<internment::ArenaIntern<'intern, &'src [u8]>>> {
+        let proto_items = proto_items.drain(..).map(|proto|
+            proto.globally_intern(intern)
+        ).collect();
+        let new_self = FunctionBlock {
             source,
             upval_count,
             param_count,
@@ -300,8 +311,8 @@ impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
 }
 
 impl<'src> Header<'src, Constant<PackedString<'src>>> {
-    pub fn globally_intern<'intern>(self, intern: &'intern Arena<&'src [u8]>)
-        -> Header<'src, Constant<internment::ArenaIntern<'intern, &'src [u8]>>>
+    pub fn globally_intern<'intern>(self, intern: &'intern Arena<(&'src [u8], u64)>)
+        -> Header<'src, Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>>
         where 'src: 'intern
     {
         Header::<'src, _> {

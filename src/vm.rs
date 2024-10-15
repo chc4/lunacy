@@ -2,17 +2,19 @@
 use crate::chunk::FunctionBlock;
 use core::fmt::Debug;
 use core::hash::Hash;
+use std::hash::BuildHasher;
 use std::{error::Error, rc::Rc, ops::Deref};
-use rustc_hash::FxHashMap;
 use std::cell::{RefCell, Cell};
 use std::borrow::Cow;
+use rustc_hash::FxBuildHasher;
 use crate::chunk::{InstBits, Constant};
+use std::collections::HashMap;
 
 use internment::ArenaIntern;
 
 use log::debug;
 
-type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, &'src [u8]>>;
+type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Number(pub f64);
@@ -228,17 +230,68 @@ impl<T> Deref for Gc<T> {
     }
 }
 
+#[derive(Default)]
+struct InternedHasher {
+    hasher: FxBuildHasher,
+}
+
+pub const fn type_eq<T: ?Sized, U: ?Sized>() -> bool {
+    // Helper trait. `VALUE` is false, except for the specialization of the
+    // case where `T == U`.
+    trait TypeEq<U: ?Sized> {
+        const VALUE: bool;
+    }
+
+    // Default implementation.
+    impl<T: ?Sized, U: ?Sized> TypeEq<U> for T {
+        default const VALUE: bool = false;
+    }
+
+    // Specialization for `T == U`.
+    impl<T: ?Sized> TypeEq<T> for T {
+        const VALUE: bool = true;
+    }
+
+    <T as TypeEq<U>>::VALUE
+}
+
+impl std::hash::BuildHasher for InternedHasher {
+    type Hasher = <FxBuildHasher as BuildHasher>::Hasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        self.hasher.build_hasher()
+    }
+
+    fn hash_one<T>(&self, x: T) -> u64
+        where T: Hash
+    {
+        debug!("hashing {:?}", std::any::type_name_of_val(&x));
+        if type_eq::<T, &LValue<'_, '_>>() {
+            let lv: &&LValue<'_, '_> = unsafe { std::mem::transmute(&x) };
+            match lv {
+                LValue::String(InternString::Interned(i)) => {
+                    debug!("interned hash {:?} {}", i.0, i.1);
+                    //assert_eq!(self.hasher.hash_one(i.0), i.1);
+                    return i.1
+                },
+                _ => (),
+            }
+        }
+        self.hasher.hash_one(x)
+    }
+}
+
 #[derive(Debug)]
 pub struct Table<'src, 'intern> {
     array: Vec<LValue<'src, 'intern>>,
-    hash: FxHashMap<LValue<'src, 'intern>, LValue<'src, 'intern>>,
+    hash: HashMap<LValue<'src, 'intern>, LValue<'src, 'intern>, InternedHasher>,
 }
 
 impl<'src, 'intern> Table<'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
             array: vec![LValue::Nil; array],
-            hash: FxHashMap::with_capacity_and_hasher(hash, Default::default())
+            hash: HashMap::with_capacity_and_hasher(hash, InternedHasher::default())
         }
     }
 }
@@ -247,7 +300,7 @@ impl<'src, 'intern> Gc<Table<'src, 'intern>> {
     fn get(&self, key: LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
             LValue::Number(n) => Some(self.borrow().array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
-            LValue::String(_) => {
+            LValue::String(ref s) => {
                 self.borrow().hash.get(&key).cloned()
             },
             _ => unimplemented!()
@@ -257,7 +310,7 @@ impl<'src, 'intern> Gc<Table<'src, 'intern>> {
     fn set(&mut self, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
         match key {
             LValue::Number(n) => unimplemented!(),
-            LValue::String(_) => {
+            LValue::String(ref s) => {
                 self.borrow_mut().hash.insert(key, value);
             },
             _ => unimplemented!()
@@ -267,7 +320,7 @@ impl<'src, 'intern> Gc<Table<'src, 'intern>> {
 
 #[derive(Hash, Clone)]
 pub enum InternString<'intern, 'src> {
-    Interned(ArenaIntern<'intern, &'src [u8]>),
+    Interned(ArenaIntern<'intern, (&'src [u8], u64)>),
     Owned(Rc<Vec<u8>>),
 }
 
@@ -275,7 +328,7 @@ impl<'intern, 'src> PartialEq for InternString<'intern, 'src> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (InternString::Interned(self_s), InternString::Interned(other_s)) => {
-                if self_s.deref().as_ptr() == other_s.deref().as_ptr() {
+                if self_s.deref().0.as_ptr() == other_s.deref().0.as_ptr() {
                     return true
                 } else {
                     return self_s == other_s
@@ -283,7 +336,7 @@ impl<'intern, 'src> PartialEq for InternString<'intern, 'src> {
             },
             (InternString::Interned(inter), InternString::Owned(own)) |
             (InternString::Owned(own), InternString::Interned(inter)) => {
-                *inter.deref() == own.as_slice()
+                inter.deref().0 == own.as_slice()
             },
             (InternString::Owned(self_o), InternString::Owned(other_o)) => {
                 self_o == other_o
@@ -296,7 +349,7 @@ impl<'intern, 'src> PartialOrd for InternString<'intern, 'src> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (InternString::Interned(self_s), InternString::Interned(other_s)) => {
-                if self_s.deref().as_ptr() == other_s.deref().as_ptr() {
+                if self_s.deref().0.as_ptr() == other_s.deref().0.as_ptr() {
                     self_s.partial_cmp(self_s)
                 } else {
                     self_s.partial_cmp(other_s)
@@ -304,7 +357,7 @@ impl<'intern, 'src> PartialOrd for InternString<'intern, 'src> {
             },
             (InternString::Interned(inter), InternString::Owned(own)) |
             (InternString::Owned(own), InternString::Interned(inter)) => {
-                inter.partial_cmp(own.as_slice())
+                inter.0.partial_cmp(own.as_slice())
             },
             (InternString::Owned(self_o), InternString::Owned(other_o)) => {
                 self_o.partial_cmp(other_o)
@@ -318,18 +371,21 @@ impl<'intern, 'src> Eq for InternString<'intern, 'src> { }
 impl<'intern, 'src> Debug for InternString<'intern, 'src> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InternString::Interned(i) => write!(f, "{}", String::from_utf8_lossy(i)),
+            InternString::Interned(i) => write!(f, "{}", String::from_utf8_lossy(i.0)),
             InternString::Owned(o) => write!(f, "{}", String::from_utf8_lossy(o)),
         }
     }
 }
 
 impl<'intern, 'src> InternString<'intern, 'src> {
-    fn intern<S: Into<String>>(intern: &'intern internment::Arena<&'src [u8]>, s: S) -> Self {
+    fn intern<S: Into<String>>(intern: &'intern internment::Arena<(&'src [u8], u64)>, s: S) -> Self {
         // this is stupid: we probably actually need to intern Cow<'src, [u8]>
         let s: String = s.into();
         let static_s: &'static [u8] = Box::leak(s.into_boxed_str().into());
-        InternString::Interned(intern.intern(static_s.as_ref()))
+        use std::hash::BuildHasher;
+        let hash = FxBuildHasher::default().hash_one(static_s);
+        debug!("interning hash {} for {:?}", hash, static_s);
+        InternString::Interned(intern.intern((static_s.as_ref(), hash)))
     }
 }
 
@@ -338,7 +394,7 @@ impl<'intern, 'src> Deref for InternString<'intern, 'src> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            InternString::Interned(i) => i.deref(),
+            InternString::Interned(i) => i.deref().0,
             InternString::Owned(o) => o.as_ref(),
         }
     }
@@ -567,7 +623,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         Self { top_level }
     }
 
-    pub fn global_env(&self, intern: &'intern internment::Arena<&'src [u8]>) -> Gc<Table<'src, 'intern>> {
+    pub fn global_env(&self, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Gc<Table<'src, 'intern>> {
         let mut math_tab = Table::new(0, 0);
         math_tab.hash.insert(LValue::String(InternString::intern(intern, "floor\0")), LValue::Closure(Closure::from_native(|f| {
             let f = match f {
@@ -598,7 +654,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let math = (LValue::String(InternString::intern(intern, "math\0")), LValue::Table(Gc::new(math_tab)));
         Gc::new(Table {
             array: vec![],
-            hash: FxHashMap::from_iter(
+            hash: HashMap::<_, _, InternedHasher>::from_iter(
                 vec![
                 (LValue::String(InternString::intern(intern, "print\0")), LValue::Closure(Closure::from_native(|v| {
                     println!("> {:?}", v);

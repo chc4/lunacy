@@ -1,4 +1,4 @@
-#![feature(trait_alias)]
+#![feature(trait_alias, specialization)]
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::Read;
