@@ -695,14 +695,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
     }
 
     fn rk<'exec>(proto: *const FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'exec Vec<LValue<'src, 'intern>>, r: u16)
-        -> Result<&'exec LConstant<'src, 'intern>, LValue<'src, 'intern>>
+        -> Result<&'exec LConstant<'src, 'intern>, &'exec LValue<'src, 'intern>>
     {
         if (r & 0x100)!=0 {
             let r_const = r & (0xff);
             debug!("rk {}", r_const);
             Ok(unsafe { &(*proto).constants.items[r_const as usize] })
         } else {
-            Err(vals[base + r as usize].clone())
+            Err(&vals[base + r as usize])
         }
     }
 
@@ -800,7 +800,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let clos = clos.into_lua();
                     let kc = match Self::rk(clos.prototype, base, &vals, c) {
                         Ok(c) => LValue::from(c),
-                        Err(lv) => lv,
+                        Err(lv) => lv.clone(),
                     };
                     debug!("gettable {:?}", &kc);
                     let val_b = match &vals[base + b as usize] {
@@ -819,12 +819,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let clos = clos.into_lua();
                     let kb = match Self::rk(clos.prototype, base, &vals, b) {
                         Ok(b) => b.into(),
-                        Err(lv) => lv,
+                        Err(lv) => lv.clone(),
                     };
                     debug!("settable {:?}", &kb);
                     let kc = match Self::rk(clos.prototype, base, &vals, c) {
                         Ok(c) => c.into(),
-                        Err(lv) => lv,
+                        Err(lv) => lv.clone(),
                     };
                     match &mut vals[base + a as usize] {
                         LValue::Table(tab) => {
@@ -862,11 +862,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         },
 
                         (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).compare(opcode, dyn_c).unwrap()
+                            LValue::from(const_b).compare(opcode, dyn_c.clone()).unwrap()
                         },
 
                         (_, Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b.compare(opcode, dyn_c).unwrap()
+                            dyn_b.compare(opcode, dyn_c.clone()).unwrap()
                         },
 
                         _ => panic!()
@@ -899,7 +899,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             LValue::Number(Number(const_b.0.powf(const_c.0))),
 
                         (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).numeric_op(opcode, dyn_c.into())?
+                            LValue::from(const_b).numeric_op(opcode, dyn_c.clone().into())?
                         },
 
                         (_, Err(dyn_b), Ok(const_c)) => {
@@ -907,7 +907,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         },
 
                         (_, Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b.numeric_op(opcode, dyn_c.into())?
+                            dyn_b.numeric_op(opcode, dyn_c.clone().into())?
                         },
 
                         _ => unimplemented!(),
