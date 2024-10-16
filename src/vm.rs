@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 use core::fmt::Debug;
 use core::hash::Hash;
+use std::ops::{DerefMut, Index, IndexMut};
 use crate::chunk::FunctionBlock;
 use crate::chunk::{InstBits, Constant};
 use rustc_hash::FxBuildHasher;
@@ -228,10 +229,69 @@ impl<T> Clone for FakeRc<T> {
 }
 
 // For testing RC overhead
-#[cfg(skip_rc)]
+#[cfg(feature = "skip_rc")]
 type Rc<T> = FakeRc<T>;
-#[cfg(not(skip_rc))]
+#[cfg(not(feature = "skip_rc"))]
 use std::rc::Rc;
+
+// For testing Vec bounds checking overhead
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
+pub struct UnsafeVec<T> {
+    vec: Vec<T>,
+}
+
+impl<T> From<Vec<T>> for UnsafeVec<T> {
+    fn from(value: Vec<T>) -> Self {
+        UnsafeVec { vec: value }
+    }
+}
+
+impl<T> Deref for UnsafeVec<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vec
+    }
+}
+
+impl<T> DerefMut for UnsafeVec<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.vec
+    }
+}
+
+
+impl<T> IntoIterator for UnsafeVec<T> {
+    type Item = T;
+
+    type IntoIter = <Vec<T> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.vec.into_iter()
+    }
+}
+
+impl<T, Idx: std::slice::SliceIndex<[T]>> Index<Idx> for UnsafeVec<T> {
+    type Output = Idx::Output;
+
+    fn index(&self, index: Idx) -> &Self::Output {
+        // safety: haha
+        unsafe { self.vec.get_unchecked(index) }
+    }
+}
+
+impl<T, Idx: std::slice::SliceIndex<[T]>> IndexMut<Idx> for UnsafeVec<T> {
+    fn index_mut(&mut self, index: Idx) -> &mut <Self as Index<Idx>>::Output {
+        // safety: smile emoji
+        unsafe { self.vec.get_unchecked_mut(index) }
+    }
+}
+
+#[cfg(feature = "skip_vec")]
+type FVec<T> = UnsafeVec<T>;
+#[cfg(not(feature = "skip_vec"))]
+type FVec<T> = Vec<T>;
+
 
 #[derive(Debug)]
 pub struct Gc<T>(Rc<RefCell<T>>);
@@ -366,14 +426,14 @@ impl std::hash::BuildHasher for InternedHasher {
 
 #[derive(Debug)]
 pub struct Table<'src, 'intern> {
-    array: Vec<LValue<'src, 'intern>>,
+    array: FVec<LValue<'src, 'intern>>,
     hash: HashMap<LValue<'src, 'intern>, LValue<'src, 'intern>, InternedHasher>,
 }
 
 impl<'src, 'intern> Table<'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
-            array: vec![LValue::Nil; array],
+            array: vec![LValue::Nil; array].into(),
             hash: HashMap::with_capacity_and_hasher(hash, InternedHasher::default())
         }
     }
@@ -417,7 +477,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
 #[derive(Hash, Clone)]
 pub enum InternString<'intern, 'src> {
     Interned(ArenaIntern<'intern, (&'src [u8], u64)>),
-    Owned(Rc<Vec<u8>>),
+    Owned(Rc<FVec<u8>>),
 }
 
 impl<'intern, 'src> PartialEq for InternString<'intern, 'src> {
@@ -503,7 +563,7 @@ pub enum LValue<'src, 'intern> {
     Bool(bool),
     Number(Number),
     InternedString(ArenaIntern<'intern, (&'src [u8], u64)>),
-    OwnedString(Rc<Vec<u8>>),
+    OwnedString(Rc<FVec<u8>>),
     LClosure(Tc<LClosure<'src, 'intern>>),
     NClosure(Tc<NClosure>),
     Table(Tc<Table<'src, 'intern>>),
@@ -667,7 +727,7 @@ enum Upvalue<'src, 'intern> {
 pub struct LClosure<'src, 'intern> {
     prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
-    upvalues: Vec<Gc<Upvalue<'src, 'intern>>>,
+    upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
 }
 
 impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
@@ -676,7 +736,7 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
     }
 }
 
-trait NativeFunc = for<'a, 'src, 'intern> FnMut(&'a [LValue<'src, 'intern>]) -> Vec<LValue<'src, 'intern>>;
+trait NativeFunc = for<'a, 'src, 'intern> FnMut(&'a [LValue<'src, 'intern>]) -> FVec<LValue<'src, 'intern>>;
 struct NClosure {
     native: Box<dyn NativeFunc>,
 }
@@ -691,7 +751,7 @@ impl<'src, 'intern> LClosure<'src, 'intern> {
     pub fn new(prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
         Self {
             prototype,
-            upvalues: vec![],
+            upvalues: vec![].into(),
         }
     }
 }
@@ -728,24 +788,24 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
                 _ => unimplemented!()
             };
-            return [f].to_vec()
+            return [f].to_vec().into()
         })));
         math_tab.hash.insert(InternString::intern(intern, "sqrt\0"), LValue::NClosure(NClosure::new(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
                 _ => unimplemented!()
             };
-            return [f].to_vec()
+            return [f].to_vec().into()
         })));
         math_tab.hash.insert(InternString::intern(intern, "abs\0"), LValue::NClosure(NClosure::new(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.abs())),
                 _ => unimplemented!()
             };
-            return [f].to_vec()
+            return [f].to_vec().into()
         })));
         math_tab.hash.insert(InternString::intern(intern, "huge\0"), LValue::NClosure(NClosure::new(|f| {
-            return [LValue::Number(Number(f64::INFINITY))].to_vec()
+            return [LValue::Number(Number(f64::INFINITY))].to_vec().into()
         })));
         math_tab.hash.insert(InternString::intern(intern, "pi\0"), LValue::Number(Number(std::f64::consts::PI)));
         math_tab.hash.insert(InternString::intern(intern, "sin\0"), LValue::NClosure(NClosure::new(|f| {
@@ -753,32 +813,32 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sin())),
                 _ => unimplemented!()
             };
-            return [f].to_vec()
+            return [f].to_vec().into()
         })));
         math_tab.hash.insert(InternString::intern(intern, "cos\0"), LValue::NClosure(NClosure::new(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.cos())),
                 _ => unimplemented!()
             };
-            return [f].to_vec()
+            return [f].to_vec().into()
         })));
         math_tab.hash.insert(InternString::intern(intern, "tan\0"), LValue::NClosure(NClosure::new(|f| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.tan())),
                 _ => unimplemented!()
             };
-            return [f].to_vec()
+            return [f].to_vec().into()
         })));
 
 
         let math = (InternString::intern(intern, "math\0"), LValue::Table(Tc::new(math_tab)));
         Tc::new(Table {
-            array: vec![],
+            array: vec![].into(),
             hash: HashMap::<_, _, InternedHasher>::from_iter(
                 vec![
                 (InternString::intern(intern, "print\0"), LValue::NClosure(NClosure::new(|v| {
                     println!("> {:?}", v);
-                    vec![LValue::Nil]
+                    vec![LValue::Nil].into()
                 }))),
                 math,
                 ].drain(..)
@@ -786,7 +846,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         })
     }
 
-    fn rk<'exec>(proto: *const FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'exec Vec<LValue<'src, 'intern>>, r: u16)
+    fn rk<'exec>(proto: *const FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'exec FVec<LValue<'src, 'intern>>, r: u16)
         -> Result<&'exec LConstant<'src, 'intern>, &'exec LValue<'src, 'intern>>
     {
         if (r & 0x100)!=0 {
@@ -799,10 +859,10 @@ impl<'src, 'intern> Vm<'src, 'intern> {
     }
 
     fn close_upvalues<'exec>(&self,
-        upvals: &'exec mut Vec<(Upvalue<'src, 'intern>, Vec<Gc<Upvalue<'src, 'intern>>>)>,
-        vals: &'exec Vec<LValue<'src, 'intern>>)
+        upvals: &'exec mut FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
+        vals: &'exec FVec<LValue<'src, 'intern>>)
     {
-        for upval in upvals {
+        for upval in upvals.iter() {
             let idx = match &upval.0 {
                 Upvalue::Open(o) => o,
                 Upvalue::Closed(u) => panic!(), // we shouldn't have any closed upvals
@@ -810,7 +870,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             // migrate all the stack references to be GC references, since we're
             // going to be removing it from the stack
             let closed = Gc::new(vals[*idx].clone());
-            for up_use in &upval.1 {
+            for up_use in upval.1.iter() {
                 up_use.deref().replace(Upvalue::Closed(closed.clone()));
             }
         }
@@ -820,21 +880,21 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         owner: &mut TCellOwner<TcOwner>,
         mut _G: Tc<Table<'src, 'intern>>,
         mut clos: Tc<LClosure<'src, 'intern>>,
-        mut args: Vec<LValue<'src, 'intern>>,
+        mut args: FVec<LValue<'src, 'intern>>,
     )
-        -> Result<Vec<LValue<'src, 'intern>>, Box<dyn Error>>
+        -> Result<FVec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LValue::Nil);
         let mut vals = args;
-        let mut upvals: Vec<(Upvalue, Vec<Gc<Upvalue>>)> = vec![];
+        let mut upvals: FVec<(Upvalue, FVec<Gc<Upvalue>>)> = vec![].into();
         let mut base = 0;
         let mut pc = 0;
         // we need to track where to return to, along with the base pointer and where to put return
         // values
-        let mut callstack: Vec<(Tc<LClosure>, usize, usize, usize)> = vec![];
+        let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize)> = vec![].into();
         let r_vals = 'int: loop {
             let inst = unsafe { clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc] };
             pc += 1;
@@ -1075,7 +1135,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                     let fresh_upval = Upvalue::Open(b as usize);
                                     let fresh_use = Gc::new(fresh_upval.clone());
                                     fresh.upvalues.push(fresh_use.clone());
-                                    upvals.push((fresh_upval, vec![fresh_use]));
+                                    upvals.push((fresh_upval, vec![fresh_use].into()));
                                     "move"
                                 },
                                 Opcode::GETUPVAL => {
@@ -1139,26 +1199,26 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     // we're going to be removing this frame, so close any open
                     // upvalues.
                     self.close_upvalues(&mut upvals, &vals);
-                    upvals = vec![];
+                    upvals = vec![].into();
 
                     let (a, b) = <RETURN as Instruction>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
                     let mut r_count = 0 as usize;
-                    let mut r_vals = if b == 1 {
+                    let mut r_vals: FVec<_> = if b == 1 {
                         // no return values
-                        vec![]
+                        vec![].into()
                     } else if b >= 2 {
                         // there are b-1 return values from R(A) onwards
                         r_count = b as usize-1;
                         let r_vals = &vals[base + a as usize..(base + a as usize + r_count as usize)];
                         debug!("{:?}", r_vals);
-                        Vec::from(r_vals)
+                        Vec::from(r_vals).into()
                     } else if b == 0 {
                         // return all values from R(A) to the ToS
                         let r_vals = &vals[base + a as usize..];
                         r_count = r_vals.len() as usize;
                         debug!("{:?}", r_vals);
-                        Vec::from(r_vals)
+                        Vec::from(r_vals).into()
                     } else {
                         unreachable!()
                     };
