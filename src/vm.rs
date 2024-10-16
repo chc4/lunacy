@@ -620,67 +620,27 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn numeric_op(&self, opcode: Opcode, right: Self) -> Result<LValue<'src, 'intern>, String> {
-        // TODO: metamethods
-        match (self, &right) {
-            (LValue::Nil, LValue::Nil) => {
-                return Err("attempt to compare nil".into())
-            },
-            (LValue::Table(left_tab), LValue::Table(right_tab)) => {
-                unimplemented!("metamethod")
-            },
-            (LValue::LClosure(left_c), LValue::LClosure(right_c)) => {
-                return Err("attempt to compare functions".into())
-            },
-            (LValue::NClosure(left_c), LValue::NClosure(right_c)) => {
-                return Err("attempt to compare functions".into())
-            },
-            _ => (),
-        }
-
-        match opcode {
-            Opcode::ADD => {
-                match (self, &right) {
-                    (LValue::Number(left_n), LValue::Number(right_n)) =>
+    #[inline(always)]
+    pub fn numeric_op(&self, opcode: Opcode, right: &Self) -> Result<LValue<'src, 'intern>, String> {
+        match (self, right) {
+            (LValue::Number(left_n), LValue::Number(right_n)) => {
+                match opcode {
+                    Opcode::ADD =>
                         Ok(LValue::Number(Number(left_n.0 + right_n.0))),
-                    _ => unimplemented!(),
-                }
-            },
-            Opcode::SUB => {
-                match (self, &right) {
-                    (LValue::Number(left_n), LValue::Number(right_n)) =>
+                    Opcode::SUB =>
                         Ok(LValue::Number(Number(left_n.0 - right_n.0))),
-                    _ => unimplemented!(),
-                }
-            },
-            Opcode::MUL => {
-                match (self, &right) {
-                    (LValue::Number(left_n), LValue::Number(right_n)) =>
+                    Opcode::MUL =>
                         Ok(LValue::Number(Number(left_n.0 * right_n.0))),
-                    x => unimplemented!(),
-                }
-            },
-            Opcode::DIV => {
-                match (self, &right) {
-                    (LValue::Number(left_n), LValue::Number(right_n)) =>
+                    Opcode::DIV =>
                         Ok(LValue::Number(Number(left_n.0 / right_n.0))),
-                    _ => unimplemented!(),
-                }
-            },
-            Opcode::MOD => {
-                match (self, &right) {
-                    (LValue::Number(left_n), LValue::Number(right_n)) =>
+                    Opcode::MOD =>
                         Ok(LValue::Number(Number(left_n.0 % right_n.0))),
-                    _ => unimplemented!(),
-                }
-            },
-            Opcode::POW => {
-                match (self, &right) {
-                    (LValue::Number(left_n), LValue::Number(right_n)) =>
+                    Opcode::POW =>
                         Ok(LValue::Number(Number(left_n.0.powf(right_n.0)))),
-                    _ => unimplemented!(),
+                    _ => unsafe { std::hint::unreachable_unchecked() },
                 }
             },
+            // TODO: metamethods and errors
             _ => unimplemented!(),
         }
     }
@@ -1054,15 +1014,15 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             LValue::Number(Number(const_b.0.powf(const_c.0))),
 
                         (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).numeric_op(opcode, dyn_c.clone().into())?
+                            LValue::from(const_b).numeric_op(opcode, dyn_c)?
                         },
 
                         (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.numeric_op(opcode, const_c.into())?
+                            dyn_b.numeric_op(opcode, &const_c.into())?
                         },
 
                         (_, Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b.numeric_op(opcode, dyn_c.clone().into())?
+                            dyn_b.numeric_op(opcode, dyn_c)?
                         },
 
                         _ => unimplemented!(),
@@ -1088,14 +1048,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, sbx) = <FORPREP as Instruction>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, sbx);
                     vals[base + a as usize] =
-                        vals[base + a as usize].numeric_op(Opcode::SUB, vals[base + a as usize + 2].clone()).unwrap();
+                        vals[base + a as usize].numeric_op(Opcode::SUB, &vals[base + a as usize + 2]).unwrap();
                     pc += sbx as usize;
                 },
                 Opcode::FORLOOP => {
                     let (a, sbx) = <FORLOOP as Instruction>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, sbx);
-                    let step = vals[base + a as usize + 2].clone();
-                    let idx = vals[base + a as usize].numeric_op(Opcode::ADD, step.clone()).unwrap();
+                    let step = &vals[base + a as usize + 2];
+                    let idx = vals[base + a as usize].numeric_op(Opcode::ADD, step).unwrap();
                     let limit = vals[base + a as usize + 1].clone();
                     let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0))))? {
                         limit.compare(Opcode::LE, idx.clone())
