@@ -3,7 +3,7 @@ use typewit::{MakeTypeWitness, TypeEq, HasTypeWitness};
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::borrow::Borrow;
 
 struct Userdata {
@@ -127,7 +127,7 @@ fn increment_r<'a>(rval: RValue<'a>) -> RValue<'a> {
 
 type Idx = u8;
 type Displacement = i16;
-type Thunk = dyn for<'a> FnMut(&'a mut Vm);
+type Thunk = dyn for<'a> FnMut(&'a mut Vm)->Vec<RLRef>;
 #[derive(Clone)]
 struct ThunkRef(Rc<RefCell<Thunk>>);
 impl std::fmt::Debug for ThunkRef {
@@ -149,17 +149,23 @@ enum Operation {
     Ret,
 }
 
+type Version = u16;
+type Block = u16;
 struct Vm {
     bytecode: Vec<Operation>,
     in_progress: Option<Vec<Operation>>,
-    thunks: Vec<Box<Thunk>>,
 
+    blocks: Vec<Vec<Operation>>,
+    // Function PC -> [Types] -> (Parent version, Block index)
+    versions: HashMap<u32, HashMap<Vec<RLRef>, (Version, Block)>>,
     rl_int: RLRef,
 }
 
 impl Vm {
     fn new(bytecode: Vec<Operation>) -> Self {
-        Self { bytecode, in_progress: None, thunks: vec![],
+        Self { bytecode, in_progress: None,
+            blocks: vec![],
+            versions: Default::default(),
             rl_int: RLRef(Rc::new(LValue::U32(TypeEq::NEW))),
         }
     }
@@ -181,9 +187,49 @@ impl Vm {
         }
     }
 
-    fn specialize(&mut self, idx: Idx, ty: RLRef, left: Box<Thunk>, right: Box<Thunk>) {
-        self.thunks.push(left);
-        self.thunks.push(right);
+    fn specialize<'a>(&mut self,
+                      vals: &Vec<RValue<'a>>,
+                      val_types: &mut Vec<RLRef>,
+                      idx: Idx, ty: RLRef, left: ThunkRef, right: ThunkRef) -> bool {
+        // Try to statically typecheck
+        if val_types[idx as usize].0.compatible(&ty) {
+            return true;
+        }
+        // Have to emit a dynamic typecheck. Semantically we emit a typecheck
+        // plus thunks for success and failure. Practically we can immediately
+        // do the typecheck and force a thunk, since we're already executing:
+        // this allows us to fastpath whichever type we actually have as the
+        // straightline code.
+        let runtime_ty = self.typeof_(&vals[idx as usize]);
+        if runtime_ty.0.compatible(&ty) {
+            // Dynamic typecheck succeeded
+            self.in_progress.as_mut().unwrap().push(
+                Operation::Typecheck(idx, ty.clone()));
+            self.in_progress.as_mut().unwrap().push(
+                Operation::Thunk(ThunkRef(Rc::new(RefCell::new(|vm: &mut Vm| {
+                    // hit the dynamic typecheck failure slowpath
+                    panic!();
+                }))))
+            );
+            // We know the type now, so can specialize and keep running
+            val_types[idx as usize] = ty.clone();
+            return true;
+        } else {
+            // Dynamic typecheck failed
+            self.in_progress.as_mut().unwrap().push(
+                Operation::NTypecheck(idx, ty.clone()));
+            let mut val_types = Cell::new(Some(val_types.clone()));
+            self.in_progress.as_mut().unwrap().push(
+                Operation::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Vm| {
+                    // we saw the type that our initial guard was for, and so can
+                    // specialize
+                    let mut val_types = val_types.take().unwrap();
+                    val_types[idx as usize] = ty.clone();
+                    val_types
+                }))))
+            );
+            return false;
+        }
     }
 
     // SPEC is a const time parameter, so that we can write the same interpreter
@@ -207,42 +253,38 @@ impl Vm {
                     Operation::Add__(ret, left, right) => {
                         if SPEC {
                             // Try to specialize on left
-                            let ty_left = self.typeof_(&vals[left as usize]);
-                            if !val_types[left as usize].0.compatible(&ty_left) {
-                                // Don't statically know the type check would succeed,
-                                // and need to emit a runtime one.
-                                // This is the same as if we unconditionally emitted
-                                // a typecheck + two thunks and then immediately
-                                // forced one: there's no reason to do that, and
-                                // resolving the typecheck immediately allows us
-                                // to fastpath the seen type for straightline code.
-                                if ty_left.0.compatible(&self.rl_int) {
-                                    // Runtime check succeeded, fastpath int
-                                    self.in_progress.as_mut().unwrap().push(
-                                        Operation::Typecheck(left, self.rl_int.clone()));
-                                    self.in_progress.as_mut().unwrap().push(
-                                        Operation::Thunk(ThunkRef(Rc::new(RefCell::new(|vm: &mut Vm| {
-                                        // failed type check
-                                        // TODO; userdata specialization
-                                        panic!()
-                                    })))));
-                                    val_types[left as usize] = ty_left;
-                                    // succeeded type check
-                                } else {
-                                    // Runtime check failed, fastpath other
-                                    self.in_progress.as_mut().unwrap().push(
-                                        Operation::NTypecheck(left, self.rl_int.clone()));
-                                    // TODO: userdata specialization
-                                    panic!();
-                                }
+                            if self.specialize(&vals, &mut val_types, left, self.rl_int.clone(),
+                                ThunkRef(Rc::new(RefCell::new(|vm: &mut Vm| {
+                                    panic!("force thunk success");
+                                }))),
+                                ThunkRef(Rc::new(RefCell::new(|vm: &mut Vm| {
+                                    panic!("force thunk failure");
+                                }))),
+                            ) {
+                                inst = Operation::AddInt_(ret, left, right);
+                                continue 'step;
                             }
-
-                            inst = Operation::AddInt_(ret, left, right);
-                            continue 'step;
+                            // TODO: specialize userdata
                         }
                         vals[ret as usize] = add_0(vals[left as usize].clone(), vals[right as usize].clone());
                     },
                     Operation::AddInt_(ret, left, right) => {
+                        if SPEC {
+                            // Try to specialize on right
+                            if self.specialize(&vals, &mut val_types, right, self.rl_int.clone(),
+                                ThunkRef(Rc::new(RefCell::new(|vm: &mut Vm| {
+                                    panic!("force thunk success");
+                                }))),
+                                ThunkRef(Rc::new(RefCell::new(|vm: &mut Vm| {
+                                    panic!("force thunk failure");
+                                }))),
+                            ) {
+                                inst = Operation::AddIntInt(ret, left, right);
+                                continue 'step;
+                            }
+                            // TODO: specialize userdata
+                        }
+
                         vals[ret as usize] = add_1(
                             unsafe { vals[left as usize].assume_int() },
                             vals[right as usize].clone()
