@@ -140,7 +140,10 @@ enum Operation {
     Add__(Idx, Idx, Idx),
     AddInt_(Idx, Idx, Idx),
     AddIntInt(Idx, Idx, Idx),
+    // if typeof(idx) == ty, pc+=1
     Typecheck(Idx, RLRef),
+    // if typeof(idx) != ty, pc+=1
+    NTypecheck(Idx, RLRef),
     Thunk(ThunkRef),
     Jump(Displacement),
     Ret,
@@ -150,11 +153,15 @@ struct Vm {
     bytecode: Vec<Operation>,
     in_progress: Option<Vec<Operation>>,
     thunks: Vec<Box<Thunk>>,
+
+    rl_int: RLRef,
 }
 
 impl Vm {
     fn new(bytecode: Vec<Operation>) -> Self {
-        Self { bytecode, in_progress: None, thunks: vec![] }
+        Self { bytecode, in_progress: None, thunks: vec![],
+            rl_int: RLRef(Rc::new(LValue::U32(TypeEq::NEW))),
+        }
     }
 
     fn infer<'a, 'b>(&mut self, vals: Vec<RValue<'a>>) -> Vec<Box<dyn RLValue + 'static>> {
@@ -185,10 +192,9 @@ impl Vm {
     // of versions for a block, in order to prevent exponential blow-up, and also
     // in order because we want to not specialize blocks until we hit a seen threshold
     // (in order to tweak startup JIT tradeoffs).
-    fn run<'a, const SPEC: bool>(&mut self, mut vals: Vec<RValue<'a>>) -> Vec<RValue<'a>> {
+    fn run<'a, const SPEC: bool>(&mut self, mut vals: Vec<RValue<'a>>, mut val_types: Vec<RLRef>) -> Vec<RValue<'a>> {
         let mut pc = 0;
         // We don't know any types initially
-        let mut val_types = vec![RLRef(Rc::new(())); vals.len()];
         dbg!(&val_types);
         if SPEC {
             self.in_progress = Some(vec![]);
@@ -203,24 +209,34 @@ impl Vm {
                             // Try to specialize on left
                             let ty_left = self.typeof_(&vals[left as usize]);
                             if !val_types[left as usize].0.compatible(&ty_left) {
-                                dbg!(&ty_left);
-                                self.in_progress.as_mut().unwrap().push(
-                                    Operation::Typecheck(left, ty_left.clone()));
-                                self.in_progress.as_mut().unwrap().push(
-                                    Operation::Thunk(ThunkRef(Rc::new(RefCell::new(|vm: &mut Vm| {
-                                    // failed type check
-                                    // emit run::<SPEC=true>(pc) to specialize the block again, and patch
-                                    // this thunk with a jump to the new block. this means that we'd
-                                    // specialize for each new type we see immediately: we know the
-                                    // non-thunk block is hot enough to specialize, and don't record number
-                                    // of times we see a type, so there's limited reason to try and delay
-                                    // specializing again.
-                                    panic!()
-                                })))));
+                                // Don't statically know the type check would succeed,
+                                // and need to emit a runtime one.
+                                // This is the same as if we unconditionally emitted
+                                // a typecheck + two thunks and then immediately
+                                // forced one: there's no reason to do that, and
+                                // resolving the typecheck immediately allows us
+                                // to fastpath the seen type for straightline code.
+                                if ty_left.0.compatible(&self.rl_int) {
+                                    // Runtime check succeeded, fastpath int
+                                    self.in_progress.as_mut().unwrap().push(
+                                        Operation::Typecheck(left, self.rl_int.clone()));
+                                    self.in_progress.as_mut().unwrap().push(
+                                        Operation::Thunk(ThunkRef(Rc::new(RefCell::new(|vm: &mut Vm| {
+                                        // failed type check
+                                        // TODO; userdata specialization
+                                        panic!()
+                                    })))));
+                                    val_types[left as usize] = ty_left;
+                                    // succeeded type check
+                                } else {
+                                    // Runtime check failed, fastpath other
+                                    self.in_progress.as_mut().unwrap().push(
+                                        Operation::NTypecheck(left, self.rl_int.clone()));
+                                    // TODO: userdata specialization
+                                    panic!();
+                                }
                             }
-                            // succeeded type check
-                            // continue execution with AddInt_ since we know the type
-                            val_types[left as usize] = ty_left;
+
                             inst = Operation::AddInt_(ret, left, right);
                             continue 'step;
                         }
@@ -239,6 +255,9 @@ impl Vm {
                         );
                     },
                     Operation::Typecheck(idx, ty) => {
+                        panic!()
+                    },
+                    Operation::NTypecheck(idx, ty) => {
                         panic!()
                     },
                     Operation::Ret => {
@@ -269,6 +288,10 @@ impl Vm {
                 break 'step;
             }
         }
+        if SPEC {
+            // we recorded a block up until an exit. finalize the in-progress
+            // specialized block, and save it off as a version.
+        }
         return vals
     }
 }
@@ -283,8 +306,10 @@ fn main() {
     ];
 
     let mut vm = Vm::new(bytecode);
-    dbg!(vm.run::<false>(vec![RValue::Int(0), RValue::Int(1), RValue::Table(Default::default())]));
-    dbg!(vm.run::<true>(vec![RValue::Int(0), RValue::Int(1), RValue::Table(Default::default())]));
+    let vals = vec![RValue::Int(0), RValue::Int(1), RValue::Table(Default::default())];
+    let mut val_types = vec![RLRef(Rc::new(())); vals.len()];
+    dbg!(vm.run::<false>(vals.clone(), val_types.clone()));
+    dbg!(vm.run::<true>(vals, val_types));
 
     dbg!(&vm.in_progress);
 
