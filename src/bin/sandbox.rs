@@ -250,9 +250,10 @@ impl Vm {
 
     fn compatible_block(&self, pc: Pc, val_types: &Vec<RLRef>, op: Operation) -> Option<Block> {
         if let Some(versions) = self.versions.get(&(pc as usize)) {
-            dbg!(&val_types, &versions);
+            dbg!(&val_types, &op);
             for (version, block) in versions {
-                if val_types == version && self.bytecode[*block as usize] == op {
+                dbg!(version, &self.bytecode.get(*block as usize));
+                if val_types == version && ((self.bytecode.get(*block as usize) == Some(&op)) || op == Operation::Nop) {
                     return Some(*block)
                 }
             }
@@ -264,11 +265,11 @@ impl Vm {
                       pc: Pc,
                       vals: &Vec<RValue<'a>>,
                       val_types: &mut Vec<RLRef>,
-                      idx: Idx, ty: RLRef, left: impl Into<ThunkRef>, right: impl Into<ThunkRef>) -> Option<Vec<RLRef>> {
+                      idx: Idx, ty: RLRef, left: impl Into<ThunkRef>, right: impl Into<ThunkRef>) -> (Option<Pc>, Option<Vec<RLRef>>) {
         // If our type statically already matches, then we can use the right thunk
         // always.
         if val_types[idx as usize].0.compatible(&ty) {
-            return Some(val_types.clone())
+            return (None, Some(val_types.clone()))
         }
 
         // Dynamic check to see which thunk we'll actually take, and then bias
@@ -279,7 +280,9 @@ impl Vm {
             let (left_pc, left_ty, left_op) = (left.into().0.borrow_mut())(self);
             dbg!(&left_pc, &left_ty, &left_op);
             if let Some(existing_left) = self.compatible_block(left_pc, &left_ty, left_op) {
-                panic!("existing left compatible");
+                self.in_progress.as_mut().unwrap().push(
+                    Operation::Jump(existing_left as i16));
+                return (Some(existing_left as Pc), Some(left_ty))
             }
             self.in_progress.as_mut().unwrap().push(
                 Operation::Typecheck(idx, ty.clone()));
@@ -290,19 +293,25 @@ impl Vm {
             self.versions.entry(pc-1 as usize)
                 .or_insert_with(|| HashMap::new())
                 .insert(left_ty.clone(), new_block as u16);
-            Some(left_ty)
+            (None, Some(left_ty))
         } else {
             // Bias type fail
             let (right_pc, right_ty, right_op) = (right.into().0.borrow_mut())(self);
             dbg!(&right_pc, &right_ty, &right_op);
             if let Some(existing_right) = self.compatible_block(right_pc, &right_ty, right_op) {
-                panic!("existing right compatible");
+                self.in_progress.as_mut().unwrap().push(
+                    Operation::Jump(existing_right as i16));
+                return (Some(existing_right as Pc), None)
             }
             self.in_progress.as_mut().unwrap().push(
                 Operation::NTypecheck(idx, ty.clone()));
             self.in_progress.as_mut().unwrap().push(
                 Operation::Thunk(left.into()));
-            None
+            let new_block = self.bytecode.len() + self.in_progress.as_ref().unwrap().len();
+            self.versions.entry(pc-1 as usize)
+                .or_insert_with(|| HashMap::new())
+                .insert(val_types.clone(), new_block as u16);
+            (None, None)
         }
 
     }
@@ -390,6 +399,16 @@ impl Vm {
             dbg!(&self.in_progress);
         }
 
+        let seal = |vm: &mut Vm, val_types: &mut Vec<RLRef>, our_edges: HashMap<Pc, Pc>| {
+            // we recorded a block up until an exit. finalize the in-progress
+            // specialized block, and save it off as a version.
+            //vm.versions.entry(block as usize).or_insert_with(|| HashMap::new()).insert(val_types.clone(), our_base as u16);
+            vm.original_pc.extend(our_edges.clone());
+            vm.version_count += 1;
+            let finalized = vm.in_progress.take();
+            vm.bytecode.append(&mut finalized.unwrap());
+        };
+
         'pc: loop {
             let mut inst = self.bytecode[pc].clone();
             pc += 1;
@@ -400,15 +419,24 @@ impl Vm {
                         if SPEC {
                             let mut typemap = val_types.clone(); typemap[left as usize] = self.rl_int.clone();
                             let fail_types = val_types.clone();
-                            if let Some(int_ty) = self.type_guard(pc, &vals, &mut val_types, left, self.rl_int.clone(),
+                            match self.type_guard(pc, &vals, &mut val_types, left, self.rl_int.clone(),
                             ThunkRef::from(move |vm: &mut Vm| {
                                 (pc-1, typemap.clone(), Operation::AddInt_(ret, left, right)) }),
                             ThunkRef::from(move |vm: &mut Vm| {
                                 (pc-1, fail_types.clone(), Operation::Add__(ret, left, right))
                             })) {
-                                val_types = int_ty;
-                                inst = Operation::AddInt_(ret, left, right);
-                                continue 'step;
+                                (None, Some(int_ty)) => {
+                                    val_types = int_ty;
+                                    inst = Operation::AddInt_(ret, left, right);
+                                    continue 'step;
+                                },
+                                (Some(existing_pc), ty) => {
+                                    pc = existing_pc;
+                                    ty.map(|ty| val_types = ty );
+                                    seal(self, &mut val_types, our_edges);
+                                    return self.run::<false>(vals, val_types, pc as Block);
+                                },
+                                (None, None) => { /* fallthrough */ },
                             }
                             // TODO: specialize userdata
                         }
@@ -420,6 +448,27 @@ impl Vm {
                     Operation::AddInt_(ret, left, right) => {
                         if SPEC {
                             // Try to specialize on right
+                            let mut typemap = val_types.clone(); typemap[right as usize] = self.rl_int.clone();
+                            let fail_types = val_types.clone();
+                            match self.type_guard(pc, &vals, &mut val_types, right, self.rl_int.clone(),
+                            ThunkRef::from(move |vm: &mut Vm| {
+                                (pc-1, typemap.clone(), Operation::AddIntInt(ret, left, right)) }),
+                            ThunkRef::from(move |vm: &mut Vm| {
+                                (pc-1, fail_types.clone(), Operation::AddInt_(ret, left, right))
+                            })) {
+                                (None, Some(int_ty)) => {
+                                    val_types = int_ty;
+                                    inst = Operation::AddIntInt(ret, left, right);
+                                    continue 'step;
+                                },
+                                (Some(existing_pc), ty) => {
+                                    pc = existing_pc;
+                                    ty.map(|ty| val_types = ty );
+                                    seal(self, &mut val_types, our_edges);
+                                    return self.run::<false>(vals, val_types, pc as Block);
+                                },
+                                (None, None) => { /* fallthrough */ },
+                            }
                             // TODO: specialize userdata
                         }
 
@@ -465,6 +514,24 @@ impl Vm {
                         break 'pc;
                     },
                     Operation::Jump(bl) => {
+                        if SPEC {
+                            // If it was an actual jump in our version 0 block,
+                            // then we want to specialize into a jump to a specialized
+                            // jump target if it already exists.
+                            // TODO: we want to finalize our existing block
+                            // and switch back to the non-specializing run here,
+                            // because we've merged back into existing code
+
+                            if let Some(spec_block) = self.compatible_block(
+                                bl as usize, &val_types, self.bytecode[bl as usize].clone())
+                            {
+                                self.in_progress.as_mut().unwrap().push(
+                                    Operation::Jump(spec_block as i16));
+                            } else {
+                                self.in_progress.as_mut().unwrap().push(
+                                    Operation::Jump(bl));
+                            }
+                        }
                         pc = bl as usize;
                         continue 'pc;
                     },
@@ -543,13 +610,7 @@ impl Vm {
             }
         }
         if SPEC {
-            // we recorded a block up until an exit. finalize the in-progress
-            // specialized block, and save it off as a version.
-            self.versions.entry(block as usize).or_insert_with(|| HashMap::new()).insert(val_types, our_base as u16);
-            self.original_pc.extend(our_edges);
-            self.version_count += 1;
-            let finalized = self.in_progress.take();
-            self.bytecode.append(&mut finalized.unwrap());
+            seal(self, &mut val_types, our_edges);
         }
         return vals
     }
@@ -574,14 +635,22 @@ fn main() {
     let mut val_types = vec![RLRef(Rc::new(())); vals_int_int.len()];
     dbg!(vm.run::<false>(vals_int_int.clone(), val_types.clone(), 0));
     let (v1, _) = vm.specialize(vals_int_int.clone(), None);
-
-    //let (v2, _) = vm.specialize(vals_int_str.clone(), None);
-    //let (v3, _) = vm.specialize(vals_str_str.clone(), None);
+    let (v2, _) = vm.specialize(vals_int_str.clone(), None);
+    let (v3, _) = vm.specialize(vals_str_str.clone(), None);
 
     dbg!(vm.run::<false>(vals_int_int.clone(), val_types.clone(), v1));
     dbg!(vm.run::<false>(vals_int_str.clone(), val_types.clone(), v1));
     dbg!(vm.run::<false>(vals_str_str.clone(), val_types.clone(), v1));
     dbg!(vm.run::<false>(vals_str_int.clone(), val_types.clone(), v1));
+
+    dbg!(vm.run::<false>(vals_int_int.clone(), val_types.clone(), v3));
+    dbg!(vm.run::<false>(vals_int_str.clone(), val_types.clone(), v3));
+    dbg!(vm.run::<false>(vals_str_str.clone(), val_types.clone(), v3));
+    dbg!(vm.run::<false>(vals_str_int.clone(), val_types.clone(), v3));
+
+    let entry_int_int = vm.compatible_block(0, &vec![vm.rl_int.clone(); 2], Operation::Nop).unwrap();
+    dbg!(vm.run::<false>(vals_int_int.clone(), val_types.clone(), entry_int_int));
+
     //dbg!(vm.run::<false>(vec![RValue::Int(1), RValue::Str("test")], val_types.clone(), Some(1)));
 
     dbg!(&vm.bytecode);
