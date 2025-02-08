@@ -349,6 +349,7 @@ impl<T> Eq for Tc<T> { }
 
 impl<T> Hash for Tc<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        panic!("this doesn't actually work");
         state.write_usize(Rc::as_ptr(&self.0) as usize)
     }
 }
