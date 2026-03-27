@@ -21,10 +21,10 @@ fn typeof_<'a>(val: &RValue) -> Ty {
 }
 
 #[derive(Clone)]
-struct ResidualExec(Rc<dyn Fn(&mut [RValue])>);
+struct ResidualExec(&'static str, Rc<dyn Fn(&mut [RValue])>);
 impl std::fmt::Debug for ResidualExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "exec({:p})", self.0.as_ref() as &_ as *const _ as *const ())
+        write!(f, "exec({}, {:p})", self.0, self.1.as_ref() as &_ as *const _ as *const ())
     }
 }
 
@@ -50,7 +50,7 @@ pub fn emit_add(dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg
         if arg == ResumeArg::Matched {
             arg = yield YieldOp::Guard(rhs, Ty::Int);
             if arg == ResumeArg::Matched {
-                yield YieldOp::Exec(ResidualExec(Rc::new(move |vals| {
+                yield YieldOp::Exec(ResidualExec("add_int_int", Rc::new(move |vals| {
                     // Safe bypass of runtime checks
                     let RValue::Int(l) = vals[lhs] else { unreachable!() };
                     let RValue::Int(r) = vals[rhs] else { unreachable!() };
@@ -65,7 +65,7 @@ pub fn emit_add(dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg
         if arg == ResumeArg::Matched {
             arg = yield YieldOp::Guard(rhs, Ty::Str);
             if arg == ResumeArg::Matched {
-                yield YieldOp::Exec(ResidualExec(Rc::new(move |vals| {
+                yield YieldOp::Exec(ResidualExec("add_str_str", Rc::new(move |vals| {
                     let RValue::Str(l) = &vals[lhs] else { unreachable!() };
                     let RValue::Str(r) = &vals[rhs] else { unreachable!() };
                     vals[dest] = RValue::Str(l.clone() + r);
@@ -122,18 +122,22 @@ impl Vm {
     }
 
 
-    pub fn compile(&mut self, mut pc: Pc, types: Vec<Ty>, block_id: usize) -> usize {
+    pub fn compile(&mut self, mut pc: Pc, mut types: Vec<Ty>, block_id: usize) -> Vec<Ty> {
         loop {
             dbg!(pc);
             let instruction = self.code[pc].clone();
-            if let Some(next) = match instruction {
+            if let Some((next, ty)) = match instruction {
                 Operation::Add(o, l, r) => self.compile_one(pc, types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
-                Operation::Ret => { self.blocks[block_id].push(Residual::Ret); None },
+                Operation::Ret => {
+                    println!("ret");
+                    self.blocks[block_id].push(Residual::Ret); None
+                },
             } {
-                println!("-> {}", next);
                 pc = next;
+                types = ty;
+                println!("-> {}", next);
             } else {
-                return pc;
+                return types;
             }
         }
     }
@@ -143,7 +147,7 @@ impl Vm {
         self.blocks.len() - 1
     }
 
-    pub fn compile_one<C>(&mut self, orig_pc: Pc, mut types: Vec<Ty>, mut coro: C, mut arg: ResumeArg, block_id: usize) -> Option<usize>
+    pub fn compile_one<C>(&mut self, orig_pc: Pc, mut types: Vec<Ty>, mut coro: C, mut arg: ResumeArg, block_id: usize) -> Option<(Pc, Vec<Ty>)>
     where
         C: Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, Ty)>> + Clone + Unpin + 'static,
     {
@@ -167,7 +171,9 @@ impl Vm {
                             dbg!(fail_pc);
                             // This executes only if the dynamic branch fails at runtime
                             let fail_thunk_id = vm.new_block();
-                            vm.compile_one(orig_pc, fail_types.clone(), fail_coro.clone(), ResumeArg::Failed, fail_thunk_id);
+                            if let Some((fail_next, fail_ty)) = vm.compile_one(orig_pc, fail_types.clone(), fail_coro.clone(), ResumeArg::Failed, fail_thunk_id) {
+                                vm.compile(fail_next, fail_ty, fail_thunk_id);
+                            }
                             // Patch the thunk block to jump to the newly specialized block
                             vm.blocks[block_id][fail_pc] = Residual::Jump(fail_thunk_id);
                         })))));
@@ -179,7 +185,9 @@ impl Vm {
                             let succ_thunk_id = vm.new_block();
                             let mut success_types = types.clone();
                             success_types[idx] = expected.clone();
-                            vm.compile_one(orig_pc, success_types.clone(), succ_coro.clone(), ResumeArg::Matched, succ_thunk_id);
+                            if let Some((succ_next, succ_ty)) = vm.compile_one(orig_pc, success_types.clone(), succ_coro.clone(), ResumeArg::Matched, succ_thunk_id) {
+                                vm.compile(succ_next, succ_ty, succ_thunk_id);
+                            }
                             // Patch the thunk block to jump to the newly specialized block
                             vm.blocks[block_id][succ_pc] = Residual::Jump(succ_thunk_id);
                         })))));
@@ -194,7 +202,7 @@ impl Vm {
                     for (idx, ty) in ty_effects {
                         types[idx] = ty;
                     }
-                    return Some(self.compile(orig_pc + 1, types, block_id));
+                    return Some((orig_pc + 1, types));
                 }
             }
         }
@@ -216,7 +224,7 @@ impl Vm {
                     }
                 },
                 Residual::Exec(f) => {
-                    f.0(&mut values[..]);
+                    f.1(&mut values[..]);
                     off += 1;
                 },
                 Residual::Jump(target) => {
@@ -234,18 +242,21 @@ impl Vm {
 }
 
 fn main() {
-    let mut vm = Vm { code: vec![
-        Operation::Add(0, 1, 2),
-        Operation::Add(0, 0, 1),
-        Operation::Ret,
-    ], blocks: vec![], versions: HashMap::new() };
+    let mut code = vec![
+    ];
+    for i in 0..10 {
+        code.push(Operation::Add(0, 1, 1));
+    }
+    code.push(Operation::Add(2,0,1));
+    code.push(Operation::Ret);
+    let mut vm = Vm { code, blocks: vec![], versions: HashMap::new() };
 
     // 1. Polymorphic compilation (Unknowns) explores the entire CFG.
     let dyn_types = vec![Ty::Unknown, Ty::Unknown, Ty::Unknown];
     //vm.compile(0, dyn_types, emit_add(0, 1, 2), ResumeArg::Start);
     let dyn_block = vm.block(0, dyn_types);
     println!("{:?}", vm.blocks[dyn_block]);
-    let res = vm.run(dyn_block, vec![RValue::Int(0), RValue::Int(1), RValue::Int(2)]);
+    let res = vm.run(dyn_block, vec![RValue::Int(0), RValue::Str("1".into()), RValue::Int(2)]);
     println!("{:?}", res);
 
     // 2. Statically known types short-circuits the generator, eliding branches.
