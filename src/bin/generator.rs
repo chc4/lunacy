@@ -42,7 +42,7 @@ pub enum ResumeArg {
 }
 
 // 1. Linearized Generator using Coroutines
-pub fn emit_add(dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin {
+pub fn emit_add(dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, Ty)>> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         // --- Int Path ---
@@ -56,7 +56,7 @@ pub fn emit_add(dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg
                     let RValue::Int(r) = vals[rhs] else { unreachable!() };
                     vals[dest] = RValue::Int(l + r);
                 })));
-                return;
+                return vec![(dest, Ty::Int)];
             }
         }
 
@@ -70,7 +70,7 @@ pub fn emit_add(dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg
                     let RValue::Str(r) = &vals[rhs] else { unreachable!() };
                     vals[dest] = RValue::Str(l.clone() + r);
                 })));
-                return;
+                return vec![(dest, Ty::Str)];
             }
         }
 
@@ -98,7 +98,7 @@ impl std::fmt::Debug for ThunkRef {
 
 #[derive(Debug, Clone)]
 pub enum Residual {
-    Guard { idx: usize, expected: Ty, fail_target: BlockId },
+    Guard { idx: usize, expected: Ty },
     Exec(ResidualExec),
     Jump(BlockId),
     Thunk(ThunkRef),
@@ -117,16 +117,23 @@ impl Vm {
 
         let block_id = self.new_block();
         self.versions.insert((pc, types.clone()), block_id);
+        self.compile(entry, types, block_id);
+        return block_id;
+    }
 
+
+    pub fn compile(&mut self, mut pc: Pc, types: Vec<Ty>, block_id: usize) -> usize {
         loop {
+            dbg!(pc);
             let instruction = self.code[pc].clone();
             if let Some(next) = match instruction {
-                Operation::Add(o, l, r) => self.compile(pc, types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
-                Operation::Ret => None,
+                Operation::Add(o, l, r) => self.compile_one(pc, types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
+                Operation::Ret => { self.blocks[block_id].push(Residual::Ret); None },
             } {
+                println!("-> {}", next);
                 pc = next;
             } else {
-                return block_id;
+                return pc;
             }
         }
     }
@@ -136,9 +143,9 @@ impl Vm {
         self.blocks.len() - 1
     }
 
-    pub fn compile<C>(&mut self, orig_pc: Pc, types: Vec<Ty>, mut coro: C, mut arg: ResumeArg, block_id: usize) -> Option<usize>
+    pub fn compile_one<C>(&mut self, orig_pc: Pc, mut types: Vec<Ty>, mut coro: C, mut arg: ResumeArg, block_id: usize) -> Option<usize>
     where
-        C: Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin + 'static,
+        C: Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, Ty)>> + Clone + Unpin + 'static,
     {
         loop {
             match Pin::new(&mut coro).resume(arg) {
@@ -154,13 +161,13 @@ impl Vm {
                         let fail_coro = coro.clone();
                         let fail_types = types.clone();
                         let fail_pc = self.blocks[block_id].len() + 1;
-                        self.blocks[block_id].push(Residual::Guard { idx, expected: expected.clone(), fail_target: fail_pc });
+                        self.blocks[block_id].push(Residual::Guard { idx, expected: expected.clone() });
 
                         self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Vm| {
                             dbg!(fail_pc);
                             // This executes only if the dynamic branch fails at runtime
                             let fail_thunk_id = vm.new_block();
-                            vm.compile(orig_pc + 1, fail_types.clone(), fail_coro.clone(), ResumeArg::Failed, fail_thunk_id);
+                            vm.compile_one(orig_pc, fail_types.clone(), fail_coro.clone(), ResumeArg::Failed, fail_thunk_id);
                             // Patch the thunk block to jump to the newly specialized block
                             vm.blocks[block_id][fail_pc] = Residual::Jump(fail_thunk_id);
                         })))));
@@ -172,7 +179,7 @@ impl Vm {
                             let succ_thunk_id = vm.new_block();
                             let mut success_types = types.clone();
                             success_types[idx] = expected.clone();
-                            vm.compile(orig_pc + 1, success_types.clone(), succ_coro.clone(), ResumeArg::Matched, succ_thunk_id);
+                            vm.compile_one(orig_pc, success_types.clone(), succ_coro.clone(), ResumeArg::Matched, succ_thunk_id);
                             // Patch the thunk block to jump to the newly specialized block
                             vm.blocks[block_id][succ_pc] = Residual::Jump(succ_thunk_id);
                         })))));
@@ -182,12 +189,12 @@ impl Vm {
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id].push(Residual::Exec(func));
                     // In a real VM, transition to the next PC generator here.
-                    self.blocks[block_id].push(Residual::Ret); 
-                    return Some(orig_pc + 1);
                 }
-                CoroutineState::Complete(_) => {
-                    self.blocks[block_id].push(Residual::Ret);
-                    return Some(orig_pc + 1);
+                CoroutineState::Complete(ty_effects) => {
+                    for (idx, ty) in ty_effects {
+                        types[idx] = ty;
+                    }
+                    return Some(self.compile(orig_pc + 1, types, block_id));
                 }
             }
         }
@@ -200,13 +207,12 @@ impl Vm {
             let res = block[off].clone();
             dbg!(&res);
             match res {
-                Residual::Guard { idx, expected, fail_target } => {
+                Residual::Guard { idx, expected } => {
                     if typeof_(&values[idx]) == expected {
                         // Fallthrough
                         off += 2;
-                        continue;
                     } else {
-                        off = fail_target;
+                        off += 1;
                     }
                 },
                 Residual::Exec(f) => {
@@ -229,8 +235,8 @@ impl Vm {
 
 fn main() {
     let mut vm = Vm { code: vec![
-        Operation::Add(0, 0, 0),
-        Operation::Add(0, 0, 0),
+        Operation::Add(0, 1, 2),
+        Operation::Add(0, 0, 1),
         Operation::Ret,
     ], blocks: vec![], versions: HashMap::new() };
 
