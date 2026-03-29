@@ -189,6 +189,9 @@ impl Instruction for JMP { type Unpack = sBx; }
 struct NEWTABLE;
 impl Instruction for NEWTABLE { type Unpack = ABC; }
 
+struct SELF;
+impl Instruction for SELF { type Unpack = ABC; }
+
 struct GETTABLE;
 impl Instruction for GETTABLE { type Unpack = ABC; }
 
@@ -703,6 +706,18 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             x => unimplemented!("{:?}", x),
         }
     }
+
+    fn gettable(&self, owner: &mut TCellOwner<TcOwner>, index: Cow<'_, LValue<'src, 'intern>>) -> LValue<'src, 'intern> {
+        let val_b = match self {
+            LValue::Table(tab) => {
+                debug!("table {:?}", tab);
+                tab.get(owner, index.deref()).ok_or_else(|| Err::<LValue, String>(format!("{:?}", index))).unwrap()
+            },
+            x => unimplemented!("gettable on {:?}", x),
+        };
+        debug!("gettable {:?}", &val_b);
+        return val_b;
+    }
 }
 
 impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LValue<'src, 'intern>
@@ -914,7 +929,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let mut spec = Specializer::new(clos.clone());
         // we need to track where to return to, along with the base pointer and where to put return
         // values
-        let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize)> = vec![].into();
+        let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize, usize)> = vec![].into();
         let r_vals = 'int: loop {
             let inst = unsafe { clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc] };
             pc += 1;
@@ -973,6 +988,17 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     // TODO: properly decode the "floating point byte" size hints instead
                     vals[base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
                 },
+                Opcode::SELF => {
+                    let (a, b, c) = <SELF as Instruction>::Unpack::unpack(inst.0);
+                    let rb = vals[base + b as usize].clone();
+                    vals[base + a as usize] = rb.clone();
+                    let kc = match Self::rk(clos.ro(owner).prototype, base, &vals, c) {
+                        Ok(c) => Cow::Owned(LValue::from(c)),
+                        Err(lv) => Cow::Borrowed(lv),
+                    };
+                    let res = rb.gettable(owner, kc);
+                    vals[base + a as usize + 1] = res;
+                },
                 Opcode::SETLIST => {
                     let (a, b, c) = <SETLIST as Instruction>::Unpack::unpack(inst.0);
                     match vals[base + a as usize].clone() {
@@ -1003,15 +1029,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         Err(lv) => Cow::Borrowed(lv),
                     };
                     debug!("gettable {:?}", &kc);
-                    let val_b = match &vals[base + b as usize] {
-                        LValue::Table(tab) => {
-                            debug!("table {:?}", tab);
-                            tab.get(owner, kc.deref()).ok_or_else(|| Err::<LValue, String>(format!("{:?}", kc))).unwrap()
-                        },
-                        x => unimplemented!("gettable on {:?}", x),
-                    };
-                    debug!("gettable {:?}", &val_b);
-                    vals[base + a as usize] = val_b;
+                    let val_b = vals[base + b as usize].clone();
+                    vals[base + a as usize] = val_b.gettable(owner, kc);
                 },
                 Opcode::SETTABLE => {
                     let (a, b, c) = <SETTABLE as Instruction>::Unpack::unpack(inst.0);
@@ -1154,8 +1173,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::FORLOOP => {
                     let (a, sbx) = <FORLOOP as Instruction>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, sbx);
-                    let step = &vals[base + a as usize + 2];
-                    let idx = vals[base + a as usize].numeric_op(Opcode::ADD, step).unwrap();
+                    let step = vals[base + a as usize + 2].clone();
+                    let idx = vals[base + a as usize].numeric_op(Opcode::ADD, &step).unwrap();
+                    vals[base + a as usize] = idx.clone();
                     let limit = vals[base + a as usize + 1].clone();
                     let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0))))? {
                         limit.compare(Opcode::LE, idx.clone())
@@ -1164,7 +1184,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                     if comp? {
                         pc = (pc as isize + sbx as isize) as usize;
-                        vals[base + a as usize] = idx.clone();
                         vals[base + a as usize + 3] = idx;
                     }
                 },
@@ -1225,7 +1244,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     // push where to return to once we RETURN
                     if let LValue::LClosure(ref lclos) = to_call.clone() {
                         // record call stack: we say where to return to and where to put the values
-                        callstack.push((clos.clone(), pc, base, base + a as usize));
+                        callstack.push((clos.clone(), pc, base, vals.len(), base + a as usize));
                         clos = lclos.clone();
                         let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
                         base = base + a as usize + 1;
@@ -1254,6 +1273,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             unimplemented!()
                         }
                         // FIXME(metatables): __call
+                    } else {
+                        panic!("cant call {:?}", to_call);
                     }
                 },
                 Opcode::RETURN => {
@@ -1283,8 +1304,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     } else {
                         unreachable!()
                     };
-                    if let Some((ret_clos, caller, frame, ret)) = callstack.pop() {
-                        debug!("{:?} {:?}", unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller);
+                    if let Some((ret_clos, caller, frame, limit, ret)) = callstack.pop() {
+                        debug!("{} {:?} {:?}", base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller);
                         clos = ret_clos.clone();
                         // copy the return values to the previous frame's return location,
                         // then clean up the popped stack frame
@@ -1294,7 +1315,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         for (i, v) in r_vals.drain(..).enumerate() {
                             vals[ret + i] = v;
                         }
-                        vals.truncate(frame + parent_stack);
+                        vals.truncate(limit);
                         pc = caller;
                     } else {
                         break 'int r_vals;
