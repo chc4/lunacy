@@ -1,4 +1,3 @@
-#![feature(coroutines, coroutine_trait, coroutine_clone, stmt_expr_attributes)]
 #![allow(unused_variables)]
 
 use std::collections::HashMap;
@@ -6,6 +5,12 @@ use std::ops::{Coroutine, CoroutineState};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::RefCell;
+
+use crate::vm::Opcode;
+use qcell::{TCell, TCellOwner};
+use crate::vm::{Tc, TcOwner};
+use crate::vm::LClosure;
+use crate::chunk::Instruction;
 
 use log::debug;
 
@@ -114,14 +119,8 @@ impl SubPc {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum Operation {
-    Add(usize, usize, usize),
-    Ret
-}
-
 #[derive(Clone)]
-pub struct ThunkRef(pub Rc<RefCell<dyn FnMut(&mut Vm) -> ()>>);
+pub struct ThunkRef(pub Rc<RefCell<dyn FnMut(&mut Specializer, &TCellOwner<TcOwner>) -> ()>>);
 
 impl std::fmt::Debug for ThunkRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Thunk(...)") }
@@ -136,34 +135,51 @@ pub enum Residual {
     Ret,
 }
 
-pub struct Vm {
-    pub code: Vec<Operation>,
+pub struct Specializer<'src, 'intern> {
+    pub clos: Tc<LClosure<'src, 'intern>>,
     pub blocks: Vec<Vec<Residual>>,
     pub versions: HashMap<(SubPc, Vec<Ty>), BlockId>,
 }
 
-impl Vm {
-    pub fn block(&mut self, entry: Pc, types: Vec<Ty>) -> BlockId {
+impl<'src, 'intern> Specializer<'src, 'intern> {
+    pub fn new(clos: Tc<LClosure<'src, 'intern>>) -> Self {
+        Self {
+            clos,
+            blocks: Vec::new(),
+            versions: Default::default(),
+        }
+    }
+
+    pub fn block(&mut self, owner: &TCellOwner<TcOwner>, entry: Pc, types: Vec<Ty>) -> BlockId {
         let mut pc = entry;
 
         let block_id = self.new_block();
         let subpc: SubPc = SubPc::new(entry);
         self.versions.insert((subpc, types.clone()), block_id);
-        self.compile(entry, types, block_id);
+        self.compile(owner, entry, types, block_id);
         return block_id;
     }
 
+    fn code<'a>(&self,
+        owner: &'a TCellOwner<TcOwner>,
+        pc: Pc) -> &'a Instruction
+        where 'intern: 'a
+    {
+        let inst = unsafe { &self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc] };
+        return inst;
+    }
 
-    pub fn compile(&mut self, mut pc: Pc, mut types: Vec<Ty>, block_id: usize) -> Vec<Ty> {
+    pub fn compile(&mut self, owner: &TCellOwner<TcOwner>, mut pc: Pc, mut types: Vec<Ty>, block_id: usize) -> Vec<Ty> {
         loop {
             debug!("compile {pc}");
-            let instruction = self.code[pc].clone();
+            let instruction = self.code(owner, pc).clone();
             if let Some((next, ty)) = match instruction {
-                Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
-                Operation::Ret => {
-                    println!("ret");
-                    self.blocks[block_id].push(Residual::Ret); None
-                },
+                //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
+                //Operation::Ret => {
+                //    println!("ret");
+                //    self.blocks[block_id].push(Residual::Ret); None
+                //},
+                _ => panic!()
             } {
                 pc = next;
                 types = ty;
@@ -199,7 +215,7 @@ impl Vm {
                         let fail_off = self.blocks[block_id].len() + 1;
                         self.blocks[block_id].push(Residual::Guard { idx, expected: expected.clone() });
 
-                        self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Vm| {
+                        self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &TCellOwner<TcOwner>| {
                             let fail_pc = orig_pc.next_false();
                             dbg!(fail_off);
                             // This executes only if the dynamic branch fails at runtime
@@ -214,7 +230,7 @@ impl Vm {
                             if let Some((fail_next, fail_ty)) = vm.compile_one(fail_pc, fail_types.clone(), fail_coro.clone(), ResumeArg::Failed, fail_thunk_id) {
                                 // We finished running the coroutine to completion, finish the
                                 // rest of the block
-                                vm.compile(fail_next, fail_ty, fail_thunk_id);
+                                vm.compile(owner, fail_next, fail_ty, fail_thunk_id);
                             } else {
                                 // The coroutine got stuck on another thunk
                             }
@@ -224,7 +240,7 @@ impl Vm {
                         })))));
                         let succ_coro = coro.clone();
                         let succ_off = fail_off + 1;
-                        self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Vm| {
+                        self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &TCellOwner<TcOwner>| {
                             let succ_pc = orig_pc.next_true();
                             dbg!(succ_off);
                             // This executes only if the dynamic branch succeeds at runtime
@@ -239,7 +255,7 @@ impl Vm {
                             }
                             let succ_thunk_id = vm.new_block();
                             if let Some((succ_next, succ_ty)) = vm.compile_one(succ_pc, success_types.clone(), succ_coro.clone(), ResumeArg::Matched, succ_thunk_id) {
-                                vm.compile(succ_next, succ_ty, succ_thunk_id);
+                                vm.compile(owner, succ_next, succ_ty, succ_thunk_id);
                             }
                             // Patch the thunk block to jump to the newly specialized block
                             vm.versions.insert((succ_pc, success_types.clone()), succ_thunk_id);
@@ -265,7 +281,7 @@ impl Vm {
         }
     }
 
-    pub fn run(&mut self, mut id: BlockId, mut values: Vec<RValue>) -> Vec<RValue> {
+    pub fn run(&mut self, owner: &TCellOwner<TcOwner>, mut id: BlockId, mut values: Vec<RValue>) -> Vec<RValue> {
         let mut off = 0;
         loop {
             let block = &self.blocks[id];
@@ -290,7 +306,7 @@ impl Vm {
                 },
                 Residual::Thunk(thunk) => {
                     dbg!(&block);
-                    (thunk.0.borrow_mut())(self)
+                    (thunk.0.borrow_mut())(self, owner)
                 },
                 Residual::Ret => { return values; },
             }
@@ -298,15 +314,9 @@ impl Vm {
     }
 }
 
+#[cfg(feature="generator")]
 fn main() {
-    let mut code = vec![
-    ];
-    for i in 0..10 {
-        code.push(Operation::Add(0, 1, 2));
-    }
-    code.push(Operation::Add(0,0,0));
-    code.push(Operation::Ret);
-    let mut vm = Vm { code, blocks: vec![], versions: HashMap::new() };
+    let mut vm = Specializer { code, blocks: vec![], versions: HashMap::new() };
 
     let dyn_types = vec![Ty::Unknown, Ty::Unknown, Ty::Unknown];
     let dyn_block = vm.block(0, dyn_types);

@@ -1,4 +1,4 @@
-#![allow(non_snake_case)]
+#![allow(non_snake_case, unused)]
 use nom::{
   bytes::complete::{tag, take_while_m_n, take},
   number::{complete::{le_u8, le_u32, le_u64, f64}, Endianness},

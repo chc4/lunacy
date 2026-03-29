@@ -1,4 +1,4 @@
-#![allow(non_snake_case)]
+#![allow(non_snake_case, unused)]
 use core::fmt::Debug;
 use core::hash::Hash;
 use std::ops::{DerefMut, Index, IndexMut};
@@ -16,6 +16,7 @@ use internment::ArenaIntern;
 use qcell::{TCell, TCellOwner};
 
 use log::debug;
+use crate::generator::Specializer;
 
 type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
 
@@ -148,8 +149,17 @@ impl Unpacker for AsBx {
 struct MOVE;
 impl Instruction for MOVE { type Unpack = AB; }
 
+struct LOADNIL;
+impl Instruction for LOADNIL { type Unpack = AB; }
+
+struct LOADBOOL;
+impl Instruction for LOADBOOL { type Unpack = AB; }
+
 struct GETUPVAL;
 impl Instruction for GETUPVAL{ type Unpack = AB; }
+
+struct SETUPVAL;
+impl Instruction for SETUPVAL{ type Unpack = AB; }
 
 struct LOADK;
 impl Instruction for LOADK { type Unpack = ABx; }
@@ -686,7 +696,7 @@ enum Upvalue<'src, 'intern> {
 }
 
 pub struct LClosure<'src, 'intern> {
-    prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
+    pub prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
     upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
 }
@@ -853,6 +863,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let mut upvals: FVec<(Upvalue, FVec<Gc<Upvalue>>)> = vec![].into();
         let mut base = 0;
         let mut pc = 0;
+        let mut spec = Specializer::new(clos.clone());
         // we need to track where to return to, along with the base pointer and where to put return
         // values
         let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize)> = vec![].into();
@@ -879,12 +890,29 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                     vals[base + a as usize] = upval.clone();
                 },
+                Opcode::SETUPVAL => {
+                    let (a, b) = <SETUPVAL as Instruction>::Unpack::unpack(inst.0);
+                    let upval = match clos.ro(owner).upvalues[b as usize].borrow().deref() {
+                        Upvalue::Open(o) => {
+                            vals[*o as usize] = vals[base + a as usize].clone()
+                        },
+                        Upvalue::Closed(c) => {
+                            *c.borrow_mut() = vals[base + a as usize].clone()
+                        },
+                    };
+                },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
                     debug!("loadk {} {} {:?}", a, bx, unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] });
                     vals[base + a as usize] = unsafe { (&(&(*clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
                     ()
                 },
+                Opcode::LOADNIL => {
+                    let (a, b) = <LOADBOOL as Instruction>::Unpack::unpack(inst.0);
+                    vals[base + a as usize..=base + b as usize].iter_mut().for_each(|i| *i = LValue::Nil);
+                    ()
+                },
+
                 Opcode::NEWTABLE => {
                     let (a, b, c) = <NEWTABLE as Instruction>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead

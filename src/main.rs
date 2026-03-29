@@ -1,4 +1,6 @@
 #![feature(trait_alias, specialization)]
+// For LBBV
+#![feature(coroutines, coroutine_trait, coroutine_clone, stmt_expr_attributes)]
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::Read;
@@ -13,6 +15,8 @@ use chunk::InstBits;
 
 mod vm;
 use vm::Vm;
+
+mod generator;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
