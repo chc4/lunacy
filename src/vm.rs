@@ -813,7 +813,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         if (r & 0x100)!=0 {
             let r_const = r & (0xff);
             debug!("rk {}", r_const);
-            Ok(unsafe { &(*proto).constants.items[r_const as usize] })
+            Ok(unsafe { &(&(*proto).constants.items)[r_const as usize] })
         } else {
             Err(&vals[base + r as usize])
         }
@@ -881,8 +881,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
-                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(*clos.ro(owner).prototype).constants.items[bx as usize] });
-                    vals[base + a as usize] = unsafe { (&(*clos.ro(owner).prototype).constants.items[bx as usize]).into() };
+                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] });
+                    vals[base + a as usize] = unsafe { (&(&(*clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
                     ()
                 },
                 Opcode::NEWTABLE => {
@@ -951,13 +951,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(*clos.ro(owner).prototype).constants.items[bx as usize] };
+                    let kst = unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("setglobal {} {} {:?}", a, bx, &kst);
                     _G.set(owner, kst.into(), vals[base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(*clos.ro(owner).prototype).constants.items[bx as usize] };
+                    let kst = unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
                     vals[base + a as usize] = _G.get(owner, &kst.into()).unwrap_or((&Constant::Nil).into()).clone();
@@ -1077,13 +1077,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::CLOSURE => {
                     let (a, bx) = <CLOSURE as Instruction>::Unpack::unpack(inst.0);
-                    let proto = unsafe { &(*clos.ro(owner).prototype).prototypes.items[bx as usize] };
+                    let proto = unsafe { &(&(*clos.ro(owner).prototype).prototypes.items)[bx as usize] };
                     debug!("{} {} {:?}", a, bx, proto);
                     // handle the MOVE/GETUPVALUE pseudoinstructions
                     let mut fresh = LClosure::new(proto as *const _);
                     {
                         for upval in 0..proto.upval_count {
-                            let pseudo = unsafe { (*clos.ro(owner).prototype).instructions.items[pc+upval as usize] };
+                            let pseudo = unsafe { (&(*clos.ro(owner).prototype).instructions.items)[pc+upval as usize] };
                             let label = match pseudo.0.Opcode() {
                                 Opcode::MOVE => {
                                     let (_, b) = <MOVE as Instruction>::Unpack::unpack(pseudo.0);

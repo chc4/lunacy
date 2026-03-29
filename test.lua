@@ -1,9 +1,14 @@
 local a = 3
-local f = function()
+local first = function()
     local second = function()
-        print(a)
+        print("second", a)
+        return 2
     end
-    second()
+    local v = second()
+    print("first", v)
+    return v
 end
 a = 3
-f()
+local c = first()
+print(c)
+return c
