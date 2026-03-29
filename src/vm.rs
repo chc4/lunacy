@@ -10,6 +10,7 @@ use std::cell::{RefCell, Cell};
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::{error::Error, ops::Deref};
+use std::io::Write;
 
 use internment::ArenaIntern;
 
@@ -153,7 +154,7 @@ struct LOADNIL;
 impl Instruction for LOADNIL { type Unpack = AB; }
 
 struct LOADBOOL;
-impl Instruction for LOADBOOL { type Unpack = AB; }
+impl Instruction for LOADBOOL { type Unpack = ABC; }
 
 struct GETUPVAL;
 impl Instruction for GETUPVAL{ type Unpack = AB; }
@@ -175,6 +176,9 @@ impl Instruction for SETGLOBAL { type Unpack = ABx; }
 
 struct CALL;
 impl Instruction for CALL { type Unpack = ABC; }
+
+struct TEST;
+impl Instruction for TEST { type Unpack = ABC; }
 
 struct EQ;
 impl Instruction for EQ { type Unpack = ABC; }
@@ -202,6 +206,9 @@ impl Instruction for FORLOOP { type Unpack = AsBx; }
 
 struct LEN;
 impl Instruction for LEN { type Unpack = AB; }
+
+struct CONCAT;
+impl Instruction for CONCAT { type Unpack = ABC; }
 
 struct UNM;
 impl Instruction for UNM { type Unpack = AB; }
@@ -454,10 +461,10 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     pub fn get(&self, owner: &TCellOwner<TcOwner>, key: &LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
             LValue::Number(n) => Some(self.ro(owner).array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
-            LValue::InternedString(ref s) => {
+            LValue::InternedString(s) => {
                 self.ro(owner).hash.get(key).cloned()
             },
-            LValue::OwnedString(ref s) => {
+            LValue::OwnedString(s) => {
                 self.ro(owner).hash.get(key).cloned()
             },
             _ => unimplemented!()
@@ -668,6 +675,34 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             _ => unimplemented!(),
         }
     }
+
+    pub fn as_bool(&self, owner: &TCellOwner<TcOwner>) -> Result<LValue<'src, 'intern>, String> {
+        match self {
+            LValue::Bool(b) => Ok(self.clone()),
+            LValue::Nil => Ok(LValue::Bool(false)),
+            _ => Ok(LValue::Bool(true)),
+        }
+    }
+
+    pub fn as_string(&self, owner: &TCellOwner<TcOwner>) -> Option<Rc<Vec<u8>>> {
+        // TODO: metamethods?
+        match self {
+            LValue::OwnedString(s) => Some(s.clone()),
+            LValue::InternedString(s) => Some(Rc::new(s.into_ref().0.to_vec())),
+            LValue::Number(f) => {
+                let mut s = Vec::new();
+                write!(s, "{}", f.0);
+                Some(Rc::new(s))
+            },
+            LValue::Table(tc) => {
+                let mut s = Vec::new();
+                write!(s, "{:?}", tc);
+                Some(Rc::new(s))
+            },
+            LValue::Nil => None,
+            x => unimplemented!("{:?}", x),
+        }
+    }
 }
 
 impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LValue<'src, 'intern>
@@ -707,9 +742,9 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
     }
 }
 
-trait NativeFunc = for<'a, 'src, 'intern> FnMut(&'a [LValue<'src, 'intern>]) -> FVec<LValue<'src, 'intern>>;
+trait NativeFunc = for<'a, 'src, 'intern> Fn(&'a [LValue<'src, 'intern>], &mut TCellOwner<TcOwner>) -> FVec<LValue<'src, 'intern>>;
 struct NClosure {
-    native: Box<dyn NativeFunc>,
+    native: Rc<dyn NativeFunc>,
 }
 
 impl<'src> Debug for NClosure {
@@ -736,7 +771,7 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: impl NativeFunc + 'static) -> Tc<Self> {
-        Tc::new(NClosure { native: Box::new(native) })
+        Tc::new(NClosure { native: Rc::new(native) })
     }
 }
 
@@ -754,46 +789,46 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
     pub fn global_env(&self, owner: &mut TCellOwner<TcOwner>, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Tc<Table<'src, 'intern>> {
         let mut math_tab = Table::new(0, 0);
-        math_tab.hash.insert(InternString::intern(intern, "floor\0"), LValue::NClosure(NClosure::new(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "floor\0"), LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
         })));
-        math_tab.hash.insert(InternString::intern(intern, "sqrt\0"), LValue::NClosure(NClosure::new(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "sqrt\0"), LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
         })));
-        math_tab.hash.insert(InternString::intern(intern, "abs\0"), LValue::NClosure(NClosure::new(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "abs\0"), LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.abs())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
         })));
-        math_tab.hash.insert(InternString::intern(intern, "huge\0"), LValue::NClosure(NClosure::new(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "huge\0"), LValue::NClosure(NClosure::new(|f, _| {
             return [LValue::Number(Number(f64::INFINITY))].to_vec().into()
         })));
         math_tab.hash.insert(InternString::intern(intern, "pi\0"), LValue::Number(Number(std::f64::consts::PI)));
-        math_tab.hash.insert(InternString::intern(intern, "sin\0"), LValue::NClosure(NClosure::new(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "sin\0"), LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sin())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
         })));
-        math_tab.hash.insert(InternString::intern(intern, "cos\0"), LValue::NClosure(NClosure::new(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "cos\0"), LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.cos())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
         })));
-        math_tab.hash.insert(InternString::intern(intern, "tan\0"), LValue::NClosure(NClosure::new(|f| {
+        math_tab.hash.insert(InternString::intern(intern, "tan\0"), LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.tan())),
                 _ => unimplemented!()
@@ -801,17 +836,30 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             return [f].to_vec().into()
         })));
 
+        let mut os_tab = Table::new(0, 0);
+        os_tab.hash.insert(InternString::intern(intern, "exit\0"), LValue::NClosure(NClosure::new(|f, _| {
+            let f = match f {
+                [LValue::Number(f)] => return std::process::exit(f.0 as i32),
+                _ => unimplemented!(),
+            };
+        })));
 
         let math = (InternString::intern(intern, "math\0"), LValue::Table(Tc::new(math_tab)));
+        let os = (InternString::intern(intern, "os\0"), LValue::Table(Tc::new(os_tab)));
         Tc::new(Table {
             array: vec![].into(),
             hash: HashMap::<_, _, InternedHasher>::from_iter(
                 vec![
-                (InternString::intern(intern, "print\0"), LValue::NClosure(NClosure::new(|v| {
-                    println!("> {:?}", v);
+                (InternString::intern(intern, "print\0"), LValue::NClosure(NClosure::new(|v, owner| {
+                    let s = v.iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
+                        maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
+                    ).collect::<Vec<_>>();
+                    //println!("> {}", String::from_utf8_lossy(s.iter().into()));
+                    println!("> {}", s.iter().intersperse(&" ".to_string()).cloned().collect::<String>());
                     vec![LValue::Nil].into()
                 }))),
                 math,
+                os,
                 ].drain(..)
             )
         })
@@ -908,11 +956,18 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     ()
                 },
                 Opcode::LOADNIL => {
-                    let (a, b) = <LOADBOOL as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b) = <LOADNIL as Instruction>::Unpack::unpack(inst.0);
                     vals[base + a as usize..=base + b as usize].iter_mut().for_each(|i| *i = LValue::Nil);
                     ()
                 },
-
+                Opcode::LOADBOOL => {
+                    let (a, b, c) = <LOADBOOL as Instruction>::Unpack::unpack(inst.0);
+                    vals[base + a as usize] = LValue::Bool(b != 0);
+                    if c != 0 {
+                        pc += 1;
+                    }
+                    ()
+                },
                 Opcode::NEWTABLE => {
                     let (a, b, c) = <NEWTABLE as Instruction>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
@@ -989,6 +1044,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
                     vals[base + a as usize] = _G.get(owner, &kst.into()).unwrap_or((&Constant::Nil).into()).clone();
+                },
+                Opcode::TEST => {
+                    let (a, _, c) = <TEST as Instruction>::Unpack::unpack(inst.0);
+                    if let LValue::Bool(b) = (vals[base + a as usize].as_bool(owner)?) && (b as u16) == c {
+                        pc += 1;
+                    }
                 },
                 opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);
@@ -1072,6 +1133,16 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, b) = <LEN as Instruction>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
                     vals[base + a as usize] = vals[base + b as usize].len(owner)?;
+                },
+                Opcode::CONCAT => {
+                    let (a, b, c) = <CONCAT as Instruction>::Unpack::unpack(inst.0);
+                    debug!("{} {}", a, b);
+                    let mut s = FVec::new();
+                    for i in (b as usize)..=(c as usize) {
+                        s.extend_from_slice(&vals[base + i as usize].as_string(owner).ok_or("nil concat")?)
+                    }
+                    debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
+                    vals[base + a as usize] = LValue::OwnedString(Rc::new(s));
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = <FORPREP as Instruction>::Unpack::unpack(inst.0);
@@ -1169,7 +1240,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             &vals[base + a as usize+1..=(base + a as usize + b as usize - 1)]
                         };
                         debug!("{:?}", args);
-                        let ret = (ncall.rw(owner).native)(args);
+                        let mut native = ncall.rw(owner).native.clone();
+                        let ret = (native)(args, owner);
                         if c == 0 {
                             // save all returned
                             vals.splice(base + a as usize.., ret).for_each(drop);

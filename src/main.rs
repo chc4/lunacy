@@ -1,4 +1,4 @@
-#![feature(trait_alias, specialization)]
+#![feature(trait_alias, specialization, iter_intersperse)]
 // For LBBV
 #![feature(coroutines, coroutine_trait, coroutine_clone, stmt_expr_attributes)]
 use std::error::Error;

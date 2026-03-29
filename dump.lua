@@ -10,6 +10,7 @@ test_cases = {
     "if true==true then a = 1 else a = 2 end return a",
     "local a = 1; local function foo(b) print(b, 'bye') end foo(a)",
     "local a = {4,5,6,7} print(a)",
+    [==[print("hello " .. "goodbye")]==],
 }
 
 for i,v in pairs(test_cases) do
