@@ -590,6 +590,17 @@ pub enum LValue<'src, 'intern> {
     Table(Tc<Table<'src, 'intern>>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LType {
+    Unknown,
+    Nil,
+    Bool,
+    Number,
+    String,
+    Closure,
+    Table
+}
+
 impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn compare(&self, opcode: Opcode, right: Self) -> Result<bool, String> {
         // TODO: metamethods

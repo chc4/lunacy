@@ -10,25 +10,21 @@ use crate::vm::Opcode;
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner};
 use crate::vm::LClosure;
+use crate::vm::{LValue, LType, Number};
 use crate::chunk::Instruction;
 
 use log::debug;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Ty { Int, Str, Unknown }
-
-#[derive(Clone, Debug)]
-pub enum RValue { Int(u32), Str(String) }
-
-fn typeof_<'a>(val: &RValue) -> Ty {
+fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
     match val {
-        RValue::Int(i) => Ty::Int,
-        RValue::Str(s) => Ty::Str,
+        LValue::Number(_) => LType::Number,
+        LValue::InternedString(_) | LValue::OwnedString(_) => LType::String,
+        _ => LType::Unknown,
     }
 }
 
 #[derive(Clone)]
-struct ResidualExec(&'static str, Rc<dyn Fn(&mut [RValue])>);
+struct ResidualExec(&'static str, Rc<dyn for <'src, 'intern> Fn(&mut [LValue<'src, 'intern>])>);
 impl std::fmt::Debug for ResidualExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "exec({}, {:p})", self.0, self.1.as_ref() as &_ as *const _ as *const ())
@@ -37,7 +33,7 @@ impl std::fmt::Debug for ResidualExec {
 
 #[derive(Clone)]
 pub enum YieldOp {
-    Guard(usize, Ty),
+    Guard(usize, LType),
     Exec(ResidualExec),
 }
 
@@ -48,35 +44,37 @@ pub enum ResumeArg {
     Failed,
 }
 
-pub fn emit_add(dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, Ty)>> + Clone + Unpin {
+pub fn emit_add(dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, LType)>> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         // --- Int Path ---
-        arg = yield YieldOp::Guard(lhs, Ty::Int);
+        arg = yield YieldOp::Guard(lhs, LType::Number);
         if arg == ResumeArg::Matched {
-            arg = yield YieldOp::Guard(rhs, Ty::Int);
+            arg = yield YieldOp::Guard(rhs, LType::Number);
             if arg == ResumeArg::Matched {
+                // TODO: is_constant for kb/kc? yeah that's needed for constant type effects
                 yield YieldOp::Exec(ResidualExec("add_int_int", Rc::new(move |vals| {
                     // Safe bypass of runtime checks
-                    let RValue::Int(l) = vals[lhs] else { unreachable!() };
-                    let RValue::Int(r) = vals[rhs] else { unreachable!() };
-                    vals[dest] = RValue::Int(l + r);
+                    let LValue::Number(Number(l)) = vals[lhs] else { unreachable!() };
+                    let LValue::Number(Number(r)) = vals[rhs] else { unreachable!() };
+                    vals[dest] = LValue::Number(Number(l + r));
                 })));
-                return vec![(dest, Ty::Int)];
+                return vec![(dest, LType::Number)];
             }
         }
 
         // --- Str Path ---
-        arg = yield YieldOp::Guard(lhs, Ty::Str);
+        arg = yield YieldOp::Guard(lhs, LType::String);
         if arg == ResumeArg::Matched {
-            arg = yield YieldOp::Guard(rhs, Ty::Str);
+            arg = yield YieldOp::Guard(rhs, LType::String);
             if arg == ResumeArg::Matched {
                 yield YieldOp::Exec(ResidualExec("add_str_str", Rc::new(move |vals| {
-                    let RValue::Str(l) = &vals[lhs] else { unreachable!() };
-                    let RValue::Str(r) = &vals[rhs] else { unreachable!() };
-                    vals[dest] = RValue::Str(l.clone() + r);
+                    //let RValue::Str(l) = &vals[lhs] else { unreachable!() };
+                    //let RValue::Str(r) = &vals[rhs] else { unreachable!() };
+                    //vals[dest] = RValue::Str(l.clone() + r);
+                    unimplemented!()
                 })));
-                return vec![(dest, Ty::Str)];
+                return vec![(dest, LType::String)];
             }
         }
 
@@ -85,14 +83,14 @@ pub fn emit_add(dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg
     }
 }
 
-pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, Ty)>> + Clone + Unpin {
+pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, LType)>> + Clone + Unpin {
     #[coroutine]
     move |arg: ResumeArg| {
         yield YieldOp::Exec(ResidualExec("move", Rc::new(move |vals| {
             vals[dest] = vals[src].clone();
         })));
         // TODO: track references? see PyLBBV
-        return vec![(dest, Ty::Unknown)];
+        return vec![(dest, LType::Unknown)];
     }
 }
 
@@ -128,7 +126,7 @@ impl std::fmt::Debug for ThunkRef {
 
 #[derive(Debug, Clone)]
 pub enum Residual {
-    Guard { idx: usize, expected: Ty },
+    Guard { idx: usize, expected: LType },
     Exec(ResidualExec),
     Jump(BlockId),
     Thunk(ThunkRef),
@@ -138,7 +136,7 @@ pub enum Residual {
 pub struct Specializer<'src, 'intern> {
     pub clos: Tc<LClosure<'src, 'intern>>,
     pub blocks: Vec<Vec<Residual>>,
-    pub versions: HashMap<(SubPc, Vec<Ty>), BlockId>,
+    pub versions: HashMap<(SubPc, Vec<LType>), BlockId>,
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
@@ -150,7 +148,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    pub fn block(&mut self, owner: &TCellOwner<TcOwner>, entry: Pc, types: Vec<Ty>) -> BlockId {
+    pub fn block(&mut self, owner: &TCellOwner<TcOwner>, entry: Pc, types: Vec<LType>) -> BlockId {
         let mut pc = entry;
 
         let block_id = self.new_block();
@@ -169,11 +167,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         return inst;
     }
 
-    pub fn compile(&mut self, owner: &TCellOwner<TcOwner>, mut pc: Pc, mut types: Vec<Ty>, block_id: usize) -> Vec<Ty> {
+    pub fn compile(&mut self, owner: &TCellOwner<TcOwner>, mut pc: Pc, mut types: Vec<LType>, block_id: usize) -> Vec<LType> {
         loop {
             debug!("compile {pc}");
             let instruction = self.code(owner, pc).clone();
-            if let Some((next, ty)) = match instruction {
+            if let Some((next, ty)) = match instruction.0.Opcode() {
+                Opcode::ADD => { panic!() },
                 //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
                 //Operation::Ret => {
                 //    println!("ret");
@@ -195,18 +194,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks.len() - 1
     }
 
-    pub fn compile_one<C>(&mut self, orig_pc: SubPc, mut types: Vec<Ty>, mut coro: C, mut arg: ResumeArg, block_id: usize) -> Option<(Pc, Vec<Ty>)>
+    pub fn compile_one<C>(&mut self, mut pc: SubPc, mut types: Vec<LType>, mut coro: C, mut arg: ResumeArg, block_id: usize) -> Option<(Pc, Vec<LType>)>
     where
-        C: Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, Ty)>> + Clone + Unpin + 'static,
+        C: Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, LType)>> + Clone + Unpin + 'static,
     {
         loop {
             match Pin::new(&mut coro).resume(arg) {
                 CoroutineState::Yielded(YieldOp::Guard(idx, expected)) => {
                     if types[idx] == expected {
                         // Statically true: pump the success path
+                        pc = pc.next_true();
                         arg = ResumeArg::Matched;
-                    } else if types[idx] != Ty::Unknown {
+                    } else if types[idx] != LType::Unknown {
                         // Statically false: pump the fail path
+                        pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     } else {
                         // Dynamic branch: Fork the coroutine
@@ -216,7 +217,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         self.blocks[block_id].push(Residual::Guard { idx, expected: expected.clone() });
 
                         self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &TCellOwner<TcOwner>| {
-                            let fail_pc = orig_pc.next_false();
+                            let fail_pc = pc.next_false();
                             dbg!(fail_off);
                             // This executes only if the dynamic branch fails at runtime
                             println!("before compile_one");
@@ -241,7 +242,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let succ_coro = coro.clone();
                         let succ_off = fail_off + 1;
                         self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &TCellOwner<TcOwner>| {
-                            let succ_pc = orig_pc.next_true();
+                            let succ_pc = pc.next_true();
                             dbg!(succ_off);
                             // This executes only if the dynamic branch succeeds at runtime
                             let mut success_types = types.clone();
@@ -271,17 +272,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Complete(ty_effects) => {
                     for (idx, ty) in ty_effects {
                         if idx > types.len() {
-                            types.resize(idx + 1, Ty::Unknown);
+                            types.resize(idx + 1, LType::Unknown);
                         }
                         types[idx] = ty;
                     }
-                    return Some((orig_pc.0 + 1, types));
+                    return Some((pc.0 + 1, types));
                 }
             }
         }
     }
 
-    pub fn run(&mut self, owner: &TCellOwner<TcOwner>, mut id: BlockId, mut values: Vec<RValue>) -> Vec<RValue> {
+    pub fn run(&mut self, owner: &TCellOwner<TcOwner>, mut id: BlockId, mut values: Vec<LValue<'src, 'intern>>) -> Vec<LValue<'src, 'intern>> {
         let mut off = 0;
         loop {
             let block = &self.blocks[id];
@@ -318,7 +319,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 fn main() {
     let mut vm = Specializer { code, blocks: vec![], versions: HashMap::new() };
 
-    let dyn_types = vec![Ty::Unknown, Ty::Unknown, Ty::Unknown];
+    let dyn_types = vec![LType::Unknown, LType::Unknown, LType::Unknown];
     let dyn_block = vm.block(0, dyn_types);
     println!("{:?}", vm.blocks[dyn_block]);
 
