@@ -17,7 +17,7 @@ use internment::ArenaIntern;
 use qcell::{TCell, TCellOwner};
 
 use log::debug;
-use crate::generator::Specializer;
+use crate::generator::{Specializer, SubPc, BlockId};
 
 type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
 
@@ -94,17 +94,17 @@ impl From<u8> for Opcode {
     }
 }
 
-trait Instruction {
+pub trait InstructionDecode {
     type Unpack: Unpacker;
 }
 
-trait Unpacker {
+pub trait Unpacker {
     type Unpacked;
     #[inline(always)]
     fn unpack(inst: InstBits) -> Self::Unpacked;
 }
 
-struct AB;
+pub struct AB;
 impl Unpacker for AB {
     type Unpacked = (u8, u16); // A: 8, B: 9
     fn unpack(inst: InstBits) -> Self::Unpacked {
@@ -112,7 +112,7 @@ impl Unpacker for AB {
     }
 }
 
-struct ABx;
+pub struct ABx;
 impl Unpacker for ABx {
     type Unpacked = (u8, u32); // A: 8, Bx: 18
     fn unpack(inst: InstBits) -> Self::Unpacked {
@@ -120,7 +120,7 @@ impl Unpacker for ABx {
     }
 }
 
-struct ABC;
+pub struct ABC;
 impl Unpacker for ABC {
     type Unpacked = (u8, u16, u16); // A: 8, B: 9, C: 9
     fn unpack(inst: InstBits) -> Self::Unpacked {
@@ -128,7 +128,7 @@ impl Unpacker for ABC {
     }
 }
 
-struct sBx;
+pub struct sBx;
 impl Unpacker for sBx {
     type Unpacked = i32; // A: 8, B: 9, C: 9
     fn unpack(inst: InstBits) -> Self::Unpacked {
@@ -137,7 +137,7 @@ impl Unpacker for sBx {
     }
 }
 
-struct AsBx;
+pub struct AsBx;
 impl Unpacker for AsBx {
     type Unpacked = (u8, i32); // A: 8, sBx: 18
     fn unpack(inst: InstBits) -> Self::Unpacked {
@@ -148,73 +148,73 @@ impl Unpacker for AsBx {
 
 
 struct MOVE;
-impl Instruction for MOVE { type Unpack = AB; }
+impl InstructionDecode for MOVE { type Unpack = AB; }
 
 struct LOADNIL;
-impl Instruction for LOADNIL { type Unpack = AB; }
+impl InstructionDecode for LOADNIL { type Unpack = AB; }
 
 struct LOADBOOL;
-impl Instruction for LOADBOOL { type Unpack = ABC; }
+impl InstructionDecode for LOADBOOL { type Unpack = ABC; }
 
 struct GETUPVAL;
-impl Instruction for GETUPVAL{ type Unpack = AB; }
+impl InstructionDecode for GETUPVAL{ type Unpack = AB; }
 
 struct SETUPVAL;
-impl Instruction for SETUPVAL{ type Unpack = AB; }
+impl InstructionDecode for SETUPVAL{ type Unpack = AB; }
 
 struct LOADK;
-impl Instruction for LOADK { type Unpack = ABx; }
+impl InstructionDecode for LOADK { type Unpack = ABx; }
 
 struct RETURN;
-impl Instruction for RETURN { type Unpack = AB; }
+impl InstructionDecode for RETURN { type Unpack = AB; }
 
 struct CLOSURE;
-impl Instruction for CLOSURE { type Unpack = ABx; }
+impl InstructionDecode for CLOSURE { type Unpack = ABx; }
 
 struct SETGLOBAL;
-impl Instruction for SETGLOBAL { type Unpack = ABx; }
+impl InstructionDecode for SETGLOBAL { type Unpack = ABx; }
 
 struct CALL;
-impl Instruction for CALL { type Unpack = ABC; }
+impl InstructionDecode for CALL { type Unpack = ABC; }
 
 struct TEST;
-impl Instruction for TEST { type Unpack = ABC; }
+impl InstructionDecode for TEST { type Unpack = ABC; }
 
 struct EQ;
-impl Instruction for EQ { type Unpack = ABC; }
+impl InstructionDecode for EQ { type Unpack = ABC; }
 
 struct JMP;
-impl Instruction for JMP { type Unpack = sBx; }
+impl InstructionDecode for JMP { type Unpack = sBx; }
 
 struct NEWTABLE;
-impl Instruction for NEWTABLE { type Unpack = ABC; }
+impl InstructionDecode for NEWTABLE { type Unpack = ABC; }
 
 struct SELF;
-impl Instruction for SELF { type Unpack = ABC; }
+impl InstructionDecode for SELF { type Unpack = ABC; }
 
 struct GETTABLE;
-impl Instruction for GETTABLE { type Unpack = ABC; }
+impl InstructionDecode for GETTABLE { type Unpack = ABC; }
 
 struct SETTABLE;
-impl Instruction for SETTABLE { type Unpack = ABC; }
+impl InstructionDecode for SETTABLE { type Unpack = ABC; }
 
 struct SETLIST;
-impl Instruction for SETLIST { type Unpack = ABC; }
+impl InstructionDecode for SETLIST { type Unpack = ABC; }
 
 struct FORPREP;
-impl Instruction for FORPREP { type Unpack = AsBx; }
+impl InstructionDecode for FORPREP { type Unpack = AsBx; }
 
 struct FORLOOP;
-impl Instruction for FORLOOP { type Unpack = AsBx; }
+impl InstructionDecode for FORLOOP { type Unpack = AsBx; }
 
 struct LEN;
-impl Instruction for LEN { type Unpack = AB; }
+impl InstructionDecode for LEN { type Unpack = AB; }
 
 struct CONCAT;
-impl Instruction for CONCAT { type Unpack = ABC; }
+impl InstructionDecode for CONCAT { type Unpack = ABC; }
 
 struct UNM;
-impl Instruction for UNM { type Unpack = AB; }
+impl InstructionDecode for UNM { type Unpack = AB; }
 
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Hash)]
@@ -760,6 +760,7 @@ pub struct LClosure<'src, 'intern> {
     pub prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
     upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
+    pub versions: HashMap<(SubPc, Vec<LType>), BlockId>,
 }
 
 impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
@@ -784,6 +785,7 @@ impl<'src, 'intern> LClosure<'src, 'intern> {
         Self {
             prototype,
             upvalues: vec![].into(),
+            versions: Default::default(),
         }
     }
 }
@@ -891,7 +893,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         })
     }
 
-    fn rk<'exec>(proto: *const FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'exec FVec<LValue<'src, 'intern>>, r: u16)
+    pub fn rk<'exec>(proto: *const FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'exec FVec<LValue<'src, 'intern>>, r: u16)
         -> Result<&'exec LConstant<'src, 'intern>, &'exec LValue<'src, 'intern>>
     {
         if (r & 0x100)!=0 {
@@ -948,12 +950,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             debug!("stack: {}, {:?}", base, &vals);
             match inst.0.Opcode() {
                 Opcode::MOVE => {
-                    let (a, b) = <MOVE as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b) = <MOVE as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("move {} {}", a, b);
                     vals[base + a as usize] = vals[base + b as usize].clone();
                 },
                 Opcode::GETUPVAL => {
-                    let (a, b) = <GETUPVAL as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b) = <GETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
                     let upval = match clos.ro(owner).upvalues[b as usize].borrow().deref() {
                         Upvalue::Open(o) => {
                             vals[*o as usize].clone()
@@ -965,7 +967,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     vals[base + a as usize] = upval.clone();
                 },
                 Opcode::SETUPVAL => {
-                    let (a, b) = <SETUPVAL as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b) = <SETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
                     let upval = match clos.ro(owner).upvalues[b as usize].borrow().deref() {
                         Upvalue::Open(o) => {
                             vals[*o as usize] = vals[base + a as usize].clone()
@@ -976,18 +978,18 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                 },
                 Opcode::LOADK => {
-                    let (a, bx) = <LOADK as Instruction>::Unpack::unpack(inst.0);
+                    let (a, bx) = <LOADK as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("loadk {} {} {:?}", a, bx, unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] });
                     vals[base + a as usize] = unsafe { (&(&(*clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
                     ()
                 },
                 Opcode::LOADNIL => {
-                    let (a, b) = <LOADNIL as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b) = <LOADNIL as InstructionDecode>::Unpack::unpack(inst.0);
                     vals[base + a as usize..=base + b as usize].iter_mut().for_each(|i| *i = LValue::Nil);
                     ()
                 },
                 Opcode::LOADBOOL => {
-                    let (a, b, c) = <LOADBOOL as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b, c) = <LOADBOOL as InstructionDecode>::Unpack::unpack(inst.0);
                     vals[base + a as usize] = LValue::Bool(b != 0);
                     if c != 0 {
                         pc += 1;
@@ -995,12 +997,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     ()
                 },
                 Opcode::NEWTABLE => {
-                    let (a, b, c) = <NEWTABLE as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
                     vals[base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
                 },
                 Opcode::SELF => {
-                    let (a, b, c) = <SELF as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);
                     let rb = vals[base + b as usize].clone();
                     vals[base + a as usize] = rb.clone();
                     let kc = match Self::rk(clos.ro(owner).prototype, base, &vals, c) {
@@ -1011,7 +1013,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     vals[base + a as usize + 1] = res;
                 },
                 Opcode::SETLIST => {
-                    let (a, b, c) = <SETLIST as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b, c) = <SETLIST as InstructionDecode>::Unpack::unpack(inst.0);
                     match vals[base + a as usize].clone() {
                         LValue::Table(tab) => {
                             assert_ne!(c, 0);
@@ -1033,7 +1035,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     }
                 },
                 Opcode::GETTABLE => {
-                    let (a, b, c) = <GETTABLE as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b, c) = <GETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("gettable {} {} {}", a, b, c);
                     let kc = match Self::rk(clos.ro(owner).prototype, base, &vals, c) {
                         Ok(c) => Cow::Owned(LValue::from(c)),
@@ -1044,7 +1046,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     vals[base + a as usize] = val_b.gettable(owner, kc);
                 },
                 Opcode::SETTABLE => {
-                    let (a, b, c) = <SETTABLE as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b, c) = <SETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("settable {} {} {}", a, b, c);
                     let kb = match Self::rk(clos.ro(owner).prototype, base, &vals, b) {
                         Ok(b) => b.into(),
@@ -1063,20 +1065,20 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                 },
                 Opcode::SETGLOBAL => {
-                    let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
+                    let (a, bx) = <SETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
                     let kst = unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("setglobal {} {} {:?}", a, bx, &kst);
                     _G.set(owner, kst.into(), vals[base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
-                    let (a, bx) = <SETGLOBAL as Instruction>::Unpack::unpack(inst.0);
+                    let (a, bx) = <SETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
                     let kst = unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
                     vals[base + a as usize] = _G.get(owner, &kst.into()).unwrap_or((&Constant::Nil).into()).clone();
                 },
                 Opcode::TEST => {
-                    let (a, _, c) = <TEST as Instruction>::Unpack::unpack(inst.0);
+                    let (a, _, c) = <TEST as InstructionDecode>::Unpack::unpack(inst.0);
                     if let LValue::Bool(b) = (vals[base + a as usize].as_bool(owner)?) && (b as u16) == c {
                         pc += 1;
                     }
@@ -1151,7 +1153,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     vals[base + a as usize] = res;
                 },
                 Opcode::UNM => {
-                    let (a, b) = <UNM as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b) = <UNM as InstructionDecode>::Unpack::unpack(inst.0);
                     let res = match &vals[base + b as usize] {
                         // TODO: metatables
                         LValue::Number(n) => LValue::Number(Number(-n.0)),
@@ -1160,12 +1162,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     vals[base + a as usize] = res;
                 },
                 Opcode::LEN => {
-                    let (a, b) = <LEN as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b) = <LEN as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
                     vals[base + a as usize] = vals[base + b as usize].len(owner)?;
                 },
                 Opcode::CONCAT => {
-                    let (a, b, c) = <CONCAT as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b, c) = <CONCAT as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
                     let mut s = FVec::new();
                     for i in (b as usize)..=(c as usize) {
@@ -1175,14 +1177,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     vals[base + a as usize] = LValue::OwnedString(Rc::new(s));
                 },
                 Opcode::FORPREP => {
-                    let (a, sbx) = <FORPREP as Instruction>::Unpack::unpack(inst.0);
+                    let (a, sbx) = <FORPREP as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, sbx);
                     vals[base + a as usize] =
                         vals[base + a as usize].numeric_op(Opcode::SUB, &vals[base + a as usize + 2]).unwrap();
                     pc += sbx as usize;
                 },
                 Opcode::FORLOOP => {
-                    let (a, sbx) = <FORLOOP as Instruction>::Unpack::unpack(inst.0);
+                    let (a, sbx) = <FORLOOP as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, sbx);
                     let step = vals[base + a as usize + 2].clone();
                     let idx = vals[base + a as usize].numeric_op(Opcode::ADD, &step).unwrap();
@@ -1200,12 +1202,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::JMP => {
                     debug!("{:?}", inst.0);
-                    let sbx = <JMP as Instruction>::Unpack::unpack(inst.0);
+                    let sbx = <JMP as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{}", sbx);
                     pc += sbx as usize;
                 },
                 Opcode::CLOSURE => {
-                    let (a, bx) = <CLOSURE as Instruction>::Unpack::unpack(inst.0);
+                    let (a, bx) = <CLOSURE as InstructionDecode>::Unpack::unpack(inst.0);
                     let proto = unsafe { &(&(*clos.ro(owner).prototype).prototypes.items)[bx as usize] };
                     debug!("{} {} {:?}", a, bx, proto);
                     // handle the MOVE/GETUPVALUE pseudoinstructions
@@ -1215,7 +1217,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             let pseudo = unsafe { (&(*clos.ro(owner).prototype).instructions.items)[pc+upval as usize] };
                             let label = match pseudo.0.Opcode() {
                                 Opcode::MOVE => {
-                                    let (_, b) = <MOVE as Instruction>::Unpack::unpack(pseudo.0);
+                                    let (_, b) = <MOVE as InstructionDecode>::Unpack::unpack(pseudo.0);
                                     // we can't just copy vals[b], because we need
                                     // to reference the stack slot not the value.
                                     // instead we reference the stack slot, and add
@@ -1229,7 +1231,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                     "move"
                                 },
                                 Opcode::GETUPVAL => {
-                                    let (_, b) = <GETUPVAL as Instruction>::Unpack::unpack(pseudo.0);
+                                    let (_, b) = <GETUPVAL as InstructionDecode>::Unpack::unpack(pseudo.0);
                                     // the upvalue already exists in our current
                                     // scope. add ourselves to the existing
                                     // use list.
@@ -1248,7 +1250,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     vals[base + a as usize] = LValue::LClosure(Tc::new(fresh));
                 },
                 Opcode::CALL => {
-                    let (a, b, c) = <CALL as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b, c) = <CALL as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {} {}", a, b, c);
                     let to_call = &vals[base + a as usize];
                     debug!("{:?}", to_call);
@@ -1263,6 +1265,19 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         vals.extend_from_slice(
                             vec![LValue::Nil; next_stack].as_slice());
                         pc = 0;
+
+                        // Lazy basic block versioning
+                        let types = vec![LType::Unknown; next_stack];
+                        let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(pc), types.clone())) {
+                            *block
+                        } else {
+                            spec.set_current(lclos.clone());
+                            spec.block(owner, 0, types)
+                        };
+                        debug!("{:?} {block}", spec.blocks);
+                        spec.run(owner, block, vals[base..].to_vec());
+                        // TODO: run the block
+
                     } else if let LValue::NClosure(ncall) = to_call {
                         let args = if b == 0 {
                             &vals[base + a as usize+1..]
@@ -1294,7 +1309,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     self.close_upvalues(&mut upvals, &vals);
                     upvals = vec![].into();
 
-                    let (a, b) = <RETURN as Instruction>::Unpack::unpack(inst.0);
+                    let (a, b) = <RETURN as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
                     let mut r_count = 0 as usize;
                     let mut r_vals: FVec<_> = if b == 1 {
