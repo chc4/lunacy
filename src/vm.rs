@@ -923,6 +923,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
     }
 
+
     pub fn run<'lua>(&'lua self,
         owner: &mut TCellOwner<TcOwner>,
         mut _G: Tc<Table<'src, 'intern>>,
@@ -932,99 +933,121 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         -> Result<FVec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
+        struct RunState<'src, 'intern> {
+            base: usize,
+            pc: usize,
+            _G: Tc<Table<'src, 'intern>>,
+            clos: Tc<LClosure<'src, 'intern>>,
+            vals: FVec<LValue<'src, 'intern>>,
+            upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
+            spec: Specializer<'src, 'intern>,
+        }
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LValue::Nil);
-        let mut vals = args;
-        let mut upvals: FVec<(Upvalue, FVec<Gc<Upvalue>>)> = vec![].into();
-        let mut base = 0;
-        let mut pc = 0;
-        let mut spec = Specializer::new(clos.clone());
+
+        let mut state = {
+            let mut vals = args;
+            let mut upvals: FVec<(Upvalue, FVec<Gc<Upvalue>>)> = vec![].into();
+            let mut base = 0;
+            let mut pc = 0;
+            let mut spec = Specializer::new(clos.clone());
+
+            RunState {
+                base,
+                pc,
+                _G,
+                clos,
+                vals,
+                upvals,
+                spec,
+            }
+        };
         // we need to track where to return to, along with the base pointer and where to put return
         // values
         let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize, usize)> = vec![].into();
         let r_vals = 'int: loop {
-            let inst = unsafe { clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc] };
-            pc += 1;
-            debug!("pc {} inst {:?}", pc, inst.0.Opcode());
-            debug!("stack: {}, {:?}", base, &vals);
+            let inst = unsafe { state.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[state.pc] };
+            state.pc += 1;
+            debug!("pc {} inst {:?}", state.pc, inst.0.Opcode());
+            debug!("stack: {}, {:?}", state.base, &state.vals);
             match inst.0.Opcode() {
                 Opcode::MOVE => {
                     let (a, b) = <MOVE as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("move {} {}", a, b);
-                    vals[base + a as usize] = vals[base + b as usize].clone();
+                    state.vals[state.base + a as usize] = state.vals[state.base + b as usize].clone();
                 },
                 Opcode::GETUPVAL => {
                     let (a, b) = <GETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let upval = match clos.ro(owner).upvalues[b as usize].borrow().deref() {
+                    let upval = match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
                         Upvalue::Open(o) => {
-                            vals[*o as usize].clone()
+                            state.vals[*o as usize].clone()
                         },
                         Upvalue::Closed(c) => {
                             c.borrow().clone()
                         },
                     };
-                    vals[base + a as usize] = upval.clone();
+                    state.vals[state.base + a as usize] = upval.clone();
                 },
                 Opcode::SETUPVAL => {
                     let (a, b) = <SETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let upval = match clos.ro(owner).upvalues[b as usize].borrow().deref() {
+                    let upval = match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
                         Upvalue::Open(o) => {
-                            vals[*o as usize] = vals[base + a as usize].clone()
+                            state.vals[*o as usize] = state.vals[state.base + a as usize].clone()
                         },
                         Upvalue::Closed(c) => {
-                            *c.borrow_mut() = vals[base + a as usize].clone()
+                            *c.borrow_mut() = state.vals[state.base + a as usize].clone()
                         },
                     };
                 },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] });
-                    vals[base + a as usize] = unsafe { (&(&(*clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] });
+                    state.vals[state.base + a as usize] = unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
                     ()
                 },
                 Opcode::LOADNIL => {
                     let (a, b) = <LOADNIL as InstructionDecode>::Unpack::unpack(inst.0);
-                    vals[base + a as usize..=base + b as usize].iter_mut().for_each(|i| *i = LValue::Nil);
+                    state.vals[state.base + a as usize..=state.base + b as usize].iter_mut().for_each(|i| *i = LValue::Nil);
                     ()
                 },
                 Opcode::LOADBOOL => {
                     let (a, b, c) = <LOADBOOL as InstructionDecode>::Unpack::unpack(inst.0);
-                    vals[base + a as usize] = LValue::Bool(b != 0);
+                    state.vals[state.base + a as usize] = LValue::Bool(b != 0);
                     if c != 0 {
-                        pc += 1;
+                        state.pc += 1;
                     }
                     ()
                 },
                 Opcode::NEWTABLE => {
                     let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
-                    vals[base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
+                    state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
                 },
                 Opcode::SELF => {
                     let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);
-                    let rb = vals[base + b as usize].clone();
-                    vals[base + a as usize] = rb.clone();
-                    let kc = match Self::rk(clos.ro(owner).prototype, base, &vals, c) {
+                    let rb = state.vals[state.base + b as usize].clone();
+                    state.vals[state.base + a as usize] = rb.clone();
+                    let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
                         Ok(c) => Cow::Owned(LValue::from(c)),
                         Err(lv) => Cow::Borrowed(lv),
                     };
                     let res = rb.gettable(owner, kc);
-                    vals[base + a as usize + 1] = res;
+                    state.vals[state.base + a as usize + 1] = res;
                 },
                 Opcode::SETLIST => {
                     let (a, b, c) = <SETLIST as InstructionDecode>::Unpack::unpack(inst.0);
-                    match vals[base + a as usize].clone() {
+                    match state.vals[state.base + a as usize].clone() {
                         LValue::Table(tab) => {
                             assert_ne!(c, 0);
                             if b == 0 {
-                                let src = vals[base + a as usize+1..].iter().cloned();
+                                let src = state.vals[state.base + a as usize+1..].iter().cloned();
                                 tab.rw(owner).array.splice(
                                     (c as usize-1)*50..,
                                     src
                                 ).for_each(drop);
                             } else {
-                                let src = vals[base + a as usize+1..=base + a as usize+b as usize as usize].iter().cloned();
+                                let src = state.vals[state.base + a as usize+1..=state.base + a as usize+b as usize as usize].iter().cloned();
                                 tab.rw(owner).array.splice(
                                     (c as usize-1)*50..,
                                     src
@@ -1037,27 +1060,27 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::GETTABLE => {
                     let (a, b, c) = <GETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("gettable {} {} {}", a, b, c);
-                    let kc = match Self::rk(clos.ro(owner).prototype, base, &vals, c) {
+                    let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
                         Ok(c) => Cow::Owned(LValue::from(c)),
                         Err(lv) => Cow::Borrowed(lv),
                     };
                     debug!("gettable {:?}", &kc);
-                    let val_b = vals[base + b as usize].clone();
-                    vals[base + a as usize] = val_b.gettable(owner, kc);
+                    let val_b = state.vals[state.base + b as usize].clone();
+                    state.vals[state.base + a as usize] = val_b.gettable(owner, kc);
                 },
                 Opcode::SETTABLE => {
                     let (a, b, c) = <SETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("settable {} {} {}", a, b, c);
-                    let kb = match Self::rk(clos.ro(owner).prototype, base, &vals, b) {
+                    let kb = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b) {
                         Ok(b) => b.into(),
                         Err(lv) => lv.clone(),
                     };
                     debug!("settable {:?}", &kb);
-                    let kc = match Self::rk(clos.ro(owner).prototype, base, &vals, c) {
+                    let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
                         Ok(c) => c.into(),
                         Err(lv) => lv.clone(),
                     };
-                    match &mut vals[base + a as usize] {
+                    match &mut state.vals[state.base + a as usize] {
                         LValue::Table(tab) => {
                             tab.set(owner, kb, kc)
                         },
@@ -1066,28 +1089,28 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] };
+                    let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("setglobal {} {} {:?}", a, bx, &kst);
-                    _G.set(owner, kst.into(), vals[base + a as usize].clone());
+                    state._G.set(owner, kst.into(), state.vals[state.base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(&(*clos.ro(owner).prototype).constants.items)[bx as usize] };
+                    let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
-                    vals[base + a as usize] = _G.get(owner, &kst.into()).unwrap_or((&Constant::Nil).into()).clone();
+                    state.vals[state.base + a as usize] = state._G.get(owner, &kst.into()).unwrap_or((&Constant::Nil).into()).clone();
                 },
                 Opcode::TEST => {
                     let (a, _, c) = <TEST as InstructionDecode>::Unpack::unpack(inst.0);
-                    if let LValue::Bool(b) = (vals[base + a as usize].as_bool(owner)?) && (b as u16) == c {
-                        pc += 1;
+                    if let LValue::Bool(b) = (state.vals[state.base + a as usize].as_bool(owner)?) && (b as u16) == c {
+                        state.pc += 1;
                     }
                 },
                 opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);
                     debug!("numeric op {} {}", b, c);
-                    let kb = Self::rk(clos.ro(owner).prototype, base, &vals, b);
-                    let kc = Self::rk(clos.ro(owner).prototype, base, &vals, c);
+                    let kb = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b);
+                    let kc = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c);
                     debug!("{:?} {:?}", &kb, &kc);
                     let cond = match (opcode, kb, kc) {
                         (Opcode::EQ, Ok(const_b), Ok(const_c)) => const_b == const_c,
@@ -1111,15 +1134,15 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                     debug!("cond {} {}", cond, a);
                     if (cond as u8) != a {
-                        pc += 1;
+                        state.pc += 1;
                     }
                 },
                 opcode @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW)
                 => {
                     let (a, b, c) = ABC::unpack(inst.0);
                     debug!("{} {} {}", a, b, c);
-                    let kb = Self::rk(clos.ro(owner).prototype, base, &vals, b);
-                    let kc = Self::rk(clos.ro(owner).prototype, base, &vals, c);
+                    let kb = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b);
+                    let kc = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c);
                     debug!("{:?} {:?}", &kb, &kc);
                     let res = match (opcode, kb, kc) {
                         (Opcode::ADD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
@@ -1150,71 +1173,71 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         _ => unimplemented!(),
                     };
                     debug!("res {:?}", &res);
-                    vals[base + a as usize] = res;
+                    state.vals[state.base + a as usize] = res;
                 },
                 Opcode::UNM => {
                     let (a, b) = <UNM as InstructionDecode>::Unpack::unpack(inst.0);
-                    let res = match &vals[base + b as usize] {
+                    let res = match &state.vals[state.base + b as usize] {
                         // TODO: metatables
                         LValue::Number(n) => LValue::Number(Number(-n.0)),
                         _ => unimplemented!(),
                     };
-                    vals[base + a as usize] = res;
+                    state.vals[state.base + a as usize] = res;
                 },
                 Opcode::LEN => {
                     let (a, b) = <LEN as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
-                    vals[base + a as usize] = vals[base + b as usize].len(owner)?;
+                    state.vals[state.base + a as usize] = state.vals[state.base + b as usize].len(owner)?;
                 },
                 Opcode::CONCAT => {
                     let (a, b, c) = <CONCAT as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
                     let mut s = FVec::new();
                     for i in (b as usize)..=(c as usize) {
-                        s.extend_from_slice(&vals[base + i as usize].as_string(owner).ok_or("nil concat")?)
+                        s.extend_from_slice(&state.vals[state.base + i as usize].as_string(owner).ok_or("nil concat")?)
                     }
                     debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-                    vals[base + a as usize] = LValue::OwnedString(Rc::new(s));
+                    state.vals[state.base + a as usize] = LValue::OwnedString(Rc::new(s));
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = <FORPREP as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, sbx);
-                    vals[base + a as usize] =
-                        vals[base + a as usize].numeric_op(Opcode::SUB, &vals[base + a as usize + 2]).unwrap();
-                    pc += sbx as usize;
+                    state.vals[state.base + a as usize] =
+                        state.vals[state.base + a as usize].numeric_op(Opcode::SUB, &state.vals[state.base + a as usize + 2]).unwrap();
+                    state.pc += sbx as usize;
                 },
                 Opcode::FORLOOP => {
                     let (a, sbx) = <FORLOOP as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, sbx);
-                    let step = vals[base + a as usize + 2].clone();
-                    let idx = vals[base + a as usize].numeric_op(Opcode::ADD, &step).unwrap();
-                    vals[base + a as usize] = idx.clone();
-                    let limit = vals[base + a as usize + 1].clone();
+                    let step = state.vals[state.base + a as usize + 2].clone();
+                    let idx = state.vals[state.base + a as usize].numeric_op(Opcode::ADD, &step).unwrap();
+                    state.vals[state.base + a as usize] = idx.clone();
+                    let limit = state.vals[state.base + a as usize + 1].clone();
                     let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0))))? {
                         limit.compare(Opcode::LE, idx.clone())
                     } else {
                         idx.clone().compare(Opcode::LE, limit)
                     };
                     if comp? {
-                        pc = (pc as isize + sbx as isize) as usize;
-                        vals[base + a as usize + 3] = idx;
+                        state.pc = (state.pc as isize + sbx as isize) as usize;
+                        state.vals[state.base + a as usize + 3] = idx;
                     }
                 },
                 Opcode::JMP => {
                     debug!("{:?}", inst.0);
                     let sbx = <JMP as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{}", sbx);
-                    pc += sbx as usize;
+                    state.pc += sbx as usize;
                 },
                 Opcode::CLOSURE => {
                     let (a, bx) = <CLOSURE as InstructionDecode>::Unpack::unpack(inst.0);
-                    let proto = unsafe { &(&(*clos.ro(owner).prototype).prototypes.items)[bx as usize] };
+                    let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx as usize] };
                     debug!("{} {} {:?}", a, bx, proto);
                     // handle the MOVE/GETUPVALUE pseudoinstructions
                     let mut fresh = LClosure::new(proto as *const _);
                     {
                         for upval in 0..proto.upval_count {
-                            let pseudo = unsafe { (&(*clos.ro(owner).prototype).instructions.items)[pc+upval as usize] };
+                            let pseudo = unsafe { (&(*state.clos.ro(owner).prototype).instructions.items)[state.pc+upval as usize] };
                             let label = match pseudo.0.Opcode() {
                                 Opcode::MOVE => {
                                     let (_, b) = <MOVE as InstructionDecode>::Unpack::unpack(pseudo.0);
@@ -1227,7 +1250,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                     let fresh_upval = Upvalue::Open(b as usize);
                                     let fresh_use = Gc::new(fresh_upval.clone());
                                     fresh.upvalues.push(fresh_use.clone());
-                                    upvals.push((fresh_upval, vec![fresh_use].into()));
+                                    state.upvals.push((fresh_upval, vec![fresh_use].into()));
                                     "move"
                                 },
                                 Opcode::GETUPVAL => {
@@ -1235,66 +1258,66 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                     // the upvalue already exists in our current
                                     // scope. add ourselves to the existing
                                     // use list.
-                                    let fresh_use = Gc::new(upvals[b as usize].clone().0);
+                                    let fresh_use = Gc::new(state.upvals[b as usize].clone().0);
                                     fresh.upvalues.push(fresh_use.clone());
-                                    upvals[b as usize].1.push(fresh_use);
+                                    state.upvals[b as usize].1.push(fresh_use);
                                     "getupvval"
                                 },
                                 _ => panic!(),
                             };
                             debug!("pseudo: {:?} ({})", pseudo, label);
                         }
-                        pc += proto.upval_count as usize;
+                        state.pc += proto.upval_count as usize;
                         //assert_eq!(proto.upval_count, 0);
                     }
-                    vals[base + a as usize] = LValue::LClosure(Tc::new(fresh));
+                    state.vals[state.base + a as usize] = LValue::LClosure(Tc::new(fresh));
                 },
                 Opcode::CALL => {
                     let (a, b, c) = <CALL as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {} {}", a, b, c);
-                    let to_call = &vals[base + a as usize];
+                    let to_call = &state.vals[state.base + a as usize];
                     debug!("{:?}", to_call);
                     // push where to return to once we RETURN
                     if let LValue::LClosure(ref lclos) = to_call.clone() {
                         // record call stack: we say where to return to and where to put the values
-                        callstack.push((clos.clone(), pc, base, vals.len(), base + a as usize));
-                        clos = lclos.clone();
+                        callstack.push((state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize));
+                        state.clos = lclos.clone();
                         let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
-                        base = base + a as usize + 1;
+                        state.base = state.base + a as usize + 1;
                         // push empty stack frame
-                        vals.extend_from_slice(
+                        state.vals.extend_from_slice(
                             vec![LValue::Nil; next_stack].as_slice());
-                        pc = 0;
+                        state.pc = 0;
 
                         // Lazy basic block versioning
                         let types = vec![LType::Unknown; next_stack];
-                        let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(pc), types.clone())) {
+                        let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(state.pc), types.clone())) {
                             *block
                         } else {
-                            spec.set_current(lclos.clone());
-                            spec.block(owner, 0, types)
+                            state.spec.set_current(lclos.clone());
+                            state.spec.block(owner, 0, types)
                         };
-                        debug!("{:?} {block}", spec.blocks);
-                        spec.run(owner, block, vals[base..].to_vec());
+                        debug!("{:?} {block}", state.spec.blocks);
+                        state.spec.run(owner, block, state.vals[state.base..].to_vec());
                         // TODO: run the block
 
                     } else if let LValue::NClosure(ncall) = to_call {
                         let args = if b == 0 {
-                            &vals[base + a as usize+1..]
+                            &state.vals[state.base + a as usize+1..]
                         } else {
-                            &vals[base + a as usize+1..=(base + a as usize + b as usize - 1)]
+                            &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
                         };
                         debug!("{:?}", args);
                         let mut native = ncall.rw(owner).native.clone();
                         let ret = (native)(args, owner);
                         if c == 0 {
                             // save all returned
-                            vals.splice(base + a as usize.., ret).for_each(drop);
+                            state.vals.splice(state.base + a as usize.., ret).for_each(drop);
                         }
                         else if c == 1 {
                             // nothing saved
                         } else if c != 1 {
-                            vals.splice(base + a as usize..base + a as usize + c as usize - 2, ret).for_each(drop);
+                            state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, ret).for_each(drop);
                         } else {
                             unimplemented!()
                         }
@@ -1306,8 +1329,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::RETURN => {
                     // we're going to be removing this frame, so close any open
                     // upvalues.
-                    self.close_upvalues(&mut upvals, &vals);
-                    upvals = vec![].into();
+                    self.close_upvalues(&mut state.upvals, &state.vals);
+                    state.upvals = vec![].into();
 
                     let (a, b) = <RETURN as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
@@ -1318,12 +1341,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     } else if b >= 2 {
                         // there are b-1 return values from R(A) onwards
                         r_count = b as usize-1;
-                        let r_vals = &vals[base + a as usize..(base + a as usize + r_count as usize)];
+                        let r_vals = &state.vals[state.base + a as usize..(state.base + a as usize + r_count as usize)];
                         debug!("{:?}", r_vals);
                         Vec::from(r_vals).into()
                     } else if b == 0 {
                         // return all values from R(A) to the ToS
-                        let r_vals = &vals[base + a as usize..];
+                        let r_vals = &state.vals[state.base + a as usize..];
                         r_count = r_vals.len() as usize;
                         debug!("{:?}", r_vals);
                         Vec::from(r_vals).into()
@@ -1331,18 +1354,18 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         unreachable!()
                     };
                     if let Some((ret_clos, caller, frame, limit, ret)) = callstack.pop() {
-                        debug!("{} {:?} {:?}", base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller);
-                        clos = ret_clos.clone();
+                        debug!("{} {:?} {:?}", state.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller);
+                        state.clos = ret_clos.clone();
                         // copy the return values to the previous frame's return location,
                         // then clean up the popped stack frame
-                        base = frame;
-                        let parent_stack = unsafe { (*clos.ro(owner).prototype).max_stack as usize };
+                        state.base = frame;
+                        let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
                         //vals.extend_from_slice(r_vals.as_slice());
                         for (i, v) in r_vals.drain(..).enumerate() {
-                            vals[ret + i] = v;
+                            state.vals[ret + i] = v;
                         }
-                        vals.truncate(limit);
-                        pc = caller;
+                        state.vals.truncate(limit);
+                        state.pc = caller;
                     } else {
                         break 'int r_vals;
                     }
