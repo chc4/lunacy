@@ -35,9 +35,14 @@ impl std::fmt::Debug for ResidualExec {
 
 #[derive(Clone)]
 pub enum YieldOp {
-    Guard(usize, LType),
-    GuardRk(usize, LType),
-    Exec(ResidualExec),
+    Typeof(usize), // Resumed with the type of STACK[idx]
+    Guard(usize, LType), // Resumed with either Matched or Failed if STACK[idx] is the expected
+                         // type
+    GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
+                           // is the expected type
+    Exec(ResidualExec), // Emit a residual operation that will be executed
+    SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
+    Jump(usize), // Emit a jump to the given PC, potentially specializing the block if needed.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,9 +50,26 @@ pub enum ResumeArg {
     Start,
     Matched,
     Failed,
+    Type(LType),
 }
 
-pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, LType)>> + Clone + Unpin {
+pub fn emit_loadk(bx: usize, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        match c {
+            LType::Number => {
+                yield YieldOp::Exec(ResidualExec("loadk_number", Rc::new(move |owner, clos, vals| {
+                    vals[dest] = unsafe { (&(&(*clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                })));
+                yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+            },
+            _ => unreachable!(),
+        }
+    }
+}
+
+
+pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         // --- Int Path ---
@@ -92,7 +114,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     debug!("res {:?}", &res);
                     vals[dest as usize] = res;
                 })));
-                return vec![(dest, LType::Number)];
+                yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+                return;
             }
         }
 
@@ -107,7 +130,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     //vals[dest] = RValue::Str(l.clone() + r);
                     unimplemented!()
                 })));
-                return vec![(dest, LType::String)];
+                yield YieldOp::SetTypes(vec![(dest, LType::String)]);
+                return;
             }
         }
 
@@ -116,14 +140,37 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
     }
 }
 
-pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, LType)>> + Clone + Unpin {
+pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin {
     #[coroutine]
-    move |arg: ResumeArg| {
-        yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, clos, vals| {
-            vals[dest] = vals[src].clone();
-        })));
-        // TODO: track references? see PyLBBV
-        return vec![(dest, LType::Unknown)];
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Typeof(src);
+        if let ResumeArg::Type(t) = arg {
+            yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, clos, vals| {
+                vals[dest] = vals[src].clone();
+            })));
+            // TODO: track references? see PyLBBV
+            debug!("move {} = {} {:?}", dest, src, t);
+            yield YieldOp::SetTypes(vec![(dest, t)]);
+        } else {
+            unreachable!();
+        }
+    }
+}
+
+pub fn emit_forprep(a: usize, sbx: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        debug!("forprep {a} {sbx} {pc}");
+        let mut sub = emit_numeric(Opcode::SUB, a, a, a + 2);
+        // TODO: define a macro that does this
+        loop {
+            let state = Pin::new(&mut sub).resume(arg);
+            match state {
+                CoroutineState::Yielded(y) => arg = yield y,
+                CoroutineState::Complete(()) => break,
+            }
+        }
+        yield YieldOp::Jump(pc + sbx as usize);
     }
 }
 
@@ -191,21 +238,34 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     pub fn compile(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut types: Vec<LType>, block_id: usize) -> Vec<LType> {
         loop {
-            let instruction = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
-            debug!("compile {pc} {:?} {:?}", instruction.0.Opcode(), types);
-            if let Some((next, ty)) = match instruction.0.Opcode() {
+            let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
+            debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), types);
+            if let Some((next, ty)) = match inst.0.Opcode() {
                 op @ Opcode::ADD => {
-                    let (a, b, c) = crate::vm::ABC::unpack(instruction.0);
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), emit_numeric(op, a as usize, b as usize, c as usize), ResumeArg::Start, block_id);
-                    Some((pc + 1, types.clone()))
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), emit_numeric(op, a as usize, b as usize, c as usize), ResumeArg::Start, block_id)
+                },
+                Opcode::LOADK => {
+                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                    let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), emit_loadk(bx as usize, typeof_(&c), a as usize), ResumeArg::Start, block_id)
+                },
+                Opcode::MOVE => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    debug!("move {} {}", a, b);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), emit_move(a as usize, b as usize), ResumeArg::Start, block_id)
+                },
+                Opcode::FORPREP => {
+                    let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), emit_forprep(a as usize, sbx as usize, pc), ResumeArg::Start, block_id)
                 },
                 //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
                 Opcode::RETURN => {
                     println!("ret");
                     self.blocks[block_id].push(Residual::Ret); None
                 },
-                _ => { Some((pc + 1, types.clone())) },
+                _ => unreachable!(),
             } {
                 pc = next;
                 types = ty;
@@ -223,11 +283,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut types: Vec<LType>, mut coro: C, mut arg: ResumeArg, block_id: usize) -> Option<(Pc, Vec<LType>)>
     where
-        C: Coroutine<ResumeArg, Yield = YieldOp, Return = Vec<(usize, LType)>> + Clone + Unpin + 'static,
+        C: Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin + 'static,
     {
         loop {
             let mut state = Pin::new(&mut coro).resume(arg);
             'machine: loop { match state {
+                CoroutineState::Yielded(YieldOp::Typeof(idx)) => {
+                    arg = ResumeArg::Type(types[idx]);
+                },
                 CoroutineState::Yielded(YieldOp::GuardRk(rk, ref expected)) => {
                     let proto = self.clos.ro(owner).prototype;
                     if (rk & 0x100)!=0 {
@@ -328,13 +391,27 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id].push(Residual::Exec(func));
                     // In a real VM, transition to the next PC generator here.
                 }
-                CoroutineState::Complete(ty_effects) => {
+                CoroutineState::Yielded(YieldOp::SetTypes(ty_effects)) => {
                     for (idx, ty) in ty_effects {
                         if idx > types.len() {
                             types.resize(idx + 1, LType::Unknown);
                         }
                         types[idx] = ty;
                     }
+                },
+                CoroutineState::Yielded(YieldOp::Jump(dest)) => {
+                    if let Some(exists) = self.clos.ro(owner).versions.get(&(SubPc::new(dest), types.clone())) {
+                        debug!("jump exist {exists}");
+                        self.blocks[block_id].push(Residual::Jump(*exists));
+                    } else {
+                        let fresh = self.new_block();
+                        debug!("jump fresh {dest}");
+                        self.compile(owner, dest, types.clone(), fresh);
+                        self.blocks[block_id].push(Residual::Jump(fresh));
+                    }
+                    return Some((dest, types));
+                },
+                CoroutineState::Complete(()) => {
                     return Some((pc.0 + 1, types));
                 }
             } break 'machine; }
@@ -374,6 +451,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
+    // TODO: this is gross! if we spec a block we have to switch current, but then forcing a thunk
+    // from another function may at runtime use the wrong current closure. figure out some better
+    // way (worse case each block has its own closure and we switch in run when we enter...)
     pub fn set_current(&mut self, clos: Tc<LClosure<'src, 'intern>>) {
         self.clos = clos;
     }

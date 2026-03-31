@@ -590,7 +590,7 @@ pub enum LValue<'src, 'intern> {
     Table(Tc<Table<'src, 'intern>>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub enum LType {
     Unknown,
     Nil,
@@ -941,6 +941,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             vals: FVec<LValue<'src, 'intern>>,
             upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
             spec: Specializer<'src, 'intern>,
+            callstack: FVec<(Tc<LClosure<'src, 'intern>>, usize, usize, usize, usize)>,
         }
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
@@ -952,6 +953,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             let mut base = 0;
             let mut pc = 0;
             let mut spec = Specializer::new(clos.clone());
+            let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize, usize)> = vec![].into();
 
             RunState {
                 base,
@@ -961,11 +963,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 vals,
                 upvals,
                 spec,
+                callstack,
             }
         };
         // we need to track where to return to, along with the base pointer and where to put return
         // values
-        let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize, usize)> = vec![].into();
         let r_vals = 'int: loop {
             let inst = unsafe { state.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[state.pc] };
             state.pc += 1;
@@ -1280,14 +1282,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     // push where to return to once we RETURN
                     if let LValue::LClosure(ref lclos) = to_call.clone() {
                         // record call stack: we say where to return to and where to put the values
-                        callstack.push((state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize));
-                        state.clos = lclos.clone();
+                        state.callstack.push((state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize));
                         let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
                         state.base = state.base + a as usize + 1;
                         // push empty stack frame
                         state.vals.extend_from_slice(
                             vec![LValue::Nil; next_stack].as_slice());
-                        state.pc = 0;
 
                         // Lazy basic block versioning
                         let types = vec![LType::Unknown; next_stack];
@@ -1298,7 +1298,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             state.spec.block(owner, 0, types)
                         };
                         debug!("{:?} {block}", state.spec.blocks);
-                        state.spec.run(owner, block, state.vals[state.base..].to_vec());
+                        state.spec.set_current(lclos.clone());
+                        let vals = state.spec.run(owner, block, state.vals[state.base..].to_vec());
+                        //state.clos = lclos.clone();
+                        //state.pc = 0;
+                        state.vals.splice(state.base.., vals).for_each(drop);
                         // TODO: run the block
 
                     } else if let LValue::NClosure(ncall) = to_call {
@@ -1353,7 +1357,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     } else {
                         unreachable!()
                     };
-                    if let Some((ret_clos, caller, frame, limit, ret)) = callstack.pop() {
+                    if let Some((ret_clos, caller, frame, limit, ret)) = state.callstack.pop() {
                         debug!("{} {:?} {:?}", state.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller);
                         state.clos = ret_clos.clone();
                         // copy the return values to the previous frame's return location,
