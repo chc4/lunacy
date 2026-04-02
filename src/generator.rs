@@ -73,6 +73,16 @@ pub fn emit_loadk(bx: usize, c: LType, dest: usize) -> impl Coroutine<ResumeArg,
 pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
+        arg = yield YieldOp::GuardRk(lhs, LType::Table);
+        if arg == ResumeArg::Matched {
+            arg = yield YieldOp::GuardRk(rhs, LType::Table);
+            if arg == ResumeArg::Matched {
+                yield YieldOp::Exec(ResidualExec("add_table_table", Rc::new(move |owner, clos, vals| {
+                })));
+                yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
+                return arg;
+            }
+        }
         // --- Int Path ---
         arg = yield YieldOp::GuardRk(lhs, LType::Number);
         // TODO: have a MatchedConst case to remove the need for Vm::rk at runtime
@@ -327,74 +337,40 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    fn make_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, thunk_types: Vec<LType>) -> ThunkRef {
+    fn make_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, thunk_types: Vec<LType>, appends: bool) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, vals: &mut [LValue], thunk_pc: usize| {
             // The thunk was forced, so now we know the runtime value and if it
             // will pass the guard or not.
-            // Instead of emitting a guard against `expected`, we can instead
-            // continue pumping the state machine until we get a type guard which
-            // *does* match the observed runtime guard in order to avoid emitting
-            // all the failing checks. The failure case of the guard can continue
-            // from our initial stuck state (by cloning a fresh instance of this
-            // thunk, which is "before" we were forced).
-            let mut thunk_coro = thunk_coro.clone();
+            // Instead of emitting a guard against `expected`, we can instead just fill in the real
+            // type and guard the rest of the generator execution under that as a new block
+            // version: if there was a guard against an unknown value and the type would fail, we
+            // can be pretty confident that the bytecode operator will try more type guards until
+            // it finds the correct one for the type we filled in, and the intermediate guards will
+            // be statically false and so not emit any more thunks. Maybe this messes up if
+            // bytecode operators don't fully resolve types in a total order? But you can just
+            // like, not do that. If needed, there's a jankier version of this that filters the
+            // remainder of thunk_coro to hoist specifically the successful type guard for idx in
+            // our git history.
+            let thunk_coro = thunk_coro.clone();
             let runtime_type = typeof_(&vals[idx]);
             let mut forced_types = thunk_types.clone();
             forced_types[idx] = runtime_type;
-            let mut arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
-            let mut final_guard = None;
-            loop {
-                debug!("fast forwarding arg {arg:?}");
-                let state = Pin::new(&mut thunk_coro).resume(arg);
-                match state {
-                    CoroutineState::Yielded(ref y) => {
-                        debug!("fast forwarding yield {y:?}");
-
-                        let r = vm.compile_one(owner, pc, forced_types.clone(), Box::new(Self::yield_one(y.clone())), ResumeArg::Matched, block_id);
-                        debug!("fast forwarding compile_one result {r:?}");
-                        // yield_one will return the result of stepping a single yield, which
-                        // compile_one will return to us. if the operation returned a Matched
-                        // then we know it was a type operation which we should also return a guard
-                        // for.
-                        // bleeeeh this forgets the subpc...do we even need a subpc at all?
-                        // i think no, we just emit a block version entry for the next pc
-                        if let Some((ff_pc, ff_types, ff_ret)) = r {
-                            if ff_ret == ResumeArg::Matched {
-                                final_guard = Some(y.clone());
-                                break;
-                            } else {
-                                arg = ff_ret;
-                            }
-                        }
-
-                    },
-                    CoroutineState::Complete(_) => unreachable!(),
-                }
+            let arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
+            if !appends {
+                // TODO; create a new block and rewrite thunk into a jump instead
+                unimplemented!();
             }
-
-            let res_guard = match final_guard {
-                Some(YieldOp::Guard(idx, expected)) => Some(Residual::Guard { idx, expected }),
-                Some(YieldOp::GuardRk(idx, expected)) => Some(Residual::Guard { idx, expected }),
-                None => None,
-                _ => unreachable!(),
-            };
-            if let Some(res_guard) = res_guard {
-                // Push the same thunk down for the next value that fails the guard
-                // TODO: this probably actually needs to be a separate make_thunk, because the
-                // captures are wrong...? idk
-                let fresh_thunk = vm.blocks[block_id][thunk_pc].clone();
-                vm.blocks[block_id][thunk_pc] = res_guard;
-                vm.blocks[block_id].push(fresh_thunk);
-            } else {
-                vm.blocks[block_id][thunk_pc] = Residual::Exec(ResidualExec("rk_thunk", Rc::new(move |owner, clos, vals| {
-})));
+            vm.blocks[block_id][thunk_pc] = Residual::Guard { idx, expected: runtime_type };
+            // Push the same thunk down for the next value that fails the guard
+            let fail_thunk = vm.make_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_types.clone(), false);
+            vm.blocks[block_id].push(Residual::Thunk(fail_thunk));
+            // Finish the remainder of the coroutine
+            let guard_block = vm.new_block();
+            if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), forced_types.clone(), thunk_coro, arg, guard_block) {
+                vm.compile(owner, succ_next, succ_ty, guard_block);
             }
-            // TODO: should this get a new block...? yes right
-            // finish the remainder of the coroutine normally, without the 
-            if let Some((fail_next, fail_ty, fail_ret)) = vm.compile_one(owner, pc, thunk_types.clone(), thunk_coro, ResumeArg::Matched, block_id) {
-                vm.compile(owner, fail_next, fail_ty, block_id);
-            }
+            vm.blocks[block_id].push(Residual::Jump(guard_block));
 
             debug!("after compiling thunk, blocks look like {:?}", vm.blocks);
         })))
@@ -453,7 +429,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Dynamic branch: Fork the coroutine
                         let thunk_coro = coro.clone();
                         let thunk_types = types.clone();
-                        let thunk = Residual::Thunk(self.make_thunk(block_id, thunk_coro, idx, expected, pc, thunk_types));
+                        let thunk = Residual::Thunk(self.make_thunk(block_id, thunk_coro, idx, expected, pc, thunk_types, true));
                         self.blocks[block_id].push(thunk);
                         return None;
                     }
