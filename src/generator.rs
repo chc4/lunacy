@@ -33,7 +33,7 @@ impl std::fmt::Debug for ResidualExec {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum YieldOp {
     Typeof(usize), // Resumed with the type of STACK[idx]
     Guard(usize, LType), // Resumed with either Matched or Failed if STACK[idx] is the expected
@@ -132,7 +132,11 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::String)]);
                 return;
+            } else {
+                debug!("fail 2");
             }
+        } else {
+            debug!("fail 1");
         }
 
         // --- Generic/Trap Fallback ---
@@ -198,7 +202,7 @@ impl SubPc {
 }
 
 #[derive(Clone)]
-pub struct ThunkRef(pub Rc<RefCell<dyn FnMut(&mut Specializer, &mut TCellOwner<TcOwner>) -> ()>>);
+pub struct ThunkRef(pub Rc<RefCell<dyn FnMut(&mut Specializer, &mut TCellOwner<TcOwner>, &mut [LValue], usize) -> ()>>);
 
 impl std::fmt::Debug for ThunkRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Thunk(...)") }
@@ -211,6 +215,20 @@ pub enum Residual {
     Jump(BlockId),
     Thunk(ThunkRef),
     Ret,
+}
+
+fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin + 'static>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin + 'static
+{
+    #[coroutine] move |mut arg: ResumeArg| {
+        loop {
+            let state = Pin::new(&mut fresh_coro).resume(arg);
+            match state {
+                CoroutineState::Yielded(y) => arg = yield y,
+                CoroutineState::Complete(()) => break,
+            }
+        }
+        return;
+    }
 }
 
 pub struct Specializer<'src, 'intern> {
@@ -322,7 +340,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         continue 'machine;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::Guard(idx, expected)) => {
+                CoroutineState::Yielded(guard @ YieldOp::Guard(idx, expected)) => {
                     if types[idx] == expected {
                         // Statically true: pump the success path
                         pc = pc.next_true();
@@ -333,56 +351,88 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         arg = ResumeArg::Failed;
                     } else {
                         // Dynamic branch: Fork the coroutine
-                        let fail_coro = coro.clone();
-                        let fail_types = types.clone();
-                        let fail_off = self.blocks[block_id].len() + 1;
-                        self.blocks[block_id].push(Residual::Guard { idx, expected: expected.clone() });
+                        let thunk_coro = coro.clone();
+                        let thunk_types = types.clone();
+                        self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, vals: &mut [LValue], thunk_pc: usize| {
+                            // The thunk was forced, so now we know the runtime value and if it
+                            // will pass the guard or not.
+                            // Instead of emitting a guard against `expected`, we can instead
+                            // continue pumping the state machine until we get a type guard which
+                            // *does* match the observed runtime guard in order to avoid emitting
+                            // all the failing checks. The failure case of the guard can continue
+                            // from our initial stuck state (by cloning a fresh instance of this
+                            // thunk, which is "before" we were forced).
+                            let mut thunk_coro = thunk_coro.clone();
+                            let runtime_type = typeof_(&vals[idx]);
+                            // Wow this sucks. I'd like to just drain from thunk_coro until it
+                            // would yield Matched, but that ends up with a recursive type error :/
+                            let mut final_guard = Some(guard.clone());
+                            let mut arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
+                            if arg != ResumeArg::Matched {
+                                'ff: loop {
+                                    let mut state = Pin::new(&mut thunk_coro).resume(arg);
+                                    debug!("fast forwarding {state:?}");
+                                    'ff_one: loop { match state {
+                                        CoroutineState::Yielded(YieldOp::GuardRk(rk, new_expected)) => {
+                                            // bleh this sucks and is exactly the same
+                                            // we can never get stuck on the type of a constant, so
+                                            // this actually is exactly the same logic as the
+                                            // first-level GuardRk.
+                                            let proto = vm.clos.ro(owner).prototype;
+                                            if (rk & 0x100)!=0 {
+                                                let r_const = rk & (0xff);
+                                                let ty = match unsafe { &(&(*proto).constants.items)[r_const as usize] } {
+                                                    crate::chunk::Constant::Nil => LType::Nil,
+                                                    crate::chunk::Constant::Bool(_) => LType::Bool,
+                                                    crate::chunk::Constant::Number(_) => LType::Number,
+                                                    crate::chunk::Constant::String(_) => LType::String,
+                                                };
+                                                if ty == new_expected {
+                                                    final_guard = None;
+                                                    arg = ResumeArg::Matched;
+                                                } else {
+                                                    arg = ResumeArg::Failed;
+                                                }
+                                                continue 'ff;
+                                            } else {
+                                                state = CoroutineState::Yielded(YieldOp::Guard(rk, new_expected));
+                                                continue 'ff_one;
+                                            }
 
-                        self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>| {
-                            let fail_pc = pc.next_false();
-                            dbg!(fail_off);
-                            // This executes only if the dynamic branch fails at runtime
-                            println!("before compile_one");
-                            // See if the block already exists
-                            if let Some(exists) = vm.clos.ro(owner).versions.get(&(fail_pc, fail_types.clone())) {
-                                dbg!("fail exists {exists}");
-                                vm.blocks[block_id][fail_off] = Residual::Jump(*exists);
-                                return;
+                                        },
+                                        CoroutineState::Yielded(guard @ (YieldOp::Guard(new_idx, new_expected) )) => {
+                                            debug!("{new_idx} {new_expected:?}");
+                                            if new_idx == idx && runtime_type == new_expected {
+                                                final_guard = Some(guard);
+                                                break 'ff;
+                                            }
+                                            arg = if typeof_(&vals[new_idx]) == new_expected { ResumeArg::Matched } else { ResumeArg::Failed };
+                                        },
+                                        x => { debug!("thunk fast forward yielded {x:?}"); /* ignore */ },
+                                    }; break 'ff_one; }
+                                }
                             }
-                            let fail_thunk_id = vm.new_block();
-                            if let Some((fail_next, fail_ty)) = vm.compile_one(owner, fail_pc, fail_types.clone(), fail_coro.clone(), ResumeArg::Failed, fail_thunk_id) {
-                                // We finished running the coroutine to completion, finish the
-                                // rest of the block
-                                vm.compile(owner, fail_next, fail_ty, fail_thunk_id);
+                            debug!("{final_guard:?}");
+                            let mut forced_types = thunk_types.clone();
+                            forced_types[idx] = runtime_type;
+                            let res_guard = match final_guard {
+                                Some(YieldOp::Guard(idx, expected)) => Some(Residual::Guard { idx, expected }),
+                                Some(YieldOp::GuardRk(idx, expected)) => Some(Residual::Guard { idx, expected }),
+                                _ => unreachable!(),
+                            };
+                            if let Some(res_guard) = res_guard {
+                                // Push the same thunk down for the next value that fails the guard
+                                let fresh_thunk = vm.blocks[block_id][thunk_pc].clone();
+                                vm.blocks[block_id][thunk_pc] = res_guard;
+                                vm.blocks[block_id].push(fresh_thunk);
                             } else {
-                                // The coroutine got stuck on another thunk
+                                vm.blocks[block_id][thunk_pc] = Residual::Exec(ResidualExec("rk_thunk", Rc::new(move |owner, clos, vals| {
+            })));
                             }
-                            // Patch the thunk block to jump to the newly specialized block
-                            vm.clos.rw(owner).versions.insert((fail_pc, fail_types.clone()), fail_thunk_id);
-                            vm.blocks[block_id][fail_off] = Residual::Jump(fail_thunk_id);
-                        })))));
-                        let succ_coro = coro.clone();
-                        let succ_off = fail_off + 1;
-                        self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>| {
-                            let succ_pc = pc.next_true();
-                            dbg!(succ_off);
-                            // This executes only if the dynamic branch succeeds at runtime
-                            let mut success_types = types.clone();
-                            success_types[idx] = expected.clone();
-                            dbg!("before succ compile_one");
-                            // See if the block already exists
-                            if let Some(exists) = vm.clos.ro(owner).versions.get(&(succ_pc, success_types.clone())) {
-                                dbg!("succ exists {exists}");
-                                vm.blocks[block_id][succ_off] = Residual::Jump(*exists);
-                                return;
+                            // TODO: should this get a new block...? yes right
+                            if let Some((fail_next, fail_ty)) = vm.compile_one(owner, pc, thunk_types.clone(), thunk_coro, ResumeArg::Matched, block_id) {
+                                vm.compile(owner, fail_next, fail_ty, block_id);
                             }
-                            let succ_thunk_id = vm.new_block();
-                            if let Some((succ_next, succ_ty)) = vm.compile_one(owner, succ_pc, success_types.clone(), succ_coro.clone(), ResumeArg::Matched, succ_thunk_id) {
-                                vm.compile(owner, succ_next, succ_ty, succ_thunk_id);
-                            }
-                            // Patch the thunk block to jump to the newly specialized block
-                            vm.clos.rw(owner).versions.insert((succ_pc, success_types.clone()), succ_thunk_id);
-                            vm.blocks[block_id][succ_off] = Residual::Jump(succ_thunk_id);
                         })))));
                         return None;
                     }
@@ -444,9 +494,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Thunk(thunk) => {
                     dbg!(&block);
-                    (thunk.0.borrow_mut())(self, owner)
+                    (thunk.0.borrow_mut())(self, owner, &mut values, off)
                 },
-                Residual::Ret => { return values; },
+                Residual::Ret => {
+                    debug!("spec final blocks: {:?}", self.blocks);
+                    return values;
+                },
             }
         }
     }
