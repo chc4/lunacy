@@ -53,7 +53,7 @@ pub enum ResumeArg {
     Type(LType),
 }
 
-pub fn emit_loadk(bx: usize, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin {
+pub fn emit_loadk(bx: usize, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         match c {
@@ -65,11 +65,12 @@ pub fn emit_loadk(bx: usize, c: LType, dest: usize) -> impl Coroutine<ResumeArg,
             },
             _ => unreachable!(),
         }
+        return arg;
     }
 }
 
 
-pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin {
+pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         // --- Int Path ---
@@ -115,7 +116,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     vals[dest as usize] = res;
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
-                return;
+                return arg;
             }
         }
 
@@ -131,7 +132,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     unimplemented!()
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::String)]);
-                return;
+                return arg;
             } else {
                 debug!("fail 2");
             }
@@ -144,7 +145,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
     }
 }
 
-pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin {
+pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Typeof(src);
@@ -158,10 +159,11 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
         } else {
             unreachable!();
         }
+        return arg;
     }
 }
 
-pub fn emit_forprep(a: usize, sbx: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin {
+pub fn emit_forprep(a: usize, sbx: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         debug!("forprep {a} {sbx} {pc}");
@@ -171,13 +173,27 @@ pub fn emit_forprep(a: usize, sbx: usize, pc: usize) -> impl Coroutine<ResumeArg
             let state = Pin::new(&mut sub).resume(arg);
             match state {
                 CoroutineState::Yielded(y) => arg = yield y,
-                CoroutineState::Complete(()) => break,
+                CoroutineState::Complete(_) => break,
             }
         }
         yield YieldOp::Jump(pc + sbx as usize);
+        return arg;
     }
 }
 
+pub fn guard_filter(mut sub: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        loop {
+            let state = Pin::new(&mut sub).resume(arg);
+            match state {
+                CoroutineState::Yielded(y) => arg = yield y,
+                CoroutineState::Complete(_) => break,
+            }
+        }
+        return arg;
+    }
+}
 
 pub type BlockId = usize;
 pub type Pc = usize;
@@ -217,18 +233,18 @@ pub enum Residual {
     Ret,
 }
 
-fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin + 'static>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin + 'static
+fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>) -> Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>
 {
-    #[coroutine] move |mut arg: ResumeArg| {
+    Box::new(#[coroutine] move |mut arg: ResumeArg| {
         loop {
             let state = Pin::new(&mut fresh_coro).resume(arg);
             match state {
                 CoroutineState::Yielded(y) => arg = yield y,
-                CoroutineState::Complete(()) => break,
+                CoroutineState::Complete(_) => break,
             }
         }
-        return;
-    }
+        return arg;
+    })
 }
 
 pub struct Specializer<'src, 'intern> {
@@ -258,25 +274,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         loop {
             let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), types);
-            if let Some((next, ty)) = match inst.0.Opcode() {
+            if let Some((next, ty, ret)) = match inst.0.Opcode() {
                 op @ Opcode::ADD => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), emit_numeric(op, a as usize, b as usize, c as usize), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_numeric(op, a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), emit_loadk(bx as usize, typeof_(&c), a as usize), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_loadk(bx as usize, typeof_(&c), a as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::MOVE => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     debug!("move {} {}", a, b);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), emit_move(a as usize, b as usize), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_move(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), emit_forprep(a as usize, sbx as usize, pc), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_forprep(a as usize, sbx as usize, pc)), ResumeArg::Start, block_id)
                 },
                 //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
                 Opcode::RETURN => {
@@ -299,9 +315,93 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks.len() - 1
     }
 
-    pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut types: Vec<LType>, mut coro: C, mut arg: ResumeArg, block_id: usize) -> Option<(Pc, Vec<LType>)>
-    where
-        C: Coroutine<ResumeArg, Yield = YieldOp, Return = ()> + Clone + Unpin + 'static,
+    // We have to be careful here, where rustc is very unhappy about generator -> thunk ->
+    // generator and will either think our types are recursive, require an infinite chain of
+    // implications to prove a Coroutine: Clone, or ICE (depending on the time of day) if we use
+    // slightly different structure.
+    fn yield_one(one: YieldOp) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
+        #[coroutine] |mut arg: ResumeArg| {
+            let arg = yield one;
+            debug!("yield one resulted in {arg:?}");
+            return arg;
+        }
+    }
+
+    fn make_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, thunk_types: Vec<LType>) -> ThunkRef {
+
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, vals: &mut [LValue], thunk_pc: usize| {
+            // The thunk was forced, so now we know the runtime value and if it
+            // will pass the guard or not.
+            // Instead of emitting a guard against `expected`, we can instead
+            // continue pumping the state machine until we get a type guard which
+            // *does* match the observed runtime guard in order to avoid emitting
+            // all the failing checks. The failure case of the guard can continue
+            // from our initial stuck state (by cloning a fresh instance of this
+            // thunk, which is "before" we were forced).
+            let mut thunk_coro = thunk_coro.clone();
+            let runtime_type = typeof_(&vals[idx]);
+            let mut forced_types = thunk_types.clone();
+            forced_types[idx] = runtime_type;
+            let mut arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
+            let mut final_guard = None;
+            loop {
+                debug!("fast forwarding arg {arg:?}");
+                let state = Pin::new(&mut thunk_coro).resume(arg);
+                match state {
+                    CoroutineState::Yielded(ref y) => {
+                        debug!("fast forwarding yield {y:?}");
+
+                        let r = vm.compile_one(owner, pc, forced_types.clone(), Box::new(Self::yield_one(y.clone())), ResumeArg::Matched, block_id);
+                        debug!("fast forwarding compile_one result {r:?}");
+                        // yield_one will return the result of stepping a single yield, which
+                        // compile_one will return to us. if the operation returned a Matched
+                        // then we know it was a type operation which we should also return a guard
+                        // for.
+                        // bleeeeh this forgets the subpc...do we even need a subpc at all?
+                        // i think no, we just emit a block version entry for the next pc
+                        if let Some((ff_pc, ff_types, ff_ret)) = r {
+                            if ff_ret == ResumeArg::Matched {
+                                final_guard = Some(y.clone());
+                                break;
+                            } else {
+                                arg = ff_ret;
+                            }
+                        }
+
+                    },
+                    CoroutineState::Complete(_) => unreachable!(),
+                }
+            }
+
+            let res_guard = match final_guard {
+                Some(YieldOp::Guard(idx, expected)) => Some(Residual::Guard { idx, expected }),
+                Some(YieldOp::GuardRk(idx, expected)) => Some(Residual::Guard { idx, expected }),
+                None => None,
+                _ => unreachable!(),
+            };
+            if let Some(res_guard) = res_guard {
+                // Push the same thunk down for the next value that fails the guard
+                // TODO: this probably actually needs to be a separate make_thunk, because the
+                // captures are wrong...? idk
+                let fresh_thunk = vm.blocks[block_id][thunk_pc].clone();
+                vm.blocks[block_id][thunk_pc] = res_guard;
+                vm.blocks[block_id].push(fresh_thunk);
+            } else {
+                vm.blocks[block_id][thunk_pc] = Residual::Exec(ResidualExec("rk_thunk", Rc::new(move |owner, clos, vals| {
+})));
+            }
+            // TODO: should this get a new block...? yes right
+            // finish the remainder of the coroutine normally, without the 
+            if let Some((fail_next, fail_ty, fail_ret)) = vm.compile_one(owner, pc, thunk_types.clone(), thunk_coro, ResumeArg::Matched, block_id) {
+                vm.compile(owner, fail_next, fail_ty, block_id);
+            }
+
+            debug!("after compiling thunk, blocks look like {:?}", vm.blocks);
+        })))
+    }
+
+    pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut types: Vec<LType>, mut coro: Box<C>, mut arg: ResumeArg, block_id: usize) -> Option<(Pc, Vec<LType>, ResumeArg)>
+    where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
         loop {
             let mut state = Pin::new(&mut coro).resume(arg);
@@ -353,87 +453,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Dynamic branch: Fork the coroutine
                         let thunk_coro = coro.clone();
                         let thunk_types = types.clone();
-                        self.blocks[block_id].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, vals: &mut [LValue], thunk_pc: usize| {
-                            // The thunk was forced, so now we know the runtime value and if it
-                            // will pass the guard or not.
-                            // Instead of emitting a guard against `expected`, we can instead
-                            // continue pumping the state machine until we get a type guard which
-                            // *does* match the observed runtime guard in order to avoid emitting
-                            // all the failing checks. The failure case of the guard can continue
-                            // from our initial stuck state (by cloning a fresh instance of this
-                            // thunk, which is "before" we were forced).
-                            let mut thunk_coro = thunk_coro.clone();
-                            let runtime_type = typeof_(&vals[idx]);
-                            // Wow this sucks. I'd like to just drain from thunk_coro until it
-                            // would yield Matched, but that ends up with a recursive type error :/
-                            let mut final_guard = Some(guard.clone());
-                            let mut arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
-                            if arg != ResumeArg::Matched {
-                                'ff: loop {
-                                    let mut state = Pin::new(&mut thunk_coro).resume(arg);
-                                    debug!("fast forwarding {state:?}");
-                                    'ff_one: loop { match state {
-                                        CoroutineState::Yielded(YieldOp::GuardRk(rk, new_expected)) => {
-                                            // bleh this sucks and is exactly the same
-                                            // we can never get stuck on the type of a constant, so
-                                            // this actually is exactly the same logic as the
-                                            // first-level GuardRk.
-                                            let proto = vm.clos.ro(owner).prototype;
-                                            if (rk & 0x100)!=0 {
-                                                let r_const = rk & (0xff);
-                                                let ty = match unsafe { &(&(*proto).constants.items)[r_const as usize] } {
-                                                    crate::chunk::Constant::Nil => LType::Nil,
-                                                    crate::chunk::Constant::Bool(_) => LType::Bool,
-                                                    crate::chunk::Constant::Number(_) => LType::Number,
-                                                    crate::chunk::Constant::String(_) => LType::String,
-                                                };
-                                                if ty == new_expected {
-                                                    final_guard = None;
-                                                    arg = ResumeArg::Matched;
-                                                } else {
-                                                    arg = ResumeArg::Failed;
-                                                }
-                                                continue 'ff;
-                                            } else {
-                                                state = CoroutineState::Yielded(YieldOp::Guard(rk, new_expected));
-                                                continue 'ff_one;
-                                            }
-
-                                        },
-                                        CoroutineState::Yielded(guard @ (YieldOp::Guard(new_idx, new_expected) )) => {
-                                            debug!("{new_idx} {new_expected:?}");
-                                            if new_idx == idx && runtime_type == new_expected {
-                                                final_guard = Some(guard);
-                                                break 'ff;
-                                            }
-                                            arg = if typeof_(&vals[new_idx]) == new_expected { ResumeArg::Matched } else { ResumeArg::Failed };
-                                        },
-                                        x => { debug!("thunk fast forward yielded {x:?}"); /* ignore */ },
-                                    }; break 'ff_one; }
-                                }
-                            }
-                            debug!("{final_guard:?}");
-                            let mut forced_types = thunk_types.clone();
-                            forced_types[idx] = runtime_type;
-                            let res_guard = match final_guard {
-                                Some(YieldOp::Guard(idx, expected)) => Some(Residual::Guard { idx, expected }),
-                                Some(YieldOp::GuardRk(idx, expected)) => Some(Residual::Guard { idx, expected }),
-                                _ => unreachable!(),
-                            };
-                            if let Some(res_guard) = res_guard {
-                                // Push the same thunk down for the next value that fails the guard
-                                let fresh_thunk = vm.blocks[block_id][thunk_pc].clone();
-                                vm.blocks[block_id][thunk_pc] = res_guard;
-                                vm.blocks[block_id].push(fresh_thunk);
-                            } else {
-                                vm.blocks[block_id][thunk_pc] = Residual::Exec(ResidualExec("rk_thunk", Rc::new(move |owner, clos, vals| {
-            })));
-                            }
-                            // TODO: should this get a new block...? yes right
-                            if let Some((fail_next, fail_ty)) = vm.compile_one(owner, pc, thunk_types.clone(), thunk_coro, ResumeArg::Matched, block_id) {
-                                vm.compile(owner, fail_next, fail_ty, block_id);
-                            }
-                        })))));
+                        let thunk = Residual::Thunk(self.make_thunk(block_id, thunk_coro, idx, expected, pc, thunk_types));
+                        self.blocks[block_id].push(thunk);
                         return None;
                     }
                 }
@@ -459,10 +480,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         self.compile(owner, dest, types.clone(), fresh);
                         self.blocks[block_id].push(Residual::Jump(fresh));
                     }
-                    return Some((dest, types));
+                    return Some((dest, types, ResumeArg::Start));
                 },
-                CoroutineState::Complete(()) => {
-                    return Some((pc.0 + 1, types));
+                CoroutineState::Complete(r) => {
+                    return Some((pc.0 + 1, types, r));
                 }
             } break 'machine; }
         }
