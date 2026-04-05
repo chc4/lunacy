@@ -1298,8 +1298,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             spec.block(owner, 0, types)
                         };
                         debug!("{:?} {block}", spec.blocks);
+                        state.clos = lclos.clone();
                         spec.set_current(lclos.clone());
-                        state = spec.run(owner, block, state);
+                        // TODO: only run LBBV for hot code
+                        if true {
+                            state = spec.run(owner, block, state);
+                        } else {
+                            state.pc = 0;
+                        }
 
                     } else if let LValue::NClosure(ncall) = to_call {
                         let args = if b == 0 {
