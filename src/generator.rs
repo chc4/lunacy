@@ -1,12 +1,12 @@
 #![allow(unused_variables)]
 
 use std::collections::HashMap;
-use std::ops::{Coroutine, CoroutineState};
+use std::ops::{Coroutine, CoroutineState, Deref};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::RefCell;
 
-use crate::vm::Opcode;
+use crate::vm::{Opcode, Upvalue};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
@@ -187,19 +187,47 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
     }
 }
 
+macro_rules! drain {
+    ($i:ident, $arg:ident) => {
+        $arg = ResumeArg::Start;
+        loop {
+            let state = Pin::new(&mut $i).resume($arg);
+            match state {
+                CoroutineState::Yielded(y) => $arg = yield y,
+                CoroutineState::Complete(_) => break,
+            }
+        }
+    }
+}
+
+
+pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, mut state, cb| {
+            let upval = match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
+                Upvalue::Open(o) => {
+                    state.vals[*o as usize].clone()
+                },
+                Upvalue::Closed(c) => {
+                    c.borrow().clone()
+                },
+            };
+            state.vals[state.base + a as usize] = upval.clone();
+            state
+        })));
+        return arg;
+    }
+}
+
+
+
 pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         debug!("forprep {a} {sbx} {pc}");
         let mut sub = emit_numeric(Opcode::SUB, a, a, a + 2);
-        // TODO: define a macro that does this
-        loop {
-            let state = Pin::new(&mut sub).resume(arg);
-            match state {
-                CoroutineState::Yielded(y) => arg = yield y,
-                CoroutineState::Complete(_) => break,
-            }
-        }
+        drain!(sub, arg);
         yield YieldOp::Jump(pc + sbx as usize);
         return arg;
     }
@@ -211,7 +239,9 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         debug!("forloop {a} {sbx} {pc}");
         debug!("{} {}", a, sbx);
         let mut sub = emit_numeric(Opcode::ADD, a, a, a + 2);
+        drain!(sub, arg);
         let mut mov = emit_move(a, a);
+        drain!(mov, arg);
         arg = yield YieldOp::GetBlock(pc);
         let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
         arg = yield YieldOp::GetBlock((pc as isize + sbx as isize) as usize);
@@ -221,7 +251,18 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
             let limit = state.vals[state.base + a as usize + 1].clone();
             let step = state.vals[state.base + a as usize + 2].clone();
             debug!("{:?} {:?} {:?}", idx, limit, step);
-            state = cb(ExecEffect::Jump(fallthrough), owner, state);
+            let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0)))).unwrap() {
+                limit.compare(Opcode::LE, idx.clone())
+            } else {
+                idx.clone().compare(Opcode::LE, limit)
+            };
+            if comp.unwrap() {
+                state = cb(ExecEffect::Jump(taken), owner, state);
+                state.vals[state.base + a as usize + 3] = idx;
+            } else {
+                state = cb(ExecEffect::Jump(fallthrough), owner, state);
+            }
+
             state
         })));
         arg
@@ -277,7 +318,7 @@ pub enum Residual {
     Exec(ResidualExec),
     Jump(BlockId),
     Thunk(ThunkRef),
-    Ret,
+    Ret(Pc),
 }
 
 fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>) -> Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>
@@ -352,10 +393,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_forloop(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
                 },
+                Opcode::GETUPVAL => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
+                },
                 //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
                 Opcode::RETURN => {
-                    println!("ret");
-                    self.blocks[block_id].push(Residual::Ret); None
+                    self.blocks[block_id].push(Residual::Ret(pc)); None
                 },
                 _ => unreachable!(),
             } {
@@ -565,8 +609,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dbg!(&block);
                     (thunk.0.borrow_mut())(self, owner, &mut state, off)
                 },
-                Residual::Ret => {
+                Residual::Ret(pc) => {
                     debug!("spec final blocks: {:?}", self.blocks);
+                    // Set pc to the return instruction, so that vm.rs runs it
+                    state.pc = pc;
                     return state;
                 },
             }

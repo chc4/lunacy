@@ -751,7 +751,7 @@ impl<'src, 'intern> PartialOrd for LConstant<'src, 'intern> {
 }
 
 #[derive(Debug, Clone)]
-enum Upvalue<'src, 'intern> {
+pub enum Upvalue<'src, 'intern> {
     Open(usize), // stack index
     Closed(Gc<LValue<'src, 'intern>>),
 }
@@ -759,7 +759,7 @@ enum Upvalue<'src, 'intern> {
 pub struct LClosure<'src, 'intern> {
     pub prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
-    upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
+    pub upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
     pub versions: HashMap<(SubPc, Vec<LType>), BlockId>,
 }
 
@@ -818,7 +818,7 @@ pub struct RunState<'src, 'intern> {
     pub clos: Tc<LClosure<'src, 'intern>>,
     pub vals: FVec<LValue<'src, 'intern>>,
     pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
-    pub callstack: FVec<(Tc<LClosure<'src, 'intern>>, usize, usize, usize, usize)>,
+    pub callstack: FVec<(Tc<LClosure<'src, 'intern>>, usize, usize, usize, usize, u16)>,
 }
 
 
@@ -955,7 +955,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             let mut upvals: FVec<(Upvalue, FVec<Gc<Upvalue>>)> = vec![].into();
             let mut base = 0;
             let mut pc = 0;
-            let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize, usize)> = vec![].into();
+            let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize, usize, u16)> = vec![].into();
 
             RunState {
                 base,
@@ -1283,26 +1283,26 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     // push where to return to once we RETURN
                     if let LValue::LClosure(ref lclos) = to_call.clone() {
                         // record call stack: we say where to return to and where to put the values
-                        state.callstack.push((state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize));
                         let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
-                        state.base = state.base + a as usize + 1;
                         // push empty stack frame
                         state.vals.extend_from_slice(
                             vec![LValue::Nil; next_stack].as_slice());
-
-                        // Lazy basic block versioning
-                        let types = vec![LType::Unknown; next_stack];
-                        let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(state.pc), types.clone())) {
-                            *block
-                        } else {
-                            spec.set_current(lclos.clone());
-                            spec.block(owner, 0, types)
-                        };
-                        debug!("{:?} {block}", spec.blocks);
+                        state.callstack.push((state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize, c));
+                        state.base = state.base + a as usize + 1;
                         state.clos = lclos.clone();
-                        spec.set_current(lclos.clone());
-                        // TODO: only run LBBV for hot code
-                        if true {
+
+                        if false {
+                            // Lazy basic block versioning
+                            // TODO: only run LBBV for hot code
+                            let types = vec![LType::Unknown; next_stack];
+                            let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(state.pc), types.clone())) {
+                                *block
+                            } else {
+                                spec.set_current(lclos.clone());
+                                spec.block(owner, 0, types)
+                            };
+                            debug!("{:?} {block}", spec.blocks);
+                            spec.set_current(lclos.clone());
                             state = spec.run(owner, block, state);
                         } else {
                             state.pc = 0;
@@ -1360,18 +1360,35 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     } else {
                         unreachable!()
                     };
-                    if let Some((ret_clos, caller, frame, limit, ret)) = state.callstack.pop() {
-                        debug!("{} {:?} {:?}", state.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller);
+                    if let Some((ret_clos, caller, frame, limit, ret, c)) = state.callstack.pop() {
+                        debug!("{} {:?} {:?} {}", state.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller, c);
                         state.clos = ret_clos.clone();
                         // copy the return values to the previous frame's return location,
                         // then clean up the popped stack frame
                         state.base = frame;
-                        let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
-                        //vals.extend_from_slice(r_vals.as_slice());
-                        for (i, v) in r_vals.drain(..).enumerate() {
-                            state.vals[ret + i] = v;
+                        if c == 1 {
+                            // No values are saved
+                            state.vals.truncate(limit);
+                        } else if c >= 2 {
+                            // (C-1) values are saved
+                            let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
+                            //vals.extend_from_slice(r_vals.as_slice());
+                            for i in 0..(c - 1) {
+                                debug!("huh {}", i);
+                                // Only copy the correct number of arguments from the CALL
+                                state.vals[ret + i as usize] = r_vals[i as usize].clone();
+                            }
+                            assert!(limit >= ret + c as usize - 1);
+                            state.vals.truncate(limit);
+                        } else {
+                            // Multiple return results are saved
+                            for (i, v) in r_vals.drain(..).enumerate() {
+                                // Only copy the correct number of arguments from the CALL
+                                state.vals[ret + i] = v;
+                            }
+                            debug!("{:?} {}", &state.vals, r_count);
+                            state.vals.truncate(ret + r_count);
                         }
-                        state.vals.truncate(limit);
                         state.pc = caller;
                     } else {
                         break 'int r_vals;

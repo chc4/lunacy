@@ -24,7 +24,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const TIMES: f64 = 10.0;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
+    env_logger::builder().format_source_path(true).init();
     let mut owner = TCellOwner::new();
 
 
