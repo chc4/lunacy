@@ -49,6 +49,7 @@ pub enum YieldOp {
     Exec(ResidualExec), // Emit a residual operation that will be executed
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(usize), // Emit a jump to the given PC, potentially specializing the block if needed.
+    GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,6 +58,7 @@ pub enum ResumeArg {
     Matched,
     Failed,
     Type(LType),
+    BlockId(BlockId),
 }
 
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -210,12 +212,16 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         debug!("{} {}", a, sbx);
         let mut sub = emit_numeric(Opcode::ADD, a, a, a + 2);
         let mut mov = emit_move(a, a);
+        arg = yield YieldOp::GetBlock(pc);
+        let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
+        arg = yield YieldOp::GetBlock((pc as isize + sbx as isize) as usize);
+        let ResumeArg::BlockId(taken) = arg else { unreachable!() };
         yield YieldOp::Exec(ResidualExec("forloop", Rc::new(move |owner, mut state, cb| {
             let idx = state.vals[state.base + a as usize].clone();
             let limit = state.vals[state.base + a as usize + 1].clone();
             let step = state.vals[state.base + a as usize + 2].clone();
             debug!("{:?} {:?} {:?}", idx, limit, step);
-            state = cb(ExecEffect::Jump((pc as isize + sbx as isize) as usize), owner, state);
+            state = cb(ExecEffect::Jump(fallthrough), owner, state);
             state
         })));
         arg
@@ -340,11 +346,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_forprep(a as usize, sbx, pc)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_forprep(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::FORLOOP => {
                     let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_forloop(a as usize, sbx, pc)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_forloop(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
                 },
                 //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
                 Opcode::RETURN => {
@@ -490,20 +496,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         types[idx] = ty;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::Jump(dest)) => {
+                CoroutineState::Yielded(op @ (YieldOp::GetBlock(dest) | YieldOp::Jump(dest))) => {
                     if let Some(exists) = self.clos.ro(owner).versions.get(&(SubPc::new(dest), types.clone())) {
                         debug!("jump exist {exists}");
-                        self.blocks[block_id].push(Residual::Jump(*exists));
+                        arg = ResumeArg::BlockId(*exists);
+                        if let YieldOp::Jump(dest) = op {
+                            self.blocks[block_id].push(Residual::Jump(*exists));
+                            return Some((dest, types, ResumeArg::Start));
+                        }
                     } else {
                         let fresh = self.new_block();
                         debug!("jump fresh {dest}");
-                        self.blocks[block_id].push(Residual::Jump(fresh));
+                        self.clos.rw(owner).versions.insert((SubPc::new(dest), types.clone()), fresh);
                         // TODO: do we just return ((dest, types, arg)) here and have self.compile
                         // try to find the block instead? this potentially blows the stack
+                        // this should probably push a thunk which compiles the block instead of a
+                        // jump
                         self.compile(owner, dest, types.clone(), fresh);
-                        return None;
+                        arg = ResumeArg::BlockId(fresh);
+                        if let YieldOp::Jump(dest) = op {
+                            self.blocks[block_id].push(Residual::Jump(fresh));
+                            return None;
+                        }
                     }
-                    return Some((dest, types, ResumeArg::Start));
+                        // If it was a jump, stop pumping the coroutine
                 },
                 CoroutineState::Complete(r) => {
                     return Some((pc.0 + 1, types, r));
@@ -533,11 +549,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     state = f.1(owner, state, &mut |eff, owner, state| {
                         debug!("{:?}", eff);
                         match eff {
-                            ExecEffect::Jump(pc) => {
-                                let types: Vec<_> = state.vals.iter().map(|v| typeof_(v)).collect();
-                                let existing = state.clos.rw(owner).versions.values().last().unwrap();
-                                // TODO: find compatible or compile new block
-                                id = *existing;
+                            ExecEffect::Jump(block) => {
+                                id = block;
                                 off = 0;
                             },
                         }
@@ -557,6 +570,55 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     return state;
                 },
             }
+        }
+    }
+
+    pub fn run_unspec(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut state: RunState<'src, 'intern>) -> RunState<'src, 'intern> {
+        loop {
+            let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
+            // TODO: figure out a good way to avoid duplicating this with compile()? Kind of
+            // difficult because we can't erase the type there...probably need a macro
+            let mut coro: Box<dyn Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Unpin> = match inst.0.Opcode() {
+                op @ Opcode::ADD => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    debug!("{a} {b} {c}");
+                    Box::new(emit_numeric(op, a as usize, b as usize, c as usize))
+                },
+                Opcode::LOADK => {
+                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                    let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                    Box::new(emit_loadk(bx, typeof_(&c), a as usize))
+                },
+                Opcode::MOVE => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    debug!("move {} {}", a, b);
+                    Box::new(emit_move(a as usize, b as usize))
+                },
+                Opcode::FORPREP => {
+                    let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
+                    Box::new(emit_forprep(a as usize, sbx, pc + 1))
+                },
+                Opcode::FORLOOP => {
+                    let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
+                    Box::new(emit_forloop(a as usize, sbx, pc + 1))
+                },
+                //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
+                Opcode::RETURN => {
+                    return state
+                },
+                _ => unreachable!(),
+            };
+            let mut arg = ResumeArg::Start;
+            'run: loop {
+                let mut state = Pin::new(&mut coro).resume(arg);
+                'machine: loop { match state {
+                    CoroutineState::Yielded(guard @ YieldOp::Guard(idx, expected)) => {
+                    },
+                    _ => unimplemented!(),
+                }; break 'machine; }
+            }
+
+            panic!();
         }
     }
 
