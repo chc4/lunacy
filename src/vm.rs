@@ -810,6 +810,7 @@ pub struct Vm<'src, 'intern> {
     pub top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
 }
 
+#[derive(Debug)]
 pub struct RunState<'src, 'intern> {
     pub base: usize,
     pub pc: usize,
