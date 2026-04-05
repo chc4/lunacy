@@ -401,7 +401,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::RETURN => {
                     self.blocks[block_id].push(Residual::Ret(pc)); None
                 },
-                _ => unreachable!(),
+                x => unreachable!("{:?}", x),
             } {
                 pc = next;
                 types = ty;

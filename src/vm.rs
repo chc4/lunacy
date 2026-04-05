@@ -1289,9 +1289,10 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             vec![LValue::Nil; next_stack].as_slice());
                         state.callstack.push((state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize, c));
                         state.base = state.base + a as usize + 1;
+                        state.vals.truncate(state.base +  next_stack);
                         state.clos = lclos.clone();
 
-                        if false {
+                        if true {
                             // Lazy basic block versioning
                             // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];
@@ -1378,8 +1379,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                 // Only copy the correct number of arguments from the CALL
                                 state.vals[ret + i as usize] = r_vals[i as usize].clone();
                             }
-                            assert!(limit >= ret + c as usize - 1);
+                            //assert!(limit >= ret + c as usize - 1);
                             state.vals.truncate(limit);
+                            //state.vals.truncate(ret + c as usize - 1);
                         } else {
                             // Multiple return results are saved
                             for (i, v) in r_vals.drain(..).enumerate() {

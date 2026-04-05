@@ -49,10 +49,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             {
                 let _G = vm.global_env(&mut owner, &intern_strings);
                 let clos = vm::Tc::new(vm::LClosure::new(vm.top_level));
-                let r_vals = vm.run(&mut owner, _G.clone(), clos, vec![].into())?;
+                let mut r_vals = vm.run(&mut owner, _G.clone(), clos, vec![].into())?;
                 if let Some(vm::LValue::LClosure(run_iter)) = _G.get(&owner, &vm::InternString::intern(&intern_strings, "run_iter\0")) {
                     println!("> starting benchmark");
-                    vm.run(&mut owner, _G.clone(), run_iter, vec![vm::LValue::Number(vm::Number(TIMES))].into()).unwrap();
+                    r_vals = vm.run(&mut owner, _G.clone(), run_iter, vec![vm::LValue::Number(vm::Number(TIMES))].into()).unwrap();
                 }
                 dbg!(&r_vals);
             }
