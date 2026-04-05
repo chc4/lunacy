@@ -810,6 +810,17 @@ pub struct Vm<'src, 'intern> {
     pub top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
 }
 
+pub struct RunState<'src, 'intern> {
+    pub base: usize,
+    pub pc: usize,
+    pub _G: Tc<Table<'src, 'intern>>,
+    pub clos: Tc<LClosure<'src, 'intern>>,
+    pub vals: FVec<LValue<'src, 'intern>>,
+    pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
+    pub callstack: FVec<(Tc<LClosure<'src, 'intern>>, usize, usize, usize, usize)>,
+}
+
+
 impl<'src, 'intern> Vm<'src, 'intern> {
     pub fn new(top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
         Self { top_level }
@@ -933,26 +944,16 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         -> Result<FVec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
-        struct RunState<'src, 'intern> {
-            base: usize,
-            pc: usize,
-            _G: Tc<Table<'src, 'intern>>,
-            clos: Tc<LClosure<'src, 'intern>>,
-            vals: FVec<LValue<'src, 'intern>>,
-            upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
-            spec: Specializer<'src, 'intern>,
-            callstack: FVec<(Tc<LClosure<'src, 'intern>>, usize, usize, usize, usize)>,
-        }
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LValue::Nil);
 
+        let mut spec = Specializer::new(clos.clone());
         let mut state = {
             let mut vals = args;
             let mut upvals: FVec<(Upvalue, FVec<Gc<Upvalue>>)> = vec![].into();
             let mut base = 0;
             let mut pc = 0;
-            let mut spec = Specializer::new(clos.clone());
             let mut callstack: FVec<(Tc<LClosure>, usize, usize, usize, usize)> = vec![].into();
 
             RunState {
@@ -962,7 +963,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 clos,
                 vals,
                 upvals,
-                spec,
                 callstack,
             }
         };
@@ -1294,16 +1294,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(state.pc), types.clone())) {
                             *block
                         } else {
-                            state.spec.set_current(lclos.clone());
-                            state.spec.block(owner, 0, types)
+                            spec.set_current(lclos.clone());
+                            spec.block(owner, 0, types)
                         };
-                        debug!("{:?} {block}", state.spec.blocks);
-                        state.spec.set_current(lclos.clone());
-                        let vals = state.spec.run(owner, block, state.vals[state.base..].to_vec());
-                        //state.clos = lclos.clone();
-                        //state.pc = 0;
-                        state.vals.splice(state.base.., vals).for_each(drop);
-                        // TODO: run the block
+                        debug!("{:?} {block}", spec.blocks);
+                        spec.set_current(lclos.clone());
+                        state = spec.run(owner, block, state);
 
                     } else if let LValue::NClosure(ncall) = to_call {
                         let args = if b == 0 {

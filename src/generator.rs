@@ -12,6 +12,7 @@ use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
 use crate::vm::{LValue, LType, Number};
 use crate::vm::{InstructionDecode, Unpacker};
+use crate::vm::RunState;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
 
@@ -26,7 +27,7 @@ fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
 }
 
 #[derive(Clone)]
-struct ResidualExec(&'static str, Rc<dyn for <'src, 'intern> Fn(&mut TCellOwner<TcOwner>, Tc<LClosure<'src, 'intern>>, &mut Vec<LValue<'src, 'intern>>)>);
+struct ResidualExec(&'static str, Rc<dyn for <'src, 'intern> Fn(&mut TCellOwner<TcOwner>, RunState<'src, 'intern>) -> RunState<'src, 'intern>>);
 impl std::fmt::Debug for ResidualExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "exec({}, {:p})", self.0, self.1.as_ref() as &_ as *const _ as *const ())
@@ -58,8 +59,9 @@ pub fn emit_loadk(bx: usize, c: LType, dest: usize) -> impl Coroutine<ResumeArg,
     move |mut arg: ResumeArg| {
         match c {
             LType::Number => {
-                yield YieldOp::Exec(ResidualExec("loadk_number", Rc::new(move |owner, clos, vals| {
-                    vals[dest] = unsafe { (&(&(*clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                yield YieldOp::Exec(ResidualExec("loadk_number", Rc::new(move |owner, mut state| {
+                    state.vals[dest] = unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                    state
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
             },
@@ -77,7 +79,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         if arg == ResumeArg::Matched {
             arg = yield YieldOp::GuardRk(rhs, LType::Table);
             if arg == ResumeArg::Matched {
-                yield YieldOp::Exec(ResidualExec("add_table_table", Rc::new(move |owner, clos, vals| {
+                yield YieldOp::Exec(ResidualExec("add_table_table", Rc::new(move |owner, mut state| {
+                    panic!();
+                    state
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
                 return arg;
@@ -90,9 +94,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             arg = yield YieldOp::GuardRk(rhs, LType::Number);
             if arg == ResumeArg::Matched {
                 // TODO: is_constant for kb/kc? yeah that's needed for constant type effects
-                yield YieldOp::Exec(ResidualExec("add_int_int", Rc::new(move |owner, clos, vals| {
-                    let kb = Vm::rk(clos.ro(owner).prototype, 0, &*vals, lhs as u16);
-                    let kc = Vm::rk(clos.ro(owner).prototype, 0, &*vals, rhs as u16);
+                yield YieldOp::Exec(ResidualExec("add_int_int", Rc::new(move |owner, mut state| {
+                    let kb = Vm::rk(state.clos.ro(owner).prototype, 0, &state.vals, lhs as u16);
+                    let kc = Vm::rk(state.clos.ro(owner).prototype, 0, &state.vals, rhs as u16);
                     // Safe bypass of runtime checks
                     debug!("{opcode:?} {kb:?} {kc:?}");
                     let res = match (opcode, kb, kc) {
@@ -123,7 +127,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                         _ => unreachable!(),
                     };
                     debug!("res {:?}", &res);
-                    vals[dest as usize] = res;
+                    state.vals[dest as usize] = res;
+                    state
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
@@ -135,7 +140,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         if arg == ResumeArg::Matched {
             arg = yield YieldOp::GuardRk(rhs, LType::String);
             if arg == ResumeArg::Matched {
-                yield YieldOp::Exec(ResidualExec("add_str_str", Rc::new(move |owner, clos, vals| {
+                yield YieldOp::Exec(ResidualExec("add_str_str", Rc::new(move |owner, state| {
                     //let RValue::Str(l) = &vals[lhs] else { unreachable!() };
                     //let RValue::Str(r) = &vals[rhs] else { unreachable!() };
                     //vals[dest] = RValue::Str(l.clone() + r);
@@ -160,8 +165,9 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Typeof(src);
         if let ResumeArg::Type(t) = arg {
-            yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, clos, vals| {
-                vals[dest] = vals[src].clone();
+            yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, mut state| {
+                state.vals[dest] = state.vals[src].clone();
+                state
             })));
             // TODO: track references? see PyLBBV
             debug!("move {} = {} {:?}", dest, src, t);
@@ -304,6 +310,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_forprep(a as usize, sbx as usize, pc)), ResumeArg::Start, block_id)
                 },
+                Opcode::FORLOOP => {
+                    panic!()
+                },
                 //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
                 Opcode::RETURN => {
                     println!("ret");
@@ -361,6 +370,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // TODO; create a new block and rewrite thunk into a jump instead
                 unimplemented!();
             }
+            // TODO: search for if we already have a compatible block
             vm.blocks[block_id][thunk_pc] = Residual::Guard { idx, expected: runtime_type };
             // Push the same thunk down for the next value that fails the guard
             let fail_thunk = vm.make_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_types.clone(), false);
@@ -368,6 +378,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // Finish the remainder of the coroutine
             let guard_block = vm.new_block();
             if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), forced_types.clone(), thunk_coro, arg, guard_block) {
+                // And continue compiling the block
                 vm.compile(owner, succ_next, succ_ty, guard_block);
             }
             vm.blocks[block_id].push(Residual::Jump(guard_block));
@@ -465,7 +476,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    pub fn run(&mut self, owner: &mut TCellOwner<TcOwner>, mut id: BlockId, mut values: Vec<LValue<'src, 'intern>>) -> Vec<LValue<'src, 'intern>> {
+    pub fn run(&mut self, owner: &mut TCellOwner<TcOwner>, mut id: BlockId, mut state: RunState<'src, 'intern>) -> RunState<'src, 'intern> {
         let mut off = 0;
         debug!("run");
         loop {
@@ -474,7 +485,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             dbg!(&res);
             match res {
                 Residual::Guard { idx, expected } => {
-                    if typeof_(&values[idx]) == expected {
+                    if typeof_(&state.vals[idx]) == expected {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -482,7 +493,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::Exec(f) => {
-                    f.1(owner, self.clos.clone(), &mut values);
+                    state = f.1(owner, state);
                     off += 1;
                 },
                 Residual::Jump(target) => {
@@ -491,11 +502,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Thunk(thunk) => {
                     dbg!(&block);
-                    (thunk.0.borrow_mut())(self, owner, &mut values, off)
+                    (thunk.0.borrow_mut())(self, owner, &mut state.vals, off)
                 },
                 Residual::Ret => {
                     debug!("spec final blocks: {:?}", self.blocks);
-                    return values;
+                    return state;
                 },
             }
         }
