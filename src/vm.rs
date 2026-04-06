@@ -941,7 +941,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
     }
 
 
-    pub fn run<'lua>(&'lua self,
+    pub fn run<'lua, const LBBV: bool>(&'lua self,
         owner: &mut TCellOwner<TcOwner>,
         mut _G: Tc<Table<'src, 'intern>>,
         mut clos: Tc<LClosure<'src, 'intern>>,
@@ -1299,7 +1299,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         state.vals.truncate(state.base +  next_stack);
                         state.clos = lclos.clone();
 
-                        if true {
+                        if LBBV {
                             // Lazy basic block versioning
                             // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];

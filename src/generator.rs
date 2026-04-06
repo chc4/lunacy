@@ -59,6 +59,7 @@ pub enum YieldOp {
 pub enum ResumeArg {
     Start,
     Matched,
+    MatchedConst(usize),
     Failed,
     Type(LType),
     BlockId(BlockId),
@@ -151,7 +152,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         }
         // TODO: table shape specialization
         arg = yield YieldOp::GuardRk(b, LType::Number);
-        if arg == ResumeArg::Matched {
+        if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
             // Array part set
             // TODO: MatchedConst
             arg = yield YieldOp::Exec(ResidualExec("settable_array", Rc::new(move |owner, state, cb| {
@@ -238,9 +239,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
     #[coroutine]
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::GuardRk(lhs, LType::Table);
-        if arg == ResumeArg::Matched {
+        if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
             arg = yield YieldOp::GuardRk(rhs, LType::Table);
-            if arg == ResumeArg::Matched {
+            if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
                 yield YieldOp::Exec(ResidualExec("add_table_table", Rc::new(move |owner, state, cb| {
                     panic!();
                 })));
@@ -249,57 +250,68 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             }
         }
         // --- Int Path ---
-        arg = yield YieldOp::GuardRk(lhs, LType::Number);
-        // TODO: have a MatchedConst case to remove the need for Vm::rk at runtime
-        if arg == ResumeArg::Matched {
-            arg = yield YieldOp::GuardRk(rhs, LType::Number);
-            if arg == ResumeArg::Matched {
-                // TODO: is_constant for kb/kc? yeah that's needed for constant type effects
+        let larg = yield YieldOp::GuardRk(lhs, LType::Number);
+        let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
+        arg = rarg;
+        match (larg, rarg) {
+            (ResumeArg::Matched, ResumeArg::Matched) => {
                 yield YieldOp::Exec(ResidualExec("add_int_int", Rc::new(move |owner, state, cb| {
-                    let kb = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, lhs as u16);
-                    let kc = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, rhs as u16);
-                    // Safe bypass of runtime checks
-                    debug!("{opcode:?} {kb:?} {kc:?}");
-                    let res = match (opcode, kb, kc) {
-                        (Opcode::ADD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 + const_c.0)),
-                        (Opcode::SUB, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 - const_c.0)),
-                        (Opcode::MUL, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 * const_c.0)),
-                        (Opcode::DIV, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 / const_c.0)),
-                        (Opcode::MOD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 % const_c.0)),
-                        (Opcode::POW, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0.powf(const_c.0))),
-
-                        (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).numeric_op(opcode, dyn_c).unwrap()
-                        },
-
-                        (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.numeric_op(opcode, &const_c.into()).unwrap()
-                        },
-
-                        (_, Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b.numeric_op(opcode, dyn_c).unwrap()
-                        },
-                        _ => unreachable!(),
-                    };
+                    let klhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, lhs as u16);
+                    let krhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, rhs as u16);
+                    let dyn_b = &state.vals[state.base + lhs];
+                    let dyn_c = &state.vals[state.base + rhs];
+                    let res = dyn_b.numeric_op(opcode, &dyn_c).unwrap();
                     debug!("res {:?}", &res);
                     state.vals[state.base + dest as usize] = res;
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
-            }
+            },
+            (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
+                yield YieldOp::Exec(ResidualExec("add_cint_cint", Rc::new(move |owner, state, cb| {
+                    let klhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc as usize]) };
+                    let krhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc as usize]) };
+                    let LConstant::Number(kb) = klhs else { unreachable!() };
+                    let LConstant::Number(kc) = krhs else { unreachable!() };
+                    let res = LValue::Number(Number(kb.0 + kc.0));
+                    debug!("res {:?}", &res);
+                    state.vals[state.base + dest as usize] = res;
+                })));
+                yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+                return arg;
+            },
+            (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
+                yield YieldOp::Exec(ResidualExec("add_cint_int", Rc::new(move |owner, state, cb| {
+                    let kb: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc as usize]) };
+                    let LConstant::Number(kb) = kb else { unreachable!() };
+                    let dyn_c = &state.vals[state.base + rhs];
+                    let res = LValue::Number(Number(kb.0)).numeric_op(opcode, dyn_c).unwrap();
+                    debug!("res {:?}", &res);
+                    state.vals[state.base + dest as usize] = res;
+                })));
+                yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+                return arg;
+            },
+            (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
+                yield YieldOp::Exec(ResidualExec("add_int_cint", Rc::new(move |owner, state, cb| {
+                    let dyn_b = &state.vals[state.base + lhs];
+                    let kc: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc as usize]) };
+                    let LConstant::Number(kc) = kc else { unreachable!() };
+                    let res = dyn_b.numeric_op(opcode, &LValue::Number(Number(kc.0))).unwrap();
+                    debug!("res {:?}", &res);
+                    state.vals[state.base + dest as usize] = res;
+                })));
+                yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+                return arg;
+            },
+            _ => { /* fallthrough */ },
         }
 
         // --- Str Path ---
         arg = yield YieldOp::GuardRk(lhs, LType::String);
-        if arg == ResumeArg::Matched {
+        if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
             arg = yield YieldOp::GuardRk(rhs, LType::String);
-            if arg == ResumeArg::Matched {
+            if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
                 yield YieldOp::Exec(ResidualExec("add_str_str", Rc::new(move |owner, state, cb| {
                     //let RValue::Str(l) = &vals[lhs] else { unreachable!() };
                     //let RValue::Str(r) = &vals[rhs] else { unreachable!() };
@@ -324,9 +336,9 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
     #[coroutine]
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::GuardRk(b, LType::Number);
-        if arg != ResumeArg::Matched {
+        let (ResumeArg::Matched | ResumeArg::MatchedConst(_)) = arg else {
             unimplemented!("__unm metatable");
-        }
+        };
         arg = yield YieldOp::Exec(ResidualExec("unm", Rc::new(move |owner, state, cb| {
             let res = match &state.vals[state.base + b as usize] {
                 // TODO: metatables
@@ -412,6 +424,8 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         drain!(sub, arg);
         let mut mov = emit_move(a, a);
         drain!(mov, arg);
+        // TODO: `comp` metamethods? which may invalidate the types that our resolved
+        // blocks are compatible for? i think they're fine because they're on the stack whatever
         arg = yield YieldOp::GetBlock(pc);
         let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
         arg = yield YieldOp::GetBlock((pc as isize + sbx as isize) as usize);
@@ -608,7 +622,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::RETURN => {
                     self.blocks[block_id].push(Residual::Ret(pc)); None
                 },
-                x => unreachable!("{:?}", x),
+                x => {
+                    #[cfg(debug_assertions)]
+                    {
+                        unreachable!("{:?}", x)
+                    }
+                    self.blocks[block_id].push(Residual::Ret(pc)); None
+                },
             } {
                 pc = next;
                 types = ty;
@@ -700,7 +720,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Constants always have known types
                         if ty == *expected {
                             pc = pc.next_true();
-                            arg = ResumeArg::Matched;
+                            arg = ResumeArg::MatchedConst(r_const);
                             break 'machine;
                         } else if ty != LType::Unknown {
                             pc = pc.next_false();
