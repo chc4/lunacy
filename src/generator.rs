@@ -801,6 +801,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         loop {
             let block = &self.blocks[id];
             let res = block[off].clone();
+            state.counters.versioned_count.increment();
             debug!("{:?}", &res);
             match res {
                 Residual::Guard { idx, expected } => {

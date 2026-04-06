@@ -18,6 +18,7 @@ use qcell::{TCell, TCellOwner};
 
 use log::debug;
 use crate::generator::{Specializer, SubPc, BlockId};
+use crate::perf::PerfCounters;
 
 pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
 
@@ -822,6 +823,7 @@ pub struct RunState<'src, 'intern> {
     pub vals: FVec<LValue<'src, 'intern>>,
     pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
     pub callstack: FVec<(Tc<LClosure<'src, 'intern>>, usize, usize, usize, usize, u16)>,
+    pub counters: PerfCounters,
 }
 
 
@@ -968,6 +970,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 vals,
                 upvals,
                 callstack,
+                counters: Default::default(),
             }
         };
         // we need to track where to return to, along with the base pointer and where to put return
@@ -975,6 +978,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let r_vals = 'int: loop {
             let inst = unsafe { state.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[state.pc] };
             state.pc += 1;
+            state.counters.interpreter_count.increment();
             debug!("pc {} inst {:?}", state.pc, inst.0.Opcode());
             debug!("stack: {}, {:?}", state.base, &state.vals);
             match inst.0.Opcode() {
@@ -1295,7 +1299,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         state.vals.truncate(state.base +  next_stack);
                         state.clos = lclos.clone();
 
-                        if false {
+                        if true {
                             // Lazy basic block versioning
                             // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];
@@ -1404,6 +1408,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 _ => (),
             };
         };
+        #[cfg(feature = "counters")] {
+            println!("counters after run {:?}", state.counters);
+        }
         Ok(r_vals)
     }
 }
