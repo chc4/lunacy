@@ -1,5 +1,6 @@
 #![allow(unused_variables)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::{Coroutine, CoroutineState, Deref};
 use std::pin::Pin;
@@ -10,9 +11,10 @@ use crate::vm::{Opcode, Upvalue};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
-use crate::vm::{LValue, LType, Number};
+use crate::vm::{LValue, LType, Number, Table};
 use crate::vm::{InstructionDecode, Unpacker};
 use crate::vm::RunState;
+use crate::vm::LConstant;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
 
@@ -22,6 +24,7 @@ fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
     match val {
         LValue::Number(_) => LType::Number,
         LValue::InternedString(_) | LValue::OwnedString(_) => LType::String,
+        LValue::Table(t) => LType::Table,
         _ => LType::Unknown,
     }
 }
@@ -79,6 +82,165 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
     }
 }
 
+pub fn emit_getglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
+    // We need unsafe here, because we can't prove to rustc that this Rc<Fn> won't outlive
+    // 'src and 'intern which it refers to. We only ever store these closures in the
+    // closure object which itself borrows from the same data, and so this is safe.
+    let kst: LConstant<'static, 'static> = unsafe { core::mem::transmute(kst.clone()) };
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        // TODO: env shape specialization
+        // maybe getting _G[kst] should be a yieldop...?
+        debug!("getglobal {} = {:?}", dest, &kst);
+        yield YieldOp::Exec(ResidualExec("getglobal", Rc::new(move |owner, mut state, cb| {
+            state.vals[state.base + dest as usize] = state._G.get(owner, &(&kst).into()).unwrap_or((&Constant::Nil).into()).clone();
+            state
+        })));
+        yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
+        arg
+    }
+}
+
+pub fn emit_setglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
+    // We need unsafe for the same reason, and with the same justification, as emit_getglobal.
+    let kst: LConstant<'static, 'static> = unsafe { core::mem::transmute(kst.clone()) };
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        // TODO: env shape specialization
+        debug!("setglobal {} = {:?}", dest, &kst);
+        yield YieldOp::Exec(ResidualExec("setglobal", Rc::new(move |owner, mut state, cb| {
+            state._G.set(owner, (&kst).into(), state.vals[state.base + dest as usize].clone());
+            state
+        })));
+        arg
+    }
+}
+
+pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Guard(b, LType::Table);
+        if arg != ResumeArg::Matched {
+            arg = yield YieldOp::Exec(ResidualExec("gettable_meta", Rc::new(move |owner, mut state, cb| {
+                panic!("gettable_meta {:?} {:?}", &state.vals, &state.vals[state.base + b])
+            })));
+            yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
+            return arg;
+        }
+        // TODO: object shape specialization
+        arg = yield YieldOp::Exec(ResidualExec("gettable", Rc::new(move |owner, mut state, cb| {
+            let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                Ok(c) => Cow::Owned(LValue::from(c)),
+                Err(lv) => Cow::Borrowed(lv),
+            };
+            debug!("gettable {:?}", &kc);
+            let val_b = state.vals[state.base + b as usize].clone();
+            state.vals[state.base + a as usize] = val_b.gettable(owner, kc);
+            state
+        })));
+        yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
+        arg
+    }
+}
+
+pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Guard(a, LType::Table);
+        if arg != ResumeArg::Matched {
+            arg = yield YieldOp::Exec(ResidualExec("settable_meta", Rc::new(move |owner, mut state, cb| {
+                panic!("settable_meta {:?}", state.vals)
+            })));
+            return arg;
+        }
+        // TODO: table shape specialization
+        arg = yield YieldOp::GuardRk(b, LType::Number);
+        if arg == ResumeArg::Matched {
+            // Array part set
+            // TODO: MatchedConst
+            arg = yield YieldOp::Exec(ResidualExec("settable_array", Rc::new(move |owner, mut state, cb| {
+                let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
+                    Ok(b) => b.into(),
+                    Err(lv) => lv.clone(),
+                };
+                let LValue::Number(kb) = kb else { unreachable!() };
+                let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                    Ok(c) => c.into(),
+                    Err(lv) => lv.clone(),
+                };
+                let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
+                let t = t.rw(owner);
+                if t.array.len() <= kb.0 as usize {
+                    t.array.resize_with(kb.0 as usize, || LValue::Nil);
+                }
+                t.array[kb.0 as usize-1] = kc;
+                state
+            })));
+        } else {
+            // Hash part set
+            arg = yield YieldOp::Exec(ResidualExec("settable_hash", Rc::new(move |owner, mut state, cb| {
+                let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
+                    Ok(b) => b.into(),
+                    Err(lv) => lv.clone(),
+                };
+                let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                    Ok(c) => c.into(),
+                    Err(lv) => lv.clone(),
+                };
+                let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
+                t.rw(owner).hash.insert(kb, kc);
+                state
+            })));
+        }
+        arg
+    }
+}
+
+pub fn emit_newtable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Exec(ResidualExec("newtable", Rc::new(move |owner, mut state, cb| {
+            // TODO: properly decode the "floating point byte" size hints instead
+            state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
+            state
+        })));
+        yield YieldOp::SetTypes(vec![(a, LType::Table)]);
+        arg
+    }
+}
+
+pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        // We don't need to guard on LType::Table, because this instruction is only ever used for
+        // table initialization, which means it is definitely a table and doesn't e.g. have a
+        // metatable we have to chain to.
+        arg = yield YieldOp::Exec(ResidualExec("setlist", Rc::new(move |owner, mut state, cb| {
+            match state.vals[state.base + a as usize].clone() {
+                LValue::Table(tab) => {
+                    assert_ne!(c, 0);
+                    if b == 0 {
+                        let src = state.vals[state.base + a as usize+1..].iter().cloned();
+                        tab.rw(owner).array.splice(
+                            (c as usize-1)*50..,
+                            src
+                        ).for_each(drop);
+                    } else {
+                        let src = state.vals[state.base + a as usize+1..=state.base + a as usize+b as usize as usize].iter().cloned();
+                        tab.rw(owner).array.splice(
+                            (c as usize-1)*50..,
+                            src
+                        ).for_each(drop);
+                    }
+                },
+                _ => unreachable!(),
+            };
+            state
+        })));
+        yield YieldOp::SetTypes(vec![(a, LType::Table)]);
+        arg
+    }
+}
 
 pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
@@ -165,6 +327,27 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
 
         // --- Generic/Trap Fallback ---
         panic!("Type mismatch trap");
+    }
+}
+
+pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::GuardRk(b, LType::Number);
+        if arg != ResumeArg::Matched {
+            unimplemented!("__unm metatable");
+        }
+        arg = yield YieldOp::Exec(ResidualExec("unm", Rc::new(move |owner, mut state, cb| {
+            let res = match &state.vals[state.base + b as usize] {
+                // TODO: metatables
+                LValue::Number(n) => LValue::Number(Number(-n.0)),
+                _ => unimplemented!(),
+            };
+            state.vals[state.base + a as usize] = res;
+            state
+        })));
+        yield YieldOp::SetTypes(vec![(a, LType::Number)]);
+        arg
     }
 }
 
@@ -370,10 +553,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), types);
             if let Some((next, ty, ret)) = match inst.0.Opcode() {
-                op @ Opcode::ADD => {
+                op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{a} {b} {c}");
                     self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_numeric(op, a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::UNM => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_unm(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
@@ -396,6 +583,42 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::GETUPVAL => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::CALL => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    debug!("{} {} {}", a, b, c);
+                    // TODO: this should try to compile a new block and jump to it, and only
+                    // fallback to a trace exit if we need to run the fully generic code
+                    self.blocks[block_id].push(Residual::Ret(pc)); None
+                },
+                Opcode::GETGLOBAL => {
+                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                    let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
+                    debug!("getglobal {} {} {:?}", a, bx, &kst);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_getglobal(a as usize, kst)), ResumeArg::Start, block_id)
+                },
+                Opcode::SETGLOBAL => {
+                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                    let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_setglobal(a as usize, kst)), ResumeArg::Start, block_id)
+                },
+                Opcode::GETTABLE => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    debug!("gettable {} {} {}", a, b, c);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_gettable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::SETTABLE => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    debug!("settable {} {} {}", a, b, c);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_settable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::NEWTABLE => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_newtable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::SETLIST => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
                 Opcode::RETURN => {
@@ -578,7 +801,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         loop {
             let block = &self.blocks[id];
             let res = block[off].clone();
-            dbg!(&res);
+            debug!("{:?}", &res);
             match res {
                 Residual::Guard { idx, expected } => {
                     if typeof_(&state.vals[state.base + idx]) == expected {
@@ -606,7 +829,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off = 0;
                 },
                 Residual::Thunk(thunk) => {
-                    dbg!(&block);
+                    debug!("thunk {:?}", &block);
                     (thunk.0.borrow_mut())(self, owner, &mut state, off)
                 },
                 Residual::Ret(pc) => {

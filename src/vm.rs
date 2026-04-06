@@ -19,7 +19,7 @@ use qcell::{TCell, TCellOwner};
 use log::debug;
 use crate::generator::{Specializer, SubPc, BlockId};
 
-type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
+pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Number(pub f64);
@@ -170,6 +170,9 @@ impl InstructionDecode for RETURN { type Unpack = AB; }
 
 struct CLOSURE;
 impl InstructionDecode for CLOSURE { type Unpack = ABx; }
+
+struct GETGLOBAL;
+impl InstructionDecode for GETGLOBAL { type Unpack = ABx; }
 
 struct SETGLOBAL;
 impl InstructionDecode for SETGLOBAL { type Unpack = ABx; }
@@ -395,7 +398,7 @@ impl<T> Deref for Tc<T> {
 }
 
 #[derive(Default)]
-struct InternedHasher {
+pub struct InternedHasher {
     hasher: FxBuildHasher,
 }
 
@@ -447,8 +450,8 @@ impl std::hash::BuildHasher for InternedHasher {
 
 #[derive(Debug)]
 pub struct Table<'src, 'intern> {
-    array: FVec<LValue<'src, 'intern>>,
-    hash: HashMap<LValue<'src, 'intern>, LValue<'src, 'intern>, InternedHasher>,
+    pub array: FVec<LValue<'src, 'intern>>,
+    pub hash: HashMap<LValue<'src, 'intern>, LValue<'src, 'intern>, InternedHasher>,
 }
 
 impl<'src, 'intern> Table<'src, 'intern> {
@@ -718,7 +721,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    fn gettable(&self, owner: &mut TCellOwner<TcOwner>, index: Cow<'_, LValue<'src, 'intern>>) -> LValue<'src, 'intern> {
+    pub fn gettable(&self, owner: &mut TCellOwner<TcOwner>, index: Cow<'_, LValue<'src, 'intern>>) -> LValue<'src, 'intern> {
         let val_b = match self {
             LValue::Table(tab) => {
                 debug!("table {:?}", tab);
@@ -1097,7 +1100,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     state._G.set(owner, kst.into(), state.vals[state.base + a as usize].clone());
                 },
                 Opcode::GETGLOBAL => {
-                    let (a, bx) = <SETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
+                    let (a, bx) = <GETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
                     let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
@@ -1292,7 +1295,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         state.vals.truncate(state.base +  next_stack);
                         state.clos = lclos.clone();
 
-                        if true {
+                        if false {
                             // Lazy basic block versioning
                             // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];
