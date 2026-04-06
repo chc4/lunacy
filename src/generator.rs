@@ -33,9 +33,9 @@ fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
 enum ExecEffect {
     Jump(Pc),
 }
-type ExecCallback<'a, 'src, 'intern> = &'a mut dyn FnMut(ExecEffect, &mut TCellOwner<TcOwner>, RunState<'src, 'intern>) -> RunState<'src, 'intern>;
+type ExecCallback<'a, 'src, 'intern> = &'a mut dyn for<'b> FnMut(ExecEffect, &mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>);
 #[derive(Clone)]
-struct ResidualExec(&'static str, Rc<dyn for <'a, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>) -> RunState<'src, 'intern>>);
+struct ResidualExec(&'static str, Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>)>);
 impl std::fmt::Debug for ResidualExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "exec({}, {:p})", self.0, self.1.as_ref() as &_ as *const _ as *const ())
@@ -69,10 +69,9 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
     move |mut arg: ResumeArg| {
         match c {
             LType::Number => {
-                yield YieldOp::Exec(ResidualExec("loadk_number", Rc::new(move |owner, mut state, cb| {
+                yield YieldOp::Exec(ResidualExec("loadk_number", Rc::new(move |owner, state, cb| {
                     debug!("{:?}", unsafe { &*state.clos.ro(owner).prototype });
                     state.vals[state.base + dest] = unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
-                    state
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
             },
@@ -92,9 +91,8 @@ pub fn emit_getglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>
         // TODO: env shape specialization
         // maybe getting _G[kst] should be a yieldop...?
         debug!("getglobal {} = {:?}", dest, &kst);
-        yield YieldOp::Exec(ResidualExec("getglobal", Rc::new(move |owner, mut state, cb| {
+        yield YieldOp::Exec(ResidualExec("getglobal", Rc::new(move |owner, state, cb| {
             state.vals[state.base + dest as usize] = state._G.get(owner, &(&kst).into()).unwrap_or((&Constant::Nil).into()).clone();
-            state
         })));
         yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
         arg
@@ -108,9 +106,8 @@ pub fn emit_setglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>
     move |mut arg: ResumeArg| {
         // TODO: env shape specialization
         debug!("setglobal {} = {:?}", dest, &kst);
-        yield YieldOp::Exec(ResidualExec("setglobal", Rc::new(move |owner, mut state, cb| {
+        yield YieldOp::Exec(ResidualExec("setglobal", Rc::new(move |owner, state, cb| {
             state._G.set(owner, (&kst).into(), state.vals[state.base + dest as usize].clone());
-            state
         })));
         arg
     }
@@ -121,14 +118,14 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Guard(b, LType::Table);
         if arg != ResumeArg::Matched {
-            arg = yield YieldOp::Exec(ResidualExec("gettable_meta", Rc::new(move |owner, mut state, cb| {
+            arg = yield YieldOp::Exec(ResidualExec("gettable_meta", Rc::new(move |owner, state, cb| {
                 panic!("gettable_meta {:?} {:?}", &state.vals, &state.vals[state.base + b])
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
             return arg;
         }
         // TODO: object shape specialization
-        arg = yield YieldOp::Exec(ResidualExec("gettable", Rc::new(move |owner, mut state, cb| {
+        arg = yield YieldOp::Exec(ResidualExec("gettable", Rc::new(move |owner, state, cb| {
             let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
                 Ok(c) => Cow::Owned(LValue::from(c)),
                 Err(lv) => Cow::Borrowed(lv),
@@ -136,7 +133,6 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             debug!("gettable {:?}", &kc);
             let val_b = state.vals[state.base + b as usize].clone();
             state.vals[state.base + a as usize] = val_b.gettable(owner, kc);
-            state
         })));
         yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
         arg
@@ -148,7 +144,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Guard(a, LType::Table);
         if arg != ResumeArg::Matched {
-            arg = yield YieldOp::Exec(ResidualExec("settable_meta", Rc::new(move |owner, mut state, cb| {
+            arg = yield YieldOp::Exec(ResidualExec("settable_meta", Rc::new(move |owner, state, cb| {
                 panic!("settable_meta {:?}", state.vals)
             })));
             return arg;
@@ -158,7 +154,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         if arg == ResumeArg::Matched {
             // Array part set
             // TODO: MatchedConst
-            arg = yield YieldOp::Exec(ResidualExec("settable_array", Rc::new(move |owner, mut state, cb| {
+            arg = yield YieldOp::Exec(ResidualExec("settable_array", Rc::new(move |owner, state, cb| {
                 let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                     Ok(b) => b.into(),
                     Err(lv) => lv.clone(),
@@ -174,11 +170,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     t.array.resize_with(kb.0 as usize, || LValue::Nil);
                 }
                 t.array[kb.0 as usize-1] = kc;
-                state
             })));
         } else {
             // Hash part set
-            arg = yield YieldOp::Exec(ResidualExec("settable_hash", Rc::new(move |owner, mut state, cb| {
+            arg = yield YieldOp::Exec(ResidualExec("settable_hash", Rc::new(move |owner, state, cb| {
                 let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                     Ok(b) => b.into(),
                     Err(lv) => lv.clone(),
@@ -189,7 +184,6 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 };
                 let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
                 t.rw(owner).hash.insert(kb, kc);
-                state
             })));
         }
         arg
@@ -199,10 +193,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
 pub fn emit_newtable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        arg = yield YieldOp::Exec(ResidualExec("newtable", Rc::new(move |owner, mut state, cb| {
+        arg = yield YieldOp::Exec(ResidualExec("newtable", Rc::new(move |owner, state, cb| {
             // TODO: properly decode the "floating point byte" size hints instead
             state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
-            state
         })));
         yield YieldOp::SetTypes(vec![(a, LType::Table)]);
         arg
@@ -215,7 +208,7 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
         // We don't need to guard on LType::Table, because this instruction is only ever used for
         // table initialization, which means it is definitely a table and doesn't e.g. have a
         // metatable we have to chain to.
-        arg = yield YieldOp::Exec(ResidualExec("setlist", Rc::new(move |owner, mut state, cb| {
+        arg = yield YieldOp::Exec(ResidualExec("setlist", Rc::new(move |owner, state, cb| {
             match state.vals[state.base + a as usize].clone() {
                 LValue::Table(tab) => {
                     assert_ne!(c, 0);
@@ -235,7 +228,6 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
                 },
                 _ => unreachable!(),
             };
-            state
         })));
         yield YieldOp::SetTypes(vec![(a, LType::Table)]);
         arg
@@ -249,9 +241,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         if arg == ResumeArg::Matched {
             arg = yield YieldOp::GuardRk(rhs, LType::Table);
             if arg == ResumeArg::Matched {
-                yield YieldOp::Exec(ResidualExec("add_table_table", Rc::new(move |owner, mut state, cb| {
+                yield YieldOp::Exec(ResidualExec("add_table_table", Rc::new(move |owner, state, cb| {
                     panic!();
-                    state
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
                 return arg;
@@ -264,7 +255,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             arg = yield YieldOp::GuardRk(rhs, LType::Number);
             if arg == ResumeArg::Matched {
                 // TODO: is_constant for kb/kc? yeah that's needed for constant type effects
-                yield YieldOp::Exec(ResidualExec("add_int_int", Rc::new(move |owner, mut state, cb| {
+                yield YieldOp::Exec(ResidualExec("add_int_int", Rc::new(move |owner, state, cb| {
                     let kb = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, lhs as u16);
                     let kc = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, rhs as u16);
                     // Safe bypass of runtime checks
@@ -298,7 +289,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     };
                     debug!("res {:?}", &res);
                     state.vals[state.base + dest as usize] = res;
-                    state
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
@@ -337,14 +327,13 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         if arg != ResumeArg::Matched {
             unimplemented!("__unm metatable");
         }
-        arg = yield YieldOp::Exec(ResidualExec("unm", Rc::new(move |owner, mut state, cb| {
+        arg = yield YieldOp::Exec(ResidualExec("unm", Rc::new(move |owner, state, cb| {
             let res = match &state.vals[state.base + b as usize] {
                 // TODO: metatables
                 LValue::Number(n) => LValue::Number(Number(-n.0)),
                 _ => unimplemented!(),
             };
             state.vals[state.base + a as usize] = res;
-            state
         })));
         yield YieldOp::SetTypes(vec![(a, LType::Number)]);
         arg
@@ -356,9 +345,8 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Typeof(src);
         if let ResumeArg::Type(t) = arg {
-            yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, mut state, cb| {
+            yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, state, cb| {
                 state.vals[state.base + dest] = state.vals[state.base + src].clone();
-                state
             })));
             // TODO: track references? see PyLBBV
             debug!("move {} = {} {:?}", dest, src, t);
@@ -387,7 +375,7 @@ macro_rules! drain {
 pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        arg = yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, mut state, cb| {
+        arg = yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, state, cb| {
             let upval = match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
                 Upvalue::Open(o) => {
                     state.vals[*o as usize].clone()
@@ -397,7 +385,6 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
                 },
             };
             state.vals[state.base + a as usize] = upval.clone();
-            state
         })));
         return arg;
     }
@@ -429,7 +416,7 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
         arg = yield YieldOp::GetBlock((pc as isize + sbx as isize) as usize);
         let ResumeArg::BlockId(taken) = arg else { unreachable!() };
-        yield YieldOp::Exec(ResidualExec("forloop", Rc::new(move |owner, mut state, cb| {
+        yield YieldOp::Exec(ResidualExec("forloop", Rc::new(move |owner, state, cb| {
             let idx = state.vals[state.base + a as usize].clone();
             let limit = state.vals[state.base + a as usize + 1].clone();
             let step = state.vals[state.base + a as usize + 2].clone();
@@ -440,13 +427,11 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
                 idx.clone().compare(Opcode::LE, limit)
             };
             if comp.unwrap() {
-                state = cb(ExecEffect::Jump(taken), owner, state);
+                cb(ExecEffect::Jump(taken), owner, state);
                 state.vals[state.base + a as usize + 3] = idx;
             } else {
-                state = cb(ExecEffect::Jump(fallthrough), owner, state);
+                cb(ExecEffect::Jump(fallthrough), owner, state);
             }
-
-            state
         })));
         arg
     }
@@ -620,7 +605,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
-                //Operation::Add(o, l, r) => self.compile_one(SubPc::new(pc), types.clone(), emit_add(o, l, r), ResumeArg::Start, block_id),
                 Opcode::RETURN => {
                     self.blocks[block_id].push(Residual::Ret(pc)); None
                 },
@@ -814,7 +798,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Exec(f) => {
                     off += 1;
-                    state = f.1(owner, state, &mut |eff, owner, state| {
+                    f.1(owner, &mut state, &mut |eff, owner, state| {
                         debug!("{:?}", eff);
                         match eff {
                             ExecEffect::Jump(block) => {
@@ -822,7 +806,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 off = 0;
                             },
                         }
-                        state
                     });
                 },
                 Residual::Jump(target) => {
