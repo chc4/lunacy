@@ -1324,7 +1324,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                 spec.set_current(lclos.clone());
                                 spec.block(owner, 0, types)
                             };
-                            debug!("{:?} {block}", spec.blocks);
+                            debug!("{:?} {block:?}", spec.blocks);
                             spec.set_current(lclos.clone());
                             state = spec.run(owner, block, state);
                         } else {

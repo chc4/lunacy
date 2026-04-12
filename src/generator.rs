@@ -375,16 +375,29 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     let dyn_c = &state.vals[state.base + c];
                     let cond = LValue::from(const_b).compare(opcode, dyn_c.clone()).unwrap();
                     if (cond as u8) != a {
-                        debug!("taking comparison jump -> {}", taken);
+                        debug!("taking comparison jump -> {:?}", taken);
                         cb(ExecEffect::Jump(taken), owner, state);
                     } else {
-                        debug!("falling through comparison jump -> {}", fallthrough);
+                        debug!("falling through comparison jump -> {:?}", fallthrough);
                         cb(ExecEffect::Jump(fallthrough), owner, state);
                     }
                 })));
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
-                unimplemented!()
+                arg = yield YieldOp::Exec(ResidualExec("comp_int_cint", Rc::new(move |owner, state, cb| {
+                    debug!("comp @ {}", pc);
+                    let dyn_b = &state.vals[state.base + b];
+                    let const_c = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[rc as usize] };
+                    let Constant::Number(Number(_)) = const_c else { unreachable!() };
+                    let cond = dyn_b.compare(opcode, const_c.into()).unwrap();
+                    if (cond as u8) != a {
+                        debug!("taking comparison jump -> {:?}", taken);
+                        cb(ExecEffect::Jump(taken), owner, state);
+                    } else {
+                        debug!("falling through comparison jump -> {:?}", fallthrough);
+                        cb(ExecEffect::Jump(fallthrough), owner, state);
+                    }
+                })));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::MatchedConst(rc)) => {
                 unimplemented!()
@@ -526,7 +539,9 @@ pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         debug!("forprep {a} {sbx} {pc}");
         let mut sub = emit_numeric(Opcode::SUB, a, a, a + 2);
         drain!(sub, arg);
-        yield YieldOp::Jump(pc + sbx as usize);
+        arg = yield YieldOp::GetBlock(((pc as isize) + sbx as isize) as usize);
+        let ResumeArg::BlockId(target) = arg else { unreachable!() };
+        yield YieldOp::Jump(target);
         return arg;
     }
 }
@@ -598,7 +613,8 @@ pub fn guard_filter(mut sub: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Retu
     }
 }
 
-pub type BlockId = usize;
+#[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
+pub struct BlockId(pub usize);
 pub type Pc = usize;
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 pub struct SubPc(usize, usize);
@@ -685,7 +701,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.clos.ro(owner).versions.get(&(pc, types.clone())).cloned()
     }
 
-    pub fn compile(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut types: Vec<LType>, block_id: usize) -> Vec<LType> {
+    pub fn compile(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut types: Vec<LType>, block_id: BlockId) -> Vec<LType> {
         loop {
             let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), types);
@@ -773,7 +789,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.blocks[block_id].push(Residual::Ret(pc, a, b)); None
+                    self.blocks[block_id.0].push(Residual::Ret(pc, a, b)); None
                 },
                 x => {
                     #[cfg(debug_assertions)]
@@ -781,7 +797,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         unreachable!("{:?}", x)
                     }
                     panic!();
-                    self.blocks[block_id].push(Residual::Ret(pc, 0, 0)); None
+                    self.blocks[block_id.0].push(Residual::Ret(pc, 0, 0)); None
                 },
             } {
                 pc = next;
@@ -795,7 +811,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     pub fn new_block(&mut self) -> BlockId {
         self.blocks.push(Vec::new());
-        self.blocks.len() - 1
+        BlockId(self.blocks.len() - 1)
     }
 
     // We have to be careful here, where rustc is very unhappy about generator -> thunk ->
@@ -836,23 +852,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 unimplemented!("{:?}", runtime_type);
             }
             // TODO: search for if we already have a compatible block
-            vm.blocks[block_id][thunk_pc] = Residual::Guard { idx, expected: runtime_type };
+            vm.blocks[block_id.0][thunk_pc] = Residual::Guard { idx, expected: runtime_type };
             // Push the same thunk down for the next value that fails the guard
             let fail_thunk = vm.make_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_types.clone(), false);
-            vm.blocks[block_id].push(Residual::Thunk(fail_thunk));
+            vm.blocks[block_id.0].push(Residual::Thunk(fail_thunk));
             // Finish the remainder of the coroutine
             let guard_block = vm.new_block();
             if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), forced_types.clone(), thunk_coro, arg, guard_block) {
                 // And continue compiling the block
                 vm.compile(owner, succ_next, succ_ty, guard_block);
             }
-            vm.blocks[block_id].push(Residual::Jump(guard_block));
+            vm.blocks[block_id.0].push(Residual::Jump(guard_block));
 
             debug!("after compiling thunk, blocks look like {:?}", vm.blocks);
         })))
     }
 
-    pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut types: Vec<LType>, mut coro: Box<C>, mut arg: ResumeArg, block_id: usize) -> Option<(Pc, Vec<LType>, ResumeArg)>
+    pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut types: Vec<LType>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Vec<LType>, ResumeArg)>
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
         loop {
@@ -907,12 +923,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_types = types.clone();
                         let thunk = Residual::Thunk(self.make_thunk(block_id, thunk_coro, idx, expected, pc, thunk_types, true));
-                        self.blocks[block_id].push(thunk);
+                        self.blocks[block_id.0].push(thunk);
                         return None;
                     }
                 }
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
-                    self.blocks[block_id].push(Residual::Exec(func));
+                    self.blocks[block_id.0].push(Residual::Exec(func));
                     // In a real VM, transition to the next PC generator here.
                 },
                 CoroutineState::Yielded(YieldOp::Call(target)) => {
@@ -923,7 +939,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // compile the continuation
                             panic!();
                             if let Some(exists) = self.find(owner, SubPc::new(target), &types) {
-                                id = target;
+                                id = exists;
                             } else {
                                 debug!("compiling fresh callsite {} {:?}", target, types);
                                 id = self.block(owner, target, types);
@@ -933,7 +949,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let call_exec = Residual::Exec(ResidualExec("call", Rc::new(move |owner, state, cb| {
                                 cb(ExecEffect::Call(a, b, c as u16), owner, state);
                             })));
-                            self.blocks[block_id].push(call_exec);
+                            self.blocks[block_id.0].push(call_exec);
                             let types = if c == 1 {
                                 // No values are saved
                                 // All our types are intact
@@ -969,11 +985,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
                     if let Some(exists) = self.clos.ro(owner).versions.get(&(SubPc::new(dest_pc), types.clone())) {
-                        debug!("jump exist {dest_pc} -> {exists}");
+                        debug!("jump exist {dest_pc} -> {exists:?}");
                         arg = ResumeArg::BlockId(*exists);
                     } else {
                         let fresh = self.new_block();
-                        debug!("jump fresh {dest_pc} -> {}", fresh);
+                        debug!("jump fresh {dest_pc} -> {:?}", fresh);
                         self.clos.rw(owner).versions.insert((SubPc::new(dest_pc), types.clone()), fresh);
                         // TODO: do we just return ((dest, types, arg)) here and have self.compile
                         // try to find the block instead? this potentially blows the stack
@@ -984,7 +1000,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::Jump(dest_block)) => {
-                    self.blocks[block_id].push(Residual::Jump(dest_block));
+                    self.blocks[block_id.0].push(Residual::Jump(dest_block));
                     // If it was a jump, stop pumping the coroutine
                     return None;
                 },
@@ -999,7 +1015,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut off = 0;
         debug!("run");
         loop {
-            let block = &self.blocks[id];
+            let block = &self.blocks[id.0];
             let res = block[off].clone();
             state.counters.versioned_count.increment();
             debug!("{:?}", &res);
@@ -1045,7 +1061,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         self.set_current(lclos.clone());
                                         self.block(owner, 0, types)
                                     };
-                                    debug!("{:?} {block}", self.blocks);
+                                    debug!("{:?} {block:?}", self.blocks);
                                     self.set_current(lclos.clone());
                                     id = block;
                                     off = 0;
