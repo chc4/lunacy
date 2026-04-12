@@ -27,7 +27,7 @@ const TIMES: f64 = 10.0;
 const LBBV: bool = true;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::builder().format_source_path(true).init();
+    env_logger::builder().format_timestamp(None).format_source_path(true).init();
     let mut owner = TCellOwner::new();
 
 

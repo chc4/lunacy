@@ -60,7 +60,7 @@ pub enum YieldOp {
                            // is the expected type
     Exec(ResidualExec), // Emit a residual operation that will be executed
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
-    Jump(usize), // Emit a jump to the given PC, potentially specializing the block if needed.
+    Jump(BlockId), // Emit a jump to the given BlockId
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
     Call(CallTarget), // Call a block target. Probably need a ResumeArg for returned values later.
 }
@@ -81,15 +81,17 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
         match c {
             LType::Number => {
                 yield YieldOp::Exec(ResidualExec("loadk_number", Rc::new(move |owner, state, cb| {
-                    debug!("{:?}", unsafe { &*state.clos.ro(owner).prototype });
-                    state.vals[state.base + dest] = unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                    let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
+                    debug!("{:?}", kst);
+                    state.vals[state.base + dest] = kst.into();
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
             },
             LType::String => {
                 yield YieldOp::Exec(ResidualExec("loadk_str", Rc::new(move |owner, state, cb| {
-                    debug!("{:?}", unsafe { &*state.clos.ro(owner).prototype });
-                    state.vals[state.base + dest] = unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                    let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
+                    debug!("{:?}", kst);
+                    state.vals[state.base + dest] = kst.into();
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::String)]);
             },
@@ -373,8 +375,10 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     let dyn_c = &state.vals[state.base + c];
                     let cond = LValue::from(const_b).compare(opcode, dyn_c.clone()).unwrap();
                     if (cond as u8) != a {
+                        debug!("taking comparison jump -> {}", taken);
                         cb(ExecEffect::Jump(taken), owner, state);
                     } else {
+                        debug!("falling through comparison jump -> {}", fallthrough);
                         cb(ExecEffect::Jump(fallthrough), owner, state);
                     }
                 })));
@@ -387,6 +391,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             },
             _ => unreachable!(),
         }
+        arg = yield YieldOp::Jump(fallthrough);
         arg
     }
 }
@@ -504,6 +509,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             };
             debug!("upval {:?}", &upval);
             state.vals[state.base + a as usize] = upval;
+            debug!("after getupval {:?}", &state.vals[state.base..]);
         })));
         // TODO: We could keep a static upval typemap, since you can't transition the type of an
         // upval after its created.
@@ -774,6 +780,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     {
                         unreachable!("{:?}", x)
                     }
+                    panic!();
                     self.blocks[block_id].push(Residual::Ret(pc, 0, 0)); None
                 },
             } {
@@ -960,30 +967,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         types[idx] = ty;
                     }
                 },
-                CoroutineState::Yielded(op @ (YieldOp::GetBlock(dest) | YieldOp::Jump(dest))) => {
-                    if let Some(exists) = self.clos.ro(owner).versions.get(&(SubPc::new(dest), types.clone())) {
-                        debug!("jump exist {exists}");
+                CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
+                    if let Some(exists) = self.clos.ro(owner).versions.get(&(SubPc::new(dest_pc), types.clone())) {
+                        debug!("jump exist {dest_pc} -> {exists}");
                         arg = ResumeArg::BlockId(*exists);
-                        if let YieldOp::Jump(dest) = op {
-                            self.blocks[block_id].push(Residual::Jump(*exists));
-                            return Some((dest, types, ResumeArg::Start));
-                        }
                     } else {
                         let fresh = self.new_block();
-                        debug!("jump fresh {dest}");
-                        self.clos.rw(owner).versions.insert((SubPc::new(dest), types.clone()), fresh);
+                        debug!("jump fresh {dest_pc} -> {}", fresh);
+                        self.clos.rw(owner).versions.insert((SubPc::new(dest_pc), types.clone()), fresh);
                         // TODO: do we just return ((dest, types, arg)) here and have self.compile
                         // try to find the block instead? this potentially blows the stack
                         // this should probably push a thunk which compiles the block instead of a
                         // jump
-                        self.compile(owner, dest, types.clone(), fresh);
+                        self.compile(owner, dest_pc, types.clone(), fresh);
                         arg = ResumeArg::BlockId(fresh);
-                        if let YieldOp::Jump(dest) = op {
-                            self.blocks[block_id].push(Residual::Jump(fresh));
-                            return None;
-                        }
                     }
-                        // If it was a jump, stop pumping the coroutine
+                },
+                CoroutineState::Yielded(YieldOp::Jump(dest_block)) => {
+                    self.blocks[block_id].push(Residual::Jump(dest_block));
+                    // If it was a jump, stop pumping the coroutine
+                    return None;
                 },
                 CoroutineState::Complete(r) => {
                     return Some((pc.0 + 1, types, r));
@@ -1150,6 +1153,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             id = block;
                             off = disp;
                             state.vals.truncate(limit);
+                            debug!("after generator return, {:?}", &state.vals[state.base..]);
                             state.callstack.pop();
                         },
                         x => unimplemented!("{:?}", x),
