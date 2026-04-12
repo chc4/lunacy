@@ -1052,13 +1052,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::SELF => {
                     let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);
                     let rb = state.vals[state.base + b as usize].clone();
-                    state.vals[state.base + a as usize] = rb.clone();
+                    state.vals[state.base + a as usize + 1] = rb.clone();
                     let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
                         Ok(c) => Cow::Owned(LValue::from(c)),
                         Err(lv) => Cow::Borrowed(lv),
                     };
                     let res = rb.gettable(owner, kc);
-                    state.vals[state.base + a as usize + 1] = res;
+                    state.vals[state.base + a as usize] = res;
                 },
                 Opcode::SETLIST => {
                     let (a, b, c) = <SETLIST as InstructionDecode>::Unpack::unpack(inst.0);
