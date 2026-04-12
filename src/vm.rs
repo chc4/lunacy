@@ -1397,7 +1397,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                 // (C-1) values are saved
                                 let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
                                 //vals.extend_from_slice(r_vals.as_slice());
-                                for i in 0..(c - 1) {
+                                for i in 0..=(c - 2) {
                                     debug!("huh {}", i);
                                     // Only copy the correct number of arguments from the CALL
                                     state.vals[ret + i as usize] = r_vals[i as usize].clone();

@@ -740,7 +740,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("{} {} {}", a, b, c);
                     // TODO: this should try to compile a new block and jump to it, and only
                     // fallback to a trace exit if we need to run the fully generic code
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_call(a as usize, b as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_call(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
@@ -1126,6 +1126,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             state.clos = ret_clos.clone();
                             self.set_current(ret_clos.clone());
                             state.base = frame;
+                            debug!("returning {c}");
                             if c == 1 {
                                 // No values are saved
                                 state.vals.truncate(limit);
@@ -1133,7 +1134,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // (C-1) values are saved
                                 let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
                                 //vals.extend_from_slice(r_vals.as_slice());
-                                for i in 0..(c - 1) {
+                                for i in 0..=(c - 2) {
                                     debug!("huh {}", i);
                                     // Only copy the correct number of arguments from the CALL
                                     state.vals[ret + i as usize] = r_vals[i as usize].clone();
