@@ -275,9 +275,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 yield YieldOp::Exec(ResidualExec("add_int_int", Rc::new(move |owner, state, cb| {
                     let klhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, lhs as u16);
                     let krhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, rhs as u16);
-                    let dyn_b = &state.vals[state.base + lhs];
-                    let dyn_c = &state.vals[state.base + rhs];
-                    let res = dyn_b.numeric_op(opcode, &dyn_c).unwrap();
+                    let LValue::Number(dyn_b) = &state.vals[state.base + lhs] else { unreachable!() };
+                    let LValue::Number(dyn_c) = &state.vals[state.base + rhs] else { unreachable!() };
+                    let res = LValue::Number(*dyn_b).numeric_op(opcode, &LValue::Number(*dyn_c)).unwrap();
                     debug!("res {:?}", &res);
                     state.vals[state.base + dest as usize] = res;
                 })));
@@ -290,7 +290,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     let krhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc as usize]) };
                     let LConstant::Number(kb) = klhs else { unreachable!() };
                     let LConstant::Number(kc) = krhs else { unreachable!() };
-                    let res = LValue::Number(Number(kb.0 + kc.0));
+                    let res = LValue::Number(*kb).numeric_op(opcode, &LValue::Number(*kc)).unwrap();
                     debug!("res {:?}", &res);
                     state.vals[state.base + dest as usize] = res;
                 })));
@@ -421,6 +421,42 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         arg
     }
 }
+
+pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Guard(b, LType::String);
+        if ResumeArg::Matched == arg {
+            arg = yield YieldOp::Exec(ResidualExec("len_str", Rc::new(move |owner, state, cb| {
+                let b = &state.vals[state.base + b];
+                let n = match b {
+                    LValue::OwnedString(s) => { s.len() },
+                    LValue::InternedString(s) => { s.0.len() },
+                    _ => unreachable!(),
+                };
+                state.vals[state.base + a] = LValue::Number(Number(n as _));
+            })));
+            yield YieldOp::SetTypes(vec![(a, LType::Number)]);
+            return arg;
+        }
+        arg = yield YieldOp::Guard(b, LType::Table);
+        if ResumeArg::Matched == arg {
+            // TODO: __len metamethod
+            arg = yield YieldOp::Exec(ResidualExec("len_str", Rc::new(move |owner, state, cb| {
+                let LValue::Table(b) = &state.vals[state.base + b] else { unreachable!() };
+                let n = b.ro(owner).array.len();
+                state.vals[state.base + a] = LValue::Number(Number(n as _));
+            })));
+            yield YieldOp::SetTypes(vec![(a, LType::Number)]);
+            return arg;
+        } else {
+            unimplemented!("__len metamethod")
+        }
+
+        arg
+    }
+}
+
 
 pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
@@ -658,6 +694,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::UNM => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_unm(a as usize, b as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::LEN => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_len(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);

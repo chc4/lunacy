@@ -24,7 +24,7 @@ mod generator;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const TIMES: f64 = 10.0;
-const LBBV: bool = false;
+const LBBV: bool = true;
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder().format_source_path(true).init();
