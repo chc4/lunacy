@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::RefCell;
 
-use crate::vm::{Opcode, Upvalue};
+use crate::vm::{Opcode, Upvalue, CallstackEntry};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
@@ -25,13 +25,16 @@ fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
         LValue::Number(_) => LType::Number,
         LValue::InternedString(_) | LValue::OwnedString(_) => LType::String,
         LValue::Table(t) => LType::Table,
+        LValue::LClosure(_) | LValue::NClosure(_) => LType::Closure,
+        LValue::Nil => LType::Nil,
         _ => LType::Unknown,
     }
 }
 
 #[derive(Debug)]
 enum ExecEffect {
-    Jump(Pc),
+    Jump(BlockId),
+    Call(usize, usize, usize),
 }
 type ExecCallback<'a, 'src, 'intern> = &'a mut dyn for<'b> FnMut(ExecEffect, &mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>);
 #[derive(Clone)]
@@ -40,6 +43,12 @@ impl std::fmt::Debug for ResidualExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "exec({}, {:p})", self.0, self.1.as_ref() as &_ as *const _ as *const ())
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum CallTarget {
+    Dynamic(usize, usize, usize),
+    Concrete(Pc),
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +62,7 @@ pub enum YieldOp {
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(usize), // Emit a jump to the given PC, potentially specializing the block if needed.
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
+    Call(CallTarget), // Call a block target. Probably need a ResumeArg for returned values later.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,6 +85,13 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
                     state.vals[state.base + dest] = unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+            },
+            LType::String => {
+                yield YieldOp::Exec(ResidualExec("loadk_str", Rc::new(move |owner, state, cb| {
+                    debug!("{:?}", unsafe { &*state.clos.ro(owner).prototype });
+                    state.vals[state.base + dest] = unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                })));
+                yield YieldOp::SetTypes(vec![(dest, LType::String)]);
             },
             _ => unreachable!(),
         }
@@ -332,6 +349,59 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
     }
 }
 
+pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        let larg = yield YieldOp::GuardRk(b, LType::Number);
+        let rarg = yield YieldOp::GuardRk(c, LType::Number);
+        arg = rarg;
+
+        arg = yield YieldOp::GetBlock(pc);
+        let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
+        arg = yield YieldOp::GetBlock((pc as isize + 1 as isize) as usize);
+        let ResumeArg::BlockId(taken) = arg else { unreachable!() };
+
+        match (larg, rarg) {
+            (ResumeArg::Matched, ResumeArg::Matched) => {
+                unimplemented!()
+            },
+            (ResumeArg::MatchedConst(rb), ResumeArg::Matched) => {
+                arg = yield YieldOp::Exec(ResidualExec("comp_cint_int", Rc::new(move |owner, state, cb| {
+                    debug!("comp @ {}", pc);
+                    let const_b = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[rb as usize] };
+                    let Constant::Number(Number(_)) = const_b else { unreachable!() };
+                    let dyn_c = &state.vals[state.base + c];
+                    let cond = LValue::from(const_b).compare(opcode, dyn_c.clone()).unwrap();
+                    if (cond as u8) != a {
+                        cb(ExecEffect::Jump(taken), owner, state);
+                    } else {
+                        cb(ExecEffect::Jump(fallthrough), owner, state);
+                    }
+                })));
+            },
+            (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
+                unimplemented!()
+            },
+            (ResumeArg::MatchedConst(rb), ResumeArg::MatchedConst(rc)) => {
+                unimplemented!()
+            },
+            _ => unreachable!(),
+        }
+        arg
+    }
+}
+
+pub fn emit_jmp(sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::GetBlock(((pc as isize) + sbx as isize) as usize);
+        let ResumeArg::BlockId(target) = arg else { unreachable!() };
+        arg = yield YieldOp::Jump(target);
+        arg
+    }
+}
+
+
 pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -451,6 +521,23 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
     }
 }
 
+pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Guard(a, LType::Closure);
+        if arg != ResumeArg::Matched {
+            arg = yield YieldOp::Exec(ResidualExec("gettable_meta", Rc::new(move |owner, state, cb| {
+                panic!("call metamethod {:?} {:?}", &state.vals, &state.vals[state.base + b])
+            })));
+            yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
+        }
+        // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch
+        // guard here for specializing the call + return continuation for each one.
+        arg = yield YieldOp::Call(CallTarget::Dynamic(a, b, c));
+        arg
+    }
+}
+
 pub fn guard_filter(mut sub: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -498,6 +585,7 @@ impl std::fmt::Debug for ThunkRef {
 pub enum Residual {
     Guard { idx: usize, expected: LType },
     Exec(ResidualExec),
+    Call(BlockId),
     Jump(BlockId),
     Thunk(ThunkRef),
     Ret(Pc),
@@ -542,7 +630,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Return a specialized block for a given PC and context, compiling a new one if necessary
-    pub fn find(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, types: Vec<LType>) -> Option<BlockId>
+    pub fn find(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, types: &Vec<LType>) -> Option<BlockId>
     {
         self.clos.ro(owner).versions.get(&(pc, types.clone())).cloned()
     }
@@ -556,6 +644,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{a} {b} {c}");
                     self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_numeric(op, a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                },
+                op @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    debug!("{a} {b} {c}");
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_compare(op, a, b as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
+                },
+                Opcode::JMP => {
+                    let sbx = crate::vm::sBx::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
+                    //self.blocks[block_id].push(Residual::Jump(((pc as isize) + sbx as isize) as usize)); return types;
                 },
                 Opcode::UNM => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
@@ -588,7 +686,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("{} {} {}", a, b, c);
                     // TODO: this should try to compile a new block and jump to it, and only
                     // fallback to a trace exit if we need to run the fully generic code
-                    self.blocks[block_id].push(Residual::Ret(pc)); None
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_call(a as usize, b as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
@@ -675,10 +773,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let runtime_type = typeof_(&state.vals[state.base + idx]);
             let mut forced_types = thunk_types.clone();
             forced_types[idx] = runtime_type;
+            debug!("forcing thunk with {:?} == {:?}", runtime_type, expected);
             let arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
             if !appends {
                 // TODO; create a new block and rewrite thunk into a jump instead
-                unimplemented!();
+                unimplemented!("{:?}", runtime_type);
             }
             // TODO: search for if we already have a compatible block
             vm.blocks[block_id][thunk_pc] = Residual::Guard { idx, expected: runtime_type };
@@ -738,6 +837,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(guard @ YieldOp::Guard(idx, expected)) => {
+                    debug!("guard {:?} == {:?}", types[idx], expected);
                     if types[idx] == expected {
                         // Statically true: pump the success path
                         pc = pc.next_true();
@@ -758,7 +858,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id].push(Residual::Exec(func));
                     // In a real VM, transition to the next PC generator here.
-                }
+                },
+                CoroutineState::Yielded(YieldOp::Call(target)) => {
+                    let id;
+                    match target {
+                        CallTarget::Concrete(target) => {
+                            // TODO: suspend coro so that it can be resumed after the target returns to
+                            // compile the continuation
+                            panic!();
+                            if let Some(exists) = self.find(owner, SubPc::new(target), &types) {
+                                id = target;
+                            } else {
+                                debug!("compiling fresh callsite {} {:?}", target, types);
+                                id = self.block(owner, target, types);
+                            }
+                        },
+                        CallTarget::Dynamic(a, b, c) => {
+                            let call_exec = Residual::Exec(ResidualExec("call", Rc::new(move |owner, state, cb| {
+                                cb(ExecEffect::Call(a, b, c), owner, state);
+                            })));
+                            self.blocks[block_id].push(call_exec);
+                            return Some((pc.0 + 1, vec![LType::Unknown; types.len()], ResumeArg::Start));
+                        },
+                    }
+                },
                 CoroutineState::Yielded(YieldOp::SetTypes(ty_effects)) => {
                     for (idx, ty) in ty_effects {
                         if idx > types.len() {
@@ -825,10 +948,70 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 id = block;
                                 off = 0;
                             },
+                            ExecEffect::Call(a, b, c) => {
+                                // Dynamic dispatch call
+                                let to_call = &state.vals[state.base + a as usize];
+                                if let LValue::LClosure(ref lclos) = to_call.clone() {
+                                    // record call stack: we say where to return to and where to put the values
+                                    let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
+                                    // push empty stack frame
+                                    state.vals.extend_from_slice(
+                                        vec![LValue::Nil; next_stack].as_slice());
+                                    state.callstack.push(CallstackEntry::Generator(self.clos.clone(), id, off, state.base, state.vals.len()));
+                                    //state.callstack.push(CallstackEntry::Interpreter(state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize, c as u16));
+                                    state.base = state.base + a as usize + 1;
+                                    state.vals.truncate(state.base +  next_stack);
+                                    state.clos = lclos.clone();
+
+                                    // Either use existing block, compile a new one, or use most
+                                    // generic.
+                                    let types = vec![LType::Unknown; next_stack];
+                                    let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(0), types.clone())) {
+                                        *block
+                                    } else {
+                                        debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, types);
+                                        self.set_current(lclos.clone());
+                                        self.block(owner, 0, types)
+                                    };
+                                    debug!("{:?} {block}", self.blocks);
+                                    self.set_current(lclos.clone());
+                                    id = block;
+                                    off = 0;
+                                } else if let LValue::NClosure(ncall) = to_call {
+                                    let args = if b == 0 {
+                                        &state.vals[state.base + a as usize+1..]
+                                    } else {
+                                        &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
+                                    };
+                                    debug!("{:?}", args);
+                                    let mut native = ncall.rw(owner).native.clone();
+                                    let ret = (native)(args, owner);
+                                    if c == 0 {
+                                        // save all returned
+                                        state.vals.splice(state.base + a as usize.., ret).for_each(drop);
+                                    }
+                                    else if c == 1 {
+                                        // nothing saved
+                                    } else if c != 1 {
+                                        state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, ret).for_each(drop);
+                                    } else {
+                                        unimplemented!()
+                                    }
+                                    // TODO: clear types?
+                                }
+                            },
                         }
                     });
                 },
                 Residual::Jump(target) => {
+                    id = target;
+                    off = 0;
+                },
+                Residual::Call(target) => {
+                    // Static dispatch call
+                    state.callstack.push(CallstackEntry::Generator(self.clos.clone(), id, off, state.base, state.vals.len()));
+                    panic!("push callstack");
+                    //state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize, c
                     id = target;
                     off = 0;
                 },
@@ -838,9 +1021,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Ret(pc) => {
                     debug!("spec final blocks: {:?}", self.blocks);
-                    // Set pc to the return instruction, so that vm.rs runs it
-                    state.pc = pc;
-                    return state;
+                    match state.callstack.last() {
+                        Some(CallstackEntry::Interpreter(ret_clos, _, _, _, _, _)) => {
+                            // We use the current closure, because we want to execute the vm RET
+                            // instruction in it
+                            state.clos = self.clos.clone();
+                            debug!("returning to {:?}", unsafe { &(*ret_clos.ro(owner).prototype).source });
+                            state.pc = pc;
+                            return state
+                        },
+                        Some(CallstackEntry::Generator(ret_clos, block, disp, base, limit)) => {
+                            state.clos = ret_clos.clone();
+                            self.set_current(ret_clos.clone());
+                            state.base = *base;
+                            id = *block;
+                            off = *disp;
+                            state.vals.truncate(*limit);
+                            state.callstack.pop();
+                        },
+                        x => unimplemented!("{:?}", x),
+                    }
                 },
             }
         }
