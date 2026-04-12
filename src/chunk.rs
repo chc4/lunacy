@@ -185,6 +185,7 @@ pub struct Header<'a, C> {
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct FunctionBlock<'a, C> {
     pub source: PackedString<'a>,
+    pub line_defined: u32,
     pub upval_count: u8,
     pub param_count: u8,
     pub is_vararg: u8,
@@ -214,6 +215,7 @@ pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock<Constant<Pac
     let (input, upvalues) = packed_list(packed_string)(input)?;
     debug!("upvalues {:?}", &upvalues);
     Ok((input, FunctionBlock {
+        line_defined,
         source,
         // lines,
         upval_count,
@@ -270,6 +272,7 @@ impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
         -> FunctionBlock<'src, Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>>
     {
         let FunctionBlock {
+            line_defined,
             source,
             upval_count,
             param_count,
@@ -293,6 +296,7 @@ impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
             proto.globally_intern(intern)
         ).collect();
         let new_self = FunctionBlock {
+            line_defined,
             source,
             upval_count,
             param_count,

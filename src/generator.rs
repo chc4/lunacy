@@ -7,11 +7,11 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::RefCell;
 
-use crate::vm::{Opcode, Upvalue, CallstackEntry};
+use crate::vm::{Opcode, Upvalue, CallstackEntry, ReturnLocation};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
-use crate::vm::{LValue, LType, Number, Table};
+use crate::vm::{LValue, LType, Number, Table, FVec};
 use crate::vm::{InstructionDecode, Unpacker};
 use crate::vm::RunState;
 use crate::vm::LConstant;
@@ -34,7 +34,7 @@ fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
 #[derive(Debug)]
 enum ExecEffect {
     Jump(BlockId),
-    Call(usize, usize, usize),
+    Call(usize, usize, u16),
 }
 type ExecCallback<'a, 'src, 'intern> = &'a mut dyn for<'b> FnMut(ExecEffect, &mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>);
 #[derive(Clone)]
@@ -565,7 +565,7 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
             arg = yield YieldOp::Exec(ResidualExec("gettable_meta", Rc::new(move |owner, state, cb| {
                 panic!("call metamethod {:?} {:?}", &state.vals, &state.vals[state.base + b])
             })));
-            yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
+            return arg;
         }
         // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch
         // guard here for specializing the call + return continuation for each one.
@@ -621,10 +621,10 @@ impl std::fmt::Debug for ThunkRef {
 pub enum Residual {
     Guard { idx: usize, expected: LType },
     Exec(ResidualExec),
-    Call(BlockId),
+    Call(BlockId, usize, usize),
     Jump(BlockId),
     Thunk(ThunkRef),
-    Ret(Pc),
+    Ret(Pc, u8, u16),
 }
 
 fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>) -> Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>
@@ -660,6 +660,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         let block_id = self.new_block();
         let subpc: SubPc = SubPc::new(entry);
+        let count: Vec<_> = self.clos.ro(owner).versions.iter().filter(|((pc, ty), block)| pc.0 == entry).collect();
+        if count.len() >= 5 {
+            panic!("too many versions: {:?}", count);
+        }
         self.clos.rw(owner).versions.insert((subpc, types.clone()), block_id);
         self.compile(owner, entry, types, block_id);
         return block_id;
@@ -758,14 +762,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::RETURN => {
-                    self.blocks[block_id].push(Residual::Ret(pc)); None
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    self.blocks[block_id].push(Residual::Ret(pc, a, b)); None
                 },
                 x => {
                     #[cfg(debug_assertions)]
                     {
                         unreachable!("{:?}", x)
                     }
-                    self.blocks[block_id].push(Residual::Ret(pc)); None
+                    self.blocks[block_id].push(Residual::Ret(pc, 0, 0)); None
                 },
             } {
                 pc = next;
@@ -915,7 +920,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         },
                         CallTarget::Dynamic(a, b, c) => {
                             let call_exec = Residual::Exec(ResidualExec("call", Rc::new(move |owner, state, cb| {
-                                cb(ExecEffect::Call(a, b, c), owner, state);
+                                cb(ExecEffect::Call(a, b, c as u16), owner, state);
                             })));
                             self.blocks[block_id].push(call_exec);
                             return Some((pc.0 + 1, vec![LType::Unknown; types.len()], ResumeArg::Start));
@@ -997,7 +1002,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     // push empty stack frame
                                     state.vals.extend_from_slice(
                                         vec![LValue::Nil; next_stack].as_slice());
-                                    state.callstack.push(CallstackEntry::Generator(self.clos.clone(), id, off, state.base, state.vals.len()));
+                                    state.callstack.push(CallstackEntry(self.clos.clone(), ReturnLocation::Generator(id, off), state.base, state.vals.len(), state.base + a, c));
                                     //state.callstack.push(CallstackEntry::Interpreter(state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize, c as u16));
                                     state.base = state.base + a as usize + 1;
                                     state.vals.truncate(state.base +  next_stack);
@@ -1037,7 +1042,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     } else {
                                         unimplemented!()
                                     }
-                                    // TODO: clear types?
                                 }
                             },
                         }
@@ -1047,9 +1051,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     id = target;
                     off = 0;
                 },
-                Residual::Call(target) => {
+                Residual::Call(target, a, c) => {
                     // Static dispatch call
-                    state.callstack.push(CallstackEntry::Generator(self.clos.clone(), id, off, state.base, state.vals.len()));
+                    //state.callstack.push(CallstackEntry(self.clos.clone(), ReturnLocation::Generator(id, off), state.base, state.vals.len(), state.base + a, c));
                     panic!("push callstack");
                     //state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize, c
                     id = target;
@@ -1059,10 +1063,29 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("thunk {:?}", &block);
                     (thunk.0.borrow_mut())(self, owner, &mut state, off)
                 },
-                Residual::Ret(pc) => {
+                Residual::Ret(pc, a, b) => {
                     debug!("spec final blocks: {:?}", self.blocks);
+                    let mut r_count = 0 as usize;
+                    let mut r_vals: FVec<_> = if b == 1 {
+                        // no return values
+                        vec![].into()
+                    } else if b >= 2 {
+                        // there are b-1 return values from R(A) onwards
+                        r_count = b as usize-1;
+                        let r_vals = &state.vals[state.base + a as usize..(state.base + a as usize + r_count as usize)];
+                        debug!("{:?}", r_vals);
+                        Vec::from(r_vals).into()
+                    } else if b == 0 {
+                        // return all values from R(A) to the ToS
+                        let r_vals = &state.vals[state.base + a as usize..];
+                        r_count = r_vals.len() as usize;
+                        debug!("{:?}", r_vals);
+                        Vec::from(r_vals).into()
+                    } else {
+                        unreachable!()
+                    };
                     match state.callstack.last() {
-                        Some(CallstackEntry::Interpreter(ret_clos, _, _, _, _, _)) => {
+                        Some(CallstackEntry(ret_clos, ReturnLocation::Interpreter(caller), frame, limit, ret, c)) => {
                             // We use the current closure, because we want to execute the vm RET
                             // instruction in it
                             state.clos = self.clos.clone();
@@ -1070,13 +1093,37 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             state.pc = pc;
                             return state
                         },
-                        Some(CallstackEntry::Generator(ret_clos, block, disp, base, limit)) => {
+                        Some(&CallstackEntry(ref ret_clos, ReturnLocation::Generator(block, disp), frame, limit, ret, c)) => {
                             state.clos = ret_clos.clone();
                             self.set_current(ret_clos.clone());
-                            state.base = *base;
-                            id = *block;
-                            off = *disp;
-                            state.vals.truncate(*limit);
+                            state.base = frame;
+                            if c == 1 {
+                                // No values are saved
+                                state.vals.truncate(limit);
+                            } else if c >= 2 {
+                                // (C-1) values are saved
+                                let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
+                                //vals.extend_from_slice(r_vals.as_slice());
+                                for i in 0..(c - 1) {
+                                    debug!("huh {}", i);
+                                    // Only copy the correct number of arguments from the CALL
+                                    state.vals[ret + i as usize] = r_vals[i as usize].clone();
+                                }
+                                //assert!(limit >= ret + c as usize - 1);
+                                state.vals.truncate(limit);
+                                //state.vals.truncate(ret + c as usize - 1);
+                            } else {
+                                // Multiple return results are saved
+                                for (i, v) in r_vals.drain(..).enumerate() {
+                                    // Only copy the correct number of arguments from the CALL
+                                    state.vals[ret + i] = v;
+                                }
+                                debug!("{:?} {}", &state.vals, r_count);
+                                state.vals.truncate(ret + r_count);
+                            }
+                            id = block;
+                            off = disp;
+                            state.vals.truncate(limit);
                             state.callstack.pop();
                         },
                         x => unimplemented!("{:?}", x),

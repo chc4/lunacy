@@ -312,9 +312,9 @@ impl<T, Idx: std::slice::SliceIndex<[T]>> IndexMut<Idx> for UnsafeVec<T> {
 }
 
 #[cfg(feature = "skip_vec")]
-type FVec<T> = UnsafeVec<T>;
+pub type FVec<T> = UnsafeVec<T>;
 #[cfg(not(feature = "skip_vec"))]
-type FVec<T> = Vec<T>;
+pub type FVec<T> = Vec<T>;
 
 
 #[derive(Debug)]
@@ -718,6 +718,13 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 Some(Rc::new(s))
             },
             LValue::Nil => None,
+            LValue::LClosure(l) => {
+                let mut s = Vec::new();
+                let line = unsafe { (*l.0.ro(owner).prototype).line_defined };
+                let src = unsafe { &(*l.0.ro(owner).prototype).source };
+                write!(s, "function({:p}, {:?} @ {})", Rc::as_ptr(&l.0), src, line);
+                Some(Rc::new(s))
+            },
             x => unimplemented!("{:?}", x),
         }
     }
@@ -815,10 +822,13 @@ pub struct Vm<'src, 'intern> {
 }
 
 #[derive(Debug)]
-pub enum CallstackEntry<'src, 'intern> {
-    Interpreter(Tc<LClosure<'src, 'intern>>, usize, usize, usize, usize, u16),
-    Generator(Tc<LClosure<'src, 'intern>>, BlockId, usize, usize, usize),
+pub enum ReturnLocation {
+    Interpreter(usize),
+    Generator(BlockId, usize),
 }
+
+#[derive(Debug)]
+pub struct CallstackEntry<'src, 'intern>(pub Tc<LClosure<'src, 'intern>>, pub ReturnLocation, pub usize, pub usize, pub usize, pub u16);
 
 #[derive(Debug)]
 pub struct RunState<'src, 'intern> {
@@ -1300,7 +1310,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         // push empty stack frame
                         state.vals.extend_from_slice(
                             vec![LValue::Nil; next_stack].as_slice());
-                        state.callstack.push(CallstackEntry::Interpreter(state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize, c));
+                        state.callstack.push(CallstackEntry(state.clos.clone(), ReturnLocation::Interpreter(state.pc), state.base, state.vals.len(), state.base + a as usize, c));
                         state.base = state.base + a as usize + 1;
                         state.vals.truncate(state.base +  next_stack);
                         state.clos = lclos.clone();
@@ -1375,7 +1385,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         unreachable!()
                     };
                     match state.callstack.pop() {
-                        Some(CallstackEntry::Interpreter(ret_clos, caller, frame, limit, ret, c)) => {
+                        Some(CallstackEntry(ret_clos, ReturnLocation::Interpreter(caller), frame, limit, ret, c)) => {
                             debug!("{} {:?} {:?} {}", state.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller, c);
                             state.clos = ret_clos.clone();
                             // copy the return values to the previous frame's return location,
@@ -1407,7 +1417,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             }
                             state.pc = caller;
                         },
-                        Some(CallstackEntry::Generator(ret_clos, block, off, base, limit)) => {
+                        Some(CallstackEntry(ret_clos, ReturnLocation::Generator(block, off), frame, limit, ret, c)) => {
                             unimplemented!()
                         },
                         None => {
