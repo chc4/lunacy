@@ -259,7 +259,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
             arg = yield YieldOp::GuardRk(rhs, LType::Table);
             if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
-                yield YieldOp::Exec(ResidualExec("add_table_table", Rc::new(move |owner, state, cb| {
+                yield YieldOp::Exec(ResidualExec("numeric_table_table", Rc::new(move |owner, state, cb| {
                     panic!();
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
@@ -272,7 +272,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         arg = rarg;
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                yield YieldOp::Exec(ResidualExec("add_int_int", Rc::new(move |owner, state, cb| {
+                yield YieldOp::Exec(ResidualExec("numeric_int_int", Rc::new(move |owner, state, cb| {
                     let klhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, lhs as u16);
                     let krhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, rhs as u16);
                     let LValue::Number(dyn_b) = &state.vals[state.base + lhs] else { unreachable!() };
@@ -285,7 +285,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 return arg;
             },
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
-                yield YieldOp::Exec(ResidualExec("add_cint_cint", Rc::new(move |owner, state, cb| {
+                yield YieldOp::Exec(ResidualExec("numeric_cint_cint", Rc::new(move |owner, state, cb| {
                     let klhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc as usize]) };
                     let krhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc as usize]) };
                     let LConstant::Number(kb) = klhs else { unreachable!() };
@@ -298,7 +298,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 return arg;
             },
             (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
-                yield YieldOp::Exec(ResidualExec("add_cint_int", Rc::new(move |owner, state, cb| {
+                yield YieldOp::Exec(ResidualExec("numeric_cint_int", Rc::new(move |owner, state, cb| {
                     let kb: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc as usize]) };
                     let LConstant::Number(kb) = kb else { unreachable!() };
                     let dyn_c = &state.vals[state.base + rhs];
@@ -310,7 +310,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 return arg;
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
-                yield YieldOp::Exec(ResidualExec("add_int_cint", Rc::new(move |owner, state, cb| {
+                yield YieldOp::Exec(ResidualExec("numeric_int_cint", Rc::new(move |owner, state, cb| {
                     let dyn_b = &state.vals[state.base + lhs];
                     let kc: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc as usize]) };
                     let LConstant::Number(kc) = kc else { unreachable!() };
@@ -329,7 +329,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
             arg = yield YieldOp::GuardRk(rhs, LType::String);
             if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
-                yield YieldOp::Exec(ResidualExec("add_str_str", Rc::new(move |owner, state, cb| {
+                yield YieldOp::Exec(ResidualExec("numeric_str_str", Rc::new(move |owner, state, cb| {
                     //let RValue::Str(l) = &vals[lhs] else { unreachable!() };
                     //let RValue::Str(r) = &vals[rhs] else { unreachable!() };
                     //vals[dest] = RValue::Str(l.clone() + r);
@@ -493,7 +493,7 @@ macro_rules! drain {
 pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        arg = yield YieldOp::Exec(ResidualExec("move", Rc::new(move |owner, state, cb| {
+        arg = yield YieldOp::Exec(ResidualExec("getupval", Rc::new(move |owner, state, cb| {
             let upval = match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
                 Upvalue::Open(o) => {
                     state.vals[*o as usize].clone()
@@ -502,8 +502,12 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
                     c.borrow().clone()
                 },
             };
-            state.vals[state.base + a as usize] = upval.clone();
+            debug!("upval {:?}", &upval);
+            state.vals[state.base + a as usize] = upval;
         })));
+        // TODO: We could keep a static upval typemap, since you can't transition the type of an
+        // upval after its created.
+        arg = yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
         return arg;
     }
 }
@@ -562,8 +566,8 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Guard(a, LType::Closure);
         if arg != ResumeArg::Matched {
-            arg = yield YieldOp::Exec(ResidualExec("gettable_meta", Rc::new(move |owner, state, cb| {
-                panic!("call metamethod {:?} {:?}", &state.vals, &state.vals[state.base + b])
+            arg = yield YieldOp::Exec(ResidualExec("call_meta", Rc::new(move |owner, state, cb| {
+                panic!("call metamethod {} {:?} {:?}", b, &state.vals, &state.vals[state.base + b])
             })));
             return arg;
         }
@@ -923,7 +927,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 cb(ExecEffect::Call(a, b, c as u16), owner, state);
                             })));
                             self.blocks[block_id].push(call_exec);
-                            return Some((pc.0 + 1, vec![LType::Unknown; types.len()], ResumeArg::Start));
+                            let types = if c == 1 {
+                                // No values are saved
+                                // All our types are intact
+                                types
+                            } else if c >= 2 {
+                                // (C-1) values are saved
+                                // Returned values become unknown
+                                // TODO: compile a type specialized thunk instead? is that better?
+                                for i in 0..(c - 1) {
+                                    types[a + i] = LType::Unknown;
+                                }
+                                types
+                            } else {
+                                // Multiple return results are saved
+                                // All types until end of stack are unknown
+                                for i in a..types.len() {
+                                    types[i] = LType::Unknown;
+                                }
+                                types
+                            };
+                            //types = vec![LType::Unknown; types.len()];
+                            return Some((pc.0 + 1, types, ResumeArg::Start));
                         },
                     }
                 },
@@ -1003,7 +1028,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     state.vals.extend_from_slice(
                                         vec![LValue::Nil; next_stack].as_slice());
                                     state.callstack.push(CallstackEntry(self.clos.clone(), ReturnLocation::Generator(id, off), state.base, state.vals.len(), state.base + a, c));
-                                    //state.callstack.push(CallstackEntry::Interpreter(state.clos.clone(), state.pc, state.base, state.vals.len(), state.base + a as usize, c as u16));
                                     state.base = state.base + a as usize + 1;
                                     state.vals.truncate(state.base +  next_stack);
                                     state.clos = lclos.clone();
@@ -1065,6 +1089,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Ret(pc, a, b) => {
                     debug!("spec final blocks: {:?}", self.blocks);
+                    state.close_upvalues();
+                    state.upvals = vec![].into();
                     let mut r_count = 0 as usize;
                     let mut r_vals: FVec<_> = if b == 1 {
                         // no return values

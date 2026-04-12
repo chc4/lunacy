@@ -842,6 +842,24 @@ pub struct RunState<'src, 'intern> {
     pub counters: PerfCounters,
 }
 
+impl<'src, 'intern> RunState<'src, 'intern> {
+    pub fn close_upvalues(&mut self)
+    {
+        for upval in self.upvals.iter() {
+            let idx = match &upval.0 {
+                Upvalue::Open(o) => o,
+                Upvalue::Closed(u) => panic!(), // we shouldn't have any closed upvals
+            };
+            // migrate all the stack references to be GC references, since we're
+            // going to be removing it from the stack
+            let closed = Gc::new(self.vals[*idx].clone());
+            for up_use in upval.1.iter() {
+                up_use.deref().replace(Upvalue::Closed(closed.clone()));
+            }
+        }
+    }
+}
+
 
 impl<'src, 'intern> Vm<'src, 'intern> {
     pub fn new(top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
@@ -937,25 +955,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             Err(&vals[base + r as usize])
         }
     }
-
-    fn close_upvalues<'exec>(&self,
-        upvals: &'exec mut FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
-        vals: &'exec FVec<LValue<'src, 'intern>>)
-    {
-        for upval in upvals.iter() {
-            let idx = match &upval.0 {
-                Upvalue::Open(o) => o,
-                Upvalue::Closed(u) => panic!(), // we shouldn't have any closed upvals
-            };
-            // migrate all the stack references to be GC references, since we're
-            // going to be removing it from the stack
-            let closed = Gc::new(vals[*idx].clone());
-            for up_use in upval.1.iter() {
-                up_use.deref().replace(Upvalue::Closed(closed.clone()));
-            }
-        }
-    }
-
 
     pub fn run<'lua, const LBBV: bool>(&'lua self,
         owner: &mut TCellOwner<TcOwner>,
@@ -1360,7 +1359,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::RETURN => {
                     // we're going to be removing this frame, so close any open
                     // upvalues.
-                    self.close_upvalues(&mut state.upvals, &state.vals);
+                    state.close_upvalues();
                     state.upvals = vec![].into();
 
                     let (a, b) = <RETURN as InstructionDecode>::Unpack::unpack(inst.0);
