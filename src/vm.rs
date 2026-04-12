@@ -1,6 +1,7 @@
 #![allow(non_snake_case, unused)]
 use core::fmt::Debug;
 use core::hash::Hash;
+use std::num::Wrapping;
 use std::ops::{DerefMut, Index, IndexMut};
 use crate::chunk::FunctionBlock;
 use crate::chunk::{InstBits, Constant};
@@ -134,7 +135,7 @@ impl Unpacker for sBx {
     type Unpacked = i32; // A: 8, B: 9, C: 9
     fn unpack(inst: InstBits) -> Self::Unpacked {
         // 131071 = 2^18-1 >> 1, aka half the bias
-        (inst.Bx() - 131071) as i32
+        (Wrapping(inst.Bx()) - Wrapping(131071)).0 as i32
     }
 }
 
@@ -1128,6 +1129,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::TEST => {
                     let (a, _, c) = <TEST as InstructionDecode>::Unpack::unpack(inst.0);
                     if let LValue::Bool(b) = (state.vals[state.base + a as usize].as_bool(owner)?) && (b as u16) == c {
+                        // No-op
+                    } else {
                         state.pc += 1;
                     }
                 },
@@ -1252,7 +1255,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     debug!("{:?}", inst.0);
                     let sbx = <JMP as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{}", sbx);
-                    state.pc += sbx as usize;
+                    state.pc = (state.pc as isize + sbx as isize) as usize;
                 },
                 Opcode::CLOSURE => {
                     let (a, bx) = <CLOSURE as InstructionDecode>::Unpack::unpack(inst.0);
