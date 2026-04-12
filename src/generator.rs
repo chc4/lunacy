@@ -365,7 +365,19 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
 
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                unimplemented!()
+                arg = yield YieldOp::Exec(ResidualExec("comp_int_int", Rc::new(move |owner, state, cb| {
+                    debug!("comp @ {}", pc);
+                    let dyn_b = &state.vals[state.base + b];
+                    let dyn_c = &state.vals[state.base + c];
+                    let cond = dyn_b.compare(opcode, dyn_c.clone()).unwrap();
+                    if (cond as u8) != a {
+                        debug!("taking comparison jump -> {:?}", taken);
+                        cb(ExecEffect::Jump(taken), owner, state);
+                    } else {
+                        debug!("falling through comparison jump -> {:?}", fallthrough);
+                        cb(ExecEffect::Jump(fallthrough), owner, state);
+                    }
+                })));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) => {
                 arg = yield YieldOp::Exec(ResidualExec("comp_cint_int", Rc::new(move |owner, state, cb| {
@@ -471,6 +483,32 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
             unimplemented!("__len metamethod")
         }
 
+        arg
+    }
+}
+
+pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        for i in (b as usize)..=(c as usize) {
+            // Weird, but we can do it
+            arg = yield YieldOp::Guard(i, LType::String);
+        }
+        arg = yield YieldOp::Exec(ResidualExec("concat", Rc::new(move |owner, state, cb| {
+            let mut s = FVec::new();
+            for i in (b as usize)..=(c as usize) {
+
+                let cont = match &state.vals[state.base + i as usize] {
+                    LValue::OwnedString(s) => s.clone(),
+                    LValue::InternedString(s) => Rc::new(s.into_ref().0.to_vec()),
+                    _ => unreachable!(),
+                };
+                s.extend_from_slice(cont.as_slice());
+            }
+            debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
+            state.vals[state.base + a as usize] = LValue::OwnedString(Rc::new(s));
+        })));
+        arg = yield YieldOp::SetTypes(vec![(a, LType::String)]);
         arg
     }
 }
@@ -728,6 +766,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::LEN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_len(a as usize, b as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::CONCAT => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_concat(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
