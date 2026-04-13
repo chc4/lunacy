@@ -18,7 +18,7 @@ use internment::ArenaIntern;
 use qcell::{TCell, TCellOwner};
 
 use log::debug;
-use crate::generator::{Specializer, SubPc, BlockId};
+use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
 use crate::perf::PerfCounters;
 
 pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
@@ -595,7 +595,7 @@ pub enum LValue<'src, 'intern> {
     Table(Tc<Table<'src, 'intern>>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LType {
     Unknown,
     Nil,
@@ -603,7 +603,7 @@ pub enum LType {
     Number,
     String,
     Closure,
-    Table
+    Table,
 }
 
 impl<'src, 'intern> LValue<'src, 'intern> {
@@ -772,7 +772,7 @@ pub struct LClosure<'src, 'intern> {
     pub prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
     pub upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
-    pub versions: HashMap<(SubPc, Vec<LType>), BlockId>,
+    pub versions: HashMap<(SubPc, Context), BlockId>,
 }
 
 impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
@@ -841,6 +841,8 @@ pub struct RunState<'src, 'intern> {
     pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
     pub callstack: FVec<CallstackEntry<'src, 'intern>>,
     pub counters: PerfCounters,
+
+    pub hrefs: FVec<HashRef>,
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
@@ -987,6 +989,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 upvals,
                 callstack,
                 counters: Default::default(),
+                hrefs: vec![],
             }
         };
         // we need to track where to return to, along with the base pointer and where to put return
@@ -1321,11 +1324,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             // Lazy basic block versioning
                             // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];
-                            let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(0), types.clone())) {
+                            let hkeys = vec![];
+                            let ctx = Context { types, hkeys };
+                            let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(0), ctx.clone())) {
                                 *block
                             } else {
                                 spec.set_current(lclos.clone());
-                                spec.block(owner, 0, types)
+                                spec.block(owner, 0, ctx)
                             };
                             debug!("{:?} {block:?}", spec.blocks);
                             spec.set_current(lclos.clone());

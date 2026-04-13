@@ -63,7 +63,19 @@ pub enum YieldOp {
     Jump(BlockId), // Emit a jump to the given BlockId
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
     Call(CallTarget), // Call a block target. Probably need a ResumeArg for returned values later.
+
+    HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
+                           // constant. Resumed with either HashKey or Failed.
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HashKey<'src, 'intern> {
+    pub key: LConstant<'src, 'intern>,
+    pub known_type: LType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HashRef(usize);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ResumeArg {
@@ -73,6 +85,7 @@ pub enum ResumeArg {
     Failed,
     Type(LType),
     BlockId(BlockId),
+    HashRef(HashRef),
 }
 
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -145,6 +158,10 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             return arg;
         }
         // TODO: object shape specialization
+        arg = yield YieldOp::HashKey(b, c);
+        if let ResumeArg::HashRef(hc) = arg {
+            panic!()
+        }
         arg = yield YieldOp::Exec(ResidualExec("gettable", Rc::new(move |owner, state, cb| {
             let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
                 Ok(c) => Cow::Owned(LValue::from(c)),
@@ -705,6 +722,12 @@ fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Re
     })
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct Context {
+    pub types: Vec<LType>,
+    pub hkeys: Vec<HashKey<'static, 'static>>,
+}
+
 pub struct Specializer<'src, 'intern> {
     pub blocks: Vec<Vec<Residual>>,
     pub clos: Tc<LClosure<'src, 'intern>>,
@@ -719,7 +742,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Create a new block at a Lua bytecode PC
-    pub fn block(&mut self, owner: &mut TCellOwner<TcOwner>, entry: Pc, types: Vec<LType>) -> BlockId {
+    pub fn block(&mut self, owner: &mut TCellOwner<TcOwner>, entry: Pc, ctx: Context) -> BlockId {
         let mut pc = entry;
 
         let block_id = self.new_block();
@@ -728,106 +751,106 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         if count.len() >= 5 {
             panic!("too many versions: {:?}", count);
         }
-        self.clos.rw(owner).versions.insert((subpc, types.clone()), block_id);
-        self.compile(owner, entry, types, block_id);
+        self.clos.rw(owner).versions.insert((subpc, ctx.clone()), block_id);
+        self.compile(owner, entry, ctx, block_id);
         return block_id;
     }
 
     /// Return a specialized block for a given PC and context, compiling a new one if necessary
-    pub fn find(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, types: &Vec<LType>) -> Option<BlockId>
+    pub fn find(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: &Context) -> Option<BlockId>
     {
-        self.clos.ro(owner).versions.get(&(pc, types.clone())).cloned()
+        self.clos.ro(owner).versions.get(&(pc, ctx.clone())).cloned()
     }
 
-    pub fn compile(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut types: Vec<LType>, block_id: BlockId) -> Vec<LType> {
+    pub fn compile(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut ctx: Context, block_id: BlockId) -> Context {
         loop {
             let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
-            debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), types);
-            if let Some((next, ty, ret)) = match inst.0.Opcode() {
+            debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
+            if let Some((next, nctx, ret)) = match inst.0.Opcode() {
                 op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_numeric(op, a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_numeric(op, a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 op @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_compare(op, a, b as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_compare(op, a, b as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::JMP => {
                     let sbx = crate::vm::sBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
-                    //self.blocks[block_id].push(Residual::Jump(((pc as isize) + sbx as isize) as usize)); return types;
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
+                    //self.blocks[block_id].push(Residual::Jump(((pc as isize) + sbx as isize) as usize)); return ctx;
                 },
                 Opcode::UNM => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_unm(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_unm(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LEN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_len(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_len(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::CONCAT => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_concat(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_concat(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_loadk(bx, typeof_(&c), a as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadk(bx, typeof_(&c), a as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::MOVE => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     debug!("move {} {}", a, b);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_move(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_move(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_forprep(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_forprep(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::FORLOOP => {
                     let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_forloop(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_forloop(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETUPVAL => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::CALL => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{} {} {}", a, b, c);
                     // TODO: this should try to compile a new block and jump to it, and only
                     // fallback to a trace exit if we need to run the fully generic code
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_call(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_call(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_getglobal(a as usize, kst)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getglobal(a as usize, kst)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_setglobal(a as usize, kst)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setglobal(a as usize, kst)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETTABLE => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("gettable {} {} {}", a, b, c);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_gettable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_gettable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETTABLE => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("settable {} {} {}", a, b, c);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_settable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_settable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::NEWTABLE => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_newtable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_newtable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETLIST => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), types.clone(), Box::new(emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
@@ -843,10 +866,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
             } {
                 pc = next;
-                types = ty;
+                ctx = nctx;
                 debug!("-> {}", next);
             } else {
-                return types;
+                return ctx;
             }
         }
     }
@@ -868,7 +891,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    fn make_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, thunk_types: Vec<LType>, appends: bool) -> ThunkRef {
+    fn make_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, thunk_ctx: Context, appends: bool) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
             // The thunk was forced, so now we know the runtime value and if it
@@ -885,8 +908,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // our git history.
             let thunk_coro = thunk_coro.clone();
             let runtime_type = typeof_(&state.vals[state.base + idx]);
-            let mut forced_types = thunk_types.clone();
-            forced_types[idx] = runtime_type;
+            let mut forced_ctx = thunk_ctx.clone();
+            forced_ctx.types[idx] = runtime_type;
             debug!("forcing thunk with {:?} == {:?}", runtime_type, expected);
             let arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
             if !appends {
@@ -896,11 +919,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // TODO: search for if we already have a compatible block
             vm.blocks[block_id.0][thunk_pc] = Residual::Guard { idx, expected: runtime_type };
             // Push the same thunk down for the next value that fails the guard
-            let fail_thunk = vm.make_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_types.clone(), false);
+            let fail_thunk = vm.make_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_ctx.clone(), false);
             vm.blocks[block_id.0].push(Residual::Thunk(fail_thunk));
             // Finish the remainder of the coroutine
             let guard_block = vm.new_block();
-            if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), forced_types.clone(), thunk_coro, arg, guard_block) {
+            if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg, guard_block) {
                 // And continue compiling the block
                 vm.compile(owner, succ_next, succ_ty, guard_block);
             }
@@ -910,14 +933,36 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut types: Vec<LType>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Vec<LType>, ResumeArg)>
+    pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut ctx: Context, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Context, ResumeArg)>
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
         loop {
             let mut state = Pin::new(&mut coro).resume(arg);
             'machine: loop { match state {
                 CoroutineState::Yielded(YieldOp::Typeof(idx)) => {
-                    arg = ResumeArg::Type(types[idx]);
+                    arg = ResumeArg::Type(ctx.types[idx]);
+                },
+                CoroutineState::Yielded(YieldOp::HashKey(b, key)) => {
+                    assert!(matches!(ctx.types[b], LType::Table));
+                    let proto = self.clos.ro(owner).prototype;
+                    if (key & 0x100)!=0 {
+                        let k_const = key & (0xff);
+                        let k_val = unsafe { &(&(*proto).constants.items)[k_const as usize] };
+                        let ty = match unsafe { &(&(*proto).constants.items)[k_const as usize] } {
+                            crate::chunk::Constant::Nil => LType::Nil,
+                            crate::chunk::Constant::Bool(_) => LType::Bool,
+                            crate::chunk::Constant::Number(_) => LType::Number,
+                            crate::chunk::Constant::String(_) => LType::String,
+                        };
+                        // We need these HashKeys to not have a lifetime, so that they can be
+                        // captured by the generator: we only ever store the generator in the
+                        // LClosure they came from, which is 'src 'lifetime, and so this is safe.
+                        let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
+                        ctx.hkeys.push(HashKey { key: k_val.clone(), known_type: ty });
+                        arg = ResumeArg::HashRef(panic!());
+                    } else {
+                        arg = ResumeArg::Failed;
+                    }
                 },
                 CoroutineState::Yielded(YieldOp::GuardRk(rk, ref expected)) => {
                     let proto = self.clos.ro(owner).prototype;
@@ -951,20 +996,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(guard @ YieldOp::Guard(idx, expected)) => {
-                    debug!("guard {:?} == {:?}", types[idx], expected);
-                    if types[idx] == expected {
+                    debug!("guard {:?} == {:?}", ctx.types[idx], expected);
+                    if ctx.types[idx] == expected {
                         // Statically true: pump the success path
                         pc = pc.next_true();
                         arg = ResumeArg::Matched;
-                    } else if types[idx] != LType::Unknown {
+                    } else if ctx.types[idx] != LType::Unknown {
                         // Statically false: pump the fail path
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     } else {
                         // Dynamic branch: Fork the coroutine
                         let thunk_coro = coro.clone();
-                        let thunk_types = types.clone();
-                        let thunk = Residual::Thunk(self.make_thunk(block_id, thunk_coro, idx, expected, pc, thunk_types, true));
+                        let thunk_ctx = ctx.clone();
+                        let thunk = Residual::Thunk(self.make_thunk(block_id, thunk_coro, idx, expected, pc, thunk_ctx, true));
                         self.blocks[block_id.0].push(thunk);
                         return None;
                     }
@@ -980,11 +1025,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // TODO: suspend coro so that it can be resumed after the target returns to
                             // compile the continuation
                             panic!();
-                            if let Some(exists) = self.find(owner, SubPc::new(target), &types) {
+                            if let Some(exists) = self.find(owner, SubPc::new(target), &ctx) {
                                 id = exists;
                             } else {
-                                debug!("compiling fresh callsite {} {:?}", target, types);
-                                id = self.block(owner, target, types);
+                                debug!("compiling fresh callsite {} {:?}", target, ctx);
+                                id = self.block(owner, target, ctx);
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
@@ -992,52 +1037,52 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 cb(ExecEffect::Call(a, b, c as u16), owner, state);
                             })));
                             self.blocks[block_id.0].push(call_exec);
-                            let types = if c == 1 {
+                            let ctx = if c == 1 {
                                 // No values are saved
                                 // All our types are intact
-                                types
+                                ctx
                             } else if c >= 2 {
                                 // (C-1) values are saved
                                 // Returned values become unknown
                                 // TODO: compile a type specialized thunk instead? is that better?
                                 for i in 0..(c - 1) {
-                                    types[a + i] = LType::Unknown;
+                                    ctx.types[a + i] = LType::Unknown;
                                 }
-                                types
+                                ctx
                             } else {
                                 // Multiple return results are saved
                                 // All types until end of stack are unknown
-                                for i in a..types.len() {
-                                    types[i] = LType::Unknown;
+                                for i in a..ctx.types.len() {
+                                    ctx.types[i] = LType::Unknown;
                                 }
-                                types
+                                ctx
                             };
-                            //types = vec![LType::Unknown; types.len()];
-                            return Some((pc.0 + 1, types, ResumeArg::Start));
+                            //ctx.types = vec![LType::Unknown; ctx.types.len()];
+                            return Some((pc.0 + 1, ctx, ResumeArg::Start));
                         },
                     }
                 },
                 CoroutineState::Yielded(YieldOp::SetTypes(ty_effects)) => {
                     for (idx, ty) in ty_effects {
-                        if idx > types.len() {
-                            types.resize(idx + 1, LType::Unknown);
+                        if idx > ctx.types.len() {
+                            ctx.types.resize(idx + 1, LType::Unknown);
                         }
-                        types[idx] = ty;
+                        ctx.types[idx] = ty;
                     }
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
-                    if let Some(exists) = self.clos.ro(owner).versions.get(&(SubPc::new(dest_pc), types.clone())) {
+                    if let Some(exists) = self.clos.ro(owner).versions.get(&(SubPc::new(dest_pc), ctx.clone())) {
                         debug!("jump exist {dest_pc} -> {exists:?}");
                         arg = ResumeArg::BlockId(*exists);
                     } else {
                         let fresh = self.new_block();
                         debug!("jump fresh {dest_pc} -> {:?}", fresh);
-                        self.clos.rw(owner).versions.insert((SubPc::new(dest_pc), types.clone()), fresh);
-                        // TODO: do we just return ((dest, types, arg)) here and have self.compile
+                        self.clos.rw(owner).versions.insert((SubPc::new(dest_pc), ctx.clone()), fresh);
+                        // TODO: do we just return ((dest, ctx, arg)) here and have self.compile
                         // try to find the block instead? this potentially blows the stack
                         // this should probably push a thunk which compiles the block instead of a
                         // jump
-                        self.compile(owner, dest_pc, types.clone(), fresh);
+                        self.compile(owner, dest_pc, ctx.clone(), fresh);
                         arg = ResumeArg::BlockId(fresh);
                     }
                 },
@@ -1047,7 +1092,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     return None;
                 },
                 CoroutineState::Complete(r) => {
-                    return Some((pc.0 + 1, types, r));
+                    return Some((pc.0 + 1, ctx, r));
                 }
             } break 'machine; }
         }
@@ -1096,12 +1141,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     // Either use existing block, compile a new one, or use most
                                     // generic.
                                     let types = vec![LType::Unknown; next_stack];
-                                    let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(0), types.clone())) {
+                                    let hkeys = vec![];
+                                    let ctx = Context { types, hkeys };
+                                    let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(0), ctx.clone())) {
                                         *block
                                     } else {
-                                        debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, types);
+                                        debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, ctx);
                                         self.set_current(lclos.clone());
-                                        self.block(owner, 0, types)
+                                        self.block(owner, 0, ctx)
                                     };
                                     debug!("{:?} {block:?}", self.blocks);
                                     self.set_current(lclos.clone());
