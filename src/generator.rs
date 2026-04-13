@@ -750,6 +750,7 @@ fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Re
 enum CType {
     Type(LType),
     Shape(Vec<HashRef>),
+    // TODO: static call targets
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -981,6 +982,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let LValue::Table(tab) = tab else { unreachable!() };
             let Some((index, key, val)) = tab.ro(owner).hash.get_full::<LValue>(&(&hkey.key).into()) else { unimplemented!("bail") };
             debug!("href forced by {tab:?} -> {val:?}");
+            // TODO: give the environment a shape as well
             let discovered_type = typeof_(&val);
             hkey.known_type = discovered_type;
 
@@ -1050,6 +1052,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     if (key & 0x100)!=0 {
                         let k_const = key & (0xff);
                         let k_val = unsafe { &(&(*proto).constants.items)[k_const as usize] };
+                        let ty = match unsafe { &(&(*proto).constants.items)[k_const as usize] } {
+                            crate::chunk::Constant::Nil => LType::Nil,
+                            crate::chunk::Constant::Bool(_) => LType::Bool,
+                            crate::chunk::Constant::Number(_) => LType::Number,
+                            crate::chunk::Constant::String(_) => LType::String,
+                        };
+                        if ty != LType::String {
+                            // Only cache string keys
+                            pc = pc.next_false();
+                            arg = ResumeArg::Failed;
+                            break 'machine;
+                        }
                         match &ctx.types[idx] {
                             CType::Type(LType::Table) => {
                             },
