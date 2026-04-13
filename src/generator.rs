@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::RefCell;
 
-use crate::vm::{Opcode, Upvalue, CallstackEntry, ReturnLocation};
+use crate::vm::{Opcode, Upvalue, CallstackEntry, ReturnLocation, HashWitness};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
@@ -74,7 +74,7 @@ pub struct HashKey<'src, 'intern> {
     pub known_type: LType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HashRef(usize);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -85,7 +85,7 @@ pub enum ResumeArg {
     Failed,
     Type(LType),
     BlockId(BlockId),
-    HashRef(HashRef),
+    HashRef(HashRef, LType),
 }
 
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -157,21 +157,43 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
             return arg;
         }
-        // TODO: object shape specialization
+        // Object shape specialization
         arg = yield YieldOp::HashKey(b, c);
-        if let ResumeArg::HashRef(hc) = arg {
-            panic!()
+        if let ResumeArg::HashRef(hc, htype) = arg {
+            arg = yield YieldOp::Exec(ResidualExec("gettable_href", Rc::new(move |owner, state, cb| {
+                let witness = &state.hash_witnesses[hc.0];
+                debug!("gettable_href with {:?} {:?}", &witness, htype);
+                let tab = &state.vals[state.base + b];
+                let LValue::Table(tab) = tab else { unreachable!() };
+                let (k, val1) = tab.ro(owner).hash.get_index(witness.as_ref().unwrap().index).unwrap();
+
+                // Sanity check
+                // Move this into make_href_check since we need it attached to the HashKey instead
+                #[cfg(debug_assertions)]
+                {
+                    let val2 = tab.ro(owner).hash.get::<LValue>(&(&witness.as_ref().unwrap().key).into()).unwrap();
+                    let full_key = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16);
+                    let Ok(const_key) = full_key else { unreachable!() };
+                    assert_eq!(k, &(const_key.into()) as &LValue);
+                    assert_eq!(val1, val2);
+                }
+
+                debug!("gettable_href fetched {a} = {val1:?}");
+                state.vals[state.base + a] = val1.clone();
+            })));
+            yield YieldOp::SetTypes(vec![(a, htype)]);
+        } else {
+            arg = yield YieldOp::Exec(ResidualExec("gettable", Rc::new(move |owner, state, cb| {
+                let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                    Ok(c) => Cow::Owned(LValue::from(c)),
+                    Err(lv) => Cow::Borrowed(lv),
+                };
+                debug!("gettable {:?}", &kc);
+                let val_b = state.vals[state.base + b as usize].clone();
+                state.vals[state.base + a as usize] = val_b.gettable(owner, kc);
+            })));
+            yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
         }
-        arg = yield YieldOp::Exec(ResidualExec("gettable", Rc::new(move |owner, state, cb| {
-            let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                Ok(c) => Cow::Owned(LValue::from(c)),
-                Err(lv) => Cow::Borrowed(lv),
-            };
-            debug!("gettable {:?}", &kc);
-            let val_b = state.vals[state.base + b as usize].clone();
-            state.vals[state.base + a as usize] = val_b.gettable(owner, kc);
-        })));
-        yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
         arg
     }
 }
@@ -643,7 +665,8 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         arg = yield YieldOp::Guard(a, LType::Closure);
         if arg != ResumeArg::Matched {
             arg = yield YieldOp::Exec(ResidualExec("call_meta", Rc::new(move |owner, state, cb| {
-                panic!("call metamethod {} {:?} {:?}", b, &state.vals, &state.vals[state.base + b])
+                debug!("??? {arg:?}");
+                panic!("call metamethod {} {:?} {:?}", a, &state.vals, &state.vals[state.base + a])
             })));
             return arg;
         }
@@ -706,6 +729,7 @@ pub enum Residual {
     Jump(BlockId),
     Thunk(ThunkRef),
     Ret(Pc, u8, u16),
+    HashGuard { tab: usize, href: HashRef, expected: LType },
 }
 
 fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>) -> Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>
@@ -723,9 +747,24 @@ fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Re
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum CType {
+    Type(LType),
+    Shape(Vec<HashRef>),
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Context {
-    pub types: Vec<LType>,
+    pub types: Vec<CType>,
     pub hkeys: Vec<HashKey<'static, 'static>>,
+}
+
+impl Context {
+    pub fn new(mut types: Vec<LType>) -> Self {
+        Self {
+            types: types.drain(..).map(|t| CType::Type(t)).collect(),
+            hkeys: vec![],
+        }
+    }
 }
 
 pub struct Specializer<'src, 'intern> {
@@ -909,7 +948,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let thunk_coro = thunk_coro.clone();
             let runtime_type = typeof_(&state.vals[state.base + idx]);
             let mut forced_ctx = thunk_ctx.clone();
-            forced_ctx.types[idx] = runtime_type;
+            forced_ctx.types[idx] = CType::Type(runtime_type);
             debug!("forcing thunk with {:?} == {:?}", runtime_type, expected);
             let arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
             if !appends {
@@ -933,6 +972,64 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
+    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Context, appends: bool) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+            let thunk_coro = thunk_coro.clone();
+            let hkey = &mut thunk_ctx.hkeys[href.0];
+            debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
+            let tab = &state.vals[state.base + idx];
+            let LValue::Table(tab) = tab else { unreachable!() };
+            let Some((index, key, val)) = tab.ro(owner).hash.get_full::<LValue>(&(&hkey.key).into()) else { unimplemented!("bail") };
+            debug!("href forced by {tab:?} -> {val:?}");
+            let discovered_type = typeof_(&val);
+            hkey.known_type = discovered_type;
+
+            // TODO: track the maximum number of hkeys + grow here instead so we can initialize the RunState
+            // array.
+
+            // Now transition into the populated hkey
+            let init_key = hkey.key.clone();
+            vm.blocks[block_id.0][thunk_pc] =
+                Residual::Exec(ResidualExec("href_init", Rc::new(move |owner, state, cb| {
+                    if state.hash_witnesses.len() <= href.0 {
+                        state.hash_witnesses.resize_with(href.0 as usize + 1, || None);
+                    }
+                    debug!("populating hashkey witness {}", href.0);
+                    let witness = &mut state.hash_witnesses[href.0];
+                    *witness = Some(HashWitness {
+                        href,
+                        key: init_key.clone(),
+                        epoch: 0,
+                        index,
+                    });
+                })));
+            vm.blocks[block_id.0].push(Residual::HashGuard { tab: idx, href, expected: discovered_type });
+            vm.blocks[block_id.0].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+                panic!("failed href guard")
+            })))));
+
+            let guard_block = vm.new_block();
+            if let CType::Shape(existing) = &mut thunk_ctx.types[idx] {
+                existing.push(href)
+            } else {
+                thunk_ctx.types[idx] = CType::Shape(vec![href]);
+            }
+            if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro, ResumeArg::HashRef(href, discovered_type), guard_block) {
+                // And continue compiling the block
+                vm.compile(owner, succ_next, succ_ty, guard_block);
+            }
+            vm.blocks[block_id.0].push(Residual::Jump(guard_block));
+        })))
+    }
+
+    fn make_href_check_thunk(&mut self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Context, appends: bool) -> ThunkRef {
+        let fail = self.new_block();
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+            panic!();
+            let fail_block = vm.new_block();
+        })))
+    }
+
     pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut ctx: Context, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Context, ResumeArg)>
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
@@ -940,14 +1037,59 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut state = Pin::new(&mut coro).resume(arg);
             'machine: loop { match state {
                 CoroutineState::Yielded(YieldOp::Typeof(idx)) => {
-                    arg = ResumeArg::Type(ctx.types[idx]);
+                    let ctype = &ctx.types[idx];
+                    // Erase any hkeys and say its just a table
+                    let ltype = match ctype {
+                        CType::Type(t) => *t,
+                        CType::Shape(_) => LType::Table,
+                    };
+                    arg = ResumeArg::Type(ltype);
                 },
-                CoroutineState::Yielded(YieldOp::HashKey(b, key)) => {
-                    assert!(matches!(ctx.types[b], LType::Table));
+                CoroutineState::Yielded(YieldOp::HashKey(idx, key)) => {
                     let proto = self.clos.ro(owner).prototype;
                     if (key & 0x100)!=0 {
                         let k_const = key & (0xff);
                         let k_val = unsafe { &(&(*proto).constants.items)[k_const as usize] };
+                        match &ctx.types[idx] {
+                            CType::Type(LType::Table) => {
+                            },
+                            CType::Shape(existing) => {
+                                debug!("hashkey on existing shape {existing:?}");
+                                for cached in existing {
+                                    let cached_hkey = &ctx.hkeys[cached.0];
+                                    if &cached_hkey.key == k_val {
+                                        // We have a cached href, but still need to make sure that
+                                        // it holds.
+                                        let thunk_cached = cached.clone();
+                                        let thunk_hkey = cached_hkey.clone();
+                                        let failed_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+                                            panic!("failed hashguard for cached")
+                                        })));
+                                        self.blocks[block_id.0].push(Residual::HashGuard {
+                                            tab: idx,
+                                            href: *cached,
+                                            expected: cached_hkey.known_type.clone(),
+                                        });
+                                        self.blocks[block_id.0].push(Residual::Thunk(failed_thunk));
+                                        let taken_coro = coro.clone();
+                                        let taken_ctx = ctx.clone();
+                                        let taken_type = cached_hkey.known_type.clone();
+                                        let taken_href = *cached;
+                                        let taken_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+                                            let guard_block = vm.new_block();
+                                            if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), taken_ctx.clone(), taken_coro.clone(), ResumeArg::HashRef(taken_href, taken_type.clone()), guard_block) {
+                                                // And continue compiling the block
+                                                vm.compile(owner, succ_next, succ_ty, guard_block);
+                                            }
+                                            vm.blocks[block_id.0][thunk_pc] = Residual::Jump(guard_block);
+                                        })));
+                                        self.blocks[block_id.0].push(Residual::Thunk(taken_thunk));
+                                        return None;
+                                    }
+                                }
+                            },
+                            _ => panic!("HashKey should only be used on a table"),
+                        }
                         let ty = match unsafe { &(&(*proto).constants.items)[k_const as usize] } {
                             crate::chunk::Constant::Nil => LType::Nil,
                             crate::chunk::Constant::Bool(_) => LType::Bool,
@@ -958,9 +1100,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // captured by the generator: we only ever store the generator in the
                         // LClosure they came from, which is 'src 'lifetime, and so this is safe.
                         let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
-                        ctx.hkeys.push(HashKey { key: k_val.clone(), known_type: ty });
-                        arg = ResumeArg::HashRef(panic!());
+                        let href = HashRef(ctx.hkeys.len());
+                        let hkey = HashKey { key: k_val.clone(), known_type: LType::Unknown };
+                        ctx.hkeys.push(hkey.clone());
+                        let thunk_coro = coro.clone();
+                        let thunk_ctx = ctx.clone();
+                        let witness = Residual::Thunk(self.make_href_thunk(block_id, thunk_coro, idx, href.clone(), pc, thunk_ctx, true));
+                        self.blocks[block_id.0].push(witness);
+                        return None;
                     } else {
+                        pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     }
                 },
@@ -997,11 +1146,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(guard @ YieldOp::Guard(idx, expected)) => {
                     debug!("guard {:?} == {:?}", ctx.types[idx], expected);
-                    if ctx.types[idx] == expected {
+                    let ctype = &ctx.types[idx];
+                    // Erase any hkeys and say its just a table before checking
+                    let ltype = match ctype {
+                        CType::Type(t) => *t,
+                        CType::Shape(_) => LType::Table,
+                    };
+
+                    if ltype == expected {
                         // Statically true: pump the success path
                         pc = pc.next_true();
                         arg = ResumeArg::Matched;
-                    } else if ctx.types[idx] != LType::Unknown {
+                    }
+                    else if ltype != LType::Unknown {
                         // Statically false: pump the fail path
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
@@ -1046,14 +1203,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // Returned values become unknown
                                 // TODO: compile a type specialized thunk instead? is that better?
                                 for i in 0..(c - 1) {
-                                    ctx.types[a + i] = LType::Unknown;
+                                    ctx.types[a + i] = CType::Type(LType::Unknown);
                                 }
                                 ctx
                             } else {
                                 // Multiple return results are saved
                                 // All types until end of stack are unknown
                                 for i in a..ctx.types.len() {
-                                    ctx.types[i] = LType::Unknown;
+                                    ctx.types[i] = CType::Type(LType::Unknown);
                                 }
                                 ctx
                             };
@@ -1065,9 +1222,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::SetTypes(ty_effects)) => {
                     for (idx, ty) in ty_effects {
                         if idx > ctx.types.len() {
-                            ctx.types.resize(idx + 1, LType::Unknown);
+                            ctx.types.resize(idx + 1, CType::Type(LType::Unknown));
                         }
-                        ctx.types[idx] = ty;
+                        ctx.types[idx] = CType::Type(ty);
+                        debug!("set types to {:?}", &ctx.types);
                     }
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
@@ -1115,6 +1273,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
+                Residual::HashGuard { tab, href, expected } => {
+                    let hkey = &state.hash_witnesses[href.0].as_ref().unwrap();
+                    let tab = &state.vals[state.base + tab];
+                    let LValue::Table(tab) = tab else { unreachable!() };
+                    let Some((key, val)) = tab.ro(owner).hash.get_index(hkey.index) else { unreachable!() };
+                    if typeof_(val) == expected {
+                        // Fallthrough
+                        off += 2;
+                    } else {
+                        off += 1;
+                    }
+                },
                 Residual::Exec(f) => {
                     off += 1;
                     f.1(owner, &mut state, &mut |eff, owner, state| {
@@ -1141,8 +1311,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     // Either use existing block, compile a new one, or use most
                                     // generic.
                                     let types = vec![LType::Unknown; next_stack];
-                                    let hkeys = vec![];
-                                    let ctx = Context { types, hkeys };
+                                    let ctx = Context::new(types);
                                     let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(0), ctx.clone())) {
                                         *block
                                     } else {

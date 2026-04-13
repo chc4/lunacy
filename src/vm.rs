@@ -14,6 +14,7 @@ use std::{error::Error, ops::Deref};
 use std::io::Write;
 
 use internment::ArenaIntern;
+use indexmap::IndexMap;
 
 use qcell::{TCell, TCellOwner};
 
@@ -453,14 +454,14 @@ impl std::hash::BuildHasher for InternedHasher {
 #[derive(Debug)]
 pub struct Table<'src, 'intern> {
     pub array: FVec<LValue<'src, 'intern>>,
-    pub hash: HashMap<LValue<'src, 'intern>, LValue<'src, 'intern>, InternedHasher>,
+    pub hash: IndexMap<LValue<'src, 'intern>, LValue<'src, 'intern>, InternedHasher>,
 }
 
 impl<'src, 'intern> Table<'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
             array: vec![LValue::Nil; array].into(),
-            hash: HashMap::with_capacity_and_hasher(hash, InternedHasher::default())
+            hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default())
         }
     }
 }
@@ -832,6 +833,14 @@ pub enum ReturnLocation {
 pub struct CallstackEntry<'src, 'intern>(pub Tc<LClosure<'src, 'intern>>, pub ReturnLocation, pub usize, pub usize, pub usize, pub u16);
 
 #[derive(Debug)]
+pub struct HashWitness {
+    pub href: HashRef,
+    pub key: LConstant<'static, 'static>,
+    pub index: usize,
+    pub epoch: usize,
+}
+
+#[derive(Debug)]
 pub struct RunState<'src, 'intern> {
     pub base: usize,
     pub pc: usize,
@@ -842,7 +851,7 @@ pub struct RunState<'src, 'intern> {
     pub callstack: FVec<CallstackEntry<'src, 'intern>>,
     pub counters: PerfCounters,
 
-    pub hrefs: FVec<HashRef>,
+    pub hash_witnesses: FVec<Option<HashWitness>>,
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
@@ -930,7 +939,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let os = (InternString::intern(intern, "os\0"), LValue::Table(Tc::new(os_tab)));
         Tc::new(Table {
             array: vec![].into(),
-            hash: HashMap::<_, _, InternedHasher>::from_iter(
+            hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
                 (InternString::intern(intern, "print\0"), LValue::NClosure(NClosure::new(|v, owner| {
                     let s = v.iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
@@ -989,7 +998,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 upvals,
                 callstack,
                 counters: Default::default(),
-                hrefs: vec![],
+                hash_witnesses: vec![],
             }
         };
         // we need to track where to return to, along with the base pointer and where to put return
@@ -1324,8 +1333,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             // Lazy basic block versioning
                             // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];
-                            let hkeys = vec![];
-                            let ctx = Context { types, hkeys };
+                            let ctx = Context::new(types);
                             let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(0), ctx.clone())) {
                                 *block
                             } else {
