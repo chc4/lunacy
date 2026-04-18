@@ -1723,8 +1723,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::HashGuard { tab, href, expected } => format!("hguard({}, {:?}, {})", tab, href, expected),
                         Residual::Thunk(_) => format!("thunk"),
                         Residual::Select(targets) => format!("select"),
+                        Residual::Ret(_, _, _) => format!("ret"),
 
-                        _ => "".to_string(),
                     };
                     instructions.push(inst_label);
                     match res {
