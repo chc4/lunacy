@@ -19,6 +19,7 @@ use crate::chunk::Constant;
 use crate::chunk::Instruction;
 
 use log::debug;
+use log::info;
 
 fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
     match val {
@@ -61,17 +62,30 @@ pub enum YieldOp {
     Exec(ResidualExec), // Emit a residual operation that will be executed
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(BlockId), // Emit a jump to the given BlockId
+    Select(Vec<(&'static str, BlockId)>), // Emit a jump to one of several branches, based on
+                                      // `state.select` at runtime
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
     Call(CallTarget), // Call a block target. Probably need a ResumeArg for returned values later.
 
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
-                           // constant. Resumed with either HashKey or Failed.
+    TryHashKey(usize, usize), // Looks up but does not allocate an HREF..
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HashKey<'src, 'intern> {
+    pub idx: usize,
     pub key: LConstant<'src, 'intern>,
     pub known_type: LType,
+    pub dirty: bool,
+}
+
+impl<'src, 'intern> std::fmt::Display for HashKey<'src, 'intern> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lv: LValue = (&self.key).into();
+        write!(f, "hkey({}, {})",
+            String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
+            self.known_type)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -173,6 +187,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 {
                     let val2 = tab.ro(owner).hash.get::<LValue>(&(&witness.as_ref().unwrap().key).into()).unwrap();
                     let full_key = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16);
+                    debug!("{:?}", &tab.ro(owner));
                     let Ok(const_key) = full_key else { unreachable!() };
                     assert_eq!(k, &(const_key.into()) as &LValue);
                     assert_eq!(val1, val2);
@@ -232,18 +247,37 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             })));
         } else {
             // Hash part set
-            arg = yield YieldOp::Exec(ResidualExec("settable_hash", Rc::new(move |owner, state, cb| {
-                let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
-                    Ok(b) => b.into(),
-                    Err(lv) => lv.clone(),
-                };
-                let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                    Ok(c) => c.into(),
-                    Err(lv) => lv.clone(),
-                };
-                let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
-                t.rw(owner).hash.insert(kb, kc);
-            })));
+            arg = ResumeArg::Failed;
+            arg = yield YieldOp::TryHashKey(a, b);
+            if let ResumeArg::HashRef(hb, htype) = arg {
+                if let ResumeArg::Type(new_val_type) = yield YieldOp::Typeof(c) {
+                    if new_val_type != htype {
+                        panic!();
+                    }
+                }
+                arg = yield YieldOp::Exec(ResidualExec("settable_href", Rc::new(move |owner, state, cb| {
+                    let witness = &state.hash_witnesses[hb.0];
+                    debug!("settable_href with {:?} {:?}", &witness, htype);
+                    let tab = &state.vals[state.base + a];
+                    let LValue::Table(tab) = tab else { unreachable!() };
+                    let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
+                    *val1 = state.vals[state.base + c].clone();
+                })));
+            } else {
+                arg = yield YieldOp::Exec(ResidualExec("settable_hash", Rc::new(move |owner, state, cb| {
+                    let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
+                        Ok(b) => b.into(),
+                        Err(lv) => lv.clone(),
+                    };
+                    let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                        Ok(c) => c.into(),
+                        Err(lv) => lv.clone(),
+                    };
+                    let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
+                    t.rw(owner).hash.insert(kb, kc);
+                })));
+                arg = yield YieldOp::SetTypes(vec![(a, LType::Table)]);
+            }
         }
         arg
     }
@@ -411,10 +445,10 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     let cond = dyn_b.compare(opcode, dyn_c.clone()).unwrap();
                     if (cond as u8) != a {
                         debug!("taking comparison jump -> {:?}", taken);
-                        cb(ExecEffect::Jump(taken), owner, state);
+                        state.select = 0;
                     } else {
                         debug!("falling through comparison jump -> {:?}", fallthrough);
-                        cb(ExecEffect::Jump(fallthrough), owner, state);
+                        state.select = 1;
                     }
                 })));
             },
@@ -427,10 +461,10 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     let cond = LValue::from(const_b).compare(opcode, dyn_c.clone()).unwrap();
                     if (cond as u8) != a {
                         debug!("taking comparison jump -> {:?}", taken);
-                        cb(ExecEffect::Jump(taken), owner, state);
+                        state.select = 0;
                     } else {
                         debug!("falling through comparison jump -> {:?}", fallthrough);
-                        cb(ExecEffect::Jump(fallthrough), owner, state);
+                        state.select = 1;
                     }
                 })));
             },
@@ -443,10 +477,10 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     let cond = dyn_b.compare(opcode, const_c.into()).unwrap();
                     if (cond as u8) != a {
                         debug!("taking comparison jump -> {:?}", taken);
-                        cb(ExecEffect::Jump(taken), owner, state);
+                        state.select = 0;
                     } else {
                         debug!("falling through comparison jump -> {:?}", fallthrough);
-                        cb(ExecEffect::Jump(fallthrough), owner, state);
+                        state.select = 1;
                     }
                 })));
             },
@@ -455,7 +489,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             },
             _ => unreachable!(),
         }
-        arg = yield YieldOp::Jump(fallthrough);
+        arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
         arg
     }
 }
@@ -608,7 +642,16 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
     }
 }
 
-
+pub fn emit_self(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        let mut getmem = emit_gettable(a, b, c);
+        drain!(getmem, arg);
+        let mut moveself = emit_move(a + 1, b);
+        drain!(moveself, arg);
+        arg
+    }
+}
 
 pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
@@ -649,12 +692,14 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
                 idx.clone().compare(Opcode::LE, limit)
             };
             if comp.unwrap() {
-                cb(ExecEffect::Jump(taken), owner, state);
                 state.vals[state.base + a as usize + 3] = idx;
+                state.select = 0;
             } else {
-                cb(ExecEffect::Jump(fallthrough), owner, state);
+                state.select = 1;
             }
         })));
+        // For debug tracing, statically document that we have two outgoing edges
+        yield YieldOp::Select(vec![("forloop_start", taken), ("forloop_finish", fallthrough)]);
         arg
     }
 }
@@ -726,6 +771,7 @@ pub enum Residual {
     Guard { idx: usize, expected: LType },
     Exec(ResidualExec),
     Call(BlockId, usize, usize),
+    Select(Vec<(&'static str, BlockId)>),
     Jump(BlockId),
     Thunk(ThunkRef),
     Ret(Pc, u8, u16),
@@ -753,10 +799,28 @@ enum CType {
     // TODO: static call targets
 }
 
+impl std::fmt::Display for CType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CType::Type(ltype) => ltype.fmt(f),
+            CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Context {
     pub types: Vec<CType>,
     pub hkeys: Vec<HashKey<'static, 'static>>,
+}
+
+impl std::fmt::Display for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "context([{}], hkeys: {})",
+            self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
+            self.hkeys.iter().map(|hk| format!("{}", hk)).intersperse(",".to_string()).collect::<String>(),
+        )
+    }
 }
 
 impl Context {
@@ -771,12 +835,17 @@ impl Context {
 pub struct Specializer<'src, 'intern> {
     pub blocks: Vec<Vec<Residual>>,
     pub clos: Tc<LClosure<'src, 'intern>>,
+
+    pub versions: std::collections::HashMap<
+        *const crate::chunk::FunctionBlock<'src, LConstant<'src, 'intern>>,
+        std::collections::HashMap<(SubPc, Context), BlockId>>,
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn new(clos: Tc<LClosure<'src, 'intern>>) -> Self {
         Self {
             blocks: Vec::new(),
+            versions: HashMap::new(),
             clos,
         }
     }
@@ -787,11 +856,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         let block_id = self.new_block();
         let subpc: SubPc = SubPc::new(entry);
-        let count: Vec<_> = self.clos.ro(owner).versions.iter().filter(|((pc, ty), block)| pc.0 == entry).collect();
+        let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((pc, ty), block)| pc.0 == entry).collect();
         if count.len() >= 5 {
             panic!("too many versions: {:?}", count);
         }
-        self.clos.rw(owner).versions.insert((subpc, ctx.clone()), block_id);
+        self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().insert((subpc, ctx.clone()), block_id);
         self.compile(owner, entry, ctx, block_id);
         return block_id;
     }
@@ -799,7 +868,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Return a specialized block for a given PC and context, compiling a new one if necessary
     pub fn find(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: &Context) -> Option<BlockId>
     {
-        self.clos.ro(owner).versions.get(&(pc, ctx.clone())).cloned()
+        self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(pc, ctx.clone())).cloned()
     }
 
     pub fn compile(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut ctx: Context, block_id: BlockId) -> Context {
@@ -855,6 +924,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::GETUPVAL => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::SELF => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_self(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::CALL => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
@@ -980,7 +1053,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
             let tab = &state.vals[state.base + idx];
             let LValue::Table(tab) = tab else { unreachable!() };
-            let Some((index, key, val)) = tab.ro(owner).hash.get_full::<LValue>(&(&hkey.key).into()) else { unimplemented!("bail") };
+            let Some((index, key, val)) = tab.ro(owner).hash.get_full::<LValue>(&(&hkey.key).into()) else {
+                // The table doesn't have this key, which means we should actually just bailout
+                let fail_block = vm.new_block();
+                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro, ResumeArg::Failed, block_id) {
+                    vm.compile(owner, succ_next, succ_ty, fail_block);
+                }
+                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(fail_block);
+                return;
+            };
             debug!("href forced by {tab:?} -> {val:?}");
             // TODO: give the environment a shape as well
             let discovered_type = typeof_(&val);
@@ -1047,7 +1128,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                     arg = ResumeArg::Type(ltype);
                 },
-                CoroutineState::Yielded(YieldOp::HashKey(idx, key)) => {
+                op @ CoroutineState::Yielded(YieldOp::HashKey(idx, key) | YieldOp::TryHashKey(idx, key)) => {
                     let proto = self.clos.ro(owner).prototype;
                     if (key & 0x100)!=0 {
                         let k_const = key & (0xff);
@@ -1072,12 +1153,31 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 for cached in existing {
                                     let cached_hkey = &ctx.hkeys[cached.0];
                                     if &cached_hkey.key == k_val {
+                                        if !cached_hkey.dirty {
+                                            // We don't need to check the guard again
+                                            pc = pc.next_true();
+                                            arg = ResumeArg::HashRef(*cached, cached_hkey.known_type.clone());
+                                            break 'machine;
+                                        }
                                         // We have a cached href, but still need to make sure that
                                         // it holds.
                                         let thunk_cached = cached.clone();
                                         let thunk_hkey = cached_hkey.clone();
+                                        let mut fail_ctx = ctx.clone();
+                                        // Unspecialize the table shape
+                                        fail_ctx.types[idx] = CType::Type(LType::Table);
+                                        let fail_coro = coro.clone();
                                         let failed_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
-                                            panic!("failed hashguard for cached")
+                                            // The table doesn't have this key, which means we should actually just bailout
+                                            if let Some(exists) = vm.find(owner, pc.next_false(), &fail_ctx) {
+                                                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(exists);
+                                            } else {
+                                                let fail_block = vm.new_block();
+                                                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), fail_ctx.clone(), fail_coro.clone(), ResumeArg::Failed, block_id) {
+                                                    vm.compile(owner, succ_next, succ_ty, fail_block);
+                                                }
+                                                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(fail_block);
+                                            }
                                         })));
                                         self.blocks[block_id.0].push(Residual::HashGuard {
                                             tab: idx,
@@ -1086,16 +1186,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         });
                                         self.blocks[block_id.0].push(Residual::Thunk(failed_thunk));
                                         let taken_coro = coro.clone();
-                                        let taken_ctx = ctx.clone();
+                                        let mut taken_ctx = ctx.clone();
+                                        // Reset the dirty flag after we check its type again
+                                        taken_ctx.hkeys[cached.0].dirty = false;
                                         let taken_type = cached_hkey.known_type.clone();
                                         let taken_href = *cached;
                                         let taken_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
-                                            let guard_block = vm.new_block();
-                                            if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), taken_ctx.clone(), taken_coro.clone(), ResumeArg::HashRef(taken_href, taken_type.clone()), guard_block) {
-                                                // And continue compiling the block
-                                                vm.compile(owner, succ_next, succ_ty, guard_block);
+                                            if let Some(exists) = vm.find(owner, pc.next_true(), &taken_ctx) {
+                                                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(exists);
+                                            } else {
+                                                let guard_block = vm.new_block();
+                                                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), taken_ctx.clone(), taken_coro.clone(), ResumeArg::HashRef(taken_href, taken_type.clone()), guard_block) {
+                                                    // And continue compiling the block
+                                                    vm.compile(owner, succ_next, succ_ty, guard_block);
+                                                }
+                                                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(guard_block);
                                             }
-                                            vm.blocks[block_id.0][thunk_pc] = Residual::Jump(guard_block);
                                         })));
                                         self.blocks[block_id.0].push(Residual::Thunk(taken_thunk));
                                         return None;
@@ -1103,6 +1209,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 }
                             },
                             _ => panic!("HashKey should only be used on a table"),
+                        }
+                        if matches!(op, CoroutineState::Yielded(YieldOp::TryHashKey(idx, key))) {
+                            pc = pc.next_false();
+                            arg = ResumeArg::Failed;
+                            break 'machine;
                         }
                         let ty = match unsafe { &(&(*proto).constants.items)[k_const as usize] } {
                             crate::chunk::Constant::Nil => LType::Nil,
@@ -1114,9 +1225,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // captured by the generator: we only ever store the generator in the
                         // LClosure they came from, which is 'src 'lifetime, and so this is safe.
                         let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
-                        let href = HashRef(ctx.hkeys.len());
-                        let hkey = HashKey { key: k_val.clone(), known_type: LType::Unknown };
-                        ctx.hkeys.push(hkey.clone());
+                        // Try to find an orphaned HashKey slot to re-use
+                        let href;
+                        if let Some((i, _)) = ctx.hkeys.iter().enumerate().find(|(i, hk)| hk.known_type == LType::Unknown) {
+                            href = HashRef(i)
+                        } else {
+                            href = HashRef(ctx.hkeys.len());
+                            let hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown, dirty: true };
+                            ctx.hkeys.push(hkey.clone());
+                        }
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         let witness = Residual::Thunk(self.make_href_thunk(block_id, thunk_coro, idx, href.clone(), pc, thunk_ctx, true));
@@ -1189,6 +1306,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].push(Residual::Exec(func));
                     // In a real VM, transition to the next PC generator here.
                 },
+                CoroutineState::Yielded(YieldOp::Select(targets)) => {
+                    self.blocks[block_id.0].push(Residual::Select(targets));
+                    return None;
+                },
                 CoroutineState::Yielded(YieldOp::Call(target)) => {
                     let id;
                     match target {
@@ -1238,18 +1359,58 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         if idx > ctx.types.len() {
                             ctx.types.resize(idx + 1, CType::Type(LType::Unknown));
                         }
+                        // We may have shape(1) [hkey(1)], and then transiton a type back to an
+                        // ltable. Discovering the type again would transition to shape(2)
+                        // [hkey(1), hkey(2)] for no reason. We make sure to also forget about any
+                        // hkeys that are from the index we're forgetting about, first trying to
+                        // transition them to be owned by another shape that may be using the same
+                        // hkey instead (consider `local x = t; use(x.a); local y = x; x = nil;`,
+                        // where our move operator maintains types).
+                        // This does give us some slight block proliferation, since hkeys are still
+                        // path-dependent and you could end up with different indexes for hkeys,
+                        // and thus shape hrefs, depending on what other local variables you have
+                        // gotten rid of in your stack. It's probably possible to instead
+                        // de-duplicate structurally equivalent types in Specializer::find, however
+                        // that has the issue of runtime hash_witness entries referring to the same
+                        // path-dependent index and having to emit shuffles if you take a
+                        // de-duplicated branch but with different indexes.
+                        if let CType::Shape(shape) = &ctx.types[idx] {
+                            for (kidx, key) in ctx.hkeys.iter_mut().enumerate() {
+                                if key.idx != idx { continue; }
+                                // Try to migrate
+                                let mut migrated = false;
+                                for (new_idx, other_type) in ctx.types.iter().enumerate() {
+                                    if new_idx == idx { continue; }
+                                    let CType::Shape(other_shape) = other_type else { continue };
+                                    if other_shape.contains(&HashRef(kidx)) {
+                                        key.idx = new_idx;
+                                        migrated = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            // We can only remove hkeys at the end of the array for the same
+                            // reason of needing stable hash_witness indexes. For interior ones, we
+                            // can mark them as LType::Unknown and try to re-use the index instead
+                            // of pushing to the array when we need a new HashKey in order to try
+                            // and re-use the slot (and potentially end up with the same
+                            // pre-SetTypes context entirely). This is safe because we only ever
+                            // have LType::Unknown as the known_type for an hkey before forcing an
+                            // href_thunk, which happens immediately.
+                            while let Some(_) = ctx.hkeys.pop_if(|hkey| hkey.idx == idx) { }
+                        }
                         ctx.types[idx] = CType::Type(ty);
                         debug!("set types to {:?}", &ctx.types);
                     }
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
-                    if let Some(exists) = self.clos.ro(owner).versions.get(&(SubPc::new(dest_pc), ctx.clone())) {
+                    if let Some(exists) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(SubPc::new(dest_pc), ctx.clone())) {
                         debug!("jump exist {dest_pc} -> {exists:?}");
                         arg = ResumeArg::BlockId(*exists);
                     } else {
                         let fresh = self.new_block();
                         debug!("jump fresh {dest_pc} -> {:?}", fresh);
-                        self.clos.rw(owner).versions.insert((SubPc::new(dest_pc), ctx.clone()), fresh);
+                        self.versions.get_mut(&self.clos.rw(owner).prototype).unwrap().insert((SubPc::new(dest_pc), ctx.clone()), fresh);
                         // TODO: do we just return ((dest, ctx, arg)) here and have self.compile
                         // try to find the block instead? this potentially blows the stack
                         // this should probably push a thunk which compiles the block instead of a
@@ -1299,6 +1460,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
+                Residual::Select(targets) => {
+                    id = targets[state.select].1;
+                    off = 0;
+                },
                 Residual::Exec(f) => {
                     off += 1;
                     f.1(owner, &mut state, &mut |eff, owner, state| {
@@ -1326,7 +1491,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     // generic.
                                     let types = vec![LType::Unknown; next_stack];
                                     let ctx = Context::new(types);
-                                    let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(0), ctx.clone())) {
+                                    let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                                    let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                                         *block
                                     } else {
                                         debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, ctx);
@@ -1507,28 +1673,97 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn set_current(&mut self, clos: Tc<LClosure<'src, 'intern>>) {
         self.clos = clos;
     }
-}
 
-#[cfg(feature="generator")]
-fn main() {
-    let mut vm = Specializer { code, blocks: vec![], versions: HashMap::new() };
+    pub fn dump(&self, owner: &TCellOwner<TcOwner>, proto: *const crate::chunk::FunctionBlock<'src, LConstant<'src, 'intern>>, filepath: &str) {
+        use graphviz_rust::*;
+        use graphviz_rust::printer::*;
+        use graphviz_rust::cmd::*;
+        use dot_structures::*;
+        use dot_generator::*;
 
-    let dyn_types = vec![LType::Unknown, LType::Unknown, LType::Unknown];
-    let dyn_block = vm.block(0, dyn_types);
-    println!("{:?}", vm.blocks[dyn_block]);
+        let Some(versions) = self.versions.get(&proto) else { return; };
+        let mut reverse_versions = HashMap::new();
+        for (k, v) in versions.iter() {
+            reverse_versions.insert(v.0, k);
+        }
 
-    let res = vm.run(dyn_block, vec![RValue::Int(0), RValue::Int(1), RValue::Int(2)]);
-    dbg!(res);
-    let res = vm.run(dyn_block, vec![RValue::Int(0), RValue::Str("1".into()), RValue::Str("2".into())]);
-    dbg!(res);
-    let res = vm.run(dyn_block, vec![RValue::Str("0".into()), RValue::Int(1), RValue::Int(2)]);
-    dbg!(res);
+        let g = graph!(strict di id!("t"); subgraph!("s",
+            self.blocks.iter().enumerate().flat_map(|(id, residuals)| {
+                let block_id = id;
+                let mut instructions = Vec::new();
+                let mut edges = vec![];
 
-    println!("{:?} blocks:{} instructions:{}", &vm.blocks,
-        vm.blocks.len(),
-        vm.blocks.iter().fold(0, |i, b| i + b.len()));
+                fn safe_str(s: impl Into<String>) -> String {
+                    let s = s.into().replace("<", "\\<");
+                    let s = s.replace(">", "\\>");
+                    s
+                }
 
-    let mut versions = vm.versions.iter().collect::<Vec<_>>();
-    versions.sort_by_key(|(subpc, ty)| subpc.0.0);
-    println!("versions {:?}", versions);
+                for (off, res) in residuals.iter().enumerate() {
+                    let inst_label = match res {
+                        Residual::Guard { idx, expected } => format!("guard({}, {})", idx, expected),
+                        Residual::Exec(ResidualExec(name, _)) => format!("exec({})", name),
+                        Residual::Jump(target) => format!("jump({})", target.0),
+                        Residual::Call(target, b, c) => format!("call({}, {}, {})", target.0, b, c),
+                        Residual::HashGuard { tab, href, expected } => format!("hguard({}, {:?}, {})", tab, href, expected),
+                        Residual::Thunk(_) => format!("thunk"),
+                        Residual::Select(targets) => format!("select"),
+
+                        _ => "".to_string(),
+                    };
+                    instructions.push(inst_label);
+                    match res {
+                        Residual::Jump(target) => {
+                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0))));
+                        }
+                        Residual::Call(target, _, _) => {
+                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "call"))));
+                        }
+                        Residual::Guard { .. } | Residual::HashGuard { .. } => {
+                            if let Some(Residual::Jump(target)) = residuals.get(off + 2) {
+                                edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "pass"))));
+                            }
+                            if let Some(Residual::Jump(target)) = residuals.get(off + 1) {
+                                edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "fail"))));
+                            }
+                        },
+                        Residual::Select(targets) => {
+                            for (name, target) in targets {
+                                edges.push(Stmt::Edge(
+                                    edge!(node_id!(block_id) => node_id!(target.0); attr!("label", name))));
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+                info!("graphviz edges: {:?}", edges);
+
+                let context_str = if let Some((subpc, ctx)) = reverse_versions.get(&block_id) {
+                    format!("PC: {:?}\\n{} |", subpc, ctx)
+                } else {
+                    "".to_string()
+                };
+                let context_str = context_str.replace("{", "(");
+                let context_str = context_str.replace("}", ")");
+
+                //let label = safe_str(format!("\"{} | {{ {} {} }}\"", block_id, context_str, instructions));
+                let label = safe_str(format!("\"{} | {{ {} {} }}\"", block_id, context_str, instructions.drain(..).intersperse("| ".to_string()).collect::<String>()));
+
+                let mut stmts = vec![Stmt::Node(node!(block_id;
+                    attr!("id", block_id),
+                    attr!("shape", "record"),
+                    attr!("label", label)
+                ))];
+                stmts.extend(edges);
+                stmts
+            }).collect::<Vec<_>>()
+          )
+        );
+
+        let graph_out = exec(g, &mut PrinterContext::default(), vec![
+            CommandArg::Format(Format::Pdf),
+            CommandArg::Output(filepath.to_string()),
+        ]).unwrap();
+        info!("graphviz output: {}", graph_out);
+    }
 }

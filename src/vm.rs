@@ -607,6 +607,20 @@ pub enum LType {
     Table,
 }
 
+impl std::fmt::Display for LType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LType::Unknown => write!(f, "?"),
+            LType::Nil => write!(f, "nil"),
+            LType::Bool => write!(f, "bool"),
+            LType::Number => write!(f, "number"),
+            LType::String => write!(f, "string"),
+            LType::Closure => write!(f, "func"),
+            LType::Table => write!(f, "table"),
+        }
+    }
+}
+
 impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn compare(&self, opcode: Opcode, right: Self) -> Result<bool, String> {
         // TODO: metamethods
@@ -731,6 +745,31 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
+    pub fn as_string_nolock(&self) -> Option<Rc<Vec<u8>>> {
+        // TODO: metamethods?
+        match self {
+            LValue::OwnedString(s) => Some(s.clone()),
+            LValue::InternedString(s) => Some(Rc::new(s.into_ref().0.to_vec())),
+            LValue::Number(f) => {
+                let mut s = Vec::new();
+                write!(s, "{}", f.0);
+                Some(Rc::new(s))
+            },
+            LValue::Table(tc) => {
+                let mut s = Vec::new();
+                write!(s, "{:?}", tc);
+                Some(Rc::new(s))
+            },
+            LValue::Nil => None,
+            LValue::LClosure(l) => {
+                let mut s = Vec::new();
+                write!(s, "function({:p})", Rc::as_ptr(&l.0));
+                Some(Rc::new(s))
+            },
+            x => unimplemented!("{:?}", x),
+        }
+    }
+
     pub fn gettable(&self, owner: &mut TCellOwner<TcOwner>, index: Cow<'_, LValue<'src, 'intern>>) -> LValue<'src, 'intern> {
         let val_b = match self {
             LValue::Table(tab) => {
@@ -773,7 +812,6 @@ pub struct LClosure<'src, 'intern> {
     pub prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
     pub upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
-    pub versions: HashMap<(SubPc, Context), BlockId>,
 }
 
 impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
@@ -798,7 +836,6 @@ impl<'src, 'intern> LClosure<'src, 'intern> {
         Self {
             prototype,
             upvalues: vec![].into(),
-            versions: Default::default(),
         }
     }
 }
@@ -850,6 +887,7 @@ pub struct RunState<'src, 'intern> {
     pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
     pub callstack: FVec<CallstackEntry<'src, 'intern>>,
     pub counters: PerfCounters,
+    pub select: usize,
 
     pub hash_witnesses: FVec<Option<HashWitness>>,
 }
@@ -999,6 +1037,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 callstack,
                 counters: Default::default(),
                 hash_witnesses: vec![],
+                select: 0,
             }
         };
         // we need to track where to return to, along with the base pointer and where to put return
@@ -1334,7 +1373,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];
                             let ctx = Context::new(types);
-                            let block = if let Some(block) = lclos.ro(owner).versions.get(&(SubPc::new(0), ctx.clone())) {
+                            let versions = spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                            let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                                 *block
                             } else {
                                 spec.set_current(lclos.clone());
@@ -1448,6 +1488,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         #[cfg(feature = "counters")] {
             println!("counters after run {:?}", state.counters);
         }
+
+        for proto in unsafe { &(*self.top_level).prototypes.items } {
+            let outfile = format!("func_{}.pdf", proto.line_defined);
+            spec.dump(owner, proto, outfile.as_str());
+        }
+
         Ok(r_vals)
     }
+
 }
