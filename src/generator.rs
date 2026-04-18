@@ -20,6 +20,7 @@ use crate::chunk::Instruction;
 
 use log::debug;
 use log::info;
+use log::warn;
 
 fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
     match val {
@@ -55,6 +56,7 @@ pub enum CallTarget {
 #[derive(Clone, Debug)]
 pub enum YieldOp {
     Typeof(usize), // Resumed with the type of STACK[idx]
+    TypeofRk(usize), // Resumed with the type of STACK[idx] or CONSTANT[idx]
     Guard(usize, LType), // Resumed with either Matched or Failed if STACK[idx] is the expected
                          // type
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
@@ -251,19 +253,32 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = ResumeArg::Failed;
             arg = yield YieldOp::TryHashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
-                if let ResumeArg::Type(new_val_type) = yield YieldOp::Typeof(c) {
-                    if new_val_type != htype {
-                        panic!();
+                arg = yield YieldOp::TypeofRk(c);
+                let mut matches = false;
+                if let ResumeArg::Type(t) = arg {
+                    if t == htype {
+                        // The value we're setting is statically known to be the same type as our
+                        // hashkey, and so everything is fine
+                        matches = true;
                     }
                 }
+
                 arg = yield YieldOp::Exec(ResidualExec("settable_href", Rc::new(move |owner, state, cb| {
                     let witness = &state.hash_witnesses[hb.0];
                     debug!("settable_href with {:?} {:?}", &witness, htype);
                     let tab = &state.vals[state.base + a];
                     let LValue::Table(tab) = tab else { unreachable!() };
+                    let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                        Ok(c) => c.into(),
+                        Err(lv) => lv.clone(),
+                    };
                     let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
-                    *val1 = state.vals[state.base + c].clone();
+                    assert!(typeof_(val1) == htype);
+                    *val1 = kc;
                 })));
+                if !matches {
+                    arg = yield YieldOp::Dirty(a);
+                }
             } else {
                 arg = yield YieldOp::Exec(ResidualExec("settable_hash", Rc::new(move |owner, state, cb| {
                     let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
@@ -1120,7 +1135,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         loop {
             let mut state = Pin::new(&mut coro).resume(arg);
             'machine: loop { match state {
-                CoroutineState::Yielded(YieldOp::Typeof(idx)) => {
+                op @ CoroutineState::Yielded(YieldOp::Typeof(idx) | YieldOp::TypeofRk(idx)) => {
+                    if let CoroutineState::Yielded(YieldOp::TypeofRk(key)) = op {
+                        let proto = self.clos.ro(owner).prototype;
+                        if (key & 0x100)!=0 {
+                            let k_const = key & (0xff);
+                            let k_val = unsafe { &(&(*proto).constants.items)[k_const as usize] };
+                            let ty = match unsafe { &(&(*proto).constants.items)[k_const as usize] } {
+                                crate::chunk::Constant::Nil => LType::Nil,
+                                crate::chunk::Constant::Bool(_) => LType::Bool,
+                                crate::chunk::Constant::Number(_) => LType::Number,
+                                crate::chunk::Constant::String(_) => LType::String,
+                            };
+                            arg = ResumeArg::Type(ty);
+                            break 'machine;
+                        }
+                    }
+
                     let ctype = &ctx.types[idx];
                     // Erase any hkeys and say its just a table
                     let ltype = match ctype {
@@ -1170,12 +1201,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         fail_ctx.types[idx] = CType::Type(LType::Table);
                                         let fail_coro = coro.clone();
                                         let failed_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+                                            warn!("forcing failed thunk for dirty hashkey");
+                                            warn!("state: {:?}", state);
                                             // The table doesn't have this key, which means we should actually just bailout
                                             if let Some(exists) = vm.find(owner, pc.next_false(), &fail_ctx) {
                                                 vm.blocks[block_id.0][thunk_pc] = Residual::Jump(exists);
                                             } else {
                                                 let fail_block = vm.new_block();
-                                                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), fail_ctx.clone(), fail_coro.clone(), ResumeArg::Failed, block_id) {
+                                                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), fail_ctx.clone(), fail_coro.clone(), ResumeArg::Failed, fail_block) {
                                                     vm.compile(owner, succ_next, succ_ty, fail_block);
                                                 }
                                                 vm.blocks[block_id.0][thunk_pc] = Residual::Jump(fail_block);
