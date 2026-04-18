@@ -69,6 +69,7 @@ pub enum YieldOp {
 
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
     TryHashKey(usize, usize), // Looks up but does not allocate an HREF..
+    Dirty(usize), // Dirty all cached HREFs for STACK[idx] because there was an untracked set
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -276,7 +277,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
                     t.rw(owner).hash.insert(kb, kc);
                 })));
-                arg = yield YieldOp::SetTypes(vec![(a, LType::Table)]);
+                arg = yield YieldOp::Dirty(a);
             }
         }
         arg
@@ -1165,6 +1166,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         let thunk_hkey = cached_hkey.clone();
                                         let mut fail_ctx = ctx.clone();
                                         // Unspecialize the table shape
+                                        // TODO: this should do the same migration as SetTypes
                                         fail_ctx.types[idx] = CType::Type(LType::Table);
                                         let fail_coro = coro.clone();
                                         let failed_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
@@ -1227,11 +1229,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
                         // Try to find an orphaned HashKey slot to re-use
                         let href;
-                        if let Some((i, _)) = ctx.hkeys.iter().enumerate().find(|(i, hk)| hk.known_type == LType::Unknown) {
-                            href = HashRef(i)
+                        if let Some((i, hkey)) = ctx.hkeys.iter_mut().enumerate().find(|(i, hk)| hk.known_type == LType::Unknown) {
+                            href = HashRef(i);
+                            *hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown, dirty: false };
                         } else {
                             href = HashRef(ctx.hkeys.len());
-                            let hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown, dirty: true };
+                            let hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown, dirty: false };
                             ctx.hkeys.push(hkey.clone());
                         }
                         let thunk_coro = coro.clone();
@@ -1305,6 +1308,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id.0].push(Residual::Exec(func));
                     // In a real VM, transition to the next PC generator here.
+                },
+                CoroutineState::Yielded(YieldOp::Dirty(idx)) => {
+                    for mut key in &mut ctx.hkeys {
+                        if key.idx == idx {
+                            key.dirty = true;
+                        }
+                    }
+                    if let CType::Shape(shape) = &mut ctx.types[idx] {
+                        for href in shape {
+                            ctx.hkeys[href.0].dirty = true;
+                        }
+                    }
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {
                     self.blocks[block_id.0].push(Residual::Select(targets));
@@ -1736,7 +1751,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         _ => {}
                     }
                 }
-                info!("graphviz edges: {:?}", edges);
+                debug!("graphviz edges: {:?}", edges);
 
                 let context_str = if let Some((subpc, ctx)) = reverse_versions.get(&block_id) {
                     format!("PC: {:?}\\n{} |", subpc, ctx)
@@ -1764,6 +1779,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             CommandArg::Format(Format::Pdf),
             CommandArg::Output(filepath.to_string()),
         ]).unwrap();
-        info!("graphviz output: {}", graph_out);
+        debug!("graphviz output: {}", graph_out);
     }
 }
