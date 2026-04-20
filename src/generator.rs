@@ -71,6 +71,7 @@ pub enum YieldOp {
 
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
     TryHashKey(usize, usize), // Looks up but does not allocate an HREF..
+    UpdateHashRef(HashRef, LType), // Update the type of HREF to a new type
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -252,13 +253,16 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::TryHashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 arg = yield YieldOp::TypeofRk(c);
-                let mut matches = false;
+                let mut mismatched_type = None;
                 if let ResumeArg::Type(t) = arg {
-                    if t == htype {
+                    if t != htype {
+                        mismatched_type = Some(t);
+                    } else {
                         // The value we're setting is statically known to be the same type as our
                         // hashkey, and so everything is fine
-                        matches = true;
                     }
+                } else {
+                    mismatched_type = Some(LType::Unknown);
                 }
 
                 arg = yield YieldOp::Exec(ResidualExec("settable_href", Rc::new(move |owner, state, cb| {
@@ -274,10 +278,15 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     debug!("settable_href {:?} {}", &val1, htype);
                     assert!(typeof_(val1) == htype);
                     *val1 = kc;
-                    if !matches {
+                    if mismatched_type.is_some() {
                         tab.rw(owner).epoch += 1;
                     }
                 })));
+                if let Some(new_type) = mismatched_type {
+                    // We statically know we will increment the epoch, so update the hashkey's
+                    // known type.
+                    arg = yield YieldOp::UpdateHashRef(hb, new_type);
+                }
             } else {
                 arg = yield YieldOp::Exec(ResidualExec("settable_hash", Rc::new(move |owner, state, cb| {
                     let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
@@ -1211,6 +1220,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         CType::Shape(_) => LType::Table,
                     };
                     arg = ResumeArg::Type(ltype);
+                },
+                CoroutineState::Yielded(YieldOp::UpdateHashRef(href, ty)) => {
+                    // We can't set a HashKey's type to Unknown, because then we'd think
+                    // the slot is free to be reused (and it doesn't really make sense).
+                    // Instead, we ignore the update and keep using the old type: there's
+                    // a chance the unknown static type is in fact still our old type and
+                    // we just didn't know, and if there is a runtime mistmatch we will hit
+                    // a type guard anyway.
+                    if ty != LType::Unknown {
+                        ctx.hkeys[href.0].known_type = ty;
+                        arg = ResumeArg::HashRef(href, ty);
+                    }
                 },
                 op @ CoroutineState::Yielded(YieldOp::HashKey(idx, key) | YieldOp::TryHashKey(idx, key)) => {
                     let proto = self.clos.ro(owner).prototype;
