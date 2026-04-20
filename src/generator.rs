@@ -71,7 +71,6 @@ pub enum YieldOp {
 
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
     TryHashKey(usize, usize), // Looks up but does not allocate an HREF..
-    Dirty(usize), // Dirty all cached HREFs for STACK[idx] because there was an untracked set
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -79,7 +78,6 @@ pub struct HashKey<'src, 'intern> {
     pub idx: usize,
     pub key: LConstant<'src, 'intern>,
     pub known_type: LType,
-    pub dirty: bool,
 }
 
 impl<'src, 'intern> std::fmt::Display for HashKey<'src, 'intern> {
@@ -273,12 +271,13 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Err(lv) => lv.clone(),
                     };
                     let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
+                    debug!("settable_href {:?} {}", &val1, htype);
                     assert!(typeof_(val1) == htype);
                     *val1 = kc;
+                    if !matches {
+                        tab.rw(owner).epoch += 1;
+                    }
                 })));
-                if !matches {
-                    arg = yield YieldOp::Dirty(a);
-                }
             } else {
                 arg = yield YieldOp::Exec(ResidualExec("settable_hash", Rc::new(move |owner, state, cb| {
                     let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
@@ -290,9 +289,14 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Err(lv) => lv.clone(),
                     };
                     let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
-                    t.rw(owner).hash.insert(kb, kc);
+                    let kc_type = typeof_(&kc);
+                    if let Some(existing) = t.rw(owner).hash.insert(kb, kc.clone()) {
+                        info!("settable_hash with existing key {:?} {:?}", &existing, kc);
+                        if typeof_(&existing) != kc_type {
+                            t.rw(owner).epoch += 1;
+                        }
+                    }
                 })));
-                arg = yield YieldOp::Dirty(a);
             }
         }
         arg
@@ -436,7 +440,12 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         }
 
         // --- Generic/Trap Fallback ---
-        panic!("Type mismatch trap");
+        //panic!("Type mismatch trap");
+        arg = yield YieldOp::Typeof(lhs);
+        arg = yield YieldOp::Exec(ResidualExec("numeric_fail", Rc::new(move |owner, state, cb| {
+            panic!("numeric runtime type mismatch {:?} {:?}", arg, state.vals)
+        })));
+        arg
     }
 }
 
@@ -792,6 +801,7 @@ pub enum Residual {
     Thunk(ThunkRef),
     Ret(Pc, u8, u16),
     HashGuard { tab: usize, href: HashRef, expected: LType },
+    EpochCheck { tab: usize, href: HashRef },
 }
 
 fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>) -> Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>
@@ -880,6 +890,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.compile(owner, entry, ctx, block_id);
         return block_id;
     }
+
+    pub fn subblock(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: Context, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
+        if let Some(exists) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(pc, ctx.clone())) {
+            return exists.clone();
+        }
+        let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((epc, ty), block)| *epc == pc).collect();
+        if count.len() >= 5 {
+            panic!("too many versions: {:?}", count);
+        }
+        // Finish the remainder of the coroutine
+        let new_block = self.new_block();
+        self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().insert((pc, ctx.clone()), new_block);
+        if let Some((succ_next, succ_ty, succ_ret)) = self.compile_one(owner, pc, ctx, coro, arg, new_block) {
+            // And continue compiling the block
+            self.compile(owner, succ_next, succ_ty, new_block);
+        }
+
+        return new_block;
+    }
+
 
     /// Return a specialized block for a given PC and context, compiling a new one if necessary
     pub fn find(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: &Context) -> Option<BlockId>
@@ -1050,19 +1080,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // Push the same thunk down for the next value that fails the guard
             let fail_thunk = vm.make_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_ctx.clone(), false);
             vm.blocks[block_id.0].push(Residual::Thunk(fail_thunk));
-            // Finish the remainder of the coroutine
-            let guard_block = vm.new_block();
-            if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg, guard_block) {
-                // And continue compiling the block
-                vm.compile(owner, succ_next, succ_ty, guard_block);
-            }
+            let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
             vm.blocks[block_id.0].push(Residual::Jump(guard_block));
 
             debug!("after compiling thunk, blocks look like {:?}", vm.blocks);
         })))
     }
 
-    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Context, appends: bool) -> ThunkRef {
+    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Context, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
             let thunk_coro = thunk_coro.clone();
             let hkey = &mut thunk_ctx.hkeys[href.0];
@@ -1087,46 +1112,73 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // array.
 
             // Now transition into the populated hkey
-            let init_key = hkey.key.clone();
-            vm.blocks[block_id.0][thunk_pc] =
-                Residual::Exec(ResidualExec("href_init", Rc::new(move |owner, state, cb| {
-                    if state.hash_witnesses.len() <= href.0 {
-                        state.hash_witnesses.resize_with(href.0 as usize + 1, || None);
-                    }
-                    debug!("populating hashkey witness {}", href.0);
-                    let witness = &mut state.hash_witnesses[href.0];
-                    *witness = Some(HashWitness {
-                        href,
-                        key: init_key.clone(),
-                        epoch: 0,
-                        index,
-                    });
-                })));
-            vm.blocks[block_id.0].push(Residual::HashGuard { tab: idx, href, expected: discovered_type });
-            vm.blocks[block_id.0].push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
-                panic!("failed href guard")
-            })))));
-
-            let guard_block = vm.new_block();
             if let CType::Shape(existing) = &mut thunk_ctx.types[idx] {
                 existing.push(href)
             } else {
                 thunk_ctx.types[idx] = CType::Shape(vec![href]);
             }
-            if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro, ResumeArg::HashRef(href, discovered_type), guard_block) {
-                // And continue compiling the block
-                vm.compile(owner, succ_next, succ_ty, guard_block);
+            let init_key = hkey.key.clone();
+            let href_init = Residual::Exec(ResidualExec("href_init", Rc::new(move |owner, state, cb| {
+                if state.hash_witnesses.len() <= href.0 {
+                    state.hash_witnesses.resize_with(href.0 as usize + 1, || None);
+                }
+                debug!("populating hashkey witness {}", href.0);
+                let witness = &mut state.hash_witnesses[href.0];
+                let LValue::Table(tab) = &state.vals[state.base + idx] else { unreachable!() };
+                *witness = Some(HashWitness {
+                    href,
+                    key: init_key.clone(),
+                    epoch: tab.ro(owner).epoch,
+                    index,
+                });
+            })));
+            if(!appends) {
+                let old_block = block_id;
+                block_id = vm.new_block();
+                vm.blocks[old_block.0][thunk_pc] = Residual::Jump(block_id);
+                vm.blocks[block_id.0].push(href_init);
+            } else {
+                vm.blocks[block_id.0][thunk_pc] = href_init;
             }
+
+            let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, discovered_type));
+            vm.make_epoch_check(owner, block_id, thunk_coro, idx, href, pc, thunk_ctx.clone(), guard_block);
             vm.blocks[block_id.0].push(Residual::Jump(guard_block));
         })))
     }
 
-    fn make_href_check_thunk(&mut self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Context, appends: bool) -> ThunkRef {
-        let fail = self.new_block();
-        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
-            panic!();
-            let fail_block = vm.new_block();
-        })))
+    fn make_epoch_check(&mut self, owner: &mut TCellOwner<TcOwner>, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Context, success_block: BlockId) {
+        // In order to assert that an href is still valid, we need to check that the witnessed
+        // epoch is still the same: if so, all of its keys still have the same type as the
+        // cached hashkey, and no additional hashkeys were inserted (which may otherwise cause
+        // keys to shadow metatable keys, or resize the hashtable and invalidate pointers).
+        // The epoch check block is behind a thunk, because since we dynamically track table
+        // epoches in our witness table they only ever would fail if a table transitions its type
+        // inside a block, which is unlikely to happen very often.
+        let thunk_coro = thunk_coro.clone();
+        self.blocks[block_id.0].push(Residual::EpochCheck { tab, href });
+        // Build the thunk for if we fail the epoch check
+        let fail_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+            debug!("hit epoch fail thunk");
+            // The epoch is different, but the actual key type might still be the same.
+            // Do another check for the key type, where if it still holds we can update the
+            // witness epoch and jump back to the success block.
+            let check_block = vm.new_block();
+            vm.blocks[block_id.0][thunk_pc] = Residual::Jump(check_block);
+            let expected = thunk_ctx.hkeys[href.0].known_type;
+            vm.blocks[check_block.0].push(Residual::HashGuard { tab, href: href.clone(), expected });
+            let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
+            vm.blocks[check_block.0].push(Residual::Thunk(update_href_thunk));
+            vm.blocks[check_block.0].push(Residual::Exec(ResidualExec("epoch_repair", Rc::new(move |owner, state, cb| {
+                // Re-init the witness and jump back to success block
+                let Some(witness) = &mut state.hash_witnesses[href.0] else { unreachable!() };
+                let LValue::Table(tab) = &state.vals[state.base + tab] else { unreachable!() };
+                debug!("repairing {:?} epoch", href);
+                witness.epoch = tab.ro(owner).epoch;
+            }))));
+            vm.blocks[check_block.0].push(Residual::Jump(success_block));
+        })));
+        self.blocks[block_id.0].push(Residual::Thunk(fail_thunk));
     }
 
     pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut ctx: Context, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Context, ResumeArg)>
@@ -1185,60 +1237,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 for cached in existing {
                                     let cached_hkey = &ctx.hkeys[cached.0];
                                     if &cached_hkey.key == k_val {
-                                        if !cached_hkey.dirty {
-                                            // We don't need to check the guard again
-                                            pc = pc.next_true();
-                                            arg = ResumeArg::HashRef(*cached, cached_hkey.known_type.clone());
-                                            break 'machine;
-                                        }
+                                        debug!("using cached href {:?}", cached);
                                         // We have a cached href, but still need to make sure that
                                         // it holds.
-                                        let thunk_cached = cached.clone();
-                                        let thunk_hkey = cached_hkey.clone();
-                                        let mut fail_ctx = ctx.clone();
-                                        // Unspecialize the table shape
-                                        // TODO: this should do the same migration as SetTypes
-                                        fail_ctx.types[idx] = CType::Type(LType::Table);
-                                        let fail_coro = coro.clone();
-                                        let failed_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
-                                            warn!("forcing failed thunk for dirty hashkey");
-                                            warn!("state: {:?}", state);
-                                            // The table doesn't have this key, which means we should actually just bailout
-                                            if let Some(exists) = vm.find(owner, pc.next_false(), &fail_ctx) {
-                                                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(exists);
-                                            } else {
-                                                let fail_block = vm.new_block();
-                                                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), fail_ctx.clone(), fail_coro.clone(), ResumeArg::Failed, fail_block) {
-                                                    vm.compile(owner, succ_next, succ_ty, fail_block);
-                                                }
-                                                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(fail_block);
-                                            }
-                                        })));
-                                        self.blocks[block_id.0].push(Residual::HashGuard {
-                                            tab: idx,
-                                            href: *cached,
-                                            expected: cached_hkey.known_type.clone(),
-                                        });
-                                        self.blocks[block_id.0].push(Residual::Thunk(failed_thunk));
-                                        let taken_coro = coro.clone();
-                                        let mut taken_ctx = ctx.clone();
-                                        // Reset the dirty flag after we check its type again
-                                        taken_ctx.hkeys[cached.0].dirty = false;
-                                        let taken_type = cached_hkey.known_type.clone();
-                                        let taken_href = *cached;
-                                        let taken_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
-                                            if let Some(exists) = vm.find(owner, pc.next_true(), &taken_ctx) {
-                                                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(exists);
-                                            } else {
-                                                let guard_block = vm.new_block();
-                                                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_true(), taken_ctx.clone(), taken_coro.clone(), ResumeArg::HashRef(taken_href, taken_type.clone()), guard_block) {
-                                                    // And continue compiling the block
-                                                    vm.compile(owner, succ_next, succ_ty, guard_block);
-                                                }
-                                                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(guard_block);
-                                            }
-                                        })));
-                                        self.blocks[block_id.0].push(Residual::Thunk(taken_thunk));
+                                        // Compile a new block assuming the type holds, so that the
+                                        // check can jump to it for spurious epoch increments (or
+                                        // for blocks specialized for a different type that
+                                        // transition back to our type).
+                                        // TODO: This probably creates too many blocks, tbh. Do we
+                                        // want to just always have failed epoch checks fallback to
+                                        // generic code instead?
+                                        arg = ResumeArg::HashRef(cached.clone(), cached_hkey.known_type.clone());
+                                        let holds_block = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), arg);
+                                        self.make_epoch_check(owner, block_id, coro.clone(), idx, cached.clone(), pc, ctx.clone(), holds_block);
+
+                                        self.blocks[block_id.0].push(Residual::Jump(holds_block));
                                         return None;
                                     }
                                 }
@@ -1264,10 +1277,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let href;
                         if let Some((i, hkey)) = ctx.hkeys.iter_mut().enumerate().find(|(i, hk)| hk.known_type == LType::Unknown) {
                             href = HashRef(i);
-                            *hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown, dirty: false };
+                            *hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown };
                         } else {
+                            warn!("allocating new hkey for {} {:?}", idx, &k_val);
                             href = HashRef(ctx.hkeys.len());
-                            let hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown, dirty: false };
+                            let hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown };
                             ctx.hkeys.push(hkey.clone());
                         }
                         let thunk_coro = coro.clone();
@@ -1341,18 +1355,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id.0].push(Residual::Exec(func));
                     // In a real VM, transition to the next PC generator here.
-                },
-                CoroutineState::Yielded(YieldOp::Dirty(idx)) => {
-                    for mut key in &mut ctx.hkeys {
-                        if key.idx == idx {
-                            key.dirty = true;
-                        }
-                    }
-                    if let CType::Shape(shape) = &mut ctx.types[idx] {
-                        for href in shape {
-                            ctx.hkeys[href.0].dirty = true;
-                        }
-                    }
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {
                     self.blocks[block_id.0].push(Residual::Select(targets));
@@ -1431,6 +1433,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     if new_idx == idx { continue; }
                                     let CType::Shape(other_shape) = other_type else { continue };
                                     if other_shape.contains(&HashRef(kidx)) {
+                                        warn!("migrating {} to stack slot {}", kidx, new_idx);
                                         key.idx = new_idx;
                                         migrated = true;
                                         break;
@@ -1448,7 +1451,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             while let Some(_) = ctx.hkeys.pop_if(|hkey| hkey.idx == idx) { }
                         }
                         ctx.types[idx] = CType::Type(ty);
-                        debug!("set types to {:?}", &ctx.types);
+                        warn!("set types to {:?}", &ctx.types);
                     }
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
@@ -1486,7 +1489,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let block = &self.blocks[id.0];
             let res = block[off].clone();
             state.counters.versioned_count.increment();
-            debug!("{:?}", &res);
+            debug!("RUN {:?}", &res);
             match res {
                 Residual::Guard { idx, expected } => {
                     if typeof_(&state.vals[state.base + idx]) == expected {
@@ -1496,11 +1499,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
-                Residual::HashGuard { tab, href, expected } => {
-                    let hkey = &state.hash_witnesses[href.0].as_ref().unwrap();
+                Residual::EpochCheck { tab, href } => {
+                    let hwit = &state.hash_witnesses[href.0].as_ref().unwrap();
                     let tab = &state.vals[state.base + tab];
                     let LValue::Table(tab) = tab else { unreachable!() };
-                    let Some((key, val)) = tab.ro(owner).hash.get_index(hkey.index) else { unreachable!() };
+                    warn!("epochcheck sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
+                    if hwit.epoch == tab.ro(owner).epoch {
+                        // Fallthrough
+                        off += 2;
+                    } else {
+                        off += 1;
+                    }
+                },
+                Residual::HashGuard { tab, href, expected } => {
+                    let hwit = &state.hash_witnesses[href.0].as_ref().unwrap();
+                    let tab = &state.vals[state.base + tab];
+                    let LValue::Table(tab) = tab else { unreachable!() };
+                    let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
+                    let cached_key_val: LValue = (&hwit.key).into();
+                    assert!(key == &cached_key_val);
                     if typeof_(val) == expected {
                         // Fallthrough
                         off += 2;
@@ -1532,6 +1549,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         vec![LValue::Nil; next_stack].as_slice());
                                     state.callstack.push(CallstackEntry(self.clos.clone(), ReturnLocation::Generator(id, off), state.base, state.vals.len(), state.base + a, c));
                                     state.base = state.base + a as usize + 1;
+                                    panic!("increment state.witness_base");
                                     state.vals.truncate(state.base +  next_stack);
                                     state.clos = lclos.clone();
 
@@ -1754,6 +1772,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call(target, b, c) => format!("call({}, {}, {})", target.0, b, c),
                         Residual::HashGuard { tab, href, expected } => format!("hguard({}, {:?}, {})", tab, href, expected),
+                        Residual::EpochCheck { tab, href } => format!("epoch({}, {:?})", tab, href),
                         Residual::Thunk(_) => format!("thunk"),
                         Residual::Select(targets) => format!("select"),
                         Residual::Ret(_, _, _) => format!("ret"),

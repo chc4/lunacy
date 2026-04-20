@@ -455,13 +455,15 @@ impl std::hash::BuildHasher for InternedHasher {
 pub struct Table<'src, 'intern> {
     pub array: FVec<LValue<'src, 'intern>>,
     pub hash: IndexMap<LValue<'src, 'intern>, LValue<'src, 'intern>, InternedHasher>,
+    pub epoch: usize,
 }
 
 impl<'src, 'intern> Table<'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
             array: vec![LValue::Nil; array].into(),
-            hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default())
+            hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
+            epoch: 0,
         }
     }
 }
@@ -491,9 +493,11 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
             },
             LValue::InternedString(ref s) => {
                 self.rw(owner).hash.insert(key, value);
+                self.rw(owner).epoch += 1;
             },
             LValue::OwnedString(ref s) => {
                 self.rw(owner).hash.insert(key, value);
+                self.rw(owner).epoch += 1;
             },
             _ => unimplemented!()
         }
@@ -990,7 +994,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 math,
                 os,
                 ].drain(..)
-            )
+            ),
+            epoch: 0,
         })
     }
 
