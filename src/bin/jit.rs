@@ -123,6 +123,12 @@ impl Jit {
 
         (buf, entrypoint)
     }
+
+    fn interpreter<'a, 'intern, 'src>(&self, owner: &mut TCellOwner<TcOwner>, state: &'a mut RunState<'src, 'intern>, cb: ExecCallback<'a, 'src, 'intern>) {
+        for op in &self.program {
+            (op.1)(owner, state, cb);
+        }
+    }
 }
 
 fn main() {
@@ -174,9 +180,18 @@ fn main() {
         thing: TCell::new(0),
         _phantom: PhantomData
     };
+    let jit_start = std::time::Instant::now();
     for i in 0..10000 {
         entry(&mut owner, &mut state, &mut |()| { println!("yippee {i}"); });
     }
-    println!("final: {:x?}", state.acc);
+    let jit_finish = state.acc;
+    let jit_elapsed = jit_start.elapsed();
+    let start = std::time::Instant::now();
+    for i in 0..10000 {
+        program.interpreter(&mut owner, &mut state, &mut |()| { println!("yippee {i}"); });
+    }
+    let elapsed = start.elapsed();
+    println!("interpreter {:x?} took {:?}", state.acc, elapsed);
+    println!("jit {:x?} took {:?}", jit_finish, jit_elapsed);
 
 }
