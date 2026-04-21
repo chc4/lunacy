@@ -1,5 +1,5 @@
 #![allow(unused)]
-#![feature(trait_alias, ptr_metadata, fn_traits)]
+#![feature(trait_alias, ptr_metadata, fn_traits, rust_preserve_none_cc)]
 use dynasmrt::ExecutableBuffer;
 use qcell::{TCell, TCellOwner};
 use std::rc::Rc;
@@ -17,7 +17,7 @@ trait ExecFn = for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut 
 #[derive(Clone)]
 pub struct ResidualExec(&'static str, Rc<dyn ExecFn>);
 
-type JitExec = for<'a, 'src, 'intern> extern "Rust" fn(&mut TCellOwner<TcOwner>, &'a mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>);
+type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut TCellOwner<TcOwner>, &'a mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>);
 
 pub struct RunState<'src, 'intern> {
     acc: std::num::Wrapping<usize>,
@@ -79,15 +79,7 @@ impl Jit {
         dynasm!(ops
             ; .arch x64
             ; ->entry:
-            ; push r15
-            ; push r14
-            ; push r12
-            ; push rbx
-            ; push rbp
-            ; mov rbx, rcx
-            ; mov r14, rdx
-            ; mov r15, rsi
-            ; mov r12, rdi
+            ; push rax
         );
 
         for entry in &self.program {
@@ -95,24 +87,19 @@ impl Jit {
             dynasm!(ops
                 ; .arch x64
                 ; mov rsi, r12
-                ; mov rdx, r15
+                ; mov rdx, r13
                 ; mov rcx, r14
-                ; mov rsi, r15
-                ; mov r8, rbx
+                ; mov r8, r15
                 ; mov rax, QWORD (this_vtable as i64)
                 ; mov rdi, QWORD (this_obj as i64)
-                ; mov rbp, QWORD (this_call as i64)
-                ; call rbp
+                ; mov rbx, QWORD (this_call as i64)
+                ; call rbx
             );
         }
 
         dynasm!(ops
             ; .arch x64
-            ; pop rbp
-            ; pop rbx
-            ; pop r12
-            ; pop r14
-            ; pop r15
+            ; pop rax
             ; ret
         );
 
@@ -159,7 +146,7 @@ fn main() {
     // want to use the prologue and epilogue once, with N calls in the middle.
     struct MockOwner;
     static MOCK_RESIDUAL: TCell<MockOwner, &dyn ExecFn> = TCell::new(&|owner, state, cb| { println!("mock"); });
-    extern "Rust" fn safe_call<'a, 'src, 'intern>(owner: &mut TCellOwner<TcOwner>, state: &'a mut RunState<'src, 'intern>, cb: ExecCallback<'a, 'src, 'intern>)
+    extern "rust-preserve-none" fn safe_call<'a, 'src, 'intern>(owner: &mut TCellOwner<TcOwner>, state: &'a mut RunState<'src, 'intern>, cb: ExecCallback<'a, 'src, 'intern>)
     {
         let mowner = TCellOwner::new();
         let binding = &MOCK_RESIDUAL;
@@ -169,7 +156,7 @@ fn main() {
         return (res)(owner, state, cb)
     }
     let mut mowner = TCellOwner::new();
-    *MOCK_RESIDUAL.rw(&mut mowner) = &|owner, state, cb| { panic!() };
+    *MOCK_RESIDUAL.rw(&mut mowner) = &|owner, state, cb| { cb(()) };
     println!("safe_call @ {:x}", safe_call as usize);
     drop(mowner);
 
@@ -180,6 +167,7 @@ fn main() {
         thing: TCell::new(0),
         _phantom: PhantomData
     };
+    safe_call(&mut owner, &mut state, &mut |()| { println!("mock cb"); });
     let jit_start = std::time::Instant::now();
     for i in 0..10000 {
         entry(&mut owner, &mut state, &mut |()| { println!("yippee {i}"); });
