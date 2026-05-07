@@ -18,8 +18,12 @@ test_cases = {
     "local a = {} function a:b() print(1) end a:b()",
     "local a = 1 print(a>0 and 1)",
     "local a = 1 print(a>0 and 1 or 2)",
-    "local function fast() local t = {} t.a = 1 t.b = 2 t.c = t.a + 1 t.b = t.a + t.c print(t.b) end fast()",
+    "local function fast() local t = {} t.a = 1 t.b = 2 print(t.a) for i = 1, 100 do t.c = t.a + t.b t.b = t.a + t.c end print(t.b) end fast()",
     [==[local function fast() local t = {} t.a = "test" print(t.a .. " post") t.a = 1 print(t.a + 1) end fast()]==],
+
+    -- test an hkey wrong type through an aliased table
+    -- emit epoch test on cached hkey, remove the dirty tracking stuff
+    [==[t = {} local function fast() local x = t x.a = "1" local z = x.a .. x.a local y = t y.a = "2" local w = y.a .. y.a x.a = 1 print(y.a) print(y.a + 3) print(x.a + 4) print(z) print(w) end fast()]==],
 }
 
 for i,v in pairs(test_cases) do
