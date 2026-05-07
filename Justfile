@@ -16,9 +16,12 @@ debug: dump
 
 run benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    cargo run --release --bin lunacy -- {{benchmark}}.bin
+    time cargo run --release --bin lunacy -- {{benchmark}}.bin
 
-benchmarks: (run "binarytrees") (run "life") (run "queens")
+baseline benchmark:
+    time lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench
+
+benchmarks: (run "binarytrees") (run "life")
 
 hyperfine benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
@@ -26,5 +29,6 @@ hyperfine benchmark:
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}.md \
         "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench" \
         "./target/release/lunacy {{benchmark}}.bin"
+hyperfines: (hyperfine "binarytrees") (hyperfine "life")
 
 all: test benchmarks (hyperfine "binarytrees")

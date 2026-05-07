@@ -22,6 +22,7 @@ use log::debug;
 use log::info;
 use log::warn;
 use rustc_hash::FxBuildHasher;
+use smallvec::SmallVec;
 
 fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
     match val {
@@ -92,7 +93,7 @@ impl<'src, 'intern> std::fmt::Display for HashKey<'src, 'intern> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HashRef(usize);
+pub struct HashRef(u8);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ResumeArg {
@@ -178,7 +179,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
             arg = yield YieldOp::Exec(ResidualExec("gettable_href", Rc::new(move |owner, state, cb| {
-                let witness = &state.hash_witnesses[state.witness_base + hc.0];
+                let witness = &state.hash_witnesses[state.witness_base + hc.0 as usize];
                 debug!("gettable_href with {:?} {:?}", &witness, htype);
                 let tab = &state.vals[state.base + b];
                 let LValue::Table(tab) = tab else { unreachable!() };
@@ -267,7 +268,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 }
 
                 arg = yield YieldOp::Exec(ResidualExec("settable_href", Rc::new(move |owner, state, cb| {
-                    let witness = &state.hash_witnesses[state.witness_base + hb.0];
+                    let witness = &state.hash_witnesses[state.witness_base + hb.0 as usize];
                     debug!("settable_href with {:?} {:?}", &witness, htype);
                     let tab = &state.vals[state.base + a];
                     let LValue::Table(tab) = tab else { unreachable!() };
@@ -859,9 +860,9 @@ fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Re
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum CType {
+pub enum CType {
     Type(LType),
-    Shape(Vec<HashRef>),
+    Shape(SmallVec<[HashRef; 4]>),
     // TODO: static call targets
 }
 
@@ -876,7 +877,7 @@ impl std::fmt::Display for CType {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Context {
-    pub types: Vec<CType>,
+    pub types: SmallVec<[CType; 8]>,
     pub hkeys: Vec<HashKey<'static, 'static>>,
 }
 
@@ -923,7 +924,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let block_id = self.new_block();
         let subpc: SubPc = SubPc::new(entry);
         let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((pc, ty), block)| pc.0 == entry).collect();
-        if count.len() >= 5 {
+        if count.len() >= 8 {
             panic!("too many versions: {:?}", count);
         }
         self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().insert((subpc, ctx.clone()), block_id);
@@ -936,8 +937,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return exists.clone();
         }
         let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((epc, ty), block)| *epc == pc).collect();
-        if count.len() >= 5 {
-            panic!("too many versions: {:?}", count);
+        if count.len() >= 8 {
+            panic!("too many versions: {:#?}", count);
         }
         // Finish the remainder of the coroutine
         let new_block = self.new_block();
@@ -1134,7 +1135,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Context, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
             let thunk_coro = thunk_coro.clone();
-            let hkey = &mut thunk_ctx.hkeys[href.0];
+            let hkey = &mut thunk_ctx.hkeys[href.0 as usize];
             debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
             let tab = &state.vals[state.base + idx];
             let LValue::Table(tab) = tab else { unreachable!() };
@@ -1159,11 +1160,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let CType::Shape(existing) = &mut thunk_ctx.types[idx] {
                 existing.push(href)
             } else {
-                thunk_ctx.types[idx] = CType::Shape(vec![href]);
+                thunk_ctx.types[idx] = CType::Shape(vec![href].into());
             }
             let init_key = hkey.key.clone();
             let href_init = Residual::Exec(ResidualExec("href_init", Rc::new(move |owner, state, cb| {
-                let hidx = state.witness_base + href.0;
+                let hidx = state.witness_base + href.0 as usize;
                 if state.hash_witnesses.len() <= hidx {
                     state.hash_witnesses.resize_with(hidx + 1, || None);
                 }
@@ -1210,13 +1211,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // witness epoch and jump back to the success block.
             let check_block = vm.new_block();
             vm.blocks[block_id.0][thunk_pc] = Residual::Jump(check_block);
-            let expected = thunk_ctx.hkeys[href.0].known_type;
+            let expected = thunk_ctx.hkeys[href.0 as usize].known_type;
             vm.blocks[check_block.0].push(Residual::HashGuard { tab, href: href.clone(), expected });
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
             vm.blocks[check_block.0].push(Residual::Thunk(update_href_thunk));
             vm.blocks[check_block.0].push(Residual::Exec(ResidualExec("epoch_repair", Rc::new(move |owner, state, cb| {
                 // Re-init the witness and jump back to success block
-                let Some(witness) = &mut state.hash_witnesses[state.witness_base + href.0] else { unreachable!() };
+                let Some(witness) = &mut state.hash_witnesses[state.witness_base + href.0 as usize] else { unreachable!() };
                 let LValue::Table(tab) = &state.vals[state.base + tab] else { unreachable!() };
                 debug!("repairing {:?} epoch", href);
                 witness.epoch = tab.ro(owner).epoch;
@@ -1265,7 +1266,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // we just didn't know, and if there is a runtime mistmatch we will hit
                     // a type guard anyway.
                     if ty != LType::Unknown {
-                        ctx.hkeys[href.0].known_type = ty;
+                        ctx.hkeys[href.0 as usize].known_type = ty;
                         arg = ResumeArg::HashRef(href, ty);
                     }
                 },
@@ -1292,7 +1293,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             CType::Shape(existing) => {
                                 debug!("hashkey on existing shape {existing:?}");
                                 for cached in existing {
-                                    let cached_hkey = &ctx.hkeys[cached.0];
+                                    let cached_hkey = &ctx.hkeys[cached.0 as usize];
                                     if &cached_hkey.key == k_val {
                                         debug!("using cached href {:?}", cached);
                                         // We have a cached href, but still need to make sure that
@@ -1333,12 +1334,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Try to find an orphaned HashKey slot to re-use
                         let href;
                         if let Some((i, hkey)) = ctx.hkeys.iter_mut().enumerate().find(|(i, hk)| hk.known_type == LType::Unknown) {
-                            href = HashRef(i);
+                            href = HashRef(i as u8);
                             *hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown };
                         } else {
                             warn!("allocating new hkey for {} {:?}", idx, &k_val);
-                            href = HashRef(ctx.hkeys.len());
+                            let hr: u8 = ctx.hkeys.len().try_into().expect("too many hrefs");
+                            href = HashRef(hr);
                             let hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown };
+                            assert_eq!(ctx.hkeys.iter().filter(|exist| **exist == hkey).next(), None);
                             ctx.hkeys.push(hkey.clone());
                         }
                         let thunk_coro = coro.clone();
@@ -1489,7 +1492,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 for (new_idx, other_type) in ctx.types.iter().enumerate() {
                                     if new_idx == idx { continue; }
                                     let CType::Shape(other_shape) = other_type else { continue };
-                                    if other_shape.contains(&HashRef(kidx)) {
+                                    let hr: u8 = kidx.try_into().expect("too many hkeys");
+                                    if other_shape.contains(&HashRef(hr)) {
                                         warn!("migrating {} to stack slot {}", kidx, new_idx);
                                         key.idx = new_idx;
                                         migrated = true;
@@ -1557,7 +1561,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::EpochCheck { tab, href } => {
-                    let hwit = &state.hash_witnesses[state.witness_base + href.0].as_ref().unwrap();
+                    let hwit = &state.hash_witnesses[state.witness_base + href.0 as usize].as_ref().unwrap();
                     let tab = &state.vals[state.base + tab];
                     let LValue::Table(tab) = tab else { unreachable!() };
                     warn!("epochcheck sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
@@ -1569,7 +1573,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::HashGuard { tab, href, expected } => {
-                    let hwit = &state.hash_witnesses[state.witness_base + href.0].as_ref().unwrap();
+                    let hwit = &state.hash_witnesses[state.witness_base + href.0 as usize].as_ref().unwrap();
                     let tab = &state.vals[state.base + tab];
                     let LValue::Table(tab) = tab else { unreachable!() };
                     let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
