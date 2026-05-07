@@ -924,7 +924,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let block_id = self.new_block();
         let subpc: SubPc = SubPc::new(entry);
         let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((pc, ty), block)| pc.0 == entry).collect();
-        if count.len() >= 8 {
+        if count.len() >= 5 {
             panic!("too many versions: {:?}", count);
         }
         self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().insert((subpc, ctx.clone()), block_id);
@@ -937,7 +937,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return exists.clone();
         }
         let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((epc, ty), block)| *epc == pc).collect();
-        if count.len() >= 8 {
+        if count.len() >= 5 {
             panic!("too many versions: {:#?}", count);
         }
         // Finish the remainder of the coroutine
@@ -1484,6 +1484,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // that has the issue of runtime hash_witness entries referring to the same
                         // path-dependent index and having to emit shuffles if you take a
                         // de-duplicated branch but with different indexes.
+                        // TODO: This ends up creating duplicate hashkeys! Rethink it.
+                        // nbody should be much faster than lua5.1, but instead is slower because
+                        // we create too many versions. We probably need to 1) remove duplicated
+                        // hashkeys by setting them to LType::Unknown 2) have a better compatible
+                        // block check when looking up if we already have a block, which ignores
+                        // unknown type hashkeys 3) long-term, do the PyLBBV reference thing.
                         if let CType::Shape(shape) = &ctx.types[idx] {
                             for (kidx, key) in ctx.hkeys.iter_mut().enumerate() {
                                 if key.idx != idx { continue; }
@@ -1499,6 +1505,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         migrated = true;
                                         break;
                                     }
+                                }
+                                if !migrated {
+                                    key.known_type = LType::Unknown;
                                 }
                             }
                             // We can only remove hkeys at the end of the array for the same
