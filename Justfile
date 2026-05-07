@@ -6,35 +6,25 @@ dump:
 
 # Run lunacy against the dumped bytecode files
 test: dump
-    cargo run --release --bin lunacy
+    cargo run --features graph --bin lunacy
 
 watch: dump
     cargo watch -- cargo check --bin lunacy
 
 debug: dump
-    RUST_LOG=all cargo run --bin lunacy -- dumped/dumped_20.bin
+    RUST_LOG=all cargo run --features graph --bin lunacy -- dumped/dumped_20.bin
 
-# Compile and run binarytrees benchmark
-binarytrees:
-    luac5.1 -o binarytrees.bin lua_benchmarking/benchmarks/binarytrees/bench.lua
-    cargo run --release --bin lunacy -- binarytrees.bin
+run benchmark:
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    cargo run --release --bin lunacy -- {{benchmark}}.bin
 
-# Compile and run life benchmark
-life:
-    luac5.1 -o life.bin lua_benchmarking/benchmarks/life/bench.lua
-    cargo run --release --bin lunacy -- life.bin
-life-debug:
-    luac5.1 -o life.bin lua_benchmarking/benchmarks/life/bench.lua
-    cargo run --bin lunacy -- life.bin
-life-baseline:
-    lua5.1 bench.lua -- lua_benchmarking/benchmarks/life/bench
+benchmarks: (run "binarytrees") (run "life") (run "queens")
 
-
-hyperfine:
-    luac5.1 -o binarytrees.bin lua_benchmarking/benchmarks/binarytrees/bench.lua
+hyperfine benchmark:
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin lunacy
-    hyperfine --warmup 1 --export-markdown hyperfine.md \
-        "lua5.1 bench.lua -- lua_benchmarking/benchmarks/binarytrees/bench" \
-        "./target/release/lunacy binarytrees.bin"
+    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}.md \
+        "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench" \
+        "./target/release/lunacy {{benchmark}}.bin"
 
-all: test hyperfine
+all: test benchmarks (hyperfine "binarytrees")

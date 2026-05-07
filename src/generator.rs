@@ -21,6 +21,7 @@ use crate::chunk::Instruction;
 use log::debug;
 use log::info;
 use log::warn;
+use rustc_hash::FxBuildHasher;
 
 fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
     match val {
@@ -903,14 +904,14 @@ pub struct Specializer<'src, 'intern> {
 
     pub versions: std::collections::HashMap<
         *const crate::chunk::FunctionBlock<'src, LConstant<'src, 'intern>>,
-        std::collections::HashMap<(SubPc, Context), BlockId>>,
+        std::collections::HashMap<(SubPc, Context), BlockId>, FxBuildHasher>,
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn new(clos: Tc<LClosure<'src, 'intern>>) -> Self {
         Self {
             blocks: Vec::new(),
-            versions: HashMap::new(),
+            versions: HashMap::default(),
             clos,
         }
     }

@@ -8,6 +8,7 @@ default = ["counters"]
 skip_rc = []
 skip_vec = []
 counters = []
+graph = []
 sonic = ["skip_rc", "skip_vec"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

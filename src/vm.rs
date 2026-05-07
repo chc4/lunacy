@@ -1390,7 +1390,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];
                             let ctx = Context::new(types);
-                            let versions = spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                            let versions = spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
                             let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                                 *block
                             } else {
@@ -1508,10 +1508,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             println!("counters after run {:?}", state.counters);
         }
 
+        #[cfg(feature = "graph")]
         for proto in unsafe { &(*self.top_level).prototypes.items } {
             let outfile = format!("func_{}.pdf", proto.line_defined);
             spec.dump(owner, proto, outfile.as_str());
         }
+
 
         Ok(r_vals)
     }
