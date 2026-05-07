@@ -14,21 +14,27 @@ watch: dump
 debug: dump
     RUST_LOG=all cargo run --features graph --bin lunacy -- dumped/dumped_20.bin
 
+# Benchmarks
 run benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     time cargo run --release --bin lunacy -- {{benchmark}}.bin
 
+graph benchmark:
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    time cargo run --release --features graph --bin lunacy -- {{benchmark}}.bin
+
 baseline benchmark:
     time lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench
 
-benchmarks: (run "binarytrees") (run "life")
+benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
+# Hyperfine reports
 hyperfine benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin lunacy
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}.md \
         "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench" \
         "./target/release/lunacy {{benchmark}}.bin"
-hyperfines: (hyperfine "binarytrees") (hyperfine "life")
+hyperfines: (hyperfine "binarytrees") (hyperfine "life") (run "nbody")
 
 all: test benchmarks (hyperfine "binarytrees")
