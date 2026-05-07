@@ -84,6 +84,9 @@ impl Jit {
 
         for entry in &self.program {
             let (this_obj, this_vtable, this_call) = get_ptr_from_closure(entry.1.deref());
+            // TODO: we could instead mmap a buffer close to our closures, and then guarantee a
+            // 32bit displacement can address them. This would both free up rbx as a GPR and remove
+            // the dispatch through a register.
             dynasm!(ops
                 ; .arch x64
                 ; mov rsi, r12

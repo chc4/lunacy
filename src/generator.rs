@@ -1,4 +1,4 @@
-#![allow(unused_variables)]
+#![allow(unused_variables, unused_assignments, unused)]
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -177,7 +177,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
             arg = yield YieldOp::Exec(ResidualExec("gettable_href", Rc::new(move |owner, state, cb| {
-                let witness = &state.hash_witnesses[hc.0];
+                let witness = &state.hash_witnesses[state.witness_base + hc.0];
                 debug!("gettable_href with {:?} {:?}", &witness, htype);
                 let tab = &state.vals[state.base + b];
                 let LValue::Table(tab) = tab else { unreachable!() };
@@ -266,7 +266,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 }
 
                 arg = yield YieldOp::Exec(ResidualExec("settable_href", Rc::new(move |owner, state, cb| {
-                    let witness = &state.hash_witnesses[hb.0];
+                    let witness = &state.hash_witnesses[state.witness_base + hb.0];
                     debug!("settable_href with {:?} {:?}", &witness, htype);
                     let tab = &state.vals[state.base + a];
                     let LValue::Table(tab) = tab else { unreachable!() };
@@ -524,6 +524,36 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             _ => unreachable!(),
         }
         arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
+        arg
+    }
+}
+
+pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        // TODO: __eq metatable?
+        arg = yield YieldOp::GetBlock(pc);
+        let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
+        arg = yield YieldOp::GetBlock((pc as isize + 1 as isize) as usize);
+        let ResumeArg::BlockId(taken) = arg else { unreachable!() };
+
+        arg = yield YieldOp::Guard(a, LType::Bool);
+        if let ResumeArg::Matched = arg {
+            arg = yield YieldOp::Exec(ResidualExec("test_bool", Rc::new(move |owner, state, cb| {
+                let LValue::Bool(b) = state.vals[state.base + a as usize] else { unreachable!() };
+                state.select = (b as u16 == c) as usize;
+            })));
+            arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
+            return arg
+        }
+        // Nil = false
+        arg = yield YieldOp::Guard(a, LType::Nil);
+        if let ResumeArg::Matched = arg {
+            arg = yield YieldOp::Jump(taken);
+            return arg;
+        }
+        // Everything else = true
+        arg = yield YieldOp::Jump(fallthrough);
         arg
     }
 }
@@ -941,6 +971,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("{a} {b} {c}");
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_compare(op, a, b as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
                 },
+                Opcode::TEST => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_test(a as usize, c, pc + 1)), ResumeArg::Start, block_id)
+                },
                 Opcode::JMP => {
                     let sbx = crate::vm::sBx::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
@@ -1128,11 +1162,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let init_key = hkey.key.clone();
             let href_init = Residual::Exec(ResidualExec("href_init", Rc::new(move |owner, state, cb| {
-                if state.hash_witnesses.len() <= href.0 {
-                    state.hash_witnesses.resize_with(href.0 as usize + 1, || None);
+                let hidx = state.witness_base + href.0;
+                if state.hash_witnesses.len() <= hidx {
+                    state.hash_witnesses.resize_with(hidx + 1, || None);
                 }
-                debug!("populating hashkey witness {}", href.0);
-                let witness = &mut state.hash_witnesses[href.0];
+                debug!("populating hashkey witness {}", hidx);
+                let witness = &mut state.hash_witnesses[hidx];
                 let LValue::Table(tab) = &state.vals[state.base + idx] else { unreachable!() };
                 *witness = Some(HashWitness {
                     href,
@@ -1180,7 +1215,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.blocks[check_block.0].push(Residual::Thunk(update_href_thunk));
             vm.blocks[check_block.0].push(Residual::Exec(ResidualExec("epoch_repair", Rc::new(move |owner, state, cb| {
                 // Re-init the witness and jump back to success block
-                let Some(witness) = &mut state.hash_witnesses[href.0] else { unreachable!() };
+                let Some(witness) = &mut state.hash_witnesses[state.witness_base + href.0] else { unreachable!() };
                 let LValue::Table(tab) = &state.vals[state.base + tab] else { unreachable!() };
                 debug!("repairing {:?} epoch", href);
                 witness.epoch = tab.ro(owner).epoch;
@@ -1521,7 +1556,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::EpochCheck { tab, href } => {
-                    let hwit = &state.hash_witnesses[href.0].as_ref().unwrap();
+                    let hwit = &state.hash_witnesses[state.witness_base + href.0].as_ref().unwrap();
                     let tab = &state.vals[state.base + tab];
                     let LValue::Table(tab) = tab else { unreachable!() };
                     warn!("epochcheck sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
@@ -1533,7 +1568,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::HashGuard { tab, href, expected } => {
-                    let hwit = &state.hash_witnesses[href.0].as_ref().unwrap();
+                    let hwit = &state.hash_witnesses[state.witness_base + href.0].as_ref().unwrap();
                     let tab = &state.vals[state.base + tab];
                     let LValue::Table(tab) = tab else { unreachable!() };
                     let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
@@ -1568,9 +1603,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     // push empty stack frame
                                     state.vals.extend_from_slice(
                                         vec![LValue::Nil; next_stack].as_slice());
-                                    state.callstack.push(CallstackEntry(self.clos.clone(), ReturnLocation::Generator(id, off), state.base, state.vals.len(), state.base + a, c));
+                                    state.callstack.push(CallstackEntry {
+                                        clos: self.clos.clone(),
+                                        ret: ReturnLocation::Generator(id, off),
+                                        frame: state.base,
+                                        limit: state.vals.len(),
+                                        witness_frame: state.witness_base,
+                                        witness_limit: state.hash_witnesses.len(),
+                                        rloc: state.base + a,
+                                        c
+                                    });
                                     state.base = state.base + a as usize + 1;
-                                    panic!("increment state.witness_base");
+                                    state.witness_base = state.hash_witnesses.len();
                                     state.vals.truncate(state.base +  next_stack);
                                     state.clos = lclos.clone();
 
@@ -1655,7 +1699,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         unreachable!()
                     };
                     match state.callstack.last() {
-                        Some(CallstackEntry(ret_clos, ReturnLocation::Interpreter(caller), frame, limit, ret, c)) => {
+                        Some(CallstackEntry { clos: ret_clos, ret: ReturnLocation::Interpreter(caller), frame, witness_frame, limit, witness_limit, rloc, c }) => {
                             // We use the current closure, because we want to execute the vm RET
                             // instruction in it
                             state.clos = self.clos.clone();
@@ -1663,38 +1707,40 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             state.pc = pc;
                             return state
                         },
-                        Some(&CallstackEntry(ref ret_clos, ReturnLocation::Generator(block, disp), frame, limit, ret, c)) => {
+                        Some(CallstackEntry { clos: ret_clos, ret: ReturnLocation::Generator(block, disp), frame, witness_frame, limit, witness_limit, rloc, c }) => {
                             state.clos = ret_clos.clone();
                             self.set_current(ret_clos.clone());
-                            state.base = frame;
+                            state.base = *frame;
+                            state.witness_base = *witness_frame;
                             debug!("returning {c}");
-                            if c == 1 {
+                            if *c == 1 {
                                 // No values are saved
-                                state.vals.truncate(limit);
-                            } else if c >= 2 {
+                                state.vals.truncate(*limit);
+                            } else if *c >= 2 {
                                 // (C-1) values are saved
                                 let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
                                 //vals.extend_from_slice(r_vals.as_slice());
                                 for i in 0..=(c - 2) {
                                     debug!("huh {}", i);
                                     // Only copy the correct number of arguments from the CALL
-                                    state.vals[ret + i as usize] = r_vals[i as usize].clone();
+                                    state.vals[rloc + i as usize] = r_vals[i as usize].clone();
                                 }
-                                //assert!(limit >= ret + c as usize - 1);
-                                state.vals.truncate(limit);
-                                //state.vals.truncate(ret + c as usize - 1);
+                                //assert!(limit >= rloc + c as usize - 1);
+                                state.vals.truncate(*limit);
+                                //state.vals.truncate(rloc + c as usize - 1);
                             } else {
                                 // Multiple return results are saved
                                 for (i, v) in r_vals.drain(..).enumerate() {
                                     // Only copy the correct number of arguments from the CALL
-                                    state.vals[ret + i] = v;
+                                    state.vals[rloc + i] = v;
                                 }
                                 debug!("{:?} {}", &state.vals, r_count);
-                                state.vals.truncate(ret + r_count);
+                                state.vals.truncate(rloc + r_count);
                             }
-                            id = block;
-                            off = disp;
-                            state.vals.truncate(limit);
+                            id = *block;
+                            off = *disp;
+                            state.vals.truncate(*limit);
+                            state.hash_witnesses.truncate(*witness_limit);
                             debug!("after generator return, {:?}", &state.vals[state.base..]);
                             state.callstack.pop();
                         },
