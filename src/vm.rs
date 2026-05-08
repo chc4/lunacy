@@ -894,6 +894,7 @@ pub struct RunState<'src, 'intern> {
     pub select: usize,
     pub witness_base: usize,
     pub hash_witnesses: FVec<Option<HashWitness>>,
+    pub trap: bool,
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
@@ -1045,6 +1046,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 counters: Default::default(),
                 hash_witnesses: vec![],
                 select: 0,
+                trap: false,
             }
         };
         // we need to track where to return to, along with the base pointer and where to put return

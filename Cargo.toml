@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["counters"]
+default = ["counters", "jit"]
 skip_rc = []
 skip_vec = []
 counters = []
 graph = []
+immediate_jit = []
+jit = []
 sonic = ["skip_rc", "skip_vec"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

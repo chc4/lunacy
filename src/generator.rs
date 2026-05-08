@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ops::{Coroutine, CoroutineState, Deref};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::vm::{Opcode, Upvalue, CallstackEntry, ReturnLocation, HashWitness};
 use qcell::{TCell, TCellOwner};
@@ -17,6 +17,7 @@ use crate::vm::RunState;
 use crate::vm::LConstant;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
+use crate::jit::JitInfo;
 
 use log::debug;
 use log::info;
@@ -24,7 +25,7 @@ use log::warn;
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 
-fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
+pub fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
     match val {
         LValue::Number(_) => LType::Number,
         LValue::InternedString(_) | LValue::OwnedString(_) => LType::String,
@@ -35,14 +36,36 @@ fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
     }
 }
 
+#[cfg(feature = "immediate_jit")]
+const INITIAL_HOTNESS: usize = 0;
+#[cfg(not(feature = "immediate_jit"))]
+const INITIAL_HOTNESS: usize = 200;
+
 #[derive(Debug)]
-enum ExecEffect {
+pub struct Block {
+    pub instructions: Vec<Residual>,
+    pub hotness: std::cell::Cell<usize>,
+    pub jit_info: JitInfo,
+}
+
+impl Block {
+    fn new() -> Self {
+        Self {
+            instructions: vec![],
+            hotness: Cell::new(INITIAL_HOTNESS),
+            jit_info: JitInfo::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ExecEffect {
     Jump(BlockId),
     Call(usize, usize, u16),
 }
-type ExecCallback<'a, 'src, 'intern> = &'a mut dyn for<'b> FnMut(ExecEffect, &mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>);
+pub type ExecCallback<'a, 'src, 'intern> = &'a mut dyn for<'b> FnMut(ExecEffect, &mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>);
 #[derive(Clone)]
-struct ResidualExec(&'static str, Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>)>);
+pub struct ResidualExec(&'static str, pub Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>)>);
 impl std::fmt::Debug for ResidualExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "exec({}, {:p})", self.0, self.1.as_ref() as &_ as *const _ as *const ())
@@ -93,7 +116,7 @@ impl<'src, 'intern> std::fmt::Display for HashKey<'src, 'intern> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HashRef(u8);
+pub struct HashRef(pub u8);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ResumeArg {
@@ -900,7 +923,7 @@ impl Context {
 }
 
 pub struct Specializer<'src, 'intern> {
-    pub blocks: Vec<Vec<Residual>>,
+    pub blocks: Vec<Block>,
     pub clos: Tc<LClosure<'src, 'intern>>,
 
     pub versions: std::collections::HashMap<
@@ -1058,7 +1081,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.blocks[block_id.0].push(Residual::Ret(pc, a, b)); None
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b)); None
                 },
                 x => {
                     #[cfg(debug_assertions)]
@@ -1066,7 +1089,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         unreachable!("{:?}", x)
                     }
                     panic!();
-                    self.blocks[block_id.0].push(Residual::Ret(pc, 0, 0)); None
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0)); None
                 },
             } {
                 pc = next;
@@ -1079,7 +1102,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     pub fn new_block(&mut self) -> BlockId {
-        self.blocks.push(Vec::new());
+        self.blocks.push(Block::new());
         BlockId(self.blocks.len() - 1)
     }
 
@@ -1121,12 +1144,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 unimplemented!("{:?}", runtime_type);
             }
             // TODO: search for if we already have a compatible block
-            vm.blocks[block_id.0][thunk_pc] = Residual::Guard { idx, expected: runtime_type };
+            vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Guard { idx, expected: runtime_type };
             // Push the same thunk down for the next value that fails the guard
             let fail_thunk = vm.make_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_ctx.clone(), false);
-            vm.blocks[block_id.0].push(Residual::Thunk(fail_thunk));
+            vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
             let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
-            vm.blocks[block_id.0].push(Residual::Jump(guard_block));
+            vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
 
             debug!("after compiling thunk, blocks look like {:?}", vm.blocks);
         })))
@@ -1145,7 +1168,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro, ResumeArg::Failed, block_id) {
                     vm.compile(owner, succ_next, succ_ty, fail_block);
                 }
-                vm.blocks[block_id.0][thunk_pc] = Residual::Jump(fail_block);
+                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Jump(fail_block);
                 return;
             };
             debug!("href forced by {tab:?} -> {val:?}");
@@ -1181,15 +1204,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if(!appends) {
                 let old_block = block_id;
                 block_id = vm.new_block();
-                vm.blocks[old_block.0][thunk_pc] = Residual::Jump(block_id);
-                vm.blocks[block_id.0].push(href_init);
+                vm.blocks[old_block.0].instructions[thunk_pc] = Residual::Jump(block_id);
+                vm.blocks[block_id.0].instructions.push(href_init);
             } else {
-                vm.blocks[block_id.0][thunk_pc] = href_init;
+                vm.blocks[block_id.0].instructions[thunk_pc] = href_init;
             }
 
             let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, discovered_type));
             vm.make_epoch_check(owner, block_id, thunk_coro, idx, href, pc, thunk_ctx.clone(), guard_block);
-            vm.blocks[block_id.0].push(Residual::Jump(guard_block));
+            vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
         })))
     }
 
@@ -1202,7 +1225,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // epoches in our witness table they only ever would fail if a table transitions its type
         // inside a block, which is unlikely to happen very often.
         let thunk_coro = thunk_coro.clone();
-        self.blocks[block_id.0].push(Residual::EpochCheck { tab, href });
+        self.blocks[block_id.0].instructions.push(Residual::EpochCheck { tab, href });
         // Build the thunk for if we fail the epoch check
         let fail_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
             debug!("hit epoch fail thunk");
@@ -1210,21 +1233,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // Do another check for the key type, where if it still holds we can update the
             // witness epoch and jump back to the success block.
             let check_block = vm.new_block();
-            vm.blocks[block_id.0][thunk_pc] = Residual::Jump(check_block);
+            vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Jump(check_block);
             let expected = thunk_ctx.hkeys[href.0 as usize].known_type;
-            vm.blocks[check_block.0].push(Residual::HashGuard { tab, href: href.clone(), expected });
+            vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), expected });
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
-            vm.blocks[check_block.0].push(Residual::Thunk(update_href_thunk));
-            vm.blocks[check_block.0].push(Residual::Exec(ResidualExec("epoch_repair", Rc::new(move |owner, state, cb| {
+            vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
+            vm.blocks[check_block.0].instructions.push(Residual::Exec(ResidualExec("epoch_repair", Rc::new(move |owner, state, cb| {
                 // Re-init the witness and jump back to success block
                 let Some(witness) = &mut state.hash_witnesses[state.witness_base + href.0 as usize] else { unreachable!() };
                 let LValue::Table(tab) = &state.vals[state.base + tab] else { unreachable!() };
                 debug!("repairing {:?} epoch", href);
                 witness.epoch = tab.ro(owner).epoch;
             }))));
-            vm.blocks[check_block.0].push(Residual::Jump(success_block));
+            vm.blocks[check_block.0].instructions.push(Residual::Jump(success_block));
         })));
-        self.blocks[block_id.0].push(Residual::Thunk(fail_thunk));
+        self.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
     }
 
     pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut ctx: Context, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Context, ResumeArg)>
@@ -1309,7 +1332,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         let holds_block = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), arg);
                                         self.make_epoch_check(owner, block_id, coro.clone(), idx, cached.clone(), pc, ctx.clone(), holds_block);
 
-                                        self.blocks[block_id.0].push(Residual::Jump(holds_block));
+                                        self.blocks[block_id.0].instructions.push(Residual::Jump(holds_block));
                                         return None;
                                     }
                                 }
@@ -1347,7 +1370,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         let witness = Residual::Thunk(self.make_href_thunk(block_id, thunk_coro, idx, href.clone(), pc, thunk_ctx, true));
-                        self.blocks[block_id.0].push(witness);
+                        self.blocks[block_id.0].instructions.push(witness);
                         return None;
                     } else {
                         pc = pc.next_false();
@@ -1408,16 +1431,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         let thunk = Residual::Thunk(self.make_thunk(block_id, thunk_coro, idx, expected, pc, thunk_ctx, true));
-                        self.blocks[block_id.0].push(thunk);
+                        self.blocks[block_id.0].instructions.push(thunk);
                         return None;
                     }
                 }
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
-                    self.blocks[block_id.0].push(Residual::Exec(func));
+                    self.blocks[block_id.0].instructions.push(Residual::Exec(func));
                     // In a real VM, transition to the next PC generator here.
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {
-                    self.blocks[block_id.0].push(Residual::Select(targets));
+                    self.blocks[block_id.0].instructions.push(Residual::Select(targets));
                     return None;
                 },
                 CoroutineState::Yielded(YieldOp::Call(target)) => {
@@ -1438,7 +1461,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let call_exec = Residual::Exec(ResidualExec("call", Rc::new(move |owner, state, cb| {
                                 cb(ExecEffect::Call(a, b, c as u16), owner, state);
                             })));
-                            self.blocks[block_id.0].push(call_exec);
+                            self.blocks[block_id.0].instructions.push(call_exec);
                             let ctx = if c == 1 {
                                 // No values are saved
                                 // All our types are intact
@@ -1541,7 +1564,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::Jump(dest_block)) => {
-                    self.blocks[block_id.0].push(Residual::Jump(dest_block));
+                    self.blocks[block_id.0].instructions.push(Residual::Jump(dest_block));
                     // If it was a jump, stop pumping the coroutine
                     return None;
                 },
@@ -1556,8 +1579,125 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut off = 0;
         debug!("run");
         loop {
-            let block = &self.blocks[id.0];
-            let res = block[off].clone();
+            let block = &mut self.blocks[id.0];
+            #[cfg(feature = "jit")]
+            if off == 0 {
+                let hot = block.hotness.get();
+                if hot > 0 {
+                    block.hotness.set(hot - 1);
+                } else {
+                    if block.jit_info.entry.is_none() {
+                        debug!("jit compile {id:?}");
+                        block.jit_compile(id);
+                    }
+
+                    let mut jit_entry = block.jit_info.entry.unwrap();
+                    let mut jump_target = None;
+                    warn!("running jit for {id:?}");
+                    let ret = jit_entry(owner, &mut state, &mut |effect, owner, state| {
+                        match effect {
+                            ExecEffect::Call(a, b, c) => {
+                                let to_call = &state.vals[state.base + a as usize];
+                                if let LValue::LClosure(ref lclos) = to_call.clone() {
+                                    // record call stack: we say where to return to and where to put the values
+                                    let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
+                                    // push empty stack frame
+                                    state.vals.extend_from_slice(
+                                        vec![LValue::Nil; next_stack].as_slice());
+                                    state.callstack.push(CallstackEntry {
+                                        clos: self.clos.clone(),
+                                        ret: ReturnLocation::Generator(id, off),
+                                        frame: state.base,
+                                        limit: state.vals.len(),
+                                        witness_frame: state.witness_base,
+                                        witness_limit: state.hash_witnesses.len(),
+                                        rloc: state.base + a,
+                                        c
+                                    });
+                                    state.base = state.base + a as usize + 1;
+                                    state.witness_base = state.hash_witnesses.len();
+                                    state.vals.truncate(state.base +  next_stack);
+                                    state.clos = lclos.clone();
+
+                                    // Either use existing block, compile a new one, or use most
+                                    // generic.
+                                    let types = vec![LType::Unknown; next_stack];
+                                    let ctx = Context::new(types);
+                                    let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                                    let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
+                                        *block
+                                    } else {
+                                        debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, ctx);
+                                        self.set_current(lclos.clone());
+                                        self.block(owner, 0, ctx)
+                                    };
+                                    debug!("{:?} {block:?}", self.blocks);
+                                    self.set_current(lclos.clone());
+                                    jump_target = Some((block, 0));
+                                } else if let LValue::NClosure(ncall) = to_call {
+                                    let args = if b == 0 {
+                                        &state.vals[state.base + a as usize+1..]
+                                    } else {
+                                        &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
+                                    };
+                                    debug!("{:?}", args);
+                                    let mut native = ncall.rw(owner).native.clone();
+                                    let ret = (native)(args, owner);
+                                    if c == 0 {
+                                        // save all returned
+                                        state.vals.splice(state.base + a as usize.., ret).for_each(drop);
+                                    }
+                                    else if c == 1 {
+                                        // nothing saved
+                                    } else if c != 1 {
+                                        state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, ret).for_each(drop);
+                                    } else {
+                                        unimplemented!()
+                                    }
+                                } else {
+                                    unimplemented!()
+                                }
+                            },
+                            _ => unimplemented!()
+                        }
+                    });
+                    let next_id = (ret >> 32) as i32 as isize;
+                    let next_off = (ret & 0xFFFFFFFF) as usize;
+                    self.clos = state.clos.clone();
+
+                    if let Some((target_id, target_off)) = jump_target {
+                        id = target_id;
+                        off = target_off;
+                        state.trap = false;
+                        continue;
+                    }
+
+                    if next_id >= 0 {
+                        debug!("jit exit to {next_id}");
+                        id = BlockId(next_id as usize);
+                        off = 0;
+                        continue;
+                    } else if next_id == -1 {
+                        debug!("jit bail 1 to {next_off}");
+                        state.trap = false;
+                        off = next_off;
+                    } else if next_id == -2 {
+                        debug!("jit bail 2 to {next_off}");
+                        off = next_off;
+                    } else if next_id == -3 {
+                        debug!("jit bail 3 to {next_off}");
+                        let Residual::Select(ref paths) = self.blocks[id.0].instructions[next_off] else { panic!() };
+                        id = paths[state.select].1;
+                        off = 0;
+                        continue;
+                    } else if next_id == -4 {
+                        debug!("jit bail 4 {off}");
+                        state.trap = false;
+                        continue;
+                    }
+                }
+            }
+            let res = self.blocks[id.0].instructions[off].clone();
             state.counters.versioned_count.increment();
             debug!("RUN {:?}", &res);
             match res {
@@ -1686,7 +1826,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off = 0;
                 },
                 Residual::Thunk(thunk) => {
-                    debug!("thunk {:?}", &block);
+                    debug!("thunk {:?}", &thunk);
                     (thunk.0.borrow_mut())(self, owner, &mut state, off)
                 },
                 Residual::Ret(pc, a, b) => {
@@ -1846,7 +1986,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     s
                 }
 
-                for (off, res) in residuals.iter().enumerate() {
+                for (off, res) in residuals.instructions.iter().enumerate() {
                     let inst_label = match res {
                         Residual::Guard { idx, expected } => format!("guard({}, {})", idx, expected),
                         Residual::Exec(ResidualExec(name, _)) => format!("exec({})", name),
@@ -1868,10 +2008,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "call"))));
                         }
                         Residual::Guard { .. } | Residual::HashGuard { .. } => {
-                            if let Some(Residual::Jump(target)) = residuals.get(off + 2) {
+                            if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
                                 edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "pass"))));
                             }
-                            if let Some(Residual::Jump(target)) = residuals.get(off + 1) {
+                            if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 1) {
                                 edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "fail"))));
                             }
                         },

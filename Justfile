@@ -11,8 +11,9 @@ test: dump
 watch: dump
     cargo watch -- cargo check --bin lunacy
 
+[env("RUST_LOG", "debug")]
 debug: dump
-    RUST_LOG=all cargo run --features graph --bin lunacy -- dumped/dumped_20.bin
+    cargo run --no-default-features --features "graph counters jit immediate_jit" --bin lunacy -- ./dumped/dumped_12.bin
 
 # Benchmarks
 run benchmark:

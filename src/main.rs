@@ -1,6 +1,8 @@
 #![feature(trait_alias, specialization, iter_intersperse, atomic_try_update)]
 // For LBBV
 #![feature(coroutines, coroutine_trait, coroutine_clone, stmt_expr_attributes)]
+// For JIT
+#![feature(ptr_metadata, rust_preserve_none_cc)]
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::Read;
@@ -19,6 +21,8 @@ use vm::Vm;
 mod perf;
 
 mod generator;
+
+mod jit;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
