@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use crate::generator::{ExecCallback, typeof_};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
@@ -8,11 +9,16 @@ use log::debug;
 use log::info;
 use log::warn;
 
+#[cfg(feature = "immediate_jit")]
+const INITIAL_HOTNESS: usize = 0;
+#[cfg(not(feature = "immediate_jit"))]
+const INITIAL_HOTNESS: usize = 200;
 
 #[derive(Debug)]
 pub struct JitInfo {
     pub buffer: Option<ExecutableBuffer>,
-    pub entry: Option<JitExec>
+    pub entry: Option<JitExec>,
+    pub hotness: std::cell::Cell<usize>,
 }
 
 impl JitInfo {
@@ -20,6 +26,7 @@ impl JitInfo {
         JitInfo {
             buffer: None,
             entry: None,
+            hotness: Cell::new(INITIAL_HOTNESS),
         }
     }
 }
@@ -103,21 +110,21 @@ impl Block {
             debug!("JIT operation {res:?}");
             let label = insts[&off];
             match res {
-                //Residual::Guard { idx, expected } => {
-                //    let expected_u8 = *expected as u8;
-                //    dynasm!(ops
-                //        ; .arch x64
-                //        ; =>label
-                //        ; mov rdi, r13 // state
-                //        ; mov rsi, QWORD (*idx as i64)
-                //        ; mov rdx, QWORD (expected_u8 as i64)
-                //        ; mov rax, QWORD (JitHelper::check_guard as *const () as i64)
-                //        ; call rax
-                //        ; test al, al
-                //        ; jnz =>insts[&(off + 2)]
-                //        // Fail: fallthrough to next (off + 1)
-                //    );
-                //},
+                Residual::Guard { idx, expected } => {
+                    let expected_u8 = *expected as u8;
+                    dynasm!(ops
+                        ; .arch x64
+                        ; =>label
+                        ; mov rdi, r13 // state
+                        ; mov rsi, QWORD (*idx as i64)
+                        ; mov rdx, QWORD (expected_u8 as i64)
+                        ; mov rax, QWORD (JitHelper::check_guard as *const () as i64)
+                        ; call rax
+                        ; test al, al
+                        ; jnz =>insts[&(off + 2)]
+                        // Fail: fallthrough to next (off + 1)
+                    );
+                },
                 Residual::Exec(f) => {
                     let (this_obj, this_vtable, this_call) = get_ptr_from_closure(f.1.as_ref());
                     dynasm!(ops
@@ -135,7 +142,6 @@ impl Block {
                         ; test al, al
                         ; jz >no_trap
                         //// Trap: return (-4, off + 1) so specializer can handle it
-                        ; int3
                         ; mov rax, QWORD (((-4i32 as u64) << 32 | (off as u64 + 1)) as i64)
                         ; jmp >exit_jit
                         ; no_trap:
@@ -150,40 +156,40 @@ impl Block {
                         ; jmp >exit_jit
                     );
                 },
-                //Residual::EpochCheck { tab, href } => {
-                //    let href_u8 = href.0;
-                //    dynasm!(ops
-                //        ; .arch x64
-                //        ; =>label
-                //        ; mov rdi, r13 // state
-                //        ; mov rsi, r12 // owner
-                //        ; mov rdx, QWORD (*tab as i64)
-                //        ; mov rcx, QWORD (href_u8 as i64)
-                //        ; mov rax, QWORD (JitHelper::check_epoch as *const () as i64)
-                //        ; call rax
-                //        ; test al, al
-                //        ; jz =>insts[&(off + 2)]
-                //        // Fail: fallthrough to next (off + 1)
-                //    );
-                //},
-                //Residual::HashGuard { tab, href, expected } => {
-                //    let href_u8 = href.0;
-                //    let expected_u8 = *expected as u8;
-                //    dynasm!(ops
-                //        ; .arch x64
-                //        ; =>label
-                //        ; mov rdi, r13 // state
-                //        ; mov rsi, r12 // owner
-                //        ; mov rdx, QWORD (*tab as i64)
-                //        ; mov rcx, QWORD (href_u8 as i64)
-                //        ; mov r8, QWORD (expected_u8 as i64)
-                //        ; mov rax, QWORD (JitHelper::check_hash_guard as *const () as i64)
-                //        ; call rax
-                //        ; test al, al
-                //        ; jnz =>insts[&(off + 2)]
-                //        // Fail: fallthrough to next (off + 1)
-                //    );
-                //},
+                Residual::EpochCheck { tab, href } => {
+                    let href_u8 = href.0;
+                    dynasm!(ops
+                        ; .arch x64
+                        ; =>label
+                        ; mov rdi, r13 // state
+                        ; mov rsi, r12 // owner
+                        ; mov rdx, QWORD (*tab as i64)
+                        ; mov rcx, QWORD (href_u8 as i64)
+                        ; mov rax, QWORD (JitHelper::check_epoch as *const () as i64)
+                        ; call rax
+                        ; test al, al
+                        ; jz =>insts[&(off + 2)]
+                        // Fail: fallthrough to next (off + 1)
+                    );
+                },
+                Residual::HashGuard { tab, href, expected } => {
+                    let href_u8 = href.0;
+                    let expected_u8 = *expected as u8;
+                    dynasm!(ops
+                        ; .arch x64
+                        ; =>label
+                        ; mov rdi, r13 // state
+                        ; mov rsi, r12 // owner
+                        ; mov rdx, QWORD (*tab as i64)
+                        ; mov rcx, QWORD (href_u8 as i64)
+                        ; mov r8, QWORD (expected_u8 as i64)
+                        ; mov rax, QWORD (JitHelper::check_hash_guard as *const () as i64)
+                        ; call rax
+                        ; test al, al
+                        ; jnz =>insts[&(off + 2)]
+                        // Fail: fallthrough to next (off + 1)
+                    );
+                },
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
                         ; .arch x64

@@ -36,15 +36,9 @@ pub fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
     }
 }
 
-#[cfg(feature = "immediate_jit")]
-const INITIAL_HOTNESS: usize = 0;
-#[cfg(not(feature = "immediate_jit"))]
-const INITIAL_HOTNESS: usize = 200;
-
 #[derive(Debug)]
 pub struct Block {
     pub instructions: Vec<Residual>,
-    pub hotness: std::cell::Cell<usize>,
     pub jit_info: JitInfo,
 }
 
@@ -52,7 +46,6 @@ impl Block {
     fn new() -> Self {
         Self {
             instructions: vec![],
-            hotness: Cell::new(INITIAL_HOTNESS),
             jit_info: JitInfo::new(),
         }
     }
@@ -1582,9 +1575,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let block = &mut self.blocks[id.0];
             #[cfg(feature = "jit")]
             if off == 0 {
-                let hot = block.hotness.get();
+                let hot = block.jit_info.hotness.get();
                 if hot > 0 {
-                    block.hotness.set(hot - 1);
+                    block.jit_info.hotness.set(hot - 1);
                 } else {
                     if block.jit_info.entry.is_none() {
                         debug!("jit compile {id:?}");
@@ -1633,6 +1626,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     };
                                     debug!("{:?} {block:?}", self.blocks);
                                     self.set_current(lclos.clone());
+                                    state.trap = true;
                                     jump_target = Some((block, 0));
                                 } else if let LValue::NClosure(ncall) = to_call {
                                     let args = if b == 0 {

@@ -13,7 +13,7 @@ watch: dump
 
 [env("RUST_LOG", "debug")]
 debug: dump
-    cargo run --no-default-features --features "graph counters jit immediate_jit" --bin lunacy -- ./dumped/dumped_12.bin
+    time cargo run --release --no-default-features --features "graph counters jit" --bin lunacy -- ./dumped/dumped_12.bin
 
 # Benchmarks
 run benchmark:
