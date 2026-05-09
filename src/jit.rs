@@ -5,6 +5,7 @@ use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
 use crate::generator::{Specializer, Block, BlockId, Residual};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
+use rustc_hash::FxBuildHasher;
 
 use log::debug;
 use log::info;
@@ -92,7 +93,7 @@ impl JitHelper {
 const JIT_SIZE: usize = 0x1000 * 16;
 pub struct JitContext {
     pub memory: std::cell::Cell<dynasmrt::mmap::ExecutableBuffer>,
-    pub blocks: HashMap<BlockId, JitPtr>,
+    pub blocks: HashMap<BlockId, JitPtr, FxBuildHasher>,
     pub pending: BTreeMap<BlockId, DynamicLabel>,
     pub used: usize,
 }
@@ -108,7 +109,7 @@ impl JitContext {
         memory.set_len(JIT_SIZE);
         Self {
             memory: Cell::new(memory.make_exec().unwrap()),
-            blocks: HashMap::new(),
+            blocks: HashMap::default(),
             pending: BTreeMap::new(),
             used: 0
         }
@@ -209,11 +210,7 @@ type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
 impl Block {
     pub fn jit_body(&mut self, id: BlockId, jctx: &mut JitContext, ops: &mut Assembler) -> AssemblyOffset {
         let entry = ops.offset();
-        let mut insts = std::collections::HashMap::new();
-        for (off, res) in self.instructions.iter().enumerate() {
-            let label = ops.new_dynamic_label();
-            insts.insert(off, label);
-        }
+        let insts: Vec<_> = self.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
 
         let mut emit_jump = |ops: &mut Assembler, target: &BlockId| {
             if let Some(target_ptr) = jctx.blocks.get(target) {
@@ -234,7 +231,7 @@ impl Block {
 
         for (off, res) in self.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
-            let label = insts[&off];
+            let label = insts[off];
             dynasm!(ops
                 ; => label
             );
@@ -256,7 +253,7 @@ impl Block {
                         ; mov rax, QWORD (JitHelper::check_guard as *const () as i64)
                         ; call rax
                         ; test al, al
-                        ; jnz =>insts[&(off + 2)]
+                        ; jnz =>insts[(off + 2)]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -271,7 +268,7 @@ impl Block {
                         ; mov rax, QWORD (JitHelper::check_epoch as *const () as i64)
                         ; call rax
                         ; test al, al
-                        ; jnz =>insts[&(off + 2)]
+                        ; jnz =>insts[(off + 2)]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -288,7 +285,7 @@ impl Block {
                         ; mov rax, QWORD (JitHelper::check_hash_guard as *const () as i64)
                         ; call rax
                         ; test al, al
-                        ; jnz =>insts[&(off + 2)]
+                        ; jnz =>insts[(off + 2)]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
