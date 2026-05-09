@@ -51,7 +51,7 @@ impl Block {
     }
 }
 
-#[cfg(feature = "unchecked")]
+#[cfg(feature = "unreachable")]
 macro_rules! unreachable {
     () => { unsafe { core::hint::unreachable_unchecked() } }
 }
@@ -1581,7 +1581,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         loop {
             let block = &mut self.blocks[id.0];
             #[cfg(feature = "jit")]
-            if off == 0 {
+            if off == 0 && state.gas > 0 {
                 let hot = block.jit_info.hotness.get();
                 if hot > 0 {
                     block.jit_info.hotness.set(hot - 1);
@@ -1708,6 +1708,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // thunk at offset=0, we don't want to jump back to the JIT again.
                     }
                 }
+            }
+            if state.gas > 0 && state.gas < 100 {
+                let res = self.blocks[id.0].instructions[off].clone();
+                println!("low gas {} at {id:?} {off} {res:?}", state.gas);
+            }
+            if state.gas == 0 {
+                let res = self.blocks[id.0].instructions[off].clone();
+                println!("out of gas at {id:?} {off} {res:?}");
+                println!("out of gas return stack: {:?}", state.callstack);
+                state.gas -= 1;
             }
             let res = self.blocks[id.0].instructions[off].clone();
             state.counters.versioned_count.increment();

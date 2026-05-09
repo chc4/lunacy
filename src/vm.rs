@@ -600,6 +600,7 @@ pub enum LValue<'src, 'intern> {
     Table(Tc<Table<'src, 'intern>>),
 }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LType {
     Unknown,
@@ -896,6 +897,7 @@ pub struct RunState<'src, 'intern> {
     pub hash_witnesses: FVec<Option<HashWitness>>,
     pub trap: bool,
     pub current_off: u16,
+    pub gas: i64,
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
@@ -993,6 +995,17 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     println!("> {}", s.iter().intersperse(&" ".to_string()).cloned().collect::<String>());
                     vec![LValue::Nil].into()
                 }))),
+                (InternString::intern(intern, "assert\0"), LValue::NClosure(NClosure::new(|v, owner| {
+                    match v {
+                        [LValue::Bool(b), ..] => {
+                            if !b {
+                                panic!("lua assert failed");
+                            }
+                        },
+                        _ => { },
+                    };
+                    vec![]
+                }))),
                 math,
                 os,
                 ].drain(..)
@@ -1049,6 +1062,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 select: 0,
                 trap: false,
                 current_off: 0,
+                gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
             }
         };
         // we need to track where to return to, along with the base pointer and where to put return

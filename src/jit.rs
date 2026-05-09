@@ -52,6 +52,7 @@ pub struct JitHelper;
 impl JitHelper {
     pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: u8) -> bool {
         unsafe {
+            //println!("state {:?} idx {} {}", state, idx, expected);
             let state = state as *mut RunState;
             let rs = &*state;
             let val = &rs.vals[rs.base + idx];
@@ -60,27 +61,29 @@ impl JitHelper {
     }
     pub unsafe extern "C" fn check_epoch(state: *mut (), owner: *mut (), tab: usize, href: u8) -> bool {
         unsafe {
+            //println!("state {:?} {} {}", state, tab, href);
             let state = state as *mut RunState;
             let owner = owner as *mut TCellOwner<TcOwner>;
             let rs = &*state;
             let owner = &*owner;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
             let tab_val = &rs.vals[rs.base + tab];
-            let LValue::Table(tab) = tab_val else { return false };
+            let LValue::Table(tab) = tab_val else { unreachable!() };
             debug!("JIT check_epoch sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
-            hwit.epoch != tab.ro(owner).epoch
+            hwit.epoch == tab.ro(owner).epoch
         }
     }
     pub unsafe extern "C" fn check_hash_guard(state: *mut (), owner: *mut (), tab: usize, href: u8, expected: u8) -> bool {
         unsafe {
+            println!("state {:?} {} {} {}", state, tab, href, expected);
             let state = state as *mut RunState;
             let owner = owner as *mut TCellOwner<TcOwner>;
             let rs = &*state;
             let owner = &*owner;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
             let tab_val = &rs.vals[rs.base + tab];
-            let LValue::Table(tab) = tab_val else { return false };
-            let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { return false };
+            let LValue::Table(tab) = tab_val else { unreachable!() };
+            let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
             (typeof_(val) as u8) == expected
         }
     }
@@ -214,12 +217,21 @@ impl Block {
         for (off, res) in self.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
             let label = insts[&off];
+            dynasm!(ops
+                ; => label
+            );
+            #[cfg(feature = "gas")]
+            dynasm!(ops
+                ; sub QWORD r13 => RunState.gas, 1
+                ; mov WORD r13 => RunState.current_off, (off as i16)
+                ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                ; jbe >exit_jit
+            );
             match res {
                 Residual::Guard { idx, expected } => {
                     let expected_u8 = *expected as u8;
                     dynasm!(ops
                         ; .arch x64
-                        ; =>label
                         ; mov rdi, r13 // state
                         ; mov rsi, QWORD (*idx as i64)
                         ; mov rdx, QWORD (expected_u8 as i64)
@@ -234,7 +246,6 @@ impl Block {
                     let href_u8 = href.0;
                     dynasm!(ops
                         ; .arch x64
-                        ; =>label
                         ; mov rsi, r12 // owner
                         ; mov rdi, r13 // state
                         ; mov rdx, QWORD (*tab as i64)
@@ -242,7 +253,7 @@ impl Block {
                         ; mov rax, QWORD (JitHelper::check_epoch as *const () as i64)
                         ; call rax
                         ; test al, al
-                        ; jz =>insts[&(off + 2)]
+                        ; jnz =>insts[&(off + 2)]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -251,7 +262,6 @@ impl Block {
                     let expected_u8 = *expected as u8;
                     dynasm!(ops
                         ; .arch x64
-                        ; =>label
                         ; mov rsi, r12 // owner
                         ; mov rdi, r13 // state
                         ; mov rdx, QWORD (*tab as i64)
@@ -268,7 +278,6 @@ impl Block {
                     let (this_obj, this_vtable, this_call) = get_ptr_from_closure(f.1.as_ref());
                     dynasm!(ops
                         ; .arch x64
-                        ; =>label
                         ; mov rsi, r12 // owner
                         ; mov rdx, r13 // state
                         ; mov rcx, r14 // cb data
@@ -280,7 +289,7 @@ impl Block {
                         ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
                         ; call rbx
                         //// Check for trap
-                        ; mov rax, r13 => RunState.trap
+                        ; mov al, BYTE r13 => RunState.trap
                         ; test al, al
                         ; jz >no_trap
                         //// Trap 4 so specializer can handle it
@@ -293,7 +302,6 @@ impl Block {
                     if let Some(target_ptr) = jctx.blocks.get(target) {
                         // We already JIT compiled the block, and can jump to it directly.
                         dynasm!(ops
-                            ; =>label
                             ; jmp extern target_ptr.0 as usize
                         );
                     } else {
@@ -302,7 +310,6 @@ impl Block {
                         // relocation.
                         let pending_label = jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
                         dynasm!(ops
-                            ; =>label
                             ; jmp =>*pending_label
                         );
                     }
@@ -310,7 +317,6 @@ impl Block {
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
                         ; .arch x64
-                        ; =>label
                         ; mov WORD r13 => RunState.current_off, (off as i16)
                         ; mov rax, QWORD (((-2i32 as u64) << 32 | (id.0 as u64)) as i64)
                         ; jmp >exit_jit
@@ -319,7 +325,6 @@ impl Block {
                 //Residual::Select(targets) => {
                 //    dynasm!(ops
                 //        ; .arch x64
-                //        ; =>label
                 //        ; mov rax, QWORD (((-3i32 as u64) << 32 | (off as u64)) as i64)
                 //        ; jmp >exit_jit
                 //    );
@@ -332,13 +337,25 @@ impl Block {
                     );
                 },
                 _ => {
-                    // Fallback to interpreter for other residuals
-                    dynasm!(ops
-                        ; .arch x64
-                        ; =>label
-                        ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
-                        ; jmp >exit_jit
-                    );
+                    if off == 0 {
+                        // If we're trying to bailout from the first instruction, we
+                        // need to record it as a JIT exit so that we don't try to call
+                        //
+                        // this same function again immediately in a loop.
+                        dynasm!(ops
+                            ; .arch x64
+                            ; mov WORD r13 => RunState.current_off, (off as i16)
+                            ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                            ; jmp >exit_jit
+                        );
+                    } else {
+                        // Fallback to interpreter for other residuals
+                        dynasm!(ops
+                            ; .arch x64
+                            ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
+                            ; jmp >exit_jit
+                        );
+                    }
                 }
             }
         }
@@ -346,6 +363,7 @@ impl Block {
         dynasm!(ops
             ; .arch x64
             // Default exit: end of block, return to interpreter at end
+            ; int3
             ; mov rax, QWORD (((self.instructions.len() as u64) << 32 | (id.0 as u64)) as i64)
             ; exit_jit:
             ; pop rdx // padding

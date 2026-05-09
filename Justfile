@@ -11,7 +11,7 @@ test: dump
 watch: dump
     cargo watch -- cargo check --bin lunacy
 
-TEST_FEATURES := "counters jit"
+TEST_FEATURES := "counters jit immediate_jit gas"
 [env("RUST_LOG", "debug")]
 debug num: dump
     time cargo run --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- ./dumped/dumped_{{num}}.bin
@@ -19,7 +19,7 @@ debug num: dump
 release num: dump
     time cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- ./dumped/dumped_{{num}}.bin
 
-gdb num: dump
+gdb-test num: dump
     cargo build --release --bin lunacy
     gdb --args ./target/release/lunacy ./dumped/dumped_{{num}}.bin
 
@@ -28,7 +28,12 @@ testing: (debug "12")
 # Benchmarks
 run benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    time cargo run --features "unreachable" --release --bin lunacy -- {{benchmark}}.bin
+    time cargo run --features "gas" --release --bin lunacy -- {{benchmark}}.bin
+
+[env("RUST_LOG", "debug")]
+run-debug benchmark:
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    time cargo run --bin lunacy -- {{benchmark}}.bin
 
 graph benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
@@ -36,6 +41,12 @@ graph benchmark:
 
 baseline benchmark:
     time lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench
+
+gdb-benchmark benchmark: dump
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    cargo build --release --bin lunacy
+    gdb --args ./target/release/lunacy {{benchmark}}.bin
+
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
