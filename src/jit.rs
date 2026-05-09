@@ -214,6 +214,24 @@ impl Block {
             let label = ops.new_dynamic_label();
             insts.insert(off, label);
         }
+
+        let mut emit_jump = |ops: &mut Assembler, target: &BlockId| {
+            if let Some(target_ptr) = jctx.blocks.get(target) {
+                // We already JIT compiled the block, and can jump to it directly.
+                dynasm!(ops
+                    ; jmp extern target_ptr.0 as usize
+                );
+            } else {
+                // The block could already be pending from another block in this assembler
+                // set. Use it if it already exists, otherwise create a new label for our
+                // relocation.
+                let pending_label = jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
+                dynasm!(ops
+                    ; jmp =>*pending_label
+                );
+            }
+        };
+
         for (off, res) in self.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
             let label = insts[&off];
@@ -299,20 +317,7 @@ impl Block {
                     );
                 },
                 Residual::Jump(target) => {
-                    if let Some(target_ptr) = jctx.blocks.get(target) {
-                        // We already JIT compiled the block, and can jump to it directly.
-                        dynasm!(ops
-                            ; jmp extern target_ptr.0 as usize
-                        );
-                    } else {
-                        // The block could already be pending from another block in this assembler
-                        // set. Use it if it already exists, otherwise create a new label for our
-                        // relocation.
-                        let pending_label = jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
-                        dynasm!(ops
-                            ; jmp =>*pending_label
-                        );
-                    }
+                    emit_jump(ops, target);
                 },
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
@@ -322,13 +327,25 @@ impl Block {
                         ; jmp >exit_jit
                     );
                 },
-                //Residual::Select(targets) => {
-                //    dynasm!(ops
-                //        ; .arch x64
-                //        ; mov rax, QWORD (((-3i32 as u64) << 32 | (off as u64)) as i64)
-                //        ; jmp >exit_jit
-                //    );
-                //},
+                Residual::Select(targets) => {
+                    dynasm!(ops
+                        ; mov rax, QWORD r13 => RunState.select
+                    );
+                    for (i, target) in targets.iter().enumerate() {
+                        dynasm!(ops
+                            ; cmp rax, i as i32
+                            ; jnz >next_target
+                        );
+                        emit_jump(ops, &target.1);
+                        dynasm!(ops
+                            ; next_target:
+                        );
+                    }
+                    // Should be unreachable, emit a trap
+                    dynasm!(ops
+                        ; int3
+                    );
+                },
                 Residual::Thunk(_) => {
                     dynasm!(ops
                         ; mov WORD r13 => RunState.current_off, (off as i16)

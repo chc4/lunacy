@@ -655,12 +655,12 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
             arg = yield YieldOp::Guard(i, LType::String);
         }
         arg = yield YieldOp::Exec(ResidualExec("concat", Rc::new(move |owner, state, cb| {
-            let mut s = FVec::new();
+            let mut s: FVec<_> = vec![].into();
             for i in (b as usize)..=(c as usize) {
 
                 let cont = match &state.vals[state.base + i as usize] {
                     LValue::OwnedString(s) => s.clone(),
-                    LValue::InternedString(s) => Rc::new(s.into_ref().0.to_vec()),
+                    LValue::InternedString(s) => Rc::new(s.into_ref().0.to_vec().into()),
                     _ => unreachable!(),
                 };
                 s.extend_from_slice(cont.as_slice());
@@ -1632,52 +1632,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let next_id = (ret & 0xFFFFFFFF) as usize;
                     self.clos = state.clos.clone();
 
-                    if let Some((a, b, c)) = jump_target {
-                        let to_call = &state.vals[state.base + a as usize];
-                        let LValue::LClosure(ref lclos) = to_call.clone() else { unreachable!() };
-                        debug!("jit set jump_target to {lclos:?}");
-                        // record call stack: we say where to return to and where to put the values
-                        let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
-                        // push empty stack frame
-                        state.vals.extend_from_slice(
-                            vec![LValue::Nil; next_stack].as_slice());
-                        state.callstack.push(CallstackEntry {
-                            clos: self.clos.clone(),
-                            // We can't use the captured `off`, because this closure
-                            // will be used by every instruction in the block.
-                            ret: ReturnLocation::Generator(BlockId(next_id as usize), state.current_off as usize),
-                            frame: state.base,
-                            limit: state.vals.len(),
-                            witness_frame: state.witness_base,
-                            witness_limit: state.hash_witnesses.len(),
-                            rloc: state.base + a,
-                            c
-                        });
-                        state.base = state.base + a as usize + 1;
-                        state.witness_base = state.hash_witnesses.len();
-                        state.vals.truncate(state.base +  next_stack);
-                        state.clos = lclos.clone();
-
-                        // Either use existing block, compile a new one, or use most
-                        // generic.
-                        let types = vec![LType::Unknown; next_stack];
-                        let ctx = Context::new(types);
-                        let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
-                        let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
-                            *block
-                        } else {
-                            debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, ctx);
-                            self.set_current(lclos.clone());
-                            self.block(owner, 0, ctx)
-                        };
-                        debug!("{:?} {block:?}", self.blocks);
-                        self.set_current(lclos.clone());
-                        id = block;
-                        off = 0;
-                        state.trap = false;
-                        continue;
-                    }
-
                     if next_off >= 0 {
                         debug!("jit exit to {next_id} {next_off}");
                         id = BlockId(next_id as usize);
@@ -1688,6 +1642,51 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         state.trap = false;
                         id = BlockId(next_id as usize);
                         off = state.current_off as usize;
+                        if let Some((a, b, c)) = jump_target {
+                            let to_call = &state.vals[state.base + a as usize];
+                            let LValue::LClosure(ref lclos) = to_call.clone() else { unreachable!() };
+                            debug!("jit set jump_target to {lclos:?}");
+                            // record call stack: we say where to return to and where to put the values
+                            let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
+                            // push empty stack frame
+                            state.vals.extend_from_slice(
+                                vec![LValue::Nil; next_stack].as_slice());
+                            state.callstack.push(CallstackEntry {
+                                clos: self.clos.clone(),
+                                // We can't use the captured `off`, because this closure
+                                // will be used by every instruction in the block.
+                                ret: ReturnLocation::Generator(BlockId(next_id as usize), state.current_off as usize),
+                                frame: state.base,
+                                limit: state.vals.len(),
+                                witness_frame: state.witness_base,
+                                witness_limit: state.hash_witnesses.len(),
+                                rloc: state.base + a,
+                                c
+                            });
+                            state.base = state.base + a as usize + 1;
+                            state.witness_base = state.hash_witnesses.len();
+                            state.vals.truncate(state.base +  next_stack);
+                            state.clos = lclos.clone();
+
+                            // Either use existing block, compile a new one, or use most
+                            // generic.
+                            let types = vec![LType::Unknown; next_stack];
+                            let ctx = Context::new(types);
+                            let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                            let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
+                                *block
+                            } else {
+                                debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, ctx);
+                                self.set_current(lclos.clone());
+                                self.block(owner, 0, ctx)
+                            };
+                            debug!("{:?} {block:?}", self.blocks);
+                            self.set_current(lclos.clone());
+                            id = block;
+                            off = 0;
+                            state.trap = false;
+                            continue;
+                        }
                         // Fallthrough to continue post-trap in the interpreter
                     } else if next_off == -2 {
                         debug!("jit bail 2 from {next_id}");

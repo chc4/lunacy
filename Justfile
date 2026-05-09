@@ -28,7 +28,7 @@ testing: (debug "12")
 # Benchmarks
 run benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    time cargo run --features "gas" --release --bin lunacy -- {{benchmark}}.bin
+    time cargo run --release --bin lunacy -- {{benchmark}}.bin
 
 [env("RUST_LOG", "debug")]
 run-debug benchmark:
@@ -46,17 +46,34 @@ gdb-benchmark benchmark: dump
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin lunacy
     gdb --args ./target/release/lunacy {{benchmark}}.bin
+    time ./target/unsafe/lunacy {{benchmark}}.bin
 
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
+INTERPRETER_FEATURES := ""
+interpreter-compile:
+    cargo build --release --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin lunacy --target-dir ./target/interpreter
+interpreter benchmark: interpreter-compile
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    time ./target/interpreter/release/lunacy {{benchmark}}.bin
+
+UNSAFE_FEATURES := "unreachable skip_vec"
+unsafe-compile:
+    cargo build --release --features "{{UNSAFE_FEATURES}}" --bin lunacy --target-dir ./target/unsafe
+unsafe benchmark: unsafe-compile
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    time ./target/unsafe/release/lunacy {{benchmark}}.bin
+
 # Hyperfine reports
-hyperfine benchmark:
+hyperfine benchmark: unsafe-compile interpreter-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin lunacy
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}.md \
         "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench" \
-        "./target/release/lunacy {{benchmark}}.bin"
+        "./target/interpreter/release/lunacy {{benchmark}}.bin" \
+        "./target/release/lunacy {{benchmark}}.bin" \
+        "./target/unsafe/release/lunacy {{benchmark}}.bin"
 hyperfines: (hyperfine "binarytrees") (hyperfine "life") (run "nbody")
 
 all: test benchmarks (hyperfine "binarytrees")

@@ -723,24 +723,24 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn as_string(&self, owner: &TCellOwner<TcOwner>) -> Option<Rc<Vec<u8>>> {
+    pub fn as_string(&self, owner: &TCellOwner<TcOwner>) -> Option<Rc<FVec<u8>>> {
         // TODO: metamethods?
         match self {
-            LValue::OwnedString(s) => Some(s.clone()),
-            LValue::InternedString(s) => Some(Rc::new(s.into_ref().0.to_vec())),
+            LValue::OwnedString(s) => Some(s.clone().into()),
+            LValue::InternedString(s) => Some(Rc::new(s.into_ref().0.to_vec().into())),
             LValue::Number(f) => {
-                let mut s = Vec::new();
+                let mut s: FVec<_> = vec![].into();
                 write!(s, "{}", f.0);
                 Some(Rc::new(s))
             },
             LValue::Table(tc) => {
-                let mut s = Vec::new();
+                let mut s: FVec<_> = vec![].into();
                 write!(s, "{:?}", tc);
                 Some(Rc::new(s))
             },
             LValue::Nil => None,
             LValue::LClosure(l) => {
-                let mut s = Vec::new();
+                let mut s: FVec<_> = vec![].into();
                 let line = unsafe { (*l.0.ro(owner).prototype).line_defined };
                 let src = unsafe { &(*l.0.ro(owner).prototype).source };
                 write!(s, "function({:p}, {:?} @ {})", Rc::as_ptr(&l.0), src, line);
@@ -750,24 +750,24 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn as_string_nolock(&self) -> Option<Rc<Vec<u8>>> {
+    pub fn as_string_nolock(&self) -> Option<Rc<FVec<u8>>> {
         // TODO: metamethods?
         match self {
-            LValue::OwnedString(s) => Some(s.clone()),
-            LValue::InternedString(s) => Some(Rc::new(s.into_ref().0.to_vec())),
+            LValue::OwnedString(s) => Some(s.clone().into()),
+            LValue::InternedString(s) => Some(Rc::new(s.into_ref().0.to_vec().into())),
             LValue::Number(f) => {
-                let mut s = Vec::new();
+                let mut s: FVec<_> = vec![].into();
                 write!(s, "{}", f.0);
                 Some(Rc::new(s))
             },
             LValue::Table(tc) => {
-                let mut s = Vec::new();
+                let mut s: FVec<_> = vec![].into();
                 write!(s, "{:?}", tc);
                 Some(Rc::new(s))
             },
             LValue::Nil => None,
             LValue::LClosure(l) => {
-                let mut s = Vec::new();
+                let mut s: FVec<_> = vec![].into();
                 write!(s, "function({:p})", Rc::as_ptr(&l.0));
                 Some(Rc::new(s))
             },
@@ -1004,7 +1004,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         },
                         _ => { },
                     };
-                    vec![]
+                    vec![].into()
                 }))),
                 math,
                 os,
@@ -1058,7 +1058,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 upvals,
                 callstack,
                 counters: Default::default(),
-                hash_witnesses: vec![],
+                hash_witnesses: vec![].into(),
                 select: 0,
                 trap: false,
                 current_off: 0,
@@ -1296,7 +1296,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::CONCAT => {
                     let (a, b, c) = <CONCAT as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
-                    let mut s = FVec::new();
+                    let mut s: FVec<_> = vec![].into();
                     for i in (b as usize)..=(c as usize) {
                         s.extend_from_slice(&state.vals[state.base + i as usize].as_string(owner).ok_or("nil concat")?)
                     }
