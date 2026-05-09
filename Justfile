@@ -11,15 +11,19 @@ test: dump
 watch: dump
     cargo watch -- cargo check --bin lunacy
 
+TEST_FEATURES := "counters jit"
 [env("RUST_LOG", "debug")]
 debug num: dump
-    time cargo run --no-default-features --features "graph counters jit immediate_jit" --bin lunacy -- ./dumped/dumped_{{num}}.bin
+    time cargo run --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- ./dumped/dumped_{{num}}.bin
 
 release num: dump
-    time cargo run --release --no-default-features --features "graph counters jit immediate_jit" --bin lunacy -- ./dumped/dumped_{{num}}.bin
+    time cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- ./dumped/dumped_{{num}}.bin
+
+gdb num: dump
+    cargo build --release --bin lunacy
+    gdb --args ./target/release/lunacy ./dumped/dumped_{{num}}.bin
 
 testing: (debug "12")
-
 
 # Benchmarks
 run benchmark:

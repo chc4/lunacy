@@ -233,8 +233,8 @@ impl Block {
                     dynasm!(ops
                         ; .arch x64
                         ; =>label
-                        ; mov rdi, r13 // state
                         ; mov rsi, r12 // owner
+                        ; mov rdi, r13 // state
                         ; mov rdx, QWORD (*tab as i64)
                         ; mov rcx, QWORD (href_u8 as i64)
                         ; mov rax, QWORD (JitHelper::check_epoch as *const () as i64)
@@ -250,8 +250,8 @@ impl Block {
                     dynasm!(ops
                         ; .arch x64
                         ; =>label
-                        ; mov rdi, r13 // state
                         ; mov rsi, r12 // owner
+                        ; mov rdi, r13 // state
                         ; mov rdx, QWORD (*tab as i64)
                         ; mov rcx, QWORD (href_u8 as i64)
                         ; mov r8, QWORD (expected_u8 as i64)
@@ -272,10 +272,11 @@ impl Block {
                         ; mov rcx, r14 // cb data
                         ; mov r8, r15  // cb vtable
                         ; mov rdi, QWORD (this_obj as i64)
-                        ; mov rax, QWORD (this_call as i64)
+                        //; mov rax, QWORD (this_vtable as i64)
+                        ; mov rbx, QWORD (this_call as i64)
                         // Lua wants to see PC+1, and also we want to resume to PC+1 if we trap.
                         ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
-                        ; call rax
+                        ; call rbx
                         //// Check for trap
                         ; mov rax, r13 => RunState.trap
                         ; test al, al
@@ -329,7 +330,7 @@ impl Block {
                     );
                 },
                 _ => {
-                    // Fallback to interpreter for other residuals (Thunk)
+                    // Fallback to interpreter for other residuals
                     dynasm!(ops
                         ; .arch x64
                         ; =>label
