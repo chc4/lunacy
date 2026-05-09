@@ -185,7 +185,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         debug!("drained pending");
         let buf = ops.finalize().unwrap();
-        self.jctx.reserve(buf.len());
         let Some(slab) = self.jctx.commit(base, buf.as_slice()) else { panic!() };
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
 
@@ -229,47 +228,6 @@ impl Block {
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
-                Residual::Exec(f) => {
-                    let (this_obj, this_vtable, this_call) = get_ptr_from_closure(f.1.as_ref());
-                    dynasm!(ops
-                        ; .arch x64
-                        ; =>label
-                        ; mov rsi, r12 // owner
-                        ; mov rdx, r13 // state
-                        ; mov rcx, r14 // cb data
-                        ; mov r8, r15  // cb vtable
-                        ; mov rdi, QWORD (this_obj as i64)
-                        ; mov rax, QWORD (this_call as i64)
-                        ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
-                        ; call rax
-                        //// Check for trap
-                        ; mov rax, r13 => RunState.trap
-                        ; test al, al
-                        ; jz >no_trap
-                        //// Trap 4 so specializer can handle it
-                        ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
-                        ; jmp >exit_jit
-                        ; no_trap:
-                    );
-                },
-                Residual::Jump(target) => {
-                    if let Some(target_ptr) = jctx.blocks.get(target) {
-                        // We already JIT compiled the block, and can jump to it directly.
-                        dynasm!(ops
-                            ; =>label
-                            ; jmp extern target_ptr.0 as usize
-                        );
-                    } else {
-                        // The block could already be pending from another block in this assembler
-                        // set. Use it if it already exists, otherwise create a new label for our
-                        // relocation.
-                        let pending_label = jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
-                        dynasm!(ops
-                            ; =>label
-                            ; jmp =>*pending_label
-                        );
-                    }
-                },
                 Residual::EpochCheck { tab, href } => {
                     let href_u8 = href.0;
                     dynasm!(ops
@@ -303,6 +261,48 @@ impl Block {
                         ; jnz =>insts[&(off + 2)]
                         // Fail: fallthrough to next (off + 1)
                     );
+                },
+                Residual::Exec(f) => {
+                    let (this_obj, this_vtable, this_call) = get_ptr_from_closure(f.1.as_ref());
+                    dynasm!(ops
+                        ; .arch x64
+                        ; =>label
+                        ; mov rsi, r12 // owner
+                        ; mov rdx, r13 // state
+                        ; mov rcx, r14 // cb data
+                        ; mov r8, r15  // cb vtable
+                        ; mov rdi, QWORD (this_obj as i64)
+                        ; mov rax, QWORD (this_call as i64)
+                        // Lua wants to see PC+1, and also we want to resume to PC+1 if we trap.
+                        ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
+                        ; call rax
+                        //// Check for trap
+                        ; mov rax, r13 => RunState.trap
+                        ; test al, al
+                        ; jz >no_trap
+                        //// Trap 4 so specializer can handle it
+                        ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; jmp >exit_jit
+                        ; no_trap:
+                    );
+                },
+                Residual::Jump(target) => {
+                    if let Some(target_ptr) = jctx.blocks.get(target) {
+                        // We already JIT compiled the block, and can jump to it directly.
+                        dynasm!(ops
+                            ; =>label
+                            ; jmp extern target_ptr.0 as usize
+                        );
+                    } else {
+                        // The block could already be pending from another block in this assembler
+                        // set. Use it if it already exists, otherwise create a new label for our
+                        // relocation.
+                        let pending_label = jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
+                        dynasm!(ops
+                            ; =>label
+                            ; jmp =>*pending_label
+                        );
+                    }
                 },
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
