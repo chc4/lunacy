@@ -161,7 +161,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; jmp extern block_ptr.0 as usize
             );
         } else {
-            self.jctx.blocks.insert(id, base);
+            // We need to skip over the uncommitted prologue
+            let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
+            self.jctx.blocks.insert(id, new_block);
             let _block = self.blocks[id.0].jit_body(id, &mut self.jctx, &mut ops);
         }
 
