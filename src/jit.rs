@@ -1,9 +1,10 @@
 use std::cell::Cell;
+use std::collections::{HashMap, BTreeMap};
 use crate::generator::{ExecCallback, typeof_};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
-use crate::generator::{Block, BlockId, Residual};
-use dynasmrt::{ExecutableBuffer, dynasm, DynasmApi, DynasmLabelApi};
+use crate::generator::{Specializer, Block, BlockId, Residual};
+use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
 use log::debug;
 use log::info;
@@ -85,10 +86,62 @@ impl JitHelper {
     }
 }
 
-impl Block {
+const JIT_SIZE: usize = 0x1000 * 16;
+pub struct JitContext {
+    pub memory: std::cell::Cell<dynasmrt::mmap::ExecutableBuffer>,
+    pub blocks: HashMap<BlockId, JitPtr>,
+    pub pending: BTreeMap<BlockId, DynamicLabel>,
+    pub used: usize,
+}
+
+#[derive(Copy, Clone)]
+struct JitPtr(*const u8);
+
+impl JitContext {
+    pub fn new() -> Self {
+        let mut memory = dynasmrt::mmap::MutableBuffer::new(JIT_SIZE).unwrap();
+        // Set the JIT memory to the max size initially, so that we don't need to
+        // mprotect back to mutable just to reserve
+        memory.set_len(JIT_SIZE);
+        Self {
+            memory: Cell::new(memory.make_exec().unwrap()),
+            blocks: HashMap::new(),
+            pending: BTreeMap::new(),
+            used: 0
+        }
+    }
+
+    fn end(&self) -> JitPtr {
+        let mut buf = self.memory.take();
+        let ptr = JitPtr(unsafe { buf.as_ptr().add(self.used).cast() });
+        self.memory.set(buf);
+        ptr
+    }
+
+    // Reserve memory in the JIT buffer
+    fn reserve(&mut self, len: usize) {
+        assert!(self.used + len < JIT_SIZE);
+        self.used += len;
+    }
+
+    // Commit contents 
+    fn commit(&mut self, ptr: JitPtr, contents: &[u8]) -> Option<*mut u8> {
+        let mut mutable = self.memory.take().make_mut().unwrap();
+        assert!(ptr.0 >= mutable.as_mut_ptr());
+        assert!(ptr.0 <= unsafe { mutable.as_mut_ptr().add(self.used) });
+        assert!(unsafe { ptr.0.add(contents.len()) } <= unsafe { mutable.as_mut_ptr().add(self.used) });
+        let ptr = unsafe { mutable.as_mut_ptr().offset(ptr.0.offset_from(mutable.as_mut_ptr())) };
+        unsafe { core::slice::from_raw_parts_mut(ptr, contents.len()).copy_from_slice(contents) };
+        self.memory.set(mutable.make_exec().unwrap());
+        Some(ptr)
+    }
+}
+
+impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn jit_compile(&mut self, id: BlockId) {
         debug!("JIT compiling block {:?}", id);
-        let mut ops = dynasmrt::x64::Assembler::new().unwrap();
+        let base = self.jctx.end();
+        let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
         let entry = ops.offset();
 
         // SystemV ABI is RDI, RSI, RDX, RCX, R8, R9
@@ -101,6 +154,57 @@ impl Block {
             ; push rax // alignment
         );
 
+        // We may have already JIT this block, if it was jumped to by another block
+        // first. In that case we just have to jump to it.
+        if let Some(block_ptr) = self.jctx.blocks.get(&id) {
+            dynasm!(ops
+            ; jmp extern block_ptr.0 as usize
+            );
+        } else {
+            self.jctx.blocks.insert(id, base);
+            let _block = self.blocks[id.0].jit_body(id, &mut self.jctx, &mut ops);
+        }
+
+
+        // Reserve the full length of our compiled function
+        let end = ops.offset();
+        self.jctx.reserve(end.0);
+
+        // Now we need to go through and also compile all of the pending labels for other blocks.
+        while let Some((pending_block, pending_label)) = self.jctx.pending.pop_first() {
+            debug!("pending block {:?} {:?}", pending_block.0, pending_label);
+            let pending_ptr = self.jctx.end();
+            let pending_start = ops.offset();
+            self.jctx.blocks.insert(pending_block, pending_ptr);
+            dynasm!(ops
+                ; =>pending_label
+            );
+            let _block = self.blocks[pending_block.0].jit_body(pending_block, &mut self.jctx, &mut ops);
+            self.jctx.reserve(ops.offset().0 - pending_start.0);
+        }
+
+        debug!("drained pending");
+        let buf = ops.finalize().unwrap();
+        self.jctx.reserve(buf.len());
+        let Some(slab) = self.jctx.commit(base, buf.as_slice()) else { panic!() };
+        let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
+
+        self.blocks[id.0].jit_info.entry = Some(entrypoint);
+    }
+}
+
+impl Drop for JitContext {
+    fn drop(&mut self) {
+        // SAFETY: This requires that no JIT code is currently running, all JitInfo for Blocks
+        // that were derived from our memory have been destroyed.
+        // Under normal circumstances this is upheld by storing the JitContext inside the
+        // Specializer that will use it for Blocks.
+    }
+}
+type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
+impl Block {
+    pub fn jit_body(&mut self, id: BlockId, jctx: &mut JitContext, ops: &mut Assembler) -> AssemblyOffset {
+        let entry = ops.offset();
         let mut insts = std::collections::HashMap::new();
         for (off, res) in self.instructions.iter().enumerate() {
             let label = ops.new_dynamic_label();
@@ -136,25 +240,35 @@ impl Block {
                         ; mov r8, r15  // cb vtable
                         ; mov rdi, QWORD (this_obj as i64)
                         ; mov rax, QWORD (this_call as i64)
+                        ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
                         ; call rax
                         //// Check for trap
                         ; mov rax, r13 => RunState.trap
                         ; test al, al
                         ; jz >no_trap
-                        //// Trap: return (-4, off + 1) so specializer can handle it
-                        ; mov rax, QWORD (((-4i32 as u64) << 32 | (off as u64 + 1)) as i64)
+                        //// Trap 4 so specializer can handle it
+                        ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                         ; jmp >exit_jit
                         ; no_trap:
                     );
                 },
                 Residual::Jump(target) => {
-                    let tid = target.0 as i64;
-                    dynasm!(ops
-                        ; .arch x64
-                        ; =>label
-                        ; mov rax, QWORD (((tid as u64) << 32) as i64)
-                        ; jmp >exit_jit
-                    );
+                    if let Some(target_ptr) = jctx.blocks.get(target) {
+                        // We already JIT compiled the block, and can jump to it directly.
+                        dynasm!(ops
+                            ; =>label
+                            ; jmp extern target_ptr.0 as usize
+                        );
+                    } else {
+                        // The block could already be pending from another block in this assembler
+                        // set. Use it if it already exists, otherwise create a new label for our
+                        // relocation.
+                        let pending_label = jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
+                        dynasm!(ops
+                            ; =>label
+                            ; jmp =>*pending_label
+                        );
+                    }
                 },
                 Residual::EpochCheck { tab, href } => {
                     let href_u8 = href.0;
@@ -194,7 +308,8 @@ impl Block {
                     dynasm!(ops
                         ; .arch x64
                         ; =>label
-                        ; mov rax, QWORD (((-2i32 as u64) << 32 | (off as u64)) as i64)
+                        ; mov WORD r13 => RunState.current_off, (off as i16)
+                        ; mov rax, QWORD (((-2i32 as u64) << 32 | (id.0 as u64)) as i64)
                         ; jmp >exit_jit
                     );
                 },
@@ -206,12 +321,19 @@ impl Block {
                 //        ; jmp >exit_jit
                 //    );
                 //},
+                Residual::Thunk(_) => {
+                    dynasm!(ops
+                        ; mov WORD r13 => RunState.current_off, (off as i16)
+                        ; mov rax, QWORD (((-4i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; jmp >exit_jit
+                    );
+                },
                 _ => {
                     // Fallback to interpreter for other residuals (Thunk)
                     dynasm!(ops
                         ; .arch x64
                         ; =>label
-                        ; mov rax, QWORD (((-1i32 as u64) << 32 | (off as u64)) as i64)
+                        ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
                         ; jmp >exit_jit
                     );
                 }
@@ -221,18 +343,13 @@ impl Block {
         dynasm!(ops
             ; .arch x64
             // Default exit: end of block, return to interpreter at end
-            ; mov rax, QWORD (((-1i32 as u64) << 32 | (self.instructions.len() as u64)) as i64)
+            ; mov rax, QWORD (((self.instructions.len() as u64) << 32 | (id.0 as u64)) as i64)
             ; exit_jit:
             ; pop rdx // padding
             ; pop rbp
             ; pop rbx
             ; ret
         );
-
-        let buf = ops.finalize().unwrap();
-        let entrypoint: JitExec = unsafe { core::mem::transmute(buf.ptr(entry)) };
-
-        self.jit_info.buffer = Some(buf);
-        self.jit_info.entry = Some(entrypoint);
+        entry
     }
 }

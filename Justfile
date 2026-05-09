@@ -12,13 +12,19 @@ watch: dump
     cargo watch -- cargo check --bin lunacy
 
 [env("RUST_LOG", "debug")]
-debug: dump
-    time cargo run --release --no-default-features --features "graph counters jit" --bin lunacy -- ./dumped/dumped_12.bin
+debug num: dump
+    time cargo run --no-default-features --features "graph counters jit immediate_jit" --bin lunacy -- ./dumped/dumped_{{num}}.bin
+
+release num: dump
+    time cargo run --release --no-default-features --features "graph counters jit immediate_jit" --bin lunacy -- ./dumped/dumped_{{num}}.bin
+
+testing: (debug "12")
+
 
 # Benchmarks
 run benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    time cargo run --release --bin lunacy -- {{benchmark}}.bin
+    time cargo run --features "unreachable" --release --bin lunacy -- {{benchmark}}.bin
 
 graph benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua

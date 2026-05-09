@@ -11,7 +11,8 @@ counters = []
 graph = []
 immediate_jit = []
 jit = []
-sonic = ["skip_rc", "skip_vec"]
+unreachable = []
+sonic = ["skip_rc", "skip_vec", "unreachable"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

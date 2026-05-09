@@ -17,7 +17,7 @@ use crate::vm::RunState;
 use crate::vm::LConstant;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
-use crate::jit::JitInfo;
+use crate::jit::{JitInfo, JitContext};
 
 use log::debug;
 use log::info;
@@ -49,6 +49,11 @@ impl Block {
             jit_info: JitInfo::new(),
         }
     }
+}
+
+#[cfg(feature = "unchecked")]
+macro_rules! unreachable {
+    () => { unsafe { core::hint::unreachable_unchecked() } }
 }
 
 #[derive(Debug)]
@@ -818,7 +823,7 @@ pub fn guard_filter(mut sub: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Retu
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Debug)]
 pub struct BlockId(pub usize);
 pub type Pc = usize;
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
@@ -918,6 +923,7 @@ impl Context {
 pub struct Specializer<'src, 'intern> {
     pub blocks: Vec<Block>,
     pub clos: Tc<LClosure<'src, 'intern>>,
+    pub jctx: JitContext,
 
     pub versions: std::collections::HashMap<
         *const crate::chunk::FunctionBlock<'src, LConstant<'src, 'intern>>,
@@ -929,6 +935,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Self {
             blocks: Vec::new(),
             versions: HashMap::default(),
+            jctx: JitContext::new(),
             clos,
         }
     }
@@ -1569,7 +1576,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     pub fn run(&mut self, owner: &mut TCellOwner<TcOwner>, mut id: BlockId, mut state: RunState<'src, 'intern>) -> RunState<'src, 'intern> {
-        let mut off = 0;
+        let mut off: usize = 0;
         debug!("run");
         loop {
             let block = &mut self.blocks[id.0];
@@ -1581,10 +1588,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 } else {
                     if block.jit_info.entry.is_none() {
                         debug!("jit compile {id:?}");
-                        block.jit_compile(id);
+                        self.jit_compile(id);
                     }
 
-                    let mut jit_entry = block.jit_info.entry.unwrap();
+                    let mut jit_entry = self.blocks[id.0].jit_info.entry.unwrap();
                     let mut jump_target = None;
                     warn!("running jit for {id:?}");
                     let ret = jit_entry(owner, &mut state, &mut |effect, owner, state| {
@@ -1599,7 +1606,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         vec![LValue::Nil; next_stack].as_slice());
                                     state.callstack.push(CallstackEntry {
                                         clos: self.clos.clone(),
-                                        ret: ReturnLocation::Generator(id, off),
+                                        // We can't use the captured `off`, because this closure
+                                        // will be used by every instruction in the block.
+                                        ret: ReturnLocation::Generator(id, state.current_off as usize),
                                         frame: state.base,
                                         limit: state.vals.len(),
                                         witness_frame: state.witness_base,
@@ -1655,39 +1664,48 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             _ => unimplemented!()
                         }
                     });
-                    let next_id = (ret >> 32) as i32 as isize;
-                    let next_off = (ret & 0xFFFFFFFF) as usize;
+                    let next_off = (ret >> 32) as i32 as isize;
+                    let next_id = (ret & 0xFFFFFFFF) as usize;
                     self.clos = state.clos.clone();
 
                     if let Some((target_id, target_off)) = jump_target {
+                        debug!("jit set jump_target to {target_id:?} {target_off}");
                         id = target_id;
                         off = target_off;
                         state.trap = false;
                         continue;
                     }
 
-                    if next_id >= 0 {
-                        debug!("jit exit to {next_id}");
+                    if next_off >= 0 {
+                        debug!("jit exit to {next_id} {next_off}");
                         id = BlockId(next_id as usize);
-                        off = 0;
+                        off = next_off as usize;
                         continue;
-                    } else if next_id == -1 {
-                        debug!("jit bail 1 to {next_off}");
+                    } else if next_off == -1 {
+                        debug!("jit bail 1 from {next_id}");
                         state.trap = false;
-                        off = next_off;
-                    } else if next_id == -2 {
-                        debug!("jit bail 2 to {next_off}");
-                        off = next_off;
-                    } else if next_id == -3 {
-                        debug!("jit bail 3 to {next_off}");
-                        let Residual::Select(ref paths) = self.blocks[id.0].instructions[next_off] else { panic!() };
+                        id = BlockId(next_id as usize);
+                        off = state.current_off as usize;
+                        // Fallthrough to continue post-trap in the interpreter
+                    } else if next_off == -2 {
+                        debug!("jit bail 2 from {next_id}");
+                        id = BlockId(next_id as usize);
+                        off = state.current_off as usize;
+                        // Fallthrough to handle RET
+                    } else if next_off == -3 {
+                        debug!("jit bail 3 from {next_id}");
+                        off = state.current_off as usize;
+                        let Residual::Select(ref paths) = self.blocks[id.0].instructions[off] else { panic!() };
                         id = paths[state.select].1;
                         off = 0;
                         continue;
-                    } else if next_id == -4 {
-                        debug!("jit bail 4 {off}");
+                    } else if next_off == -4 {
+                        debug!("jit bail 4 from {next_id}");
                         state.trap = false;
-                        continue;
+                        id = BlockId(next_id as usize);
+                        off = state.current_off as usize;
+                        // Fallthrough to immediately handle the instruction: if we have a
+                        // thunk at offset=0, we don't want to jump back to the JIT again.
                     }
                 }
             }
