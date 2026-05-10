@@ -37,7 +37,7 @@ impl Eq for Number {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
 pub enum Opcode {
     MOVE = 0,
     LOADK,
