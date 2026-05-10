@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
 use crate::generator::{ExecCallback, typeof_};
 use qcell::{TCell, TCellOwner};
-use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
+use crate::vm::{Tc, TcOwner, Vm, RunState, LValue, LBoxed};
 use crate::generator::{Specializer, Block, BlockId, Residual};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use rustc_hash::FxBuildHasher;
@@ -69,7 +69,7 @@ impl JitHelper {
             let owner = &*owner;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
             let tab_val = &rs.vals[rs.base + tab];
-            let LValue::Table(tab) = tab_val else { unreachable!() };
+            let tab_unboxed = unsafe { tab_val.unbox() }; let LValue::Table(tab) = tab_unboxed else { unreachable!() };
             debug!("JIT check_epoch sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
             hwit.epoch == tab.ro(owner).epoch
         }
@@ -83,7 +83,7 @@ impl JitHelper {
             let owner = &*owner;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
             let tab_val = &rs.vals[rs.base + tab];
-            let LValue::Table(tab) = tab_val else { unreachable!() };
+            let tab_unboxed = unsafe { tab_val.unbox() }; let LValue::Table(tab) = tab_unboxed else { unreachable!() };
             let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
             (typeof_(val) as u8) == expected
         }

@@ -436,15 +436,18 @@ impl std::hash::BuildHasher for InternedHasher {
         where T: Hash
     {
         debug!("hashing {:?}", std::any::type_name_of_val(&x));
-        if type_eq::<T, &LValue<'_, '_>>() {
-            let lv: &&LValue<'_, '_> = unsafe { std::mem::transmute(&x) };
-            match lv {
-                LValue::InternedString(i) => {
+        if type_eq::<T, &LBoxed>() {
+            let lb: &LBoxed = unsafe { std::mem::transmute(&x) };
+            if (lb.0 & LBoxed::NUMBER_TAG) == 0 {
+                let tag_low = lb.0 & LBoxed::PTR_MASK_LOW;
+                let tag_top = lb.0 & LBoxed::PTR_MASK_TOP;
+                let ptr = (lb.0 & !LBoxed::PTR_MASK_TOP & !LBoxed::PTR_MASK_LOW) as *const ();
+                if tag_top == LBoxed::TAG_TOP_INTERNED && tag_low == LBoxed::TAG_LOW_INTERNED {
+                    let ptr = ptr as *const (&[u8], u64);
+                    let i = unsafe { &*ptr };
                     debug!("interned hash {:?} {}", i.0, i.1);
-                    //assert_eq!(self.hasher.hash_one(i.0), i.1);
-                    return i.1
-                },
-                _ => (),
+                    return i.1;
+                }
             }
         }
         self.hasher.hash_one(x)
@@ -452,33 +455,30 @@ impl std::hash::BuildHasher for InternedHasher {
 }
 
 #[derive(Debug)]
-pub struct Table<'src, 'intern> {
-    pub array: FVec<LValue<'src, 'intern>>,
-    pub hash: IndexMap<LValue<'src, 'intern>, LValue<'src, 'intern>, InternedHasher>,
+pub struct Table {
+    pub array: FVec<LBoxed>,
+    pub hash: IndexMap<LBoxed, LBoxed, InternedHasher>,
     pub epoch: usize,
 }
 
-impl<'src, 'intern> Table<'src, 'intern> {
+impl Table {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
-            array: vec![LValue::Nil; array].into(),
+            array: vec![LBoxed::default(); array].into(),
             hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
             epoch: 0,
         }
     }
 }
 
-impl<'src, 'intern> Tc<Table<'src, 'intern>> {
+impl<'src, 'intern> Tc<Table> {
     pub fn get(&self, owner: &TCellOwner<TcOwner>, key: &LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
-            LValue::Number(n) => Some(self.ro(owner).array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
-            LValue::InternedString(s) => {
-                self.ro(owner).hash.get(key).cloned()
-            },
-            LValue::OwnedString(s) => {
-                self.ro(owner).hash.get(key).cloned()
-            },
-            _ => unimplemented!()
+            LValue::Number(n) => Some(unsafe { self.ro(owner).array.get(n.0 as usize-1).cloned().unwrap_or_default().unbox() }),
+            _ => {
+                let boxed_key = LBoxed::box_lvalue(key.clone());
+                self.ro(owner).hash.get(&boxed_key).map(|v| unsafe { v.unbox() })
+            }
         }
     }
 
@@ -487,19 +487,16 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
             LValue::Number(n) => {
                 // TODO: sparse arrays
                 if self.rw(owner).array.len() <= n.0 as usize {
-                    self.rw(owner).array.resize_with(n.0 as usize, || LValue::Nil);
+                    self.rw(owner).array.resize_with(n.0 as usize, || LBoxed::default());
                 }
-                self.rw(owner).array[n.0 as usize-1] = value
+                self.rw(owner).array[n.0 as usize-1] = LBoxed::box_lvalue(value)
             },
-            LValue::InternedString(ref s) => {
-                self.rw(owner).hash.insert(key, value);
+            _ => {
+                let boxed_key = LBoxed::box_lvalue(key);
+                let boxed_val = LBoxed::box_lvalue(value);
+                self.rw(owner).hash.insert(boxed_key, boxed_val);
                 self.rw(owner).epoch += 1;
-            },
-            LValue::OwnedString(ref s) => {
-                self.rw(owner).hash.insert(key, value);
-                self.rw(owner).epoch += 1;
-            },
-            _ => unimplemented!()
+            }
         }
     }
 }
@@ -597,8 +594,182 @@ pub enum LValue<'src, 'intern> {
     OwnedString(Rc<FVec<u8>>),
     LClosure(Tc<LClosure<'src, 'intern>>),
     NClosure(Tc<NClosure>),
-    Table(Tc<Table<'src, 'intern>>),
+    Table(Tc<Table>),
 }
+
+#[derive(Debug, Eq, Hash)]
+#[repr(transparent)]
+pub struct LBoxed(pub u64);
+
+impl LBoxed {
+    pub const NUMBER_TAG: u64 = 0xfffe000000000000;
+    pub const DOUBLE_ENCODE_OFFSET: u64 = 0x0002000000000000;
+    pub const OTHER_TAG: u64 = 0x2;
+    pub const BOOL_TAG: u64 = 0x4;
+    pub const VALUE_NULL: u64 = Self::OTHER_TAG;
+    pub const VALUE_FALSE: u64 = Self::OTHER_TAG | Self::BOOL_TAG | 0;
+    pub const VALUE_TRUE: u64 = Self::OTHER_TAG | Self::BOOL_TAG | 1;
+
+    pub const PTR_MASK_TOP: u64 = 0xffff000000000000;
+    pub const PTR_MASK_LOW: u64 = 0x7;
+
+    pub const TAG_TOP_TABLE: u64 = 0x0000000000000000;
+    pub const TAG_LOW_TABLE: u64 = 0;
+
+    pub const TAG_TOP_LCLOSURE: u64 = 0x0000000000000000;
+    pub const TAG_LOW_LCLOSURE: u64 = 1;
+
+    pub const TAG_TOP_NCLOSURE: u64 = 0x0000000000000000;
+    pub const TAG_LOW_NCLOSURE: u64 = 4;
+
+    pub const TAG_TOP_INTERNED: u64 = 0x0000000000000000;
+    pub const TAG_LOW_INTERNED: u64 = 5;
+
+    pub const TAG_TOP_OWNED: u64 = 0x0001000000000000;
+    pub const TAG_LOW_OWNED: u64 = 0;
+
+    #[inline(always)]
+    pub fn box_lvalue<'src, 'intern>(val: LValue<'src, 'intern>) -> Self {
+        match val {
+            LValue::Nil => LBoxed(Self::VALUE_NULL),
+            LValue::Bool(b) => LBoxed(if b { Self::VALUE_TRUE } else { Self::VALUE_FALSE }),
+            LValue::Number(n) => {
+                let bits = n.0.to_bits();
+                LBoxed(bits.wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
+            }
+            LValue::Table(t) => {
+                let ptr = Rc::into_raw(t.0) as u64;
+                LBoxed(ptr | Self::TAG_TOP_TABLE | Self::TAG_LOW_TABLE)
+            }
+            LValue::LClosure(c) => {
+                let ptr = Rc::into_raw(c.0) as u64;
+                LBoxed(ptr | Self::TAG_TOP_LCLOSURE | Self::TAG_LOW_LCLOSURE)
+            }
+            LValue::NClosure(c) => {
+                let ptr = Rc::into_raw(c.0) as u64;
+                LBoxed(ptr | Self::TAG_TOP_NCLOSURE | Self::TAG_LOW_NCLOSURE)
+            }
+            LValue::InternedString(s) => {
+                let ptr = s.into_ref() as *const _ as u64;
+                LBoxed(ptr | Self::TAG_TOP_INTERNED | Self::TAG_LOW_INTERNED)
+            }
+            LValue::OwnedString(s) => {
+                let ptr = Rc::into_raw(s) as u64;
+                LBoxed(ptr | Self::TAG_TOP_OWNED | Self::TAG_LOW_OWNED)
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn unbox<'src, 'intern>(&self) -> LValue<'src, 'intern> {
+        if (self.0 & Self::NUMBER_TAG) != 0 {
+            // Double or Int32
+            let bits = self.0.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET);
+            return LValue::Number(Number(f64::from_bits(bits)));
+        }
+
+        match self.0 {
+            Self::VALUE_NULL => LValue::Nil,
+            Self::VALUE_FALSE => LValue::Bool(false),
+            Self::VALUE_TRUE => LValue::Bool(true),
+            _ => {
+                let tag_top = self.0 & Self::PTR_MASK_TOP;
+                let tag_low = self.0 & Self::PTR_MASK_LOW;
+                let ptr = (self.0 & !Self::PTR_MASK_TOP & !Self::PTR_MASK_LOW) as *const ();
+                if tag_top == Self::TAG_TOP_OWNED && tag_low == Self::TAG_LOW_OWNED {
+                    let rc = unsafe { Rc::from_raw(ptr as *const FVec<u8>) };
+                    let val = LValue::OwnedString(rc.clone());
+                    std::mem::forget(rc);
+                    return val;
+                }
+                match tag_low {
+                    Self::TAG_LOW_TABLE => {
+                        let rc = unsafe { Rc::from_raw(ptr as *const TCell<TcOwner, Table>) };
+                        let val = LValue::Table(Tc(rc.clone()));
+                        std::mem::forget(rc);
+                        val
+                    }
+                    Self::TAG_LOW_LCLOSURE => {
+                        let rc = unsafe { Rc::from_raw(ptr as *const TCell<TcOwner, LClosure<'src, 'intern>>) };
+                        let val = LValue::LClosure(Tc(rc.clone()));
+                        std::mem::forget(rc);
+                        val
+                    }
+                    Self::TAG_LOW_NCLOSURE => {
+                        let rc = unsafe { Rc::from_raw(ptr as *const TCell<TcOwner, NClosure>) };
+                        let val = LValue::NClosure(Tc(rc.clone()));
+                        std::mem::forget(rc);
+                        val
+                    }
+                    Self::TAG_LOW_INTERNED => {
+                        let ptr = ptr as *const (&'src [u8], u64);
+                        LValue::InternedString(unsafe { std::mem::transmute(ptr) })
+                    }
+                    _ => panic!("Invalid LBoxed value: 0x{:x}", self.0),
+                }
+            }
+        }
+    }
+}
+
+impl Clone for LBoxed {
+    fn clone(&self) -> Self {
+        unsafe {
+            let val = self.unbox();
+            Self::box_lvalue(val)
+        }
+    }
+}
+
+impl Drop for LBoxed {
+    fn drop(&mut self) {
+        if (self.0 & Self::NUMBER_TAG) != 0 {
+            return;
+        }
+        match self.0 {
+            Self::VALUE_NULL | Self::VALUE_FALSE | Self::VALUE_TRUE => return,
+            _ => {
+                let tag_top = self.0 & Self::PTR_MASK_TOP;
+                let tag_low = self.0 & Self::PTR_MASK_LOW;
+                let ptr = (self.0 & !Self::PTR_MASK_TOP & !Self::PTR_MASK_LOW) as *const ();
+                unsafe {
+                    if tag_top == Self::TAG_TOP_OWNED && tag_low == Self::TAG_LOW_OWNED {
+                        drop(Rc::from_raw(ptr as *const FVec<u8>));
+                        return;
+                    }
+                    match tag_low {
+                        Self::TAG_LOW_TABLE => {
+                            drop(Rc::from_raw(ptr as *const TCell<TcOwner, Table>));
+                        }
+                        Self::TAG_LOW_LCLOSURE => {
+                            drop(Rc::from_raw(ptr as *const TCell<TcOwner, LClosure>));
+                        }
+                        Self::TAG_LOW_NCLOSURE => {
+                            drop(Rc::from_raw(ptr as *const TCell<TcOwner, NClosure>));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl PartialEq for LBoxed {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0 == other.0 {
+            return true;
+        }
+        unsafe { self.unbox() == other.unbox() }
+    }
+}
+
+impl Default for LBoxed {
+    fn default() -> Self {
+        LBoxed(Self::VALUE_NULL)
+    }
+}
+
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -808,15 +979,15 @@ impl<'src, 'intern> PartialOrd for LConstant<'src, 'intern> {
 }
 
 #[derive(Debug, Clone)]
-pub enum Upvalue<'src, 'intern> {
+pub enum Upvalue {
     Open(usize), // stack index
-    Closed(Gc<LValue<'src, 'intern>>),
+    Closed(Gc<LBoxed>),
 }
 
 pub struct LClosure<'src, 'intern> {
     pub prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
     //environment: LTable<'src>,
-    pub upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
+    pub upvalues: FVec<Gc<Upvalue>>,
 }
 
 impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
@@ -872,8 +1043,10 @@ pub enum ReturnLocation {
 }
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_limit: usize, pub rloc: usize, pub c: u16 }
 
+#[repr(C)]
 #[derive(Debug)]
 pub struct HashWitness {
     pub href: HashRef,
@@ -882,14 +1055,15 @@ pub struct HashWitness {
     pub epoch: usize,
 }
 
+#[repr(C)]
 #[derive(Debug)]
 pub struct RunState<'src, 'intern> {
     pub base: usize,
-    pub vals: FVec<LValue<'src, 'intern>>,
+    pub vals: FVec<LBoxed>,
     pub pc: usize,
-    pub _G: Tc<Table<'src, 'intern>>,
+    pub _G: Tc<Table>,
     pub clos: Tc<LClosure<'src, 'intern>>,
-    pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
+    pub upvals: FVec<(Upvalue, FVec<Gc<Upvalue>>)>,
     pub callstack: FVec<CallstackEntry<'src, 'intern>>,
     pub counters: PerfCounters,
     pub select: usize,
@@ -924,78 +1098,77 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         Self { top_level }
     }
 
-    pub fn global_env(&self, owner: &mut TCellOwner<TcOwner>, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Tc<Table<'src, 'intern>> {
+    pub fn global_env(&self, owner: &mut TCellOwner<TcOwner>, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Tc<Table> {
         let mut math_tab = Table::new(0, 0);
-        math_tab.hash.insert(InternString::intern(intern, "floor\0"), LValue::NClosure(NClosure::new(|f, _| {
+        math_tab.hash.insert(LBoxed::box_lvalue(InternString::intern(intern, "floor ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "sqrt\0"), LValue::NClosure(NClosure::new(|f, _| {
+        }))));
+        math_tab.hash.insert(LBoxed::box_lvalue(InternString::intern(intern, "sqrt ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "abs\0"), LValue::NClosure(NClosure::new(|f, _| {
+        }))));
+        math_tab.hash.insert(LBoxed::box_lvalue(InternString::intern(intern, "abs ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.abs())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "huge\0"), LValue::NClosure(NClosure::new(|f, _| {
+        }))));
+        math_tab.hash.insert(LBoxed::box_lvalue(InternString::intern(intern, "huge ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|f, _| {
             return [LValue::Number(Number(f64::INFINITY))].to_vec().into()
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "pi\0"), LValue::Number(Number(std::f64::consts::PI)));
-        math_tab.hash.insert(InternString::intern(intern, "sin\0"), LValue::NClosure(NClosure::new(|f, _| {
+        }))));
+        math_tab.hash.insert(LBoxed::box_lvalue(InternString::intern(intern, "pi ")), LBoxed::box_lvalue(LValue::Number(Number(std::f64::consts::PI))));
+        math_tab.hash.insert(LBoxed::box_lvalue(InternString::intern(intern, "sin ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sin())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "cos\0"), LValue::NClosure(NClosure::new(|f, _| {
+        }))));
+        math_tab.hash.insert(LBoxed::box_lvalue(InternString::intern(intern, "cos ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.cos())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "tan\0"), LValue::NClosure(NClosure::new(|f, _| {
+        }))));
+        math_tab.hash.insert(LBoxed::box_lvalue(InternString::intern(intern, "tan ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.tan())),
                 _ => unimplemented!()
             };
             return [f].to_vec().into()
-        })));
+        }))));
 
         let mut os_tab = Table::new(0, 0);
-        os_tab.hash.insert(InternString::intern(intern, "exit\0"), LValue::NClosure(NClosure::new(|f, _| {
+        os_tab.hash.insert(LBoxed::box_lvalue(InternString::intern(intern, "exit ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => return std::process::exit(f.0 as i32),
                 _ => unimplemented!(),
             };
-        })));
+        }))));
 
-        let math = (InternString::intern(intern, "math\0"), LValue::Table(Tc::new(math_tab)));
-        let os = (InternString::intern(intern, "os\0"), LValue::Table(Tc::new(os_tab)));
+        let math = (LBoxed::box_lvalue(InternString::intern(intern, "math ")), LBoxed::box_lvalue(LValue::Table(Tc::new(math_tab))));
+        let os = (LBoxed::box_lvalue(InternString::intern(intern, "os ")), LBoxed::box_lvalue(LValue::Table(Tc::new(os_tab))));
         Tc::new(Table {
             array: vec![].into(),
             hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
-                (InternString::intern(intern, "print\0"), LValue::NClosure(NClosure::new(|v, owner| {
+                (LBoxed::box_lvalue(InternString::intern(intern, "print ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|v, owner| {
                     let s = v.iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
                         maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
                     ).collect::<Vec<_>>();
-                    //println!("> {}", String::from_utf8_lossy(s.iter().into()));
                     println!("> {}", s.iter().intersperse(&" ".to_string()).cloned().collect::<String>());
                     vec![LValue::Nil].into()
-                }))),
-                (InternString::intern(intern, "assert\0"), LValue::NClosure(NClosure::new(|v, owner| {
+                })))),
+                (LBoxed::box_lvalue(InternString::intern(intern, "assert ")), LBoxed::box_lvalue(LValue::NClosure(NClosure::new(|v, owner| {
                     match v {
                         [LValue::Bool(b), ..] => {
                             if !b {
@@ -1005,7 +1178,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         _ => { },
                     };
                     vec![].into()
-                }))),
+                })))),
                 math,
                 os,
                 ].drain(..)
@@ -1014,8 +1187,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         })
     }
 
-    pub fn rk<'exec>(proto: *const FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'exec FVec<LValue<'src, 'intern>>, r: u16)
-        -> Result<&'exec LConstant<'src, 'intern>, &'exec LValue<'src, 'intern>>
+    pub fn rk<'exec>(proto: *const FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'exec FVec<LBoxed>, r: u16)
+        -> Result<&'exec LConstant<'src, 'intern>, &'exec LBoxed>
     {
         if (r & 0x100)!=0 {
             let r_const = r & (0xff);
@@ -1028,20 +1201,21 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
     pub fn run<'lua, const LBBV: bool>(&'lua self,
         owner: &mut TCellOwner<TcOwner>,
-        mut _G: Tc<Table<'src, 'intern>>,
+        mut _G: Tc<Table>,
         mut clos: Tc<LClosure<'src, 'intern>>,
         mut args: FVec<LValue<'src, 'intern>>,
     )
         -> Result<FVec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
-        args.resize_with(unsafe {
+        let mut boxed_args: FVec<LBoxed> = args.into_iter().map(LBoxed::box_lvalue).collect::<Vec<_>>().into();
+        boxed_args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
-        }, || LValue::Nil);
+        }, || LBoxed::default());
 
         let mut spec = Specializer::new(clos.clone());
         let mut state = {
-            let mut vals = args;
+            let mut vals = boxed_args;
             let mut upvals: FVec<(Upvalue, FVec<Gc<Upvalue>>)> = vec![].into();
             let mut base = 0;
             let mut witness_base = 0;
@@ -1065,18 +1239,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
             }
         };
-        // we need to track where to return to, along with the base pointer and where to put return
-        // values
         let r_vals = 'int: loop {
             let inst = unsafe { state.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[state.pc] };
             state.pc += 1;
             state.counters.interpreter_count.increment();
             debug!("pc {} inst {:?}", state.pc, inst.0.Opcode());
-            debug!("stack: {}, {:?}", state.base, &state.vals);
             match inst.0.Opcode() {
                 Opcode::MOVE => {
                     let (a, b) = <MOVE as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("move {} {}", a, b);
                     state.vals[state.base + a as usize] = state.vals[state.base + b as usize].clone();
                 },
                 Opcode::GETUPVAL => {
@@ -1089,42 +1259,37 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             c.borrow().clone()
                         },
                     };
-                    state.vals[state.base + a as usize] = upval.clone();
+                    state.vals[state.base + a as usize] = upval;
                 },
                 Opcode::SETUPVAL => {
                     let (a, b) = <SETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let upval = match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
+                    match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
                         Upvalue::Open(o) => {
                             state.vals[*o as usize] = state.vals[state.base + a as usize].clone()
                         },
                         Upvalue::Closed(c) => {
-                            *c.borrow_mut() = state.vals[state.base + a as usize].clone()
+                            let val = unsafe { state.vals[state.base + a as usize].unbox() }; *c.borrow_mut() = LBoxed::box_lvalue(val)
                         },
                     };
                 },
                 Opcode::LOADK => {
                     let (a, bx) = <LOADK as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] });
-                    state.vals[state.base + a as usize] = unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
-                    ()
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() });
                 },
                 Opcode::LOADNIL => {
                     let (a, b) = <LOADNIL as InstructionDecode>::Unpack::unpack(inst.0);
-                    state.vals[state.base + a as usize..=state.base + b as usize].iter_mut().for_each(|i| *i = LValue::Nil);
-                    ()
+                    state.vals[state.base + a as usize..=state.base + b as usize].iter_mut().for_each(|i| *i = LBoxed::default());
                 },
                 Opcode::LOADBOOL => {
                     let (a, b, c) = <LOADBOOL as InstructionDecode>::Unpack::unpack(inst.0);
-                    state.vals[state.base + a as usize] = LValue::Bool(b != 0);
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::Bool(b != 0));
                     if c != 0 {
                         state.pc += 1;
                     }
-                    ()
                 },
                 Opcode::NEWTABLE => {
                     let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
-                    // TODO: properly decode the "floating point byte" size hints instead
-                    state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::Table(Tc::new(Table::new(b as usize, c as usize))));
                 },
                 Opcode::SELF => {
                     let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);
@@ -1132,28 +1297,23 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     state.vals[state.base + a as usize + 1] = rb.clone();
                     let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
                         Ok(c) => Cow::Owned(LValue::from(c)),
-                        Err(lv) => Cow::Borrowed(lv),
+                        Err(lv) => Cow::Owned(unsafe { lv.unbox() }),
                     };
-                    let res = rb.gettable(owner, kc);
-                    state.vals[state.base + a as usize] = res;
+                    let res = unsafe { rb.unbox() }.gettable(owner, kc);
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(res);
                 },
                 Opcode::SETLIST => {
                     let (a, b, c) = <SETLIST as InstructionDecode>::Unpack::unpack(inst.0);
-                    match state.vals[state.base + a as usize].clone() {
+                    let val_a = unsafe { state.vals[state.base + a as usize].unbox() };
+                    match val_a {
                         LValue::Table(tab) => {
                             assert_ne!(c, 0);
                             if b == 0 {
-                                let src = state.vals[state.base + a as usize+1..].iter().cloned();
-                                tab.rw(owner).array.splice(
-                                    (c as usize-1)*50..,
-                                    src
-                                ).for_each(drop);
+                                let src = state.vals[state.base + a as usize + 1..].iter().cloned();
+                                tab.rw(owner).array.splice((c as usize - 1) * 50.., src).for_each(drop);
                             } else {
-                                let src = state.vals[state.base + a as usize+1..=state.base + a as usize+b as usize as usize].iter().cloned();
-                                tab.rw(owner).array.splice(
-                                    (c as usize-1)*50..,
-                                    src
-                                ).for_each(drop);
+                                let src = state.vals[state.base + a as usize + 1..=state.base + a as usize + b as usize].iter().cloned();
+                                tab.rw(owner).array.splice((c as usize - 1) * 50.., src).for_each(drop);
                             }
                         },
                         _ => unimplemented!(),
@@ -1161,162 +1321,119 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::GETTABLE => {
                     let (a, b, c) = <GETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("gettable {} {} {}", a, b, c);
                     let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
                         Ok(c) => Cow::Owned(LValue::from(c)),
-                        Err(lv) => Cow::Borrowed(lv),
+                        Err(lv) => Cow::Owned(unsafe { lv.unbox() }),
                     };
-                    debug!("gettable {:?}", &kc);
-                    let val_b = state.vals[state.base + b as usize].clone();
-                    state.vals[state.base + a as usize] = val_b.gettable(owner, kc);
+                    let val_b = unsafe { state.vals[state.base + b as usize].unbox() };
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(val_b.gettable(owner, kc));
                 },
                 Opcode::SETTABLE => {
                     let (a, b, c) = <SETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("settable {} {} {}", a, b, c);
                     let kb = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b) {
                         Ok(b) => b.into(),
-                        Err(lv) => lv.clone(),
+                        Err(lv) => unsafe { lv.unbox() },
                     };
-                    debug!("settable {:?}", &kb);
                     let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
                         Ok(c) => c.into(),
-                        Err(lv) => lv.clone(),
+                        Err(lv) => unsafe { lv.unbox() },
                     };
-                    match &mut state.vals[state.base + a as usize] {
-                        LValue::Table(tab) => {
+                    match unsafe { state.vals[state.base + a as usize].unbox() } {
+                        LValue::Table(mut tab) => {
                             tab.set(owner, kb, kc)
                         },
-                        x => { debug!("huh {:?}", x); unimplemented!() },
+                        x => unimplemented!(),
                     };
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
                     let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
-                    debug!("setglobal {} {} {:?}", a, bx, &kst);
-                    state._G.set(owner, kst.into(), state.vals[state.base + a as usize].clone());
+                    state._G.set(owner, kst.into(), unsafe { state.vals[state.base + a as usize].unbox() });
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <GETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
                     let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
-                    debug!("getglobal {} {} {:?}", a, bx, &kst);
-                    // FIXME(error handling)
-                    state.vals[state.base + a as usize] = state._G.get(owner, &kst.into()).unwrap_or((&Constant::Nil).into()).clone();
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(state._G.get(owner, &kst.into()).unwrap_or(LValue::Nil));
                 },
                 Opcode::TEST => {
                     let (a, _, c) = <TEST as InstructionDecode>::Unpack::unpack(inst.0);
-                    if let LValue::Bool(b) = (state.vals[state.base + a as usize].as_bool(owner)?) && (b as u16) == c {
-                        // No-op
+                    if let LValue::Bool(b) = (unsafe { state.vals[state.base + a as usize].unbox() }.as_bool(owner)?) && (b as u16) == c {
                     } else {
                         state.pc += 1;
                     }
                 },
                 opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);
-                    debug!("numeric op {} {}", b, c);
                     let kb = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b);
                     let kc = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c);
-                    debug!("{:?} {:?}", &kb, &kc);
                     let cond = match (opcode, kb, kc) {
-                        (Opcode::EQ, Ok(const_b), Ok(const_c)) => const_b == const_c,
-                        (Opcode::LT, Ok(const_b), Ok(const_c)) => const_b < const_c,
-                        (Opcode::LE, Ok(const_b), Ok(const_c)) => const_b <= const_c,
-
-                        (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.compare(opcode.clone(), const_c.into()).unwrap()
-                        },
-
-                        (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).compare(opcode, dyn_c.clone()).unwrap()
-                        },
-
-                        (_, Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b.compare(opcode, dyn_c.clone()).unwrap()
-                        },
-
-                        _ => panic!()
-
+                        (Opcode::EQ, Ok(cb), Ok(cc)) => cb == cc,
+                        (Opcode::LT, Ok(cb), Ok(cc)) => cb < cc,
+                        (Opcode::LE, Ok(cb), Ok(cc)) => cb <= cc,
+                        (_, Err(db), Ok(cc)) => unsafe { db.unbox() }.compare(opcode, cc.into()).unwrap(),
+                        (_, Ok(cb), Err(dc)) => LValue::from(cb).compare(opcode, unsafe { dc.unbox() }).unwrap(),
+                        (_, Err(db), Err(dc)) => unsafe { db.unbox() }.compare(opcode, unsafe { dc.unbox() }).unwrap(),
+                        _ => panic!(),
                     };
-                    debug!("cond {} {}", cond, a);
                     if (cond as u8) != a {
                         state.pc += 1;
                     }
                 },
-                opcode @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW)
-                => {
+                opcode @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
                     let (a, b, c) = ABC::unpack(inst.0);
-                    debug!("{} {} {}", a, b, c);
                     let kb = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b);
                     let kc = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c);
-                    debug!("{:?} {:?}", &kb, &kc);
                     let res = match (opcode, kb, kc) {
-                        (Opcode::ADD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 + const_c.0)),
-                        (Opcode::SUB, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 - const_c.0)),
-                        (Opcode::MUL, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 * const_c.0)),
-                        (Opcode::DIV, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 / const_c.0)),
-                        (Opcode::MOD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 % const_c.0)),
-                        (Opcode::POW, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0.powf(const_c.0))),
-
-                        (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).numeric_op(opcode, dyn_c)?
-                        },
-
-                        (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.numeric_op(opcode, &const_c.into())?
-                        },
-
-                        (_, Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b.numeric_op(opcode, dyn_c)?
-                        },
-
+                        (Opcode::ADD, Ok(Constant::Number(cb)), Ok(Constant::Number(cc))) => LValue::Number(Number(cb.0 + cc.0)),
+                        (Opcode::SUB, Ok(Constant::Number(cb)), Ok(Constant::Number(cc))) => LValue::Number(Number(cb.0 - cc.0)),
+                        (Opcode::MUL, Ok(Constant::Number(cb)), Ok(Constant::Number(cc))) => LValue::Number(Number(cb.0 * cc.0)),
+                        (Opcode::DIV, Ok(Constant::Number(cb)), Ok(Constant::Number(cc))) => LValue::Number(Number(cb.0 / cc.0)),
+                        (Opcode::MOD, Ok(Constant::Number(cb)), Ok(Constant::Number(cc))) => LValue::Number(Number(cb.0 % cc.0)),
+                        (Opcode::POW, Ok(Constant::Number(cb)), Ok(Constant::Number(cc))) => LValue::Number(Number(cb.0.powf(cc.0))),
+                        (_, Ok(cb), Err(dc)) => LValue::from(cb).numeric_op(opcode, &unsafe { dc.unbox() })?,
+                        (_, Err(db), Ok(cc)) => unsafe { db.unbox() }.numeric_op(opcode, &cc.into())?,
+                        (_, Err(db), Err(dc)) => unsafe { db.unbox() }.numeric_op(opcode, &unsafe { dc.unbox() })?,
                         _ => unimplemented!(),
                     };
-                    debug!("res {:?}", &res);
-                    state.vals[state.base + a as usize] = res;
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(res);
                 },
                 Opcode::UNM => {
                     let (a, b) = <UNM as InstructionDecode>::Unpack::unpack(inst.0);
-                    let res = match &state.vals[state.base + b as usize] {
-                        // TODO: metatables
+                    let b_val = unsafe { state.vals[state.base + b as usize].unbox() };
+                    let res = match b_val {
                         LValue::Number(n) => LValue::Number(Number(-n.0)),
                         _ => unimplemented!(),
                     };
-                    state.vals[state.base + a as usize] = res;
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(res);
                 },
                 Opcode::LEN => {
                     let (a, b) = <LEN as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, b);
-                    state.vals[state.base + a as usize] = state.vals[state.base + b as usize].len(owner)?;
+                    let b_val = unsafe { state.vals[state.base + b as usize].unbox() };
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(b_val.len(owner)?);
                 },
                 Opcode::CONCAT => {
                     let (a, b, c) = <CONCAT as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, b);
                     let mut s: FVec<_> = vec![].into();
                     for i in (b as usize)..=(c as usize) {
-                        s.extend_from_slice(&state.vals[state.base + i as usize].as_string(owner).ok_or("nil concat")?)
+                        let i_val = unsafe { state.vals[state.base + i as usize].unbox() };
+                        s.extend_from_slice(&i_val.as_string(owner).ok_or("nil concat")?);
                     }
-                    debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-                    state.vals[state.base + a as usize] = LValue::OwnedString(Rc::new(s));
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::OwnedString(Rc::new(s)));
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = <FORPREP as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, sbx);
-                    state.vals[state.base + a as usize] =
-                        state.vals[state.base + a as usize].numeric_op(Opcode::SUB, &state.vals[state.base + a as usize + 2]).unwrap();
-                    state.pc += sbx as usize;
+                    let a_val = unsafe { state.vals[state.base + a as usize].unbox() };
+                    let step_val = unsafe { state.vals[state.base + a as usize + 2].unbox() };
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(a_val.numeric_op(Opcode::SUB, &step_val).unwrap());
+                    state.pc = (state.pc as isize + sbx as isize) as usize;
                 },
                 Opcode::FORLOOP => {
                     let (a, sbx) = <FORLOOP as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, sbx);
-                    let step = state.vals[state.base + a as usize + 2].clone();
-                    let idx = state.vals[state.base + a as usize].numeric_op(Opcode::ADD, &step).unwrap();
-                    state.vals[state.base + a as usize] = idx.clone();
-                    let limit = state.vals[state.base + a as usize + 1].clone();
+                    let step = unsafe { state.vals[state.base + a as usize + 2].unbox() };
+                    let a_val = unsafe { state.vals[state.base + a as usize].unbox() };
+                    let idx = a_val.numeric_op(Opcode::ADD, &step).unwrap();
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(idx.clone());
+                    let limit = unsafe { state.vals[state.base + a as usize + 1].unbox() };
                     let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0))))? {
                         limit.compare(Opcode::LE, idx.clone())
                     } else {
@@ -1324,70 +1441,46 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                     if comp? {
                         state.pc = (state.pc as isize + sbx as isize) as usize;
-                        state.vals[state.base + a as usize + 3] = idx;
+                        state.vals[state.base + a as usize + 3] = LBoxed::box_lvalue(idx);
                     }
                 },
                 Opcode::JMP => {
-                    debug!("{:?}", inst.0);
                     let sbx = <JMP as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{}", sbx);
                     state.pc = (state.pc as isize + sbx as isize) as usize;
                 },
                 Opcode::CLOSURE => {
                     let (a, bx) = <CLOSURE as InstructionDecode>::Unpack::unpack(inst.0);
                     let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx as usize] };
-                    debug!("{} {} {:?}", a, bx, proto);
-                    // handle the MOVE/GETUPVALUE pseudoinstructions
                     let mut fresh = LClosure::new(proto as *const _);
-                    {
-                        for upval in 0..proto.upval_count {
-                            let pseudo = unsafe { (&(*state.clos.ro(owner).prototype).instructions.items)[state.pc+upval as usize] };
-                            let label = match pseudo.0.Opcode() {
-                                Opcode::MOVE => {
-                                    let (_, b) = <MOVE as InstructionDecode>::Unpack::unpack(pseudo.0);
-                                    // we can't just copy vals[b], because we need
-                                    // to reference the stack slot not the value.
-                                    // instead we reference the stack slot, and add
-                                    // this new use to the list of uses. on CLOSE
-                                    // we will iterate over all these uses and close
-                                    // them - but only then.
-                                    let fresh_upval = Upvalue::Open(b as usize);
-                                    let fresh_use = Gc::new(fresh_upval.clone());
-                                    fresh.upvalues.push(fresh_use.clone());
-                                    state.upvals.push((fresh_upval, vec![fresh_use].into()));
-                                    "move"
-                                },
-                                Opcode::GETUPVAL => {
-                                    let (_, b) = <GETUPVAL as InstructionDecode>::Unpack::unpack(pseudo.0);
-                                    // the upvalue already exists in our current
-                                    // scope. add ourselves to the existing
-                                    // use list.
-                                    let fresh_use = Gc::new(state.upvals[b as usize].clone().0);
-                                    fresh.upvalues.push(fresh_use.clone());
-                                    state.upvals[b as usize].1.push(fresh_use);
-                                    "getupvval"
-                                },
-                                _ => panic!(),
-                            };
-                            debug!("pseudo: {:?} ({})", pseudo, label);
+                    for upval_idx in 0..proto.upval_count {
+                        let pseudo = unsafe { (&(*state.clos.ro(owner).prototype).instructions.items)[state.pc + upval_idx as usize] };
+                        match pseudo.0.Opcode() {
+                            Opcode::MOVE => {
+                                let (_, b) = <MOVE as InstructionDecode>::Unpack::unpack(pseudo.0);
+                                let fresh_upval = Upvalue::Open(b as usize);
+                                let fresh_use = Gc::new(fresh_upval.clone());
+                                fresh.upvalues.push(fresh_use.clone());
+                                state.upvals.push((fresh_upval, vec![fresh_use].into()));
+                            },
+                            Opcode::GETUPVAL => {
+                                let (_, b) = <GETUPVAL as InstructionDecode>::Unpack::unpack(pseudo.0);
+                                let fresh_use = Gc::new(state.upvals[b as usize].0.clone());
+                                fresh.upvalues.push(fresh_use.clone());
+                                state.upvals[b as usize].1.push(fresh_use);
+                            },
+                            _ => panic!(),
                         }
-                        state.pc += proto.upval_count as usize;
-                        //assert_eq!(proto.upval_count, 0);
                     }
-                    state.vals[state.base + a as usize] = LValue::LClosure(Tc::new(fresh));
+                    state.pc += proto.upval_count as usize;
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::LClosure(Tc::new(fresh)));
                 },
                 Opcode::CALL => {
                     let (a, b, c) = <CALL as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {} {}", a, b, c);
-                    let to_call = &state.vals[state.base + a as usize];
-                    debug!("{:?}", to_call);
-                    // push where to return to once we RETURN
-                    if let LValue::LClosure(ref lclos) = to_call.clone() {
-                        // record call stack: we say where to return to and where to put the values
+                    let to_call_boxed = &state.vals[state.base + a as usize];
+                    let to_call = unsafe { to_call_boxed.unbox() };
+                    if let LValue::LClosure(ref lclos) = to_call {
                         let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
-                        // push empty stack frame
-                        state.vals.extend_from_slice(
-                            vec![LValue::Nil; next_stack].as_slice());
+                        state.vals.extend_from_slice(vec![LBoxed::default(); next_stack].as_slice());
                         state.callstack.push(CallstackEntry {
                             clos: state.clos.clone(),
                             ret: ReturnLocation::Interpreter(state.pc),
@@ -1400,12 +1493,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         });
                         state.base = state.base + a as usize + 1;
                         state.witness_base = state.hash_witnesses.len();
-                        state.vals.truncate(state.base +  next_stack);
+                        state.vals.truncate(state.base + next_stack);
                         state.clos = lclos.clone();
-
                         if LBBV {
-                            // Lazy basic block versioning
-                            // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];
                             let ctx = Context::new(types);
                             let versions = spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
@@ -1415,125 +1505,91 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                 spec.set_current(lclos.clone());
                                 spec.block(owner, 0, ctx)
                             };
-                            debug!("{:?} {block:?}", spec.blocks);
                             spec.set_current(lclos.clone());
                             state = spec.run(owner, block, state);
                         } else {
                             state.pc = 0;
                         }
-
                     } else if let LValue::NClosure(ncall) = to_call {
-                        let args = if b == 0 {
-                            &state.vals[state.base + a as usize+1..]
+                        let args_boxed = if b == 0 {
+                            &state.vals[state.base + a as usize + 1..]
                         } else {
-                            &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
+                            &state.vals[state.base + a as usize + 1..=(state.base + a as usize + b as usize - 1)]
                         };
-                        debug!("{:?}", args);
+                        let args: Vec<LValue> = args_boxed.iter().map(|v| unsafe { v.unbox() }).collect();
                         let mut native = ncall.rw(owner).native.clone();
-                        let ret = (native)(args, owner);
+                        let ret = (native)(&args, owner);
+                        let boxed_ret = ret.into_iter().map(LBoxed::box_lvalue);
                         if c == 0 {
-                            // save all returned
-                            state.vals.splice(state.base + a as usize.., ret).for_each(drop);
-                        }
-                        else if c == 1 {
-                            // nothing saved
+                            state.vals.splice(state.base + a as usize.., boxed_ret).for_each(drop);
                         } else if c != 1 {
-                            state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, ret).for_each(drop);
-                        } else {
-                            unimplemented!()
+                            state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, boxed_ret).for_each(drop);
                         }
-                        // FIXME(metatables): __call
                     } else {
                         panic!("cant call {:?}", to_call);
                     }
                 },
                 Opcode::RETURN => {
-                    // we're going to be removing this frame, so close any open
-                    // upvalues.
                     state.close_upvalues();
                     state.upvals = vec![].into();
-
                     let (a, b) = <RETURN as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, b);
-                    let mut r_count = 0 as usize;
-                    let mut r_vals: FVec<_> = if b == 1 {
-                        // no return values
+                    let r_count: usize;
+                    let r_vals: FVec<LBoxed> = if b == 1 {
+                        r_count = 0;
                         vec![].into()
                     } else if b >= 2 {
-                        // there are b-1 return values from R(A) onwards
-                        r_count = b as usize-1;
-                        let r_vals = &state.vals[state.base + a as usize..(state.base + a as usize + r_count as usize)];
-                        debug!("{:?}", r_vals);
-                        Vec::from(r_vals).into()
-                    } else if b == 0 {
-                        // return all values from R(A) to the ToS
-                        let r_vals = &state.vals[state.base + a as usize..];
-                        r_count = r_vals.len() as usize;
-                        debug!("{:?}", r_vals);
-                        Vec::from(r_vals).into()
+                        r_count = b as usize - 1;
+                        state.vals[state.base + a as usize..(state.base + a as usize + r_count)].to_vec().into()
                     } else {
-                        unreachable!()
+                        let r_v = &state.vals[state.base + a as usize..];
+                        r_count = r_v.len();
+                        r_v.to_vec().into()
                     };
                     match state.callstack.pop() {
                         Some(CallstackEntry { clos: ret_clos, ret: ReturnLocation::Interpreter(caller), frame, witness_frame, limit, witness_limit, rloc, c }) => {
-                            debug!("{} {:?} {:?} {}", state.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller, c);
-                            state.clos = ret_clos.clone();
-                            // copy the return values to the previous frame's return location,
-                            // then clean up the popped stack frame
+                            state.clos = ret_clos;
                             state.base = frame;
                             state.witness_base = witness_frame;
                             if c == 1 {
-                                // No values are saved
                                 state.vals.truncate(limit);
                             } else if c >= 2 {
-                                // (C-1) values are saved
-                                let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
-                                //vals.extend_from_slice(r_vals.as_slice());
                                 for i in 0..=(c - 2) {
-                                    debug!("huh {}", i);
-                                    // Only copy the correct number of arguments from the CALL
                                     state.vals[rloc + i as usize] = r_vals[i as usize].clone();
                                 }
-                                //assert!(limit >= rloc + c as usize - 1);
                                 state.vals.truncate(limit);
-                                //state.vals.truncate(rloc + c as usize - 1);
                             } else {
-                                // Multiple return results are saved
-                                for (i, v) in r_vals.drain(..).enumerate() {
-                                    // Only copy the correct number of arguments from the CALL
+                                for (i, v) in r_vals.into_iter().enumerate() {
                                     state.vals[rloc + i] = v;
                                 }
-                                debug!("{:?} {}", &state.vals, r_count);
                                 state.vals.truncate(rloc + r_count);
                             }
                             state.hash_witnesses.truncate(witness_limit);
                             state.pc = caller;
                         },
-                        Some(CallstackEntry { clos: ret_clos, ret: ReturnLocation::Generator(block, off), frame, witness_frame, limit, witness_limit, rloc, c }) => {
-                            unimplemented!()
-                        },
                         None => {
-                            break 'int r_vals;
-                        }
+                            let unboxed_r: FVec<LValue> = r_vals.into_iter().map(|v| unsafe { v.unbox() }).collect::<Vec<_>>().into();
+                            break 'int unboxed_r;
+                        },
+                        _ => unimplemented!(),
                     }
                 },
                 Opcode::INVALID => unreachable!(),
-                x => unimplemented!("opcode {:?}", x),
-                _ => (),
-            };
+                _ => {},
+            }
         };
-        #[cfg(feature = "counters")] {
-            println!("counters after run {:?}", state.counters);
-        }
-
+        #[cfg(feature = "counters")] { println!("counters after run {:?}", state.counters); }
         #[cfg(feature = "graph")]
         for proto in unsafe { &(*self.top_level).prototypes.items } {
             let outfile = format!("func_{}.pdf", proto.line_defined);
             spec.dump(owner, proto, outfile.as_str());
         }
-
-
         Ok(r_vals)
     }
 
+}
+
+impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LBoxed {
+    fn from(value: &LConstant<'src, 'intern>) -> Self {
+        LBoxed::box_lvalue(LValue::from(value))
+    }
 }

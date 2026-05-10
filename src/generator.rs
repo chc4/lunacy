@@ -12,6 +12,7 @@ use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
 use crate::vm::{LValue, LType, Number, Table, FVec};
+pub use crate::vm::LBoxed;
 use crate::vm::{InstructionDecode, Unpacker};
 use crate::vm::RunState;
 use crate::vm::LConstant;
@@ -25,14 +26,26 @@ use log::warn;
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 
-pub fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
-    match val {
-        LValue::Number(_) => LType::Number,
-        LValue::InternedString(_) | LValue::OwnedString(_) => LType::String,
-        LValue::Table(t) => LType::Table,
-        LValue::LClosure(_) | LValue::NClosure(_) => LType::Closure,
-        LValue::Nil => LType::Nil,
-        _ => LType::Unknown,
+pub fn typeof_(val: &LBoxed) -> LType {
+    if (val.0 & LBoxed::NUMBER_TAG) != 0 {
+        return LType::Number;
+    }
+    match val.0 {
+        LBoxed::VALUE_NULL => LType::Nil,
+        LBoxed::VALUE_FALSE | LBoxed::VALUE_TRUE => LType::Bool,
+        _ => {
+            let tag_low = val.0 & LBoxed::PTR_MASK_LOW;
+            let tag_top = val.0 & LBoxed::PTR_MASK_TOP;
+            if tag_top == LBoxed::TAG_TOP_OWNED && tag_low == LBoxed::TAG_LOW_OWNED {
+                return LType::String;
+            }
+            match tag_low {
+                LBoxed::TAG_LOW_TABLE => LType::Table,
+                LBoxed::TAG_LOW_LCLOSURE | LBoxed::TAG_LOW_NCLOSURE => LType::Closure,
+                LBoxed::TAG_LOW_INTERNED => LType::String,
+                _ => LType::Unknown,
+            }
+        }
     }
 }
 
@@ -135,7 +148,7 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
                 yield YieldOp::Exec(ResidualExec("loadk_number", Rc::new(move |owner, state, cb| {
                     let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("{:?}", kst);
-                    state.vals[state.base + dest] = kst.into();
+                    state.vals[state.base + dest] = LBoxed::box_lvalue(kst.into())
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
             },
@@ -143,7 +156,7 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
                 yield YieldOp::Exec(ResidualExec("loadk_str", Rc::new(move |owner, state, cb| {
                     let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("{:?}", kst);
-                    state.vals[state.base + dest] = kst.into();
+                    state.vals[state.base + dest] = LBoxed::box_lvalue(kst.into())
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::String)]);
             },
@@ -164,7 +177,7 @@ pub fn emit_getglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>
         // maybe getting _G[kst] should be a yieldop...?
         debug!("getglobal {} = {:?}", dest, &kst);
         yield YieldOp::Exec(ResidualExec("getglobal", Rc::new(move |owner, state, cb| {
-            state.vals[state.base + dest as usize] = state._G.get(owner, &(&kst).into()).unwrap_or((&Constant::Nil).into()).clone();
+            state.vals[state.base + dest as usize] = LBoxed::box_lvalue(state._G.get(owner, &(&kst).into()).unwrap_or(LValue::Nil));
         })));
         yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
         arg
@@ -179,7 +192,7 @@ pub fn emit_setglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>
         // TODO: env shape specialization
         debug!("setglobal {} = {:?}", dest, &kst);
         yield YieldOp::Exec(ResidualExec("setglobal", Rc::new(move |owner, state, cb| {
-            state._G.set(owner, (&kst).into(), state.vals[state.base + dest as usize].clone());
+            state._G.set(owner, (&kst).into(), unsafe { state.vals[state.base + dest as usize].unbox() });
         })));
         arg
     }
@@ -203,19 +216,19 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let witness = &state.hash_witnesses[state.witness_base + hc.0 as usize];
                 debug!("gettable_href with {:?} {:?}", &witness, htype);
                 let tab = &state.vals[state.base + b];
-                let LValue::Table(tab) = tab else { unreachable!() };
+                let tab_unboxed = unsafe { tab.unbox() }; let LValue::Table(tab) = tab_unboxed else { unreachable!() };
                 let (k, val1) = tab.ro(owner).hash.get_index(witness.as_ref().unwrap().index).unwrap();
 
                 // Sanity check
                 // Move this into make_href_check since we need it attached to the HashKey instead
                 #[cfg(debug_assertions)]
                 {
-                    let val2 = tab.ro(owner).hash.get::<LValue>(&(&witness.as_ref().unwrap().key).into()).unwrap();
+                    let boxed_key = LBoxed::box_lvalue((&witness.as_ref().unwrap().key).into()); let val2 = tab.ro(owner).hash.get(&boxed_key).unwrap().clone();
                     let full_key = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16);
                     debug!("{:?}", &tab.ro(owner));
                     let Ok(const_key) = full_key else { unreachable!() };
-                    assert_eq!(k, &(const_key.into()) as &LValue);
-                    assert_eq!(val1, val2);
+                    assert_eq!(unsafe { k.unbox() }, const_key.into());
+                    assert_eq!(val1, &val2);
                 }
 
                 debug!("gettable_href fetched {a} = {val1:?}");
@@ -226,11 +239,11 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::Exec(ResidualExec("gettable", Rc::new(move |owner, state, cb| {
                 let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
                     Ok(c) => Cow::Owned(LValue::from(c)),
-                    Err(lv) => Cow::Borrowed(lv),
+                    Err(lv) => Cow::Owned(unsafe { lv.unbox() }),
                 };
                 debug!("gettable {:?}", &kc);
                 let val_b = state.vals[state.base + b as usize].clone();
-                state.vals[state.base + a as usize] = val_b.gettable(owner, kc);
+                state.vals[state.base + a as usize] = LBoxed::box_lvalue(unsafe { val_b.unbox() }.gettable(owner, kc));
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
         }
@@ -258,15 +271,15 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Ok(b) => b.into(),
                     Err(lv) => lv.clone(),
                 };
-                let LValue::Number(kb) = kb else { unreachable!() };
+                let kb_unboxed = unsafe { kb.unbox() }; let LValue::Number(kb) = kb_unboxed else { unreachable!() };
                 let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
                     Ok(c) => c.into(),
                     Err(lv) => lv.clone(),
                 };
-                let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
+                let mut tab_val = unsafe { state.vals[state.base + a].unbox() }; let LValue::Table(ref mut t) = tab_val else { unreachable!() };
                 let t = t.rw(owner);
                 if t.array.len() <= kb.0 as usize {
-                    t.array.resize_with(kb.0 as usize, || LValue::Nil);
+                    t.array.resize_with(kb.0 as usize, || LBoxed::default());
                 }
                 t.array[kb.0 as usize-1] = kc;
             })));
@@ -292,7 +305,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let witness = &state.hash_witnesses[state.witness_base + hb.0 as usize];
                     debug!("settable_href with {:?} {:?}", &witness, htype);
                     let tab = &state.vals[state.base + a];
-                    let LValue::Table(tab) = tab else { unreachable!() };
+                    let tab_unboxed = unsafe { tab.unbox() }; let LValue::Table(tab) = tab_unboxed else { unreachable!() };
                     let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
                         Ok(c) => c.into(),
                         Err(lv) => lv.clone(),
@@ -320,7 +333,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Ok(c) => c.into(),
                         Err(lv) => lv.clone(),
                     };
-                    let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
+                    let mut tab_val = unsafe { state.vals[state.base + a].unbox() }; let LValue::Table(ref mut t) = tab_val else { unreachable!() };
                     let kc_type = typeof_(&kc);
                     if let Some(existing) = t.rw(owner).hash.insert(kb, kc.clone()) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
@@ -340,7 +353,7 @@ pub fn emit_newtable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Exec(ResidualExec("newtable", Rc::new(move |owner, state, cb| {
             // TODO: properly decode the "floating point byte" size hints instead
-            state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
+            state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::Table(Tc::new(Table::new(b as usize, c as usize))));
         })));
         yield YieldOp::SetTypes(vec![(a, LType::Table)]);
         arg
@@ -354,7 +367,7 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
         // table initialization, which means it is definitely a table and doesn't e.g. have a
         // metatable we have to chain to.
         arg = yield YieldOp::Exec(ResidualExec("setlist", Rc::new(move |owner, state, cb| {
-            match state.vals[state.base + a as usize].clone() {
+            match unsafe { state.vals[state.base + a as usize].unbox() } {
                 LValue::Table(tab) => {
                     assert_ne!(c, 0);
                     if b == 0 {
@@ -402,11 +415,11 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 yield YieldOp::Exec(ResidualExec("numeric_int_int", Rc::new(move |owner, state, cb| {
                     let klhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, lhs as u16);
                     let krhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, rhs as u16);
-                    let LValue::Number(dyn_b) = &state.vals[state.base + lhs] else { unreachable!() };
-                    let LValue::Number(dyn_c) = &state.vals[state.base + rhs] else { unreachable!() };
-                    let res = LValue::Number(*dyn_b).numeric_op(opcode, &LValue::Number(*dyn_c)).unwrap();
+                    let b_val = unsafe { state.vals[state.base + lhs].unbox() }; let LValue::Number(dyn_b) = b_val else { unreachable!() };
+                    let c_val = unsafe { state.vals[state.base + rhs].unbox() }; let LValue::Number(dyn_c) = c_val else { unreachable!() };
+                    let res = LValue::Number(dyn_b).numeric_op(opcode, &LValue::Number(dyn_c)).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest as usize] = res;
+                    state.vals[state.base + dest as usize] = LBoxed::box_lvalue(res)
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
@@ -419,7 +432,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     let LConstant::Number(kc) = krhs else { unreachable!() };
                     let res = LValue::Number(*kb).numeric_op(opcode, &LValue::Number(*kc)).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest as usize] = res;
+                    state.vals[state.base + dest as usize] = LBoxed::box_lvalue(res)
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
@@ -429,9 +442,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     let kb: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc as usize]) };
                     let LConstant::Number(kb) = kb else { unreachable!() };
                     let dyn_c = &state.vals[state.base + rhs];
-                    let res = LValue::Number(Number(kb.0)).numeric_op(opcode, dyn_c).unwrap();
+                    let res = LValue::Number(Number(kb.0)).numeric_op(opcode, &unsafe { dyn_c.unbox() }).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest as usize] = res;
+                    state.vals[state.base + dest as usize] = LBoxed::box_lvalue(res)
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
@@ -441,9 +454,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     let dyn_b = &state.vals[state.base + lhs];
                     let kc: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc as usize]) };
                     let LConstant::Number(kc) = kc else { unreachable!() };
-                    let res = dyn_b.numeric_op(opcode, &LValue::Number(Number(kc.0))).unwrap();
+                    let res = unsafe { dyn_b.unbox() }.numeric_op(opcode, &LValue::Number(Number(kc.0))).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest as usize] = res;
+                    state.vals[state.base + dest as usize] = LBoxed::box_lvalue(res)
                 })));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
@@ -499,7 +512,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     debug!("comp @ {}", pc);
                     let dyn_b = &state.vals[state.base + b];
                     let dyn_c = &state.vals[state.base + c];
-                    let cond = dyn_b.compare(opcode, dyn_c.clone()).unwrap();
+                    let cond = unsafe { dyn_b.unbox() }.compare(opcode, unsafe { dyn_c.unbox() }).unwrap();
                     if (cond as u8) != a {
                         debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
@@ -515,7 +528,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     let const_b = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[rb as usize] };
                     let Constant::Number(Number(_)) = const_b else { unreachable!() };
                     let dyn_c = &state.vals[state.base + c];
-                    let cond = LValue::from(const_b).compare(opcode, dyn_c.clone()).unwrap();
+                    let cond = LValue::from(const_b).compare(opcode, unsafe { dyn_c.unbox() }).unwrap();
                     if (cond as u8) != a {
                         debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
@@ -531,7 +544,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     let dyn_b = &state.vals[state.base + b];
                     let const_c = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[rc as usize] };
                     let Constant::Number(Number(_)) = const_c else { unreachable!() };
-                    let cond = dyn_b.compare(opcode, const_c.into()).unwrap();
+                    let cond = unsafe { dyn_b.unbox() }.compare(opcode, const_c.into()).unwrap();
                     if (cond as u8) != a {
                         debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
@@ -563,7 +576,7 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
         arg = yield YieldOp::Guard(a, LType::Bool);
         if let ResumeArg::Matched = arg {
             arg = yield YieldOp::Exec(ResidualExec("test_bool", Rc::new(move |owner, state, cb| {
-                let LValue::Bool(b) = state.vals[state.base + a as usize] else { unreachable!() };
+                let b_val = unsafe { state.vals[state.base + a as usize].unbox() }; let LValue::Bool(b) = b_val else { unreachable!() };
                 state.select = (b as u16 == c) as usize;
             })));
             arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
@@ -600,12 +613,12 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
             unimplemented!("__unm metatable");
         };
         arg = yield YieldOp::Exec(ResidualExec("unm", Rc::new(move |owner, state, cb| {
-            let res = match &state.vals[state.base + b as usize] {
+            let b_val = unsafe { state.vals[state.base + b as usize].unbox() }; let res = match b_val {
                 // TODO: metatables
                 LValue::Number(n) => LValue::Number(Number(-n.0)),
                 _ => unimplemented!(),
             };
-            state.vals[state.base + a as usize] = res;
+            state.vals[state.base + a as usize] = LBoxed::box_lvalue(res)
         })));
         yield YieldOp::SetTypes(vec![(a, LType::Number)]);
         arg
@@ -619,12 +632,12 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         if ResumeArg::Matched == arg {
             arg = yield YieldOp::Exec(ResidualExec("len_str", Rc::new(move |owner, state, cb| {
                 let b = &state.vals[state.base + b];
-                let n = match b {
+                let b_val = unsafe { b.unbox() }; let n = match b_val {
                     LValue::OwnedString(s) => { s.len() },
                     LValue::InternedString(s) => { s.0.len() },
                     _ => unreachable!(),
                 };
-                state.vals[state.base + a] = LValue::Number(Number(n as _));
+                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::Number(Number(n as _)));
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Number)]);
             return arg;
@@ -633,9 +646,9 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         if ResumeArg::Matched == arg {
             // TODO: __len metamethod
             arg = yield YieldOp::Exec(ResidualExec("len_str", Rc::new(move |owner, state, cb| {
-                let LValue::Table(b) = &state.vals[state.base + b] else { unreachable!() };
+                let b_val = unsafe { state.vals[state.base + b].unbox() }; let LValue::Table(b) = b_val else { unreachable!() };
                 let n = b.ro(owner).array.len();
-                state.vals[state.base + a] = LValue::Number(Number(n as _));
+                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::Number(Number(n as _)));
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Number)]);
             return arg;
@@ -658,7 +671,7 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
             let mut s: FVec<_> = vec![].into();
             for i in (b as usize)..=(c as usize) {
 
-                let cont = match &state.vals[state.base + i as usize] {
+                let val = unsafe { state.vals[state.base + i as usize].unbox() }; let cont = match val {
                     LValue::OwnedString(s) => s.clone(),
                     LValue::InternedString(s) => Rc::new(s.into_ref().0.to_vec().into()),
                     _ => unreachable!(),
@@ -666,7 +679,7 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
                 s.extend_from_slice(cont.as_slice());
             }
             debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-            state.vals[state.base + a as usize] = LValue::OwnedString(Rc::new(s));
+            state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::OwnedString(Rc::new(s)));
         })));
         arg = yield YieldOp::SetTypes(vec![(a, LType::String)]);
         arg
@@ -773,10 +786,10 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
             let limit = state.vals[state.base + a as usize + 1].clone();
             let step = state.vals[state.base + a as usize + 2].clone();
             debug!("{:?} {:?} {:?}", idx, limit, step);
-            let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0)))).unwrap() {
-                limit.compare(Opcode::LE, idx.clone())
+            let comp = if unsafe { step.unbox() }.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0)))).unwrap() {
+                unsafe { limit.unbox() }.compare(Opcode::LE, unsafe { idx.clone().unbox() })
             } else {
-                idx.clone().compare(Opcode::LE, limit)
+                unsafe { idx.clone().unbox() }.compare(Opcode::LE, unsafe { limit.unbox() })
             };
             if comp.unwrap() {
                 state.vals[state.base + a as usize + 3] = idx;
@@ -1020,7 +1033,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadk(bx, typeof_(&c), a as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadk(bx, typeof_(&LBoxed::box_lvalue(c.clone())), a as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::MOVE => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
@@ -1161,8 +1174,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let hkey = &mut thunk_ctx.hkeys[href.0 as usize];
             debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
             let tab = &state.vals[state.base + idx];
-            let LValue::Table(tab) = tab else { unreachable!() };
-            let Some((index, key, val)) = tab.ro(owner).hash.get_full::<LValue>(&(&hkey.key).into()) else {
+            let tab_unboxed = unsafe { tab.unbox() }; let LValue::Table(tab) = tab_unboxed else { unreachable!() };
+            let Some((index, key, val)) = tab.ro(owner).hash.get_full(&LBoxed::box_lvalue((&hkey.key).into())) else {
                 // The table doesn't have this key, which means we should actually just bailout
                 let fail_block = vm.new_block();
                 if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro, ResumeArg::Failed, block_id) {
@@ -1173,7 +1186,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
             debug!("href forced by {tab:?} -> {val:?}");
             // TODO: give the environment a shape as well
-            let discovered_type = typeof_(&val);
+            let discovered_type = typeof_(val);
             hkey.known_type = discovered_type;
 
             // TODO: track the maximum number of hkeys + grow here instead so we can initialize the RunState
@@ -1193,7 +1206,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
                 debug!("populating hashkey witness {}", hidx);
                 let witness = &mut state.hash_witnesses[hidx];
-                let LValue::Table(tab) = &state.vals[state.base + idx] else { unreachable!() };
+                let tab_boxed = &state.vals[state.base + idx]; let tab_unboxed = unsafe { tab_boxed.unbox() }; let LValue::Table(tab) = tab_unboxed else { unreachable!() };
                 *witness = Some(HashWitness {
                     href,
                     key: init_key.clone(),
@@ -1241,7 +1254,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.blocks[check_block.0].instructions.push(Residual::Exec(ResidualExec("epoch_repair", Rc::new(move |owner, state, cb| {
                 // Re-init the witness and jump back to success block
                 let Some(witness) = &mut state.hash_witnesses[state.witness_base + href.0 as usize] else { unreachable!() };
-                let LValue::Table(tab) = &state.vals[state.base + tab] else { unreachable!() };
+                let tab_boxed = &state.vals[state.base + tab]; let tab_unboxed = unsafe { tab_boxed.unbox() }; let LValue::Table(tab) = tab_unboxed else { unreachable!() };
                 debug!("repairing {:?} epoch", href);
                 witness.epoch = tab.ro(owner).epoch;
             }))));
@@ -1598,26 +1611,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         match effect {
                             ExecEffect::Call(a, b, c) => {
                                 let to_call = &state.vals[state.base + a as usize];
-                                if let LValue::LClosure(ref lclos) = to_call.clone() {
+                                let unboxed_to_call = unsafe { to_call.unbox() }; if let LValue::LClosure(ref lclos) = unboxed_to_call {
                                     state.trap = true;
                                     jump_target = Some((a, b, c));
-                                } else if let LValue::NClosure(ncall) = to_call {
-                                    let args = if b == 0 {
+                                let unboxed_to_call = unsafe { to_call.unbox() }; } else if let LValue::NClosure(ncall) = unboxed_to_call {
+                                    let args_boxed = if b == 0 {
                                         &state.vals[state.base + a as usize+1..]
                                     } else {
                                         &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
                                     };
+                                    let args: Vec<LValue> = args_boxed.iter().map(|v| unsafe { v.unbox() }).collect();
                                     debug!("{:?}", args);
                                     let mut native = ncall.rw(owner).native.clone();
-                                    let ret = (native)(args, owner);
+                                    let ret = (native)(&args, owner);
+                                    let boxed_ret = ret.into_iter().map(LBoxed::box_lvalue);
                                     if c == 0 {
                                         // save all returned
-                                        state.vals.splice(state.base + a as usize.., ret).for_each(drop);
+                                        state.vals.splice(state.base + a as usize.., boxed_ret).for_each(drop);
                                     }
                                     else if c == 1 {
                                         // nothing saved
                                     } else if c != 1 {
-                                        state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, ret).for_each(drop);
+                                        state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, boxed_ret).for_each(drop);
                                     } else {
                                         unimplemented!()
                                     }
@@ -1644,13 +1659,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off = state.current_off as usize;
                         if let Some((a, b, c)) = jump_target {
                             let to_call = &state.vals[state.base + a as usize];
-                            let LValue::LClosure(ref lclos) = to_call.clone() else { unreachable!() };
+                            let unboxed_to_call = unsafe { to_call.unbox() }; let LValue::LClosure(ref lclos) = unboxed_to_call else { unreachable!() };
                             debug!("jit set jump_target to {lclos:?}");
                             // record call stack: we say where to return to and where to put the values
                             let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
                             // push empty stack frame
                             state.vals.extend_from_slice(
-                                vec![LValue::Nil; next_stack].as_slice());
+                                vec![LBoxed::default(); next_stack].as_slice());
                             state.callstack.push(CallstackEntry {
                                 clos: self.clos.clone(),
                                 // We can't use the captured `off`, because this closure
@@ -1735,7 +1750,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::EpochCheck { tab, href } => {
                     let hwit = &state.hash_witnesses[state.witness_base + href.0 as usize].as_ref().unwrap();
                     let tab = &state.vals[state.base + tab];
-                    let LValue::Table(tab) = tab else { unreachable!() };
+                    let tab_unboxed = unsafe { tab.unbox() }; let LValue::Table(tab) = tab_unboxed else { unreachable!() };
                     warn!("epochcheck sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
                     if hwit.epoch == tab.ro(owner).epoch {
                         // Fallthrough
@@ -1747,10 +1762,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::HashGuard { tab, href, expected } => {
                     let hwit = &state.hash_witnesses[state.witness_base + href.0 as usize].as_ref().unwrap();
                     let tab = &state.vals[state.base + tab];
-                    let LValue::Table(tab) = tab else { unreachable!() };
+                    let tab_unboxed = unsafe { tab.unbox() }; let LValue::Table(tab) = tab_unboxed else { unreachable!() };
                     let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
                     let cached_key_val: LValue = (&hwit.key).into();
-                    assert!(key == &cached_key_val);
+                    assert_eq!(unsafe { key.unbox() }, cached_key_val);
                     if typeof_(val) == expected {
                         // Fallthrough
                         off += 2;
@@ -1773,13 +1788,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             },
                             ExecEffect::Call(a, b, c) => {
                                 // Dynamic dispatch call
-                                let to_call = &state.vals[state.base + a as usize];
-                                if let LValue::LClosure(ref lclos) = to_call.clone() {
+                                let to_call = state.vals[state.base + a as usize].clone();
+                                let unboxed_to_call = unsafe { to_call.unbox() }; if let LValue::LClosure(ref lclos) = unboxed_to_call {
                                     // record call stack: we say where to return to and where to put the values
                                     let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
                                     // push empty stack frame
                                     state.vals.extend_from_slice(
-                                        vec![LValue::Nil; next_stack].as_slice());
+                                        vec![LBoxed::default(); next_stack].as_slice());
                                     state.callstack.push(CallstackEntry {
                                         clos: self.clos.clone(),
                                         ret: ReturnLocation::Generator(id, off),
@@ -1811,23 +1826,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     self.set_current(lclos.clone());
                                     id = block;
                                     off = 0;
-                                } else if let LValue::NClosure(ncall) = to_call {
-                                    let args = if b == 0 {
+                                let unboxed_to_call = unsafe { to_call.unbox() }; } else if let LValue::NClosure(ncall) = unboxed_to_call {
+                                    let args_boxed = if b == 0 {
                                         &state.vals[state.base + a as usize+1..]
                                     } else {
                                         &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
                                     };
+                                    let args: Vec<LValue> = args_boxed.iter().map(|v| unsafe { v.unbox() }).collect();
                                     debug!("{:?}", args);
                                     let mut native = ncall.rw(owner).native.clone();
-                                    let ret = (native)(args, owner);
+                                    let ret = (native)(&args, owner);
+                                    let boxed_ret = ret.into_iter().map(LBoxed::box_lvalue);
                                     if c == 0 {
                                         // save all returned
-                                        state.vals.splice(state.base + a as usize.., ret).for_each(drop);
+                                        state.vals.splice(state.base + a as usize.., boxed_ret).for_each(drop);
                                     }
                                     else if c == 1 {
                                         // nothing saved
                                     } else if c != 1 {
-                                        state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, ret).for_each(drop);
+                                        state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, boxed_ret).for_each(drop);
                                     } else {
                                         unimplemented!()
                                     }
@@ -1942,7 +1959,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
-                    Box::new(emit_loadk(bx, typeof_(&c), a as usize))
+                    Box::new(emit_loadk(bx, typeof_(&LBoxed::box_lvalue(c.clone())), a as usize))
                 },
                 Opcode::MOVE => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
