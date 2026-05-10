@@ -74,6 +74,12 @@ hyperfine benchmark: unsafe-compile interpreter-compile
         "./target/interpreter/release/lunacy {{benchmark}}.bin" \
         "./target/release/lunacy {{benchmark}}.bin" \
         "./target/unsafe/release/lunacy {{benchmark}}.bin"
+hyperfine-jit benchmark:
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    cargo build --release --bin lunacy
+    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-jit.md \
+        "./target/release/lunacy {{benchmark}}.bin"
+
 hyperfines: (hyperfine "binarytrees") (hyperfine "life") (run "nbody")
 
 all: test benchmarks (hyperfine "binarytrees")

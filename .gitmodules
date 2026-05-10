@@ -1,3 +1,12 @@
 [submodule "lua_benchmarking"]
 	path = lua_benchmarking
 	url = https://github.com/softdevteam/lua_benchmarking.git
+[submodule "memmap-rs"]
+	path = memmap-rs
+	url = git@github.com:chc4/memmap-rs.git
+[submodule "dynasm-rs"]
+	path = dynasm-rs
+	url = git@github.com:chc4/dynasm-rs.git
+[submodule "memmap2-rs"]
+	path = memmap2-rs
+	url = git@github.com:chc4/memmap2-rs.git

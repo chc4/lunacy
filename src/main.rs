@@ -2,7 +2,7 @@
 // For LBBV
 #![feature(coroutines, coroutine_trait, coroutine_clone, stmt_expr_attributes)]
 // For JIT
-#![feature(ptr_metadata, rust_preserve_none_cc)]
+#![feature(ptr_metadata, rust_preserve_none_cc, iter_map_windows)]
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::Read;

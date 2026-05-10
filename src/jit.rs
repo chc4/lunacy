@@ -103,7 +103,10 @@ struct JitPtr(*const u8);
 
 impl JitContext {
     pub fn new() -> Self {
-        let mut memory = dynasmrt::mmap::MutableBuffer::new(JIT_SIZE).unwrap();
+        let near = Self::find_near();
+        assert!(near != core::ptr::null_mut());
+        let mut memory = dynasmrt::mmap::MutableBuffer::new_with_hint(JIT_SIZE, near).unwrap();
+        debug!("allocated JIT memory @ {:?}", memory.as_ptr());
         // Set the JIT memory to the max size initially, so that we don't need to
         // mprotect back to mutable just to reserve
         memory.set_len(JIT_SIZE);
@@ -111,8 +114,32 @@ impl JitContext {
             memory: Cell::new(memory.make_exec().unwrap()),
             blocks: HashMap::default(),
             pending: BTreeMap::new(),
-            used: 0
+            used: 0,
         }
+    }
+
+    fn find_near() -> *mut core::ffi::c_void {
+        let target = JitHelper::check_guard as *mut u8 as usize;
+        let MAX_DIST = 2isize.pow(31);
+        let maps = rsprocmaps::from_path("/proc/self/maps").unwrap();
+        // Our goal is to find an available place in memory such that our entire JIT_SIZE buffer is
+        // within 2GB of the target.
+        // This means that we can
+        // 1) allocate memory before it, with a start <2GB away, and a JIT_SIZE hole
+        // 2) allocate memory after it, with a start <2GB-JIT_SIZE away, and a JIT_SIZE hole
+        // Really this needs to have the target be a *range* and require a buffer that is within
+        // distance of both the start and end, and then we should compute the start and end based
+        // off all of our closure call targets...but it isn't likely to matter, so we don't.
+        let res = maps.map_windows(|[first, second]| {
+            let (Ok(first), Ok(second)) = (first, second) else { return None };
+            // Case 1
+            if (target as isize - first.address_range.end as isize).abs() < MAX_DIST && (second.address_range.begin - first.address_range.end) as usize >= JIT_SIZE {
+                debug!("Found near JIT location @ {:#x}", first.address_range.end);
+                return Some(first.address_range.end as *mut core::ffi::c_void);
+            }
+            None
+        }).flatten().next();
+        res.unwrap_or(core::ptr::null_mut())
     }
 
     fn end(&self) -> JitPtr {
@@ -168,7 +195,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // We need to skip over the uncommitted prologue
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
             self.jctx.blocks.insert(id, new_block);
-            let _block = self.blocks[id.0].jit_body(id, &mut self.jctx, &mut ops);
+            let _block = self.blocks[id.0 as usize].jit_body(id, &mut self.jctx, &mut ops);
         }
 
 
@@ -185,7 +212,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             dynasm!(ops
                 ; =>pending_label
             );
-            let _block = self.blocks[pending_block.0].jit_body(pending_block, &mut self.jctx, &mut ops);
+            let _block = self.blocks[pending_block.0 as usize].jit_body(pending_block, &mut self.jctx, &mut ops);
             self.jctx.reserve(ops.offset().0 - pending_start.0);
         }
 
@@ -194,22 +221,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let Some(slab) = self.jctx.commit(base, buf.as_slice()) else { panic!() };
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
 
-        self.blocks[id.0].jit_info.entry = Some(entrypoint);
+        self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
     }
 }
 
-impl Drop for JitContext {
-    fn drop(&mut self) {
-        // SAFETY: This requires that no JIT code is currently running, all JitInfo for Blocks
-        // that were derived from our memory have been destroyed.
-        // Under normal circumstances this is upheld by storing the JitContext inside the
-        // Specializer that will use it for Blocks.
-    }
-}
 type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
 impl Block {
     pub fn jit_body(&mut self, id: BlockId, jctx: &mut JitContext, ops: &mut Assembler) -> AssemblyOffset {
         let entry = ops.offset();
+        let x = jctx.memory.get_mut().as_ptr();
         let insts: Vec<_> = self.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
 
         let mut emit_jump = |ops: &mut Assembler, target: &BlockId| {
@@ -248,10 +268,9 @@ impl Block {
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r13 // state
-                        ; mov rsi, QWORD (*idx as i64)
-                        ; mov rdx, QWORD (expected_u8 as i64)
-                        ; mov rax, QWORD (JitHelper::check_guard as *const () as i64)
-                        ; call rax
+                        ; mov rsi, WORD (*idx as i32)
+                        ; mov rdx, WORD (expected_u8 as i32)
+                        ; call extern (JitHelper::check_guard as *const () as usize)
                         ; test al, al
                         ; jnz =>insts[(off + 2)]
                         // Fail: fallthrough to next (off + 1)
@@ -263,10 +282,9 @@ impl Block {
                         ; .arch x64
                         ; mov rsi, r12 // owner
                         ; mov rdi, r13 // state
-                        ; mov rdx, QWORD (*tab as i64)
-                        ; mov rcx, QWORD (href_u8 as i64)
-                        ; mov rax, QWORD (JitHelper::check_epoch as *const () as i64)
-                        ; call rax
+                        ; mov rdx, WORD (*tab as i32)
+                        ; mov rcx, WORD (href_u8 as i32)
+                        ; call extern (JitHelper::check_epoch as *const () as usize)
                         ; test al, al
                         ; jnz =>insts[(off + 2)]
                         // Fail: fallthrough to next (off + 1)
@@ -279,11 +297,10 @@ impl Block {
                         ; .arch x64
                         ; mov rsi, r12 // owner
                         ; mov rdi, r13 // state
-                        ; mov rdx, QWORD (*tab as i64)
-                        ; mov rcx, QWORD (href_u8 as i64)
-                        ; mov r8, QWORD (expected_u8 as i64)
-                        ; mov rax, QWORD (JitHelper::check_hash_guard as *const () as i64)
-                        ; call rax
+                        ; mov rdx, WORD (*tab as i32)
+                        ; mov rcx, WORD (href_u8 as i32)
+                        ; mov r8, WORD (expected_u8 as i32)
+                        ; call extern (JitHelper::check_hash_guard as *const () as usize)
                         ; test al, al
                         ; jnz =>insts[(off + 2)]
                         // Fail: fallthrough to next (off + 1)
@@ -291,6 +308,7 @@ impl Block {
                 },
                 Residual::Exec(f) => {
                     let (this_obj, this_vtable, this_call) = get_ptr_from_closure(f.1.as_ref());
+                    debug!("JIT memory @ {:?}, operation @ {:#x}, desired {:?}", x, this_call, &mut JitHelper::check_guard as &mut _ as *mut _ as *mut core::ffi::c_void);
                     dynasm!(ops
                         ; .arch x64
                         ; mov rsi, r12 // owner
@@ -299,10 +317,9 @@ impl Block {
                         ; mov r8, r15  // cb vtable
                         ; mov rdi, QWORD (this_obj as i64)
                         ; mov rax, QWORD (this_vtable as i64)
-                        ; mov rbx, QWORD (this_call as i64)
                         // Lua wants to see PC+1, and also we want to resume to PC+1 if we trap.
                         ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
-                        ; call rbx
+                        ; call extern (this_call)
                         //// Check for trap
                         ; mov al, BYTE r13 => RunState.trap
                         ; test al, al

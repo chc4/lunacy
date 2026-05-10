@@ -30,8 +30,9 @@ qcell = "0.5.4"
 graphviz-rust = { version = "0.4.0" }
 indexmap = "2.14.0"
 dynasm = "5.0.0"
-dynasmrt = "5.0.0"
+dynasmrt = { version = "5.0.0", path = "./dynasm-rs/runtime" }
 smallvec = "1.15.1"
+rsprocmaps = "0.3.2"
 
 [target.sandbox]
 
