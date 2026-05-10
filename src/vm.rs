@@ -895,7 +895,6 @@ pub struct RunState<'src, 'intern> {
     pub select: usize,
     pub witness_base: usize,
     pub hash_witnesses: FVec<Option<HashWitness>>,
-    pub trap: bool,
     pub current_off: u16,
     pub gas: i64,
 }
@@ -1060,7 +1059,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 counters: Default::default(),
                 hash_witnesses: vec![].into(),
                 select: 0,
-                trap: false,
                 current_off: 0,
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
             }
