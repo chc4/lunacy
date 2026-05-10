@@ -106,6 +106,18 @@ macro_rules! dispatch_numeric {
     };
 }
 
+macro_rules! dispatch_compare {
+    ($opcode:expr, $label:expr, $name:ident, {$($cap:ident: $val:expr),*}) => {
+        match $opcode {
+            Opcode::EQ => ResidualExec(concat!($label, "_EQ"), Rc::new($name::<{Opcode::EQ}> { $($cap: $val),* })),
+            Opcode::LT => ResidualExec(concat!($label, "_LT"), Rc::new($name::<{Opcode::LT}> { $($cap: $val),* })),
+            Opcode::LE => ResidualExec(concat!($label, "_LE"), Rc::new($name::<{Opcode::LE}> { $($cap: $val),* })),
+            _ => unreachable!(),
+        }
+    };
+}
+
+
 #[derive(Debug)]
 pub enum ExecEffect {
     Jump(BlockId),
@@ -561,51 +573,54 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
 
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                arg = yield YieldOp::Exec(ResidualExec("comp_int_int", Rc::new(move |owner, state, cb| {
-                    debug!("comp @ {}", pc);
+                define_exec!(CompareIntInt, [a: u8, b: usize, c: usize], [OP: Opcode],
+                |owner, state, cb, dest, lhs, rhs| {
                     let dyn_b = &state.vals[state.base + b];
                     let dyn_c = &state.vals[state.base + c];
-                    let cond = dyn_b.compare(opcode, dyn_c.clone()).unwrap();
-                    if (cond as u8) != a {
-                        debug!("taking comparison jump -> {:?}", taken);
+                    let cond = dyn_b.compare(OP, dyn_c.clone()).unwrap();
+                    if (cond as u8) != *a {
+                        //debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
                     } else {
-                        debug!("falling through comparison jump -> {:?}", fallthrough);
+                        //debug!("falling through comparison jump -> {:?}", fallthrough);
                         state.select = 1;
                     }
-                })));
+                });
+                arg = yield YieldOp::Exec(dispatch_compare!(opcode, "comp_int_int", CompareIntInt, {a: a, b: b, c: c}));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) => {
-                arg = yield YieldOp::Exec(ResidualExec("comp_cint_int", Rc::new(move |owner, state, cb| {
-                    debug!("comp @ {}", pc);
-                    let const_b = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[rb as usize] };
+                define_exec!(CompareCIntInt, [a: u8, rb: usize, c: usize], [OP: Opcode],
+                |owner, state, cb, dest, lhs, rhs| {
+                    let const_b = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[*rb as usize] };
                     let Constant::Number(Number(_)) = const_b else { unreachable!() };
                     let dyn_c = &state.vals[state.base + c];
-                    let cond = LValue::from(const_b).compare(opcode, dyn_c.clone()).unwrap();
-                    if (cond as u8) != a {
-                        debug!("taking comparison jump -> {:?}", taken);
+                    let cond = LValue::from(const_b).compare(OP, dyn_c.clone()).unwrap();
+                    if (cond as u8) != *a {
+                        //debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
                     } else {
-                        debug!("falling through comparison jump -> {:?}", fallthrough);
+                        //debug!("falling through comparison jump -> {:?}", fallthrough);
                         state.select = 1;
                     }
-                })));
+                });
+                arg = yield YieldOp::Exec(dispatch_compare!(opcode, "comp_cint_int", CompareCIntInt, {a: a, rb: rb, c: c}));
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
-                arg = yield YieldOp::Exec(ResidualExec("comp_int_cint", Rc::new(move |owner, state, cb| {
-                    debug!("comp @ {}", pc);
+                define_exec!(CompareIntCInt, [a: u8, b: usize, rc: usize], [OP: Opcode],
+                |owner, state, cb, dest, lhs, rhs| {
                     let dyn_b = &state.vals[state.base + b];
-                    let const_c = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[rc as usize] };
+                    let const_c = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[*rc as usize] };
                     let Constant::Number(Number(_)) = const_c else { unreachable!() };
-                    let cond = dyn_b.compare(opcode, const_c.into()).unwrap();
-                    if (cond as u8) != a {
-                        debug!("taking comparison jump -> {:?}", taken);
+                    let cond = dyn_b.compare(OP, const_c.into()).unwrap();
+                    if (cond as u8) != *a {
+                        //debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
                     } else {
-                        debug!("falling through comparison jump -> {:?}", fallthrough);
+                        //debug!("falling through comparison jump -> {:?}", fallthrough);
                         state.select = 1;
                     }
-                })));
+                });
+                arg = yield YieldOp::Exec(dispatch_compare!(opcode, "comp_int_cint", CompareIntCInt, {a: a, b: b, rc: rc}));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::MatchedConst(rc)) => {
                 unimplemented!()
