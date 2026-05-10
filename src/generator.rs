@@ -56,6 +56,56 @@ macro_rules! unreachable {
     () => { unsafe { core::hint::unreachable_unchecked() } }
 }
 
+macro_rules! define_exec {
+    ($name:ident, [$($cap:ident: $cap_ty:ty),*], [$($const_param:ident: $const_ty:ty),*], |$owner:ident, $state:ident, $cb:ident, $($args:ident),*| $body:block) => {
+        #[derive(Clone)]
+        pub struct $name<$(const $const_param: $const_ty),*> {
+            $(pub $cap: $cap_ty),*
+        }
+
+        impl<$(const $const_param: $const_ty),*> FnOnce<(&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>, ExecCallback<'_, '_, '_>)> for $name<$($const_param),*> {
+            type Output = ();
+            #[inline(always)]
+            extern "rust-call" fn call_once(self, args: (&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>, ExecCallback<'_, '_, '_>)) {
+                self.call(args)
+            }
+        }
+
+        impl<$(const $const_param: $const_ty),*> FnMut<(&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>, ExecCallback<'_, '_, '_>)> for $name<$($const_param),*> {
+            #[inline(always)]
+            extern "rust-call" fn call_mut(&mut self, args: (&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>, ExecCallback<'_, '_, '_>)) {
+                self.call(args)
+            }
+        }
+
+        impl<$(const $const_param: $const_ty),*> Fn<(&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>, ExecCallback<'_, '_, '_>)> for $name<$($const_param),*> {
+            #[inline(always)]
+            extern "rust-call" fn call(&self, (owner, state, cb): (&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>, ExecCallback<'_, '_, '_>)) {
+                let $name { $($cap),* } = self;
+                $(let $args = *$cap;)*
+                let $owner = owner;
+                let $state = state;
+                let $cb = cb;
+                $body
+            }
+        }
+    };
+}
+
+macro_rules! dispatch_numeric {
+    ($opcode:expr, $label:expr, $name:ident, {$($cap:ident: $val:expr),*}) => {
+        match $opcode {
+            Opcode::ADD => ResidualExec(concat!($label, "_ADD"), Rc::new($name::<{Opcode::ADD}> { $($cap: $val),* })),
+            Opcode::SUB => ResidualExec(concat!($label, "_SUB"), Rc::new($name::<{Opcode::SUB}> { $($cap: $val),* })),
+            Opcode::MUL => ResidualExec(concat!($label, "_MUL"), Rc::new($name::<{Opcode::MUL}> { $($cap: $val),* })),
+            Opcode::DIV => ResidualExec(concat!($label, "_DIV"), Rc::new($name::<{Opcode::DIV}> { $($cap: $val),* })),
+            Opcode::MOD => ResidualExec(concat!($label, "_MOD"), Rc::new($name::<{Opcode::MOD}> { $($cap: $val),* })),
+            Opcode::POW => ResidualExec(concat!($label, "_POW"), Rc::new($name::<{Opcode::POW}> { $($cap: $val),* })),
+            _ => unreachable!(),
+        }
+    };
+}
+
 #[derive(Debug)]
 pub enum ExecEffect {
     Jump(BlockId),
@@ -400,52 +450,67 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         arg = rarg;
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                yield YieldOp::Exec(ResidualExec("numeric_int_int", Rc::new(move |owner, state, cb| {
-                    let klhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, lhs as u16);
-                    let krhs = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, rhs as u16);
+                define_exec!(NumericIntInt, [dest: usize, lhs: usize, rhs: usize], [OP: Opcode],
+                |owner, state, cb, dest, lhs, rhs| {
+                    let state: &mut RunState = state;
                     let LValue::Number(dyn_b) = &state.vals[state.base + lhs] else { unreachable!() };
                     let LValue::Number(dyn_c) = &state.vals[state.base + rhs] else { unreachable!() };
-                    let res = LValue::Number(*dyn_b).numeric_op(opcode, &LValue::Number(*dyn_c)).unwrap();
+                    let res = LValue::Number(*dyn_b).numeric_op(OP, &LValue::Number(*dyn_c)).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest as usize] = res;
-                })));
+                    state.vals[state.base + dest] = res;
+                });
+
+                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_int_int", NumericIntInt, {dest: dest, lhs: lhs, rhs: rhs}));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
-                yield YieldOp::Exec(ResidualExec("numeric_cint_cint", Rc::new(move |owner, state, cb| {
-                    let klhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc as usize]) };
-                    let krhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc as usize]) };
+                define_exec!(NumericCintCint, [dest: usize, lhsc: usize, rhsc: usize], [OP: Opcode],
+                |owner, state, cb, dest, lhsc, rhsc| {
+                    let state: &mut RunState = state;
+                    let klhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc]) };
+                    let krhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc]) };
                     let LConstant::Number(kb) = klhs else { unreachable!() };
                     let LConstant::Number(kc) = krhs else { unreachable!() };
-                    let res = LValue::Number(*kb).numeric_op(opcode, &LValue::Number(*kc)).unwrap();
+                    let res = LValue::Number(*kb).numeric_op(OP, &LValue::Number(*kc)).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest as usize] = res;
-                })));
+                    state.vals[state.base + dest] = res;
+                });
+
+                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_cint_cint", NumericCintCint, {dest: dest, lhsc: lhsc as usize, rhsc: rhsc as usize}));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
             (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
-                yield YieldOp::Exec(ResidualExec("numeric_cint_int", Rc::new(move |owner, state, cb| {
-                    let kb: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc as usize]) };
+                define_exec!(NumericCintInt, [dest: usize, lhsc: usize, rhs: usize], [OP: Opcode],
+                |owner, state, cb, dest, lhsc, rhs| {
+                    let state: &mut RunState = state;
+                    let kb: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc]) };
                     let LConstant::Number(kb) = kb else { unreachable!() };
                     let dyn_c = &state.vals[state.base + rhs];
-                    let res = LValue::Number(Number(kb.0)).numeric_op(opcode, dyn_c).unwrap();
+                    let res = LValue::Number(Number(kb.0)).numeric_op(OP, dyn_c).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest as usize] = res;
-                })));
+                    state.vals[state.base + dest] = res;
+                });
+
+                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_cint_int", NumericCintInt, {dest: dest, lhsc: lhsc as usize, rhs: rhs}));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
-                yield YieldOp::Exec(ResidualExec("numeric_int_cint", Rc::new(move |owner, state, cb| {
+                define_exec!(NumericIntCint, [dest: usize, lhs: usize, rhsc: usize], [OP: Opcode],
+                |owner, state, cb, dest, lhs, rhsc| {
+                    let state: &mut RunState = state;
                     let dyn_b = &state.vals[state.base + lhs];
-                    let kc: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc as usize]) };
+                    let kc: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc]) };
                     let LConstant::Number(kc) = kc else { unreachable!() };
-                    let res = dyn_b.numeric_op(opcode, &LValue::Number(Number(kc.0))).unwrap();
+                    let res = dyn_b.numeric_op(OP, &LValue::Number(Number(kc.0))).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest as usize] = res;
-                })));
+                    state.vals[state.base + dest] = res;
+                });
+
+
+                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_int_cint", NumericIntCint, {dest: dest, lhs: lhs, rhsc: rhsc as usize}));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },

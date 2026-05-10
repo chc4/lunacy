@@ -77,7 +77,7 @@ hyperfine benchmark: unsafe-compile interpreter-compile
         "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench" \
         "./target/interpreter/release/lunacy {{benchmark}}.bin" \
         "./target/release/lunacy {{benchmark}}.bin" \
-        "./target/unsafe/release/lunacy {{benchmark}}.bin"
+        "./target/unsafe/lunacy {{benchmark}}.bin"
 hyperfine-jit benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin lunacy
