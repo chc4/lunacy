@@ -14,7 +14,7 @@ use log::warn;
 #[cfg(feature = "immediate_jit")]
 const INITIAL_HOTNESS: usize = 0;
 #[cfg(not(feature = "immediate_jit"))]
-const INITIAL_HOTNESS: usize = 200;
+const INITIAL_HOTNESS: usize = 64;
 
 #[derive(Debug)]
 pub struct JitInfo {
@@ -76,7 +76,7 @@ impl JitHelper {
     }
     pub unsafe extern "C" fn check_hash_guard(state: *mut (), owner: *mut (), tab: usize, href: u8, expected: u8) -> bool {
         unsafe {
-            println!("state {:?} {} {} {}", state, tab, href, expected);
+            panic!();
             let state = state as *mut RunState;
             let owner = owner as *mut TCellOwner<TcOwner>;
             let rs = &*state;
@@ -151,6 +151,7 @@ impl JitContext {
 
     // Reserve memory in the JIT buffer
     fn reserve(&mut self, len: usize) {
+        #[cfg(debug_assertions)]
         assert!(self.used + len < JIT_SIZE);
         self.used += len;
     }
@@ -158,9 +159,12 @@ impl JitContext {
     // Commit contents 
     fn commit(&mut self, ptr: JitPtr, contents: &[u8]) -> Option<*mut u8> {
         let mut mutable = self.memory.take().make_mut().unwrap();
-        assert!(ptr.0 >= mutable.as_mut_ptr());
-        assert!(ptr.0 <= unsafe { mutable.as_mut_ptr().add(self.used) });
-        assert!(unsafe { ptr.0.add(contents.len()) } <= unsafe { mutable.as_mut_ptr().add(self.used) });
+        #[cfg(debug_assertions)]
+        {
+            assert!(ptr.0 >= mutable.as_mut_ptr());
+            assert!(ptr.0 <= unsafe { mutable.as_mut_ptr().add(self.used) });
+            assert!(unsafe { ptr.0.add(contents.len()) } <= unsafe { mutable.as_mut_ptr().add(self.used) });
+        }
         let ptr = unsafe { mutable.as_mut_ptr().offset(ptr.0.offset_from(mutable.as_mut_ptr())) };
         unsafe { core::slice::from_raw_parts_mut(ptr, contents.len()).copy_from_slice(contents) };
         self.memory.set(mutable.make_exec().unwrap());

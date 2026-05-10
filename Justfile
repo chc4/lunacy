@@ -46,7 +46,6 @@ gdb-benchmark benchmark: dump
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin lunacy
     gdb --args ./target/release/lunacy {{benchmark}}.bin
-    time ./target/unsafe/lunacy {{benchmark}}.bin
 
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
@@ -58,12 +57,17 @@ interpreter benchmark: interpreter-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     time ./target/interpreter/release/lunacy {{benchmark}}.bin
 
-UNSAFE_FEATURES := "unreachable skip_vec"
 unsafe-compile:
-    cargo build --release --features "{{UNSAFE_FEATURES}}" --bin lunacy --target-dir ./target/unsafe
+    cargo build --profile unsafe --no-default-features --features unsafe --bin lunacy \
+        -Z build-std="core,std,panic_abort"
 unsafe benchmark: unsafe-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    time ./target/unsafe/release/lunacy {{benchmark}}.bin
+    time ./target/unsafe/lunacy {{benchmark}}.bin
+
+gdb-unsafe benchmark: unsafe-compile
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    gdb --args ./target/unsafe/lunacy {{benchmark}}.bin
+
 
 # Hyperfine reports
 hyperfine benchmark: unsafe-compile interpreter-compile
@@ -79,6 +83,11 @@ hyperfine-jit benchmark:
     cargo build --release --bin lunacy
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-jit.md \
         "./target/release/lunacy {{benchmark}}.bin"
+hyperfine-unsafe benchmark: unsafe-compile
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-unsafe.md \
+        "./target/unsafe/lunacy {{benchmark}}.bin"
+
 
 hyperfines: (hyperfine "binarytrees") (hyperfine "life") (run "nbody")
 

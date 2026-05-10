@@ -299,6 +299,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     };
                     let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
                     debug!("settable_href {:?} {}", &val1, htype);
+                    #[cfg(debug_assertions)]
                     assert!(typeof_(val1) == htype);
                     *val1 = kc;
                     if mismatched_type.is_some() {
@@ -1364,6 +1365,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let hr: u8 = ctx.hkeys.len().try_into().expect("too many hrefs");
                             href = HashRef(hr);
                             let hkey = HashKey { idx, key: k_val.clone(), known_type: LType::Unknown };
+                            #[cfg(debug_assertions)]
                             assert_eq!(ctx.hkeys.iter().filter(|exist| **exist == hkey).next(), None);
                             ctx.hkeys.push(hkey.clone());
                         }
@@ -1750,6 +1752,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let LValue::Table(tab) = tab else { unreachable!() };
                     let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
                     let cached_key_val: LValue = (&hwit.key).into();
+                    #[cfg(debug_assertions)]
                     assert!(key == &cached_key_val);
                     if typeof_(val) == expected {
                         // Fallthrough

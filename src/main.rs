@@ -34,7 +34,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder().format_timestamp(None).format_source_path(true).init();
     let mut owner = TCellOwner::new();
 
-
     let input = std::env::args().nth(1);
     let inputs = if let Some(input) = input {
         vec![OsString::from(input)]

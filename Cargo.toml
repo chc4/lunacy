@@ -1,3 +1,4 @@
+cargo-features = ["panic-immediate-abort"]
 [package]
 name = "lunacy"
 version = "0.1.0"
@@ -13,7 +14,8 @@ immediate_jit = []
 jit = []
 unreachable = []
 gas = []
-sonic = ["skip_rc", "skip_vec", "unreachable"]
+unsafe = ["jit", "skip_vec", "unreachable"]
+sonic = ["unsafe", "skip_rc"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -45,3 +47,7 @@ panic = "abort"
 lto = "fat"
 strip = false
 debug = true
+
+[profile.unsafe]
+inherits = "release"
+panic = "immediate-abort"
