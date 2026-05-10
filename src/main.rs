@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let header = chunk::header(&bytecode[..]);
         debug!("header {:?}", &header);
         let intern_strings = internment::Arena::new();
-        if let Ok((rest, header)) = header {
+        if let Ok((_rest, header)) = header {
             let header = header.globally_intern(&intern_strings);
             let vm = Vm::new(&header.top_level as *const _);
             {
