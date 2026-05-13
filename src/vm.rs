@@ -597,7 +597,7 @@ pub enum LValue<'src, 'intern> {
     InternedString(ArenaIntern<'intern, (&'src [u8], u64)>),
     OwnedString(Rc<FVec<u8>>),
     LClosure(Tc<LClosure<'src, 'intern>>),
-    NClosure(Tc<NClosure>),
+    NClosure(NClosure),
     Table(Tc<Table<'src, 'intern>>),
 }
 
@@ -826,14 +826,29 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
     }
 }
 
-pub trait NativeFunc = for<'a, 'src, 'intern> Fn(&'a [LValue<'src, 'intern>], &mut TCellOwner<TcOwner>) -> FVec<LValue<'src, 'intern>>;
+pub type NativeFunc = for<'a, 'src, 'intern> fn(&'a [LValue<'src, 'intern>], &mut TCellOwner<TcOwner>) -> FVec<LValue<'src, 'intern>>;
+#[derive(Clone)]
 pub struct NClosure {
-    pub native: Rc<dyn NativeFunc>,
+    pub native: NativeFunc,
+}
+
+impl PartialEq for NClosure {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::fn_addr_eq(self.native, other.native)
+    }
+}
+
+impl Eq for NClosure { }
+
+impl Hash for NClosure {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.native.hash(state);
+    }
 }
 
 impl<'src> Debug for NClosure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<native function {:p}>", self.native.as_ref())
+        write!(f, "<native function {:p}>", self.native)
     }
 }
 
@@ -850,12 +865,16 @@ impl<'src, 'intern> LClosure<'src, 'intern> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Closure<'src, 'intern> {
     Lua(Gc<LClosure<'src, 'intern>>),
-    Native(Gc<NClosure>),
+    Native(NClosure),
 }
 
 impl NClosure {
-    pub fn new(native: impl NativeFunc + 'static) -> Tc<Self> {
-        Tc::new(NClosure { native: Rc::new(native) })
+    pub fn new(native: NativeFunc) -> Self {
+        NClosure { native }
+    }
+
+    pub fn get_ptr(&self) -> *const () {
+        self.native as _
     }
 }
 
@@ -1458,7 +1477,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
                         };
                         debug!("{:?}", args);
-                        let mut native = ncall.rw(owner).native.clone();
+                        let mut native = ncall.native.clone();
                         let ret = (native)(args, owner);
                         if c == 0 {
                             // save all returned

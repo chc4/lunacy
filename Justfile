@@ -11,7 +11,7 @@ test: dump
 watch: dump
     cargo watch -- cargo check --bin lunacy
 
-TEST_FEATURES := "counters jit gas"
+TEST_FEATURES := "counters graph jit gas"
 [env("RUST_LOG", "debug")]
 debug num: dump
     time cargo run --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- ./dumped/dumped_{{num}}.bin

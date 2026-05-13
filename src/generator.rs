@@ -952,7 +952,7 @@ pub enum Residual {
 pub enum CType {
     Type(LType),
     Shape(SmallVec<[HashRef; 4]>),
-    NativeFunction(Tc<NClosure>),
+    NativeFunction(NClosure),
     // TODO: static lua call targets
 }
 
@@ -1306,8 +1306,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
                 // we have to do this all over again with the newly observed type (up to our block
                 // limit).
-                let (ptr, _metadata) = (nf.ro(owner).native.as_ref() as *const dyn NativeFunc).to_raw_parts();
-                vm.blocks[block_id.0].instructions.push(Residual::NativeGuard { idx, ptr });
+                let call = nf.get_ptr();
+                vm.blocks[block_id.0].instructions.push(Residual::NativeGuard { idx, ptr: call });
                 // TODO: this fail thunk could be a bit more efficient, where it doesn't actually
                 // need to re-emit the Guard against Closure - but also it's unlikely to matter
                 // much.
@@ -1412,8 +1412,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // Because we will need to JIT the guards, we split "simple" hashguards from other, more
             // specialized ones such as for function targets.
             if let CType::NativeFunction(nf) = expected {
-                let (ptr, _metadata) = (nf.ro(owner).native.as_ref() as *const dyn NativeFunc).to_raw_parts();
-                vm.blocks[check_block.0].instructions.push(Residual::NativeGuard { idx: tab, ptr });
+                let call = nf.get_ptr();
+                vm.blocks[check_block.0].instructions.push(Residual::NativeGuard { idx: tab, ptr: call });
             } else {
                 vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), expected: expected.as_ltype() });
             }
@@ -1730,7 +1730,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
                                     };
                                     debug!("{:?}", args);
-                                    let mut native = ncall.rw(owner).native.clone();
+                                    let mut native = ncall.native.clone();
                                     let ret = (native)(args, owner);
                                     if c == 0 {
                                         // save all returned
@@ -1857,8 +1857,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::NativeGuard { idx, ptr } => {
                     if let LValue::NClosure(nf) = &state.vals[state.base + idx] {
 
-                        let (observed_ptr, _metadata) = (nf.ro(owner).native.as_ref() as *const dyn NativeFunc).to_raw_parts();
-                        if observed_ptr == ptr {
+                        let call = nf.get_ptr();
+                        if call == ptr {
                             // Fallthrough
                             off += 2;
                         } else {
@@ -1955,7 +1955,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
                                     };
                                     debug!("{:?}", args);
-                                    let mut native = ncall.rw(owner).native.clone();
+                                    let mut native = ncall.native.clone();
                                     let ret = (native)(args, owner);
                                     if c == 0 {
                                         // save all returned
@@ -2100,7 +2100,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 for (off, res) in residuals.instructions.iter().enumerate() {
                     let inst_label = match res {
                         Residual::Guard { idx, expected } => format!("guard({}, {})", idx, expected),
-                        Residual::NativeGuard { idx, ptr } => format!("native_guard({}, {:p})", idx, ptr),
+                        Residual::NativeGuard { idx, ptr } => format!("native_guard({}, {:p})", idx, *ptr),
                         Residual::Exec(ResidualExec(name, _)) => format!("exec({})", name),
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call(target, b, c) => format!("call({}, {}, {})", target.0, b, c),
