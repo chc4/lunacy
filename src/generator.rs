@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 
-use crate::vm::{CallstackEntry, HashWitness, NClosure, Opcode, ReturnLocation, Upvalue};
+use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, ReturnLocation, Upvalue};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
@@ -958,6 +958,7 @@ pub enum Residual {
     Ret(Pc, u8, u16),
     HashGuard { tab: usize, href: HashRef, expected: LType },
     EpochCheck { tab: usize, href: HashRef },
+    NativeGuard { idx: usize, ptr: *const () },
 }
 
 fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>) -> Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>
@@ -973,6 +974,21 @@ fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Re
         return arg;
     })
 }
+
+fn native_guard_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>) -> Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>
+{
+    Box::new(#[coroutine] move |mut arg: ResumeArg| {
+        loop {
+            let state = Pin::new(&mut fresh_coro).resume(arg);
+            match state {
+                CoroutineState::Yielded(y) => arg = yield y,
+                CoroutineState::Complete(_) => break,
+            }
+        }
+        return arg;
+    })
+}
+
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum CType {
@@ -1240,7 +1256,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // like, not do that. If needed, there's a jankier version of this that filters the
             // remainder of thunk_coro to hoist specifically the successful type guard for idx in
             // our git history.
-            let thunk_coro = thunk_coro.clone();
+            let mut thunk_coro  = thunk_coro.clone();
             let runtime_type = state.vals[state.base + idx].typeof_();
             let mut forced_ctx = thunk_ctx.clone();
             forced_ctx.types[idx] = CType::Type(runtime_type);
@@ -1255,8 +1271,32 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // Push the same thunk down for the next value that fails the guard
             let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_ctx.clone(), false);
             vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
-            let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
-            vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
+            // If we're in the success block and the guarded value is a native function, we can
+            // also try to emit a guard to specialize the functin value as well. This lets us
+            // specialize code like `local print = print; print("xyz");`.
+            if let CType::NativeFunction(nf) = state.vals[state.base + idx].ctypeof_() {
+                // We know this original value has the correct native function, and so can compile
+                // a block for it immediately.
+                let mut native_ctx = forced_ctx.clone();
+                native_ctx.types[idx] = CType::NativeFunction(nf.clone());
+                let guard_block = vm.subblock(owner, pc.next_true(), native_ctx.clone(), thunk_coro, arg);
+                // However future executions may have change the native function out from under us.
+                // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
+                // we have to do this all over again with the newly observed type (up to our block
+                // limit).
+                let (ptr, _metadata) = (nf.ro(owner).native.as_ref() as *const dyn NativeFunc).to_raw_parts();
+                vm.blocks[block_id.0].instructions.push(Residual::NativeGuard { idx, ptr });
+                let fail_native_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+                    // TODO: move this to a separate make_native_check_thunk so it can call itself
+                    // with the newly observed native function
+                    panic!();
+                })));
+                vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_native_thunk));
+                vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
+            } else {
+                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
+                vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
+            }
 
             debug!("after compiling thunk, blocks look like {:?}", vm.blocks);
         })))
@@ -1282,6 +1322,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // TODO: give the environment a shape as well
             let discovered_type = val.typeof_();
             hkey.known_type = discovered_type;
+
+            // If we're loading a hashkey from a table and it's a native function, also try to
+            // specialize on its value. This lets us devirtualize code like `local t = { print =
+            // print }; t.print("xyz");`.
+            if let CType::NativeFunction(nf) = state.vals[state.base + idx].ctypeof_() {
+                debug!("todo href native function specialization");
+            }
 
             // TODO: track the maximum number of hkeys + grow here instead so we can initialize the RunState
             // array.
@@ -1836,6 +1883,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
+                Residual::NativeGuard { idx, ptr } => {
+                    if let LValue::NClosure(nf) = &state.vals[state.base + idx] {
+
+                        let (observed_ptr, _metadata) = (nf.ro(owner).native.as_ref() as *const dyn NativeFunc).to_raw_parts();
+                        if observed_ptr == ptr {
+                            // Fallthrough
+                            off += 2;
+                        } else {
+                            off += 1;
+                        }
+                    } else {
+                        off += 1;
+                    }
+                },
                 Residual::EpochCheck { tab, href } => {
                     let hwit = &state.hash_witnesses[state.witness_base + href.0 as usize].as_ref().unwrap();
                     let tab = &state.vals[state.base + tab];
@@ -2117,6 +2178,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 for (off, res) in residuals.instructions.iter().enumerate() {
                     let inst_label = match res {
                         Residual::Guard { idx, expected } => format!("guard({}, {})", idx, expected),
+                        Residual::NativeGuard { idx, ptr } => format!("native_guard({}, {:p})", idx, ptr),
                         Residual::Exec(ResidualExec(name, _)) => format!("exec({})", name),
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call(target, b, c) => format!("call({}, {}, {})", target.0, b, c),
@@ -2135,7 +2197,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::Call(target, _, _) => {
                             edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "call"))));
                         }
-                        Residual::Guard { .. } | Residual::HashGuard { .. } => {
+                        Residual::Guard { .. } | Residual::HashGuard { .. } | Residual::NativeGuard { .. } => {
                             if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
                                 edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "pass"))));
                             }
