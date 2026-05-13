@@ -1294,7 +1294,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected, pc, thunk_ctx.clone(), false);
             vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk.clone()));
             // If we're in the success block and the guarded value is a native function, we can
-            // also try to emit a guard to specialize the functin value as well. This lets us
+            // also try to emit a guard to specialize the function value as well. This lets us
             // specialize code like `local print = print; print("xyz");`.
             if let CType::NativeFunction(nf) = state.vals[state.base + idx].ctypeof_() {
                 // We know this original value has the correct native function, and so can compile
@@ -1308,6 +1308,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // limit).
                 let (ptr, _metadata) = (nf.ro(owner).native.as_ref() as *const dyn NativeFunc).to_raw_parts();
                 vm.blocks[block_id.0].instructions.push(Residual::NativeGuard { idx, ptr });
+                // TODO: this fail thunk could be a bit more efficient, where it doesn't actually
+                // need to re-emit the Guard against Closure - but also it's unlikely to matter
+                // much.
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
             } else {

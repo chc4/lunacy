@@ -1,6 +1,7 @@
 #![allow(non_snake_case, unused)]
 use core::fmt::Debug;
 use core::hash::Hash;
+use std::collections::hash_map::Entry;
 use std::num::Wrapping;
 use std::ops::{DerefMut, Index, IndexMut};
 use crate::chunk::FunctionBlock;
@@ -19,6 +20,7 @@ use indexmap::IndexMap;
 use qcell::{TCell, TCellOwner};
 
 use log::debug;
+use log::warn;
 use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
 use crate::perf::PerfCounters;
 
@@ -1192,7 +1194,28 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         LValue::Table(tab) => {
                             tab.set(owner, kb, kc)
                         },
-                        x => { debug!("huh {:?}", x); unimplemented!() },
+                        x => { debug!("huh {:?} {:?}", x, kb);
+                            // Handle magic debugging keys
+                            #[cfg(debug_assertions)]
+                            if let LValue::LClosure(lc) = x && let LValue::InternedString(key) = kb {
+                                println!("{key:?}");
+                                match key.0 {
+                                    x if x == const { "__jit\0".as_bytes() } => {
+                                        if let Entry::Occupied(mut entry) = spec.versions.entry(lc.rw(owner).prototype) {
+                                            for block in entry.get_mut().values() {
+                                                warn!("Forcing JIT for block {}", block.0);
+                                                spec.blocks[block.0].jit_info.hotness.set(0);
+                                            }
+                                        }
+                                    },
+                                    _ => unimplemented!(),
+                                }
+                            } else {
+                                unimplemented!()
+                            }
+                            #[cfg(not(debug_assertions))]
+                            unimplemented!()
+                        },
                     };
                 },
                 Opcode::SETGLOBAL => {
