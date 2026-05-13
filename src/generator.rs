@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 
-use crate::vm::{Opcode, Upvalue, CallstackEntry, ReturnLocation, HashWitness};
+use crate::vm::{CallstackEntry, HashWitness, NClosure, Opcode, ReturnLocation, Upvalue};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
@@ -26,6 +26,7 @@ use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 
 impl<'src, 'intern> LValue<'src, 'intern> {
+    /// Get the LType of an observed value
     pub fn typeof_(&self) -> LType {
         match self {
             LValue::Number(_) => LType::Number,
@@ -35,6 +36,16 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             LValue::Nil => LType::Nil,
             _ => LType::Unknown,
         }
+    }
+
+    /// Get the CType of an observed value: this may have more precise information, such as
+    /// specialized call targets for functions.
+    pub fn ctypeof_(&self) -> CType {
+        match self {
+            LValue::NClosure(c) => CType::NativeFunction(c.clone()),
+            x => CType::Type(x.typeof_()),
+        }
+
     }
 }
 
@@ -967,7 +978,19 @@ fn filter_coro(mut fresh_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Re
 pub enum CType {
     Type(LType),
     Shape(SmallVec<[HashRef; 4]>),
-    // TODO: static call targets
+    NativeFunction(Tc<NClosure>),
+    // TODO: static lua call targets
+}
+
+impl CType {
+    /// Convert a CType to an LType, potentially losing static information.
+    fn as_ltype(&self) -> LType {
+        match self {
+            CType::Type(ty) => ty.clone(),
+            CType::Shape(_) => LType::Table,
+            CType::NativeFunction(_) => LType::Closure,
+        }
+    }
 }
 
 impl std::fmt::Display for CType {
@@ -975,6 +998,7 @@ impl std::fmt::Display for CType {
         match self {
             CType::Type(ltype) => ltype.fmt(f),
             CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
+            CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
         }
     }
 }
@@ -1201,7 +1225,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    fn make_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, thunk_ctx: Context, appends: bool) -> ThunkRef {
+    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, thunk_ctx: Context, appends: bool) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
             // The thunk was forced, so now we know the runtime value and if it
@@ -1229,7 +1253,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // TODO: search for if we already have a compatible block
             vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Guard { idx, expected: runtime_type };
             // Push the same thunk down for the next value that fails the guard
-            let fail_thunk = vm.make_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_ctx.clone(), false);
+            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected, pc.next_false(), thunk_ctx.clone(), false);
             vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
             let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
             vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
@@ -1357,11 +1381,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
 
                     let ctype = &ctx.types[idx];
-                    // Erase any hkeys and say its just a table
-                    let ltype = match ctype {
-                        CType::Type(t) => *t,
-                        CType::Shape(_) => LType::Table,
-                    };
+                    // Erase any additional static information which the generator doesn't have
+                    // access to
+                    let ltype = ctype.as_ltype();
                     arg = ResumeArg::Type(ltype);
                 },
                 CoroutineState::Yielded(YieldOp::UpdateHashRef(href, ty)) => {
@@ -1496,10 +1518,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("guard {:?} == {:?}", ctx.types[idx], expected);
                     let ctype = &ctx.types[idx];
                     // Erase any hkeys and say its just a table before checking
-                    let ltype = match ctype {
-                        CType::Type(t) => *t,
-                        CType::Shape(_) => LType::Table,
-                    };
+                    let ltype = ctype.as_ltype();
 
                     if ltype == expected {
                         // Statically true: pump the success path
@@ -1511,10 +1530,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     } else {
-                        // Dynamic branch: Fork the coroutine
+                        // Dynamic branch: create a thunk that will discovery the type of the
+                        // guarded value when forced, and fork the coroutine for the observed case.
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
-                        let thunk = Residual::Thunk(self.make_thunk(block_id, thunk_coro, idx, expected, pc, thunk_ctx, true));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, expected, pc, thunk_ctx, true));
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
                     }
