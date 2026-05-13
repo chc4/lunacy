@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
 use crate::generator::{ExecCallback};
 use qcell::{TCell, TCellOwner};
-use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
+use crate::vm::{Tc, TcOwner, Vm, RunState, LValue, NativeFunc, FVec};
 use crate::generator::{Specializer, Block, BlockId, Residual};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use rustc_hash::FxBuildHasher;
@@ -49,6 +49,20 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwn
     }
 }
 
+pub fn get_ptr_from_native_func(f: &dyn NativeFunc) -> (*const (), usize, usize) {
+    let (addr, meta) = (f as *const dyn NativeFunc).to_raw_parts();
+    #[derive(Debug)]
+    #[repr(C)]
+    struct RawMeta {
+        vtable: &'static [usize; 8],
+    }
+    unsafe {
+        let vtable = std::mem::transmute::<_, RawMeta>(meta);
+        let call = vtable.vtable[5];
+        return (addr, vtable.vtable as &_ as *const _ as usize, call);
+    }
+}
+
 pub struct JitHelper;
 impl JitHelper {
     pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: u8) -> bool {
@@ -86,6 +100,30 @@ impl JitHelper {
             let LValue::Table(tab) = tab_val else { unreachable!() };
             let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
             (val.typeof_() as u8) == expected
+        }
+    }
+    pub unsafe extern "C" fn prepare_native_call(state: *mut RunState<'static, 'static>, a: usize, b: usize) -> (*const LValue<'static, 'static>, usize) {
+        let rs = unsafe { &*state };
+        let args = if b == 0 {
+            &rs.vals[rs.base + a + 1..]
+        } else {
+            &rs.vals[rs.base + a + 1..=(rs.base + a + b - 1)]
+        };
+        (args.as_ptr(), args.len())
+    }
+    pub unsafe extern "C" fn finish_native_call(state: *mut RunState<'static, 'static>, _owner: *mut TCellOwner<TcOwner>, returned_vec_ptr: *mut FVec<LValue<'static, 'static>>, a: usize, c: u16) {
+        let rs = unsafe { &mut *state };
+        let returned = unsafe { std::ptr::read(returned_vec_ptr) };
+        if c == 0 {
+            // save all returned
+            rs.vals.splice(rs.base + a.., returned).for_each(drop);
+        }
+        else if c == 1 {
+            // nothing saved
+        } else if c != 1 {
+            rs.vals.splice(rs.base + a..rs.base + a + c as usize - 1, returned).for_each(drop);
+        } else {
+            unimplemented!()
         }
     }
 }
@@ -173,7 +211,7 @@ impl JitContext {
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
-    pub fn jit_compile(&mut self, id: BlockId) {
+    pub fn jit_compile(&mut self, owner: &mut TCellOwner<TcOwner>, id: BlockId) {
         debug!("JIT compiling block {:?}", id);
         let base = self.jctx.end();
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
@@ -199,7 +237,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // We need to skip over the uncommitted prologue
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
             self.jctx.blocks.insert(id, new_block);
-            let _block = self.blocks[id.0 as usize].jit_body(id, &mut self.jctx, &mut ops);
+            let _block = self.blocks[id.0 as usize].jit_body(owner, id, &mut self.jctx, &mut ops);
         }
 
 
@@ -216,7 +254,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             dynasm!(ops
                 ; =>pending_label
             );
-            let _block = self.blocks[pending_block.0 as usize].jit_body(pending_block, &mut self.jctx, &mut ops);
+            let _block = self.blocks[pending_block.0 as usize].jit_body(owner, pending_block, &mut self.jctx, &mut ops);
             self.jctx.reserve(ops.offset().0 - pending_start.0);
         }
 
@@ -231,7 +269,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
 type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
 impl Block {
-    pub fn jit_body(&mut self, id: BlockId, jctx: &mut JitContext, ops: &mut Assembler) -> AssemblyOffset {
+    pub fn jit_body(&mut self, owner: &mut TCellOwner<TcOwner>, id: BlockId, jctx: &mut JitContext, ops: &mut Assembler) -> AssemblyOffset {
         let entry = ops.offset();
         let x = jctx.memory.get_mut().as_ptr();
         let insts: Vec<_> = self.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
@@ -276,7 +314,7 @@ impl Block {
                         ; mov rdx, WORD (expected_u8 as i32)
                         ; call extern (JitHelper::check_guard as *const () as usize)
                         ; test al, al
-                        ; jnz =>insts[(off + 2)]
+                        ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -290,7 +328,7 @@ impl Block {
                         ; mov rcx, WORD (href_u8 as i32)
                         ; call extern (JitHelper::check_epoch as *const () as usize)
                         ; test al, al
-                        ; jnz =>insts[(off + 2)]
+                        ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -306,7 +344,7 @@ impl Block {
                         ; mov r8, WORD (expected_u8 as i32)
                         ; call extern (JitHelper::check_hash_guard as *const () as usize)
                         ; test al, al
-                        ; jnz =>insts[(off + 2)]
+                        ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -336,6 +374,33 @@ impl Block {
                 },
                 Residual::Jump(target) => {
                     emit_jump(ops, target);
+                },
+                Residual::NativeCall(nclos, a, b, c) => {
+                    let (this_obj, _this_vtable, this_call) = get_ptr_from_native_func(nclos.ro(owner).native.as_ref());
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, r13 // state
+                        ; mov rsi, QWORD (*a as i64)
+                        ; mov rdx, QWORD (*b as i64)
+                        ; call extern (JitHelper::prepare_native_call as *const () as usize)
+                        // RAX = args_ptr, RDX = args_len
+
+                        ; sub rsp, 32
+                        ; mov rdi, rsp // hidden return pointer
+                        ; mov rsi, QWORD (this_obj as i64)
+                        ; mov rcx, rdx // args_len
+                        ; mov rdx, rax // args_ptr
+                        ; mov r8, r12 // owner
+                        ; call extern (this_call)
+
+                        ; mov rdi, r13 // state
+                        ; mov rsi, r12 // owner
+                        ; mov rdx, rsp // returned_vec_ptr
+                        ; mov rcx, QWORD (*a as i64)
+                        ; mov r8, QWORD (*c as i64)
+                        ; call extern (JitHelper::finish_native_call as *const () as usize)
+                        ; add rsp, 32
+                    );
                 },
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops

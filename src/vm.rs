@@ -1467,7 +1467,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         else if c == 1 {
                             // nothing saved
                         } else if c != 1 {
-                            state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, ret).for_each(drop);
+                            state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 1, ret).for_each(drop);
                         } else {
                             unimplemented!()
                         }
