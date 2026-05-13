@@ -932,6 +932,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             };
             return [f].to_vec().into()
         })));
+        math_tab.hash.insert(InternString::intern(intern, "ceil\0"), LValue::NClosure(NClosure::new(|f, _| {
+            let f = match f {
+                [LValue::Number(f)] => LValue::Number(Number(f.0.ceil())),
+                _ => unimplemented!()
+            };
+            return [f].to_vec().into()
+        })));
         math_tab.hash.insert(InternString::intern(intern, "sqrt\0"), LValue::NClosure(NClosure::new(|f, _| {
             let f = match f {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
