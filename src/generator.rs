@@ -25,14 +25,16 @@ use log::warn;
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 
-pub fn typeof_<'src, 'intern>(val: &LValue<'src, 'intern>) -> LType {
-    match val {
-        LValue::Number(_) => LType::Number,
-        LValue::InternedString(_) | LValue::OwnedString(_) => LType::String,
-        LValue::Table(t) => LType::Table,
-        LValue::LClosure(_) | LValue::NClosure(_) => LType::Closure,
-        LValue::Nil => LType::Nil,
-        _ => LType::Unknown,
+impl<'src, 'intern> LValue<'src, 'intern> {
+    pub fn typeof_(&self) -> LType {
+        match self {
+            LValue::Number(_) => LType::Number,
+            LValue::InternedString(_) | LValue::OwnedString(_) => LType::String,
+            LValue::Table(t) => LType::Table,
+            LValue::LClosure(_) | LValue::NClosure(_) => LType::Closure,
+            LValue::Nil => LType::Nil,
+            _ => LType::Unknown,
+        }
     }
 }
 
@@ -362,7 +364,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
                     debug!("settable_href {:?} {}", &val1, htype);
                     #[cfg(debug_assertions)]
-                    assert!(typeof_(val1) == htype);
+                    assert!(val1.typeof_() == htype);
                     *val1 = kc;
                     if mismatched_type.is_some() {
                         tab.rw(owner).epoch += 1;
@@ -384,10 +386,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Err(lv) => lv.clone(),
                     };
                     let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
-                    let kc_type = typeof_(&kc);
+                    let kc_type = kc.typeof_();
                     if let Some(existing) = t.rw(owner).hash.insert(kb, kc.clone()) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
-                        if typeof_(&existing) != kc_type {
+                        if existing.typeof_() != kc_type {
                             t.rw(owner).epoch += 1;
                         }
                     }
@@ -1101,7 +1103,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadk(bx, typeof_(&c), a as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadk(bx, c.typeof_(), a as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::MOVE => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
@@ -1215,7 +1217,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // remainder of thunk_coro to hoist specifically the successful type guard for idx in
             // our git history.
             let thunk_coro = thunk_coro.clone();
-            let runtime_type = typeof_(&state.vals[state.base + idx]);
+            let runtime_type = state.vals[state.base + idx].typeof_();
             let mut forced_ctx = thunk_ctx.clone();
             forced_ctx.types[idx] = CType::Type(runtime_type);
             debug!("forcing thunk with {:?} == {:?}", runtime_type, expected);
@@ -1254,7 +1256,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
             debug!("href forced by {tab:?} -> {val:?}");
             // TODO: give the environment a shape as well
-            let discovered_type = typeof_(&val);
+            let discovered_type = val.typeof_();
             hkey.known_type = discovered_type;
 
             // TODO: track the maximum number of hkeys + grow here instead so we can initialize the RunState
@@ -1807,7 +1809,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("RUN {:?}", &res);
             match res {
                 Residual::Guard { idx, expected } => {
-                    if typeof_(&state.vals[state.base + idx]) == expected {
+                    if state.vals[state.base + idx].typeof_() == expected {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -1834,7 +1836,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let cached_key_val: LValue = (&hwit.key).into();
                     #[cfg(debug_assertions)]
                     assert!(key == &cached_key_val);
-                    if typeof_(val) == expected {
+                    if val.typeof_() == expected {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -2025,7 +2027,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
-                    Box::new(emit_loadk(bx, typeof_(&c), a as usize))
+                    Box::new(emit_loadk(bx, c.typeof_(), a as usize))
                 },
                 Opcode::MOVE => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);

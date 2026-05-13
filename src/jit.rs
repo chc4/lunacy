@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
-use crate::generator::{ExecCallback, typeof_};
+use crate::generator::{ExecCallback};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
 use crate::generator::{Specializer, Block, BlockId, Residual};
@@ -57,7 +57,7 @@ impl JitHelper {
             let state = state as *mut RunState;
             let rs = &*state;
             let val = &rs.vals[rs.base + idx];
-            (typeof_(val) as u8) == expected
+            (val.typeof_() as u8) == expected
         }
     }
     pub unsafe extern "C" fn check_epoch(state: *mut (), owner: *mut (), tab: usize, href: u8) -> bool {
@@ -85,7 +85,7 @@ impl JitHelper {
             let tab_val = &rs.vals[rs.base + tab];
             let LValue::Table(tab) = tab_val else { unreachable!() };
             let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
-            (typeof_(val) as u8) == expected
+            (val.typeof_() as u8) == expected
         }
     }
 }
