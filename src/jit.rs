@@ -58,7 +58,7 @@ pub fn get_ptr_from_native_func(f: &dyn NativeFunc) -> (*const (), usize, usize)
     }
     unsafe {
         let vtable = std::mem::transmute::<_, RawMeta>(meta);
-        let call = vtable.vtable[5];
+        let call = vtable.vtable[4];
         return (addr, vtable.vtable as &_ as *const _ as usize, call);
     }
 }
