@@ -946,6 +946,7 @@ pub enum Residual {
     HashGuard { tab: usize, href: HashRef, expected: LType },
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
+    NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1634,10 +1635,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
-                            let call_exec = Residual::Exec(ResidualExec("call", Rc::new(move |owner, state, cb| {
-                                cb(ExecEffect::Call(a, b, c as u16), owner, state);
-                            })));
-                            self.blocks[block_id.0].instructions.push(call_exec);
+                            if let CType::NativeFunction(nf) = &ctx.types[a] {
+                                self.blocks[block_id.0].instructions.push(Residual::NativeCall {
+                                    nf: nf.native, a: a as u16, b: b as u16, c: c as u16
+                                });
+                            } else {
+                                let call_exec = Residual::Exec(ResidualExec("call", Rc::new(move |owner, state, cb| {
+                                    cb(ExecEffect::Call(a, b, c as u16), owner, state);
+                                })));
+                                self.blocks[block_id.0].instructions.push(call_exec);
+                            }
                             let ctx = if c == 1 {
                                 // No values are saved
                                 // All our types are intact
@@ -1982,9 +1989,38 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         let args = unsafe { core::mem::transmute(seq.cell(args)) };
                                         let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
                                         let ret = (native)(&mut seq, args, returns, owner);
-                                    });                                }
+                                    });
+                                }
                             },
                         }
+                    });
+                },
+                Residual::NativeCall { nf, a, b, c } => {
+                    off += 1;
+                    let args = if b == 0 {
+                        &state.vals[state.base + a as usize+1..]
+                    } else {
+                        &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
+                    };
+                    debug!("{:?}", args);
+                    let returns = if c == 0 {
+                        // save all returned
+                        &state.vals[state.base + a as usize..]
+                    }
+                    else if c == 1 {
+                        // nothing saved
+                        &[]
+                    } else if c != 1 {
+                        &state.vals[state.base + a as usize..state.base + a as usize + c as usize - 1]
+                    } else {
+                        unimplemented!()
+                    };
+                    LCellOwner::scope(|mut seq| {
+                        // Safety: LCellOwner guarantees that the native function can only ever
+                        // have mutable access to one slice at a time.
+                        let args = unsafe { core::mem::transmute(seq.cell(args)) };
+                        let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
+                        let ret = (nf)(&mut seq, args, returns, owner);
                     });
                 },
                 Residual::Jump(target) => {
@@ -2118,6 +2154,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::Exec(ResidualExec(name, _)) => format!("exec({})", name),
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call(target, b, c) => format!("call({}, {}, {})", target.0, b, c),
+                        Residual::NativeCall { nf, a, b, c } => format!("ncall({:p}, {}, {}, {})", nf, a, b, c),
                         Residual::HashGuard { tab, href, expected } => format!("hguard({}, {:?}, {})", tab, href, expected),
                         Residual::EpochCheck { tab, href } => format!("epoch({}, {:?})", tab, href),
                         Residual::Thunk(_) => format!("thunk"),
@@ -2133,6 +2170,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::Call(target, _, _) => {
                             edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "call"))));
                         }
+                        Residual::NativeCall { nf, a, b, c }  => {
+                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("{:p}", nf)); attr!("label", "ncall"))));
+                        },
                         Residual::Guard { .. } | Residual::HashGuard { .. } | Residual::NativeGuard { .. } => {
                             if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
                                 edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "pass"))));

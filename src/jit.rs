@@ -60,13 +60,14 @@ impl JitHelper {
             (val.typeof_() as u8) == expected
         }
     }
-    pub unsafe extern "C" fn check_epoch(state: *mut (), owner: *mut (), tab: usize, href: u8) -> bool {
+    pub unsafe extern "C" fn check_epoch(state: *mut (), tab: usize, href: u8) -> bool {
         unsafe {
             //println!("state {:?} {} {}", state, tab, href);
             let state = state as *mut RunState;
-            let owner = owner as *mut TCellOwner<TcOwner>;
+            // Forge an owner
+            let mut owner = ();
+            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
             let rs = &*state;
-            let owner = &*owner;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
             let tab_val = &rs.vals[rs.base + tab];
             let LValue::Table(tab) = tab_val else { unreachable!() };
@@ -74,13 +75,14 @@ impl JitHelper {
             hwit.epoch == tab.ro(owner).epoch
         }
     }
-    pub unsafe extern "C" fn check_hash_guard(state: *mut (), owner: *mut (), tab: usize, href: u8, expected: u8) -> bool {
+    pub unsafe extern "C" fn check_hash_guard(state: *mut (), tab: usize, href: u8, expected: u8) -> bool {
         unsafe {
             panic!();
             let state = state as *mut RunState;
-            let owner = owner as *mut TCellOwner<TcOwner>;
+            // Forge an owner
+            let mut owner = ();
+            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
             let rs = &*state;
-            let owner = &*owner;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
             let tab_val = &rs.vals[rs.base + tab];
             let LValue::Table(tab) = tab_val else { unreachable!() };
@@ -188,6 +190,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; push rbp
             ; push rax // alignment
         );
+        // TODO: Pin state.vals.as_ptr() to a register, which will let us remove a lot of the
+        // JitHelper function calls.
 
         // We may have already JIT this block, if it was jumped to by another block
         // first. In that case we just have to jump to it.
@@ -272,11 +276,11 @@ impl Block {
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r13 // state
-                        ; mov rsi, WORD (*idx as i32)
-                        ; mov rdx, WORD (expected_u8 as i32)
+                        ; mov rsi, WORD (*idx as i32) // idx
+                        ; mov rdx, WORD (expected_u8 as i32) // expected
                         ; call extern (JitHelper::check_guard as *const () as usize)
                         ; test al, al
-                        ; jnz =>insts[(off + 2)]
+                        ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -284,13 +288,12 @@ impl Block {
                     let href_u8 = href.0;
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rsi, r12 // owner
                         ; mov rdi, r13 // state
-                        ; mov rdx, WORD (*tab as i32)
-                        ; mov rcx, WORD (href_u8 as i32)
+                        ; mov rsi, WORD (*tab as i32)
+                        ; mov rdx, WORD (href_u8 as i32)
                         ; call extern (JitHelper::check_epoch as *const () as usize)
                         ; test al, al
-                        ; jnz =>insts[(off + 2)]
+                        ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -299,14 +302,13 @@ impl Block {
                     let expected_u8 = *expected as u8;
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rsi, r12 // owner
                         ; mov rdi, r13 // state
-                        ; mov rdx, WORD (*tab as i32)
-                        ; mov rcx, WORD (href_u8 as i32)
-                        ; mov r8, WORD (expected_u8 as i32)
+                        ; mov rsi, WORD (*tab as i32)
+                        ; mov rdx, WORD (href_u8 as i32)
+                        ; mov rcx, WORD (expected_u8 as i32)
                         ; call extern (JitHelper::check_hash_guard as *const () as usize)
                         ; test al, al
-                        ; jnz =>insts[(off + 2)]
+                        ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -334,6 +336,17 @@ impl Block {
                         ; no_trap:
                     );
                 },
+                //Residual::NativeCall { nf, a, b, c } => {
+                //    // NativeFunction is an extern "rust-call" like Exec.
+                //    dynasm!(ops
+                //        ; mov rsi, r12 // owner
+                //        ; mov rdx, r13 // state
+                //        // Lua wants to see PC+1, and also we want to resume to PC+1 if we trap.
+                //        ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
+
+                //        ; call extern (*nf as usize)
+                //    );
+                //},
                 Residual::Jump(target) => {
                     emit_jump(ops, target);
                 },
