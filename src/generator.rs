@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 
 use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, ReturnLocation, Upvalue};
-use qcell::{TCell, TCellOwner};
+use qcell::{TCell, TCellOwner, LCell, LCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
 use crate::vm::LClosure;
 use crate::vm::{LValue, LType, Number, Table, FVec};
@@ -1730,19 +1730,27 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
                                     };
                                     debug!("{:?}", args);
-                                    let mut native = ncall.native.clone();
-                                    let ret = (native)(args, owner);
-                                    if c == 0 {
+                                    let returns = if c == 0 {
                                         // save all returned
-                                        state.vals.splice(state.base + a as usize.., ret).for_each(drop);
+                                        &state.vals[state.base + a as usize..]
                                     }
                                     else if c == 1 {
                                         // nothing saved
+                                        &[]
                                     } else if c != 1 {
-                                        state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, ret).for_each(drop);
+                                        &state.vals[state.base + a as usize..state.base + a as usize + c as usize - 1]
                                     } else {
                                         unimplemented!()
-                                    }
+                                    };
+                                    let mut native = ncall.native.clone();
+                                    LCellOwner::scope(|mut seq| {
+                                        // Safety: LCellOwner guarantees that the native function can only ever
+                                        // have mutable access to one slice at a time.
+                                        let args = unsafe { core::mem::transmute(seq.cell(args)) };
+                                        let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
+                                        let ret = (native)(&mut seq, args, returns, owner);
+                                    });
+
                                 } else {
                                     unimplemented!()
                                 }
@@ -1955,20 +1963,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
                                     };
                                     debug!("{:?}", args);
-                                    let mut native = ncall.native.clone();
-                                    let ret = (native)(args, owner);
-                                    if c == 0 {
+                                    let returns = if c == 0 {
                                         // save all returned
-                                        state.vals.splice(state.base + a as usize.., ret).for_each(drop);
+                                        &state.vals[state.base + a as usize..]
                                     }
                                     else if c == 1 {
                                         // nothing saved
+                                        &[]
                                     } else if c != 1 {
-                                        state.vals.splice(state.base + a as usize..state.base + a as usize + c as usize - 2, ret).for_each(drop);
+                                        &state.vals[state.base + a as usize..state.base + a as usize + c as usize - 1]
                                     } else {
                                         unimplemented!()
-                                    }
-                                }
+                                    };
+                                    let mut native = ncall.native.clone();
+                                    LCellOwner::scope(|mut seq| {
+                                        // Safety: LCellOwner guarantees that the native function can only ever
+                                        // have mutable access to one slice at a time.
+                                        let args = unsafe { core::mem::transmute(seq.cell(args)) };
+                                        let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
+                                        let ret = (native)(&mut seq, args, returns, owner);
+                                    });                                }
                             },
                         }
                     });
