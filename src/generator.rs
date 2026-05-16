@@ -727,7 +727,7 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         arg = yield YieldOp::Guard(b, LType::Table);
         if ResumeArg::Matched == arg {
             // TODO: __len metamethod
-            arg = yield YieldOp::Exec(ResidualExec("len_str", Rc::new(move |owner, state, cb| {
+            arg = yield YieldOp::Exec(ResidualExec("len_tab", Rc::new(move |owner, state, cb| {
                 let LValue::Table(b) = &state.vals[state.base + b] else { unreachable!() };
                 let n = b.ro(owner).array.len();
                 state.vals[state.base + a] = LValue::Number(Number(n as _));
@@ -1362,6 +1362,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let init_key = hkey.key.clone();
             let href_init = Residual::Exec(ResidualExec("href_init", Rc::new(move |owner, state, cb| {
+                let mut index = index;
                 let hidx = state.witness_base + href.0 as usize;
                 if state.hash_witnesses.len() <= hidx {
                     state.hash_witnesses.resize_with(hidx + 1, || None);
@@ -1369,6 +1370,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 debug!("populating hashkey witness {}", hidx);
                 let witness = &mut state.hash_witnesses[hidx];
                 let LValue::Table(tab) = &state.vals[state.base + idx] else { unreachable!() };
+                let lkey: LValue = (&init_key).into();
+                // Inline cache for assuming the index stays the same
+                if *tab.ro(owner).hash.get_index(index).unwrap().0 != lkey {
+                    index = tab.ro(owner).hash.get_index_of(&lkey).unwrap();
+                }
                 *witness = Some(HashWitness {
                     href,
                     key: init_key.clone(),

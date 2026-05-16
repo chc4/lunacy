@@ -23,7 +23,7 @@ test_cases = {
 
     -- test an hkey wrong type through an aliased table
     -- emit epoch test on cached hkey, remove the dirty tracking stuff
-    [==[t = {} local function fast() local x = t x.a = "1" local z = x.a .. x.a local y = t y.a = "2" local w = y.a .. y.a x.a = 1 print(y.a) print(y.a + 3) print(x.a + 4) print(z) print(w) end fast()]==],
+    [==[t = {} local function fast() local x = t x.a = "1" local z = x.a .. x.a local y = t y.a = "2" local w = y.a .. y.a x.a = 1 print(y.a) print(y.a + 3) print(x.a + 4) print(z) print(w) end fast() fast.__jit = 1 fast()]==],
     -- Local NativeFunction
     "function fast(p) local a = p(1.5) print(a) return a end assert(fast(math.ceil) == 2) assert(fast(math.floor) == 1)",
     "local function fast(p) local a = p(1.5) print(a) return a end assert(fast(math.ceil) == 2); fast.__jit = 1; assert(fast(math.floor) == 1)",

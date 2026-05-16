@@ -38,9 +38,12 @@ run-debug benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     time cargo run --bin lunacy -- {{benchmark}}.bin
 
-graph benchmark:
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    time cargo run --release --features graph --bin lunacy -- {{benchmark}}.bin
+graph name:
+    luac5.1 -o {{name}}.bin {{name}}.lua
+    cargo run --features graph --bin lunacy -- {{name}}.bin
+graph-release name:
+    luac5.1 -o {{name}}.bin {{name}}.lua
+    cargo run --release --features graph --bin lunacy -- {{name}}.bin
 
 baseline benchmark:
     time lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench
