@@ -1,8 +1,8 @@
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
 use crate::generator::{ExecCallback};
-use qcell::{TCell, TCellOwner};
-use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
+use qcell::{TCell, TCellOwner, LCellOwner, LCell};
+use crate::vm::{Tc, TcOwner, Vm, RunState, LValue, NativeFunc};
 use crate::generator::{Specializer, Block, BlockId, Residual};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use rustc_hash::FxBuildHasher;
@@ -88,6 +88,41 @@ impl JitHelper {
             let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
             (val.typeof_() as u8) == expected
         }
+    }
+
+    pub unsafe extern "C" fn check_native_guard(state: *mut (), idx: usize, ptr: *const ()) -> bool {
+        let state = unsafe { &mut *(state as *mut RunState) };
+        if let LValue::NClosure(nf) = &state.vals[state.base + idx] {
+            nf.get_ptr() == ptr
+        } else {
+            false
+        }
+    }
+
+    pub unsafe extern "C" fn call_native(owner: *mut (), state: *mut (), nf: *const (), a: u32, b: u32, c: u32) {
+        let owner = unsafe { &mut *(owner as *mut TCellOwner<TcOwner>) };
+        let state = unsafe { &mut *(state as *mut RunState) };
+        let nf: NativeFunc = unsafe { core::mem::transmute(nf) };
+
+        let args = if b == 0 {
+            &state.vals[state.base + a as usize + 1..]
+        } else {
+            &state.vals[state.base + a as usize + 1..=(state.base + a as usize + b as usize - 1)]
+        };
+
+        let returns = if c == 0 {
+            &state.vals[state.base + a as usize..]
+        } else if c == 1 {
+            &[]
+        } else {
+            &state.vals[state.base + a as usize..state.base + a as usize + c as usize - 1]
+        };
+
+        LCellOwner::scope(|mut seq| {
+            let args = unsafe { core::mem::transmute(seq.cell(args)) };
+            let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
+            (nf)(&mut seq, args, returns, owner);
+        });
     }
 }
 
@@ -335,17 +370,30 @@ impl Block {
                         ; no_trap:
                     );
                 },
-                //Residual::NativeCall { nf, a, b, c } => {
-                //    // NativeFunction is an extern "rust-call" like Exec.
-                //    dynasm!(ops
-                //        ; mov rsi, r12 // owner
-                //        ; mov rdx, r13 // state
-                //        // Lua wants to see PC+1, and also we want to resume to PC+1 if we trap.
-                //        ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
-
-                //        ; call extern (*nf as usize)
-                //    );
-                //},
+                Residual::NativeGuard { idx, ptr } => {
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, r13 // state
+                        ; mov rsi, QWORD (*idx as i64)
+                        ; mov rdx, QWORD (*ptr as i64)
+                        ; call extern (JitHelper::check_native_guard as *const () as usize)
+                        ; test al, al
+                        ; jnz =>insts[off + 2]
+                    );
+                },
+                Residual::NativeCall { nf, a, b, c } => {
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, r12 // owner
+                        ; mov rsi, r13 // state
+                        ; mov rdx, QWORD (*nf as i64)
+                        ; mov rcx, DWORD (*a as i32)
+                        ; mov r8, DWORD (*b as i32)
+                        ; mov r9, DWORD (*c as i32)
+                        ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
+                        ; call extern (JitHelper::call_native as *const () as usize)
+                    );
+                },
                 Residual::Jump(target) => {
                     emit_jump(ops, target);
                 },
@@ -354,6 +402,14 @@ impl Block {
                         ; .arch x64
                         ; mov WORD r13 => RunState.current_off, (off as i16)
                         ; mov rax, QWORD (((-2i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; jmp >exit_jit
+                    );
+                },
+                Residual::LuaCall { .. } => {
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov WORD r13 => RunState.current_off, (off as i16)
+                        ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                         ; jmp >exit_jit
                     );
                 },
