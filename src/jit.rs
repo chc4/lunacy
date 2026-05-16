@@ -77,7 +77,6 @@ impl JitHelper {
     }
     pub unsafe extern "C" fn check_hash_guard(state: *mut (), tab: usize, href: u8, expected: u8) -> bool {
         unsafe {
-            panic!();
             let state = state as *mut RunState;
             // Forge an owner
             let mut owner = ();

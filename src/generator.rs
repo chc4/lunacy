@@ -1421,14 +1421,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.blocks[missing_key.0].instructions[thunk_pc] = Residual::Jump(fail_block);
             })))));
 
-
-            // TODO: emit an inline cache guard that table[index].key == key
-            // on failure we either update the hashwitness index, or bailout to the above fail
-            // block via thunk
-            // just use select here probably
-
             let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, CType::Type(discovered_type)));
-            vm.make_epoch_check(owner, has_key, thunk_coro, idx, href, pc, thunk_ctx.clone(), guard_block);
+            // TODO: do we need this? im pretty sure the answer is no, because we've always just
+            // initialized it to the correct value.
+            //vm.make_epoch_check(owner, has_key, thunk_coro, idx, href, pc, thunk_ctx.clone(), guard_block);
             vm.blocks[has_key.0].instructions.push(Residual::Jump(guard_block));
         })))
     }
