@@ -1,8 +1,8 @@
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
-use crate::generator::{ExecCallback};
+use crate::generator::{ExecCallback, ExecEffect};
 use qcell::{TCell, TCellOwner};
-use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
+use crate::vm::{Tc, TcOwner, Vm, RunState, LValue, LClosure};
 use crate::generator::{Specializer, Block, BlockId, Residual};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use rustc_hash::FxBuildHasher;
@@ -35,6 +35,12 @@ impl JitInfo {
 
 pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut TCellOwner<TcOwner>, &'a mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>) -> u64;
 
+#[repr(C)]
+pub struct LuaCallInfo {
+    pub entry: Option<JitExec>,
+    pub bailout: u64,
+}
+
 pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>)) -> (*const (), usize, usize) {
     let (addr, meta) = (f as *const dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>)).to_raw_parts();
     #[derive(Debug)]
@@ -51,6 +57,38 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwn
 
 pub struct JitHelper;
 impl JitHelper {
+    pub unsafe extern "C" fn lua_call(
+        owner: *mut TCellOwner<TcOwner>,
+        state: *mut RunState,
+        cb_data: *mut (),
+        cb_vtable: *mut (),
+        lclos: usize,
+        a: usize, b: usize, c: usize,
+        id: usize, off: usize,
+    ) -> LuaCallInfo {
+        let owner = unsafe { &mut *owner };
+        let state = unsafe { &mut *state };
+        let lclos = unsafe { &*(lclos as *const Tc<LClosure<'static, 'static>>) };
+
+        #[repr(C)]
+        struct RawTraitObject {
+            data: *mut (),
+            vtable: *mut (),
+        }
+        let cb: &mut dyn for<'a, 'b, 'src, 'intern> FnMut(ExecEffect, &mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>) =
+            unsafe { core::mem::transmute(RawTraitObject { data: cb_data, vtable: cb_vtable }) };
+
+        let mut target_id = BlockId(0);
+        let mut target_entry: Option<JitExec> = None;
+
+        cb(ExecEffect::PrepareLuaCall(lclos.clone(), a as u16, b as u16, c as u16, BlockId(id), off, &mut target_id, &mut target_entry), owner, state);
+
+        LuaCallInfo {
+            entry: target_entry,
+            bailout: (0u64 << 32) | (target_id.0 as u64)
+        }
+    }
+
     pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: u8) -> bool {
         unsafe {
             //println!("state {:?} idx {} {}", state, idx, expected);
@@ -374,6 +412,42 @@ impl Block {
                     // Should be unreachable, emit a trap
                     dynasm!(ops
                         ; int3
+                    );
+                },
+                Residual::LuaCall { lc, a, b, c } => {
+                    let leaked = Box::leak(Box::new(lc.clone()));
+                    let lc_ptr = leaked as *const Tc<LClosure> as usize;
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, r12 // owner
+                        ; mov rsi, r13 // state
+                        ; mov rdx, r14 // cb data
+                        ; mov rcx, r15 // cb vtable
+                        ; mov r8, QWORD (lc_ptr as i64)
+                        ; mov r9, QWORD (*a as i64)
+
+                        ; sub rsp, 32
+                        ; mov rax, QWORD (*b as i64)
+                        ; mov [rsp], rax
+                        ; mov rax, QWORD (*c as i64)
+                        ; mov [rsp + 8], rax
+                        ; mov rax, QWORD (id.0 as i64)
+                        ; mov [rsp + 16], rax
+                        ; mov rax, QWORD ((off + 1) as i64)
+                        ; mov [rsp + 24], rax
+
+                        ; call extern (JitHelper::lua_call as *const () as usize)
+                        ; add rsp, 32
+
+                        // RAX = entry, RDX = bailout
+                        ; test rax, rax
+                        ; jz >bailout
+                        ; call rax
+                        ; jmp >exit_jit
+
+                        ; bailout:
+                        ; mov rax, rdx
+                        ; jmp >exit_jit
                     );
                 },
                 Residual::Thunk(_) => {

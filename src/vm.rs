@@ -1595,7 +1595,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             println!("counters after run {:?}", state.counters);
         }
 
-        #[cfg(feature = "graph")]
+        #[cfg(feature = "graph_disabled")]
         for proto in unsafe { &(*self.top_level).prototypes.items } {
             let outfile = format!("graphs/func_{}.pdf", proto.line_defined);
             spec.dump(owner, proto, outfile.as_str());

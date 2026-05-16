@@ -17,7 +17,7 @@ use crate::vm::RunState;
 use crate::vm::LConstant;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
-use crate::jit::{JitInfo, JitContext};
+use crate::jit::{JitInfo, JitContext, JitExec};
 
 use log::debug;
 use log::info;
@@ -135,6 +135,7 @@ macro_rules! dispatch_compare {
 pub enum ExecEffect {
     Jump(BlockId),
     Call(usize, usize, u16),
+    PrepareLuaCall(Tc<LClosure<'static, 'static>>, u16, u16, u16, BlockId, usize, *mut BlockId, *mut Option<JitExec>),
 }
 pub type ExecCallback<'a, 'src, 'intern> = &'a mut dyn for<'b> FnMut(ExecEffect, &mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>);
 #[derive(Clone)]
@@ -1794,6 +1795,40 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     warn!("running jit for {id:?}");
                     let ret = jit_entry(owner, &mut state, &mut |effect, owner, state| {
                         match effect {
+                            ExecEffect::PrepareLuaCall(lclos, a, b, c, id, off, out_id, out_entry) => {
+                                let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
+                                state.vals.extend_from_slice(vec![LValue::Nil; next_stack].as_slice());
+                                state.callstack.push(CallstackEntry {
+                                    clos: state.clos.clone(),
+                                    ret: ReturnLocation::Generator(id, off),
+                                    frame: state.base,
+                                    limit: state.vals.len(),
+                                    witness_frame: state.witness_base,
+                                    witness_limit: state.hash_witnesses.len(),
+                                    rloc: state.base + a as usize,
+                                    c
+                                });
+                                state.base = state.base + a as usize + 1;
+                                state.witness_base = state.hash_witnesses.len();
+                                state.vals.truncate(state.base + next_stack);
+                                state.clos = unsafe { core::mem::transmute(lclos.clone()) };
+
+                                let types = vec![LType::Unknown; next_stack];
+                                let ctx = Context::new(types);
+                                let versions = self.versions.entry(state.clos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                                let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
+                                    *block
+                                } else {
+                                    let lclos = state.clos.clone();
+                                    self.set_current(lclos);
+                                    self.block(owner, 0, ctx)
+                                };
+                                self.set_current(state.clos.clone());
+                                unsafe {
+                                    *out_id = block;
+                                    *out_entry = self.blocks[block.0].jit_info.entry;
+                                }
+                            }
                             ExecEffect::Call(a, b, c) => {
                                 let to_call = &state.vals[state.base + a as usize];
                                 if let LValue::LClosure(ref lclos) = to_call.clone() {
@@ -1988,6 +2023,42 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     f.1(owner, &mut state, &mut |eff, owner, state| {
                         debug!("{:?}", eff);
                         match eff {
+                            ExecEffect::PrepareLuaCall(lclos, a, b, c, call_id, call_off, out_id, out_entry) => {
+                                let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
+                                state.vals.extend_from_slice(vec![LValue::Nil; next_stack].as_slice());
+                                state.callstack.push(CallstackEntry {
+                                    clos: state.clos.clone(),
+                                    ret: ReturnLocation::Generator(call_id, call_off),
+                                    frame: state.base,
+                                    limit: state.vals.len(),
+                                    witness_frame: state.witness_base,
+                                    witness_limit: state.hash_witnesses.len(),
+                                    rloc: state.base + a as usize,
+                                    c
+                                });
+                                state.base = state.base + a as usize + 1;
+                                state.witness_base = state.hash_witnesses.len();
+                                state.vals.truncate(state.base + next_stack);
+                                state.clos = unsafe { core::mem::transmute(lclos.clone()) };
+
+                                let types = vec![LType::Unknown; next_stack];
+                                let ctx = Context::new(types);
+                                let versions = self.versions.entry(state.clos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                                let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
+                                    *block
+                                } else {
+                                    let lclos = state.clos.clone();
+                                    self.set_current(lclos);
+                                    self.block(owner, 0, ctx)
+                                };
+                                self.set_current(state.clos.clone());
+                                unsafe {
+                                    *out_id = block;
+                                    *out_entry = self.blocks[block.0].jit_info.entry;
+                                }
+                                id = block;
+                                off = 0;
+                            }
                             ExecEffect::Jump(block) => {
                                 id = block;
                                 off = 0;
