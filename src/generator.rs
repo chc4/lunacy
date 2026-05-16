@@ -1326,6 +1326,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Context, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
             let thunk_coro = thunk_coro.clone();
+            let orig_ctx = thunk_ctx.clone();
             let hkey = &mut thunk_ctx.hkeys[href.0 as usize];
             debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
             let tab = &state.vals[state.base + idx];
@@ -1333,7 +1334,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let Some((index, key, val)) = tab.ro(owner).hash.get_full::<LValue>(&(&hkey.key).into()) else {
                 // The table doesn't have this key, which means we should actually just bailout
                 let fail_block = vm.new_block();
-                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro, ResumeArg::Failed, block_id) {
+                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), thunk_coro, ResumeArg::Failed, block_id) {
                     vm.compile(owner, succ_next, succ_ty, fail_block);
                 }
                 vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Jump(fail_block);
@@ -1372,8 +1373,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let LValue::Table(tab) = &state.vals[state.base + idx] else { unreachable!() };
                 let lkey: LValue = (&init_key).into();
                 // Inline cache for assuming the index stays the same
-                if *tab.ro(owner).hash.get_index(index).unwrap().0 != lkey {
-                    index = tab.ro(owner).hash.get_index_of(&lkey).unwrap();
+                match tab.ro(owner).hash.get_index(index) {
+                    Some((key, _)) if *key != lkey => {
+                        debug!("href_init key mismatch, {:?} {:?}", key, lkey);
+                        if let Some(new_index) = tab.ro(owner).hash.get_index_of(&lkey) {
+                            index = new_index;
+                            state.select = 0;
+                        } else {
+                            state.select = 1;
+                        }
+                    },
+                    Some((key, _)) => {
+                        state.select = 0
+                    },
+                    None => {
+                        debug!("href_init missing key");
+                        state.select = 1
+                    },
                 }
                 *witness = Some(HashWitness {
                     href,
@@ -1390,10 +1406,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else {
                 vm.blocks[block_id.0].instructions[thunk_pc] = href_init;
             }
+            let has_key = vm.new_block();
+            let missing_key = vm.new_block();
+            vm.blocks[block_id.0].instructions.push(Residual::Select(
+                vec![("has_key", has_key), ("missing_key", missing_key)]));
+            let missing_coro = thunk_coro.clone();
+            vm.blocks[missing_key.0].instructions.push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+                debug!("missing key thunk");
+                // Same as the outer thunk missing the key
+                let fail_block = vm.new_block();
+                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), missing_coro.clone(), ResumeArg::Failed, missing_key) {
+                    vm.compile(owner, succ_next, succ_ty, fail_block);
+                }
+                vm.blocks[missing_key.0].instructions[thunk_pc] = Residual::Jump(fail_block);
+            })))));
+
+
+            // TODO: emit an inline cache guard that table[index].key == key
+            // on failure we either update the hashwitness index, or bailout to the above fail
+            // block via thunk
+            // just use select here probably
 
             let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, CType::Type(discovered_type)));
-            vm.make_epoch_check(owner, block_id, thunk_coro, idx, href, pc, thunk_ctx.clone(), guard_block);
-            vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
+            vm.make_epoch_check(owner, has_key, thunk_coro, idx, href, pc, thunk_ctx.clone(), guard_block);
+            vm.blocks[has_key.0].instructions.push(Residual::Jump(guard_block));
         })))
     }
 
