@@ -43,9 +43,9 @@ impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn ctypeof_(&self) -> CType {
         match self {
             LValue::NClosure(c) => CType::NativeFunction(c.clone()),
+            LValue::LClosure(c) => CType::LuaFunction(unsafe { core::mem::transmute(c.clone()) }),
             x => CType::Type(x.typeof_()),
         }
-
     }
 }
 
@@ -947,6 +947,7 @@ pub enum Residual {
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
+    LuaCall { lc: Tc<LClosure<'static, 'static>>, a: u16, b: u16, c: u16 },
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -954,7 +955,7 @@ pub enum CType {
     Type(LType),
     Shape(SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
-    // TODO: static lua call targets
+    LuaFunction(Tc<LClosure<'static, 'static>>),
 }
 
 impl CType {
@@ -964,6 +965,7 @@ impl CType {
             CType::Type(ty) => ty.clone(),
             CType::Shape(_) => LType::Table,
             CType::NativeFunction(_) => LType::Closure,
+            CType::LuaFunction(_) => LType::Closure,
         }
     }
 }
@@ -974,6 +976,7 @@ impl std::fmt::Display for CType {
             CType::Type(ltype) => ltype.fmt(f),
             CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
             CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
+            CType::LuaFunction(func) => write!(f, "lua_fn({:?})", func),
         }
     }
 }
@@ -1314,6 +1317,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // much.
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
+            } else if let CType::LuaFunction(lc) = state.vals[state.base + idx].ctypeof_() {
+                let mut lua_ctx = forced_ctx.clone();
+                lua_ctx.types[idx] = CType::LuaFunction(lc.clone());
+                let success_block = vm.subblock(owner, pc.next_true(), lua_ctx.clone(), thunk_coro, arg);
+
+                let lc_ptr = lc.as_ptr() as usize;
+                vm.blocks[block_id.0].instructions.push(Residual::Exec(ResidualExec("lclos_guard", Rc::new(move |owner, state, cb| {
+                    if let LValue::LClosure(c) = &state.vals[state.base + idx] {
+                        if c.as_ptr() as usize == lc_ptr {
+                            state.select = 0;
+                            return;
+                        }
+                    }
+                    state.select = 1;
+                }))));
+                let fail_block_id = vm.new_block();
+                vm.blocks[block_id.0].instructions.push(Residual::Select(vec![
+                    ("matched_lclos", success_block),
+                    ("failed_lclos", fail_block_id)
+                ]));
+                let fail_block = if let Residual::Select(targets) = vm.blocks[block_id.0].instructions.last_mut().unwrap() {
+                    targets[1].1
+                } else { unreachable!() };
+                vm.blocks[fail_block.0].instructions.push(Residual::Thunk(fail_thunk));
             } else {
                 let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
@@ -1676,6 +1703,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             if let CType::NativeFunction(nf) = &ctx.types[a] {
                                 self.blocks[block_id.0].instructions.push(Residual::NativeCall {
                                     nf: nf.native, a: a as u16, b: b as u16, c: c as u16
+                                });
+                            } else if let CType::LuaFunction(lc) = &ctx.types[a] {
+                                self.blocks[block_id.0].instructions.push(Residual::LuaCall {
+                                    lc: lc.clone(), a: a as u16, b: b as u16, c: c as u16
                                 });
                             } else {
                                 let call_exec = Residual::Exec(ResidualExec("call", Rc::new(move |owner, state, cb| {
@@ -2061,6 +2092,47 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let ret = (nf)(&mut seq, args, returns, owner);
                     });
                 },
+                Residual::LuaCall { lc, a, b, c } => {
+                    off += 1;
+                    // specialized Lua call
+                    let next_stack = unsafe { (*lc.ro(owner).prototype).max_stack as usize };
+                    // push empty stack frame
+                    state.vals.extend_from_slice(
+                        vec![LValue::Nil; next_stack].as_slice());
+                    state.callstack.push(CallstackEntry {
+                        clos: state.clos.clone(),
+                        ret: ReturnLocation::Generator(id, off),
+                        frame: state.base,
+                        limit: state.vals.len(),
+                        witness_frame: state.witness_base,
+                        witness_limit: state.hash_witnesses.len(),
+                        rloc: state.base + a as usize,
+                        c
+                    });
+                    state.base = state.base + a as usize + 1;
+                    state.witness_base = state.hash_witnesses.len();
+                    state.vals.truncate(state.base +  next_stack);
+                    state.clos = unsafe { core::mem::transmute(lc.clone()) };
+
+                    // Either use existing block, compile a new one, or use most
+                    // generic.
+                    let types = vec![LType::Unknown; next_stack];
+                    let ctx = Context::new(types);
+                    let versions = self.versions.entry(state.clos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                    let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
+                        *block
+                    } else {
+                        debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*state.clos.ro(owner).prototype).source }, ctx);
+                        let lclos = state.clos.clone();
+                        self.set_current(lclos);
+                        self.block(owner, 0, ctx)
+                    };
+                    debug!("{:?} {block:?}", self.blocks);
+                    let lclos = state.clos.clone();
+                    self.set_current(lclos);
+                    id = block;
+                    off = 0;
+                },
                 Residual::Jump(target) => {
                     id = target;
                     off = 0;
@@ -2193,6 +2265,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call(target, b, c) => format!("call({}, {}, {})", target.0, b, c),
                         Residual::NativeCall { nf, a, b, c } => format!("ncall({:p}, {}, {}, {})", nf, a, b, c),
+                        Residual::LuaCall { lc, a, b, c } => format!("lcall({:p}, {}, {}, {})", lc.as_ptr(), a, b, c),
                         Residual::HashGuard { tab, href, expected } => format!("hguard({}, {:?}, {})", tab, href, expected),
                         Residual::EpochCheck { tab, href } => format!("epoch({}, {:?})", tab, href),
                         Residual::Thunk(_) => format!("thunk"),
@@ -2210,6 +2283,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                         Residual::NativeCall { nf, a, b, c }  => {
                             edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("{:p}", nf)); attr!("label", "ncall"))));
+                        },
+                        Residual::LuaCall { lc, a, b, c } => {
+                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("{:p}", lc.as_ptr())); attr!("label", "lcall"))));
                         },
                         Residual::Guard { .. } | Residual::HashGuard { .. } | Residual::NativeGuard { .. } => {
                             if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {

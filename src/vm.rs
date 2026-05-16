@@ -385,6 +385,11 @@ impl<T> Tc<T> {
     pub fn new(val: T) -> Self {
         Self(Rc::new(TCell::new(val)))
     }
+
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const T {
+        Rc::as_ptr(&self.0) as *const T
+    }
 }
 
 impl<T> Clone for Tc<T> {
@@ -1592,7 +1597,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
         #[cfg(feature = "graph")]
         for proto in unsafe { &(*self.top_level).prototypes.items } {
-            let outfile = format!("func_{}.pdf", proto.line_defined);
+            let outfile = format!("graphs/func_{}.pdf", proto.line_defined);
             spec.dump(owner, proto, outfile.as_str());
         }
 
