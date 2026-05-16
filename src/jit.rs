@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
-use crate::generator::{ExecCallback};
 use qcell::{TCell, TCellOwner};
 use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
 use crate::generator::{Specializer, Block, BlockId, Residual};
@@ -33,10 +32,10 @@ impl JitInfo {
     }
 }
 
-pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut TCellOwner<TcOwner>, &'a mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>) -> u64;
+pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut TCellOwner<TcOwner>, &'a mut RunState<'src, 'intern>) -> u64;
 
-pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>)) -> (*const (), usize, usize) {
-    let (addr, meta) = (f as *const dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>, ExecCallback<'a, 'src, 'intern>)).to_raw_parts();
+pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>)) -> (*const (), usize, usize) {
+    let (addr, meta) = (f as *const dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>)).to_raw_parts();
     #[derive(Debug)]
     #[repr(C)]
     struct RawMeta {

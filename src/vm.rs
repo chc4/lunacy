@@ -941,6 +941,62 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             }
         }
     }
+
+    #[inline(always)]
+    pub fn call_native(&mut self, nf: NativeFunc, a: u16, b: u16, c: u16, owner: &mut TCellOwner<TcOwner>) {
+        let args = if b == 0 {
+            &self.vals[self.base + a as usize+1..]
+        } else {
+            &self.vals[self.base + a as usize+1..=(self.base + a as usize + b as usize - 1)]
+        };
+        debug!("{:?}", args);
+        let returns = if c == 0 {
+            // save all returned
+            &self.vals[self.base + a as usize..]
+        }
+        else if c == 1 {
+            // nothing saved
+            &[]
+        } else if c != 1 {
+            &self.vals[self.base + a as usize..self.base + a as usize + c as usize - 1]
+        } else {
+            unimplemented!()
+        };
+        LCellOwner::scope(|mut seq| {
+            // Safety: LCellOwner guarantees that the native function can only ever
+            // have mutable access to one slice at a time.
+            let args = unsafe { core::mem::transmute(seq.cell(args)) };
+            let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
+            let ret = (nf)(seq, args, returns, owner);
+        });
+    }
+
+    pub fn call_lua(&mut self, lclos: Tc<LClosure<'src, 'intern>>,
+        ret_loc: ReturnLocation,
+        a: u16, b: u16, c: u16,
+        owner: &mut TCellOwner<TcOwner>) -> usize
+    {
+        // record call stack: we say where to return to and where to put the values
+        let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
+        // push empty stack frame
+        self.vals.extend_from_slice(
+            vec![LValue::Nil; next_stack].as_slice());
+        self.callstack.push(CallstackEntry {
+            clos: self.clos.clone(),
+            ret: ret_loc,
+            frame: self.base,
+            limit: self.vals.len(),
+            rloc: self.base + a as usize,
+            witness_frame: self.witness_base,
+            witness_limit: self.hash_witnesses.len(),
+            c
+        });
+        self.base = self.base + a as usize + 1;
+        self.witness_base = self.hash_witnesses.len();
+        self.vals.truncate(self.base +  next_stack);
+        self.clos = lclos.clone();
+        next_stack
+    }
 }
 
 
@@ -1440,26 +1496,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     debug!("{:?}", to_call);
                     // push where to return to once we RETURN
                     if let LValue::LClosure(ref lclos) = to_call.clone() {
-                        // record call stack: we say where to return to and where to put the values
-                        let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
-                        // push empty stack frame
-                        state.vals.extend_from_slice(
-                            vec![LValue::Nil; next_stack].as_slice());
-                        state.callstack.push(CallstackEntry {
-                            clos: state.clos.clone(),
-                            ret: ReturnLocation::Interpreter(state.pc),
-                            frame: state.base,
-                            limit: state.vals.len(),
-                            rloc: state.base + a as usize,
-                            witness_frame: state.witness_base,
-                            witness_limit: state.hash_witnesses.len(),
-                            c
-                        });
-                        state.base = state.base + a as usize + 1;
-                        state.witness_base = state.hash_witnesses.len();
-                        state.vals.truncate(state.base +  next_stack);
-                        state.clos = lclos.clone();
-
+                        let next_stack = state.call_lua(lclos.clone(), ReturnLocation::Interpreter(state.pc),
+                            a as u16, b as u16, c as u16, owner
+                        );
                         if LBBV {
                             // Lazy basic block versioning
                             // TODO: only run LBBV for hot code
@@ -1480,32 +1519,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         }
 
                     } else if let LValue::NClosure(ncall) = to_call {
-                        let args = if b == 0 {
-                            &state.vals[state.base + a as usize+1..]
-                        } else {
-                            &state.vals[state.base + a as usize+1..=(state.base + a as usize + b as usize - 1)]
-                        };
-                        debug!("{:?}", args);
-                        let mut native = ncall.native.clone();
-                        let returns = if c == 0 {
-                            // save all returned
-                            &state.vals[state.base + a as usize..]
-                        }
-                        else if c == 1 {
-                            // nothing saved
-                            &[]
-                        } else if c != 1 {
-                            &state.vals[state.base + a as usize..state.base + a as usize + c as usize - 1]
-                        } else {
-                            unimplemented!()
-                        };
-                        LCellOwner::scope(|mut seq| {
-                            // Safety: LCellOwner guarantees that the native function can only ever
-                            // have mutable access to one slice at a time.
-                            let args = unsafe { core::mem::transmute(seq.cell(args)) };
-                            let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
-                            let ret = (native)(seq, args, returns, owner);
-                        });
+                        state.call_native(ncall.native.clone(), a as u16, b, c, owner);
                         // FIXME(metatables): __call
                     } else {
                         panic!("cant call {:?}", to_call);
