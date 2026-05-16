@@ -831,7 +831,7 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
     }
 }
 
-pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(&mut LCellOwner<'id>, &'a LCell<'id, [LValue<'src, 'intern>]>, &'a LCell<'id, [LValue<'src, 'intern>]>, &mut TCellOwner<TcOwner>);
+pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LValue<'src, 'intern>]>, &'a LCell<'id, [LValue<'src, 'intern>]>, &mut TCellOwner<TcOwner>);
 #[derive(Clone)]
 pub struct NClosure {
     pub native: NativeFunc,
@@ -951,66 +951,66 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
     pub fn global_env(&self, owner: &mut TCellOwner<TcOwner>, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Tc<Table<'src, 'intern>> {
         let mut math_tab = Table::new(0, 0);
-        math_tab.hash.insert(InternString::intern(intern, "floor\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-            let f = match args.ro(seq) {
+        math_tab.hash.insert(InternString::intern(intern, "floor\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+            let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
                 _ => unimplemented!()
             };
-            returns.rw(seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
+            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "ceil\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-            let f = match args.ro(seq) {
+        math_tab.hash.insert(InternString::intern(intern, "ceil\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+            let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.ceil())),
                 _ => unimplemented!()
             };
-            returns.rw(seq).into_iter().zip([f]).map(|(r, o)| {
+            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| {
                 println!("overwriting {:?} with {:?}", *r, o);
                 *r = o
             }).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "sqrt\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-            let f = match args.ro(seq) {
+        math_tab.hash.insert(InternString::intern(intern, "sqrt\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+            let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
                 _ => unimplemented!()
             };
-            returns.rw(seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
+            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "abs\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-            let f = match args.ro(seq) {
+        math_tab.hash.insert(InternString::intern(intern, "abs\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+            let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.abs())),
                 _ => unimplemented!()
             };
-            returns.rw(seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
+            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "huge\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner|{
-            returns.rw(seq).into_iter().next().map(|r| *r = LValue::Number(Number(f64::INFINITY)));
+        math_tab.hash.insert(InternString::intern(intern, "huge\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner|{
+            returns.rw(&mut seq).into_iter().next().map(|r| *r = LValue::Number(Number(f64::INFINITY)));
         })));
         math_tab.hash.insert(InternString::intern(intern, "pi\0"), LValue::Number(Number(std::f64::consts::PI)));
-        math_tab.hash.insert(InternString::intern(intern, "sin\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-            let f = match args.ro(seq) {
+        math_tab.hash.insert(InternString::intern(intern, "sin\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+            let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sin())),
                 _ => unimplemented!()
             };
-            returns.rw(seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
+            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "cos\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-            let f = match args.ro(seq) {
+        math_tab.hash.insert(InternString::intern(intern, "cos\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+            let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.cos())),
                 _ => unimplemented!()
             };
-            returns.rw(seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
+            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "tan\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-          let f = match args.ro(seq) {
+        math_tab.hash.insert(InternString::intern(intern, "tan\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+          let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.tan())),
                 _ => unimplemented!()
             };
-            returns.rw(seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
+            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
 
         let mut os_tab = Table::new(0, 0);
         os_tab.hash.insert(InternString::intern(intern, "exit\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-            let f = match args.ro(seq) {
+            let f = match args.ro(&seq) {
                 [LValue::Number(f)] => return std::process::exit(f.0 as i32),
                 _ => unimplemented!(),
             };
@@ -1024,7 +1024,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
                 (InternString::intern(intern, "print\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-                    let s = args.ro(seq).iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
+                    let s = args.ro(&seq).iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
                         maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
                     ).collect::<Vec<_>>();
                     //println!("> {}", String::from_utf8_lossy(s.iter().into()));
@@ -1032,7 +1032,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     // No returns
                 }))),
                 (InternString::intern(intern, "assert\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-                    match args.ro(seq) {
+                    match args.ro(&seq) {
                         [LValue::Bool(b), ..] => {
                             if !b {
                                 panic!("lua assert failed");
@@ -1504,7 +1504,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             // have mutable access to one slice at a time.
                             let args = unsafe { core::mem::transmute(seq.cell(args)) };
                             let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
-                            let ret = (native)(&mut seq, args, returns, owner);
+                            let ret = (native)(seq, args, returns, owner);
                         });
                         // FIXME(metatables): __call
                     } else {

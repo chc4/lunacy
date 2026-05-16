@@ -1793,7 +1793,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         // have mutable access to one slice at a time.
                                         let args = unsafe { core::mem::transmute(seq.cell(args)) };
                                         let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
-                                        let ret = (native)(&mut seq, args, returns, owner);
+                                        let ret = (native)(seq, args, returns, owner);
                                     });
 
                                 } else {
@@ -2026,7 +2026,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         // have mutable access to one slice at a time.
                                         let args = unsafe { core::mem::transmute(seq.cell(args)) };
                                         let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
-                                        let ret = (native)(&mut seq, args, returns, owner);
+                                        let ret = (native)(seq, args, returns, owner);
                                     });
                                 }
                             },
@@ -2058,7 +2058,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // have mutable access to one slice at a time.
                         let args = unsafe { core::mem::transmute(seq.cell(args)) };
                         let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
-                        let ret = (nf)(&mut seq, args, returns, owner);
+                        let ret = (nf)(seq, args, returns, owner);
                     });
                 },
                 Residual::Jump(target) => {
