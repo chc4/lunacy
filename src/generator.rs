@@ -948,6 +948,7 @@ pub enum Residual {
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
+    LuaCall { lclos: Tc<LClosure<'static, 'static>>, a: u16, b: u16, c: u16 },
     LuaGuard { idx: usize, ptr: *const () },
 }
 
@@ -956,7 +957,6 @@ pub enum CType {
     Type(LType),
     Shape(SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
-    // TODO: make this a Weak?
     LuaFunction(Tc<LClosure<'static, 'static>>),
 }
 
@@ -1467,8 +1467,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let call = nf.get_ptr();
                 vm.blocks[check_block.0].instructions.push(Residual::NativeGuard { idx: tab, ptr: call });
             } else if let CType::LuaFunction(lclos) = expected {
-                let call = lclos.ro(owner).prototype.cast();
-                vm.blocks[check_block.0].instructions.push(Residual::LuaGuard { idx: tab, ptr: call });
+                let proto = lclos.ro(owner).prototype.cast();
+                vm.blocks[check_block.0].instructions.push(Residual::LuaGuard { idx: tab, ptr: proto });
             }else {
                 vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), expected: expected.as_ltype() });
             }
@@ -1698,8 +1698,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // subtract that count from the initial hotness of the entry block.
                                 // Otherwise we will repeatedly bailout in the JIT as we trigger
                                 // hotness=0 top-down instead of bottom-up.
-                                self.blocks[block_id.0].instructions.push(Residual::Call {
-                                    a: a as u16, b: b as u16, c: c as u16
+                                self.blocks[block_id.0].instructions.push(Residual::LuaCall {
+                                    lclos: lclos.clone(), a: a as u16, b: b as u16, c: c as u16
                                 });
                             } else {
                                 self.blocks[block_id.0].instructions.push(Residual::Call {
@@ -1905,13 +1905,32 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     f.1(owner, &mut state);
                 },
+                Residual::LuaCall { lclos, a, b, c } => {
+                    off += 1;
+                    // Safety: transmute the 'static lifetime back down. This is always shorter.
+                    let lclos: Tc<LClosure<'src, 'intern>> = unsafe { core::mem::transmute(lclos) };
+                    let next_stack = state.call_lua(lclos.clone(), ReturnLocation::Generator(id, off), a, b, c, owner);
+                    // Either use existing block, compile a new one, or use most
+                    // generic.
+                    let types = vec![LType::Unknown; next_stack];
+                    let ctx = Context::new(types);
+                    let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                    let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
+                        *block
+                    } else {
+                        debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, ctx);
+                        self.set_current(lclos.clone());
+                        self.block(owner, 0, ctx)
+                    };
+                    debug!("{:?} {block:?}", self.blocks);
+                    self.set_current(lclos.clone());
+                    id = block;
+                    off = 0;
+                    continue;
+                },
                 Residual::NativeCall { nf, a, b, c } => {
                     off += 1;
                     state.call_native(nf, a, b, c, owner);
-                },
-                Residual::Jump(target) => {
-                    id = target;
-                    off = 0;
                 },
                 Residual::Call { a, b, c } => {
                     off += 1;
@@ -1945,6 +1964,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         panic!("cant call {:?}", to_call);
                     }
+                },
+                Residual::Jump(target) => {
+                    id = target;
+                    off = 0;
                 },
                 Residual::Thunk(thunk) => {
                     debug!("thunk {:?}", &thunk);
@@ -2067,6 +2090,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call { a, b, c } => format!("call({}, {}, {})", a, b, c),
                         Residual::NativeCall { nf, a, b, c } => format!("ncall({:p}, {}, {}, {})", nf, a, b, c),
+                        Residual::LuaCall { lclos, a, b, c } => format!("lcall({:p}, {}, {}, {})", lclos, a, b, c),
                         Residual::HashGuard { tab, href, expected } => format!("hguard({}, {:?}, {})", tab, href, expected),
                         Residual::EpochCheck { tab, href } => format!("epoch({}, {:?})", tab, href),
                         Residual::Thunk(_) => format!("thunk"),
