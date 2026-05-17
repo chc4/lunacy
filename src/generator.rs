@@ -68,6 +68,7 @@ impl Block {
 }
 
 #[cfg(feature = "unreachable")]
+#[macro_export]
 macro_rules! unreachable {
     () => { unsafe { core::hint::unreachable_unchecked() } }
 }

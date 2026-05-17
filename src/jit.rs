@@ -10,6 +10,10 @@ use log::debug;
 use log::info;
 use log::warn;
 
+#[cfg(feature = "unreachable")]
+#[macro_use]
+use crate::unreachable;
+
 #[cfg(feature = "immediate_jit")]
 const INITIAL_HOTNESS: usize = 0;
 #[cfg(not(feature = "immediate_jit"))]
