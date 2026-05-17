@@ -226,12 +226,12 @@ impl InstructionDecode for UNM { type Unpack = AB; }
 
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Hash)]
-struct FakeRc<T> {
+pub struct FakeRc<T> {
     val: std::ptr::NonNull<T>,
 }
 
 impl<T> FakeRc<T> {
-    fn new(val: T) -> Self {
+    pub fn new(val: T) -> Self {
         let bo = Box::leak(Box::new(val));
         let bo_ptr = std::ptr::NonNull::from(bo);
         Self { val: bo_ptr }
@@ -258,9 +258,9 @@ impl<T> Clone for FakeRc<T> {
 
 // For testing RC overhead
 #[cfg(feature = "skip_rc")]
-type Rc<T> = FakeRc<T>;
+pub type Rc<T> = FakeRc<T>;
 #[cfg(not(feature = "skip_rc"))]
-use std::rc::Rc;
+pub use std::rc::Rc;
 
 // For testing Vec bounds checking overhead
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]

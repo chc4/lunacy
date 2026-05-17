@@ -754,13 +754,13 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
 
                 let cont = match &state.vals[state.base + i as usize] {
                     LValue::OwnedString(s) => s.clone(),
-                    LValue::InternedString(s) => Rc::new(s.into_ref().0.to_vec().into()),
+                    LValue::InternedString(s) => crate::vm::Rc::new(s.into_ref().0.to_vec().into()),
                     _ => unreachable!(),
                 };
                 s.extend_from_slice(cont.as_slice());
             }
             debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-            state.vals[state.base + a as usize] = LValue::OwnedString(Rc::new(s));
+            state.vals[state.base + a as usize] = LValue::OwnedString(crate::vm::Rc::new(s));
         })));
         arg = yield YieldOp::SetTypes(vec![(a, LType::String)]);
         arg
