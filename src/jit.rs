@@ -60,6 +60,48 @@ pub struct CallArgs {
     returns_len: usize,
 }
 
+#[derive(PartialEq, Eq, core::marker::ConstParamTy)]
+#[repr(u8)]
+enum Count {
+    Zero,
+    One,
+    Many
+}
+
+macro_rules! dispatch_abc {
+    // Base case: emit the function item, cast to a function pointer 
+    // to ensure all match arms unify to the same type.
+    (@munch
+        func: $($func:ident)::+;
+        consts: ($($const:expr),*);
+        rem: ()
+    ) => {
+        ($($func)::+::<$( $const ),*> as *const ())
+    };
+
+    // Recursive case: evaluate the head and append the const generic.
+    (@munch
+        func: $($func:ident)::+;
+        consts: ($($const:expr),*);
+        rem: ($head:expr $(, $tail:expr)*)
+    ) => {
+        match $head {
+            0 => dispatch_abc!(@munch func: $($func)::+; consts: ($($const,)* { Count::Zero }); rem: ($($tail),*)),
+            1 => dispatch_abc!(@munch func: $($func)::+; consts: ($($const,)* { Count::One }); rem: ($($tail),*)),
+            _ => dispatch_abc!(@munch func: $($func)::+; consts: ($($const,)* { Count::Many }); rem: ($($tail),*)),
+        }
+    };
+
+    // Entry point
+    ($($func:ident)::+, $a:expr, $b:expr, $c:expr) => {
+        dispatch_abc!(@munch
+            func: $($func)::+;
+            consts: ();
+            rem: ($a, $b, $c)
+        )
+    };
+}
+
 pub struct JitHelper;
 impl JitHelper {
     pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: u8) -> bool {
@@ -100,30 +142,27 @@ impl JitHelper {
             (val.typeof_() as u8) == expected
         }
     }
-    pub unsafe extern "C" fn prepare_native_call(state: *mut (), a: u16, b: u16, c: u16) -> CallArgs {
+    pub unsafe extern "C" fn prepare_native_call<const A: Count, const B: Count, const C: Count>(state: *mut (), a: u16, b: u16, c: u16) -> CallArgs {
         unsafe {
             let state = state as *mut RunState;
             let mut owner = ();
             let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
             let rs = &*state;
             // The same as RunState::call_native
-            let args = if b == 0 {
+            let args = if B == Count::Zero {
                 &rs.vals[rs.base + a as usize+1..]
             } else {
                 &rs.vals[rs.base + a as usize+1..=(rs.base + a as usize + b as usize - 1)]
             };
             debug!("{:?}", args);
-            let returns = if c == 0 {
+            let returns = if C == Count::Zero {
                 // save all returned
                 &rs.vals[rs.base + a as usize..]
-            }
-            else if c == 1 {
+            } else if C == Count::One {
                 // nothing saved
                 &[]
-            } else if c != 1 {
-                &rs.vals[rs.base + a as usize..rs.base + a as usize + c as usize - 1]
             } else {
-                unimplemented!()
+                &rs.vals[rs.base + a as usize..rs.base + a as usize + c as usize - 1]
             };
 
             CallArgs {
@@ -468,6 +507,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::NativeCall { nf, a, b, c } => {
+                    let dispatch: *const () = dispatch_abc!(JitHelper::prepare_native_call, a, b, c);
                     dynasm!(ops
                         ; sub rsp, (core::mem::size_of::<CallArgs>() as i32)
                         ; mov rdi, rsp
@@ -475,7 +515,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rdx, WORD (*a as i32)
                         ; mov rcx, WORD (*b as i32)
                         ; mov  r8, WORD (*c as i32)
-                        ; call extern (JitHelper::prepare_native_call as *const () as usize)
+                        ; call extern (dispatch as *const () as usize)
 
                         // NativeFunction is an extern "rust-call" like Exec.
                         ; mov rdi, rsp => CallArgs.args_ptr

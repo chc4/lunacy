@@ -1234,7 +1234,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     {
                         unreachable!("{:?}", x)
                     }
-                    panic!();
+                    panic!("{:?}", x);
                     self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0)); None
                 },
             } {
