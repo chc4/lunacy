@@ -1280,7 +1280,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         },
                         x => { debug!("huh {:?} {:?}", x, kb);
                             // Handle magic debugging keys
-                            #[cfg(debug_assertions)]
+                            #[cfg(any(debug_assertions, feature = "magic"))]
                             if let LValue::LClosure(lc) = x && let LValue::InternedString(key) = kb {
                                 println!("{key:?}");
                                 match key.0 {
@@ -1297,7 +1297,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             } else {
                                 unimplemented!()
                             }
-                            #[cfg(not(debug_assertions))]
+                            #[cfg(not(any(debug_assertions, feature = "magic")))]
                             unimplemented!()
                         },
                     };

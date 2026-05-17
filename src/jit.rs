@@ -48,6 +48,14 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwn
     }
 }
 
+#[repr(C)]
+pub struct CallArgs {
+    args_ptr: *const (),
+    args_len: usize,
+    returns_ptr: *const (),
+    returns_len: usize,
+}
+
 pub struct JitHelper;
 impl JitHelper {
     pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: u8) -> bool {
@@ -86,6 +94,40 @@ impl JitHelper {
             let LValue::Table(tab) = tab_val else { unreachable!() };
             let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
             (val.typeof_() as u8) == expected
+        }
+    }
+    pub unsafe extern "C" fn prepare_call(state: *mut (), a: u16, b: u16, c: u16) -> CallArgs {
+        unsafe {
+            let state = state as *mut RunState;
+            let mut owner = ();
+            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
+            let rs = &*state;
+            // The same as RunState::call_native
+            let args = if b == 0 {
+                &rs.vals[rs.base + a as usize+1..]
+            } else {
+                &rs.vals[rs.base + a as usize+1..=(rs.base + a as usize + b as usize - 1)]
+            };
+            debug!("{:?}", args);
+            let returns = if c == 0 {
+                // save all returned
+                &rs.vals[rs.base + a as usize..]
+            }
+            else if c == 1 {
+                // nothing saved
+                &[]
+            } else if c != 1 {
+                &rs.vals[rs.base + a as usize..rs.base + a as usize + c as usize - 1]
+            } else {
+                unimplemented!()
+            };
+
+            CallArgs {
+                args_ptr: args.as_ptr().cast(),
+                args_len: args.len(),
+                returns_ptr: returns.as_ptr().cast(),
+                returns_len: args.len()
+            }
         }
     }
 }
@@ -332,17 +374,25 @@ impl Block {
                         ; no_trap:
                     );
                 },
-                //Residual::NativeCall { nf, a, b, c } => {
-                //    // NativeFunction is an extern "rust-call" like Exec.
-                //    dynasm!(ops
-                //        ; mov rsi, r12 // owner
-                //        ; mov rdx, r13 // state
-                //        // Lua wants to see PC+1, and also we want to resume to PC+1 if we trap.
-                //        ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
+                Residual::NativeCall { nf, a, b, c } => {
+                    dynasm!(ops
+                        ; sub rsp, (core::mem::size_of::<CallArgs>() as i32)
+                        ; mov rdi, rsp
+                        ; mov rsi, r13 // state
+                        ; mov rdx, WORD (*a as i32)
+                        ; mov rcx, WORD (*b as i32)
+                        ; mov  r8, WORD (*c as i32)
+                        ; call extern (JitHelper::prepare_call as *const () as usize)
 
-                //        ; call extern (*nf as usize)
-                //    );
-                //},
+                        // NativeFunction is an extern "rust-call" like Exec.
+                        ; mov rdi, rsp => CallArgs.args_ptr
+                        ; mov rsi, rsp => CallArgs.args_len
+                        ; mov rdx, rsp => CallArgs.returns_ptr
+                        ; mov rcx, rsp => CallArgs.returns_len
+                        ; add rsp, (core::mem::size_of::<CallArgs>() as i32)
+                        ; call extern (*nf as usize)
+                    );
+                },
                 Residual::Jump(target) => {
                     emit_jump(ops, target);
                 },

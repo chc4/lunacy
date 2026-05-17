@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["counters", "jit"]
+default = ["counters", "jit", "magic"]
 skip_rc = []
 skip_vec = []
 counters = []
@@ -14,6 +14,7 @@ immediate_jit = []
 jit = []
 unreachable = []
 gas = []
+magic = [] # Magic JIT intrinsics
 unsafe = ["jit", "skip_vec", "unreachable"]
 sonic = ["unsafe", "skip_rc"]
 
