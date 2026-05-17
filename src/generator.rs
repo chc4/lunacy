@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, ReturnLocation, Upvalue};
 use qcell::{TCell, TCellOwner, LCell, LCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
-use crate::vm::LClosure;
+use crate::vm::{LClosure, LProto};
 use crate::vm::{LValue, LType, Number, Table, FVec};
 use crate::vm::{InstructionDecode, Unpacker};
 use crate::vm::RunState;
@@ -43,6 +43,9 @@ impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn ctypeof_(&self) -> CType {
         match self {
             LValue::NClosure(c) => CType::NativeFunction(c.clone()),
+            // Safety: Ok this one is kinda sketchy. We only use CTypes inside Specializer, which
+            // is parameterized over the same pre-transmute lifetimes and thus outlives them.
+            LValue::LClosure(c) => CType::LuaFunction(unsafe { core::mem::transmute(c.clone()) }),
             x => CType::Type(x.typeof_()),
         }
 
@@ -945,6 +948,7 @@ pub enum Residual {
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
+    LuaGuard { idx: usize, ptr: *const () },
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -952,7 +956,8 @@ pub enum CType {
     Type(LType),
     Shape(SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
-    // TODO: static lua call targets
+    // TODO: make this a Weak?
+    LuaFunction(Tc<LClosure<'static, 'static>>),
 }
 
 impl CType {
@@ -962,6 +967,7 @@ impl CType {
             CType::Type(ty) => ty.clone(),
             CType::Shape(_) => LType::Table,
             CType::NativeFunction(_) => LType::Closure,
+            CType::LuaFunction(_) => LType::Closure,
         }
     }
 }
@@ -972,6 +978,7 @@ impl std::fmt::Display for CType {
             CType::Type(ltype) => ltype.fmt(f),
             CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
             CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
+            CType::LuaFunction(lclos) => write!(f, "fn({:?})", lclos.as_ptr()),
         }
     }
 }
@@ -1067,7 +1074,7 @@ pub struct Specializer<'src, 'intern> {
     pub jctx: JitContext,
 
     pub versions: std::collections::HashMap<
-        *const crate::chunk::FunctionBlock<'src, LConstant<'src, 'intern>>,
+        LProto<'src, 'intern>,
         std::collections::HashMap<(SubPc, Context), BlockId>, FxBuildHasher>,
 }
 
@@ -1295,12 +1302,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // If we're in the success block and the guarded value is a native function, we can
             // also try to emit a guard to specialize the function value as well. This lets us
             // specialize code like `local print = print; print("xyz");`.
-            if let CType::NativeFunction(nf) = state.vals[state.base + idx].ctypeof_() {
+            let idx_ctype = state.vals[state.base + idx].ctypeof_();
+            if let CType::NativeFunction(nf) = &idx_ctype {
                 // We know this original value has the correct native function, and so can compile
                 // a block for it immediately.
-                let mut native_ctx = forced_ctx.clone();
-                native_ctx.types[idx] = CType::NativeFunction(nf.clone());
-                let guard_block = vm.subblock(owner, pc.next_true(), native_ctx.clone(), thunk_coro, arg);
+                forced_ctx.types[idx] = idx_ctype.clone();
+                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
                 // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
                 // we have to do this all over again with the newly observed type (up to our block
@@ -1310,6 +1317,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // TODO: this fail thunk could be a bit more efficient, where it doesn't actually
                 // need to re-emit the Guard against Closure - but also it's unlikely to matter
                 // much.
+                vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
+                vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
+            } else if let CType::LuaFunction(lclos) = &idx_ctype {
+                // Likewise we can do the same thing with statically known Lua functions
+                forced_ctx.types[idx] = idx_ctype.clone();
+                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
+                let proto = lclos.ro(owner).prototype.cast();
+                vm.blocks[block_id.0].instructions.push(Residual::LuaGuard { idx, ptr: proto });
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
             } else {
@@ -1451,7 +1466,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let CType::NativeFunction(nf) = expected {
                 let call = nf.get_ptr();
                 vm.blocks[check_block.0].instructions.push(Residual::NativeGuard { idx: tab, ptr: call });
-            } else {
+            } else if let CType::LuaFunction(lclos) = expected {
+                let call = lclos.ro(owner).prototype.cast();
+                vm.blocks[check_block.0].instructions.push(Residual::LuaGuard { idx: tab, ptr: call });
+            }else {
                 vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), expected: expected.as_ltype() });
             }
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
@@ -1675,6 +1693,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 self.blocks[block_id.0].instructions.push(Residual::NativeCall {
                                     nf: nf.native, a: a as u16, b: b as u16, c: c as u16
                                 });
+                            } else if let CType::LuaFunction(lclos) = &ctx.types[a] {
+                                // TODO: we should probably track the number of incoming edges, and
+                                // subtract that count from the initial hotness of the entry block.
+                                // Otherwise we will repeatedly bailout in the JIT as we trigger
+                                // hotness=0 top-down instead of bottom-up.
+                                self.blocks[block_id.0].instructions.push(Residual::Call {
+                                    a: a as u16, b: b as u16, c: c as u16
+                                });
                             } else {
                                 self.blocks[block_id.0].instructions.push(Residual::Call {
                                     a: a as u16, b: b as u16, c: c as u16
@@ -1821,6 +1847,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     if let LValue::NClosure(nf) = &state.vals[state.base + idx] {
 
                         let call = nf.get_ptr();
+                        if call == ptr {
+                            // Fallthrough
+                            off += 2;
+                        } else {
+                            off += 1;
+                        }
+                    } else {
+                        off += 1;
+                    }
+                },
+                Residual::LuaGuard { idx, ptr } => {
+                    if let LValue::LClosure(clos) = &state.vals[state.base + idx] {
+                        let call = clos.ro(owner).prototype.cast();
                         if call == ptr {
                             // Fallthrough
                             off += 2;
@@ -1994,7 +2033,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.clos = clos;
     }
 
-    pub fn dump(&self, owner: &TCellOwner<TcOwner>, proto: *const crate::chunk::FunctionBlock<'src, LConstant<'src, 'intern>>, filepath: &str) {
+    pub fn dump(&self, owner: &TCellOwner<TcOwner>, proto: LProto<'src, 'intern>, filepath: &str) {
         use graphviz_rust::*;
         use graphviz_rust::printer::*;
         use graphviz_rust::cmd::*;
@@ -2023,6 +2062,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let inst_label = match res {
                         Residual::Guard { idx, expected } => format!("guard({}, {})", idx, expected),
                         Residual::NativeGuard { idx, ptr } => format!("native_guard({}, {:p})", idx, *ptr),
+                        Residual::LuaGuard { idx, ptr } => format!("lua_guard({}, {:p})", idx, *ptr),
                         Residual::Exec(ResidualExec(name, _)) => format!("exec({})", name),
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call { a, b, c } => format!("call({}, {}, {})", a, b, c),
@@ -2042,7 +2082,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::NativeCall { nf, a, b, c }  => {
                             edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("{:p}", nf)); attr!("label", "ncall"))));
                         },
-                        Residual::Guard { .. } | Residual::HashGuard { .. } | Residual::NativeGuard { .. } => {
+                        Residual::Guard { .. } | Residual::HashGuard { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
                             if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
                                 edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "pass"))));
                             }

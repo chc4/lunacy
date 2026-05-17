@@ -385,6 +385,10 @@ impl<T> Tc<T> {
     pub fn new(val: T) -> Self {
         Self(Rc::new(TCell::new(val)))
     }
+
+    pub fn as_ptr(&self) -> *const () {
+        Rc::<TCell<TcOwner, T>>::as_ptr(&self.0).cast()
+    }
 }
 
 impl<T> Clone for Tc<T> {
@@ -819,8 +823,9 @@ pub enum Upvalue<'src, 'intern> {
     Closed(Gc<LValue<'src, 'intern>>),
 }
 
+pub type LProto<'src, 'intern> = *const FunctionBlock<'src, LConstant<'src, 'intern>>;
 pub struct LClosure<'src, 'intern> {
-    pub prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
+    pub prototype: LProto<'src, 'intern>,
     //environment: LTable<'src>,
     pub upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
 }
@@ -858,7 +863,7 @@ impl<'src> Debug for NClosure {
 }
 
 impl<'src, 'intern> LClosure<'src, 'intern> {
-    pub fn new(prototype: *const FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
+    pub fn new(prototype: LProto<'src, 'intern>) -> Self {
         Self {
             prototype,
             upvalues: vec![].into(),
@@ -887,7 +892,7 @@ pub struct Vm<'src, 'intern> {
     // This is terrible, but because we reference FunctionBlocks in Gc<T> types,
     // we can't use proper lifetimes for it: Rust doesn't know that a Gc<T> won't
     // stick around past 'src
-    pub top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>,
+    pub top_level: LProto<'src, 'intern>,
 }
 
 #[derive(Debug)]
@@ -1001,7 +1006,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
 
 impl<'src, 'intern> Vm<'src, 'intern> {
-    pub fn new(top_level: *const FunctionBlock<'src, LConstant<'src, 'intern>>) -> Self {
+    pub fn new(top_level: LProto<'src, 'intern>) -> Self {
         Self { top_level }
     }
 
@@ -1106,7 +1111,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         })
     }
 
-    pub fn rk<'exec>(proto: *const FunctionBlock<'src, LConstant<'src, 'intern>>, base: usize, vals: &'exec FVec<LValue<'src, 'intern>>, r: u16)
+    pub fn rk<'exec>(proto: LProto<'src, 'intern>, base: usize, vals: &'exec FVec<LValue<'src, 'intern>>, r: u16)
         -> Result<&'exec LConstant<'src, 'intern>, &'exec LValue<'src, 'intern>>
     {
         if (r & 0x100)!=0 {
