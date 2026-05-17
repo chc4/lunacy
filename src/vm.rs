@@ -597,13 +597,16 @@ impl<'intern, 'src> Deref for InternString<'intern, 'src> {
 #[derive(Debug, Hash, Clone, PartialEq, Eq)]
 pub enum LValue<'src, 'intern> {
     Nil = 0,
-    Bool(bool),
-    Number(Number),
-    InternedString(ArenaIntern<'intern, (&'src [u8], u64)>),
-    OwnedString(Rc<FVec<u8>>),
-    LClosure(Tc<LClosure<'src, 'intern>>),
-    NClosure(NClosure),
-    Table(Tc<Table<'src, 'intern>>),
+    Bool(bool) = 1,
+    Number(Number) = 2,
+    Table(Tc<Table<'src, 'intern>>) = 3,
+    // Shared variants get mapped so they have a bit we can check
+    // Strings
+    InternedString(ArenaIntern<'intern, (&'src [u8], u64)>) = 4,
+    OwnedString(Rc<FVec<u8>>) = 5,
+    // Closures
+    LClosure(Tc<LClosure<'src, 'intern>>) = 8,
+    NClosure(NClosure) = 9,
 }
 
 #[repr(u8)]

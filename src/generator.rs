@@ -1781,7 +1781,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
                     let mut jit_entry = self.blocks[id.0].jit_info.entry.unwrap();
                     warn!("running jit for {id:?}");
-                    let ret = jit_entry(owner, &mut state);
+                    let base_ptr = unsafe { state.vals.stack_ptr.add(state.base).as_ptr() };
+                    let ret = jit_entry(owner, &mut state, base_ptr);
                     let next_off = (ret >> 32) as i32 as isize;
                     let next_id = (ret & 0xFFFFFFFF) as usize;
                     self.clos = state.clos.clone();

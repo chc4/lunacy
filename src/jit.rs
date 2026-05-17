@@ -36,7 +36,7 @@ impl JitInfo {
     }
 }
 
-pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut TCellOwner<TcOwner>, &'a mut RunState<'src, 'intern>) -> u64;
+pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut TCellOwner<TcOwner>, &'a mut RunState<'src, 'intern>, *const LValue<'src, 'intern>) -> u64;
 
 pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>)) -> (*const (), usize, usize) {
     let (addr, meta) = (f as *const dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>)).to_raw_parts();
@@ -193,6 +193,8 @@ impl JitHelper {
     }
 }
 
+type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
+
 const JIT_SIZE: usize = 0x1000 * 16;
 pub struct JitContext {
     pub memory: std::cell::Cell<dynasmrt::mmap::ExecutableBuffer>,
@@ -283,13 +285,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let entry = ops.offset();
 
         // SystemV ABI is RDI, RSI, RDX, RCX, R8, R9
-        // JitExec (rust-preserve-none): R12=owner, R13=state
+        // JitExec (rust-preserve-none): R12=owner, R13=state, R14=base_ptr
 
         dynasm!(ops
             ; .arch x64
             ; push rbx
             ; push rbp
-            ; push rax // alignment
+            ; push r14 // save initial base_ptr
         );
         // TODO: Pin state.vals.as_ptr() to a register, which will let us remove a lot of the
         // JitHelper function calls.
@@ -393,17 +395,43 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             );
             loop { match res {
                 Residual::Guard { idx, expected } => {
+                    // We map LType variants to be their corresponding LValue tags, except
+                    // for types that have multiple variants which map to the bit position we will
+                    // check is set via `test`.
+                    let tag = match expected {
+                        LType::Closure => LValue::LClosure as u8,
+                        LType::String => LValue::InternedString as u8,
+                        variant => *variant as u8,
+                    };
                     let expected_u8 = *expected as u8;
-                    dynasm!(ops
-                        ; .arch x64
-                        ; mov rdi, r13 // state
-                        ; mov rsi, WORD (*idx as i32) // idx
-                        ; mov rdx, WORD (expected_u8 as i32) // expected
-                        ; call extern (JitHelper::check_guard as *const () as usize)
-                        ; test al, al
-                        ; jnz =>insts[off + 2]
-                        // Fail: fallthrough to next (off + 1)
-                    );
+                    match expected {
+                        LType::Nil | LType::Bool | LType::Number | LType::Table => {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; cmp BYTE r14 => LValue<'src, 'intern>[*idx as i32], (tag as i8)
+                                ; jnz =>insts[off + 2]
+                            );
+                        },
+                        LType::Closure | LType::String => {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; test BYTE r14 => LValue<'src, 'intern>[*idx as i32], (tag as i8)
+                                ; jz =>insts[off + 2]
+                            );
+                        },
+                        _ => {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rdi, r13 // state
+                                ; mov rsi, WORD (*idx as i32) // idx
+                                ; mov rdx, WORD (expected_u8 as i32) // expected
+                                ; call extern (JitHelper::check_guard as *const () as usize)
+                                ; test al, al
+                                ; jnz =>insts[off + 2]
+                                // Fail: fallthrough to next (off + 1)
+                            );
+                        },
+                    }
                 },
                 Residual::EpochCheck { tab, href } => {
                     let href_u8 = href.0;
@@ -485,6 +513,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; call extern (JitHelper::prepare_lua_call as *const () as usize)
 
                                 // state is already in r13
+                                // Our base_ptr is in r14, and needs to be incremented for the
+                                // caller's frame.
+                                ; add r14, ((a + 1) as i32)
                                 ; call extern (entry as usize)
 
                                 // Check if the call is trying to bailout: we propagate the bailout
@@ -495,6 +526,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // set it when it wants to start bailing. but we don't actually JIT Ret
                                 // yet, so,
                                 ; jmp >exit_jit
+                                // Reload the correct base ptr for the remainder of our function
+                                ; mov r14, QWORD [rsp + 0]
                             );
                         },
                         None => {
@@ -575,7 +608,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; int3
             ; mov rax, QWORD (((block.instructions.len() as u64) << 32 | (id.0 as u64)) as i64)
             ; exit_jit:
-            ; pop rdx // padding
+            ; pop r14
             ; pop rbp
             ; pop rbx
             ; ret
@@ -584,7 +617,3 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 }
 
-type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
-impl Block {
-
-}
