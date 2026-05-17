@@ -180,7 +180,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let entry = ops.offset();
 
         // SystemV ABI is RDI, RSI, RDX, RCX, R8, R9
-        // JitExec (rust-preserve-none): R12=owner, R13=state, R14=cb_data, R15=cb_vtable
+        // JitExec (rust-preserve-none): R12=owner, R13=state
 
         dynasm!(ops
             ; .arch x64
@@ -317,8 +317,6 @@ impl Block {
                         ; .arch x64
                         ; mov rsi, r12 // owner
                         ; mov rdx, r13 // state
-                        ; mov rcx, r14 // cb data
-                        ; mov r8, r15  // cb vtable
                         ; mov rdi, QWORD (this_obj as i64)
                         ; mov rax, QWORD (this_vtable as i64)
                         // Lua wants to see PC+1, and also we want to resume to PC+1 if we trap.
