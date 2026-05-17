@@ -1,8 +1,8 @@
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
 use qcell::{TCell, TCellOwner};
-use crate::vm::{Tc, TcOwner, Vm, RunState, LValue};
-use crate::generator::{Specializer, Block, BlockId, Residual};
+use crate::vm::{LClosure, LType, LValue, ReturnLocation, RunState, Tc, TcOwner, Vm};
+use crate::generator::{Block, BlockId, Context, Residual, Specializer, SubPc};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use rustc_hash::FxBuildHasher;
 
@@ -96,7 +96,7 @@ impl JitHelper {
             (val.typeof_() as u8) == expected
         }
     }
-    pub unsafe extern "C" fn prepare_call(state: *mut (), a: u16, b: u16, c: u16) -> CallArgs {
+    pub unsafe extern "C" fn prepare_native_call(state: *mut (), a: u16, b: u16, c: u16) -> CallArgs {
         unsafe {
             let state = state as *mut RunState;
             let mut owner = ();
@@ -128,6 +128,24 @@ impl JitHelper {
                 returns_ptr: returns.as_ptr().cast(),
                 returns_len: args.len()
             }
+        }
+    }
+
+    pub unsafe extern "C" fn prepare_lua_call(state: *mut (), block_id: usize, off: usize, a: u16, b: u16, c: u16) -> *const () {
+        unsafe {
+            let state = state as *mut RunState;
+            let rs = &mut *state;
+            // Forge an owner.
+            let mut owner = ();
+            let mut owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
+            let lclos = &rs.vals[rs.base + a as usize];
+            let LValue::LClosure(lclos) = lclos else { unreachable!() };
+            debug!("prepare_lua_call {:?} {} {} {} {:?}", rs, a, b, c, lclos);
+            let before = rs.vals.len();
+            debug!("{}", (*lclos.ro(owner).prototype).max_stack);
+            rs.call_lua(lclos.clone(), ReturnLocation::Generator(BlockId(block_id), off), a, b, c, owner);
+            debug!("after call_lua {:?}", rs);
+            core::ptr::null()
         }
     }
 }
@@ -215,7 +233,7 @@ impl JitContext {
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
-    pub fn jit_compile(&mut self, id: BlockId) {
+    pub fn jit_compile(&mut self, id: BlockId, owner: &mut TCellOwner<TcOwner>) {
         debug!("JIT compiling block {:?}", id);
         let base = self.jctx.end();
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
@@ -233,6 +251,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // TODO: Pin state.vals.as_ptr() to a register, which will let us remove a lot of the
         // JitHelper function calls.
 
+
         // We may have already JIT this block, if it was jumped to by another block
         // first. In that case we just have to jump to it.
         if let Some(block_ptr) = self.jctx.blocks.get(&id) {
@@ -243,7 +262,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // We need to skip over the uncommitted prologue
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
             self.jctx.blocks.insert(id, new_block);
-            let _block = self.blocks[id.0 as usize].jit_body(id, &mut self.jctx, &mut ops);
+            let _block = self.jit_block(id, &mut ops, owner);
         }
 
 
@@ -260,7 +279,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             dynasm!(ops
                 ; =>pending_label
             );
-            let _block = self.blocks[pending_block.0 as usize].jit_body(pending_block, &mut self.jctx, &mut ops);
+            let _block = self.jit_block(pending_block, &mut ops, owner);
             self.jctx.reserve(ops.offset().0 - pending_start.0);
         }
 
@@ -271,17 +290,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
     }
-}
 
-type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
-impl Block {
-    pub fn jit_body(&mut self, id: BlockId, jctx: &mut JitContext, ops: &mut Assembler) -> AssemblyOffset {
+    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, owner: &mut TCellOwner<TcOwner>) -> AssemblyOffset {
         let entry = ops.offset();
-        let x = jctx.memory.get_mut().as_ptr();
-        let insts: Vec<_> = self.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
+        let x = self.jctx.memory.get_mut().as_ptr();
+        let block = &self.blocks[id.0];
+        let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
 
         let mut emit_jump = |ops: &mut Assembler, target: &BlockId| {
-            if let Some(target_ptr) = jctx.blocks.get(target) {
+            if let Some(target_ptr) = self.jctx.blocks.get(target) {
                 // We already JIT compiled the block, and can jump to it directly.
                 dynasm!(ops
                     ; jmp extern target_ptr.0 as usize
@@ -290,14 +307,35 @@ impl Block {
                 // The block could already be pending from another block in this assembler
                 // set. Use it if it already exists, otherwise create a new label for our
                 // relocation.
-                let pending_label = jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
+                let pending_label = self.jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
                 dynasm!(ops
                     ; jmp =>*pending_label
                 );
             }
         };
 
-        for (off, res) in self.instructions.iter().enumerate() {
+        let emit_bailout = |ops: &mut Assembler, off| {
+            if off == 0 {
+                // If we're trying to bailout from the first instruction, we
+                // need to record it as a JIT exit so that we don't try to call
+                // this same function again immediately in a loop.
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov WORD r13 => RunState.current_off, (off as i16)
+                    ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                    ; jmp >exit_jit
+                );
+            } else {
+                // Fallback to interpreter for other residuals
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
+                    ; jmp >exit_jit
+                );
+            }
+        };
+
+        for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
             let label = insts[off];
             dynasm!(ops
@@ -310,7 +348,7 @@ impl Block {
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                 ; jbe >exit_jit
             );
-            match res {
+            loop { match res {
                 Residual::Guard { idx, expected } => {
                     let expected_u8 = *expected as u8;
                     dynasm!(ops
@@ -374,6 +412,57 @@ impl Block {
                         ; no_trap:
                     );
                 },
+                Residual::LuaCall { lclos, a, b, c } => {
+                    // TODO: For now look up if there is a JIT block for the entrypoint with no known types
+                    let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack.into() };
+                    let types = vec![LType::Unknown; next_stack];
+                    let ctx = Context::new(types);
+                    let versions = self.versions.get(&lclos.ro(owner).prototype).unwrap();
+                    let entry: Option<*const ()> = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
+                        self.blocks[block.0].jit_info.entry.map(|f| f as *const _)
+                    } else {
+                        // This shouldn't ever happen...?
+                        None
+                    };
+                    match entry {
+                        Some(entry) => {
+                            dynasm!(ops
+                                ; mov rdi, r13 // state
+                                ; mov rsi, WORD (id.0 as i32)
+                                ; mov rdx, WORD ((off + 1) as i32)
+                                ; mov rcx, WORD (*a as i32)
+                                ; mov  r8, WORD (*b as i32)
+                                ; mov  r9, WORD (*c as i32)
+
+                                //; mov rsi, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
+                                //; mov rdx, WORD (*a as i32)
+                                //; mov rcx, WORD (*b as i32)
+                                //; mov  r8, WORD (*c as i32)
+
+                                ; call extern (JitHelper::prepare_lua_call as *const () as usize)
+
+                                // state is already in r13
+                                ; call extern (entry as usize)
+
+                                // Check if the call is trying to bailout: we propagate the bailout
+                                // if so, unwinding our native stack but yielding to the generator run loop
+                                // with a suspended ReturnLocation stack.
+                                // TODO: for now we just have to always bailout...we should actually check
+                                // state.trap, and have everything except a properly handled Residual::Ret
+                                // set it when it wants to start bailing. but we don't actually JIT Ret
+                                // yet, so,
+                                ; jmp >exit_jit
+                            );
+                        },
+                        None => {
+                            // TODO: Even though we don't have the block it's unavailable now, we
+                            // could emit a patchpoint and fill it in once we emit it. For now, we
+                            // just bailout to the interpreter forever because we missed our
+                            // opportunity.
+                            emit_bailout(ops, off)
+                        },
+                    }
+                },
                 Residual::NativeCall { nf, a, b, c } => {
                     dynasm!(ops
                         ; sub rsp, (core::mem::size_of::<CallArgs>() as i32)
@@ -382,7 +471,7 @@ impl Block {
                         ; mov rdx, WORD (*a as i32)
                         ; mov rcx, WORD (*b as i32)
                         ; mov  r8, WORD (*c as i32)
-                        ; call extern (JitHelper::prepare_call as *const () as usize)
+                        ; call extern (JitHelper::prepare_native_call as *const () as usize)
 
                         // NativeFunction is an extern "rust-call" like Exec.
                         ; mov rdi, rsp => CallArgs.args_ptr
@@ -431,34 +520,16 @@ impl Block {
                     );
                 },
                 _ => {
-                    if off == 0 {
-                        // If we're trying to bailout from the first instruction, we
-                        // need to record it as a JIT exit so that we don't try to call
-                        //
-                        // this same function again immediately in a loop.
-                        dynasm!(ops
-                            ; .arch x64
-                            ; mov WORD r13 => RunState.current_off, (off as i16)
-                            ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
-                            ; jmp >exit_jit
-                        );
-                    } else {
-                        // Fallback to interpreter for other residuals
-                        dynasm!(ops
-                            ; .arch x64
-                            ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
-                            ; jmp >exit_jit
-                        );
-                    }
+                    emit_bailout(ops, off)
                 }
-            }
+            }; break; }
         }
 
         dynasm!(ops
             ; .arch x64
             // Default exit: end of block, return to interpreter at end
             ; int3
-            ; mov rax, QWORD (((self.instructions.len() as u64) << 32 | (id.0 as u64)) as i64)
+            ; mov rax, QWORD (((block.instructions.len() as u64) << 32 | (id.0 as u64)) as i64)
             ; exit_jit:
             ; pop rdx // padding
             ; pop rbp
@@ -467,4 +538,9 @@ impl Block {
         );
         entry
     }
+}
+
+type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
+impl Block {
+
 }

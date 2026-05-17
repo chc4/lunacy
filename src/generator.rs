@@ -480,7 +480,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             (ResumeArg::Matched, ResumeArg::Matched) => {
                 define_exec!(NumericIntInt, [dest: usize, lhs: usize, rhs: usize], [OP: Opcode],
                 |owner, state, dest, lhs, rhs| {
-                    let state: &mut RunState = state;
+                    debug!("state {:?}", state);
                     let LValue::Number(dyn_b) = &state.vals[state.base + lhs] else { unreachable!() };
                     let LValue::Number(dyn_c) = &state.vals[state.base + rhs] else { unreachable!() };
                     let res = LValue::Number(*dyn_b).numeric_op(OP, &LValue::Number(*dyn_c)).unwrap();
@@ -495,7 +495,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
                 define_exec!(NumericCintCint, [dest: usize, lhsc: usize, rhsc: usize], [OP: Opcode],
                 |owner, state, dest, lhsc, rhsc| {
-                    let state: &mut RunState = state;
                     let klhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc]) };
                     let krhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc]) };
                     let LConstant::Number(kb) = klhs else { unreachable!() };
@@ -512,7 +511,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
                 define_exec!(NumericCintInt, [dest: usize, lhsc: usize, rhs: usize], [OP: Opcode],
                 |owner, state, dest, lhsc, rhs| {
-                    let state: &mut RunState = state;
                     let kb: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc]) };
                     let LConstant::Number(kb) = kb else { unreachable!() };
                     let dyn_c = &state.vals[state.base + rhs];
@@ -528,7 +526,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
                 define_exec!(NumericIntCint, [dest: usize, lhs: usize, rhsc: usize], [OP: Opcode],
                 |owner, state, dest, lhs, rhsc| {
-                    let state: &mut RunState = state;
                     let dyn_b = &state.vals[state.base + lhs];
                     let kc: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc]) };
                     let LConstant::Number(kc) = kc else { unreachable!() };
@@ -1778,7 +1775,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 } else {
                     if block.jit_info.entry.is_none() {
                         debug!("jit compile {id:?}");
-                        self.jit_compile(id);
+                        self.jit_compile(id, owner);
                     }
 
                     let mut jit_entry = self.blocks[id.0].jit_info.entry.unwrap();

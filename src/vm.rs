@@ -998,7 +998,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         });
         self.base = self.base + a as usize + 1;
         self.witness_base = self.hash_witnesses.len();
-        self.vals.truncate(self.base +  next_stack);
+        self.vals.truncate(self.base + next_stack);
         self.clos = lclos.clone();
         next_stack
     }
