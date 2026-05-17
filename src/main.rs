@@ -16,6 +16,8 @@ use qcell::TCellOwner;
 mod chunk;
 use chunk::InstBits;
 
+mod stack;
+
 mod vm;
 use vm::Vm;
 

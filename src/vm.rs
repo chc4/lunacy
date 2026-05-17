@@ -6,6 +6,7 @@ use std::num::Wrapping;
 use std::ops::{DerefMut, Index, IndexMut};
 use crate::chunk::FunctionBlock;
 use crate::chunk::{InstBits, Constant};
+use crate::stack::ValueStack;
 use rustc_hash::FxBuildHasher;
 use std::borrow::Cow;
 use std::cell::{RefCell, Cell};
@@ -595,7 +596,7 @@ impl<'intern, 'src> Deref for InternString<'intern, 'src> {
 #[repr(u8)]
 #[derive(Debug, Hash, Clone, PartialEq, Eq)]
 pub enum LValue<'src, 'intern> {
-    Nil,
+    Nil = 0,
     Bool(bool),
     Number(Number),
     InternedString(ArenaIntern<'intern, (&'src [u8], u64)>),
@@ -915,7 +916,7 @@ pub struct HashWitness {
 #[derive(Debug)]
 pub struct RunState<'src, 'intern> {
     pub base: usize,
-    pub vals: FVec<LValue<'src, 'intern>>,
+    pub vals: ValueStack<'src, 'intern>,
     pub pc: usize,
     pub _G: Tc<Table<'src, 'intern>>,
     pub clos: Tc<LClosure<'src, 'intern>>,
@@ -1111,7 +1112,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         })
     }
 
-    pub fn rk<'exec>(proto: LProto<'src, 'intern>, base: usize, vals: &'exec FVec<LValue<'src, 'intern>>, r: u16)
+    pub fn rk<'exec>(proto: LProto<'src, 'intern>, base: usize, vals: &'exec ValueStack<'src, 'intern>, r: u16)
         -> Result<&'exec LConstant<'src, 'intern>, &'exec LValue<'src, 'intern>>
     {
         if (r & 0x100)!=0 {
@@ -1127,7 +1128,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         owner: &mut TCellOwner<TcOwner>,
         mut _G: Tc<Table<'src, 'intern>>,
         mut clos: Tc<LClosure<'src, 'intern>>,
-        mut args: FVec<LValue<'src, 'intern>>,
+        mut args: ValueStack<'src, 'intern>,
     )
         -> Result<FVec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
