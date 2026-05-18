@@ -1,3 +1,4 @@
+#![allow(unused_parens)]
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
 use qcell::{TCell, TCellOwner};
@@ -189,6 +190,31 @@ impl JitHelper {
             rs.call_lua(lclos.clone(), ReturnLocation::Generator(BlockId(block_id), off), a, b, c, owner);
             debug!("after call_lua {:?}", rs);
             core::ptr::null()
+        }
+    }
+
+    pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16) -> u64 {
+        unsafe {
+            let rs = &mut *(state as *mut RunState);
+            let mut owner = ();
+            let mut owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
+            match rs.do_return(owner, a as usize, b as usize) {
+                Ok(ReturnLocation::Interpreter(_)) => {
+                    // Bailout and return to interpreter
+                    return ((-2i32 as u64) << 32);
+                }
+                Ok(ReturnLocation::Generator(block, off)) => {
+                    // Return block and offset
+                    return ((off as u64) << 32) | (block.0 as u64);
+                }
+                Err(r_vals) => {
+                    // Done
+                    // TODO: Ugh we probably need to stash these r_vals somewhere instead of
+                    // forgetting them. This would show up if we tailcall return through a JIT
+                    // function to the top-level.
+                    return ((-5i32 as u64) << 32);
+                }
+            }
         }
     }
 }
@@ -399,8 +425,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // for types that have multiple variants which map to the bit position we will
                     // check is set via `test`.
                     let tag = match expected {
-                        LType::Closure => LValue::LClosure as u8,
-                        LType::String => LValue::InternedString as u8,
+                        LType::String => 4,
+                        LType::Closure => 8,
                         variant => *variant as u8,
                     };
                     let expected_u8 = *expected as u8;
@@ -416,7 +442,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             dynasm!(ops
                                 ; .arch x64
                                 ; test BYTE r14 => LValue<'src, 'intern>[*idx as i32], (tag as i8)
-                                ; jz =>insts[off + 2]
+                                ; jnz =>insts[off + 2]
                             );
                         },
                         _ => {
