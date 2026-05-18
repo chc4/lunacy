@@ -33,6 +33,9 @@ test_cases = {
     "local function multi() return 1,2,3,4 end local function fast() local a, b, c, d = multi() print(a,b,c,d) end fast()",
     "local function multi() return 1,2,3,4 end local function fast() local a, b, c = multi() print(a,b,c) end fast()",
     "local function multi() return 1,2,3,4 end local function fast() local a, b, _, d = multi() local x = 1 print(a, b, d, x) end fast()",
+    "return 1",
+    "local function foo() return 1 end print(foo())",
+    "local function foo() return 1,2 end return foo() + 1",
 }
 
 for i,v in pairs(test_cases) do

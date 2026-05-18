@@ -56,13 +56,17 @@ gdb-benchmark benchmark: dump
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
-INTERPRETER_FEATURES := ""
+# Interpreter
+INTERPRETER_FEATURES := "magic"
 interpreter-compile:
     cargo build --release --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin lunacy --target-dir ./target/interpreter
 interpreter benchmark: interpreter-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     time ./target/interpreter/release/lunacy {{benchmark}}.bin
+interpreter-test num: interpreter-compile dump
+    time ./target/interpreter/release/lunacy ./dumped/dumped_{{num}}.bin
 
+# Unsafe
 unsafe-compile:
     cargo build --profile unsafe --no-default-features --features unsafe --bin lunacy \
         -Z build-std="core,std,panic_abort"

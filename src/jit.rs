@@ -162,14 +162,14 @@ impl JitHelper {
                 // nothing saved
                 &[]
             } else {
-                &rs.vals[rs.base + a as usize..rs.base + a as usize + c as usize - 1]
+                &rs.vals[rs.base + a as usize..=rs.base + a as usize + c as usize - 2]
             };
 
             CallArgs {
                 args_ptr: args.as_ptr().cast(),
                 args_len: args.len(),
                 returns_ptr: returns.as_ptr().cast(),
-                returns_len: args.len()
+                returns_len: returns.len()
             }
         }
     }

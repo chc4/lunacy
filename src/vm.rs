@@ -966,8 +966,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         else if c == 1 {
             // nothing saved
             &[]
-        } else if c != 1 {
-            &self.vals[self.base + a as usize..self.base + a as usize + c as usize - 1]
+        } else if c >= 2 {
+            &self.vals[self.base + a as usize..=self.base + a as usize + c as usize - 2]
         } else {
             unimplemented!()
         };
@@ -1070,6 +1070,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                 return Ok(ret)
             },
             None => {
+                println!("huh {a} {b} {:?}", self);
+                self.vals.truncate(0);
                 Err(r_vals)
             }
         }
@@ -1590,7 +1592,13 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             };
                             debug!("{:?} {block:?}", spec.blocks);
                             spec.set_current(lclos.clone());
-                            state = spec.run(owner, block, state);
+                            let (r_state, r_vals) = spec.run(owner, block, state);
+                            state = r_state;
+                            // Unlike a normal call, LBBV might have returned *out* of our current
+                            // function and exitted the top-level.
+                            if let Some(r_vals) = r_vals {
+                                break 'int r_vals;
+                            }
                         } else {
                             state.pc = 0;
                         }

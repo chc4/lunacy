@@ -1763,7 +1763,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    pub fn run(&mut self, owner: &mut TCellOwner<TcOwner>, mut id: BlockId, mut state: RunState<'src, 'intern>) -> RunState<'src, 'intern> {
+    pub fn run(&mut self, owner: &mut TCellOwner<TcOwner>, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, Option<FVec<LValue<'src, 'intern>>>) {
         let mut off: usize = 0;
         debug!("run");
         loop {
@@ -1977,6 +1977,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     match state.do_return(owner, a as usize, b as usize) {
                         Ok(ReturnLocation::Interpreter(caller)) => {
                             state.pc = caller;
+                            return (state, None);
                         },
                         Ok(ReturnLocation::Generator(block, disp)) => {
                             self.set_current(state.clos.clone());
@@ -1984,7 +1985,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             off = disp;
                         },
                         Err(r_vals) => {
-                            return state;
+                            return (state, Some(r_vals));
                         },
                     }
                 },
