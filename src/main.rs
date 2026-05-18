@@ -31,7 +31,7 @@ mod jit;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const TIMES: f64 = 10.0;
-const LBBV: bool = true;
+const LBBV: bool = false;
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder().format_timestamp(None).format_source_path(true).init();

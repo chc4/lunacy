@@ -29,6 +29,10 @@ test_cases = {
     "local function fast(p) local a = p(1.5) print(a) return a end assert(fast(math.ceil) == 2); fast.__jit = 1; assert(fast(math.floor) == 1)",
     -- HRef NativeFunction
     "function fast() local t = { print = print }; t.print('xyz'); end fast()",
+    "local function multi() return 1,2,3,4 end local function fast() print(multi()) end fast()",
+    "local function multi() return 1,2,3,4 end local function fast() local a, b, c, d = multi() print(a,b,c,d) end fast()",
+    "local function multi() return 1,2,3,4 end local function fast() local a, b, c = multi() print(a,b,c) end fast()",
+    "local function multi() return 1,2,3,4 end local function fast() local a, b, _, d = multi() local x = 1 print(a, b, d, x) end fast()",
 }
 
 for i,v in pairs(test_cases) do
