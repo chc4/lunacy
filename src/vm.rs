@@ -987,9 +987,11 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     {
         // record call stack: we say where to return to and where to put the values
         let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
+        let next_base = self.base + a as usize + 1;
         // push empty stack frame
-        self.vals.extend_from_slice(
-            vec![LValue::Nil; next_stack].as_slice());
+        if next_base + next_stack > self.vals.len() {
+            self.vals.resize_with(next_base + next_stack, || LValue::Nil);
+        }
         self.callstack.push(CallstackEntry {
             clos: self.clos.clone(),
             ret: ret_loc,
@@ -1000,9 +1002,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             witness_limit: self.hash_witnesses.len(),
             c
         });
-        self.base = self.base + a as usize + 1;
+        self.base = next_base;
         self.witness_base = self.hash_witnesses.len();
-        self.vals.truncate(self.base + next_stack);
         self.clos = lclos.clone();
         next_stack
     }
