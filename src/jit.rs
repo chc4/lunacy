@@ -104,6 +104,28 @@ macro_rules! dispatch_abc {
 
 pub struct JitHelper;
 impl JitHelper {
+    pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16) -> u64 {
+        unsafe {
+            let rs = &mut *(state as *mut RunState);
+            let mut owner = ();
+            let mut owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
+            match rs.do_return(owner, a, b) {
+                Some(ReturnLocation::Interpreter(_)) => {
+                    // Bailout and return to interpreter
+                    return ((-2i32 as u64) << 32);
+                }
+                Some(ReturnLocation::Generator(block, off)) => {
+                    // Return block and offset
+                    return ((off as u64) << 32) | (block.0 as u64);
+                }
+                None => {
+                    // Done
+                    return ((-5i32 as u64) << 32);
+                }
+            }
+        }
+    }
+
     pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: u8) -> bool {
         unsafe {
             //println!("state {:?} idx {} {}", state, idx, expected);
@@ -358,6 +380,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         };
 
         let emit_bailout = |ops: &mut Assembler, off| {
+            dynasm!(ops
+                ; .arch x64
+                ; mov BYTE r13 => RunState.trap, 1
+            );
             if off == 0 {
                 // If we're trying to bailout from the first instruction, we
                 // need to record it as a JIT exit so that we don't try to call
@@ -471,16 +497,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Some(entry) => {
                             dynasm!(ops
                                 ; mov rdi, r13 // state
-                                ; mov rsi, WORD (id.0 as i32)
-                                ; mov rdx, WORD ((off + 1) as i32)
-                                ; mov rcx, WORD (*a as i32)
-                                ; mov  r8, WORD (*b as i32)
-                                ; mov  r9, WORD (*c as i32)
-
-                                //; mov rsi, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
-                                //; mov rdx, WORD (*a as i32)
-                                //; mov rcx, WORD (*b as i32)
-                                //; mov  r8, WORD (*c as i32)
+                                ; mov rsi, QWORD (id.0 as i64)
+                                ; mov rdx, QWORD ((off + 1) as i64)
+                                ; mov rcx, QWORD (*a as i64)
+                                ; mov  r8, QWORD (*b as i64)
+                                ; mov  r9, QWORD (*c as i64)
 
                                 ; call extern (JitHelper::prepare_lua_call as *const () as usize)
 
@@ -490,11 +511,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // Check if the call is trying to bailout: we propagate the bailout
                                 // if so, unwinding our native stack but yielding to the generator run loop
                                 // with a suspended ReturnLocation stack.
-                                // TODO: for now we just have to always bailout...we should actually check
-                                // state.trap, and have everything except a properly handled Residual::Ret
-                                // set it when it wants to start bailing. but we don't actually JIT Ret
-                                // yet, so,
-                                ; jmp >exit_jit
+                                ; mov al, BYTE r13 => RunState.trap
+                                ; test al, al
+                                ; jnz >exit_jit
+
+                                // If we're back here, it means we returned from a JIT call.
+                                // The return value of the JIT call (RAX) contains the next BlockId and offset.
+                                // We need to check if it matches our expected next instruction.
+                                ; mov rdx, rax
+                                ; shr rdx, 32
+                                ; cmp edx, (off + 1) as i32
+                                ; jnz >exit_jit
+                                ; mov edx, eax
+                                ; cmp edx, id.0 as i32
+                                ; jnz >exit_jit
+
+                                // If it matches, we can continue in JIT!
                             );
                         },
                         None => {
@@ -532,8 +564,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
                         ; .arch x64
-                        ; mov WORD r13 => RunState.current_off, (off as i16)
-                        ; mov rax, QWORD (((-2i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; mov rdi, r13
+                        ; mov rsi, QWORD (*a as i64)
+                        ; mov rdx, QWORD (*b as i64)
+                        ; call extern (JitHelper::lua_return as *const () as usize)
                         ; jmp >exit_jit
                     );
                 },

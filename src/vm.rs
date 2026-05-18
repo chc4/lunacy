@@ -824,6 +824,7 @@ pub enum Upvalue<'src, 'intern> {
 }
 
 pub type LProto<'src, 'intern> = *const FunctionBlock<'src, LConstant<'src, 'intern>>;
+#[repr(C)]
 pub struct LClosure<'src, 'intern> {
     pub prototype: LProto<'src, 'intern>,
     //environment: LTable<'src>,
@@ -837,6 +838,7 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
 }
 
 pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LValue<'src, 'intern>]>, &'a LCell<'id, [LValue<'src, 'intern>]>, &mut TCellOwner<TcOwner>);
+#[repr(C)]
 #[derive(Clone)]
 pub struct NClosure {
     pub native: NativeFunc,
@@ -895,15 +897,18 @@ pub struct Vm<'src, 'intern> {
     pub top_level: LProto<'src, 'intern>,
 }
 
+#[repr(C, u8)]
 #[derive(Debug)]
 pub enum ReturnLocation {
     Interpreter(usize),
     Generator(BlockId, usize),
 }
 
+#[repr(C)]
 #[derive(Debug)]
 pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_limit: usize, pub rloc: usize, pub c: u16 }
 
+#[repr(C)]
 #[derive(Debug)]
 pub struct HashWitness {
     pub href: HashRef,
@@ -912,6 +917,7 @@ pub struct HashWitness {
     pub epoch: usize,
 }
 
+#[repr(C)]
 #[derive(Debug)]
 pub struct RunState<'src, 'intern> {
     pub base: usize,
@@ -931,6 +937,75 @@ pub struct RunState<'src, 'intern> {
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
+    pub fn do_return(&mut self, owner: &mut TCellOwner<TcOwner>, a: u16, b: u16) -> Option<ReturnLocation> {
+        // we're going to be removing this frame, so close any open
+        // upvalues.
+        self.close_upvalues();
+        self.upvals = vec![].into();
+
+        debug!("{} {}", a, b);
+        let r_vals: Vec<LValue> = if b == 1 {
+            // no return values
+            vec![]
+        } else if b >= 2 {
+            // there are b-1 return values from R(A) onwards
+            let r_count = b as usize - 1;
+            self.vals[self.base + a as usize..(self.base + a as usize + r_count)].to_vec()
+        } else {
+            // b == 0, return all values from R(A) to the ToS
+            self.vals[self.base + a as usize..].to_vec()
+        };
+
+        match self.callstack.pop() {
+            Some(CallstackEntry { clos: ret_clos, ret, frame, witness_frame, limit, witness_limit, rloc, c }) => {
+                self.clos = ret_clos.clone();
+                self.base = frame;
+                self.witness_base = witness_frame;
+
+                let caller_max_stack = unsafe { (*self.clos.ro(owner).prototype).max_stack as usize };
+                let min_caller_len = self.base + caller_max_stack;
+
+                // Restore stack to at least what it was before callee was called,
+                // and at least what caller expects for its registers.
+                let restore_len = limit.max(min_caller_len);
+                if self.vals.len() < restore_len {
+                    self.vals.resize(restore_len, LValue::Nil);
+                }
+
+                if c == 1 {
+                    // No values are saved
+                    self.vals.truncate(restore_len);
+                } else if c >= 2 {
+                    // (C-1) values are saved
+                    let save_count = c as usize - 1;
+                    if self.vals.len() < rloc + save_count {
+                        self.vals.resize(rloc + save_count, LValue::Nil);
+                    }
+                    for i in 0..save_count {
+                        self.vals[rloc + i] = r_vals.get(i).cloned().unwrap_or(LValue::Nil);
+                    }
+                    self.vals.truncate(restore_len);
+                } else {
+                    // Multiple return results are saved (c == 0)
+                    let r_count = r_vals.len();
+                    if self.vals.len() < rloc + r_count {
+                        self.vals.resize(rloc + r_count, LValue::Nil);
+                    }
+                    for (i, v) in r_vals.into_iter().enumerate() {
+                        self.vals[rloc + i] = v;
+                    }
+                    self.vals.truncate(rloc + r_count);
+                    if self.vals.len() < min_caller_len {
+                        self.vals.resize(min_caller_len, LValue::Nil);
+                    }
+                }
+                self.hash_witnesses.truncate(witness_limit);
+                Some(ret)
+            },
+            None => None,
+        }
+    }
+
     pub fn close_upvalues(&mut self)
     {
         for upval in self.upvals.iter() {
@@ -983,22 +1058,26 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     {
         // record call stack: we say where to return to and where to put the values
         let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
-        // push empty stack frame
-        self.vals.extend_from_slice(
-            vec![LValue::Nil; next_stack].as_slice());
+        let caller_limit = self.vals.len();
+        let new_base = self.base + a as usize + 1;
+
+        // Ensure the stack is large enough for the callee's requirements
+        if self.vals.len() < new_base + next_stack {
+            self.vals.resize(new_base + next_stack, LValue::Nil);
+        }
+
         self.callstack.push(CallstackEntry {
             clos: self.clos.clone(),
             ret: ret_loc,
             frame: self.base,
-            limit: self.vals.len(),
+            limit: caller_limit,
             rloc: self.base + a as usize,
             witness_frame: self.witness_base,
             witness_limit: self.hash_witnesses.len(),
             c
         });
-        self.base = self.base + a as usize + 1;
+        self.base = new_base;
         self.witness_base = self.hash_witnesses.len();
-        self.vals.truncate(self.base + next_stack);
         self.clos = lclos.clone();
         next_stack
     }
@@ -1531,72 +1610,25 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     }
                 },
                 Opcode::RETURN => {
-                    // we're going to be removing this frame, so close any open
-                    // upvalues.
-                    state.close_upvalues();
-                    state.upvals = vec![].into();
-
                     let (a, b) = <RETURN as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, b);
-                    let mut r_count = 0 as usize;
-                    let mut r_vals: FVec<_> = if b == 1 {
-                        // no return values
-                        vec![].into()
-                    } else if b >= 2 {
-                        // there are b-1 return values from R(A) onwards
-                        r_count = b as usize-1;
-                        let r_vals = &state.vals[state.base + a as usize..(state.base + a as usize + r_count as usize)];
-                        debug!("{:?}", r_vals);
-                        Vec::from(r_vals).into()
-                    } else if b == 0 {
-                        // return all values from R(A) to the ToS
-                        let r_vals = &state.vals[state.base + a as usize..];
-                        r_count = r_vals.len() as usize;
-                        debug!("{:?}", r_vals);
-                        Vec::from(r_vals).into()
+                    let r_vals = if b == 0 {
+                         state.vals[state.base + a as usize..].to_vec()
+                    } else if b > 1 {
+                         state.vals[state.base + a as usize..state.base + a as usize + b as usize - 1].to_vec()
                     } else {
-                        unreachable!()
+                         vec![]
                     };
-                    match state.callstack.pop() {
-                        Some(CallstackEntry { clos: ret_clos, ret: ReturnLocation::Interpreter(caller), frame, witness_frame, limit, witness_limit, rloc, c }) => {
-                            debug!("{} {:?} {:?} {}", state.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, caller, c);
-                            state.clos = ret_clos.clone();
-                            // copy the return values to the previous frame's return location,
-                            // then clean up the popped stack frame
-                            state.base = frame;
-                            state.witness_base = witness_frame;
-                            if c == 1 {
-                                // No values are saved
-                                state.vals.truncate(limit);
-                            } else if c >= 2 {
-                                // (C-1) values are saved
-                                let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
-                                //vals.extend_from_slice(r_vals.as_slice());
-                                for i in 0..=(c - 2) {
-                                    debug!("huh {}", i);
-                                    // Only copy the correct number of arguments from the CALL
-                                    state.vals[rloc + i as usize] = r_vals[i as usize].clone();
-                                }
-                                //assert!(limit >= rloc + c as usize - 1);
-                                state.vals.truncate(limit);
-                                //state.vals.truncate(rloc + c as usize - 1);
-                            } else {
-                                // Multiple return results are saved
-                                for (i, v) in r_vals.drain(..).enumerate() {
-                                    // Only copy the correct number of arguments from the CALL
-                                    state.vals[rloc + i] = v;
-                                }
-                                debug!("{:?} {}", &state.vals, r_count);
-                                state.vals.truncate(rloc + r_count);
-                            }
-                            state.hash_witnesses.truncate(witness_limit);
+
+                    match state.do_return(owner, a.into(), b) {
+                        Some(ReturnLocation::Interpreter(caller)) => {
                             state.pc = caller;
                         },
-                        Some(CallstackEntry { clos: ret_clos, ret: ReturnLocation::Generator(block, off), frame, witness_frame, limit, witness_limit, rloc, c }) => {
-                            unimplemented!()
+                        Some(ReturnLocation::Generator(block, off)) => {
+                            state.pc = off;
+                            state = spec.run(owner, block, state);
                         },
                         None => {
-                            break 'int r_vals;
+                            break 'int r_vals.into();
                         }
                     }
                 },

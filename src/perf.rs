@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[repr(C)]
 #[derive(Default, Debug)]
 pub struct Counter {
     count: AtomicUsize,
@@ -38,6 +39,7 @@ impl Counter {
     }
 }
 
+#[repr(C)]
 #[derive(Default)]
 pub struct PerfCounters {
     pub interpreter_count: Counter,
