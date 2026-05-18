@@ -1070,7 +1070,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                 return Ok(ret)
             },
             None => {
-                println!("huh {a} {b} {:?}", self);
                 self.vals.truncate(0);
                 Err(r_vals)
             }

@@ -1817,6 +1817,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off = state.current_off as usize;
                         // Fallthrough to immediately handle the instruction: if we have a
                         // thunk at offset=0, we don't want to jump back to the JIT again.
+                    } else if next_off == -5 {
+                        // Returning to interpreter
+                        debug!("jit bailout to interpreter");
+                        return (state, None);
                     }
                 }
             }

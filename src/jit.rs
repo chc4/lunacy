@@ -199,15 +199,18 @@ impl JitHelper {
             let mut owner = ();
             let mut owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
             match rs.do_return(owner, a as usize, b as usize) {
-                Ok(ReturnLocation::Interpreter(_)) => {
+                Ok(ReturnLocation::Interpreter(caller)) => {
                     // Bailout and return to interpreter
-                    return ((-2i32 as u64) << 32);
+                    debug!("returning to {}", caller);
+                    return ((-5i32 as u64) << 32);
                 }
                 Ok(ReturnLocation::Generator(block, off)) => {
                     // Return block and offset
+                    debug!("returning to {:?} {}", block, off);
                     return ((off as u64) << 32) | (block.0 as u64);
                 }
                 Err(r_vals) => {
+                    panic!();
                     // Done
                     // TODO: Ugh we probably need to stash these r_vals somewhere instead of
                     // forgetting them. This would show up if we tailcall return through a JIT
@@ -547,11 +550,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // Check if the call is trying to bailout: we propagate the bailout
                                 // if so, unwinding our native stack but yielding to the generator run loop
                                 // with a suspended ReturnLocation stack.
-                                // TODO: for now we just have to always bailout...we should actually check
-                                // state.trap, and have everything except a properly handled Residual::Ret
-                                // set it when it wants to start bailing. but we don't actually JIT Ret
-                                // yet, so,
-                                ; jmp >exit_jit
+                                ; cmp rax, 0
+                                ; jb >exit_jit
                                 // Reload the correct base ptr for the remainder of our function
                                 ; mov r14, QWORD [rsp + 0]
                             );
@@ -591,8 +591,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
                         ; .arch x64
-                        ; mov WORD r13 => RunState.current_off, (off as i16)
-                        ; mov rax, QWORD (((-2i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; mov rdi, r13 // state
+                        ; mov rsi, WORD (*a as i32)
+                        ; mov rdx, WORD (*b as i32)
+                        ; call extern (JitHelper::lua_return as *const () as usize)
                         ; jmp >exit_jit
                     );
                 },
