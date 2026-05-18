@@ -1974,74 +1974,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Ret(pc, a, b) => {
                     debug!("spec final blocks: {:?}", self.blocks);
-                    state.close_upvalues();
-                    state.upvals = vec![].into();
-                    let mut r_count = 0 as usize;
-                    let mut r_vals: FVec<_> = if b == 1 {
-                        // no return values
-                        vec![].into()
-                    } else if b >= 2 {
-                        // there are b-1 return values from R(A) onwards
-                        r_count = b as usize-1;
-                        let r_vals = &state.vals[state.base + a as usize..(state.base + a as usize + r_count as usize)];
-                        debug!("{:?}", r_vals);
-                        Vec::from(r_vals).into()
-                    } else if b == 0 {
-                        // return all values from R(A) to the ToS
-                        let r_vals = &state.vals[state.base + a as usize..];
-                        r_count = r_vals.len() as usize;
-                        debug!("{:?}", r_vals);
-                        Vec::from(r_vals).into()
-                    } else {
-                        unreachable!()
-                    };
-                    match state.callstack.last() {
-                        Some(CallstackEntry { clos: ret_clos, ret: ReturnLocation::Interpreter(caller), frame, witness_frame, limit, witness_limit, rloc, c }) => {
-                            // We use the current closure, because we want to execute the vm RET
-                            // instruction in it
-                            state.clos = self.clos.clone();
-                            debug!("returning to {:?}", unsafe { &(*ret_clos.ro(owner).prototype).source });
-                            state.pc = pc;
-                            return state
+                    match state.do_return(owner, a as usize, b as usize) {
+                        Ok(ReturnLocation::Interpreter(caller)) => {
+                            state.pc = caller;
                         },
-                        Some(CallstackEntry { clos: ret_clos, ret: ReturnLocation::Generator(block, disp), frame, witness_frame, limit, witness_limit, rloc, c }) => {
-                            state.clos = ret_clos.clone();
-                            self.set_current(ret_clos.clone());
-                            state.base = *frame;
-                            state.witness_base = *witness_frame;
-                            debug!("returning {c}");
-                            if *c == 1 {
-                                // No values are saved
-                                state.vals.truncate(*limit);
-                            } else if *c >= 2 {
-                                // (C-1) values are saved
-                                let parent_stack = unsafe { (*state.clos.ro(owner).prototype).max_stack as usize };
-                                //vals.extend_from_slice(r_vals.as_slice());
-                                for i in 0..=(c - 2) {
-                                    debug!("huh {}", i);
-                                    // Only copy the correct number of arguments from the CALL
-                                    state.vals[rloc + i as usize] = r_vals[i as usize].clone();
-                                }
-                                //assert!(limit >= rloc + c as usize - 1);
-                                state.vals.truncate(*limit);
-                                //state.vals.truncate(rloc + c as usize - 1);
-                            } else {
-                                // Multiple return results are saved
-                                for (i, v) in r_vals.drain(..).enumerate() {
-                                    // Only copy the correct number of arguments from the CALL
-                                    state.vals[rloc + i] = v;
-                                }
-                                debug!("{:?} {}", &state.vals, r_count);
-                                state.vals.truncate(rloc + r_count);
-                            }
-                            id = *block;
-                            off = *disp;
-                            state.vals.truncate(*limit);
-                            state.hash_witnesses.truncate(*witness_limit);
-                            debug!("after generator return, {:?}", &state.vals[state.base..]);
-                            state.callstack.pop();
+                        Ok(ReturnLocation::Generator(block, disp)) => {
+                            self.set_current(state.clos.clone());
+                            id = block;
+                            off = disp;
                         },
-                        x => unimplemented!("{:?}", x),
+                        Err(r_vals) => {
+                            return state;
+                        },
                     }
                 },
             }

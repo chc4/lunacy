@@ -1009,6 +1009,12 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     }
 
     pub fn do_return(&mut self, owner: &mut TCellOwner<TcOwner>, a: usize, b: usize) -> Result<ReturnLocation, FVec<LValue<'src, 'intern>>> {
+        // we're going to be removing this frame, so close any open
+        // upvalues.
+        self.close_upvalues();
+        self.upvals = vec![].into();
+
+
         let mut r_count = 0 as usize;
         let mut r_vals: FVec<_> = if b == 1 {
             // no return values
@@ -1597,11 +1603,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     }
                 },
                 Opcode::RETURN => {
-                    // we're going to be removing this frame, so close any open
-                    // upvalues.
-                    state.close_upvalues();
-                    state.upvals = vec![].into();
-
                     let (a, b) = <RETURN as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
                     match state.do_return(owner, a as usize, b as usize) {
