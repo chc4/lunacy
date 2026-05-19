@@ -53,6 +53,11 @@ gdb-benchmark benchmark: dump
     cargo build --release --bin lunacy
     gdb --args ./target/release/lunacy {{benchmark}}.bin
 
+flamegraph benchmark:
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    -rm /tmp/perf-*.map
+    cargo flamegraph --features "perf" --bin lunacy -- {{benchmark}}.bin
+    firefox -new-tab flamegraph.svg
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 

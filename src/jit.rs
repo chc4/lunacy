@@ -1,4 +1,5 @@
 #![allow(unused_parens)]
+use std::io::Write;
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
 use qcell::{TCell, TCellOwner};
@@ -230,6 +231,7 @@ pub struct JitContext {
     pub blocks: HashMap<BlockId, JitPtr, FxBuildHasher>,
     pub pending: BTreeMap<BlockId, DynamicLabel>,
     pub used: usize,
+    pub perf_map: Option<std::cell::RefCell<std::fs::File>>,
 }
 
 #[derive(Copy, Clone)]
@@ -244,11 +246,29 @@ impl JitContext {
         // Set the JIT memory to the max size initially, so that we don't need to
         // mprotect back to mutable just to reserve
         memory.set_len(JIT_SIZE);
+        let mut perf_map = None;
+        #[cfg(feature = "perf")]
+        {
+            perf_map = {
+                let pid = std::process::id();
+                let path = format!("/tmp/perf-{}.map", pid);
+                std::fs::File::create(path).ok().map(|f| std::cell::RefCell::new(f))
+            };
+        }
         Self {
             memory: Cell::new(memory.make_exec().unwrap()),
             blocks: HashMap::default(),
             pending: BTreeMap::new(),
             used: 0,
+            perf_map,
+        }
+    }
+
+    pub fn add_to_perf_map(&self, addr: usize, size: usize, name: &str) {
+        #[cfg(feature = "perf")]
+        if let Some(ref map) = self.perf_map {
+            let mut map = map.borrow_mut();
+            writeln!(map, "{:x} {:x} {}", addr, size, name).ok();
         }
     }
 
@@ -325,7 +345,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // TODO: Pin state.vals.as_ptr() to a register, which will let us remove a lot of the
         // JitHelper function calls.
 
-
+        let mut compiled_offsets = Vec::new();
         // We may have already JIT this block, if it was jumped to by another block
         // first. In that case we just have to jump to it.
         if let Some(block_ptr) = self.jctx.blocks.get(&id) {
@@ -336,7 +356,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // We need to skip over the uncommitted prologue
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
             self.jctx.blocks.insert(id, new_block);
+            let start_off = ops.offset().0;
             let _block = self.jit_block(id, &mut ops, owner);
+            compiled_offsets.push((id, start_off, ops.offset().0));
         }
 
 
@@ -354,6 +376,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; =>pending_label
             );
             let _block = self.jit_block(pending_block, &mut ops, owner);
+            compiled_offsets.push((pending_block, pending_start.0, ops.offset().0));
             self.jctx.reserve(ops.offset().0 - pending_start.0);
         }
 
@@ -361,6 +384,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let buf = ops.finalize().unwrap();
         let Some(slab) = self.jctx.commit(base, buf.as_slice()) else { panic!() };
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
+
+        let (source, line) = {
+            let proto = self.clos.ro(owner).prototype;
+            let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
+            let line = unsafe { (*proto).line_defined };
+            (source, line)
+        };
+
+        #[cfg(feature = "perf")]
+        {
+            for (bid, start, end) in compiled_offsets {
+                self.jctx.add_to_perf_map(
+                    unsafe { slab.add(start) } as usize,
+                    end - start,
+                    &format!("jit_block_{} {}:{}", bid.0, source, line)
+                );
+            }
+            self.jctx.perf_map.as_mut().map(|mut map| map.get_mut().sync_all());
+        }
 
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
     }
