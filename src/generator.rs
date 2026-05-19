@@ -903,7 +903,6 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
     }
 }
 
-#[repr(transparent)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Debug)]
 pub struct BlockId(pub usize);
 pub type Pc = usize;
@@ -1233,7 +1232,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 x => {
                     #[cfg(debug_assertions)]
                     {
-                        panic!("{:?}", x)
+                        unreachable!("{:?}", x)
                     }
                     panic!("{:?}", x);
                     self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0)); None
@@ -1794,7 +1793,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off = next_off as usize;
                         continue;
                     } else if next_off == -10 {
-                        // JIT FAST RETURN
                         let ret_a = ((ret >> 16) & 0xFFFF) as usize;
                         let ret_count = (ret & 0xFFFF) as usize;
                         match state.do_return(owner, ret_a, ret_count + 1) {

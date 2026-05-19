@@ -359,6 +359,7 @@ impl<T> Deref for Gc<T> {
     }
 }
 
+#[repr(C)]
 pub struct TcOwner;
 #[repr(transparent)]
 pub struct Tc<T>(Rc<TCell<TcOwner, T>>);
@@ -902,14 +903,14 @@ pub struct Vm<'src, 'intern> {
 }
 
 #[repr(C, u8)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum ReturnLocation {
     Interpreter(usize),
     Generator(BlockId, usize),
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_limit: usize, pub rloc: usize, pub c: u16 }
 
 #[repr(C)]

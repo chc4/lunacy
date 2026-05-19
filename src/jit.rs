@@ -1,8 +1,9 @@
 #![allow(unused_parens)]
+use crate::vm::CallstackEntry;
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
 use qcell::{TCell, TCellOwner};
-use crate::vm::{LClosure, LType, LValue, ReturnLocation, RunState, Tc, TcOwner, Vm, CallstackEntry};
+use crate::vm::{LClosure, LType, LValue, ReturnLocation, RunState, Tc, TcOwner, Vm};
 use crate::generator::{Block, BlockId, Context, Residual, Specializer, SubPc};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use rustc_hash::FxBuildHasher;
@@ -105,6 +106,87 @@ macro_rules! dispatch_abc {
 
 pub struct JitHelper;
 impl JitHelper {
+
+    pub unsafe extern "C" fn lua_call_pre<'src, 'intern>(state: *mut (),
+        entry_out: *mut CallstackEntry<'src, 'intern>,
+        a: u16,
+        ret_block: usize,
+        ret_off: usize,
+        c: u16) -> *const LValue<'src, 'intern> {
+        unsafe {
+            let rs = &mut *(state as *mut RunState);
+            let mut owner = ();
+            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
+            let lclos = match rs.vals.get(rs.base + a as usize) {
+                Some(LValue::LClosure(lc)) => lc.clone(),
+                _ => unreachable!(),
+            };
+            std::ptr::write(entry_out, CallstackEntry {
+                clos: rs.clos.clone(),
+                ret: ReturnLocation::Generator(BlockId(ret_block), ret_off),
+                frame: rs.base,
+                limit: rs.vals.len(),
+                rloc: rs.base + a as usize,
+                witness_frame: rs.witness_base,
+                witness_limit: rs.hash_witnesses.len(),
+                c,
+            });
+            let next_stack = (*lclos.ro(owner).prototype).max_stack as usize;
+            let next_base = rs.base + a as usize + 1;
+            if next_base + next_stack > rs.vals.len() {
+                rs.vals.resize_with(next_base + next_stack, || LValue::Nil);
+            }
+            rs.base = next_base;
+            rs.witness_base = rs.hash_witnesses.len();
+            rs.clos = lclos;
+            rs.vals.stack_ptr.add(rs.base).as_ptr()
+        }
+    }
+    pub unsafe extern "C" fn lua_call_post_fast<'src, 'intern>(state: *mut (),
+        entry_ptr: *mut CallstackEntry<'src, 'intern>,
+        packed_ret: u64) -> *const LValue<'src, 'intern> {
+        unsafe {
+            let rs = &mut *(state as *mut RunState);
+            let entry = std::ptr::read(entry_ptr);
+            let callee_a = ((packed_ret >> 16) & 0xFFFF) as u16;
+            let count = (packed_ret & 0xFFFF) as usize;
+            let src_start = rs.base + callee_a as usize;
+            let dst_start = entry.rloc;
+            if entry.c >= 2 {
+                for i in 0..(entry.c - 1) as usize {
+                    rs.vals[dst_start + i] = if i < count { rs.vals[src_start + i].clone() } else { LValue::Nil };
+                }
+                rs.vals.truncate(entry.limit);
+            } else if entry.c == 0 {
+                for i in 0..count { rs.vals[dst_start + i] = rs.vals[src_start + i].clone(); }
+                rs.vals.truncate(dst_start + count);
+            } else {
+                rs.vals.truncate(entry.limit);
+            }
+            rs.clos = entry.clos;
+            rs.base = entry.frame;
+            rs.witness_base = entry.witness_frame;
+            rs.hash_witnesses.truncate(entry.witness_limit);
+            rs.vals.stack_ptr.add(rs.base).as_ptr()
+        }
+    }
+    pub unsafe extern "C" fn lua_call_post_bailout(state: *mut (), entry_ptr: *mut CallstackEntry, bailout_ret: u64) -> u64 {
+        unsafe {
+            let rs = &mut *(state as *mut RunState);
+            rs.callstack.push(std::ptr::read(entry_ptr));
+            bailout_ret
+        }
+    }
+    pub unsafe extern "C" fn lua_return_fastpath(state: *mut (), a: u16, b: u16) -> u64 {
+        unsafe {
+            let rs = &mut *(state as *mut RunState);
+            rs.close_upvalues();
+            rs.upvals = vec![].into();
+            let count = if b == 0 { rs.vals.len() - (rs.base + a as usize) } else { (b - 1) as usize };
+            let code = -10i32 as i64;
+            ((code as u64) << 32) | ((a as u64) << 16) | (count as u64)
+        }
+    }
     pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: u8) -> bool {
         unsafe {
             //println!("state {:?} idx {} {}", state, idx, expected);
@@ -175,122 +257,49 @@ impl JitHelper {
         }
     }
 
-    pub unsafe extern "C" fn lua_call_pre<'src, 'intern>(state: *mut (),
-        entry_out: *mut CallstackEntry<'src, 'intern>,
-        a: u16,
-        ret_block: usize,
-        ret_off: usize,
-        c: u16) -> *const LValue<'src, 'intern> {
+    pub unsafe extern "C" fn prepare_lua_call(state: *mut (), block_id: usize, off: usize, a: u16, b: u16, c: u16) -> *const () {
+        unsafe {
+            let state = state as *mut RunState;
+            let rs = &mut *state;
+            // Forge an owner.
+            let mut owner = ();
+            let mut owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
+            let lclos = &rs.vals[rs.base + a as usize];
+            let LValue::LClosure(lclos) = lclos else { unreachable!() };
+            debug!("prepare_lua_call {:?} {} {} {} {:?}", rs, a, b, c, lclos);
+            let before = rs.vals.len();
+            debug!("{}", (*lclos.ro(owner).prototype).max_stack);
+            rs.call_lua(lclos.clone(), ReturnLocation::Generator(BlockId(block_id), off), a, b, c, owner);
+            debug!("after call_lua {:?}", rs);
+            core::ptr::null()
+        }
+    }
+
+    pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16) -> u64 {
         unsafe {
             let rs = &mut *(state as *mut RunState);
             let mut owner = ();
             let mut owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
-
-            let lclos = match rs.vals.get(rs.base + a as usize) {
-                Some(LValue::LClosure(lc)) => lc.clone(),
-                _ => unreachable!(),
-            };
-
-            // Save current state into the entry provided (on native stack)
-            let prev_clos = rs.clos.clone();
-            let prev_base = rs.base;
-            let prev_witness_base = rs.witness_base;
-            let limit = rs.vals.len();
-            let witness_limit = rs.hash_witnesses.len();
-
-            std::ptr::write(entry_out, CallstackEntry {
-                clos: prev_clos,
-                ret: ReturnLocation::Generator(BlockId(ret_block), ret_off),
-                frame: prev_base,
-                limit,
-                rloc: prev_base + a as usize,
-                witness_frame: prev_witness_base,
-                witness_limit,
-                c,
-            });
-
-            // Setup state for callee
-            let next_stack = (*lclos.ro(owner).prototype).max_stack as usize;
-            let next_base = rs.base + a as usize + 1;
-            if next_base + next_stack > rs.vals.len() {
-                rs.vals.resize_with(next_base + next_stack, || LValue::Nil);
-            }
-            rs.base = next_base;
-            rs.witness_base = witness_limit;
-            rs.clos = lclos;
-
-            rs.vals.stack_ptr.add(rs.base).as_ptr()
-        }
-    }
-
-    pub unsafe extern "C" fn lua_call_post_fast<'src, 'intern>(state: *mut (),
-        entry_ptr: *mut CallstackEntry<'src, 'intern>,
-        packed_ret: u64) -> *const LValue<'src, 'intern> {
-        unsafe {
-            let rs = &mut *(state as *mut RunState);
-            let entry = std::ptr::read(entry_ptr);
-
-            let callee_a = ((packed_ret >> 16) & 0xFFFF) as u16;
-            let count = (packed_ret & 0xFFFF) as usize;
-
-            let callee_base = rs.base;
-            let src_start = callee_base + callee_a as usize;
-            let dst_start = entry.rloc;
-
-            if entry.c == 1 {
-                // No values saved
-            } else if entry.c >= 2 {
-                let to_copy = (entry.c - 1) as usize;
-                for i in 0..to_copy {
-                    if i < count {
-                        let val = rs.vals[src_start + i].clone();
-                        rs.vals[dst_start + i] = val;
-                    } else {
-                        rs.vals[dst_start + i] = LValue::Nil;
-                    }
+            match rs.do_return(owner, a as usize, b as usize) {
+                Ok(ReturnLocation::Interpreter(caller)) => {
+                    // Bailout and return to interpreter
+                    debug!("returning to {}", caller);
+                    return ((-5i32 as u64) << 32);
                 }
-            } else {
-                // c == 0: all values saved
-                for i in 0..count {
-                    let val = rs.vals[src_start + i].clone();
-                    rs.vals[dst_start + i] = val;
+                Ok(ReturnLocation::Generator(block, off)) => {
+                    // Return block and offset
+                    debug!("returning to {:?} {}", block, off);
+                    return ((off as u64) << 32) | (block.0 as u64);
                 }
-                rs.vals.truncate(dst_start + count);
+                Err(r_vals) => {
+                    panic!();
+                    // Done
+                    // TODO: Ugh we probably need to stash these r_vals somewhere instead of
+                    // forgetting them. This would show up if we tailcall return through a JIT
+                    // function to the top-level.
+                    return ((-5i32 as u64) << 32);
+                }
             }
-
-            // Restore caller state
-            rs.clos = entry.clos.clone();
-            rs.base = entry.frame;
-            rs.witness_base = entry.witness_frame;
-
-            rs.vals.stack_ptr.add(rs.base).as_ptr()
-        }
-    }
-
-    pub unsafe extern "C" fn lua_call_post_bailout(state: *mut (),
-        entry_ptr: *mut CallstackEntry,
-        bailout_ret: u64) -> u64 {
-        unsafe {
-            let rs = &mut *(state as *mut RunState);
-            let entry = std::ptr::read(entry_ptr);
-            rs.callstack.push(entry);
-            bailout_ret
-        }
-    }
-
-    pub unsafe extern "C" fn lua_return_fastpath(state: *mut (), a: u16, b: u16) -> u64 {
-        unsafe {
-            let rs = &mut *(state as *mut RunState);
-            // In fastpath, we only close upvalues.
-            rs.close_upvalues();
-            rs.upvals = vec![].into();
-
-            let count = if b == 0 {
-                rs.vals.len() - (rs.base + a as usize)
-            } else {
-                (b - 1) as usize
-            };
-            ((-10i32 as u64) << 32) | ((a as u64) << 16) | (count as u64)
         }
     }
 }
@@ -590,8 +599,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack.into() };
                     let types = vec![LType::Unknown; next_stack];
                     let ctx = Context::new(types);
-                    let versions = self.versions.get(&lclos.ro(owner).prototype);
-                    let entry: Option<*const ()> = if let Some(versions) = versions && let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
+                    let versions = self.versions.get(&lclos.ro(owner).prototype).unwrap();
+                    let entry: Option<*const ()> = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                         self.blocks[block.0].jit_info.entry.map(|f| f as *const _)
                     } else {
                         // This shouldn't ever happen...?
@@ -600,51 +609,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     match entry {
                         Some(entry) => {
                             dynasm!(ops
-                                ; .arch x64
-                                ; sub rsp, 80 // size_of::<CallstackEntry>()
                                 ; mov rdi, r13 // state
-                                ; mov rsi, rsp // entry_out
-                                ; mov rdx, WORD (*a as i32)
-                                ; mov rax, QWORD (id.0 as i64)
-                                ; mov rcx, rax // ret_block
-                                ; mov rax, QWORD ((off + 1) as i64)
-                                ; mov r8, rax // ret_off
-                                ; mov r9, WORD (*c as i32)
-                                ; call extern (JitHelper::lua_call_pre as *const () as usize)
-                                ; mov r14, rax // new base_ptr
+                                ; mov rsi, WORD (id.0 as i32)
+                                ; mov rdx, WORD ((off + 1) as i32)
+                                ; mov rcx, WORD (*a as i32)
+                                ; mov  r8, WORD (*b as i32)
+                                ; mov  r9, WORD (*c as i32)
 
-                                ; mov r15, QWORD r13 => RunState.witness_base
-                                ; mov rdi, r12 // owner
-                                ; mov rsi, r13 // state
-                                ; mov rdx, r14 // base_ptr
+                                //; mov rsi, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
+                                //; mov rdx, WORD (*a as i32)
+                                //; mov rcx, WORD (*b as i32)
+                                //; mov  r8, WORD (*c as i32)
+
+                                ; call extern (JitHelper::prepare_lua_call as *const () as usize)
+
+                                // state is already in r13
+                                // Our base_ptr is in r14, and needs to be incremented for the
+                                // caller's frame.
+                                ; add r14, ((a + 1) as i32)
                                 ; call extern (entry as usize)
 
-                                ; mov rcx, rax
-                                ; sar rcx, 32
-                                ; cmp ecx, -10
-                                ; je >fast_return
-                                ; jmp >bailout
-
-                                ; fast_return:
-                                ; mov rdi, r13 // state
-                                ; mov rsi, rsp // entry_ptr
-                                ; mov rdx, rax // packed_ret
-                                ; call extern (JitHelper::lua_call_post_fast as *const () as usize)
-                                ; mov r14, rax // restored base_ptr
-                                ; jmp >done
-
-                                ; bailout:
-                                ; mov rdi, r13 // state
-                                ; mov rsi, rsp // entry_ptr
-                                ; mov rdx, rax // bailout_ret
-                                ; call extern (JitHelper::lua_call_post_bailout as *const () as usize)
-                                // rax now contains bailout_ret
-                                ; add rsp, 80
-                                ; jmp >exit_jit
-
-                                ; done:
-                                ; add rsp, 80
-                                ; mov r15, QWORD r13 => RunState.witness_base
+                                // Check if the call is trying to bailout: we propagate the bailout
+                                // if so, unwinding our native stack but yielding to the generator run loop
+                                // with a suspended ReturnLocation stack.
+                                ; cmp rax, 0
+                                ; jb >exit_jit
+                                // Reload the correct base ptr for the remainder of our function
+                                ; mov r14, QWORD [rsp + 0]
                             );
                         },
                         None => {
@@ -682,11 +673,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r13 // state
+                        ; mov rdi, r13
                         ; mov rsi, WORD (*a as i32)
                         ; mov rdx, WORD (*b as i32)
                         ; call extern (JitHelper::lua_return_fastpath as *const () as usize)
-                        // rax contains status (-10) and packed return metadata
                         ; jmp >exit_jit
                     );
                 },
