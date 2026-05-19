@@ -194,9 +194,11 @@ impl JitHelper {
         }
     }
 
-    pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16) -> u64 {
+    pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16, base_ptr: *const ()) -> u64 {
         unsafe {
             let rs = &mut *(state as *mut RunState);
+            #[cfg(debug_assertions)]
+            assert_eq!(base_ptr, rs.vals.stack_ptr.as_non_null_ptr().add(rs.base).as_ptr().cast());
             let mut owner = ();
             let mut owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
             match rs.do_return(owner, a as usize, b as usize) {
@@ -334,7 +336,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let entry = ops.offset();
 
         // SystemV ABI is RDI, RSI, RDX, RCX, R8, R9
-        // JitExec (rust-preserve-none): R12=owner, R13=state, R14=base_ptr
+        // JitExec (rust-preserve-none): R12=owner, R13=state, R14=base_ptr, R15=base_ptr
 
         dynasm!(ops
             ; .arch x64
@@ -576,17 +578,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; mov  r8, WORD (*b as i32)
                                 ; mov  r9, WORD (*c as i32)
 
-                                //; mov rsi, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
-                                //; mov rdx, WORD (*a as i32)
-                                //; mov rcx, WORD (*b as i32)
-                                //; mov  r8, WORD (*c as i32)
-
                                 ; call extern (JitHelper::prepare_lua_call as *const () as usize)
 
                                 // state is already in r13
                                 // Our base_ptr is in r14, and needs to be incremented for the
                                 // caller's frame.
-                                ; add r14, ((a + 1) as i32)
+                                ; add r14, (((a + 1) as usize * core::mem::size_of::<LValue<'static, 'static>>()) as i32)
                                 ; call extern (entry as usize)
 
                                 // Check if the call is trying to bailout: we propagate the bailout
@@ -636,6 +633,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rdi, r13 // state
                         ; mov rsi, WORD (*a as i32)
                         ; mov rdx, WORD (*b as i32)
+                        ; mov rcx, r14 // base_ptr
                         ; call extern (JitHelper::lua_return as *const () as usize)
                         ; jmp >exit_jit
                     );
