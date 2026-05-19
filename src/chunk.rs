@@ -121,6 +121,7 @@ fn instruction(input: &[u8]) -> IResult<&[u8], Instruction> {
     map(le_u32, |i| Instruction(InstBits(i)))(input)
 }
 
+#[repr(C, u8)]
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub enum Constant<S: PartialEq + Eq> {
     Nil,

@@ -360,6 +360,7 @@ impl<T> Deref for Gc<T> {
 }
 
 pub struct TcOwner;
+#[repr(transparent)]
 pub struct Tc<T>(Rc<TCell<TcOwner, T>>);
 
 impl<T> Debug for Tc<T> {
@@ -593,7 +594,7 @@ impl<'intern, 'src> Deref for InternString<'intern, 'src> {
     }
 }
 
-#[repr(u8)]
+#[repr(C, u8)]
 #[derive(Debug, Hash, Clone, PartialEq, Eq)]
 pub enum LValue<'src, 'intern> {
     Nil = 0,
@@ -841,6 +842,7 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
 }
 
 pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LValue<'src, 'intern>]>, &'a LCell<'id, [LValue<'src, 'intern>]>, &mut TCellOwner<TcOwner>);
+#[repr(C)]
 #[derive(Clone)]
 pub struct NClosure {
     pub native: NativeFunc,
@@ -899,15 +901,18 @@ pub struct Vm<'src, 'intern> {
     pub top_level: LProto<'src, 'intern>,
 }
 
-#[derive(Debug)]
+#[repr(C, u8)]
+#[derive(Debug, Clone, Copy)]
 pub enum ReturnLocation {
     Interpreter(usize),
     Generator(BlockId, usize),
 }
 
-#[derive(Debug)]
+#[repr(C)]
+#[derive(Debug, Clone)]
 pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_limit: usize, pub rloc: usize, pub c: u16 }
 
+#[repr(C)]
 #[derive(Debug)]
 pub struct HashWitness {
     pub href: HashRef,
@@ -916,6 +921,7 @@ pub struct HashWitness {
     pub epoch: usize,
 }
 
+#[repr(C)]
 #[derive(Debug)]
 pub struct RunState<'src, 'intern> {
     pub base: usize,

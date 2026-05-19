@@ -903,6 +903,7 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
     }
 }
 
+#[repr(transparent)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Debug)]
 pub struct BlockId(pub usize);
 pub type Pc = usize;
@@ -1232,7 +1233,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 x => {
                     #[cfg(debug_assertions)]
                     {
-                        unreachable!("{:?}", x)
+                        panic!("{:?}", x)
                     }
                     panic!("{:?}", x);
                     self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0)); None
@@ -1792,6 +1793,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         id = BlockId(next_id as usize);
                         off = next_off as usize;
                         continue;
+                    } else if next_off == -10 {
+                        // JIT FAST RETURN
+                        let ret_a = ((ret >> 16) & 0xFFFF) as usize;
+                        let ret_count = (ret & 0xFFFF) as usize;
+                        match state.do_return(owner, ret_a, ret_count + 1) {
+                            Ok(ReturnLocation::Interpreter(caller)) => {
+                                state.pc = caller;
+                                return (state, None);
+                            },
+                            Ok(ReturnLocation::Generator(block, disp)) => {
+                                self.set_current(state.clos.clone());
+                                id = block;
+                                off = disp;
+                                continue;
+                            },
+                            Err(r_vals) => {
+                                return (state, Some(r_vals));
+                            },
+                        }
                     } else if next_off == -1 {
                         debug!("jit bail 1 from {next_id}");
                         state.trap = false;
