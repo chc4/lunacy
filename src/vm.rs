@@ -1012,7 +1012,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         // we're going to be removing this frame, so close any open
         // upvalues.
         self.close_upvalues();
-        self.upvals = vec![].into();
+        self.upvals.truncate(0);
 
 
         let mut r_count = 0 as usize;
