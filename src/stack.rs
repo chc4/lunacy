@@ -1,4 +1,4 @@
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Index, IndexMut};
 
 use crate::vm::LValue;
 
@@ -8,7 +8,7 @@ const VALUE_STACK_DEFAULT: usize = 0x1000 * 0x1000 * 2; // 2mb hugepage
 
 #[repr(C)]
 pub struct ValueStack<'src, 'intern> {
-    pub stack_ptr: core::ptr::NonNull<LValue<'src, 'intern>>,
+    pub stack_ptr: core::ptr::NonNull<[LValue<'src, 'intern>]>,
     used: usize,
     mmap: MmapMut,
 }
@@ -16,24 +16,44 @@ pub struct ValueStack<'src, 'intern> {
 impl<'src, 'intern> Deref for ValueStack<'src, 'intern> {
     type Target = [LValue<'src, 'intern>];
     fn deref(&self) -> &Self::Target {
-        unsafe { std::slice::from_raw_parts(self.stack_ptr.as_ptr(), self.used) }
+        unsafe { self.stack_ptr.get_unchecked_mut(..self.used).as_ref() }
     }
 }
 
 impl<'src, 'intern> DerefMut for ValueStack<'src, 'intern> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { std::slice::from_raw_parts_mut(self.stack_ptr.as_mut(), self.used) }
+        unsafe { self.stack_ptr.get_unchecked_mut(..self.used).as_mut() }
     }
 }
+
+#[cfg(feature = "skip_vec")]
+impl<'src, 'intern, Idx: std::slice::SliceIndex<[LValue<'src, 'intern>]>> Index<Idx> for ValueStack<'src, 'intern> {
+    type Output = Idx::Output;
+
+    fn index(&self, index: Idx) -> &Self::Output {
+        // safety: haha
+        unsafe { self.stack_ptr.get_unchecked_mut(index).as_ref() }
+    }
+}
+
+#[cfg(feature = "skip_vec")]
+impl<'src, 'intern, Idx: std::slice::SliceIndex<[LValue<'src, 'intern>]>> IndexMut<Idx> for ValueStack<'src, 'intern> {
+    fn index_mut(&mut self, index: Idx) -> &mut <Self as Index<Idx>>::Output {
+        // safety: smile emoji
+        unsafe { self.stack_ptr.get_unchecked_mut(index).as_mut() }
+    }
+}
+
+
 
 impl<'src, 'intern> ValueStack<'src, 'intern> {
     pub fn new(capacity: usize) -> Self {
         let length = capacity * std::mem::size_of::<LValue<'src, 'intern>>();
         let mut mmap = MmapMut::map_anon(length).expect("ValueStack mmap succeeds");
         drop(mmap.advise(Advice::HugePage)); // Ignore if we can't madvise for a hugepage
-        let stack_ptr = mmap.as_mut_ptr() as *mut LValue<'src, 'intern>;
+        let stack_ptr = core::ptr::NonNull::new(mmap.as_mut_ptr() as *mut LValue<'src, 'intern>).expect("mmap succeeded which means its non-null");
         Self {
-            stack_ptr: core::ptr::NonNull::new(stack_ptr).expect("mmap succeeded which means its non-null"),
+            stack_ptr: core::ptr::NonNull::slice_from_raw_parts(stack_ptr, capacity),
             used: 0,
             mmap,
         }
@@ -43,7 +63,7 @@ impl<'src, 'intern> ValueStack<'src, 'intern> {
         if new_len < self.used {
             for i in new_len..self.used {
                 unsafe {
-                    std::ptr::drop_in_place(self.stack_ptr.add(i).as_ptr());
+                    std::ptr::drop_in_place(self.stack_ptr.as_non_null_ptr().add(i).as_ptr());
                 }
             }
             self.used = new_len;
@@ -57,7 +77,7 @@ impl<'src, 'intern> ValueStack<'src, 'intern> {
         }
         for (i, val) in slice.iter().enumerate() {
             unsafe {
-                std::ptr::write(self.stack_ptr.add(self.used + i).as_ptr(), val.clone());
+                std::ptr::write(self.stack_ptr.as_non_null_ptr().add(self.used + i).as_ptr(), val.clone());
             }
         }
         self.used = new_len;
@@ -92,7 +112,7 @@ impl<'src, 'intern> Drop for ValueStack<'src, 'intern> {
         let used = self.len() / std::mem::size_of::<LValue>();
         for i in 0..used {
             unsafe {
-                std::ptr::drop_in_place(self.stack_ptr.add(i).as_ptr());
+                std::ptr::drop_in_place(self.stack_ptr.as_non_null_ptr().add(i).as_ptr());
             }
         }
     }
@@ -100,7 +120,7 @@ impl<'src, 'intern> Drop for ValueStack<'src, 'intern> {
 
 impl<'src, 'intern> std::fmt::Debug for ValueStack<'src, 'intern> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        unsafe { std::slice::from_raw_parts(self.stack_ptr.as_ptr(), self.used).fmt(f) }
+        unsafe { std::slice::from_raw_parts(self.stack_ptr.as_non_null_ptr().as_ptr(), self.used).fmt(f) }
     }
 }
 

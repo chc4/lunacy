@@ -614,7 +614,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     // Should be unreachable, emit a trap
                     dynasm!(ops
-                        ; int3
+                        ; ud2
                     );
                 },
                 Residual::Thunk(_) => {

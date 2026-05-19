@@ -854,31 +854,48 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         debug!("{} {}", a, sbx);
         let mut sub = emit_numeric(Opcode::ADD, a, a, a + 2);
         drain!(sub, arg);
-        let mut mov = emit_move(a, a);
-        drain!(mov, arg);
+
+        let idx_number = yield YieldOp::Guard(a, LType::Number);
+        let limit_number = yield YieldOp::Guard(a + 1, LType::Number);
+        let step_number = yield YieldOp::Guard(a + 2, LType::Number);
+
         // TODO: `comp` metamethods? which may invalidate the types that our resolved
         // blocks are compatible for? i think they're fine because they're on the stack whatever
         arg = yield YieldOp::GetBlock(pc);
         let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
         arg = yield YieldOp::GetBlock((pc as isize + sbx as isize) as usize);
-        let ResumeArg::BlockId(taken) = arg else { unreachable!() };
-        yield YieldOp::Exec(ResidualExec("forloop", Rc::new(move |owner, state| {
-            let idx = state.vals[state.base + a as usize].clone();
-            let limit = state.vals[state.base + a as usize + 1].clone();
-            let step = state.vals[state.base + a as usize + 2].clone();
-            debug!("{:?} {:?} {:?}", idx, limit, step);
-            let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0)))).unwrap() {
-                limit.compare(Opcode::LE, idx.clone())
-            } else {
-                idx.clone().compare(Opcode::LE, limit)
-            };
-            if comp.unwrap() {
-                state.vals[state.base + a as usize + 3] = idx;
-                state.select = 0;
-            } else {
-                state.select = 1;
-            }
-        })));
+            let ResumeArg::BlockId(taken) = arg else { unreachable!() };
+
+        match (idx_number, limit_number, step_number) {
+            (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
+                yield YieldOp::Exec(ResidualExec("forloop_numbers", Rc::new(move |owner, state| {
+                    let idx = state.vals[state.base + a as usize].clone();
+                    let limit = state.vals[state.base + a as usize + 1].clone();
+                    let step = state.vals[state.base + a as usize + 2].clone();
+                    let LValue::Number(nidx) = idx else { unreachable!() };
+                    let LValue::Number(nlimit) = limit else { unreachable!() };
+                    let LValue::Number(nstep) = step else { unreachable!() };
+                    debug!("{:?} {:?} {:?}", idx, limit, step);
+                    let comp = if nstep.0 < 0.0 {
+                        nlimit.0 <= nidx.0
+                    } else {
+                        nidx.0 <= nlimit.0
+                    };
+                    if comp {
+                        state.vals[state.base + a as usize + 3] = idx;
+                        state.select = 0;
+                    } else {
+                        state.select = 1;
+                    }
+                })));
+                // We don't need any SetType effects, because a+3 stays a Number.
+            },
+            _ => {
+                yield YieldOp::Exec(ResidualExec("forloop_other", Rc::new(move |owner, state| {
+                    panic!("forloop induction variable metamethod");
+                })));
+            },
+        }
         // For debug tracing, statically document that we have two outgoing edges
         yield YieldOp::Select(vec![("forloop_start", taken), ("forloop_finish", fallthrough)]);
         arg
@@ -1781,7 +1798,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
                     let mut jit_entry = self.blocks[id.0].jit_info.entry.unwrap();
                     warn!("running jit for {id:?}");
-                    let base_ptr = unsafe { state.vals.stack_ptr.add(state.base).as_ptr() };
+                    let base_ptr = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
                     let ret = jit_entry(owner, &mut state, base_ptr);
                     let next_off = (ret >> 32) as i32 as isize;
                     let next_id = (ret & 0xFFFFFFFF) as usize;
