@@ -15,6 +15,7 @@ use crate::vm::{LValue, LType, Number, Table, FVec};
 use crate::vm::{InstructionDecode, Unpacker};
 use crate::vm::RunState;
 use crate::vm::LConstant;
+use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
 use crate::jit::{JitInfo, JitContext};
@@ -22,7 +23,6 @@ use crate::jit::{JitInfo, JitContext};
 use log::debug;
 use log::info;
 use log::warn;
-use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 
 impl<'src, 'intern> LValue<'src, 'intern> {
@@ -869,9 +869,9 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
                 yield YieldOp::Exec(ResidualExec("forloop_numbers", Rc::new(move |owner, state| {
-                    let idx = state.vals[state.base + a as usize].clone();
-                    let limit = state.vals[state.base + a as usize + 1].clone();
-                    let step = state.vals[state.base + a as usize + 2].clone();
+                    let idx = &state.vals[state.base + a as usize];
+                    let limit = &state.vals[state.base + a as usize + 1];
+                    let step = &state.vals[state.base + a as usize + 2];
                     let LValue::Number(nidx) = idx else { unreachable!() };
                     let LValue::Number(nlimit) = limit else { unreachable!() };
                     let LValue::Number(nstep) = step else { unreachable!() };
@@ -882,7 +882,7 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
                         nidx.0 <= nlimit.0
                     };
                     if comp {
-                        state.vals[state.base + a as usize + 3] = idx;
+                        state.vals[state.base + a as usize + 3] = idx.clone();
                         state.select = 0;
                     } else {
                         state.select = 1;
@@ -1090,7 +1090,7 @@ pub struct Specializer<'src, 'intern> {
 
     pub versions: std::collections::HashMap<
         LProto<'src, 'intern>,
-        std::collections::HashMap<(SubPc, Context), BlockId>, FxBuildHasher>,
+        std::collections::HashMap<(SubPc, Context), BlockId>, InternedHasher>,
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
