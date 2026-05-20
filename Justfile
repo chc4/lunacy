@@ -1,32 +1,30 @@
 set shell := ["bash", "-c"]
 
-# Run the lua dump script to generate bytecode files
-dump:
-    lua5.1 dump.lua
+# Run lunacy against the golden testcases
+test:
+    cargo test
 
-# Run lunacy against the dumped bytecode files
-test: dump
-    cargo run --features graph --bin lunacy
-
-watch: dump
-    cargo watch -- cargo check --bin lunacy
+watch:
+    cargo watch -- cargo test
 
 TEST_FEATURES := "counters graph jit gas"
 [env("RUST_LOG", "debug")]
-debug num: dump
-    time cargo run --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- ./dumped/dumped_{{num}}.bin
+debug name:
+    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
+    time cargo run --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
 
-debug-jit num: dump
-    time cargo run --no-default-features --features "{{TEST_FEATURES}} immediate_jit" --bin lunacy -- ./dumped/dumped_{{num}}.bin
+debug-jit name:
+    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
+    time cargo run --no-default-features --features "{{TEST_FEATURES}} immediate_jit" --bin lunacy -- {{name}}.bin
 
-release num: dump
-    time cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- ./dumped/dumped_{{num}}.bin
+release name:
+    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
+    time cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
 
-gdb-test num: dump
+gdb-test name:
+    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
     cargo build --release --bin lunacy
-    gdb --args ./target/release/lunacy ./dumped/dumped_{{num}}.bin
-
-testing: (debug "12")
+    gdb --args ./target/release/lunacy {{name}}.bin
 
 # Benchmarks
 run benchmark:
@@ -48,7 +46,7 @@ graph-release name:
 baseline benchmark:
     time lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench
 
-gdb-benchmark benchmark: dump
+gdb-benchmark benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin lunacy
     gdb --args ./target/release/lunacy {{benchmark}}.bin
@@ -68,8 +66,9 @@ interpreter-compile:
 interpreter benchmark: interpreter-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     time ./target/interpreter/release/lunacy {{benchmark}}.bin
-interpreter-test num: interpreter-compile dump
-    time ./target/interpreter/release/lunacy ./dumped/dumped_{{num}}.bin
+interpreter-test name: interpreter-compile
+    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
+    time ./target/interpreter/release/lunacy {{name}}.bin
 
 # Unsafe
 unsafe-compile:

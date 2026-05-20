@@ -43,8 +43,16 @@ impl<'a> Debug for PackedString<'a> {
 
 pub fn packed_string(input: &[u8]) -> IResult<&[u8], PackedString<'_>> {
     let (input, len) = map_res(le_u64, |i| usize::try_from(i))(input)?;
+    if len == 0 {
+        return Ok((input, PackedString { len: 0, data: &[] }));
+    }
     let (input, data) = take(len)(input)?;
-    Ok((input, PackedString { len, data }))
+    let (actual_len, actual_data) = if len > 0 && data[len - 1] == 0 {
+        (len - 1, &data[..len - 1])
+    } else {
+        (len, data)
+    };
+    Ok((input, PackedString { len: actual_len, data: actual_data }))
 }
 
 #[derive(Hash, PartialEq, Eq, Clone)]

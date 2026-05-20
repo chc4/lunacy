@@ -1085,14 +1085,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
     pub fn global_env(&self, owner: &mut TCellOwner<TcOwner>, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Tc<Table<'src, 'intern>> {
         let mut math_tab = Table::new(0, 0);
-        math_tab.hash.insert(InternString::intern(intern, "floor\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+        math_tab.hash.insert(InternString::intern(intern, "floor"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
             let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
                 _ => unimplemented!()
             };
             returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "ceil\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+        math_tab.hash.insert(InternString::intern(intern, "ceil"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
             let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.ceil())),
                 _ => unimplemented!()
@@ -1102,39 +1102,39 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 *r = o
             }).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "sqrt\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+        math_tab.hash.insert(InternString::intern(intern, "sqrt"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
             let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
                 _ => unimplemented!()
             };
             returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "abs\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+        math_tab.hash.insert(InternString::intern(intern, "abs"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
             let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.abs())),
                 _ => unimplemented!()
             };
             returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "huge\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner|{
+        math_tab.hash.insert(InternString::intern(intern, "huge"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner|{
             returns.rw(&mut seq).into_iter().next().map(|r| *r = LValue::Number(Number(f64::INFINITY)));
         })));
-        math_tab.hash.insert(InternString::intern(intern, "pi\0"), LValue::Number(Number(std::f64::consts::PI)));
-        math_tab.hash.insert(InternString::intern(intern, "sin\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+        math_tab.hash.insert(InternString::intern(intern, "pi"), LValue::Number(Number(std::f64::consts::PI)));
+        math_tab.hash.insert(InternString::intern(intern, "sin"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
             let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.sin())),
                 _ => unimplemented!()
             };
             returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "cos\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+        math_tab.hash.insert(InternString::intern(intern, "cos"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
             let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.cos())),
                 _ => unimplemented!()
             };
             returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
         })));
-        math_tab.hash.insert(InternString::intern(intern, "tan\0"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+        math_tab.hash.insert(InternString::intern(intern, "tan"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
           let f = match args.ro(&seq) {
                 [LValue::Number(f)] => LValue::Number(Number(f.0.tan())),
                 _ => unimplemented!()
@@ -1143,7 +1143,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         })));
 
         let mut os_tab = Table::new(0, 0);
-        os_tab.hash.insert(InternString::intern(intern, "exit\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
+        os_tab.hash.insert(InternString::intern(intern, "exit"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
             let f = match args.ro(&seq) {
                 [LValue::Number(f)] => return std::process::exit(f.0 as i32),
                 _ => unimplemented!(),
@@ -1151,21 +1151,21 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             // No returns
         })));
 
-        let math = (InternString::intern(intern, "math\0"), LValue::Table(Tc::new(math_tab)));
-        let os = (InternString::intern(intern, "os\0"), LValue::Table(Tc::new(os_tab)));
+        let math = (InternString::intern(intern, "math"), LValue::Table(Tc::new(math_tab)));
+        let os = (InternString::intern(intern, "os"), LValue::Table(Tc::new(os_tab)));
         Tc::new(Table {
             array: vec![].into(),
             hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
-                (InternString::intern(intern, "print\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
+                (InternString::intern(intern, "print"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
                     let s = args.ro(&seq).iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
                         maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
                     ).collect::<Vec<_>>();
                     //println!("> {}", String::from_utf8_lossy(s.iter().into()));
-                    println!("> {}", s.iter().intersperse(&" ".to_string()).cloned().collect::<String>());
+                    println!("{}", s.iter().intersperse(&"\t".to_string()).cloned().collect::<String>());
                     // No returns
                 }))),
-                (InternString::intern(intern, "assert\0"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
+                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
                     match args.ro(&seq) {
                         [LValue::Bool(b), ..] => {
                             if !b {
@@ -1362,7 +1362,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             if let LValue::LClosure(lc) = x && let LValue::InternedString(key) = kb {
                                 println!("{key:?}");
                                 match key.0 {
-                                    x if x == const { "__jit\0".as_bytes() } => {
+                                    x if x == const { "__jit".as_bytes() } => {
                                         if let Entry::Occupied(mut entry) = spec.versions.entry(lc.rw(owner).prototype) {
                                             for block in entry.get_mut().values() {
                                                 warn!("Forcing JIT for block {}", block.0);
@@ -1629,7 +1629,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 _ => (),
             };
         };
-        #[cfg(feature = "counters")] {
+        #[cfg(all(feature = "counters", not(test)))] {
             println!("counters after run {:?}", state.counters);
         }
 
