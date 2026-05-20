@@ -121,11 +121,13 @@ impl JitHelper {
                 Some(LValue::LClosure(lc)) => lc.clone(),
                 _ => unreachable!(),
             };
+            let caller_max_stack = (*rs.clos.ro(owner).prototype).max_stack as usize;
+            let saved_limit = rs.vals.len().max(rs.base + caller_max_stack);
             std::ptr::write(entry_out, CallstackEntry {
                 clos: rs.clos.clone(),
                 ret: ReturnLocation::Generator(BlockId(ret_block), ret_off),
                 frame: rs.base,
-                limit: rs.vals.len(),
+                limit: saved_limit,
                 rloc: rs.base + a as usize,
                 witness_frame: rs.witness_base,
                 witness_limit: rs.hash_witnesses.len(),
@@ -158,8 +160,12 @@ impl JitHelper {
                 }
                 rs.vals.truncate(entry.limit);
             } else if entry.c == 0 {
+                let limit_to_restore = entry.limit.max(dst_start + count);
+                if limit_to_restore > rs.vals.len() {
+                    rs.vals.resize_with(limit_to_restore, || LValue::Nil);
+                }
                 for i in 0..count { rs.vals[dst_start + i] = rs.vals[src_start + i].clone(); }
-                rs.vals.truncate(dst_start + count);
+                rs.vals.truncate(limit_to_restore);
             } else {
                 rs.vals.truncate(entry.limit);
             }
@@ -173,7 +179,11 @@ impl JitHelper {
     pub unsafe extern "C" fn lua_call_post_bailout(state: *mut (), entry_ptr: *mut CallstackEntry, bailout_ret: u64) -> u64 {
         unsafe {
             let rs = &mut *(state as *mut RunState);
-            rs.callstack.push(std::ptr::read(entry_ptr));
+            let entry = std::ptr::read(entry_ptr);
+            rs.base = entry.frame;
+            rs.clos = entry.clos.clone();
+            rs.witness_base = entry.witness_frame;
+            rs.callstack.push(entry);
             bailout_ret
         }
     }
@@ -673,10 +683,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r13
+                        ; mov rdi, r13 // state
                         ; mov rsi, WORD (*a as i32)
                         ; mov rdx, WORD (*b as i32)
-                        ; call extern (JitHelper::lua_return_fastpath as *const () as usize)
+                        ; call extern (JitHelper::lua_return as *const () as usize)
                         ; jmp >exit_jit
                     );
                 },

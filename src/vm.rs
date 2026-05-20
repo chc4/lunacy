@@ -1050,28 +1050,21 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                 self.base = frame;
                 self.witness_base = witness_frame;
                 if c == 1 {
-                    // No values are saved
                     self.vals.truncate(limit);
                 } else if c >= 2 {
-                    // (C-1) values are saved
-                    let parent_stack = unsafe { (*self.clos.ro(owner).prototype).max_stack as usize };
-                    //vals.extend_from_slice(r_vals.as_slice());
                     for i in 0..=(c - 2) {
-                        debug!("huh {}", i);
-                        // Only copy the correct number of arguments from the CALL
-                        self.vals[rloc + i as usize] = r_vals[i as usize].clone();
+                        self.vals[rloc + i as usize] = if (i as usize) < r_count { r_vals[i as usize].clone() } else { LValue::Nil };
                     }
-                    //assert!(limit >= rloc + c as usize - 1);
                     self.vals.truncate(limit);
-                    //self.vals.truncate(rloc + c as usize - 1);
                 } else {
-                    // Multiple return results are saved
                     for (i, v) in r_vals.drain(..).enumerate() {
-                        // Only copy the correct number of arguments from the CALL
                         self.vals[rloc + i] = v;
                     }
-                    debug!("{:?} {}", &self.vals, r_count);
-                    self.vals.truncate(rloc + r_count);
+                    let limit_to_restore = limit.max(rloc + r_count);
+                    if limit_to_restore > self.vals.len() {
+                        self.vals.resize_with(limit_to_restore, || LValue::Nil);
+                    }
+                    self.vals.truncate(limit_to_restore);
                 }
                 self.hash_witnesses.truncate(witness_limit);
                 return Ok(ret)
