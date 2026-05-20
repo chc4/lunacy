@@ -1,0 +1,1 @@
+local function bar(a) return a+a end local function foo(a) for i=1, a do bar(a + i) end end foo(100000)

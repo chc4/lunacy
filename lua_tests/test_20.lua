@@ -1,0 +1,11 @@
+-- EXPECT: 1
+-- EXPECT: 4
+-- EXPECT: 5
+-- EXPECT: 11
+-- EXPECT: 22
+-- EXPECT: 1
+-- EXPECT: 4
+-- EXPECT: 5
+-- EXPECT: 11
+-- EXPECT: 22
+t = {} local function fast() local x = t x.a = "1" local z = x.a .. x.a local y = t y.a = "2" local w = y.a .. y.a x.a = 1 print(y.a) print(y.a + 3) print(x.a + 4) print(z) print(w) end fast() fast.__jit = 1 fast()

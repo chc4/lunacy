@@ -1,0 +1,1 @@
+if true==true then a = 1 else a = 2 end return a

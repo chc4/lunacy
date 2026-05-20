@@ -1,0 +1,1 @@
+local function foo() return 1,2 end return foo() + 1
