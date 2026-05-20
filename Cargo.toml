@@ -39,6 +39,9 @@ memmap2 = { version = "0.9.10", path = "./memmap2-rs" }
 smallvec = "1.15.1"
 rsprocmaps = "0.3.2"
 
+[dev-dependencies]
+regex = "1.11.1"
+
 [target.sandbox]
 
 [target.jit]
