@@ -144,6 +144,46 @@ impl JitHelper {
             (val.typeof_() as u8) == expected
         }
     }
+    pub unsafe extern "C" fn check_lua_guard(state: *mut (), idx: usize, ptr: *const ()) -> bool {
+        unsafe {
+            let state = state as *mut RunState;
+            // Forge an owner
+            let mut owner = ();
+            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
+            let rs = &*state;
+            if let LValue::LClosure(clos) = &rs.vals[rs.base + idx] {
+                let call = clos.ro(owner).prototype.cast();
+                if call == ptr {
+                    // Fallthrough
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+    }
+    pub unsafe extern "C" fn check_native_guard(state: *mut (), idx: usize, ptr: *const ()) -> bool {
+        unsafe {
+            let state = state as *mut RunState;
+            // Forge an owner
+            let mut owner = ();
+            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
+            let rs = &*state;
+            if let LValue::NClosure(nf) = &rs.vals[rs.base + idx] {
+                let call = nf.get_ptr();
+                if call == ptr {
+                    // Fallthrough
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+    }
     pub unsafe extern "C" fn prepare_native_call<const A: Count, const B: Count, const C: Count>(state: *mut (), a: u16, b: u16, c: u16) -> CallArgs {
         unsafe {
             let state = state as *mut RunState;
@@ -515,6 +555,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             );
                         },
                     }
+                },
+                Residual::NativeGuard { idx, ptr } => {
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, r13 // state
+                        ; mov rsi, WORD (*idx as i32)
+                        ; mov rdx, QWORD (*ptr as i64)
+                        ; call extern (JitHelper::check_native_guard as *const () as usize)
+                        ; test al, al
+                        ; jnz =>insts[off + 2]
+                        // Fail: fallthrough to next (off + 1)
+                    );
+                },
+                Residual::LuaGuard { idx, ptr } => {
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, r13 // state
+                        ; mov rsi, WORD (*idx as i32)
+                        ; mov rdx, QWORD (*ptr as i64)
+                        ; call extern (JitHelper::check_lua_guard as *const () as usize)
+                        ; test al, al
+                        ; jnz =>insts[off + 2]
+                        // Fail: fallthrough to next (off + 1)
+                    );
                 },
                 Residual::EpochCheck { tab, href } => {
                     let href_u8 = href.0;
