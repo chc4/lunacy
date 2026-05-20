@@ -190,13 +190,16 @@ impl JitHelper {
             debug!("{}", (*lclos.ro(owner).prototype).max_stack);
             rs.call_lua(lclos.clone(), ReturnLocation::Generator(BlockId(block_id), off), a, b, c, owner);
             debug!("after call_lua {:?}", rs);
-            core::ptr::null()
+            let new_stack = rs.vals.stack_ptr.as_non_null_ptr().add(rs.base).as_ptr().cast();
+            warn!("prepare_lua_call returns new stack {new_stack:p} for {base}", base = rs.base);
+            new_stack
         }
     }
 
     pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16, base_ptr: *const ()) -> u64 {
         unsafe {
             let rs = &mut *(state as *mut RunState);
+            warn!("lua_return base {base} base_ptr {base_ptr:p} stack_ptr {stack_ptr:p}", base = rs.base, stack_ptr = rs.vals.stack_ptr.as_non_null_ptr());
             #[cfg(debug_assertions)]
             assert_eq!(base_ptr, rs.vals.stack_ptr.as_non_null_ptr().add(rs.base).as_ptr().cast());
             let mut owner = ();
@@ -205,6 +208,7 @@ impl JitHelper {
                 Ok(ReturnLocation::Interpreter(caller)) => {
                     // Bailout and return to interpreter
                     debug!("returning to {}", caller);
+                    rs.trap = true;
                     return ((-5i32 as u64) << 32);
                 }
                 Ok(ReturnLocation::Generator(block, off)) => {
@@ -218,6 +222,7 @@ impl JitHelper {
                     // TODO: Ugh we probably need to stash these r_vals somewhere instead of
                     // forgetting them. This would show up if we tailcall return through a JIT
                     // function to the top-level.
+                    rs.trap = true;
                     return ((-5i32 as u64) << 32);
                 }
             }
@@ -441,6 +446,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ; .arch x64
                     ; mov WORD r13 => RunState.current_off, (off as i16)
                     ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                    ; mov BYTE r13 => RunState.trap, 1
                     ; jmp >exit_jit
                 );
             } else {
@@ -448,6 +454,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 dynasm!(ops
                     ; .arch x64
                     ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
+                    ; mov BYTE r13 => RunState.trap, 1
                     ; jmp >exit_jit
                 );
             }
@@ -463,8 +470,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             dynasm!(ops
                 ; sub QWORD r13 => RunState.gas, 1
                 ; mov WORD r13 => RunState.current_off, (off as i16)
+                ; ja >have_gas
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
-                ; jbe >exit_jit
+                ; mov BYTE r13 => RunState.trap, 1
+                ; jmp >exit_jit
+                ; have_gas:
             );
             loop { match res {
                 Residual::Guard { idx, expected } => {
@@ -579,23 +589,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; mov  r9, WORD (*c as i32)
 
                                 ; call extern (JitHelper::prepare_lua_call as *const () as usize)
+                                ; mov r14, rax
 
                                 // state is already in r13
-                                // Our base_ptr is in r14, and needs to be incremented for the
-                                // caller's frame.
-                                ; add r14, (((a + 1) as usize * core::mem::size_of::<LValue<'static, 'static>>()) as i32)
                                 ; call extern (entry as usize)
+                                ; mov r14, QWORD [rsp - 0]
 
                                 // Check if the call is trying to bailout: we propagate the bailout
                                 // if so, unwinding our native stack but yielding to the generator run loop
                                 // with a suspended ReturnLocation stack.
-                                ; cmp rax, 0
-                                ; jb >exit_jit
+                                ; cmp BYTE r13 => RunState.trap, 0
+                                ; jnz >exit_jit
+
                                 // Reload the correct base ptr for the remainder of our function
-                                ; mov r14, QWORD [rsp + 0]
                             );
                         },
-                        None => {
+                        Some(_) | None => {
                             // TODO: Even though we don't have the block it's unavailable now, we
                             // could emit a patchpoint and fill it in once we emit it. For now, we
                             // just bailout to the interpreter forever because we missed our
@@ -661,6 +670,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; mov WORD r13 => RunState.current_off, (off as i16)
                         ; mov rax, QWORD (((-4i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; mov BYTE r13 => RunState.trap, 1
                         ; jmp >exit_jit
                     );
                 },
@@ -672,9 +682,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         dynasm!(ops
             ; .arch x64
-            // Default exit: end of block, return to interpreter at end
-            ; int3
-            ; mov rax, QWORD (((block.instructions.len() as u64) << 32 | (id.0 as u64)) as i64)
+            ; ud2
             ; exit_jit:
             ; pop r14
             ; pop rbp

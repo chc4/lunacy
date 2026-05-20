@@ -1797,8 +1797,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
 
                     let mut jit_entry = self.blocks[id.0].jit_info.entry.unwrap();
-                    warn!("running jit for {id:?}");
                     let base_ptr = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
+                    warn!("running jit for {id:?} with base_ptr {base_ptr:p}");
+                    state.trap = false;
                     let ret = jit_entry(owner, &mut state, base_ptr);
                     let next_off = (ret >> 32) as i32 as isize;
                     let next_id = (ret & 0xFFFFFFFF) as usize;
@@ -1848,6 +1849,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if state.gas == 0 {
                 let res = self.blocks[id.0].instructions[off].clone();
                 println!("out of gas at {id:?} {off} {res:?}");
+                println!("out of gas run state: base={:?}", state.base);
                 println!("out of gas return stack: {:?}", state.callstack);
                 state.gas -= 1;
             }
