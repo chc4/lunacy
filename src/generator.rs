@@ -369,7 +369,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
 
                 let t_mismatched_type = mismatched_type.clone();
                 arg = yield YieldOp::Exec(ResidualExec("settable_href", Rc::new(move |owner, state| {
-                    let witness = &state.hash_witnesses[state.witness_base + hb.0 as usize];
+                    let hidx = state.witness_base + hb.0 as usize;
+                    let witness = &state.hash_witnesses[hidx];
                     debug!("settable_href with {:?} {:?}", &witness, htype);
                     let tab = &state.vals[state.base + a];
                     let LValue::Table(tab) = tab else { unreachable!() };
@@ -384,6 +385,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     *val1 = kc;
                     if t_mismatched_type.is_some() {
                         tab.rw(owner).epoch += 1;
+                        // This is safe because we're statically updating the known type as well.
+                        state.hash_witnesses[hidx].as_mut().unwrap().epoch = tab.rw(owner).epoch;
                     }
                 })));
                 if let Some(new_type) = mismatched_type {
@@ -408,6 +411,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         if existing.typeof_() != kc_type {
                             t.rw(owner).epoch += 1;
                         }
+                    } else {
+                        // Set new key, which implies keys that previously chained through the
+                        // metatable or resolved to nil are invalidated.
+                        t.rw(owner).epoch += 1;
                     }
                 })));
             }
@@ -2021,6 +2028,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     // way (worse case each block has its own closure and we switch in run when we enter...)
     pub fn set_current(&mut self, clos: Tc<LClosure<'src, 'intern>>) {
         self.clos = clos;
+    }
+
+    pub fn count(&self) -> usize {
+        let mut count = 0;
+        for (proto, versions) in &self.versions {
+            for version in versions {
+                count += self.blocks[version.1.0].instructions.len();
+            }
+        }
+        count
     }
 
     pub fn dump(&self, owner: &TCellOwner<TcOwner>, proto: LProto<'src, 'intern>, filepath: &str) {
