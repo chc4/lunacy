@@ -61,8 +61,40 @@ static ALIVE: AtomicBool = AtomicBool::new(true);
 
 #[derive(Eq, PartialEq)]
 #[repr(transparent)]
-struct Gc<T> {
+pub struct Gc<T> {
     ptr: core::ptr::NonNull<GcInner<T>>,
+}
+
+impl<T> Gc<T> {
+    fn new(val: T) -> Self {
+        let heap = unsafe { HEAP.load(Ordering::Acquire).as_ref().unwrap() };
+        let mut top = heap.top.load(Ordering::Acquire);
+        let inner = GcInner {
+            next: top,
+            state: ALIVE.load(Ordering::Acquire),
+            val
+        };
+        let ptr = Box::leak(Box::new(inner));
+        loop {
+            // Try to put ourself as the new top
+            let erased: *mut GcInner<()> = unsafe { core::mem::transmute(ptr as *mut _) };
+            match heap.top.compare_exchange(top, erased, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => {
+                    // We were able to swap ourself as the top, which means our next pointer is
+                    // correct.
+                    break;
+                },
+                Err(new_top) => {
+                    // We failed to set ourself as the top, which means something else did. Update
+                    // our next pointer and try again.
+                    ptr.next = new_top;
+                    continue;
+                },
+            }
+
+        }
+        Self { ptr: core::ptr::NonNull::from_mut(ptr) }
+    }
 }
 
 // Always clonable
@@ -111,7 +143,7 @@ struct GcInner<T> {
 static HEAP: AtomicPtr<Heap> = AtomicPtr::new(core::ptr::null_mut());
 #[derive(Default)]
 pub struct Heap {
-    top: *mut GcInner<()>,
+    top: AtomicPtr<GcInner<()>>,
     roots: HashMap<Gc<()>, usize>,
 }
 
@@ -139,7 +171,7 @@ impl Heap {
         }
         let alive = ALIVE.load(Ordering::Acquire);
         let mut prev = None;
-        let mut current = self.top;
+        let mut current = self.top.load(Ordering::Acquire);
         while current != core::ptr::null_mut() {
             debug!("sweeping {current:p}");
             prev = Some(current);

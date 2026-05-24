@@ -22,7 +22,7 @@ use qcell::{TCell, TCellOwner, LCell, LCellOwner};
 
 use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
 use crate::perf::PerfCounters;
-use crate::gc::{Mark, Heap};
+use crate::gc::{Mark, Heap, Gc};
 use crate::{debug, warn};
 
 pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
