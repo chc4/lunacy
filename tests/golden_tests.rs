@@ -99,7 +99,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
             let print_key = vm::InternString::intern(&intern_strings, "print");
             let custom_print = vm::LValue::NClosure(vm::NClosure::new(|seq, args, _returns, owner| {
                 let s = args.ro(&seq).iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
-                    maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
+                    maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.ro(owner).as_slice()).to_owned()) })
                 ).collect::<Vec<_>>();
                 let output = s.into_iter().intersperse("\t".to_string()).collect::<String>();
                 CAPTURED.rw(owner).push(output);

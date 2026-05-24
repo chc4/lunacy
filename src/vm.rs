@@ -22,7 +22,7 @@ use qcell::{TCell, TCellOwner, LCell, LCellOwner};
 
 use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
 use crate::perf::PerfCounters;
-use crate::gc::Mark;
+use crate::gc::{Mark, Heap};
 use crate::{debug, warn};
 
 pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
@@ -1068,6 +1068,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
 impl<'src, 'intern> Vm<'src, 'intern> {
     pub fn new(top_level: LProto<'src, 'intern>) -> Self {
+        Heap::init();
         Self { top_level }
     }
 

@@ -1,5 +1,6 @@
 use std::ops::Deref;
 use std::collections::HashMap;
+use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
 use crate::vm::{Tc, TcOwner, LValue, LClosure, Table};
 use crate::{TCell, TCellOwner};
 use crate::debug;
@@ -55,7 +56,7 @@ impl<T: Mark> Mark for Vec<T> {
     }
 }
 
-static ALIVE: TCell<TcOwner, bool> = TCell::new(true);
+static ALIVE: AtomicBool = AtomicBool::new(true);
 
 struct Gc<T> {
     ptr: core::ptr::NonNull<GcInner<T>>,
@@ -65,7 +66,7 @@ impl<T> Mark for Gc<T> {
     default fn mark(&self, owner: &TCellOwner<TcOwner>) {
         // A Gc<T> object can only be marked if it is reachable by the mutator, and is only freed
         // by Heap::sweep if it unreachable and thus wasn't marked before the last sweep.
-        unsafe { (*self.ptr.as_ptr()).state = *ALIVE.ro(owner) };
+        unsafe { (*self.ptr.as_ptr()).state = ALIVE.load(Ordering::Acquire) };
     }
 }
 
@@ -73,7 +74,7 @@ impl<T: Mark> Mark for Gc<T> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
         // Safety: See default implementation.
         unsafe {
-            (*self.ptr.as_ptr()).state = *ALIVE.ro(owner);
+            (*self.ptr.as_ptr()).state = ALIVE.load(Ordering::Acquire);
             (*self.ptr.as_ptr()).val.mark(owner);
         };
     }
@@ -85,21 +86,36 @@ struct GcInner<T> {
     val: T,
 }
 
-struct Heap {
+static HEAP: AtomicPtr<*mut Heap> = AtomicPtr::new(core::ptr::null_mut());
+#[derive(Default)]
+pub struct Heap {
     top: *mut GcInner<()>,
     roots: HashMap<Gc<()>, usize>,
 }
 
 impl Heap {
+    pub fn init() {
+        if HEAP.load(Ordering::Acquire) == core::ptr::null_mut() {
+            let heap = Box::leak(Default::default());
+            if let Err(_) = HEAP.compare_exchange(core::ptr::null_mut(), heap,
+                Ordering::Release, Ordering::Acquire)
+            {
+                // Someone else initialized the heap instead. Deallocate ours because it won't be
+                // used.
+                // SAFETY: The cmpxchg failed, which means its unreachable.
+                unsafe { drop(Box::from_raw(heap)) };
+            }
+        }
+    }
     /// Sweep all allocation and free unmarked objects.
     /// SAFETY: All reachable objects must be marked before being called, and any
     /// objects that haven't been marked must not be used afterwards.
-    unsafe fn sweep(&mut self, owner: &mut TCellOwner<TcOwner>) {
+    unsafe fn sweep(&mut self, owner: &TCellOwner<TcOwner>) {
         // Mark all of our rooted objects.
         for (root, _) in &self.roots {
             unsafe { root.mark(owner) };
         }
-        let alive = *ALIVE.ro(owner);
+        let alive = ALIVE.load(Ordering::Acquire);
         let mut prev = None;
         let mut current = self.top;
         while current != core::ptr::null_mut() {
@@ -107,7 +123,7 @@ impl Heap {
             prev = Some(current);
             current = unsafe { (*current).next };
         }
-        // Flip all live objects to dead
-        *ALIVE.rw(owner) = !alive;
+        // Flip all live objects back to dead
+        ALIVE.store(!alive, Ordering::Release);
     }
 }
