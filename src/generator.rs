@@ -823,12 +823,12 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
     #[coroutine]
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Exec(ResidualExec("getupval", Rc::new(move |owner, state| {
-            let upval = match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
+            let upval = match state.clos.ro(owner).upvalues[b as usize].deref().ro(owner) {
                 Upvalue::Open(o) => {
                     state.vals[*o as usize].clone()
                 },
                 Upvalue::Closed(c) => {
-                    c.borrow().clone()
+                    c.ro(owner).clone()
                 },
             };
             debug!("upval {:?}", &upval);

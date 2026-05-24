@@ -322,44 +322,6 @@ pub type FVec<T> = UnsafeVec<T>;
 #[cfg(not(feature = "skip_vec"))]
 pub type FVec<T> = Vec<T>;
 
-
-#[derive(Debug)]
-pub struct Gc<T>(Rc<RefCell<T>>);
-
-impl<T> PartialEq for Gc<T> {
-    fn eq(&self, other: &Self) -> bool {
-        Rc::as_ptr(&self.0) == Rc::as_ptr(&other.0)
-    }
-}
-
-impl<T> Eq for Gc<T> { }
-
-impl<T> Hash for Gc<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_usize(Rc::as_ptr(&self.0) as usize)
-    }
-}
-
-impl<T> Gc<T> {
-    fn new(val: T) -> Self {
-        Self(Rc::new(RefCell::new(val)))
-    }
-}
-
-impl<T> Clone for Gc<T> {
-    fn clone(&self) -> Self {
-        Gc(self.0.clone())
-    }
-}
-
-impl<T> Deref for Gc<T> {
-    type Target = RefCell<T>;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
-
 pub struct TcOwner;
 pub struct Tc<T>(Rc<TCell<TcOwner, T>>);
 
@@ -830,14 +792,14 @@ impl<'src, 'intern> PartialOrd for LConstant<'src, 'intern> {
 #[derive(Debug, Clone)]
 pub enum Upvalue<'src, 'intern> {
     Open(usize), // stack index
-    Closed(Gc<LValue<'src, 'intern>>),
+    Closed(Tc<LValue<'src, 'intern>>),
 }
 
 pub type LProto<'src, 'intern> = *const FunctionBlock<'src, LConstant<'src, 'intern>>;
 pub struct LClosure<'src, 'intern> {
     pub prototype: LProto<'src, 'intern>,
     //environment: LTable<'src>,
-    pub upvalues: FVec<Gc<Upvalue<'src, 'intern>>>,
+    pub upvalues: FVec<Tc<Upvalue<'src, 'intern>>>,
 }
 
 impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
@@ -884,7 +846,7 @@ impl<'src, 'intern> LClosure<'src, 'intern> {
 #[repr(u8)]
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Closure<'src, 'intern> {
-    Lua(Gc<LClosure<'src, 'intern>>),
+    Lua(Tc<LClosure<'src, 'intern>>),
     Native(NClosure),
 }
 
@@ -929,7 +891,7 @@ pub struct RunState<'src, 'intern> {
     pub pc: usize,
     pub _G: Tc<Table<'src, 'intern>>,
     pub clos: Tc<LClosure<'src, 'intern>>,
-    pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Gc<Upvalue<'src, 'intern>>>)>,
+    pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Tc<Upvalue<'src, 'intern>>>)>,
     pub callstack: FVec<CallstackEntry<'src, 'intern>>,
     pub counters: PerfCounters,
     pub select: usize,
@@ -943,7 +905,7 @@ pub struct RunState<'src, 'intern> {
 static ACTIVE: TCell<TcOwner, bool> = TCell::new(true);
 
 impl<'src, 'intern> RunState<'src, 'intern> {
-    pub fn close_upvalues(&mut self)
+    pub fn close_upvalues(&mut self, owner: &mut TCellOwner<TcOwner>)
     {
         for upval in self.upvals.iter() {
             let idx = match &upval.0 {
@@ -952,9 +914,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             };
             // migrate all the stack references to be GC references, since we're
             // going to be removing it from the stack
-            let closed = Gc::new(self.vals[*idx].clone());
+            let closed = Tc::new(self.vals[*idx].clone());
             for up_use in upval.1.iter() {
-                up_use.deref().replace(Upvalue::Closed(closed.clone()));
+                *up_use.rw(owner) = Upvalue::Closed(closed.clone());
             }
         }
     }
@@ -1019,7 +981,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     pub fn do_return(&mut self, owner: &mut TCellOwner<TcOwner>, a: usize, b: usize) -> Result<ReturnLocation, FVec<LValue<'src, 'intern>>> {
         // we're going to be removing this frame, so close any open
         // upvalues.
-        self.close_upvalues();
+        self.close_upvalues(owner);
         self.upvals.truncate(0);
 
 
@@ -1239,7 +1201,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let mut spec = Specializer::new(clos.clone());
         let mut state = {
             let mut vals = args;
-            let mut upvals: FVec<(Upvalue, FVec<Gc<Upvalue>>)> = vec![].into();
+            let mut upvals: FVec<(Upvalue, FVec<Tc<Upvalue>>)> = vec![].into();
             let mut base = 0;
             let mut witness_base = 0;
             let mut pc = 0;
@@ -1278,24 +1240,25 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::GETUPVAL => {
                     let (a, b) = <GETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let upval = match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
+                    let upval = match state.clos.ro(owner).upvalues[b as usize].ro(owner).deref() {
                         Upvalue::Open(o) => {
                             state.vals[*o as usize].clone()
                         },
                         Upvalue::Closed(c) => {
-                            c.borrow().clone()
+                            c.ro(owner).clone()
                         },
                     };
                     state.vals[state.base + a as usize] = upval.clone();
                 },
                 Opcode::SETUPVAL => {
                     let (a, b) = <SETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let upval = match state.clos.ro(owner).upvalues[b as usize].borrow().deref() {
+                    let upval = match state.clos.ro(owner).upvalues[b as usize].ro(owner) {
                         Upvalue::Open(o) => {
                             state.vals[*o as usize] = state.vals[state.base + a as usize].clone()
                         },
                         Upvalue::Closed(c) => {
-                            *c.borrow_mut() = state.vals[state.base + a as usize].clone()
+                            let c = c.clone();
+                            *c.rw(owner) = state.vals[state.base + a as usize].clone()
                         },
                     };
                 },
@@ -1570,7 +1533,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                     // we will iterate over all these uses and close
                                     // them - but only then.
                                     let fresh_upval = Upvalue::Open(b as usize);
-                                    let fresh_use = Gc::new(fresh_upval.clone());
+                                    let fresh_use = Tc::new(fresh_upval.clone());
                                     fresh.upvalues.push(fresh_use.clone());
                                     state.upvals.push((fresh_upval, vec![fresh_use].into()));
                                     "move"
@@ -1580,7 +1543,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                     // the upvalue already exists in our current
                                     // scope. add ourselves to the existing
                                     // use list.
-                                    let fresh_use = Gc::new(state.upvals[b as usize].clone().0);
+                                    let fresh_use = Tc::new(state.upvals[b as usize].clone().0);
                                     fresh.upvalues.push(fresh_use.clone());
                                     state.upvals[b as usize].1.push(fresh_use);
                                     "getupvval"

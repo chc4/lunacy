@@ -1,5 +1,5 @@
 use std::ops::Deref;
-use crate::vm::{Tc, TcOwner, LValue, LClosure, Table, Gc};
+use crate::vm::{Tc, TcOwner, LValue, LClosure, Table};
 use crate::TCellOwner;
 pub trait Mark {
     fn mark(&self, owner: &TCellOwner<TcOwner>);
@@ -34,11 +34,5 @@ impl<'src, 'intern> Mark for Table<'src, 'intern> {
 
 impl<'src, 'intern> Mark for LClosure<'src, 'intern> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
-    }
-}
-
-impl<T: Mark> Mark for Gc<T> {
-    fn mark(&self, owner: &TCellOwner<TcOwner>) {
-        self.borrow().mark(owner)
     }
 }
