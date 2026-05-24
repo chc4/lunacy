@@ -24,6 +24,7 @@ use log::debug;
 use log::warn;
 use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
 use crate::perf::PerfCounters;
+use crate::gc::Mark;
 
 pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
 
@@ -939,6 +940,8 @@ pub struct RunState<'src, 'intern> {
     pub gas: i64,
 }
 
+static ACTIVE: TCell<TcOwner, bool> = TCell::new(true);
+
 impl<'src, 'intern> RunState<'src, 'intern> {
     pub fn close_upvalues(&mut self)
     {
@@ -1078,6 +1081,26 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                 self.vals.truncate(0);
                 Err(r_vals)
             }
+        }
+    }
+
+    pub fn collect(&mut self, owner: &mut TCellOwner<TcOwner>) {
+        for val in self.vals.iter() {
+            val.mark(owner);
+        }
+        self._G.mark(owner);
+        for upval in &self.upvals {
+            // We only need to mark closed upvalues, because open ones were marked on the value
+            // stack.
+            if let Upvalue::Closed(o) = &upval.0 {
+                o.mark(owner);
+            }
+        }
+        // Our callstack isn't actually guaranteed to be accurate, because it could be lagging due
+        // to being inside the JIT with a native call frame instead. However, we would only end up
+        // missing closures which were already rooted by the JIT, so it's fine.
+        for call in &self.callstack {
+            call.clos.mark(owner);
         }
     }
 }

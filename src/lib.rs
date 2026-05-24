@@ -11,6 +11,7 @@ pub mod vm;
 pub mod perf;
 pub mod generator;
 pub mod jit;
+pub mod gc;
 
 pub use vm::Vm;
 pub use qcell::TCellOwner;
