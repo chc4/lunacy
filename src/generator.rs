@@ -20,9 +20,7 @@ use crate::chunk::Constant;
 use crate::chunk::Instruction;
 use crate::jit::{JitInfo, JitContext};
 
-use log::debug;
-use log::info;
-use log::warn;
+use crate::{debug, info, warn};
 use smallvec::SmallVec;
 
 impl<'src, 'intern> LValue<'src, 'intern> {
@@ -190,11 +188,11 @@ pub struct HashKey<'src, 'intern> {
     pub hazards: SmallVec<[bool; 8]>,
 }
 
-impl<'src, 'intern> std::fmt::Display for HashKey<'src, 'intern> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<'src, 'intern> HashKey<'src, 'intern> {
+    fn tostring(&self, owner: &TCellOwner<TcOwner>) -> String {
         let lv: LValue = (&self.key).into();
-        write!(f, "hkey({}, {})",
-            String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
+        format!("hkey({}, {})",
+            String::from_utf8_lossy(lv.as_string_nolock().unwrap().ro(owner).as_slice()).to_owned().replace("\0",""),
             self.known_type)
     }
 }
@@ -609,7 +607,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                 |owner, state, dest, lhs, rhs| {
                     let dyn_b = &state.vals[state.base + b];
                     let dyn_c = &state.vals[state.base + c];
-                    let cond = dyn_b.compare(OP, dyn_c.clone()).unwrap();
+                    let cond = dyn_b.compare(OP, dyn_c.clone(), owner).unwrap();
                     if (cond as u8) != *a {
                         //debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
@@ -626,7 +624,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     let const_b = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[*rb as usize] };
                     let Constant::Number(Number(_)) = const_b else { unreachable!() };
                     let dyn_c = &state.vals[state.base + c];
-                    let cond = LValue::from(const_b).compare(OP, dyn_c.clone()).unwrap();
+                    let cond = LValue::from(const_b).compare(OP, dyn_c.clone(), owner).unwrap();
                     if (cond as u8) != *a {
                         //debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
@@ -643,7 +641,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                     let dyn_b = &state.vals[state.base + b];
                     let const_c = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[*rc as usize] };
                     let Constant::Number(Number(_)) = const_c else { unreachable!() };
-                    let cond = dyn_b.compare(OP, const_c.into()).unwrap();
+                    let cond = dyn_b.compare(OP, const_c.into(), owner).unwrap();
                     if (cond as u8) != *a {
                         //debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
@@ -733,7 +731,7 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
             arg = yield YieldOp::Exec(ResidualExec("len_str", Rc::new(move |owner, state| {
                 let b = &state.vals[state.base + b];
                 let n = match b {
-                    LValue::OwnedString(s) => { s.len() },
+                    LValue::OwnedString(s) => { s.ro(owner).len() },
                     LValue::InternedString(s) => { s.0.len() },
                     _ => unreachable!(),
                 };
@@ -773,13 +771,13 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
 
                 let cont = match &state.vals[state.base + i as usize] {
                     LValue::OwnedString(s) => s.clone(),
-                    LValue::InternedString(s) => crate::vm::Rc::new(s.into_ref().0.to_vec().into()),
+                    LValue::InternedString(s) => crate::vm::Tc::new(s.into_ref().0.to_vec().into()),
                     _ => unreachable!(),
                 };
-                s.extend_from_slice(cont.as_slice());
+                s.extend_from_slice(cont.ro(owner).as_slice());
             }
             debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-            state.vals[state.base + a as usize] = LValue::OwnedString(crate::vm::Rc::new(s));
+            state.vals[state.base + a as usize] = LValue::OwnedString(Tc::new(s));
         })));
         arg = yield YieldOp::SetTypes(vec![(a, LType::String)]);
         arg
@@ -1023,21 +1021,19 @@ pub struct Context {
     pub hkeys: Vec<HashKey<'static, 'static>>,
 }
 
-impl std::fmt::Display for Context {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "context([{}], hkeys: {})",
-            self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
-            self.hkeys.iter().map(|hk| format!("{}", hk)).intersperse(",".to_string()).collect::<String>(),
-        )
-    }
-}
-
 impl Context {
     pub fn new(mut types: Vec<LType>) -> Self {
         Self {
             types: types.drain(..).map(|t| CType::Type(t)).collect(),
             hkeys: vec![],
         }
+    }
+
+    fn tostring(&self, owner: &TCellOwner<TcOwner>) -> String {
+        format!("context([{}], hkeys: {})",
+            self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
+            self.hkeys.iter().map(|hk| hk.tostring(owner)).intersperse(",".to_string()).collect::<String>(),
+        )
     }
 
     fn set_types(&mut self, owner: &mut TCellOwner<TcOwner>, ty_effects: Vec<(usize, CType)>) {
@@ -2171,7 +2167,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 debug!("graphviz edges: {:?}", edges);
 
                 let context_str = if let Some((subpc, ctx)) = reverse_versions.get(&block_id) {
-                    format!("PC: {:?}\\n{} |", subpc, ctx)
+                    format!("PC: {:?}\\n{} |", subpc, ctx.tostring(owner))
                 } else {
                     "".to_string()
                 };

@@ -20,11 +20,10 @@ use indexmap::IndexMap;
 
 use qcell::{TCell, TCellOwner, LCell, LCellOwner};
 
-use log::debug;
-use log::warn;
 use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
 use crate::perf::PerfCounters;
 use crate::gc::Mark;
+use crate::{debug, warn};
 
 pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
 
@@ -566,7 +565,7 @@ pub enum LValue<'src, 'intern> {
     // Shared variants get mapped so they have a bit we can check
     // Strings
     InternedString(ArenaIntern<'intern, (&'src [u8], u64)>) = 4,
-    OwnedString(Rc<FVec<u8>>) = 5,
+    OwnedString(Tc<FVec<u8>>) = 5,
     // Closures
     LClosure(Tc<LClosure<'src, 'intern>>) = 8,
     NClosure(NClosure) = 9,
@@ -599,7 +598,7 @@ impl std::fmt::Display for LType {
 }
 
 impl<'src, 'intern> LValue<'src, 'intern> {
-    pub fn compare(&self, opcode: Opcode, right: Self) -> Result<bool, String> {
+    pub fn compare(&self, opcode: Opcode, right: Self, owner: &TCellOwner<TcOwner>) -> Result<bool, String> {
         // TODO: metamethods
         if std::mem::discriminant(self) != std::mem::discriminant(&right) {
             panic!("bad compare");
@@ -631,7 +630,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                     (LValue::InternedString(left_s), LValue::InternedString(right_s)) =>
                         Ok(left_s.0 < right_s.0),
                     (LValue::OwnedString(left_s), LValue::OwnedString(right_s)) =>
-                        Ok(left_s < right_s),
+                        Ok(left_s.ro(owner) < right_s.ro(owner)),
                     _ => panic!()
                 }
             },
@@ -678,7 +677,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         // TODO: metamethods
         match self {
             LValue::InternedString(s) => Ok(LValue::Number(Number(s.0.len() as _))),
-            LValue::OwnedString(s) => Ok(LValue::Number(Number(s.len() as _))),
+            LValue::OwnedString(s) => Ok(LValue::Number(Number(s.ro(owner).len() as _))),
             LValue::Table(t) => {
                 // TODO: sparse arrays
                 Ok(LValue::Number(Number(t.ro(owner).array.len() as _)))
@@ -695,25 +694,25 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn as_string(&self, owner: &TCellOwner<TcOwner>) -> Option<Rc<FVec<u8>>> {
+    pub fn as_string(&self, owner: &TCellOwner<TcOwner>) -> Option<Tc<FVec<u8>>> {
         // TODO: metamethods?
         match self {
             LValue::OwnedString(s) => Some(s.clone().into()),
-            LValue::InternedString(s) => Some(Rc::new(s.into_ref().0.to_vec().into())),
+            LValue::InternedString(s) => Some(Tc::new(s.into_ref().0.to_vec().into())),
             LValue::Number(f) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "{}", f.0);
-                Some(Rc::new(s))
+                Some(Tc::new(s))
             },
             LValue::Table(tc) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "{:?}", tc);
-                Some(Rc::new(s))
+                Some(Tc::new(s))
             },
             LValue::Nil => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "nil");
-                Some(Rc::new(s))
+                Some(Tc::new(s))
 
             },
             LValue::LClosure(l) => {
@@ -721,37 +720,37 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 let line = unsafe { (*l.0.ro(owner).prototype).line_defined };
                 let src = unsafe { &(*l.0.ro(owner).prototype).source };
                 write!(s, "function({:p}, {:?} @ {})", Rc::as_ptr(&l.0), src, line);
-                Some(Rc::new(s))
+                Some(Tc::new(s))
             },
             LValue::NClosure(nf) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "native({:p})", nf.native);
-                Some(Rc::new(s))
+                Some(Tc::new(s))
             },
             x => unimplemented!("{:?}", x),
         }
     }
 
-    pub fn as_string_nolock(&self) -> Option<Rc<FVec<u8>>> {
+    pub fn as_string_nolock(&self) -> Option<Tc<FVec<u8>>> {
         // TODO: metamethods?
         match self {
             LValue::OwnedString(s) => Some(s.clone().into()),
-            LValue::InternedString(s) => Some(Rc::new(s.into_ref().0.to_vec().into())),
+            LValue::InternedString(s) => Some(Tc::new(s.into_ref().0.to_vec().into())),
             LValue::Number(f) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "{}", f.0);
-                Some(Rc::new(s))
+                Some(Tc::new(s))
             },
             LValue::Table(tc) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "{:?}", tc);
-                Some(Rc::new(s))
+                Some(Tc::new(s))
             },
             LValue::Nil => None,
             LValue::LClosure(l) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "function({:p})", Rc::as_ptr(&l.0));
-                Some(Rc::new(s))
+                Some(Tc::new(s))
             },
             x => unimplemented!("{:?}", x),
         }
@@ -1148,7 +1147,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 vec![
                 (InternString::intern(intern, "print"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
                     let s = args.ro(&seq).iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
-                        maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
+                        maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.ro(owner).as_slice()).to_owned()) })
                     ).collect::<Vec<_>>();
                     //println!("> {}", String::from_utf8_lossy(s.iter().into()));
                     println!("{}", s.iter().intersperse(&"\t".to_string()).cloned().collect::<String>());
@@ -1403,15 +1402,15 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         (Opcode::LE, Ok(const_b), Ok(const_c)) => const_b <= const_c,
 
                         (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.compare(opcode.clone(), const_c.into()).unwrap()
+                            dyn_b.compare(opcode.clone(), const_c.into(), owner).unwrap()
                         },
 
                         (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).compare(opcode, dyn_c.clone()).unwrap()
+                            LValue::from(const_b).compare(opcode, dyn_c.clone(), owner).unwrap()
                         },
 
                         (_, Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b.compare(opcode, dyn_c.clone()).unwrap()
+                            dyn_b.compare(opcode, dyn_c.clone(), owner).unwrap()
                         },
 
                         _ => panic!()
@@ -1479,10 +1478,10 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     debug!("{} {}", a, b);
                     let mut s: FVec<_> = vec![].into();
                     for i in (b as usize)..=(c as usize) {
-                        s.extend_from_slice(&state.vals[state.base + i as usize].as_string(owner).ok_or("nil concat")?)
+                        s.extend_from_slice(&state.vals[state.base + i as usize].as_string(owner).ok_or("nil concat")?.ro(owner))
                     }
                     debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-                    state.vals[state.base + a as usize] = LValue::OwnedString(Rc::new(s));
+                    state.vals[state.base + a as usize] = LValue::OwnedString(Tc::new(s));
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = <FORPREP as InstructionDecode>::Unpack::unpack(inst.0);
@@ -1498,10 +1497,10 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let idx = state.vals[state.base + a as usize].numeric_op(Opcode::ADD, &step).unwrap();
                     state.vals[state.base + a as usize] = idx.clone();
                     let limit = state.vals[state.base + a as usize + 1].clone();
-                    let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0))))? {
-                        limit.compare(Opcode::LE, idx.clone())
+                    let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0))), owner)? {
+                        limit.compare(Opcode::LE, idx.clone(), owner)
                     } else {
-                        idx.clone().compare(Opcode::LE, limit)
+                        idx.clone().compare(Opcode::LE, limit, owner)
                     };
                     if comp? {
                         state.pc = (state.pc as isize + sbx as isize) as usize;

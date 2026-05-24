@@ -1,4 +1,4 @@
-#![feature(trait_alias, specialization, iter_intersperse, atomic_try_update, slice_ptr_get)]
+#![feature(trait_alias, specialization, iter_intersperse, slice_ptr_get)]
 // For LBBV
 #![feature(coroutines, coroutine_trait, coroutine_clone, stmt_expr_attributes)]
 // For JIT
@@ -14,4 +14,8 @@ pub mod jit;
 pub mod gc;
 
 pub use vm::Vm;
-pub use qcell::TCellOwner;
+pub use qcell::{TCell, TCellOwner};
+
+pub use log::debug;
+pub use log::info;
+pub use log::warn;
