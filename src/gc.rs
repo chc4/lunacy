@@ -1,4 +1,5 @@
 use std::ops::Deref;
+use std::hash::Hash;
 use std::collections::HashMap;
 use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
 use crate::vm::{Tc, TcOwner, LValue, LClosure, Table};
@@ -58,8 +59,29 @@ impl<T: Mark> Mark for Vec<T> {
 
 static ALIVE: AtomicBool = AtomicBool::new(true);
 
+#[derive(Eq, PartialEq)]
+#[repr(transparent)]
 struct Gc<T> {
     ptr: core::ptr::NonNull<GcInner<T>>,
+}
+
+// Always clonable
+impl<T> core::clone::Clone for Gc<T> {
+    fn clone(&self) -> Self {
+        Self { ptr: self.ptr.clone() }
+    }
+}
+
+impl<T> Hash for Gc<T> {
+    default fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(self.ptr.as_ptr() as usize)
+    }
+}
+
+impl<T: Hash> Hash for Gc<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        unsafe { (*self.ptr.as_ptr()).val.hash(state) }
+    }
 }
 
 impl<T> Mark for Gc<T> {
@@ -86,7 +108,7 @@ struct GcInner<T> {
     val: T,
 }
 
-static HEAP: AtomicPtr<*mut Heap> = AtomicPtr::new(core::ptr::null_mut());
+static HEAP: AtomicPtr<Heap> = AtomicPtr::new(core::ptr::null_mut());
 #[derive(Default)]
 pub struct Heap {
     top: *mut GcInner<()>,
@@ -125,5 +147,18 @@ impl Heap {
         }
         // Flip all live objects back to dead
         ALIVE.store(!alive, Ordering::Release);
+    }
+
+    fn root<T>(gc: &Gc<T>, owner: &mut TCellOwner<TcOwner>) {
+        // SAFETY: We have owner. Maybe still kinda sus think about this some more
+        let heap = unsafe { HEAP.load(Ordering::Acquire).as_mut().unwrap() };
+        // SAFETY: Erasing the type, which keeps the same representation.
+        let gc: Gc<()> = unsafe { core::mem::transmute(gc.clone()) };
+        // Increment the root count for this key
+        *heap.roots.entry(gc).or_insert(0) += 1;
+    }
+
+    fn unroot<T>(gc: &Gc<T>, owner: &mut TCellOwner<TcOwner>) {
+        // No-op for now?
     }
 }

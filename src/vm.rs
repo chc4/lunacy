@@ -1044,8 +1044,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             }
         }
     }
+}
 
-    pub fn collect(&mut self, owner: &mut TCellOwner<TcOwner>) {
+impl<'src, 'intern> Mark for RunState<'src, 'intern> {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
         for val in self.vals.iter() {
             val.mark(owner);
         }
