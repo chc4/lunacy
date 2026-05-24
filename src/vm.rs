@@ -714,8 +714,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn len(&self, owner: &TCellOwner<TcOwner>) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match self {
-            LValue::InternedString(s) => Ok(LValue::Number(Number((s.0.len() - 1) as _))),
-            LValue::OwnedString(s) => Ok(LValue::Number(Number((s.len() - 1) as _))),
+            LValue::InternedString(s) => Ok(LValue::Number(Number(s.0.len() as _))),
+            LValue::OwnedString(s) => Ok(LValue::Number(Number(s.len() as _))),
             LValue::Table(t) => {
                 // TODO: sparse arrays
                 Ok(LValue::Number(Number(t.ro(owner).array.len() as _)))
@@ -747,7 +747,12 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 write!(s, "{:?}", tc);
                 Some(Rc::new(s))
             },
-            LValue::Nil => None,
+            LValue::Nil => {
+                let mut s: FVec<_> = vec![].into();
+                write!(s, "nil");
+                Some(Rc::new(s))
+
+            },
             LValue::LClosure(l) => {
                 let mut s: FVec<_> = vec![].into();
                 let line = unsafe { (*l.0.ro(owner).prototype).line_defined };

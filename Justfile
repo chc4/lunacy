@@ -1,13 +1,14 @@
 set shell := ["bash", "-c"]
+TEST_FEATURES := "counters graph jit gas"
 
 # Run lunacy against the golden testcases
 test:
     cargo test
+    cargo test --no-default-features --features "{{TEST_FEATURES}}"
 
 watch:
     cargo watch -- cargo test
 
-TEST_FEATURES := "counters graph jit gas"
 [env("RUST_LOG", "debug")]
 debug name:
     luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
