@@ -714,8 +714,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn len(&self, owner: &TCellOwner<TcOwner>) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match self {
-            LValue::InternedString(s) => Ok(LValue::Number(Number(s.0.len() as _))),
-            LValue::OwnedString(s) => Ok(LValue::Number(Number(s.len() as _))),
+            LValue::InternedString(s) => Ok(LValue::Number(Number((s.0.len() - 1) as _))),
+            LValue::OwnedString(s) => Ok(LValue::Number(Number((s.len() - 1) as _))),
             LValue::Table(t) => {
                 // TODO: sparse arrays
                 Ok(LValue::Number(Number(t.ro(owner).array.len() as _)))
@@ -1076,7 +1076,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         }
     }
 }
-
 
 impl<'src, 'intern> Vm<'src, 'intern> {
     pub fn new(top_level: LProto<'src, 'intern>) -> Self {
@@ -1630,7 +1629,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             };
         };
         #[cfg(feature = "counters")] {
-            println!("counters after run {:?}", state.counters);
+            println!("counters after run {:?} instructions {:?}", state.counters, spec.count());
         }
 
         #[cfg(feature = "graph")]

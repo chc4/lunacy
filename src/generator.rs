@@ -173,13 +173,21 @@ pub enum YieldOp {
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
     TryHashKey(usize, usize), // Looks up but does not allocate an HREF..
     UpdateHashRef(HashRef, CType), // Update the type of HREF to a new type
+    SetHazards(Option<usize>, Option<HashRef>), // Set optimization hazards, potentially
+                                        // scoped to only information that may alias with an href,
+                                        // and potentially keeping information about a specific
+                                        // stack slot intact.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HashKey<'src, 'intern> {
+    /// The HashRef
     pub idx: usize,
     pub key: LConstant<'src, 'intern>,
     pub known_type: CType,
+    /// Optimization hazards: if set to `true` for an index, index is already checked
+    /// for aliasing and an epoch check can be elided.
+    pub hazards: SmallVec<[bool; 8]>,
 }
 
 impl<'src, 'intern> std::fmt::Display for HashKey<'src, 'intern> {
@@ -325,6 +333,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::Exec(ResidualExec("settable_meta", Rc::new(move |owner, state| {
                 panic!("settable_meta {:?}", state.vals)
             })));
+            arg = yield YieldOp::SetHazards(None, None);
             return arg;
         }
         // TODO: table shape specialization
@@ -391,8 +400,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 })));
                 if let Some(new_type) = mismatched_type {
                     // We statically know we will increment the epoch, so update the hashkey's
-                    // known type.
+                    // known type. This also will set hazards.
                     arg = yield YieldOp::UpdateHashRef(hb, new_type);
+                } else {
+                    arg = yield YieldOp::SetHazards(Some(a), Some(hb));
                 }
             } else {
                 arg = yield YieldOp::Exec(ResidualExec("settable_hash", Rc::new(move |owner, state| {
@@ -417,6 +428,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         t.rw(owner).epoch += 1;
                     }
                 })));
+                arg = yield YieldOp::SetHazards(None, None);
             }
         }
         arg
@@ -1088,6 +1100,31 @@ impl Context {
             warn!("set types to {:?}", &self.types);
         }
     }
+
+    /// Set optimization hazards for a stack slot, potentially scoped to only information which
+    /// can alias with a specific hash key, and potentially keeping intact information about a
+    /// stack slot.
+    pub fn set_hazards(&mut self, keep: Option<usize>, href: Option<HashRef>) {
+        let mut invalidate: Vec<usize> = (0..self.hkeys.len()).collect();
+        if let Some(href) = href {
+            // If we know we wrote to an href, then we can set hazards only on hkeys
+            // that have the same key value: writing to `x.a` may invalidate `y.a`, but never
+            // `y.b`.
+            let hkey = &self.hkeys[href.0 as usize].key;
+            invalidate = self.hkeys.iter().enumerate().filter(|(i, hk)| hk.key == *hkey).map(|(i, _)| i).collect();
+        }
+        if let Some(keep) = keep {
+            invalidate = invalidate.drain(..).filter(|i| self.hkeys[*i].idx != keep).collect();
+        }
+        for invalid in invalidate {
+            for know in &mut self.hkeys[invalid as usize].hazards {
+                if *know {
+                    debug!("hazard cleared {invalid}");
+                }
+                *know = false;
+            }
+        }
+    }
 }
 
 pub struct Specializer<'src, 'intern> {
@@ -1379,6 +1416,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // TODO: give the environment a shape as well
             let discovered_type = val.typeof_();
             hkey.known_type = CType::Type(discovered_type);
+            // Initialize the hkey after discovery with a cleared hazard for the index
+            if hkey.hazards.len() <= idx {
+                hkey.hazards.resize_with(idx + 1, || false);
+                hkey.hazards[idx] = true;
+            }
 
             // If we're loading a hashkey from a table and it's a native function, also try to
             // specialize on its value. This lets us devirtualize code like `local t = { print =
@@ -1535,17 +1577,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let ctype = &ctx.types[idx];
                     arg = ResumeArg::Type(ctype.clone());
                 },
-                CoroutineState::Yielded(YieldOp::UpdateHashRef(href, ty)) => {
+                CoroutineState::Yielded(YieldOp::UpdateHashRef(href, ref ty)) => {
                     // We can't set a HashKey's type to Unknown, because then we'd think
                     // the slot is free to be reused (and it doesn't really make sense).
                     // Instead, we ignore the update and keep using the old type: there's
                     // a chance the unknown static type is in fact still our old type and
-                    // we just didn't know, and if there is a runtime mistmatch we will hit
+                    // we just didn't know, and if there is a runtime mismatch we will hit
                     // a type guard anyway.
-                    if ty != CType::Type(LType::Unknown) {
-                        ctx.hkeys[href.0 as usize].known_type = ty.clone();
-                        arg = ResumeArg::HashRef(href, ty);
+                    let hkey = &mut ctx.hkeys[href.0 as usize];
+                    if *ty != CType::Type(LType::Unknown) {
+                        hkey.known_type = ty.clone();
                     }
+                    // If we updated an href, then we also need to set optimization hazards for any
+                    // potentially aliased ones. We also need to invalidate this stack slot as
+                    // well.
+                    state = CoroutineState::Yielded(YieldOp::SetHazards(None, Some(href)));
+                    arg = ResumeArg::Failed;
+                    continue 'machine;
                 },
                 op @ CoroutineState::Yielded(YieldOp::HashKey(idx, key) | YieldOp::TryHashKey(idx, key)) => {
                     let proto = self.clos.ro(owner).prototype;
@@ -1574,16 +1622,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     if &cached_hkey.key == k_val {
                                         debug!("using cached href {:?}", cached);
                                         // We have a cached href, but still need to make sure that
-                                        // it holds.
+                                        // it holds if there are any optimization hazards.
                                         // Compile a new block assuming the type holds, so that the
                                         // check can jump to it for spurious epoch increments (or
                                         // for blocks specialized for a different type that
                                         // transition back to our type).
-                                        // TODO: This probably creates too many blocks, tbh. Do we
-                                        // want to just always have failed epoch checks fallback to
-                                        // generic code instead?
                                         arg = ResumeArg::HashRef(cached.clone(), cached_hkey.known_type.clone());
-                                        let holds_block = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), arg);
+                                        if let Some(true) = cached_hkey.hazards.get(idx) {
+                                            // We can use the href without needing another epoch
+                                            // check, because we know nothing could have
+                                            // invalidated it.
+                                            pc = pc.next_true();
+                                            debug!("using cached hkey without hazards");
+                                            break 'machine;
+                                        }
+                                        let mut holds_ctx = ctx.clone();
+                                        // If we check the epoch and it still holds, we'll have
+                                        // cleared any optimzation hazards until its potentially
+                                        // invallidated.
+                                        holds_ctx.hkeys[cached.0 as usize].hazards[idx] = true;
+                                        let holds_block = self.subblock(owner, pc.next_true(), holds_ctx.clone(), coro.clone(), arg);
                                         self.make_epoch_check(owner, block_id, coro.clone(), idx, cached.clone(), pc, ctx.clone(), holds_block);
 
                                         self.blocks[block_id.0].instructions.push(Residual::Jump(holds_block));
@@ -1612,12 +1670,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let href;
                         if let Some((i, hkey)) = ctx.hkeys.iter_mut().enumerate().find(|(i, hk)| hk.known_type == CType::Type(LType::Unknown)) {
                             href = HashRef(i as u8);
-                            *hkey = HashKey { idx, key: k_val.clone(), known_type: CType::Type(LType::Unknown) };
+                            *hkey = HashKey { idx, key: k_val.clone(), known_type: CType::Type(LType::Unknown), hazards: Default::default() };
                         } else {
                             warn!("allocating new hkey for {} {:?}", idx, &k_val);
                             let hr: u8 = ctx.hkeys.len().try_into().expect("too many hrefs");
                             href = HashRef(hr);
-                            let hkey = HashKey { idx, key: k_val.clone(), known_type: CType::Type(LType::Unknown) };
+                            let hkey = HashKey { idx, key: k_val.clone(), known_type: CType::Type(LType::Unknown), hazards: Default::default() };
                             #[cfg(debug_assertions)]
                             assert_eq!(ctx.hkeys.iter().filter(|exist| **exist == hkey).next(), None);
                             ctx.hkeys.push(hkey.clone());
@@ -1755,6 +1813,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::SetTypes(mut ty_effects)) => {
                     ctx.set_types(owner, ty_effects.drain(..).map(|(idx, ty)| (idx, CType::Type(ty))).collect())
+                },
+                CoroutineState::Yielded(YieldOp::SetHazards(idx, href)) => {
+                    ctx.set_hazards(idx, href)
                 },
                 CoroutineState::Yielded(YieldOp::SetCTypes(ty_effects)) => {
                     ctx.set_types(owner, ty_effects)
