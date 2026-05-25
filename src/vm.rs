@@ -322,17 +322,17 @@ pub type FVec<T> = UnsafeVec<T>;
 pub type FVec<T> = Vec<T>;
 
 pub struct TcOwner;
-pub struct Tc<T>(Rc<TCell<TcOwner, T>>);
+pub struct Tc<T>(pub Gc<TCell<TcOwner, T>>);
 
 impl<T> Debug for Tc<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "tc({:p})", Rc::as_ptr(&self.0))
+        write!(f, "tc({:p})", self.0.as_ptr())
     }
 }
 
 impl<T> PartialEq for Tc<T> {
     fn eq(&self, other: &Self) -> bool {
-        Rc::as_ptr(&self.0) == Rc::as_ptr(&other.0)
+        self.0.as_ptr() == other.0.as_ptr()
     }
 }
 
@@ -340,17 +340,17 @@ impl<T> Eq for Tc<T> { }
 
 impl<T> Hash for Tc<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_usize(Rc::as_ptr(&self.0) as usize)
+        state.write_usize(self.0.as_ptr() as usize)
     }
 }
 
 impl<T> Tc<T> {
     pub fn new(val: T) -> Self {
-        Self(Rc::new(TCell::new(val)))
+        Self(Gc::new(TCell::new(val)))
     }
 
     pub fn as_ptr(&self) -> *const () {
-        Rc::<TCell<TcOwner, T>>::as_ptr(&self.0).cast()
+        self.0.as_ptr().cast()
     }
 }
 
@@ -476,7 +476,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
 #[derive(Hash, Clone)]
 pub enum InternString<'intern, 'src> {
     Interned(ArenaIntern<'intern, (&'src [u8], u64)>),
-    Owned(Rc<FVec<u8>>),
+    Owned(Gc<FVec<u8>>),
 }
 
 impl<'intern, 'src> PartialEq for InternString<'intern, 'src> {
@@ -719,7 +719,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 let mut s: FVec<_> = vec![].into();
                 let line = unsafe { (*l.0.ro(owner).prototype).line_defined };
                 let src = unsafe { &(*l.0.ro(owner).prototype).source };
-                write!(s, "function({:p}, {:?} @ {})", Rc::as_ptr(&l.0), src, line);
+                write!(s, "function({:p}, {:?} @ {})", l.as_ptr(), src, line);
                 Some(Tc::new(s))
             },
             LValue::NClosure(nf) => {
@@ -749,7 +749,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             LValue::Nil => None,
             LValue::LClosure(l) => {
                 let mut s: FVec<_> = vec![].into();
-                write!(s, "function({:p})", Rc::as_ptr(&l.0));
+                write!(s, "function({:p})", l.as_ptr());
                 Some(Tc::new(s))
             },
             x => unimplemented!("{:?}", x),
@@ -1144,7 +1144,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
         let math = (InternString::intern(intern, "math"), LValue::Table(Tc::new(math_tab)));
         let os = (InternString::intern(intern, "os"), LValue::Table(Tc::new(os_tab)));
-        Tc::new(Table {
+        let mut _g = Tc::new(Table {
             array: vec![].into(),
             hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
@@ -1172,7 +1172,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 ].drain(..)
             ),
             epoch: 0,
-        })
+        });
+        Heap::root(&mut _g.0, owner);
+        _g
     }
 
     pub fn rk<'exec>(proto: LProto<'src, 'intern>, base: usize, vals: &'exec ValueStack<'src, 'intern>, r: u16)
@@ -1227,6 +1229,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             }
         };
         // we need to track where to return to, along with the base pointer and where to put return
+            #[cfg(feature = "gc_stress")]
+            Heap::collect(&state, owner);
+
         // values
         let r_vals = 'int: loop {
             let inst = unsafe { state.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[state.pc] };
@@ -1287,6 +1292,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
                     state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
+                    Heap::collect(&state, owner);
                 },
                 Opcode::SELF => {
                     let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);

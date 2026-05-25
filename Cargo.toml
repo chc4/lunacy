@@ -17,6 +17,7 @@ gas = []
 magic = [] # Magic JIT intrinsics
 perf = [] # Create perf JIT map file
 gc_sanitize = []
+gc_stress = []
 unsafe = ["jit", "skip_vec", "unreachable"]
 sonic = ["unsafe", "skip_rc"]
 

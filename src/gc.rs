@@ -3,8 +3,9 @@ use std::hash::Hash;
 use std::rc::Rc;
 use std::collections::BTreeMap;
 use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
-use crate::vm::{Tc, TcOwner, LValue, LClosure, Table, Upvalue};
+use crate::vm::{Tc, TcOwner, LValue, LClosure, NClosure, Table, Upvalue};
 use crate::{TCell, TCellOwner};
+use indexmap::IndexMap;
 use crate::debug;
 
 pub trait Mark {
@@ -18,7 +19,8 @@ impl<'src, 'intern> Mark for LValue<'src, 'intern> {
             LValue::Table(t) => t.mark(owner),
             LValue::InternedString(_) => { },
             LValue::OwnedString(s) => s.mark(owner),
-            x => panic!("not implemented for {x:?}"),
+            LValue::LClosure(c) => c.mark(owner),
+            LValue::NClosure(c) => c.mark(owner),
         }
     }
 }
@@ -33,6 +35,12 @@ impl<T> Mark for T {
 }
 
 impl<T> Mark for Tc<T> {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        self.0.mark(owner)
+    }
+}
+
+impl<T: Mark> Mark for TCell<TcOwner, T> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
         self.ro(owner).mark(owner)
     }
@@ -61,21 +69,35 @@ impl<'src, 'intern> Mark for Table<'src, 'intern> {
         for item in &self.array {
             item.mark(owner);
         }
-        for (key, val) in &self.hash {
-            key.mark(owner);
-            val.mark(owner);
-        }
+        self.hash.mark(owner);
     }
 }
 
 impl<'src, 'intern> Mark for LClosure<'src, 'intern> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
         for upval in &self.upvalues {
-            // We only need to mark closed upvalues, because open ones are on the
-            // value stack.
-            if let Upvalue::Closed(o) = upval.ro(owner) {
-                upval.mark(owner)
-            }
+            upval.mark(owner);
+        }
+    }
+}
+
+impl Mark for NClosure {
+    fn mark(&self, _owner: &TCellOwner<TcOwner>) { }
+}
+
+impl<'src, 'intern> Mark for Upvalue<'src, 'intern> {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        if let Upvalue::Closed(o) = self {
+            o.mark(owner)
+        }
+    }
+}
+
+impl<K: Mark, V: Mark, S> Mark for IndexMap<K, V, S> {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        for (k, v) in self {
+            k.mark(owner);
+            v.mark(owner);
         }
     }
 }
@@ -98,11 +120,15 @@ pub struct Gc<T: ?Sized> {
 }
 
 impl<T> Gc<T> {
-    fn new(val: T) -> Self {
+    pub fn as_ptr(&self) -> *const T {
+        unsafe { &self.ptr.as_ref().val }
+    }
+
+    pub fn new(val: T) -> Self {
         let heap = unsafe { HEAP.load(Ordering::Acquire).as_ref().unwrap() };
         let mut top = heap.top.load(Ordering::Acquire);
         let inner = GcInner {
-            next: top,
+            next: AtomicPtr::new(top),
             state: !ALIVE.load(Ordering::Acquire),
             #[cfg(feature = "gc_sanitize")]
             finalize: |ptr| unsafe {
@@ -113,7 +139,7 @@ impl<T> Gc<T> {
             alive: AtomicBool::new(true),
 
             #[cfg(not(feature = "gc_sanitize"))]
-            finalize: |ptr| unsafe { core::ptr::drop_in_place(ptr.cast::<GcInner<T>>()) },
+            finalize: |ptr| unsafe { drop(Box::from_raw(ptr.cast::<GcInner<T>>())) },
             val
         };
         let ptr = Box::leak(Box::new(inner));
@@ -129,7 +155,8 @@ impl<T> Gc<T> {
                 Err(new_top) => {
                     // We failed to set ourself as the top, which means something else did. Update
                     // our next pointer and try again.
-                    ptr.next = new_top;
+                    ptr.next.store(new_top, Ordering::Release);
+                    top = new_top;
                     continue;
                 },
             }
@@ -191,7 +218,7 @@ impl<T> Mark for Gc<T> {
 }
 
 struct GcInner<T: ?Sized> {
-    next: *mut GcInner<()>,
+    next: AtomicPtr<GcInner<()>>,
     finalize: fn(*mut GcInner<()>),
     state: bool,
     #[cfg(feature = "gc_sanitize")]
@@ -220,39 +247,51 @@ impl Heap {
             }
         }
     }
+
+    pub fn collect(state: &impl Mark, owner: &TCellOwner<TcOwner>) {
+        state.mark(owner);
+        unsafe { Self::sweep(owner) };
+    }
+
     /// Sweep all allocation and free unmarked objects.
     /// SAFETY: All reachable objects must be marked before being called, and any
     /// objects that haven't been marked must not be used afterwards.
-    unsafe fn sweep(owner: &TCellOwner<TcOwner>) {
+    pub unsafe fn sweep(owner: &TCellOwner<TcOwner>) {
         let heap = unsafe { HEAP.load(Ordering::Acquire).as_mut().unwrap() };
         // Mark all of our rooted objects.
-        for (ptr, (tr, _)) in &heap.roots {
+        for (_ptr, (tr, _)) in &heap.roots {
             tr.mark(owner);
         }
         let alive = ALIVE.load(Ordering::Acquire);
-        let mut prev: *mut AtomicPtr<GcInner<()>> = (&raw mut heap.top).cast();
+        let mut prev = &raw mut heap.top;
         let mut current = heap.top.load(Ordering::Acquire);
         while current != core::ptr::null_mut() {
-            let next = unsafe { &raw mut (*current).next };
+            let next_ptr = unsafe { (*current).next.load(Ordering::Acquire) };
             if unsafe { (*current).state } != alive {
                 debug!("freeing {current:p}");
-                unsafe { (*prev).store(*next, Ordering::Release) };
+                unsafe { (*prev).store(next_ptr, Ordering::Release) };
                 unsafe { ((*current).finalize)(current.cast()) };
+            } else {
+                prev = unsafe { &raw mut (*current).next };
             }
-            prev = next.cast();
-            current = unsafe { *next };
+            current = next_ptr;
         }
         // Flip all live objects back to dead
         ALIVE.store(!alive, Ordering::Release);
     }
 
-    fn root<T: Mark + Ord + 'static>(gc: &mut Gc<T>, owner: &mut TCellOwner<TcOwner>) {
+    pub fn root<T: Mark>(gc: &mut Gc<T>, owner: &mut TCellOwner<TcOwner>) {
         // SAFETY: We have owner. Maybe still kinda sus think about this some more
         let heap = unsafe { HEAP.load(Ordering::Acquire).as_mut().unwrap() };
         // Increment the root count for this key
         let ptr = gc.ptr.as_ptr();
         let dt: Box<Gc<T>> = Box::new(gc.clone());
-        heap.roots.entry(ptr.cast()).or_insert_with(|| (Box::new(dt), 0)).1 += 1;
+        // SAFETY: We're erasing the lifetime of Gc<T>. This is only safe if we
+        // ensure that the rooted object doesn't outlive its own internal
+        // references. For the global environment, this is fine because it
+        // should stay alive for the duration of the VM.
+        let dt: Box<dyn Mark> = unsafe { core::mem::transmute(dt as Box<dyn Mark>) };
+        heap.roots.entry(ptr.cast()).or_insert_with(|| (dt, 0)).1 += 1;
     }
 
     fn unroot<T>(gc: &Gc<T>, owner: &mut TCellOwner<TcOwner>) {
@@ -264,7 +303,11 @@ impl Drop for Heap {
     fn drop(&mut self) {
         let mut current = self.top.load(Ordering::Acquire);
         while current != core::ptr::null_mut() {
-            unsafe { ((*current).finalize)(current.cast()) };
+            unsafe {
+                let next = (*current).next.load(Ordering::Acquire);
+                ((*current).finalize)(current.cast());
+                current = next;
+            }
         }
     }
 }
