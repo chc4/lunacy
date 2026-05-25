@@ -833,8 +833,8 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             state.vals[state.base + a as usize] = upval;
             debug!("after getupval {:?}", &state.vals[state.base..]);
         })));
-        // TODO: We could keep a static upval typemap, since you can't transition the type of an
-        // upval after its created.
+        // TODO: We can resolve upvalues to types, but would need to make sure to
+        // keep them synced with the type of the stack slot or SETUPVAL/calls.
         arg = yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
         return arg;
     }
@@ -933,6 +933,7 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch
         // guard here for specializing the call + return continuation for each one.
         arg = yield YieldOp::Call(CallTarget::Dynamic(a, b, c));
+        arg = yield YieldOp::SetHazards(None, None);
         arg
     }
 }
