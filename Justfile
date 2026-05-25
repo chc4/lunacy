@@ -5,6 +5,7 @@ TEST_FEATURES := "counters graph jit gas"
 test:
     cargo test
     cargo test --no-default-features --features "{{TEST_FEATURES}}"
+    cargo test "gc::" --features "gc_sanitize"
 
 watch:
     cargo watch -- cargo test

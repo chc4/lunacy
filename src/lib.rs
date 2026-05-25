@@ -4,6 +4,8 @@
 // For JIT
 #![feature(ptr_metadata, rust_preserve_none_cc, iter_map_windows)]
 #![feature(fn_traits, unboxed_closures, adt_const_params)]
+// For GC
+#![feature(core_intrinsics, generic_const_exprs)]
 
 pub mod chunk;
 pub mod stack;

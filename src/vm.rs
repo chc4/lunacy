@@ -1242,7 +1242,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::GETUPVAL => {
                     let (a, b) = <GETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let upval = match state.clos.ro(owner).upvalues[b as usize].ro(owner).deref() {
+                    let upval = match state.clos.ro(owner).upvalues[b as usize].ro(owner) {
                         Upvalue::Open(o) => {
                             state.vals[*o as usize].clone()
                         },

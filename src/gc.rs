@@ -1,10 +1,12 @@
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::hash::Hash;
-use std::collections::HashMap;
+use std::rc::Rc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
-use crate::vm::{Tc, TcOwner, LValue, LClosure, Table};
+use crate::vm::{Tc, TcOwner, LValue, LClosure, Table, Upvalue};
 use crate::{TCell, TCellOwner};
 use crate::debug;
+
 pub trait Mark {
     fn mark(&self, owner: &TCellOwner<TcOwner>);
 }
@@ -21,14 +23,36 @@ impl<'src, 'intern> Mark for LValue<'src, 'intern> {
     }
 }
 
-impl<T> Mark for Tc<T> {
+// All types are Mark by default
+impl<T> Mark for T {
     default fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        if const { std::intrinsics::needs_drop::<T>() } {
+            panic!("default Mark for non-trivial drop {}", const { std::intrinsics::type_name::<T>() })
+        }
     }
 }
 
-impl<T: Mark> Mark for Tc<T> {
+impl<T> Mark for Tc<T> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
         self.ro(owner).mark(owner)
+    }
+}
+
+impl<T> Mark for Rc<T> {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        self.deref().mark(owner)
+    }
+}
+
+impl<T> Mark for Box<T> {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        self.deref().mark(owner)
+    }
+}
+
+impl Mark for Box<dyn Mark> {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        self.deref().mark(owner)
     }
 }
 
@@ -46,6 +70,13 @@ impl<'src, 'intern> Mark for Table<'src, 'intern> {
 
 impl<'src, 'intern> Mark for LClosure<'src, 'intern> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        for upval in &self.upvalues {
+            // We only need to mark closed upvalues, because open ones are on the
+            // value stack.
+            if let Upvalue::Closed(o) = upval.ro(owner) {
+                upval.mark(owner)
+            }
+        }
     }
 }
 
@@ -59,9 +90,10 @@ impl<T: Mark> Mark for Vec<T> {
 
 static ALIVE: AtomicBool = AtomicBool::new(true);
 
+// TODO: const marker trait for trivial drop, since we don't run finalizers?
 #[derive(Eq, PartialEq)]
 #[repr(transparent)]
-pub struct Gc<T> {
+pub struct Gc<T: ?Sized> {
     ptr: core::ptr::NonNull<GcInner<T>>,
 }
 
@@ -71,7 +103,17 @@ impl<T> Gc<T> {
         let mut top = heap.top.load(Ordering::Acquire);
         let inner = GcInner {
             next: top,
-            state: ALIVE.load(Ordering::Acquire),
+            state: !ALIVE.load(Ordering::Acquire),
+            #[cfg(feature = "gc_sanitize")]
+            finalize: |ptr| unsafe {
+                let ptr = ptr.cast::<GcInner<T>>();
+                (*ptr).alive.store(false, Ordering::Release)
+            },
+            #[cfg(feature = "gc_sanitize")]
+            alive: AtomicBool::new(true),
+
+            #[cfg(not(feature = "gc_sanitize"))]
+            finalize: |ptr| unsafe { core::ptr::drop_in_place(ptr.cast::<GcInner<T>>()) },
             val
         };
         let ptr = Box::leak(Box::new(inner));
@@ -93,7 +135,7 @@ impl<T> Gc<T> {
             }
 
         }
-        Self { ptr: core::ptr::NonNull::from_mut(ptr) }
+        Self { ptr: core::ptr::NonNull::new(ptr as _).unwrap() }
     }
 }
 
@@ -101,6 +143,24 @@ impl<T> Gc<T> {
 impl<T> core::clone::Clone for Gc<T> {
     fn clone(&self) -> Self {
         Self { ptr: self.ptr.clone() }
+    }
+}
+
+impl<T> DerefMut for Gc<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        #[cfg(feature = "gc_sanitize")]
+        unsafe { assert!(self.ptr.as_ref().alive.load(Ordering::Acquire), "value is dead") };
+        unsafe { &mut self.ptr.as_mut().val }
+    }
+}
+
+impl<T> Deref for Gc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        #[cfg(feature = "gc_sanitize")]
+        unsafe { assert!(self.ptr.as_ref().alive.load(Ordering::Acquire), "value is dead") };
+        unsafe { &self.ptr.as_ref().val }
     }
 }
 
@@ -117,26 +177,25 @@ impl<T: Hash> Hash for Gc<T> {
 }
 
 impl<T> Mark for Gc<T> {
-    default fn mark(&self, owner: &TCellOwner<TcOwner>) {
-        // A Gc<T> object can only be marked if it is reachable by the mutator, and is only freed
-        // by Heap::sweep if it unreachable and thus wasn't marked before the last sweep.
-        unsafe { (*self.ptr.as_ptr()).state = ALIVE.load(Ordering::Acquire) };
-    }
-}
-
-impl<T: Mark> Mark for Gc<T> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
         // Safety: See default implementation.
         unsafe {
-            (*self.ptr.as_ptr()).state = ALIVE.load(Ordering::Acquire);
-            (*self.ptr.as_ptr()).val.mark(owner);
+            let state = &mut (*self.ptr.as_ptr()).state;
+            let alive = ALIVE.load(Ordering::Acquire);
+            if *state != alive {
+                *state = alive;
+                (*self.ptr.as_ptr()).val.mark(owner);
+            }
         };
     }
 }
 
-struct GcInner<T> {
+struct GcInner<T: ?Sized> {
     next: *mut GcInner<()>,
+    finalize: fn(*mut GcInner<()>),
     state: bool,
+    #[cfg(feature = "gc_sanitize")]
+    alive: AtomicBool,
     val: T,
 }
 
@@ -144,7 +203,7 @@ static HEAP: AtomicPtr<Heap> = AtomicPtr::new(core::ptr::null_mut());
 #[derive(Default)]
 pub struct Heap {
     top: AtomicPtr<GcInner<()>>,
-    roots: HashMap<Gc<()>, usize>,
+    roots: BTreeMap<*const (), (Box<dyn Mark>, usize)>,
 }
 
 impl Heap {
@@ -164,33 +223,179 @@ impl Heap {
     /// Sweep all allocation and free unmarked objects.
     /// SAFETY: All reachable objects must be marked before being called, and any
     /// objects that haven't been marked must not be used afterwards.
-    unsafe fn sweep(&mut self, owner: &TCellOwner<TcOwner>) {
+    unsafe fn sweep(owner: &TCellOwner<TcOwner>) {
+        let heap = unsafe { HEAP.load(Ordering::Acquire).as_mut().unwrap() };
         // Mark all of our rooted objects.
-        for (root, _) in &self.roots {
-            unsafe { root.mark(owner) };
+        for (ptr, (tr, _)) in &heap.roots {
+            tr.mark(owner);
         }
         let alive = ALIVE.load(Ordering::Acquire);
-        let mut prev = None;
-        let mut current = self.top.load(Ordering::Acquire);
+        let mut prev: *mut AtomicPtr<GcInner<()>> = (&raw mut heap.top).cast();
+        let mut current = heap.top.load(Ordering::Acquire);
         while current != core::ptr::null_mut() {
-            debug!("sweeping {current:p}");
-            prev = Some(current);
-            current = unsafe { (*current).next };
+            let next = unsafe { &raw mut (*current).next };
+            if unsafe { (*current).state } != alive {
+                debug!("freeing {current:p}");
+                unsafe { (*prev).store(*next, Ordering::Release) };
+                unsafe { ((*current).finalize)(current.cast()) };
+            }
+            prev = next.cast();
+            current = unsafe { *next };
         }
         // Flip all live objects back to dead
         ALIVE.store(!alive, Ordering::Release);
     }
 
-    fn root<T>(gc: &Gc<T>, owner: &mut TCellOwner<TcOwner>) {
+    fn root<T: Mark + Ord + 'static>(gc: &mut Gc<T>, owner: &mut TCellOwner<TcOwner>) {
         // SAFETY: We have owner. Maybe still kinda sus think about this some more
         let heap = unsafe { HEAP.load(Ordering::Acquire).as_mut().unwrap() };
-        // SAFETY: Erasing the type, which keeps the same representation.
-        let gc: Gc<()> = unsafe { core::mem::transmute(gc.clone()) };
         // Increment the root count for this key
-        *heap.roots.entry(gc).or_insert(0) += 1;
+        let ptr = gc.ptr.as_ptr();
+        let dt: Box<Gc<T>> = Box::new(gc.clone());
+        heap.roots.entry(ptr.cast()).or_insert_with(|| (Box::new(dt), 0)).1 += 1;
     }
 
     fn unroot<T>(gc: &Gc<T>, owner: &mut TCellOwner<TcOwner>) {
         // No-op for now?
+    }
+}
+
+impl Drop for Heap {
+    fn drop(&mut self) {
+        let mut current = self.top.load(Ordering::Acquire);
+        while current != core::ptr::null_mut() {
+            unsafe { ((*current).finalize)(current.cast()) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn gc_works() {
+        Heap::init();
+        let a = Gc::new(1);
+        assert_eq!(*a, 1);
+    }
+
+    #[test]
+    fn gc_can_mark() {
+        Heap::init();
+        let a = Gc::new(1);
+        let owner = TCellOwner::new();
+        a.mark(&owner);
+        assert_eq!(*a, 1);
+    }
+
+    #[test]
+    fn gc_sweep_empty() {
+        Heap::init();
+        let owner = TCellOwner::new();
+        unsafe { Heap::sweep(&owner) };
+    }
+
+    #[cfg(feature = "gc_sanitize")]
+    #[test]
+    fn gc_sweep_keeps_marks_alive() {
+        Heap::init();
+        let a = Gc::new(1);
+        let owner = TCellOwner::new();
+        a.mark(&owner);
+        unsafe { Heap::sweep(&owner) };
+        assert_eq!(*a, 1);
+    }
+
+    #[cfg(feature = "gc_sanitize")]
+    #[test]
+    fn gc_sweep_keeps_marks_alive_twice() {
+        Heap::init();
+        let a = Gc::new(1);
+        let owner = TCellOwner::new();
+        a.mark(&owner);
+        unsafe { Heap::sweep(&owner) };
+        a.mark(&owner);
+        unsafe { Heap::sweep(&owner) };
+        assert_eq!(*a, 1);
+    }
+
+    #[cfg(feature = "gc_sanitize")]
+    #[test]
+    fn gc_sweep_keeps_roots_alive() {
+        Heap::init();
+        let mut a = Gc::new(1);
+        let mut owner = TCellOwner::new();
+        Heap::root(&mut a, &mut owner);
+        unsafe { Heap::sweep(&owner) };
+        assert_eq!(*a, 1);
+    }
+
+    #[cfg(feature = "gc_sanitize")]
+    #[test]
+    fn gc_sweep_keeps_roots_alive_twice() {
+        Heap::init();
+        let mut a = Gc::new(1);
+        let mut owner = TCellOwner::new();
+        Heap::root(&mut a, &mut owner);
+        unsafe { Heap::sweep(&owner) };
+        unsafe { Heap::sweep(&owner) };
+        assert_eq!(*a, 1);
+    }
+
+    #[cfg(feature = "gc_sanitize")]
+    #[test]
+    #[should_panic]
+    fn gc_sweep_frees_unmarked() {
+        Heap::init();
+        let a = Gc::new(1);
+        let mut owner = TCellOwner::new();
+        unsafe { Heap::sweep(&owner) };
+        assert_eq!(*a, 1); // should panic
+    }
+
+    #[cfg(feature = "gc_sanitize")]
+    #[test]
+    #[should_panic]
+    fn gc_sweep_traverses_one() {
+        Heap::init();
+        let a = Gc::new(1);
+        let b = Gc::new(2);
+        let mut owner = TCellOwner::new();
+        a.mark(&owner);
+        unsafe { Heap::sweep(&owner) };
+        assert_eq!(*a, 1);
+        assert_eq!(*b, 2); // should panic
+    }
+
+    #[cfg(feature = "gc_sanitize")]
+    #[test]
+    fn gc_sweep_unlinks() {
+        Heap::init();
+        let a = Gc::new(1);
+        let b = Gc::new(2);
+        let mut owner = TCellOwner::new();
+        b.mark(&owner);
+        unsafe { Heap::sweep(&owner) };
+        b.mark(&owner);
+        unsafe { Heap::sweep(&owner) };
+        assert_eq!(*b, 2);
+    }
+
+    #[cfg(feature = "gc_sanitize")]
+    #[test]
+    fn gc_sweep_unlinks_two() {
+        Heap::init();
+        let a = Gc::new(1);
+        let b = Gc::new(2);
+        let c = Gc::new(3);
+        let mut owner = TCellOwner::new();
+        a.mark(&owner);
+        c.mark(&owner);
+        unsafe { Heap::sweep(&owner) };
+        c.mark(&owner);
+        unsafe { Heap::sweep(&owner) };
+        c.mark(&owner);
+        unsafe { Heap::sweep(&owner) };
+        assert_eq!(*c, 3);
     }
 }
