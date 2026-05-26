@@ -66,7 +66,7 @@ impl Mark for Box<dyn Mark> {
 
 impl<'src, 'intern> Mark for Table<'src, 'intern> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
-        for item in &self.array {
+        for item in self.array.iter() {
             item.mark(owner);
         }
         self.hash.mark(owner);
@@ -75,7 +75,7 @@ impl<'src, 'intern> Mark for Table<'src, 'intern> {
 
 impl<'src, 'intern> Mark for LClosure<'src, 'intern> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
-        for upval in &self.upvalues {
+        for upval in self.upvalues.iter() {
             upval.mark(owner);
         }
     }

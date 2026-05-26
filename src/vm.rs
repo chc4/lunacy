@@ -1053,7 +1053,7 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
         }
         self.clos.mark(owner);
         self._G.mark(owner);
-        for upval in &self.upvals {
+        for upval in self.upvals.iter() {
             // We only need to mark closed upvalues, because open ones were marked on the value
             // stack.
             if let Upvalue::Closed(o) = &upval.0 {
@@ -1063,7 +1063,7 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
         // Our callstack isn't actually guaranteed to be accurate, because it could be lagging due
         // to being inside the JIT with a native call frame instead. However, we would only end up
         // missing closures which were already rooted by the JIT, so it's fine.
-        for call in &self.callstack {
+        for call in self.callstack.iter() {
             call.clos.mark(owner);
         }
     }

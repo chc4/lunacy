@@ -40,12 +40,12 @@ gdb-test name:
 # Benchmarks
 run benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    time cargo run --release --bin lunacy -- {{benchmark}}.bin
+    time cargo run --release --bin bench -- {{benchmark}}.bin
 
 [env("RUST_LOG", "debug")]
 run-debug benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    time cargo run --bin lunacy -- {{benchmark}}.bin
+    time cargo run --bin bench -- {{benchmark}}.bin
 
 graph name:
     luac5.1 -o {{name}}.bin {{name}}.lua
@@ -59,13 +59,13 @@ baseline benchmark:
 
 gdb-benchmark benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    cargo build --release --bin lunacy
-    gdb --args ./target/release/lunacy {{benchmark}}.bin
+    cargo build --release --bin bench
+    gdb --args ./target/release/bench {{benchmark}}.bin
 
 flamegraph benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     -rm /tmp/perf-*.map
-    cargo flamegraph --features "perf" --bin lunacy -- {{benchmark}}.bin
+    cargo flamegraph --features "perf" --bin bench -- {{benchmark}}.bin
     firefox -new-tab flamegraph.svg
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
@@ -73,45 +73,45 @@ benchmarks: (run "binarytrees") (run "life") (run "nbody")
 # Interpreter
 INTERPRETER_FEATURES := "magic"
 interpreter-compile:
-    cargo build --release --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin lunacy --target-dir ./target/interpreter
+    cargo build --release --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin bench --target-dir ./target/interpreter
 interpreter benchmark: interpreter-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    time ./target/interpreter/release/lunacy {{benchmark}}.bin
+    time ./target/interpreter/release/bench {{benchmark}}.bin
 interpreter-test name: interpreter-compile
     luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
-    time ./target/interpreter/release/lunacy {{name}}.bin
+    time ./target/interpreter/release/bench {{name}}.bin
 
 # Unsafe
 unsafe-compile:
-    cargo build --profile unsafe --no-default-features --features unsafe --bin lunacy \
+    cargo build --profile unsafe --no-default-features --features unsafe --bin bench \
         -Z build-std="core,std,panic_abort"
 unsafe benchmark: unsafe-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    time ./target/unsafe/lunacy {{benchmark}}.bin
+    time ./target/unsafe/bench {{benchmark}}.bin
 
 gdb-unsafe benchmark: unsafe-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    gdb --args ./target/unsafe/lunacy {{benchmark}}.bin
+    gdb --args ./target/unsafe/bench {{benchmark}}.bin
 
 
 # Hyperfine reports
 hyperfine benchmark: unsafe-compile interpreter-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    cargo build --release --bin lunacy
+    cargo build --release --bin bench
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}.md \
         "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench" \
-        "./target/interpreter/release/lunacy {{benchmark}}.bin" \
-        "./target/release/lunacy {{benchmark}}.bin" \
-        "./target/unsafe/lunacy {{benchmark}}.bin"
+        "./target/interpreter/release/bench {{benchmark}}.bin" \
+        "./target/release/bench {{benchmark}}.bin" \
+        "./target/unsafe/bench {{benchmark}}.bin"
 hyperfine-jit benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    cargo build --release --bin lunacy
+    cargo build --release --bin bench
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-jit.md \
-        "./target/release/lunacy {{benchmark}}.bin"
+        "./target/release/bench {{benchmark}}.bin"
 hyperfine-unsafe benchmark: unsafe-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-unsafe.md \
-        "./target/unsafe/lunacy {{benchmark}}.bin"
+        "./target/unsafe/bench {{benchmark}}.bin"
 
 
 hyperfines: (hyperfine "binarytrees") (hyperfine "life") (run "nbody")
