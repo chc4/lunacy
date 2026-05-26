@@ -997,6 +997,15 @@ pub enum CType {
     LuaFunction(Tc<LClosure<'static, 'static>>),
 }
 
+impl Mark for CType {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        match self {
+            CType::LuaFunction(c) => c.mark(owner),
+            _ => { },
+        }
+    }
+}
+
 impl CType {
     /// Convert a CType to an LType, potentially losing static information.
     fn as_ltype(&self) -> LType {
@@ -1024,6 +1033,14 @@ impl std::fmt::Display for CType {
 pub struct Context {
     pub types: SmallVec<[CType; 8]>,
     pub hkeys: Vec<HashKey<'static, 'static>>,
+}
+
+impl Mark for Context {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        for ctype in &self.types {
+            ctype.mark(owner);
+        }
+    }
 }
 
 impl Context {
@@ -1061,12 +1078,6 @@ impl Context {
             // that has the issue of runtime hash_witness entries referring to the same
             // path-dependent index and having to emit shuffles if you take a
             // de-duplicated branch but with different indexes.
-            // TODO: This ends up creating duplicate hashkeys! Rethink it.
-            // nbody should be much faster than lua5.1, but instead is slower because
-            // we create too many versions. We probably need to 1) remove duplicated
-            // hashkeys by setting them to LType::Unknown 2) have a better compatible
-            // block check when looking up if we already have a block, which ignores
-            // unknown type hashkeys 3) long-term, do the PyLBBV reference thing.
             if let CType::Shape(shape) = &self.types[idx] {
                 for (kidx, key) in self.hkeys.iter_mut().enumerate() {
                     if key.idx != idx { continue; }
@@ -1140,7 +1151,12 @@ pub struct Specializer<'src, 'intern> {
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
-        panic!()
+        self.clos.mark(owner);
+        for (proto, versions) in &self.versions {
+            for ((subpc, context), blockid) in versions {
+                (*context).mark(owner);
+            }
+        }
     }
 }
 
@@ -2096,7 +2112,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::GC => {
                     off += 1;
-                    self.mark(owner);
+                    (*self).mark(owner);
                     unsafe { Heap::collect(&state, owner) };
                 },
             }
