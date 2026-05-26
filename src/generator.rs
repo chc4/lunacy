@@ -19,6 +19,7 @@ use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
 use crate::jit::{JitInfo, JitContext};
+use crate::gc::{Mark, Heap};
 
 use crate::{debug, info, warn};
 use smallvec::SmallVec;
@@ -175,6 +176,7 @@ pub enum YieldOp {
                                         // scoped to only information that may alias with an href,
                                         // and potentially keeping information about a specific
                                         // stack slot intact.
+    CollectGarbage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -441,6 +443,7 @@ pub fn emit_newtable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
         })));
         yield YieldOp::SetTypes(vec![(a, LType::Table)]);
+        yield YieldOp::CollectGarbage;
         arg
     }
 }
@@ -983,6 +986,7 @@ pub enum Residual {
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
     LuaCall { lclos: Tc<LClosure<'static, 'static>>, a: u16, b: u16, c: u16 },
     LuaGuard { idx: usize, ptr: *const () },
+    GC,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1132,6 +1136,12 @@ pub struct Specializer<'src, 'intern> {
     pub versions: std::collections::HashMap<
         LProto<'src, 'intern>,
         std::collections::HashMap<(SubPc, Context), BlockId>, InternedHasher>,
+}
+
+impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
+    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+        panic!()
+    }
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
@@ -1745,7 +1755,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
-                    // In a real VM, transition to the next PC generator here.
+                },
+                CoroutineState::Yielded(YieldOp::CollectGarbage) => {
+                    self.blocks[block_id.0].instructions.push(Residual::GC);
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {
                     self.blocks[block_id.0].instructions.push(Residual::Select(targets));
@@ -1849,6 +1861,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut off: usize = 0;
         debug!("run");
         loop {
+            #[cfg(feature = "gc_stress")]
+            {
+                self.mark(owner);
+                unsafe { Heap::collect(&state, owner) };
+            }
             let block = &mut self.blocks[id.0];
             #[cfg(feature = "jit")]
             if off == 0 && state.gas > 0 {
@@ -2077,6 +2094,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         },
                     }
                 },
+                Residual::GC => {
+                    off += 1;
+                    self.mark(owner);
+                    unsafe { Heap::collect(&state, owner) };
+                },
             }
         }
     }
@@ -2138,6 +2160,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::Thunk(_) => format!("thunk"),
                         Residual::Select(targets) => format!("select"),
                         Residual::Ret(_, _, _) => format!("ret"),
+                        Residual::GC => format!("gc"),
 
                     };
                     instructions.push(inst_label);

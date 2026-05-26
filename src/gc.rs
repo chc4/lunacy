@@ -205,7 +205,7 @@ impl<T: Hash> Hash for Gc<T> {
 
 impl<T> Mark for Gc<T> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
-        // Safety: See default implementation.
+        // SAFETY: See default implementation.
         unsafe {
             let state = &mut (*self.ptr.as_ptr()).state;
             let alive = ALIVE.load(Ordering::Acquire);
@@ -248,11 +248,6 @@ impl Heap {
         }
     }
 
-    pub fn collect(state: &impl Mark, owner: &TCellOwner<TcOwner>) {
-        state.mark(owner);
-        unsafe { Self::sweep(owner) };
-    }
-
     /// Sweep all allocation and free unmarked objects.
     /// SAFETY: All reachable objects must be marked before being called, and any
     /// objects that haven't been marked must not be used afterwards.
@@ -280,16 +275,23 @@ impl Heap {
         ALIVE.store(!alive, Ordering::Release);
     }
 
-    pub fn root<T: Mark>(gc: &mut Gc<T>, owner: &mut TCellOwner<TcOwner>) {
+    pub unsafe fn collect(state: &impl Mark, owner: &TCellOwner<TcOwner>) {
+        state.mark(owner);
+        unsafe { Self::sweep(owner) };
+    }
+
+    /// Root a GC pointer, so that it is automatically marked by the GC before any sweep.
+    /// The caller is required to guarantee that GC object is unrooted before freeing
+    /// it, and that the root doesn't outlive any lifetimes attached to the object.
+    // TODO: Replace with Root smartpointer instead.
+    pub unsafe fn root<T: Mark>(gc: &mut Gc<T>, owner: &mut TCellOwner<TcOwner>) {
         // SAFETY: We have owner. Maybe still kinda sus think about this some more
         let heap = unsafe { HEAP.load(Ordering::Acquire).as_mut().unwrap() };
         // Increment the root count for this key
         let ptr = gc.ptr.as_ptr();
         let dt: Box<Gc<T>> = Box::new(gc.clone());
-        // SAFETY: We're erasing the lifetime of Gc<T>. This is only safe if we
-        // ensure that the rooted object doesn't outlive its own internal
-        // references. For the global environment, this is fine because it
-        // should stay alive for the duration of the VM.
+        // SAFETY: Erase the lifetime of Gc<T>. The caller is required to not have the
+        // object remain rooted longer than its lifetimes.
         let dt: Box<dyn Mark> = unsafe { core::mem::transmute(dt as Box<dyn Mark>) };
         heap.roots.entry(ptr.cast()).or_insert_with(|| (dt, 0)).1 += 1;
     }
@@ -312,7 +314,7 @@ impl Drop for Heap {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gc_test"))]
 mod test {
     use super::*;
     #[test]
@@ -368,7 +370,7 @@ mod test {
         Heap::init();
         let mut a = Gc::new(1);
         let mut owner = TCellOwner::new();
-        Heap::root(&mut a, &mut owner);
+        unsafe { Heap::root(&mut a, &mut owner) };
         unsafe { Heap::sweep(&owner) };
         assert_eq!(*a, 1);
     }
@@ -379,7 +381,7 @@ mod test {
         Heap::init();
         let mut a = Gc::new(1);
         let mut owner = TCellOwner::new();
-        Heap::root(&mut a, &mut owner);
+        unsafe { Heap::root(&mut a, &mut owner) };
         unsafe { Heap::sweep(&owner) };
         unsafe { Heap::sweep(&owner) };
         assert_eq!(*a, 1);

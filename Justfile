@@ -1,11 +1,20 @@
 set shell := ["bash", "-c"]
-TEST_FEATURES := "counters graph jit gas"
+TEST_FEATURES := "counters graph jit gas gc_sanitize"
 
 # Run lunacy against the golden testcases
+[env("RUST_BACKTRACE","1")]
 test:
-    cargo test
-    cargo test --no-default-features --features "{{TEST_FEATURES}}"
-    cargo test "gc::" --features "gc_sanitize"
+    # GC correctness tests
+    cargo test "gc::" --features "gc_test,gc_sanitize" -- --test-threads 1
+    # Normal interpreter tests
+    cargo test --features "gc_sanitize"
+    # Interpreter GC stress test
+    cargo test --features "gc_stress gc_sanitize"
+
+[env("RUST_LOG", "debug")]
+[env("RUST_BACKTRACE","1")]
+test-debug:
+    cargo test --features "gc_sanitize" -- --nocapture
 
 watch:
     cargo watch -- cargo test

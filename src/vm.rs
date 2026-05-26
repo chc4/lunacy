@@ -1051,6 +1051,7 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
         for val in self.vals.iter() {
             val.mark(owner);
         }
+        self.clos.mark(owner);
         self._G.mark(owner);
         for upval in &self.upvals {
             // We only need to mark closed upvalues, because open ones were marked on the value
@@ -1173,7 +1174,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             ),
             epoch: 0,
         });
-        Heap::root(&mut _g.0, owner);
+        unsafe {
+            Heap::root(&mut _g.0, owner);
+        }
         _g
     }
 
@@ -1229,11 +1232,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             }
         };
         // we need to track where to return to, along with the base pointer and where to put return
-            #[cfg(feature = "gc_stress")]
-            Heap::collect(&state, owner);
-
         // values
         let r_vals = 'int: loop {
+            #[cfg(feature = "gc_stress")]
+            unsafe { Heap::collect(&state, owner) };
+
             let inst = unsafe { state.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[state.pc] };
             state.pc += 1;
             state.counters.interpreter_count.increment();
@@ -1292,7 +1295,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
                     state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
-                    Heap::collect(&state, owner);
+                    unsafe { Heap::collect(&state, owner) };
                 },
                 Opcode::SELF => {
                     let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);

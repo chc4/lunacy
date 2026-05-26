@@ -90,6 +90,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
         let mut owner = TCellOwner::new();
         let vm = Vm::new(&header.top_level as *const _);
 
+        println!("Running golden test {}", path.display());
         {
             *CAPTURED.rw(&mut owner) = Vec::new();
 
