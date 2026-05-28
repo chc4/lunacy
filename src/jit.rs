@@ -12,6 +12,9 @@ use log::debug;
 use log::info;
 use log::warn;
 
+#[cfg(feature = "jit_dump")]
+use serde::Serialize;
+
 #[cfg(feature = "unreachable")]
 #[macro_use]
 use crate::unreachable;
@@ -22,8 +25,11 @@ const INITIAL_HOTNESS: usize = 0;
 const INITIAL_HOTNESS: usize = 64;
 
 #[derive(Debug)]
+#[cfg_attr(feature = "jit_dump", derive(Serialize))]
 pub struct JitInfo {
+    #[cfg_attr(feature = "jit_dump", serde(skip))]
     pub buffer: Option<ExecutableBuffer>,
+    #[cfg_attr(feature = "jit_dump", serde(skip))]
     pub entry: Option<JitExec>,
     pub hotness: std::cell::Cell<usize>,
 }
