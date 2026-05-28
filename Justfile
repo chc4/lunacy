@@ -70,6 +70,10 @@ flamegraph benchmark:
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
+dump-ir name:
+    luac5.1 -o {{name}}.bin {{name}}.lua
+    cargo run --release --features "jit_dump counters" --bin lunacy -- {{name}}.bin
+
 # Interpreter
 INTERPRETER_FEATURES := "magic"
 interpreter-compile:

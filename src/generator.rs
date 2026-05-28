@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, ReturnLocation, Upvalue};
 use qcell::{TCell, TCellOwner, LCell, LCellOwner};
 use crate::vm::{Tc, TcOwner, Vm};
-use crate::vm::{LClosure, LProto};
+use crate::vm::{LClosure, LProto, LValueSer};
 use crate::vm::{LValue, LType, Number, Table, FVec};
 use crate::vm::{InstructionDecode, Unpacker};
 use crate::vm::RunState;
@@ -20,6 +20,25 @@ use crate::chunk::Constant;
 use crate::chunk::Instruction;
 use crate::jit::{JitInfo, JitContext};
 use crate::gc::{Mark, Heap};
+
+#[cfg(feature = "jit_dump")]
+use serde::Serialize;
+
+#[cfg(feature = "jit_dump")]
+fn serialize_ptr<S>(ptr: &*const (), serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format!("{:p}", *ptr))
+}
+
+#[cfg(feature = "jit_dump")]
+fn serialize_nf<S>(nf: &NativeFunc, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format!("{:p}", *nf as *const ()))
+}
 
 use crate::{debug, info, warn};
 use smallvec::SmallVec;
@@ -52,9 +71,12 @@ impl<'src, 'intern> LValue<'src, 'intern> {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "jit_dump", derive(Serialize))]
 pub struct Block {
     pub instructions: Vec<Residual>,
     pub jit_info: JitInfo,
+    #[cfg(feature = "counters")]
+    pub execution_count: crate::perf::Counter,
 }
 
 impl Block {
@@ -62,6 +84,8 @@ impl Block {
         Self {
             instructions: vec![],
             jit_info: JitInfo::new(),
+            #[cfg(feature = "counters")]
+            execution_count: Default::default(),
         }
     }
 }
@@ -140,6 +164,17 @@ pub enum ExecEffect {
 }
 #[derive(Clone)]
 pub struct ResidualExec(&'static str, pub Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>)>);
+
+#[cfg(feature = "jit_dump")]
+impl Serialize for ResidualExec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.0)
+    }
+}
+
 impl std::fmt::Debug for ResidualExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "exec({}, {:p})", self.0, self.1.as_ref() as &_ as *const _ as *const ())
@@ -190,6 +225,30 @@ pub struct HashKey<'src, 'intern> {
     pub hazards: SmallVec<[bool; 8]>,
 }
 
+#[cfg(feature = "jit_dump")]
+pub struct HashKeySer<'a, 'src, 'intern> {
+    pub owner: &'a TCellOwner<TcOwner>,
+    pub hk: &'a HashKey<'src, 'intern>,
+}
+
+#[cfg(feature = "jit_dump")]
+impl<'a, 'src, 'intern> Serialize for HashKeySer<'a, 'src, 'intern> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("HashKey", 4)?;
+        s.serialize_field("idx", &self.hk.idx)?;
+        let lv: LValue = (&self.hk.key).into();
+        let lv_ser = LValueSer { owner: self.owner, val: &lv };
+        s.serialize_field("key", &lv_ser)?;
+        s.serialize_field("known_type", &self.hk.known_type)?;
+        s.serialize_field("hazards", &self.hk.hazards)?;
+        s.end()
+    }
+}
+
 impl<'src, 'intern> HashKey<'src, 'intern> {
     fn tostring(&self, owner: &TCellOwner<TcOwner>) -> String {
         let lv: LValue = (&self.key).into();
@@ -200,6 +259,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "jit_dump", derive(Serialize))]
 pub struct HashRef(pub u8);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -942,9 +1002,11 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Debug)]
+#[cfg_attr(feature = "jit_dump", derive(Serialize))]
 pub struct BlockId(pub usize);
 pub type Pc = usize;
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
+#[cfg_attr(feature = "jit_dump", derive(Serialize))]
 pub struct SubPc(usize, usize);
 
 impl SubPc {
@@ -966,6 +1028,16 @@ impl SubPc {
 
 #[derive(Clone)]
 pub struct ThunkRef(pub Rc<RefCell<dyn FnMut(&mut Specializer, &mut TCellOwner<TcOwner>, &mut RunState, usize) -> ()>>);
+
+#[cfg(feature = "jit_dump")]
+impl Serialize for ThunkRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("Thunk")
+    }
+}
 
 impl std::fmt::Debug for ThunkRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Thunk(...)") }
@@ -989,7 +1061,104 @@ pub enum Residual {
     GC,
 }
 
+#[cfg(feature = "jit_dump")]
+impl Serialize for Residual {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        match self {
+            Residual::Guard { idx, expected } => {
+                let mut s = serializer.serialize_struct("Guard", 2)?;
+                s.serialize_field("idx", idx)?;
+                s.serialize_field("expected", expected)?;
+                s.end()
+            }
+            Residual::Exec(exec) => {
+                let mut s = serializer.serialize_struct("Exec", 1)?;
+                s.serialize_field("exec", exec)?;
+                s.end()
+            }
+            Residual::Call { a, b, c } => {
+                let mut s = serializer.serialize_struct("Call", 3)?;
+                s.serialize_field("a", a)?;
+                s.serialize_field("b", b)?;
+                s.serialize_field("c", c)?;
+                s.end()
+            }
+            Residual::Select(targets) => {
+                let mut s = serializer.serialize_struct("Select", 1)?;
+                s.serialize_field("targets", targets)?;
+                s.end()
+            }
+            Residual::Jump(id) => {
+                let mut s = serializer.serialize_struct("Jump", 1)?;
+                s.serialize_field("id", id)?;
+                s.end()
+            }
+            Residual::Thunk(thunk) => {
+                let mut s = serializer.serialize_struct("Thunk", 1)?;
+                s.serialize_field("thunk", thunk)?;
+                s.end()
+            }
+            Residual::Ret(pc, a, b) => {
+                let mut s = serializer.serialize_struct("Ret", 3)?;
+                s.serialize_field("pc", pc)?;
+                s.serialize_field("a", a)?;
+                s.serialize_field("b", b)?;
+                s.end()
+            }
+            Residual::HashGuard { tab, href, expected } => {
+                let mut s = serializer.serialize_struct("HashGuard", 3)?;
+                s.serialize_field("tab", tab)?;
+                s.serialize_field("href", href)?;
+                s.serialize_field("expected", expected)?;
+                s.end()
+            }
+            Residual::EpochCheck { tab, href } => {
+                let mut s = serializer.serialize_struct("EpochCheck", 2)?;
+                s.serialize_field("tab", tab)?;
+                s.serialize_field("href", href)?;
+                s.end()
+            }
+            Residual::NativeGuard { idx, ptr } => {
+                let mut s = serializer.serialize_struct("NativeGuard", 2)?;
+                s.serialize_field("idx", idx)?;
+                s.serialize_field("ptr", &format!("{:p}", *ptr))?;
+                s.end()
+            }
+            Residual::NativeCall { nf, a, b, c } => {
+                let mut s = serializer.serialize_struct("NativeCall", 4)?;
+                s.serialize_field("nf", &format!("{:p}", *nf as *const ()))?;
+                s.serialize_field("a", a)?;
+                s.serialize_field("b", b)?;
+                s.serialize_field("c", c)?;
+                s.end()
+            }
+            Residual::LuaCall { lclos, a, b, c } => {
+                let mut s = serializer.serialize_struct("LuaCall", 4)?;
+                s.serialize_field("lclos", lclos)?;
+                s.serialize_field("a", a)?;
+                s.serialize_field("b", b)?;
+                s.serialize_field("c", c)?;
+                s.end()
+            }
+            Residual::LuaGuard { idx, ptr } => {
+                let mut s = serializer.serialize_struct("LuaGuard", 2)?;
+                s.serialize_field("idx", idx)?;
+                s.serialize_field("ptr", &format!("{:p}", *ptr))?;
+                s.end()
+            }
+            Residual::GC => {
+                serializer.serialize_str("GC")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[cfg_attr(feature = "jit_dump", derive(Serialize))]
 pub enum CType {
     Type(LType),
     Shape(SmallVec<[HashRef; 4]>),
@@ -1033,6 +1202,27 @@ impl std::fmt::Display for CType {
 pub struct Context {
     pub types: SmallVec<[CType; 8]>,
     pub hkeys: Vec<HashKey<'static, 'static>>,
+}
+
+#[cfg(feature = "jit_dump")]
+pub struct ContextSer<'a> {
+    pub owner: &'a TCellOwner<TcOwner>,
+    pub ctx: &'a Context,
+}
+
+#[cfg(feature = "jit_dump")]
+impl<'a> Serialize for ContextSer<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Context", 2)?;
+        s.serialize_field("types", &self.ctx.types)?;
+        let hkeys_ser: Vec<_> = self.ctx.hkeys.iter().map(|hk| HashKeySer { owner: self.owner, hk }).collect();
+        s.serialize_field("hkeys", &hkeys_ser)?;
+        s.end()
+    }
 }
 
 impl Mark for Context {
@@ -1952,6 +2142,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 state.gas -= 1;
             }
             let res = self.blocks[id.0].instructions[off].clone();
+            #[cfg(feature = "counters")]
+            self.blocks[id.0].execution_count.increment();
             state.counters.versioned_count.increment();
             debug!("RUN {:?}", &res);
             match res {
@@ -2233,5 +2425,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             CommandArg::Output(filepath.to_string()),
         ]).unwrap();
         debug!("graphviz output: {}", graph_out);
+    }
+
+    #[cfg(feature = "jit_dump")]
+    pub fn dump_json(&self, owner: &TCellOwner<TcOwner>, proto: LProto<'src, 'intern>, filepath: &str) {
+        use std::fs::File;
+        let Some(versions) = self.versions.get(&proto) else { return; };
+
+        #[derive(Serialize)]
+        struct DumpData<'a> {
+            proto_source: String,
+            blocks: &'a [Block],
+            versions: Vec<(SubPc, ContextSer<'a>, BlockId)>,
+        }
+
+        let proto_source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string() };
+        let dump_versions: Vec<_> = versions.iter().map(|((spc, ctx), bid)| {
+             (*spc, ContextSer { owner, ctx }, *bid)
+        }).collect();
+
+        let data = DumpData {
+            proto_source,
+            blocks: &self.blocks,
+            versions: dump_versions,
+        };
+
+        if let Ok(file) = File::create(filepath) {
+            serde_json::to_writer_pretty(file, &data).ok();
+        }
     }
 }

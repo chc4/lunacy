@@ -20,6 +20,9 @@ use indexmap::IndexMap;
 
 use qcell::{TCell, TCellOwner, LCell, LCellOwner};
 
+#[cfg(feature = "jit_dump")]
+use serde::Serialize;
+
 use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
 use crate::perf::PerfCounters;
 use crate::gc::{Mark, Heap, Gc};
@@ -41,6 +44,7 @@ impl Eq for Number {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
+#[cfg_attr(feature = "jit_dump", derive(Serialize))]
 pub enum Opcode {
     MOVE = 0,
     LOADK,
@@ -571,8 +575,54 @@ pub enum LValue<'src, 'intern> {
     NClosure(NClosure) = 9,
 }
 
+pub struct LValueSer<'a, 'src, 'intern> {
+    pub owner: &'a TCellOwner<TcOwner>,
+    pub val: &'a LValue<'src, 'intern>,
+}
+
+#[cfg(feature = "jit_dump")]
+impl<'a, 'src, 'intern> Serialize for LValueSer<'a, 'src, 'intern> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.val {
+            LValue::Nil => serializer.serialize_str("nil"),
+            LValue::Bool(b) => serializer.serialize_bool(*b),
+            LValue::Number(n) => serializer.serialize_f64(n.0),
+            LValue::Table(t) => serializer.serialize_str(&format!("Table({:p})", t.as_ptr())),
+            LValue::InternedString(s) => serializer.serialize_str(&String::from_utf8_lossy(s.0)),
+            LValue::OwnedString(s) => {
+                serializer.serialize_str(&String::from_utf8_lossy(s.ro(self.owner).as_slice()))
+            },
+            LValue::LClosure(c) => serializer.serialize_str(&format!("LClosure({:p})", c.as_ptr())),
+            LValue::NClosure(c) => serializer.serialize_str(&format!("NClosure({:p})", c.native as *const ())),
+        }
+    }
+}
+
+#[cfg(feature = "jit_dump")]
+impl<'src, 'intern> Serialize for LValue<'src, 'intern> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            LValue::Nil => serializer.serialize_str("nil"),
+            LValue::Bool(b) => serializer.serialize_bool(*b),
+            LValue::Number(n) => serializer.serialize_f64(n.0),
+            LValue::Table(t) => serializer.serialize_str(&format!("Table({:p})", t.as_ptr())),
+            LValue::InternedString(s) => serializer.serialize_str(&String::from_utf8_lossy(s.0)),
+            LValue::OwnedString(s) => serializer.serialize_str(&format!("OwnedString({:p})", s.as_ptr())),
+            LValue::LClosure(c) => serializer.serialize_str(&format!("LClosure({:p})", c.as_ptr())),
+            LValue::NClosure(c) => serializer.serialize_str(&format!("NClosure({:p})", c.native as *const ())),
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "jit_dump", derive(Serialize))]
 pub enum LType {
     Unknown,
     Nil,
@@ -766,6 +816,63 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         };
         debug!("gettable {:?}", &val_b);
         return val_b;
+    }
+}
+
+#[cfg(feature = "jit_dump")]
+impl<'src, 'intern> Serialize for Tc<LClosure<'src, 'intern>> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("LClosure({:p})", self.as_ptr()))
+    }
+}
+
+#[cfg(feature = "jit_dump")]
+impl<'src, 'intern> Serialize for Tc<Table<'src, 'intern>> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("Table({:p})", self.as_ptr()))
+    }
+}
+
+#[cfg(feature = "jit_dump")]
+impl Serialize for NClosure {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("NClosure({:p})", self.native as *const ()))
+    }
+}
+
+#[cfg(feature = "jit_dump")]
+impl Serialize for Number {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_f64(self.0)
+    }
+}
+
+
+
+#[cfg(feature = "jit_dump")]
+impl<'src, 'intern> Serialize for Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Constant::Nil => serializer.serialize_str("nil"),
+            Constant::Bool(b) => serializer.serialize_bool(*b),
+            Constant::Number(n) => serializer.serialize_f64(n.0),
+            Constant::String(s) => serializer.serialize_str(&String::from_utf8_lossy(s.0)),
+        }
     }
 }
 
@@ -1638,6 +1745,17 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         for proto in unsafe { &(*self.top_level).prototypes.items } {
             let outfile = format!("func_{}.pdf", proto.line_defined);
             spec.dump(owner, proto, outfile.as_str());
+        }
+
+        #[cfg(feature = "jit_dump")]
+        {
+            let mut protos = spec.versions.keys().cloned().collect::<Vec<_>>();
+            for proto in protos {
+                let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
+                let line = unsafe { (*proto).line_defined };
+                let outfile = format!("func_{}_{:p}.json", line, proto);
+                spec.dump_json(owner, proto, outfile.as_str());
+            }
         }
 
 
