@@ -26,8 +26,18 @@ impl std::fmt::Display for Counter {
 
 #[cfg(feature = "counters")]
 impl Counter {
-    pub fn increment(&mut self) {
-        self.count.update(Ordering::Release, Ordering::Relaxed, |u| u + 1);
+    pub fn increment(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "jit_dump")]
+impl serde::Serialize for Counter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.count.load(Ordering::Relaxed) as u64)
     }
 }
 

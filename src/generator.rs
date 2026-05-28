@@ -75,6 +75,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
 pub struct Block {
     pub instructions: Vec<Residual>,
     pub jit_info: JitInfo,
+    #[cfg(feature = "counters")]
+    pub execution_count: crate::perf::Counter,
 }
 
 impl Block {
@@ -82,6 +84,8 @@ impl Block {
         Self {
             instructions: vec![],
             jit_info: JitInfo::new(),
+            #[cfg(feature = "counters")]
+            execution_count: Default::default(),
         }
     }
 }
@@ -2138,6 +2142,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 state.gas -= 1;
             }
             let res = self.blocks[id.0].instructions[off].clone();
+            #[cfg(feature = "counters")]
+            self.blocks[id.0].execution_count.increment();
             state.counters.versioned_count.increment();
             debug!("RUN {:?}", &res);
             match res {
