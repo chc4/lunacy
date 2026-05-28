@@ -383,43 +383,67 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // JitHelper function calls.
 
         let mut compiled_offsets = Vec::new();
-        // We may have already JIT this block, if it was jumped to by another block
-        // first. In that case we just have to jump to it.
-        if let Some(block_ptr) = self.jctx.blocks.get(&id) {
-            dynasm!(ops
-            ; jmp extern block_ptr.0 as usize
-            );
-        } else {
-            // We need to skip over the uncommitted prologue
-            let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
-            self.jctx.blocks.insert(id, new_block);
+        let exit_label = ops.new_dynamic_label();
+        let mut session_labels = HashMap::new();
+
+        let mut current_id = Some(id);
+        while let Some(bid) = current_id.take().or_else(|| {
+            self.jctx.pending.pop_first().map(|(p_bid, p_label)| {
+                session_labels.insert(p_bid, p_label);
+                p_bid
+            })
+        }).or_else(|| {
+            session_labels.keys()
+                .find(|&b| !compiled_offsets.iter().any(|(cbid, _, _)| cbid == b))
+                .cloned()
+        }) {
+            if let Some(block_ptr) = self.jctx.blocks.get(&bid) {
+                if let Some(label) = session_labels.remove(&bid) {
+                    dynasm!(ops ; =>label ; jmp extern block_ptr.0 as usize);
+                } else if bid == id {
+                    dynasm!(ops ; jmp extern block_ptr.0 as usize);
+                }
+                continue;
+            }
+
+            if compiled_offsets.iter().any(|(cb, _, _)| *cb == bid) {
+                continue;
+            }
+
+            let block_label = *session_labels.entry(bid).or_insert_with(|| {
+                self.jctx.pending.remove(&bid).unwrap_or_else(|| ops.new_dynamic_label())
+            });
+            self.jctx.pending.remove(&bid);
+
+            dynasm!(ops ; =>block_label);
             let start_off = ops.offset().0;
-            let _block = self.jit_block(id, &mut ops, owner);
-            compiled_offsets.push((id, start_off, ops.offset().0));
+            let (_offset, fallthrough) = self.jit_block(bid, &mut ops, owner, exit_label, &mut session_labels);
+            compiled_offsets.push((bid, start_off, ops.offset().0));
+            current_id = fallthrough;
         }
 
+        dynasm!(ops
+            ; =>exit_label
+            ; pop r14
+            ; pop rbp
+            ; pop rbx
+            ; ret
+        );
+
+        debug!("drained pending");
 
         // Reserve the full length of our compiled function
         let end = ops.offset();
         self.jctx.reserve(end.0);
 
-        // Now we need to go through and also compile all of the pending labels for other blocks.
-        while let Some((pending_block, pending_label)) = self.jctx.pending.pop_first() {
-            debug!("pending block {:?} {:?}", pending_block.0, pending_label);
-            let pending_ptr = self.jctx.end();
-            let pending_start = ops.offset();
-            self.jctx.blocks.insert(pending_block, pending_ptr);
-            dynasm!(ops
-                ; =>pending_label
-            );
-            let _block = self.jit_block(pending_block, &mut ops, owner);
-            compiled_offsets.push((pending_block, pending_start.0, ops.offset().0));
-            self.jctx.reserve(ops.offset().0 - pending_start.0);
-        }
-
-        debug!("drained pending");
         let buf = ops.finalize().unwrap();
         let Some(slab) = self.jctx.commit(base, buf.as_slice()) else { panic!() };
+
+        for (bid, start, _end) in &compiled_offsets {
+            let ptr = JitPtr(unsafe { slab.add(*start) });
+            self.jctx.blocks.insert(*bid, ptr);
+        }
+
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
 
         let (source, line) = {
@@ -444,14 +468,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
     }
 
-    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, owner: &mut TCellOwner<TcOwner>) -> AssemblyOffset {
+    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, owner: &mut TCellOwner<TcOwner>, exit_label: DynamicLabel, session_labels: &mut HashMap<BlockId, DynamicLabel>) -> (AssemblyOffset, Option<BlockId>) {
         let entry = ops.offset();
         let x = self.jctx.memory.get_mut().as_ptr();
         let block = &self.blocks[id.0];
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
 
-        let mut emit_jump = |ops: &mut Assembler, target: &BlockId| {
-            if let Some(target_ptr) = self.jctx.blocks.get(target) {
+        let mut emit_jump = |ops: &mut Assembler, target: &BlockId, session_labels: &mut HashMap<BlockId, DynamicLabel>, jctx: &mut JitContext| {
+            if let Some(label) = session_labels.get(target) {
+                dynasm!(ops
+                    ; jmp =>*label
+                );
+            } else if let Some(target_ptr) = jctx.blocks.get(target) {
                 // We already JIT compiled the block, and can jump to it directly.
                 dynasm!(ops
                     ; jmp extern target_ptr.0 as usize
@@ -460,9 +488,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // The block could already be pending from another block in this assembler
                 // set. Use it if it already exists, otherwise create a new label for our
                 // relocation.
-                let pending_label = self.jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
+                let label = *jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
+                session_labels.insert(*target, label);
                 dynasm!(ops
-                    ; jmp =>*pending_label
+                    ; jmp =>label
                 );
             }
         };
@@ -477,7 +506,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ; mov WORD r13 => RunState.current_off, (off as i16)
                     ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                     ; mov BYTE r13 => RunState.trap, 1
-                    ; jmp >exit_jit
+                    ; jmp =>exit_label
                 );
             } else {
                 // Fallback to interpreter for other residuals
@@ -485,11 +514,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ; .arch x64
                     ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
                     ; mov BYTE r13 => RunState.trap, 1
-                    ; jmp >exit_jit
+                    ; jmp =>exit_label
                 );
             }
         };
 
+        let mut fallthrough = None;
         for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
             let label = insts[off];
@@ -503,7 +533,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; ja >have_gas
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                 ; mov BYTE r13 => RunState.trap, 1
-                ; jmp >exit_jit
+                ; jmp =>exit_label
                 ; have_gas:
             );
             loop { match res {
@@ -616,7 +646,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jz >no_trap
                         //// Trap 4 so specializer can handle it
                         ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
-                        ; jmp >exit_jit
+                        ; jmp =>exit_label
                         ; no_trap:
                     );
                 },
@@ -653,7 +683,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // if so, unwinding our native stack but yielding to the generator run loop
                                 // with a suspended ReturnLocation stack.
                                 ; cmp BYTE r13 => RunState.trap, 0
-                                ; jnz >exit_jit
+                                ; jnz =>exit_label
 
                                 // Reload the correct base ptr for the remainder of our function
                             );
@@ -688,7 +718,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                 },
                 Residual::Jump(target) => {
-                    emit_jump(ops, target);
+                    if off == block.instructions.len() - 1 && !self.jctx.blocks.contains_key(target) && !session_labels.contains_key(target) {
+                        fallthrough = Some(*target);
+                    } else {
+                        emit_jump(ops, target, session_labels, &mut self.jctx);
+                    }
                 },
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
@@ -698,7 +732,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rdx, WORD (*b as i32)
                         ; mov rcx, r14 // base_ptr
                         ; call extern (JitHelper::lua_return as *const () as usize)
-                        ; jmp >exit_jit
+                        ; jmp =>exit_label
                     );
                 },
                 Residual::Select(targets) => {
@@ -710,7 +744,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; cmp rax, i as i32
                             ; jnz >next_target
                         );
-                        emit_jump(ops, &target.1);
+                        emit_jump(ops, &target.1, session_labels, &mut self.jctx);
                         dynasm!(ops
                             ; next_target:
                         );
@@ -725,7 +759,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov WORD r13 => RunState.current_off, (off as i16)
                         ; mov rax, QWORD (((-4i32 as u64) << 32 | (id.0 as u64)) as i64)
                         ; mov BYTE r13 => RunState.trap, 1
-                        ; jmp >exit_jit
+                        ; jmp =>exit_label
                     );
                 },
                 _ => {
@@ -734,16 +768,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }; break; }
         }
 
-        dynasm!(ops
-            ; .arch x64
-            ; ud2
-            ; exit_jit:
-            ; pop r14
-            ; pop rbp
-            ; pop rbx
-            ; ret
-        );
-        entry
+        if fallthrough.is_none() {
+            dynasm!(ops
+                ; .arch x64
+                ; ud2
+            );
+        }
+
+        (entry, fallthrough)
     }
 }
 
