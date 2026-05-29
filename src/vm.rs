@@ -760,7 +760,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         let val_b = match self {
             LValue::Table(tab) => {
                 debug!("table {:?}", tab);
-                tab.get(owner, index.deref()).ok_or_else(|| Err::<LValue, String>(format!("{:?}", index))).unwrap()
+                tab.get(owner, index.deref()).unwrap_or(LValue::Nil)
             },
             x => unimplemented!("gettable on {:?}", x),
         };

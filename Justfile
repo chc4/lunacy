@@ -53,6 +53,11 @@ graph name:
 graph-release name:
     luac5.1 -o {{name}}.bin {{name}}.lua
     cargo run --release --features graph --bin lunacy -- {{name}}.bin
+gdb name:
+    luac5.1 -o {{name}}.bin {{name}}.lua
+    cargo build --release --bin lunacy
+    gdb --args ./target/release/lunacy {{name}}.bin
+
 
 baseline benchmark:
     time lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench

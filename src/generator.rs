@@ -599,6 +599,9 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
         let larg = yield YieldOp::GuardRk(b, LType::Number);
         let rarg = yield YieldOp::GuardRk(c, LType::Number);
 
+        let lnil = yield YieldOp::GuardRk(b, LType::Nil);
+        let rnil = yield YieldOp::GuardRk(c, LType::Nil);
+
         arg = yield YieldOp::GetBlock(pc);
         let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
         arg = yield YieldOp::GetBlock((pc as isize + 1 as isize) as usize);
@@ -658,7 +661,17 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             (ResumeArg::MatchedConst(rb), ResumeArg::MatchedConst(rc)) => {
                 unimplemented!()
             },
-            _ => unreachable!(),
+            (larg, rarg) => match (&lnil, &rnil) {
+                (ResumeArg::Matched | ResumeArg::MatchedConst(_), ResumeArg::Matched | ResumeArg::MatchedConst(_)) => {
+                    // nil == nil = true
+                    yield YieldOp::Jump(fallthrough);
+                },
+                (ResumeArg::Matched | ResumeArg::MatchedConst(_), _) | (_, ResumeArg::Matched | ResumeArg::MatchedConst(_)) => {
+                    // nil == !nil = false
+                    yield YieldOp::Jump(taken);
+                }
+                _ => { unimplemented!() },
+            }
         }
         arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
         arg
@@ -1421,11 +1434,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Context, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
             let thunk_coro = thunk_coro.clone();
-            let orig_ctx = thunk_ctx.clone();
+            let mut orig_ctx = thunk_ctx.clone();
             let hkey = &mut thunk_ctx.hkeys[href.0 as usize];
             debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
             let tab = &state.vals[state.base + idx];
             let LValue::Table(tab) = tab else { unreachable!() };
+            orig_ctx.types[idx] = CType::Type(LType::Nil);
             let Some((index, key, val)) = tab.ro(owner).hash.get_full::<LValue>(&(&hkey.key).into()) else {
                 // The table doesn't have this key, which means we should actually just bailout
                 let fail_block = vm.new_block();
@@ -1515,7 +1529,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 debug!("missing key thunk");
                 // Same as the outer thunk missing the key
                 let fail_block = vm.new_block();
-                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), missing_coro.clone(), ResumeArg::Failed, missing_key) {
+                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), missing_coro.clone(), ResumeArg::Failed, fail_block) {
                     vm.compile(owner, succ_next, succ_ty, fail_block);
                 }
                 vm.blocks[missing_key.0].instructions[thunk_pc] = Residual::Jump(fail_block);
@@ -1764,6 +1778,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // guarded value when forced, and fork the coroutine for the observed case.
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
+                        debug!("emitting discovery thunk");
                         let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, expected, pc, thunk_ctx, true));
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -2185,7 +2200,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0))));
                         }
                         Residual::NativeCall { nf, a, b, c }  => {
-                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("{:p}", nf)); attr!("label", "ncall"))));
+                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("\"{:p}\"", nf)); attr!("label", "ncall"))));
                         },
                         Residual::Guard { .. } | Residual::HashGuard { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
                             if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
