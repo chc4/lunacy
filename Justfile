@@ -100,14 +100,14 @@ gdb-unsafe benchmark: unsafe-compile
 
 
 # Hyperfine reports
-hyperfine benchmark: unsafe-compile interpreter-compile
+hyperfine benchmark times='10': unsafe-compile interpreter-compile
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin bench
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}.md \
-        "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench" \
-        "./target/interpreter/release/bench {{benchmark}}.bin" \
-        "./target/release/bench {{benchmark}}.bin" \
-        "./target/unsafe/bench {{benchmark}}.bin"
+        "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}}" \
+        "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \
+        "./target/release/bench {{benchmark}}.bin {{times}}" \
+        "./target/unsafe/bench {{benchmark}}.bin {{times}}"
 hyperfine-jit benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin bench

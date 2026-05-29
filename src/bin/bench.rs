@@ -4,7 +4,7 @@ use lunacy::Vm;
 use lunacy::chunk;
 use lunacy::vm;
 
-const TIMES: f64 = 10.0;
+const TIMES: usize = 10;
 const LBBV: bool = true;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut owner = TCellOwner::new();
 
     let input = std::env::args().nth(1).ok_or("usage: bench <file>")?;
+    let times: usize = std::env::args().nth(2).map_or_else(|| Ok(TIMES), |s| str::parse(&s[..]))?;
     let bytecode = std::fs::read(input)?;
     let header = chunk::header(&bytecode[..]);
     let intern_strings = internment::Arena::new();
@@ -25,7 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let vm::LValue::LClosure(run_iter) = _g.get(&owner, &vm::InternString::intern(&intern_strings, "run_iter")).ok_or("no run_iter")? else { panic!() };
             println!("> starting benchmark");
-            _r_vals = vm.run::<LBBV>(&mut owner, _g.clone(), run_iter, vec![vm::LValue::Number(vm::Number(TIMES))].into())?;
+            _r_vals = vm.run::<LBBV>(&mut owner, _g.clone(), run_iter, vec![vm::LValue::Number(vm::Number(times as f64))].into())?;
         }
     }
 

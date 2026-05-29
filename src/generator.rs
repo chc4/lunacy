@@ -291,13 +291,17 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 debug!("gettable_href with {:?} {:?}", &witness, t_htype);
                 let tab = &state.vals[state.base + b];
                 let LValue::Table(tab) = tab else { unreachable!() };
-                let (k, val1) = tab.ro(owner).hash.get_index(witness.as_ref().unwrap().index).unwrap();
+                #[cfg(debug_assertions)]
+                let witness = witness.as_ref().unwrap();
+                #[cfg(not(debug_assertions))]
+                let witness = unsafe { witness.as_ref().unwrap_unchecked() };
+                let (k, val1) = tab.ro(owner).hash.get_index(witness.index).unwrap();
 
                 // Sanity check
                 // Move this into make_href_check since we need it attached to the HashKey instead
                 #[cfg(debug_assertions)]
                 {
-                    let val2 = tab.ro(owner).hash.get::<LValue>(&(&witness.as_ref().unwrap().key).into()).unwrap();
+                    let val2 = tab.ro(owner).hash.get::<LValue>(&(&witness.key).into()).unwrap();
                     let full_key = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16);
                     debug!("{:?}", &tab.ro(owner));
                     let Ok(const_key) = full_key else { unreachable!() };
