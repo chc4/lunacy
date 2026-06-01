@@ -599,7 +599,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                 },
                 Residual::Exec(f) => {
-                    let (this_obj, this_vtable, this_call) = get_ptr_from_closure(f.1.as_ref());
+                    let (this_obj, this_vtable, this_call) = get_ptr_from_closure(f.body.as_ref());
                     debug!("JIT memory @ {:?}, operation @ {:#x}, desired {:?}", x, this_call, &mut JitHelper::check_guard as &mut _ as *mut _ as *mut core::ffi::c_void);
                     dynasm!(ops
                         ; .arch x64
