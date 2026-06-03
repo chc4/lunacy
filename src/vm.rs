@@ -1018,10 +1018,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                     // (C-1) values are saved
                     let parent_stack = unsafe { (*self.clos.ro(owner).prototype).max_stack as usize };
                     //vals.extend_from_slice(r_vals.as_slice());
-                    for i in 0..=(c - 2) {
-                        debug!("huh {}", i);
+                    for i in 0..(c - 1) {
+                        debug!("huh {} {:?}", i, r_vals.get(i as usize));
                         // Only copy the correct number of arguments from the CALL
-                        self.vals[rloc + i as usize] = r_vals[i as usize].clone();
+                        self.vals.get_mut(rloc + i as usize).map(|r| *r = r_vals.get(i as usize).unwrap_or(&LValue::Nil).clone());
                     }
                     //assert!(limit >= rloc + c as usize - 1);
                     self.vals.truncate(limit);
@@ -1030,7 +1030,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                     // Multiple return results are saved
                     for (i, v) in r_vals.drain(..).enumerate() {
                         // Only copy the correct number of arguments from the CALL
-                        self.vals[rloc + i] = v;
+                        self.vals.get_mut(rloc + i).map(|r| *r = v);
                     }
                     debug!("{:?} {}", &self.vals, r_count);
                     self.vals.truncate(rloc + r_count);

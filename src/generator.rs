@@ -287,8 +287,9 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Guard(b, LType::Table);
         if arg != ResumeArg::Matched {
+            let have = yield YieldOp::Typeof(b);
             arg = yield YieldOp::Exec(ResidualExec::new("gettable_meta", Rc::new(move |owner, state| {
-                panic!("gettable_meta {:?} {:?}", &state.vals, &state.vals[state.base + b])
+                panic!("gettable_meta {:?} {:?} {:?}", &state.vals, &state.vals[state.base + b], have)
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
             return arg;
@@ -1454,7 +1455,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
             let tab = &state.vals[state.base + idx];
             let LValue::Table(tab) = tab else { unreachable!() };
-            orig_ctx.types[idx] = CType::Type(LType::Nil);
             let Some((index, key, val)) = tab.ro(owner).hash.get_full::<LValue>(&(&hkey.key).into()) else {
                 // The table doesn't have this key, which means we should actually just bailout
                 let fail_block = vm.new_block();
@@ -1850,6 +1850,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // Returned values become unknown
                                 // TODO: compile a type specialized thunk instead? is that better?
                                 for i in 0..(c - 1) {
+                                    //ctx.set_types(owner, vec![(a + i, CType::Type(LType::Unknown))]);
                                     ctx.types[a + i] = CType::Type(LType::Unknown);
                                 }
                                 ctx
@@ -1857,6 +1858,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // Multiple return results are saved
                                 // All types until end of stack are unknown
                                 for i in a..ctx.types.len() {
+                                    //ctx.set_types(owner, vec![(i, CType::Type(LType::Unknown))]);
                                     ctx.types[i] = CType::Type(LType::Unknown);
                                 }
                                 ctx
