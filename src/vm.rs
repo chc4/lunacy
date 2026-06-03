@@ -1201,6 +1201,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         -> Result<FVec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
+        #[cfg(feature = "tracing")]
+        crate::tracing::begin("interpreter", "run", &[]);
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LValue::Nil);
@@ -1633,6 +1635,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         #[cfg(all(feature = "counters", not(test)))] {
             println!("counters after run {:?} instructions {:?}", state.counters, spec.count());
         }
+
+        #[cfg(feature = "tracing")]
+        crate::tracing::end("interpreter", "run", &[]);
 
         #[cfg(feature = "graph")]
         for proto in unsafe { &(*self.top_level).prototypes.items } {

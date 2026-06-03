@@ -16,6 +16,7 @@ unreachable = []
 gas = []
 magic = [] # Magic JIT intrinsics
 perf = [] # Create perf JIT map file
+tracing = []
 gc_sanitize = []
 gc_stress = []
 gc_test = []

@@ -8,6 +8,14 @@ const LBBV: bool = true;
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder().format_timestamp(None).format_source_path(true).init();
+
+    #[cfg(feature = "tracing")]
+    {
+        let path = "lunacy.fxt";
+        lunacy::tracing::init(&path);
+        eprintln!("Tracing to {}", path);
+    }
+
     let mut owner = TCellOwner::new();
 
     let input = std::env::args().nth(1).ok_or("usage: lunacy <file>")?;
@@ -23,6 +31,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let _r_vals = vm.run::<LBBV>(&mut owner, _g.clone(), clos, vec![].into())?;
         }
     }
+
+    #[cfg(feature = "tracing")]
+    lunacy::tracing::flush();
 
     Ok(())
 }
