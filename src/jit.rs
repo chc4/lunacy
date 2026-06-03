@@ -375,8 +375,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         dynasm!(ops
             ; .arch x64
-            ; push rbx
             ; push rbp
+            ; mov rbp, rsp
+            ; push rbx
             ; push r14 // save initial base_ptr
         );
         // TODO: Pin state.vals.as_ptr() to a register, which will let us remove a lot of the
@@ -430,8 +431,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; .arch x64
             ; ->exit_jit:
             ; pop r14
-            ; pop rbp
             ; pop rbx
+            ; pop rbp
             ; ret
         );
         self.jctx.reserve(ops.offset().0 - epilogue.0);

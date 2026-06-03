@@ -1,4 +1,4 @@
-cargo-features = ["panic-immediate-abort"]
+cargo-features = ["panic-immediate-abort", "profile-rustflags"]
 [package]
 name = "lunacy"
 version = "0.1.0"
@@ -56,7 +56,9 @@ panic = "abort"
 lto = "fat"
 strip = false
 debug = true
+rustflags = ["-C", "force-frame-pointers=yes"]
 
 [profile.unsafe]
 inherits = "release"
 panic = "immediate-abort"
+rustflags = []
