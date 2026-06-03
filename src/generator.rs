@@ -1944,17 +1944,47 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off = next_off as usize;
                         continue;
                     } else if next_off == -1 {
+                        #[cfg(feature = "tracing")]
+                        {
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
+                            crate::tracing::instant("jit", "bailout", &[
+                                ("reason", "gas/trap/LuaCall".into()),
+                                ("block_id", next_id.into()),
+                                ("source", source.as_str().into()),
+                                ("line", (line as u64).into())
+                            ]);
+                        }
                         debug!("jit bail 1 from {next_id}");
                         state.trap = false;
                         id = BlockId(next_id as usize);
                         off = state.current_off as usize;
                         // Fallthrough to continue post-trap in the interpreter
                     } else if next_off == -2 {
+                        #[cfg(feature = "tracing")]
+                        {
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
+                            crate::tracing::instant("jit", "bailout", &[
+                                ("reason", "Ret".into()),
+                                ("block_id", next_id.into()),
+                                ("source", source.as_str().into()),
+                                ("line", (line as u64).into())
+                            ]);
+                        }
                         debug!("jit bail 2 from {next_id}");
                         id = BlockId(next_id as usize);
                         off = state.current_off as usize;
                         // Fallthrough to handle RET
                     } else if next_off == -3 {
+                        #[cfg(feature = "tracing")]
+                        {
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
+                            crate::tracing::instant("jit", "bailout", &[
+                                ("reason", "Select".into()),
+                                ("block_id", next_id.into()),
+                                ("source", source.as_str().into()),
+                                ("line", (line as u64).into())
+                            ]);
+                        }
                         debug!("jit bail 3 from {next_id}");
                         off = state.current_off as usize;
                         let Residual::Select(ref paths) = self.blocks[id.0].instructions[off] else { panic!() };
@@ -1962,6 +1992,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off = 0;
                         continue;
                     } else if next_off == -4 {
+                        #[cfg(feature = "tracing")]
+                        {
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
+                            crate::tracing::instant("jit", "bailout", &[
+                                ("reason", "Thunk".into()),
+                                ("block_id", next_id.into()),
+                                ("source", source.as_str().into()),
+                                ("line", (line as u64).into())
+                            ]);
+                        }
                         debug!("jit bail 4 from {next_id}");
                         state.trap = false;
                         id = BlockId(next_id as usize);
@@ -1970,6 +2010,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // thunk at offset=0, we don't want to jump back to the JIT again.
                     } else if next_off == -5 {
                         // Returning to interpreter
+                        #[cfg(feature = "tracing")]
+                        {
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
+                            crate::tracing::instant("jit", "bailout", &[
+                                ("reason", "interpreter".into()),
+                                ("block_id", next_id.into()),
+                                ("source", source.as_str().into()),
+                                ("line", (line as u64).into())
+                            ]);
+                        }
                         debug!("jit bailout to interpreter");
                         return (state, None);
                     }

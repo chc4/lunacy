@@ -121,4 +121,21 @@ hyperfine-unsafe benchmark: unsafe-compile
 
 hyperfines: (hyperfine "binarytrees") (hyperfine "life") (run "nbody")
 
+trace name:
+    luac5.1 -o {{name}}.bin {{name}}.lua
+    rm -f lunacy.fxt
+    cargo run --features tracing --bin lunacy -- {{name}}.bin
+    @echo "Trace written to lunacy.fxt. Open it in https://ui.perfetto.dev"
+    python3 scripts/verify_perfetto.py lunacy.fxt
+
+trace-benchmark benchmark:
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    rm -f lunacy.fxt
+    cargo run --release --features tracing --bin bench -- {{benchmark}}.bin
+    @echo "Trace written to lunacy.fxt. Open it in https://ui.perfetto.dev"
+    python3 scripts/verify_perfetto.py lunacy.fxt
+
+show-trace:
+    python3 scripts/verify_perfetto.py lunacy.fxt
+
 all: test benchmarks (hyperfine "binarytrees")

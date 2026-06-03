@@ -1072,6 +1072,10 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
 impl<'src, 'intern> Vm<'src, 'intern> {
     pub fn new(top_level: LProto<'src, 'intern>) -> Self {
         Heap::init();
+        #[cfg(feature = "tracing")]
+        {
+            crate::tracing::init("lunacy.fxt");
+        }
         Self { top_level }
     }
 
@@ -1180,6 +1184,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         _g
     }
 
+    pub fn info(proto: LProto<'src, 'intern>) -> (String, u32) {
+        unsafe {
+            let source = String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "");
+            let line = (*proto).line_defined;
+            (source, line)
+        }
+    }
+
     pub fn rk<'exec>(proto: LProto<'src, 'intern>, base: usize, vals: &'exec ValueStack<'src, 'intern>, r: u16)
         -> Result<&'exec LConstant<'src, 'intern>, &'exec LValue<'src, 'intern>>
     {
@@ -1201,6 +1213,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         -> Result<FVec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
+        #[cfg(feature = "tracing")]
+        crate::tracing::begin("interpreter", "run", &[]);
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LValue::Nil);
@@ -1632,6 +1646,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         };
         #[cfg(all(feature = "counters", not(test)))] {
             println!("counters after run {:?} instructions {:?}", state.counters, spec.count());
+        }
+
+        #[cfg(feature = "tracing")]
+        {
+            crate::tracing::end("interpreter", "run", &[]);
+            crate::tracing::flush();
         }
 
         #[cfg(feature = "graph")]

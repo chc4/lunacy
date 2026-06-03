@@ -14,6 +14,8 @@ pub mod perf;
 pub mod generator;
 pub mod jit;
 pub mod gc;
+#[cfg(feature = "tracing")]
+pub mod tracing;
 
 pub use vm::Vm;
 pub use qcell::{TCell, TCellOwner};

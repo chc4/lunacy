@@ -366,6 +366,8 @@ impl JitContext {
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn jit_compile(&mut self, id: BlockId, owner: &mut TCellOwner<TcOwner>) {
+        #[cfg(feature = "tracing")]
+        crate::tracing::begin("jit", "compile", &[("block_id", id.0.into())]);
         debug!("JIT compiling block {:?}", id);
         let base = self.jctx.end();
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
@@ -443,12 +445,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let Some(slab) = self.jctx.commit(base, buf.as_slice()) else { panic!() };
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
 
-        let (source, line) = {
-            let proto = self.clos.ro(owner).prototype;
-            let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
-            let line = unsafe { (*proto).line_defined };
-            (source, line)
-        };
+        #[cfg(any(feature = "perf", feature = "tracing"))]
+        let (source, line) = Vm::info(self.clos.ro(owner).prototype);
 
         #[cfg(feature = "perf")]
         {
@@ -463,6 +461,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
 
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
+        #[cfg(feature = "tracing")]
+        crate::tracing::end("jit", "compile", &[
+            ("source", source.as_str().into()),
+            ("line", (line as u64).into())
+        ]);
     }
 
     /// JIT compile one block, returning the JIT code offset and optionally the next block to
