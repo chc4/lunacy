@@ -1,6 +1,6 @@
 | Command | Mean [s] | Min [s] | Max [s] | Relative |
 |:---|---:|---:|---:|---:|
-| `lua5.1 bench.lua -- lua_benchmarking/benchmarks/nbody/bench 10` | 4.176 ± 0.033 | 4.090 | 4.199 | 1.06 ± 0.02 |
-| `./target/interpreter/release/bench nbody.bin 10` | 11.441 ± 0.049 | 11.381 | 11.513 | 2.90 ± 0.04 |
-| `./target/release/bench nbody.bin 10` | 4.456 ± 0.044 | 4.399 | 4.528 | 1.13 ± 0.02 |
-| `./target/unsafe/bench nbody.bin 10` | 3.950 ± 0.052 | 3.894 | 4.077 | 1.00 |
+| `lua5.1 bench.lua -- lua_benchmarking/benchmarks/nbody/bench 10` | 4.181 ± 0.065 | 4.122 | 4.358 | 1.07 ± 0.02 |
+| `./target/interpreter/release/bench nbody.bin 10` | 10.935 ± 0.056 | 10.880 | 11.025 | 2.81 ± 0.02 |
+| `./target/release/bench nbody.bin 10` | 4.232 ± 0.024 | 4.202 | 4.266 | 1.09 ± 0.01 |
+| `./target/unsafe/bench nbody.bin 10` | 3.890 ± 0.027 | 3.852 | 3.943 | 1.00 |

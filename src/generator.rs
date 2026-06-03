@@ -1175,14 +1175,15 @@ pub struct Specializer<'src, 'intern> {
 
     pub versions: std::collections::HashMap<
         LProto<'src, 'intern>,
-        std::collections::HashMap<(SubPc, Context), BlockId>, InternedHasher>,
+        std::collections::HashMap<(SubPc, Rc<Context>), BlockId>, InternedHasher>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
     fn mark(&self, owner: &TCellOwner<TcOwner>) {
         self.clos.mark(owner);
         for (proto, versions) in &self.versions {
-            for ((subpc, context), blockid) in versions {
+            for (key, blockid) in versions {
+                let (subpc, context) = key.deref();
                 (*context).mark(owner);
             }
         }
@@ -1200,7 +1201,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Create a new block at a Lua bytecode PC
-    pub fn block(&mut self, owner: &mut TCellOwner<TcOwner>, entry: Pc, ctx: Context) -> BlockId {
+    pub fn block(&mut self, owner: &mut TCellOwner<TcOwner>, entry: Pc, ctx: Rc<Context>) -> BlockId {
         let mut pc = entry;
 
         let block_id = self.new_block();
@@ -1214,7 +1215,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         return block_id;
     }
 
-    pub fn subblock(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: Context, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
+    pub fn subblock(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: Rc<Context>, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
         if let Some(exists) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(pc, ctx.clone())) {
             return exists.clone();
         }
@@ -1235,12 +1236,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
 
     /// Return a specialized block for a given PC and context, compiling a new one if necessary
-    pub fn find(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: &Context) -> Option<BlockId>
+    pub fn find(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: &Rc<Context>) -> Option<BlockId>
     {
         self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(pc, ctx.clone())).cloned()
     }
 
-    pub fn compile(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut ctx: Context, block_id: BlockId) -> Context {
+    pub fn compile(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
         loop {
             let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
@@ -1377,7 +1378,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, thunk_ctx: Context, appends: bool) -> ThunkRef {
+    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
             // The thunk was forced, so now we know the runtime value and if it
@@ -1394,8 +1395,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // our git history.
             let mut thunk_coro  = thunk_coro.clone();
             let runtime_type = state.vals[state.base + idx].typeof_();
-            let mut forced_ctx = thunk_ctx.clone();
-            forced_ctx.types[idx] = CType::Type(runtime_type);
+            let mut forced_ctx = thunk_ctx.clone();;
+            let mut forced_mut = Rc::make_mut(&mut forced_ctx);
+            forced_mut.types[idx] = CType::Type(runtime_type);
             debug!("forcing thunk with {:?} == {:?}", runtime_type, expected);
             let arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
             // TODO: search for if we already have a compatible block
@@ -1417,8 +1419,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let CType::NativeFunction(nf) = &idx_ctype {
                 // We know this original value has the correct native function, and so can compile
                 // a block for it immediately.
-                forced_ctx.types[idx] = idx_ctype.clone();
-                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
+                forced_mut.types[idx] = idx_ctype.clone();
+                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx, thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
                 // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
                 // we have to do this all over again with the newly observed type (up to our block
@@ -1432,14 +1434,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
             } else if let CType::LuaFunction(lclos) = &idx_ctype {
                 // Likewise we can do the same thing with statically known Lua functions
-                forced_ctx.types[idx] = idx_ctype.clone();
-                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
+                forced_mut.types[idx] = idx_ctype.clone();
+                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx, thunk_coro, arg);
                 let proto = lclos.ro(owner).prototype.cast();
                 vm.blocks[block_id.0].instructions.push(Residual::LuaGuard { idx, ptr: proto });
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
             } else {
-                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx.clone(), thunk_coro, arg);
+                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx, thunk_coro, arg);
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
             }
 
@@ -1447,11 +1449,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Context, appends: bool) -> ThunkRef {
+    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
             let thunk_coro = thunk_coro.clone();
             let mut orig_ctx = thunk_ctx.clone();
-            let hkey = &mut thunk_ctx.hkeys[href.0 as usize];
+            let thunk_mut = Rc::make_mut(&mut thunk_ctx);
+            let hkey = &mut thunk_mut.hkeys[href.0 as usize];
             debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
             let tab = &state.vals[state.base + idx];
             let LValue::Table(tab) = tab else { unreachable!() };
@@ -1485,10 +1488,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // array.
 
             // Now transition into the populated hkey
-            if let CType::Shape(existing) = &mut thunk_ctx.types[idx] {
+            if let CType::Shape(existing) = &mut thunk_mut.types[idx] {
                 existing.push(href)
             } else {
-                thunk_ctx.types[idx] = CType::Shape(vec![href].into());
+                thunk_mut.types[idx] = CType::Shape(vec![href].into());
             }
             let init_key = hkey.key.clone();
             let href_init = Residual::Exec(ResidualExec::new("href_init", Rc::new(move |owner, state| {
@@ -1558,7 +1561,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_epoch_check(&mut self, owner: &mut TCellOwner<TcOwner>, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Context, success_block: BlockId) {
+    fn make_epoch_check(&mut self, owner: &mut TCellOwner<TcOwner>, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId) {
         // In order to assert that an href is still valid, we need to check that the witnessed
         // epoch is still the same: if so, all of its keys still have the same type as the
         // cached hashkey, and no additional hashkeys were inserted (which may otherwise cause
@@ -1602,7 +1605,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
     }
 
-    pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut ctx: Context, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Context, ResumeArg)>
+    pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
         loop {
@@ -1636,7 +1639,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // a chance the unknown static type is in fact still our old type and
                     // we just didn't know, and if there is a runtime mismatch we will hit
                     // a type guard anyway.
-                    let hkey = &mut ctx.hkeys[href.0 as usize];
+                    let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
                     if *ty != CType::Type(LType::Unknown) {
                         hkey.known_type = ty.clone();
                     }
@@ -1692,7 +1695,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         // If we check the epoch and it still holds, we'll have
                                         // cleared any optimzation hazards until its potentially
                                         // invallidated.
-                                        holds_ctx.hkeys[cached.0 as usize].hazards[idx] = true;
+                                        Rc::make_mut(&mut holds_ctx).hkeys[cached.0 as usize].hazards[idx] = true;
                                         let holds_block = self.subblock(owner, pc.next_true(), holds_ctx.clone(), coro.clone(), arg);
                                         self.make_epoch_check(owner, block_id, coro.clone(), idx, cached.clone(), pc, ctx.clone(), holds_block);
 
@@ -1720,7 +1723,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
                         // Try to find an orphaned HashKey slot to re-use
                         let href;
-                        if let Some((i, hkey)) = ctx.hkeys.iter_mut().enumerate().find(|(i, hk)| hk.known_type == CType::Type(LType::Unknown)) {
+                        if let Some((i, hkey)) = Rc::make_mut(&mut ctx).hkeys.iter_mut().enumerate().find(|(i, hk)| hk.known_type == CType::Type(LType::Unknown)) {
                             href = HashRef(i as u8);
                             *hkey = HashKey { idx, key: k_val.clone(), known_type: CType::Type(LType::Unknown), hazards: Default::default() };
                         } else {
@@ -1730,7 +1733,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let hkey = HashKey { idx, key: k_val.clone(), known_type: CType::Type(LType::Unknown), hazards: Default::default() };
                             #[cfg(debug_assertions)]
                             assert_eq!(ctx.hkeys.iter().filter(|exist| **exist == hkey).next(), None);
-                            ctx.hkeys.push(hkey.clone());
+                            Rc::make_mut(&mut ctx).hkeys.push(hkey.clone());
                         }
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
@@ -1851,7 +1854,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // TODO: compile a type specialized thunk instead? is that better?
                                 for i in 0..(c - 1) {
                                     //ctx.set_types(owner, vec![(a + i, CType::Type(LType::Unknown))]);
-                                    ctx.types[a + i] = CType::Type(LType::Unknown);
+                                    Rc::make_mut(&mut ctx).types[a + i] = CType::Type(LType::Unknown);
                                 }
                                 ctx
                             } else {
@@ -1859,7 +1862,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // All types until end of stack are unknown
                                 for i in a..ctx.types.len() {
                                     //ctx.set_types(owner, vec![(i, CType::Type(LType::Unknown))]);
-                                    ctx.types[i] = CType::Type(LType::Unknown);
+                                    Rc::make_mut(&mut ctx).types[i] = CType::Type(LType::Unknown);
                                 }
                                 ctx
                             };
@@ -1869,13 +1872,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::SetTypes(mut ty_effects)) => {
-                    ctx.set_types(owner, ty_effects.drain(..).map(|(idx, ty)| (idx, CType::Type(ty))).collect())
+                    Rc::make_mut(&mut ctx).set_types(owner, ty_effects.drain(..).map(|(idx, ty)| (idx, CType::Type(ty))).collect())
                 },
                 CoroutineState::Yielded(YieldOp::SetHazards(idx, href)) => {
-                    ctx.set_hazards(idx, href)
+                    Rc::make_mut(&mut ctx).set_hazards(idx, href)
                 },
                 CoroutineState::Yielded(YieldOp::SetCTypes(ty_effects)) => {
-                    ctx.set_types(owner, ty_effects)
+                    Rc::make_mut(&mut ctx).set_types(owner, ty_effects)
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
                     if let Some(exists) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(SubPc::new(dest_pc), ctx.clone())) {
@@ -2065,12 +2068,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // Either use existing block, compile a new one, or use most
                     // generic.
                     let types = vec![LType::Unknown; next_stack];
-                    let ctx = Context::new(types);
+                    let ctx = Rc::new(Context::new(types));
                     let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
                     let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                         *block
                     } else {
-                        debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, ctx);
+                        debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, &ctx);
                         self.set_current(lclos.clone());
                         self.block(owner, 0, ctx)
                     };
@@ -2096,12 +2099,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Either use existing block, compile a new one, or use most
                         // generic.
                         let types = vec![LType::Unknown; next_stack];
-                        let ctx = Context::new(types);
+                        let ctx = Rc::new(Context::new(types));
                         let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
                         let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                             *block
                         } else {
-                            debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, ctx);
+                            debug!("compiling fresh callsite {:?} {:?}", unsafe { &(*lclos.ro(owner).prototype).source }, &ctx);
                             self.set_current(lclos.clone());
                             self.block(owner, 0, ctx)
                         };

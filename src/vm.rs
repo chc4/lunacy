@@ -1582,7 +1582,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             // Lazy basic block versioning
                             // TODO: only run LBBV for hot code
                             let types = vec![LType::Unknown; next_stack];
-                            let ctx = Context::new(types);
+                            let ctx = Rc::new(Context::new(types));
                             let versions = spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
                             let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                                 *block

@@ -1,5 +1,6 @@
 #![allow(unused_parens)]
 use std::io::Write;
+use std::rc::Rc;
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
 use qcell::{TCell, TCellOwner};
@@ -654,7 +655,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // TODO: For now look up if there is a JIT block for the entrypoint with no known types
                     let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack.into() };
                     let types = vec![LType::Unknown; next_stack];
-                    let ctx = Context::new(types);
+                    let ctx = Rc::new(Context::new(types));
                     let versions = self.versions.get(&lclos.ro(owner).prototype).unwrap();
                     let entry: Option<*const ()> = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                         self.blocks[block.0].jit_info.entry.map(|f| f as *const _)
