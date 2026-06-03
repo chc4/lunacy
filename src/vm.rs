@@ -1072,6 +1072,10 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
 impl<'src, 'intern> Vm<'src, 'intern> {
     pub fn new(top_level: LProto<'src, 'intern>) -> Self {
         Heap::init();
+        #[cfg(feature = "tracing")]
+        {
+            crate::tracing::init("lunacy.fxt");
+        }
         Self { top_level }
     }
 
@@ -1178,6 +1182,14 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             Heap::root(&mut _g.0, owner);
         }
         _g
+    }
+
+    pub fn info(proto: LProto<'src, 'intern>) -> (String, u32) {
+        unsafe {
+            let source = String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "");
+            let line = (*proto).line_defined;
+            (source, line)
+        }
     }
 
     pub fn rk<'exec>(proto: LProto<'src, 'intern>, base: usize, vals: &'exec ValueStack<'src, 'intern>, r: u16)
@@ -1637,7 +1649,10 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
 
         #[cfg(feature = "tracing")]
-        crate::tracing::end("interpreter", "run", &[]);
+        {
+            crate::tracing::end("interpreter", "run", &[]);
+            crate::tracing::flush();
+        }
 
         #[cfg(feature = "graph")]
         for proto in unsafe { &(*self.top_level).prototypes.items } {

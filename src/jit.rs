@@ -444,12 +444,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
 
         #[cfg(any(feature = "perf", feature = "tracing"))]
-        let (source, line) = {
-            let proto = self.clos.ro(owner).prototype;
-            let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
-            let line = unsafe { (*proto).line_defined };
-            (source, line)
-        };
+        let (source, line) = Vm::info(self.clos.ro(owner).prototype);
 
         #[cfg(feature = "perf")]
         {

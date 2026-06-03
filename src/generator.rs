@@ -1943,9 +1943,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else if next_off == -1 {
                         #[cfg(feature = "tracing")]
                         {
-                            let proto = state.clos.ro(owner).prototype;
-                            let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
-                            let line = unsafe { (*proto).line_defined };
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
                             crate::tracing::instant("jit", "bailout", &[
                                 ("reason", "gas/trap/LuaCall".into()),
                                 ("block_id", next_id.into()),
@@ -1961,9 +1959,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else if next_off == -2 {
                         #[cfg(feature = "tracing")]
                         {
-                            let proto = state.clos.ro(owner).prototype;
-                            let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
-                            let line = unsafe { (*proto).line_defined };
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
                             crate::tracing::instant("jit", "bailout", &[
                                 ("reason", "Ret".into()),
                                 ("block_id", next_id.into()),
@@ -1978,9 +1974,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else if next_off == -3 {
                         #[cfg(feature = "tracing")]
                         {
-                            let proto = state.clos.ro(owner).prototype;
-                            let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
-                            let line = unsafe { (*proto).line_defined };
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
                             crate::tracing::instant("jit", "bailout", &[
                                 ("reason", "Select".into()),
                                 ("block_id", next_id.into()),
@@ -1997,9 +1991,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else if next_off == -4 {
                         #[cfg(feature = "tracing")]
                         {
-                            let proto = state.clos.ro(owner).prototype;
-                            let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
-                            let line = unsafe { (*proto).line_defined };
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
                             crate::tracing::instant("jit", "bailout", &[
                                 ("reason", "Thunk".into()),
                                 ("block_id", next_id.into()),
@@ -2017,9 +2009,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Returning to interpreter
                         #[cfg(feature = "tracing")]
                         {
-                            let proto = state.clos.ro(owner).prototype;
-                            let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
-                            let line = unsafe { (*proto).line_defined };
+                            let (source, line) = Vm::info(state.clos.ro(owner).prototype);
                             crate::tracing::instant("jit", "bailout", &[
                                 ("reason", "interpreter".into()),
                                 ("block_id", next_id.into()),

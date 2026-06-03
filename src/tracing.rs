@@ -1,3 +1,6 @@
+// Derived from Ruby's ZJIT stats.rs under the Ruby license (Clause 4).
+// Source: https://github.com/ruby/ruby/blob/master/zjit/src/stats.rs
+
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
@@ -98,10 +101,10 @@ impl Tracer {
         }
 
         let mut arg_words = 0;
-        for (_, val_ref, _) in &frame_refs {
+        for (_, val_ref, u64_val) in &frame_refs {
             if val_ref.is_some() {
                 arg_words += 1;
-            } else {
+            } else if u64_val.is_some() {
                 arg_words += 2;
             }
         }
