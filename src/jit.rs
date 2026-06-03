@@ -385,6 +385,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut compiled_offsets = Vec::new();
         // We may have already JIT this block, if it was jumped to by another block
         // first. In that case we just have to jump to it.
+        let mut successor = None;
         if let Some(block_ptr) = self.jctx.blocks.get(&id) {
             dynasm!(ops
             ; jmp extern block_ptr.0 as usize
@@ -394,7 +395,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
             self.jctx.blocks.insert(id, new_block);
             let start_off = ops.offset().0;
-            let _block = self.jit_block(id, &mut ops, owner);
+            let (_block, entry_succ) = self.jit_block(id, &mut ops, owner);
+            successor = entry_succ;
             compiled_offsets.push((id, start_off, ops.offset().0));
         }
 
@@ -404,7 +406,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.reserve(end.0);
 
         // Now we need to go through and also compile all of the pending labels for other blocks.
-        while let Some((pending_block, pending_label)) = self.jctx.pending.pop_first() {
+        loop {
+            // Try to use the successor label first, if it exists
+            // Else pop the next pending
+            // If there are none remaining, we're done.
+            let successor_pair = successor.and_then(|succ| self.jctx.pending.remove(&succ).map(|label| (succ, label)));
+            let Some((pending_block, pending_label)) = successor_pair.or_else(|| self.jctx.pending.pop_first()) else { break };
             debug!("pending block {:?} {:?}", pending_block.0, pending_label);
             let pending_ptr = self.jctx.end();
             let pending_start = ops.offset();
@@ -412,10 +419,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             dynasm!(ops
                 ; =>pending_label
             );
-            let _block = self.jit_block(pending_block, &mut ops, owner);
+            let (_block, next_succ) = self.jit_block(pending_block, &mut ops, owner);
+            successor = next_succ;
             compiled_offsets.push((pending_block, pending_start.0, ops.offset().0));
             self.jctx.reserve(ops.offset().0 - pending_start.0);
         }
+
+        let epilogue = ops.offset();
+        dynasm!(ops
+            ; .arch x64
+            ; ->exit_jit:
+            ; pop r14
+            ; pop rbp
+            ; pop rbx
+            ; ret
+        );
+        self.jctx.reserve(ops.offset().0 - epilogue.0);
 
         debug!("drained pending");
         let buf = ops.finalize().unwrap();
@@ -444,26 +463,36 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
     }
 
-    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, owner: &mut TCellOwner<TcOwner>) -> AssemblyOffset {
+    /// JIT compile one block, returning the JIT code offset and optionally the next block to
+    /// compile.
+    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, owner: &mut TCellOwner<TcOwner>) -> (AssemblyOffset, Option<BlockId>) {
+        // We try to bias the default exit as the next block to compile. This is only a suggestion,
+        // and doesn't affect correctness; `GUARD; JMP failure; RET;` for example may say that
+        // `failure` is the "next block" despite not quite being correct.
+        let mut successor = None;
         let entry = ops.offset();
         let x = self.jctx.memory.get_mut().as_ptr();
         let block = &self.blocks[id.0];
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
 
-        let mut emit_jump = |ops: &mut Assembler, target: &BlockId| {
+        let mut emit_jump = |ops: &mut Assembler, target: &BlockId, skip: bool| {
             if let Some(target_ptr) = self.jctx.blocks.get(target) {
                 // We already JIT compiled the block, and can jump to it directly.
-                dynasm!(ops
-                    ; jmp extern target_ptr.0 as usize
-                );
+                if !skip {
+                    dynasm!(ops
+                        ; jmp extern target_ptr.0 as usize
+                    );
+                }
             } else {
                 // The block could already be pending from another block in this assembler
                 // set. Use it if it already exists, otherwise create a new label for our
                 // relocation.
                 let pending_label = self.jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
-                dynasm!(ops
-                    ; jmp =>*pending_label
-                );
+                if !skip {
+                    dynasm!(ops
+                        ; jmp =>*pending_label
+                    );
+                }
             }
         };
 
@@ -477,7 +506,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ; mov WORD r13 => RunState.current_off, (off as i16)
                     ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                     ; mov BYTE r13 => RunState.trap, 1
-                    ; jmp >exit_jit
+                    ; jmp ->exit_jit
                 );
             } else {
                 // Fallback to interpreter for other residuals
@@ -485,7 +514,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ; .arch x64
                     ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
                     ; mov BYTE r13 => RunState.trap, 1
-                    ; jmp >exit_jit
+                    ; jmp ->exit_jit
                 );
             }
         };
@@ -503,7 +532,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; ja >have_gas
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                 ; mov BYTE r13 => RunState.trap, 1
-                ; jmp >exit_jit
+                ; jmp ->exit_jit
                 ; have_gas:
             );
             loop { match res {
@@ -616,7 +645,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jz >no_trap
                         //// Trap 4 so specializer can handle it
                         ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
-                        ; jmp >exit_jit
+                        ; jmp ->exit_jit
                         ; no_trap:
                     );
                 },
@@ -653,7 +682,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // if so, unwinding our native stack but yielding to the generator run loop
                                 // with a suspended ReturnLocation stack.
                                 ; cmp BYTE r13 => RunState.trap, 0
-                                ; jnz >exit_jit
+                                ; jnz ->exit_jit
 
                                 // Reload the correct base ptr for the remainder of our function
                             );
@@ -688,7 +717,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                 },
                 Residual::Jump(target) => {
-                    emit_jump(ops, target);
+                    // If the block ends in a jump, and the block hasn't already been emitted, then
+                    // we can elide a jump and instead fallthrough. We will use the target as
+                    // `successor`, and so the JIT worklist will compile it immediately after this
+                    // code.
+                    emit_jump(ops, target,
+                        off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none());
+                    successor = Some(*target);
                 },
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
@@ -698,7 +733,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rdx, WORD (*b as i32)
                         ; mov rcx, r14 // base_ptr
                         ; call extern (JitHelper::lua_return as *const () as usize)
-                        ; jmp >exit_jit
+                        ; jmp ->exit_jit
                     );
                 },
                 Residual::Select(targets) => {
@@ -710,7 +745,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; cmp rax, i as i32
                             ; jnz >next_target
                         );
-                        emit_jump(ops, &target.1);
+                        emit_jump(ops, &target.1, false);
                         dynasm!(ops
                             ; next_target:
                         );
@@ -725,7 +760,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov WORD r13 => RunState.current_off, (off as i16)
                         ; mov rax, QWORD (((-4i32 as u64) << 32 | (id.0 as u64)) as i64)
                         ; mov BYTE r13 => RunState.trap, 1
-                        ; jmp >exit_jit
+                        ; jmp ->exit_jit
                     );
                 },
                 _ => {
@@ -734,16 +769,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }; break; }
         }
 
-        dynasm!(ops
-            ; .arch x64
-            ; ud2
-            ; exit_jit:
-            ; pop r14
-            ; pop rbp
-            ; pop rbx
-            ; ret
-        );
-        entry
+        (entry, successor)
     }
 }
 
