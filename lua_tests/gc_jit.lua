@@ -1,30 +1,32 @@
--- Exercise the GC on the *native JIT* code path. `build` allocates a large live
--- table of subtables, mutates it, and reads it back -- all opcodes the block
--- specializer implements. We warm it up once (to populate the LBBV blocks), then
--- use the `__jit` magic intrinsic to force native compilation of those blocks, so
--- the subsequent calls run table allocation / mutation / GC safepoints through the
--- JIT. Under gc_stress + gc_sanitize this catches any write-barrier miss on the
--- JIT path (a reclaimed-but-live object would panic "value is dead").
-local function build(n)
-  local root = {}
-  for i = 1, n do
-    root[i] = { i, i * 2, i * 3 }
+-- Exercise the write barrier on the *native JIT* code path. `root` is a global, so
+-- it's permanently reachable via _G and gets marked black by the collector. The
+-- JIT-compiled `insert` stores freshly-allocated (white) subtables into that black
+-- `root` via SETTABLE while collection is in progress -- exactly the case the backward
+-- write barrier exists for. If the JIT path missed the barrier, `root` would stay black
+-- pointing at a white child, the child would be swept, and reading it back below would
+-- yield the wrong sum (or panic "value is dead" under gc_sanitize).
+root = {}
+
+function insert(base, count)
+  local r = root
+  for i = 1, count do
+    r[base + i] = { base + i } -- SETTABLE into the long-lived (black) root
   end
-  local s = 0
-  for i = 1, n do
-    s = s + root[i][1] + root[i][2] + root[i][3]
-  end
-  return s
 end
 
-build(50)        -- warmup: saturate the LBBV blocks so __jit has blocks to compile
-build.__jit = 1  -- force native JIT compilation of build's blocks
+insert(0, 1)      -- warmup: run the loop body once so its LBBV block exists to compile
+insert.__jit = 1  -- force native JIT compilation of `insert`
+collectgarbage("collect")
 
-local total = 0
-for k = 1, 3 do
-  total = total + build(800)
-  collectgarbage("step")
+for batch = 0, 9 do
+  insert(batch * 1000, 1000) -- JIT-compiled SETTABLEs into the black root
+  collectgarbage("step")     -- interleave marking with the mutations (barrier path)
 end
 collectgarbage("collect")
+
+local total = 0
+for k = 1, 10000 do
+  total = total + root[k][1]
+end
 print(total)
--- EXPECT: 5767200
+-- EXPECT: 50005000
