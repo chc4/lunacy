@@ -528,11 +528,19 @@ impl Heap {
         }
     }
 
-    /// Synchronously run a full collection to completion. Finishes any in-progress
-    /// incremental cycle. Private worker behind the `GcCtx` token.
+    /// Synchronously run a full collection, reclaiming *all* currently-unreachable
+    /// objects. Private worker behind the `GcCtx` token.
+    ///
+    /// Runs two cycles (like Lua's `luaC_fullgc`). The first finishes any in-progress
+    /// incremental cycle; but objects that became unreachable *during* that cycle were
+    /// already shaded and so are retained as floating garbage. The second cycle starts
+    /// fresh (they are white again) and reclaims them, so a single
+    /// `collectgarbage("collect")` frees everything dead at the call, matching Lua.
     unsafe fn full_collect_inner(owner: &TCellOwner<TcOwner>) {
         let heap = hp();
         unsafe {
+            (*heap).phase = Phase::Mark;
+            Self::finish(owner);
             (*heap).phase = Phase::Mark;
             Self::finish(owner);
         }
