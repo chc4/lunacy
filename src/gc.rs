@@ -186,12 +186,6 @@ impl<T> Gc<T> {
             // Born white; swept next cycle unless reached. See Note [Incremental GC].
             color: Cell::new(WHITE),
             size,
-            // Shades this object's immediate children: `val.mark` reaches each child `Gc`,
-            // whose `mark` enqueues rather than recurses, so this visits exactly one level.
-            scan: |erased, owner| unsafe {
-                let typed = erased as *const GcInner<T>;
-                (*typed).val.mark(owner);
-            },
             #[cfg(feature = "gc_sanitize")]
             finalize: |ptr| unsafe {
                 let ptr = ptr.cast::<GcInner<T>>();
@@ -253,7 +247,7 @@ impl<T> Gc<T> {
         unsafe {
             if (*inner).color.get() == BLACK {
                 (*inner).color.set(GRAY);
-                push_grayagain(inner as *const GcInner<()>);
+                push_grayagain(inner as *const GcInner<()>, scan_thunk::<T>);
             }
         }
     }
@@ -304,7 +298,7 @@ impl<T> Mark for Gc<T> {
         unsafe {
             if (*inner).color.get() == WHITE {
                 (*inner).color.set(GRAY);
-                push_gray(inner as *const GcInner<()>);
+                push_gray(inner as *const GcInner<()>, scan_thunk::<T>);
             }
         }
     }
@@ -314,12 +308,21 @@ impl<T> Mark for Gc<T> {
 struct GcInner<T: ?Sized> {
     next: AtomicPtr<GcInner<()>>,
     finalize: fn(*mut GcInner<()>),
-    scan: fn(*const GcInner<()>, &TCellOwner<TcOwner>),
     color: Cell<u8>,
     size: usize,
     #[cfg(feature = "gc_sanitize")]
     alive: AtomicBool,
     val: T,
+}
+
+/// Shades an object's immediate children. Carried in the worklist entry (not in `GcInner`)
+/// since only worklisted objects are scanned and every push site knows the concrete type.
+type ScanFn = fn(*const GcInner<()>, &TCellOwner<TcOwner>);
+
+/// Monomorphized `ScanFn` for `GcInner<T>`: `val.mark` reaches each child `Gc`, whose
+/// `mark` enqueues rather than recurses, so this visits exactly one level.
+fn scan_thunk<T: Mark>(erased: *const GcInner<()>, owner: &TCellOwner<TcOwner>) {
+    unsafe { (*(erased as *const GcInner<T>)).val.mark(owner) }
 }
 
 /// Type-erased pointer to a published root plus its shade thunk. See Note [GC roots].
@@ -344,23 +347,23 @@ fn hp() -> *mut Heap {
 }
 
 #[inline]
-fn push_gray(ptr: *const GcInner<()>) {
-    unsafe { (*hp()).gray.push(ptr); }
+fn push_gray(ptr: *const GcInner<()>, scan: ScanFn) {
+    unsafe { (*hp()).gray.push((ptr, scan)); }
 }
 
 /// Enqueue onto `grayagain`. See Note [Write barriers].
 #[inline]
-fn push_grayagain(ptr: *const GcInner<()>) {
-    unsafe { (*hp()).grayagain.push(ptr); }
+fn push_grayagain(ptr: *const GcInner<()>, scan: ScanFn) {
+    unsafe { (*hp()).grayagain.push((ptr, scan)); }
 }
 
 pub struct Heap {
     top: AtomicPtr<GcInner<()>>,
     roots: BTreeMap<*const (), (Box<dyn Mark>, usize)>,
-    /// Gray objects awaiting scanning.
-    gray: Vec<*const GcInner<()>>,
+    /// Gray objects awaiting scanning, each with its scan thunk.
+    gray: Vec<(*const GcInner<()>, ScanFn)>,
     /// Tables reverted by the backward barrier, drained in `finish`. See Note [Write barriers].
-    grayagain: Vec<*const GcInner<()>>,
+    grayagain: Vec<(*const GcInner<()>, ScanFn)>,
     phase: Phase,
     /// Live bytes tracked by the collector.
     total_bytes: usize,
@@ -435,11 +438,11 @@ impl Heap {
     unsafe fn mark_some(owner: &TCellOwner<TcOwner>, budget: usize) -> bool {
         let mut n = 0;
         while n < budget {
-            let ptr = unsafe { (*hp()).gray.pop() };
-            let Some(ptr) = ptr else { return true; };
+            let entry = unsafe { (*hp()).gray.pop() };
+            let Some((ptr, scan)) = entry else { return true; };
             unsafe {
                 (*ptr).color.set(BLACK);
-                ((*ptr).scan)(ptr, owner);
+                scan(ptr, owner);
             }
             n += 1;
         }
