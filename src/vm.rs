@@ -353,22 +353,14 @@ impl<T> Tc<T> {
         self.0.as_ptr().cast()
     }
 
-    /// Forward (Dijkstra) write barrier: call before storing a pointer to `value` into
-    /// this object. If `self` is black, `value` is shaded so the marking frontier advances
-    /// to it, preserving the "no black -> white" invariant. Store sites that write a
-    /// *sub-field* in place (Table::set, SETLIST) call this directly; whole-cell writes
-    /// should use [`Tc::replace`] instead, which can't be misused (barrier + write fused).
-    #[inline]
-    pub fn barrier<V: Mark>(&self, value: &V, owner: &TCellOwner<TcOwner>) {
-        self.0.write_barrier(value, owner);
-    }
 }
 
 impl<T: Mark> Tc<T> {
-    /// Replace the whole cell contents, firing the forward write barrier first. This is
-    /// the misuse-resistant way to store into a `Tc`: the barrier and the write are fused,
-    /// so a caller can't accidentally write a GC pointer without shading it. Prefer this
-    /// over `*tc.rw(owner) = value`.
+    /// Replace the whole cell contents, firing the forward (Dijkstra) write barrier first:
+    /// if `self` is black, `value` is shaded so the marking frontier advances to it. This
+    /// is the misuse-resistant way to store into a non-table `Tc` (upvalue cells): the
+    /// barrier and the write are fused, so a caller can't write a GC pointer without
+    /// shading it. Prefer this over `*tc.rw(owner) = value`.
     #[inline]
     pub fn replace(&self, owner: &mut TCellOwner<TcOwner>, value: T) {
         self.0.write_barrier(&value, owner);
@@ -459,6 +451,14 @@ impl<'src, 'intern> Table<'src, 'intern> {
 }
 
 impl<'src, 'intern> Tc<Table<'src, 'intern>> {
+    /// Backward write barrier (Lua's `barrierback`), for tables only: reverts a black table
+    /// to gray so it is re-scanned once in the atomic finish, instead of shading each
+    /// written value. Call before any in-place mutation of the table's array/hash.
+    #[inline]
+    pub fn barrier_back(&self) {
+        self.0.backward_barrier();
+    }
+
     pub fn get(&self, owner: &TCellOwner<TcOwner>, key: &LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
             LValue::Number(n) => Some(self.ro(owner).array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
@@ -473,10 +473,8 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     }
 
     pub fn set(&mut self, owner: &mut TCellOwner<TcOwner>, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
-        // Forward write barrier: storing key/value pointers into this table; if it is
-        // black, shade them so the marking frontier reaches them (no-op for non-GC values).
-        self.barrier(&key, owner);
-        self.barrier(&value, owner);
+        // Backward write barrier: revert this table to gray so it is re-scanned atomically.
+        self.barrier_back();
         match key {
             LValue::Number(n) => {
                 // TODO: sparse arrays
@@ -1378,13 +1376,10 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     match state.vals[state.base + a as usize].clone() {
                         LValue::Table(tab) => {
                             assert_ne!(c, 0);
+                            // Backward write barrier: revert the table to gray for an atomic rescan.
+                            tab.barrier_back();
                             let start = state.base + a as usize + 1;
                             let end = if b == 0 { state.vals.len() } else { start + b as usize };
-                            // Forward write barrier: shade the values being stored into the
-                            // (possibly black) table so the marking frontier reaches them.
-                            if tab.0.is_black() {
-                                for i in start..end { state.vals[i].mark(owner); }
-                            }
                             let src = state.vals[start..end].iter().cloned();
                             tab.rw(owner).array.splice(
                                 (c as usize-1)*50..,
