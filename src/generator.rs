@@ -368,7 +368,6 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Err(lv) => lv.clone(),
                 };
                 let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
-                // Backward write barrier: revert the table to gray for an atomic rescan.
                 t.barrier_back();
                 let t = t.rw(owner);
                 if t.array.len() <= kb.0 as usize {
@@ -405,7 +404,6 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Ok(c) => c.into(),
                         Err(lv) => lv.clone(),
                     };
-                    // Backward write barrier: revert the table to gray for an atomic rescan.
                     tab.barrier_back();
                     let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
                     debug!("settable_href {:?} {}", &val1, htype);
@@ -436,7 +434,6 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Err(lv) => lv.clone(),
                     };
                     let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
-                    // Backward write barrier: revert the table to gray for an atomic rescan.
                     t.barrier_back();
                     let kc_type = kc.typeof_();
                     if let Some(existing) = t.rw(owner).hash.insert(kb, kc.clone()) {
@@ -480,7 +477,6 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
             match state.vals[state.base + a as usize].clone() {
                 LValue::Table(tab) => {
                     assert_ne!(c, 0);
-                    // Backward write barrier: revert the table to gray for an atomic rescan.
                     tab.barrier_back();
                     let start = state.base + a as usize + 1;
                     let end = if b == 0 { state.vals.len() } else { start + b as usize };
@@ -1913,9 +1909,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut TCellOwner<TcOwner>, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, Option<FVec<LValue<'src, 'intern>>>) {
         let mut off: usize = 0;
         debug!("run");
-        // Publish our (stable) roots up front: JIT-compiled blocks can call natives (e.g.
-        // `collectgarbage`) before reaching any safepoint, and the interpreter's published
-        // `state` was just moved into this frame, so its old pointer is stale.
+        // Republish on entry: `state` was moved into this frame (the caller's pointer is now
+        // stale) and a JIT block can call a native before the first safepoint. See Note
+        // [GC roots] in `gc`.
         gc.publish(&state, &*self);
         loop {
             #[cfg(feature = "gc_stress")]
@@ -2155,8 +2151,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::GC => {
                     off += 1;
-                    // GC safepoint: publish roots (RunState + this Specializer) and
-                    // advance the incremental collector one step.
+                    // GC safepoint. See Note [GC roots] in `gc`.
                     gc.step(&state, &*self, owner);
                 },
             }

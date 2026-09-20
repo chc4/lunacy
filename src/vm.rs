@@ -356,11 +356,9 @@ impl<T> Tc<T> {
 }
 
 impl<T: Mark> Tc<T> {
-    /// Replace the whole cell contents, firing the forward (Dijkstra) write barrier first:
-    /// if `self` is black, `value` is shaded so the marking frontier advances to it. This
-    /// is the misuse-resistant way to store into a non-table `Tc` (upvalue cells): the
-    /// barrier and the write are fused, so a caller can't write a GC pointer without
-    /// shading it. Prefer this over `*tc.rw(owner) = value`.
+    /// Replace the whole cell contents, firing the write barrier first. Fusing the two is
+    /// the misuse-resistant way to store into a non-table `Tc` (upvalue cells) — prefer it
+    /// over `*tc.rw(owner) = value`. See Note [Write barriers] in `gc`.
     #[inline]
     pub fn replace(&self, owner: &mut TCellOwner<TcOwner>, value: T) {
         self.0.write_barrier(&value, owner);
@@ -451,9 +449,8 @@ impl<'src, 'intern> Table<'src, 'intern> {
 }
 
 impl<'src, 'intern> Tc<Table<'src, 'intern>> {
-    /// Backward write barrier (Lua's `barrierback`), for tables only: reverts a black table
-    /// to gray so it is re-scanned once in the atomic finish, instead of shading each
-    /// written value. Call before any in-place mutation of the table's array/hash.
+    /// Fire the table write barrier before mutating this table's array/hash in place.
+    /// See Note [Write barriers] in `gc`.
     #[inline]
     pub fn barrier_back(&self) {
         self.0.backward_barrier();
@@ -473,7 +470,6 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     }
 
     pub fn set(&mut self, owner: &mut TCellOwner<TcOwner>, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
-        // Backward write barrier: revert this table to gray so it is re-scanned atomically.
         self.barrier_back();
         match key {
             LValue::Number(n) => {
@@ -939,7 +935,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             // going to be removing it from the stack
             let closed = Tc::new(self.vals[*idx].clone());
             for up_use in upval.1.iter() {
-                // `set` fuses the forward write barrier with the write.
                 up_use.replace(owner, Upvalue::Closed(closed.clone()));
             }
         }
@@ -1193,9 +1188,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                     // No returns
                 }))),
-                // Drive the incremental garbage collector explicitly. Mirrors Lua's
-                // `collectgarbage(opt [, arg])`; used both by real programs and by the
-                // golden GC tests to force specific collection timings.
+                // Lua's `collectgarbage(opt [, arg])`: drive the collector explicitly.
                 (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
                     let opt: Vec<u8> = match args.ro(&seq).get(0) {
                         Some(LValue::InternedString(s)) => s.0.to_vec(),
@@ -1203,9 +1196,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         _ => b"collect".to_vec(),
                     };
                     let result: LValue = match opt.as_slice() {
-                        // SAFETY: `collectgarbage` is only reachable from a VM safepoint that
-                        // has just published the roots (see `gc.publish` before every native
-                        // call), so assuming a rooted scope here is sound.
+                        // SAFETY: reachable only from a safepoint that just published roots.
+                        // See Note [GC roots] in `gc`.
                         b"collect" | b"" => { unsafe { GcCtx::assume_rooted() }.full_collect_published(owner); LValue::Number(Number(0.0)) },
                         // Live memory in Kbytes, as a (fractional) number.
                         b"count" => LValue::Number(Number(Heap::live_bytes() as f64 / 1024.0)),
@@ -1282,12 +1274,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
             }
         };
-        // Establish the GC rooting scope for this run. `gc` is a `'lua`-branded token
-        // (borrowed from `_root_scope`) required to drive any collection; when the scope
-        // drops at the end of `run`, the published roots are cleared. `state` moves between
-        // this interpreter loop and `Specializer::run`, so the token's `step`/`publish`
-        // take the live `&state`/`&spec` and republish them at each safepoint rather than
-        // storing a single (would-be-dangling) pointer.
+        // GC rooting scope for this run; roots clear when `_root_scope` drops. See Note
+        // [GC roots] in `gc`.
         let _root_scope = Heap::root_scope();
         let gc = _root_scope.token();
         // we need to track where to return to, along with the base pointer and where to put return
@@ -1328,7 +1316,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         Upvalue::Closed(c) => {
                             let c = c.clone();
                             let new_val = state.vals[state.base + a as usize].clone();
-                            // `set` fuses the forward write barrier with the write.
                             c.replace(owner, new_val);
                         },
                     };
@@ -1356,8 +1343,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
                     state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
-                    // GC safepoint: publish the live roots and advance the incremental
-                    // collector by one bounded step (a no-op while under the threshold).
+                    // GC safepoint. See Note [GC roots] in `gc`.
                     gc.step(&state, &spec, owner);
                 },
                 Opcode::SELF => {
@@ -1376,7 +1362,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     match state.vals[state.base + a as usize].clone() {
                         LValue::Table(tab) => {
                             assert_ne!(c, 0);
-                            // Backward write barrier: revert the table to gray for an atomic rescan.
                             tab.barrier_back();
                             let start = state.base + a as usize + 1;
                             let end = if b == 0 { state.vals.len() } else { start + b as usize };
@@ -1664,8 +1649,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
                     } else if let LValue::NClosure(ncall) = to_call {
                         let nf = ncall.native.clone();
-                        // Native functions (e.g. `collectgarbage`) only receive an owner,
-                        // so publish the current roots before entering one.
+                        // Publish roots so a native (e.g. `collectgarbage`) can reach them.
+                        // See Note [GC roots] in `gc`.
                         gc.publish(&state, &spec);
                         state.call_native(nf, a as u16, b, c, owner);
                         // FIXME(metatables): __call

@@ -1,8 +1,6 @@
--- Write-barrier stress: keep a long-lived table `root` that the incremental
--- collector will have already marked (blackened), then store freshly allocated
--- tables into it *while a collection is in progress*. Without a correct write
--- barrier those fresh (white) children would be swept out from under a black
--- parent and the reads below would be wrong (or crash under gc_sanitize).
+-- Interpreter-path table write barrier: store freshly-allocated (white) tables into a
+-- long-lived (black) `root` mid-collection. A missed barrier would sweep the children out
+-- from under root, making the reads below wrong (or crash under gc_sanitize).
 local root = {}
 collectgarbage("collect") -- settle the heap / run a full cycle
 

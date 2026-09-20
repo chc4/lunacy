@@ -112,65 +112,56 @@ impl<T: Mark> Mark for Vec<T> {
     }
 }
 
-// ===== Tricolor incremental garbage collector =====
+// Note [Incremental GC]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// A tricolor mark/sweep collector. Each object is white (unreached), gray (reached but its
+// children are not yet scanned — on the `gray` worklist), or black (reached and scanned).
+// The strong invariant is that a black object never points directly at a white one.
+// Marking is incremental: each safepoint shades the roots then scans a bounded budget of
+// gray objects, so the mark phase spreads across many safepoints instead of one pause. A
+// cycle starts once live `total_bytes` crosses `threshold` (re-armed to 2x live after each
+// cycle). When the worklist empties, `finish` runs the atomic tail with the mutator
+// stopped: fold in grayagain (see Note [Write barriers]), re-scan the roots, drain, sweep.
+// Sweep is atomic, so one white color suffices: objects allocated mid-cycle are white and
+// cannot be swept before the next completed mark.
 //
-// Objects are one of three colors, stored in `GcInner::color`:
-//   WHITE - not yet reached this cycle (candidate for collection)
-//   GRAY  - reached, but its children have not been scanned yet (on the gray worklist)
-//   BLACK - reached and fully scanned; the strong tricolor invariant says a black
-//           object may never point directly at a white one.
+// Note [Write barriers]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// Between increments the mutator can create a black->white edge, which would let the
+// collector free a reachable object. Two barriers preserve the invariant, split as in Lua:
+//   * non-tables: a forward (Dijkstra) barrier (`Gc::write_barrier`) shades the written
+//     value, so the container stays black and the frontier advances incrementally.
+//   * tables: a backward barrier (`Gc::backward_barrier`, Lua's `barrierback`) reverts the
+//     mutated table to gray onto `grayagain`, re-scanned once in the atomic `finish`.
+//     Tables are mutated often, so this avoids shading every write, paying an atomic
+//     re-scan of the mutated tables instead.
+// Neither barrier re-enters the incremental `gray` worklist, so a hot mutation loop cannot
+// keep the collector marking forever. Both are self-gating: nothing is black while idle,
+// so the fast path is one load and branch.
 //
-// Marking is *incremental*: at each GC safepoint we shade the roots and then scan a
-// bounded budget of gray objects, spreading the mark phase across many safepoints
-// instead of pausing for a full traversal.
-//
-// To keep the tricolor invariant while the mutator runs between increments we use two
-// write barriers, split the same way Lua does:
-//
-//   * Non-table objects use a *forward* (Dijkstra) barrier (`Gc::write_barrier`): storing
-//     a pointer to `value` into a black container shades `value` gray, advancing the
-//     frontier to it. The container stays black. Work is pushed *forward* onto the
-//     incremental gray worklist and traced by ordinary mark steps; nothing is deferred to
-//     the atomic phase and nothing is re-scanned, so a mutation loop can't starve.
-//
-//   * Tables use a *backward* barrier (`Gc::backward_barrier`, Lua's `barrierback`):
-//     mutating a black table reverts it to gray and links it onto the `grayagain` list,
-//     without shading the written value. Tables are the most frequently mutated objects,
-//     so shading every written value (forward) would be costly; instead we re-scan the
-//     whole table once, in the atomic finish. The `color == BLACK` guard means each table
-//     joins `grayagain` at most once per cycle, and it is *not* put on the incremental
-//     `gray` worklist (that could let a hot loop re-gray it forever), so no starvation.
-//     The cost is that `finish` traces the white sub-graph reachable from mutated tables
-//     in the stop-the-world phase — Lua accepts this trade for tables.
-//
-// Both barriers fire at the store sites (where the container — and, for the forward one,
-// the value — are visible). They are self-gating: the `is_black` check is false while idle
-// (nothing is black between cycles), so the fast path is a single load + branch.
-//
-// When the incremental gray set empties we perform an atomic finish that folds in
-// `grayagain` (the backward-barrier'd tables), re-scans the roots (the value stack /
-// registers have no barrier, so the mutator may have dropped a white object into a
-// register since the last scan) and drains whatever those shade, then an atomic sweep.
-// Because sweep is atomic (no allocation interleaves with it) a single white color is
-// sufficient — new objects are always allocated white and only ever swept after a
-// completed atomic mark.
+// Note [GC roots]
+// ~~~~~~~~~~~~~~~
+// The roots are the interpreter `RunState` (whose value stack covers every Lua frame) and
+// the JIT `Specializer`. A collection runs only through a `GcCtx` token, minted inside
+// `Heap::rooted`/`root_scope` and cleared on scope exit, so roots are never read after a
+// run ends. `RunState` moves between the interpreter and `Specializer::run`, so the token
+// republishes the live `&state`/`&spec` at each safepoint rather than storing one pointer
+// that would dangle across the move. `collectgarbage` is a native given only an owner, so
+// it relies on the safepoint having published the roots immediately before the call.
 const WHITE: u8 = 0;
 const GRAY: u8 = 1;
 const BLACK: u8 = 2;
 
 /// Gray objects scanned per incremental step during normal operation.
 const STEP_BUDGET: usize = 512;
-/// Never let the trigger threshold drop below this, to avoid thrashing when the live
-/// set is tiny.
+/// Floor on the cycle-trigger threshold, so a tiny live set doesn't cause thrashing.
 const MIN_THRESHOLD: usize = 256 * 1024;
-/// Bytes of live heap before the first collection cycle starts.
+/// Live heap that triggers the first collection cycle.
 const INITIAL_THRESHOLD: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
-    /// No collection in progress.
     Idle,
-    /// Incrementally marking reachable objects.
     Mark,
 }
 
@@ -192,13 +183,11 @@ impl<T> Gc<T> {
         let mut top = unsafe { (*heap).top.load(Ordering::Acquire) };
         let inner = GcInner {
             next: AtomicPtr::new(top),
-            // New objects are born white: if nothing reaches them this cycle they are
-            // reclaimed on the next sweep.
+            // Born white; swept next cycle unless reached. See Note [Incremental GC].
             color: Cell::new(WHITE),
             size,
-            // Scan-one-level thunk: shades this object's immediate children gray. The
-            // recursion in the `Mark` impls stops at each `Gc` boundary (which merely
-            // enqueues), so calling `val.mark` here visits exactly one level.
+            // Shades this object's immediate children: `val.mark` reaches each child `Gc`,
+            // whose `mark` enqueues rather than recurses, so this visits exactly one level.
             scan: |erased, owner| unsafe {
                 let typed = erased as *const GcInner<T>;
                 (*typed).val.mark(owner);
@@ -235,8 +224,8 @@ impl<T> Gc<T> {
             }
 
         }
-        // Account for the allocation. The safepoints consult `total_bytes` to decide
-        // when to start a cycle; `Gc::new` has no owner/roots so it can't step itself.
+        // Only accounts for the allocation; stepping happens at safepoints, which have the
+        // roots. See Note [GC roots].
         unsafe { (*heap).total_bytes += size; }
         Self { ptr: core::ptr::NonNull::new(ptr as _).unwrap() }
     }
@@ -247,13 +236,8 @@ impl<T> Gc<T> {
         unsafe { (*self.ptr.as_ptr()).color.get() == BLACK }
     }
 
-    /// Forward (Dijkstra) write barrier. Call at every store of a pointer `value` into
-    /// this object. If `self` is black, storing a pointer to a (possibly white) `value`
-    /// would break the "no black -> white" invariant, so shade `value` — pushing the
-    /// marking frontier forward onto the incremental gray worklist. `self` stays black, so
-    /// there is no re-scanning and no way for a mutation loop to starve the collector; the
-    /// shaded value is traced by ordinary mark steps. No-op while idle (nothing is black),
-    /// so the fast path is a single load + branch.
+    /// Forward barrier: shade `value` when storing it into this (black) object, so the
+    /// container may stay black. See Note [Write barriers].
     #[inline]
     pub fn write_barrier<V: Mark>(&self, value: &V, owner: &TCellOwner<TcOwner>) {
         if self.is_black() {
@@ -261,12 +245,8 @@ impl<T> Gc<T> {
         }
     }
 
-    /// Backward write barrier (Lua's `barrierback`), used only for tables. Mutating a black
-    /// table reverts it to gray and links it onto `grayagain` to be re-scanned once in the
-    /// atomic `finish` — cheaper per-write than the forward barrier (no value shading) for
-    /// the frequently-mutated tables. It is NOT put on the incremental `gray` worklist, and
-    /// the `color == BLACK` guard means it joins `grayagain` at most once per cycle, so a
-    /// hot mutation loop can't starve the collector. No-op while idle.
+    /// Backward barrier for tables: revert this (black) object to gray onto `grayagain` for
+    /// a later atomic re-scan. See Note [Write barriers].
     #[inline]
     pub fn backward_barrier(&self) {
         let inner = self.ptr.as_ptr();
@@ -317,8 +297,8 @@ impl<T: Hash> Hash for Gc<T> {
 }
 
 impl<T> Mark for Gc<T> {
-    /// Shading: white -> gray (and enqueue). Unlike the old collector this does *not*
-    /// recurse; the gray worklist drives scanning one level at a time.
+    /// Shade this object: white -> gray, enqueued on the worklist. Does not recurse; the
+    /// worklist drives scanning, one level per gray object. See Note [Incremental GC].
     fn mark(&self, _owner: &TCellOwner<TcOwner>) {
         let inner = self.ptr.as_ptr();
         unsafe {
@@ -342,9 +322,7 @@ struct GcInner<T: ?Sized> {
     val: T,
 }
 
-/// A type-erased reference to a live root (the interpreter's `RunState` and the JIT
-/// `Specializer`). Refreshed at every safepoint / before every native call so that the
-/// collector — and `collectgarbage`, which only receives an owner — can find the roots.
+/// Type-erased pointer to a published root plus its shade thunk. See Note [GC roots].
 #[derive(Clone, Copy)]
 struct RootRef {
     ptr: *const (),
@@ -370,8 +348,7 @@ fn push_gray(ptr: *const GcInner<()>) {
     unsafe { (*hp()).gray.push(ptr); }
 }
 
-/// Tables reverted to gray by the backward barrier: re-scanned once, atomically, in
-/// `finish` (never fed into the incremental `gray` worklist).
+/// Enqueue onto `grayagain`. See Note [Write barriers].
 #[inline]
 fn push_grayagain(ptr: *const GcInner<()>) {
     unsafe { (*hp()).grayagain.push(ptr); }
@@ -380,17 +357,16 @@ fn push_grayagain(ptr: *const GcInner<()>) {
 pub struct Heap {
     top: AtomicPtr<GcInner<()>>,
     roots: BTreeMap<*const (), (Box<dyn Mark>, usize)>,
-    /// Worklist of gray objects awaiting scanning.
+    /// Gray objects awaiting scanning.
     gray: Vec<*const GcInner<()>>,
-    /// Tables turned back to gray by the backward barrier; folded into `gray` and drained
-    /// once during the atomic `finish` (Lua's `grayagain`).
+    /// Tables reverted by the backward barrier, drained in `finish`. See Note [Write barriers].
     grayagain: Vec<*const GcInner<()>>,
     phase: Phase,
-    /// Live bytes currently tracked by the collector.
+    /// Live bytes tracked by the collector.
     total_bytes: usize,
-    /// Start a cycle once `total_bytes` reaches this.
+    /// Cycle-trigger threshold for `total_bytes`.
     threshold: usize,
-    /// `collectgarbage("stop")` disables automatic stepping.
+    /// Set by `collectgarbage("stop")` to disable automatic stepping.
     gc_off: bool,
     state_root: Option<RootRef>,
     spec_root: Option<RootRef>,
@@ -428,10 +404,7 @@ impl Heap {
         }
     }
 
-    /// Register the current VM roots so incremental stepping and `collectgarbage` can
-    /// reach them. The pointers are only ever dereferenced synchronously (during a step
-    /// or a native call in the same interpreter iteration), while the referents live at
-    /// a stable address.
+    /// Publish the current VM roots for the collector to shade. See Note [GC roots].
     #[inline]
     pub fn set_roots<S: Mark, P: Mark>(state: &S, spec: &P) {
         let heap = hp();
@@ -497,21 +470,15 @@ impl Heap {
         }
     }
 
-    /// Finish the collection atomically: rescan the roots (catching anything the mutator
-    /// stashed only on the stack since the cycle began), drain the remaining gray set,
-    /// sweep, and re-arm the trigger threshold.
+    /// Atomic tail of a cycle: fold in grayagain, re-scan the roots, drain, sweep, and
+    /// re-arm the threshold. See Note [Incremental GC], Note [Write barriers].
     unsafe fn finish(owner: &TCellOwner<TcOwner>) {
         unsafe {
-            // Fold the backward-barrier'd tables into the gray worklist for a single atomic
-            // rescan (each appears at most once per cycle; the mutator is stopped now, so
-            // the barrier can't add more).
+            // The mutator is stopped, so grayagain is final; the roots need re-scanning
+            // because the value stack has no barrier.
             let hp = hp();
             let mut ga = core::mem::take(&mut (*hp).grayagain);
             (*hp).gray.append(&mut ga);
-            // Re-scan the roots with the mutator stopped: the value stack / registers have
-            // no write barrier, so the mutator may have dropped a white object into a
-            // register since the last scan. The forward barrier kept every non-table heap
-            // edge sound already; this plus draining is all the atomic phase needs.
             Self::mark_roots(owner);
             Self::mark_some(owner, usize::MAX);
             Self::sweep_free(owner);
@@ -524,20 +491,16 @@ impl Heap {
         }
     }
 
-    /// Perform one incremental step of collection. Cheap (a load + compare) when idle
-    /// and under the trigger threshold — this is the common case that makes the new
-    /// collector fast, versus the old "full collect on every allocation".
-    ///
-    /// Private worker: callers must go through the `GcCtx` token (see `Heap::rooted`),
-    /// which guarantees the roots are published first.
+    /// One incremental step: start a cycle if over threshold, otherwise scan a bounded
+    /// budget, finishing when the worklist empties. Idle+under-threshold is a load and
+    /// compare. See Note [Incremental GC]. Private worker behind the `GcCtx` token.
     unsafe fn step_inner(owner: &TCellOwner<TcOwner>) {
         let heap = hp();
         unsafe {
             if (*heap).gc_off { return; }
 
-            // Under gc_stress, collect as aggressively and incrementally as possible
-            // (start immediately, one object per step) to exercise the barrier + gray
-            // worklist on every allocation.
+            // gc_stress: collect on every allocation, one object per step, to exercise the
+            // barriers and worklist maximally.
             #[cfg(feature = "gc_stress")]
             let (trigger, budget) = (0usize, 1usize);
             #[cfg(not(feature = "gc_stress"))]
@@ -558,14 +521,10 @@ impl Heap {
         }
     }
 
-    /// Synchronously run a full collection, reclaiming *all* currently-unreachable
-    /// objects. Private worker behind the `GcCtx` token.
-    ///
-    /// Runs two cycles (like Lua's `luaC_fullgc`). The first finishes any in-progress
-    /// incremental cycle; but objects that became unreachable *during* that cycle were
-    /// already shaded and so are retained as floating garbage. The second cycle starts
-    /// fresh (they are white again) and reclaims them, so a single
-    /// `collectgarbage("collect")` frees everything dead at the call, matching Lua.
+    /// Full synchronous collection reclaiming everything unreachable at the call (as Lua's
+    /// `luaC_fullgc`). Two cycles are required: the first finishes the in-progress cycle
+    /// but retains objects that died mid-cycle (already shaded — floating garbage); the
+    /// second, with them white again, reclaims them. Private worker behind the `GcCtx` token.
     unsafe fn full_collect_inner(owner: &TCellOwner<TcOwner>) {
         let heap = hp();
         unsafe {
@@ -586,11 +545,9 @@ impl Heap {
         unsafe { (*hp()).gc_off = off; }
     }
 
-    /// Sweep all allocation and free unmarked objects: shades all registered roots,
-    /// drains the gray worklist (including anything shaded via `Gc::mark` beforehand),
-    /// then frees the white objects. Private worker behind the `GcCtx` token.
-    /// SAFETY: Any objects not reachable from the roots / prior shading must not be used
-    /// afterwards.
+    /// Run a collection to completion from the roots plus anything already shaded (the gc
+    /// unit tests shade manually via `Mark::mark`). Private worker behind the `GcCtx` token.
+    /// SAFETY: objects unreachable from the roots / prior shading must not be used afterwards.
     unsafe fn sweep_inner(owner: &TCellOwner<TcOwner>) {
         unsafe {
             (*hp()).phase = Phase::Mark;
@@ -598,19 +555,17 @@ impl Heap {
         }
     }
 
-    /// Enter a rooting scope via a closure. The `GcCtx` token handed to `f` is the only
-    /// way to drive a collection; when `f` returns (or panics) the published roots are
-    /// cleared, so a stray later collection can never read a dangling root pointer. The
-    /// higher-ranked `'lua` brand makes the token un-storable outside the scope.
+    /// Run `f` in a rooting scope, handing it the `GcCtx` token that gates collection.
+    /// Roots clear when `f` returns or panics; the higher-ranked `'lua` brand stops the
+    /// token escaping. See Note [GC roots].
     pub fn rooted<R>(f: impl for<'lua> FnOnce(GcCtx<'lua>) -> R) -> R {
         let scope = RootScope { _priv: () };
         f(scope.token())
     }
 
-    /// Manual (RAII) form of [`Heap::rooted`], for call sites (like the interpreter loop)
-    /// that can't wrap their whole body in a closure. Hold the returned guard for the
-    /// duration of the run and obtain tokens from it via [`RootScope::token`]; roots are
-    /// cleared when the guard drops.
+    /// RAII form of [`Heap::rooted`] for call sites that can't wrap their body in a closure
+    /// (the interpreter loop): hold the guard for the run and take tokens from
+    /// [`RootScope::token`]. See Note [GC roots].
     pub fn root_scope() -> RootScope {
         RootScope { _priv: () }
     }
@@ -636,9 +591,8 @@ impl Heap {
     }
 }
 
-/// RAII scope that publishes VM roots and clears them on drop. Obtained from
-/// [`Heap::root_scope`] (or created internally by [`Heap::rooted`]). Hand out `GcCtx`
-/// tokens via [`RootScope::token`]; a token borrows the scope, so it cannot outlive it.
+/// RAII scope that clears the published roots on drop and mints `GcCtx` tokens (borrowed
+/// from it, so they can't outlive it) via [`RootScope::token`]. See Note [GC roots].
 #[must_use = "dropping the RootScope immediately clears the GC roots"]
 pub struct RootScope {
     _priv: (),
@@ -654,8 +608,6 @@ impl RootScope {
 
 impl Drop for RootScope {
     fn drop(&mut self) {
-        // Clear the published roots so a later stray collection can't read a dangling
-        // RunState/Specializer pointer.
         let heap = hp();
         unsafe {
             (*heap).state_root = None;
@@ -664,10 +616,9 @@ impl Drop for RootScope {
     }
 }
 
-/// A `'lua`-branded capability token: proof that we are inside a rooting scope. Every
-/// collection entry point requires one, so it is impossible to sweep without having
-/// published roots. `Copy`, so it threads freely (e.g. into `Specializer::run`); the
-/// invariant `'lua` brand keeps it from being stored beyond the scope.
+/// Capability token proving a rooting scope is active; every collection entry point takes
+/// one. `Copy`, so it threads freely; the invariant `'lua` brand keeps it from escaping
+/// the scope. See Note [GC roots].
 #[derive(Clone, Copy)]
 pub struct GcCtx<'lua> {
     _brand: PhantomData<fn(&'lua ()) -> &'lua ()>,
@@ -711,9 +662,9 @@ impl<'lua> GcCtx<'lua> {
         unsafe { Heap::step_inner(owner) };
     }
 
-    /// SAFETY: only sound while executing inside a live rooting scope with roots currently
-    /// published. The VM upholds this: a native function is only ever invoked from a
-    /// safepoint that has just called [`GcCtx::publish`].
+    /// SAFETY: only sound inside a live rooting scope whose roots are currently published —
+    /// which the VM guarantees for natives (a safepoint calls `publish` just before the
+    /// call). See Note [GC roots].
     #[inline]
     pub unsafe fn assume_rooted() -> GcCtx<'lua> {
         GcCtx { _brand: PhantomData }
