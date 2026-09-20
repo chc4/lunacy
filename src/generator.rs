@@ -19,7 +19,7 @@ use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
 use crate::jit::{JitInfo, JitContext};
-use crate::gc::{Mark, Heap};
+use crate::gc::{Mark, Heap, GcCtx};
 
 use crate::{debug, info, warn};
 use smallvec::SmallVec;
@@ -1908,14 +1908,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    pub fn run(&mut self, owner: &mut TCellOwner<TcOwner>, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, Option<FVec<LValue<'src, 'intern>>>) {
+    pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut TCellOwner<TcOwner>, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, Option<FVec<LValue<'src, 'intern>>>) {
         let mut off: usize = 0;
         debug!("run");
+        // Publish our (stable) roots up front: JIT-compiled blocks can call natives (e.g.
+        // `collectgarbage`) before reaching any safepoint, and the interpreter's published
+        // `state` was just moved into this frame, so its old pointer is stale.
+        gc.publish(&state, &*self);
         loop {
             #[cfg(feature = "gc_stress")]
             {
-                self.mark(owner);
-                unsafe { Heap::collect(&state, owner) };
+                gc.step(&state, &*self, owner);
             }
             let block = &mut self.blocks[id.0];
             #[cfg(feature = "jit")]
@@ -2085,6 +2088,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::NativeCall { nf, a, b, c } => {
                     off += 1;
+                    gc.publish(&state, &*self);
                     state.call_native(nf, a, b, c, owner);
                 },
                 Residual::Call { a, b, c } => {
@@ -2114,7 +2118,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off = 0;
                         continue;
                     } else if let LValue::NClosure(ncall) = to_call {
-                        state.call_native(ncall.native.clone(), a as u16, b, c, owner);
+                        let nf = ncall.native.clone();
+                        gc.publish(&state, &*self);
+                        state.call_native(nf, a as u16, b, c, owner);
                         // FIXME(metatables): __call
                     } else {
                         panic!("cant call {:?}", to_call);
@@ -2147,8 +2153,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::GC => {
                     off += 1;
-                    (*self).mark(owner);
-                    unsafe { Heap::collect(&state, owner) };
+                    // GC safepoint: publish roots (RunState + this Specializer) and
+                    // advance the incremental collector one step.
+                    gc.step(&state, &*self, owner);
                 },
             }
         }

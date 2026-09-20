@@ -22,7 +22,7 @@ use qcell::{TCell, TCellOwner, LCell, LCellOwner};
 
 use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
 use crate::perf::PerfCounters;
-use crate::gc::{Mark, Heap, Gc};
+use crate::gc::{Mark, Heap, Gc, GcCtx};
 use crate::{debug, warn};
 
 pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
@@ -351,6 +351,16 @@ impl<T> Tc<T> {
 
     pub fn as_ptr(&self) -> *const () {
         self.0.as_ptr().cast()
+    }
+
+    /// Mutable access to the cell contents. This inherent method shadows the `TCell::rw`
+    /// reached through `Deref`, so *every* in-place mutation of a GC object funnels
+    /// through here — the single choke point where we fire the incremental GC's write
+    /// barrier before handing out `&mut`.
+    #[inline]
+    pub fn rw<'a>(&'a self, owner: &'a mut TCellOwner<TcOwner>) -> &'a mut T {
+        self.0.write_barrier();
+        self.0.deref().rw(owner)
     }
 }
 
@@ -1168,6 +1178,32 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                     // No returns
                 }))),
+                // Drive the incremental garbage collector explicitly. Mirrors Lua's
+                // `collectgarbage(opt [, arg])`; used both by real programs and by the
+                // golden GC tests to force specific collection timings.
+                (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
+                    let opt: Vec<u8> = match args.ro(&seq).get(0) {
+                        Some(LValue::InternedString(s)) => s.0.to_vec(),
+                        Some(LValue::OwnedString(s)) => s.ro(owner).as_slice().to_vec(),
+                        _ => b"collect".to_vec(),
+                    };
+                    let result: LValue = match opt.as_slice() {
+                        // SAFETY: `collectgarbage` is only reachable from a VM safepoint that
+                        // has just published the roots (see `gc.publish` before every native
+                        // call), so assuming a rooted scope here is sound.
+                        b"collect" | b"" => { unsafe { GcCtx::assume_rooted() }.full_collect_published(owner); LValue::Number(Number(0.0)) },
+                        // Live memory in Kbytes, as a (fractional) number.
+                        b"count" => LValue::Number(Number(Heap::live_bytes() as f64 / 1024.0)),
+                        // Advance one incremental step.
+                        b"step" => { unsafe { GcCtx::assume_rooted() }.step_published(owner); LValue::Bool(false) },
+                        b"stop" => { Heap::set_gc_off(true); LValue::Number(Number(0.0)) },
+                        b"restart" => { Heap::set_gc_off(false); LValue::Number(Number(0.0)) },
+                        // Tuning knobs we accept but don't model.
+                        b"setpause" | b"setstepmul" => LValue::Number(Number(0.0)),
+                        _ => LValue::Nil,
+                    };
+                    returns.rw(&mut seq).into_iter().next().map(|r| *r = result);
+                }))),
                 math,
                 os,
                 ].drain(..)
@@ -1231,11 +1267,19 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
             }
         };
+        // Establish the GC rooting scope for this run. `gc` is a `'lua`-branded token
+        // (borrowed from `_root_scope`) required to drive any collection; when the scope
+        // drops at the end of `run`, the published roots are cleared. `state` moves between
+        // this interpreter loop and `Specializer::run`, so the token's `step`/`publish`
+        // take the live `&state`/`&spec` and republish them at each safepoint rather than
+        // storing a single (would-be-dangling) pointer.
+        let _root_scope = Heap::root_scope();
+        let gc = _root_scope.token();
         // we need to track where to return to, along with the base pointer and where to put return
         // values
         let r_vals = 'int: loop {
             #[cfg(feature = "gc_stress")]
-            unsafe { Heap::collect(&state, owner) };
+            { gc.step(&state, &spec, owner); }
 
             let inst = unsafe { state.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[state.pc] };
             state.pc += 1;
@@ -1295,7 +1339,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
                     state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
-                    unsafe { Heap::collect(&state, owner) };
+                    // GC safepoint: publish the live roots and advance the incremental
+                    // collector by one bounded step (a no-op while under the threshold).
+                    gc.step(&state, &spec, owner);
                 },
                 Opcode::SELF => {
                     let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);
@@ -1592,7 +1638,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             };
                             debug!("{:?} {block:?}", spec.blocks);
                             spec.set_current(lclos.clone());
-                            let (r_state, r_vals) = spec.run(owner, block, state);
+                            let (r_state, r_vals) = spec.run(gc, owner, block, state);
                             state = r_state;
                             // Unlike a normal call, LBBV might have returned *out* of our current
                             // function and exitted the top-level.
@@ -1604,7 +1650,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         }
 
                     } else if let LValue::NClosure(ncall) = to_call {
-                        state.call_native(ncall.native.clone(), a as u16, b, c, owner);
+                        let nf = ncall.native.clone();
+                        // Native functions (e.g. `collectgarbage`) only receive an owner,
+                        // so publish the current roots before entering one.
+                        gc.publish(&state, &spec);
+                        state.call_native(nf, a as u16, b, c, owner);
                         // FIXME(metatables): __call
                     } else {
                         panic!("cant call {:?}", to_call);

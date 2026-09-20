@@ -1,6 +1,8 @@
 use std::ops::{Deref, DerefMut};
 use std::hash::Hash;
 use std::rc::Rc;
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::collections::BTreeMap;
 use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
 use crate::vm::{Tc, TcOwner, LValue, LClosure, NClosure, Table, Upvalue};
@@ -110,7 +112,55 @@ impl<T: Mark> Mark for Vec<T> {
     }
 }
 
-static ALIVE: AtomicBool = AtomicBool::new(true);
+// ===== Tricolor incremental garbage collector =====
+//
+// Objects are one of three colors, stored in `GcInner::color`:
+//   WHITE - not yet reached this cycle (candidate for collection)
+//   GRAY  - reached, but its children have not been scanned yet (on the gray worklist)
+//   BLACK - reached and fully scanned; the strong tricolor invariant says a black
+//           object may never point directly at a white one.
+//
+// Marking is *incremental*: at each GC safepoint we shade the roots and then scan a
+// bounded budget of gray objects, spreading the mark phase across many safepoints
+// instead of pausing for a full traversal.
+//
+// To keep the tricolor invariant while the mutator runs between increments we use a
+// *bounded backward* write barrier (see `Gc::write_barrier`, funnelled through
+// `Tc::rw`), modelled on Lua's `luaC_barrierback`: mutating a black object turns it
+// gray and links it onto a separate `grayagain` list. Crucially it is *not* put back
+// on the incremental `gray` worklist — that would let a hot mutation loop re-gray an
+// object as fast as the collector re-blackens it, so the gray set would never drain
+// and the cycle could starve forever. Instead, because the barrier only fires on a
+// *black* object (`color == BLACK`), each object joins `grayagain` at most once per
+// cycle, and `grayagain` is rescanned exactly once, atomically, in `finish` (like
+// Lua's atomic phase folding grayagain into gray). That bounds re-scan work to O(objects
+// mutated) per cycle and guarantees progress. (A true forward barrier — shading the
+// written *value* — isn't possible here: the `Tc::rw` choke point sees the mutated
+// object, not the new pointer.)
+//
+// When the incremental gray set empties we perform an atomic finish (re-scan the roots,
+// fold in `grayagain`, drain) and then an atomic sweep. Because sweep is atomic (no
+// allocation interleaves with it) a single white color is sufficient — new objects are
+// always allocated white and only ever swept after a completed atomic mark.
+const WHITE: u8 = 0;
+const GRAY: u8 = 1;
+const BLACK: u8 = 2;
+
+/// Gray objects scanned per incremental step during normal operation.
+const STEP_BUDGET: usize = 512;
+/// Never let the trigger threshold drop below this, to avoid thrashing when the live
+/// set is tiny.
+const MIN_THRESHOLD: usize = 256 * 1024;
+/// Bytes of live heap before the first collection cycle starts.
+const INITIAL_THRESHOLD: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// No collection in progress.
+    Idle,
+    /// Incrementally marking reachable objects.
+    Mark,
+}
 
 // TODO: const marker trait for trivial drop, since we don't run finalizers?
 #[derive(Eq, PartialEq)]
@@ -125,11 +175,22 @@ impl<T> Gc<T> {
     }
 
     pub fn new(val: T) -> Self {
-        let heap = unsafe { HEAP.load(Ordering::Acquire).as_ref().unwrap() };
-        let mut top = heap.top.load(Ordering::Acquire);
+        let heap = hp();
+        let size = core::mem::size_of::<GcInner<T>>();
+        let mut top = unsafe { (*heap).top.load(Ordering::Acquire) };
         let inner = GcInner {
             next: AtomicPtr::new(top),
-            state: !ALIVE.load(Ordering::Acquire),
+            // New objects are born white: if nothing reaches them this cycle they are
+            // reclaimed on the next sweep.
+            color: Cell::new(WHITE),
+            size,
+            // Scan-one-level thunk: shades this object's immediate children gray. The
+            // recursion in the `Mark` impls stops at each `Gc` boundary (which merely
+            // enqueues), so calling `val.mark` here visits exactly one level.
+            scan: |erased, owner| unsafe {
+                let typed = erased as *const GcInner<T>;
+                (*typed).val.mark(owner);
+            },
             #[cfg(feature = "gc_sanitize")]
             finalize: |ptr| unsafe {
                 let ptr = ptr.cast::<GcInner<T>>();
@@ -146,7 +207,7 @@ impl<T> Gc<T> {
         loop {
             // Try to put ourself as the new top
             let erased: *mut GcInner<()> = unsafe { core::mem::transmute(ptr as *mut _) };
-            match heap.top.compare_exchange(top, erased, Ordering::Acquire, Ordering::Relaxed) {
+            match unsafe { (*heap).top.compare_exchange(top, erased, Ordering::Acquire, Ordering::Relaxed) } {
                 Ok(_) => {
                     // We were able to swap ourself as the top, which means our next pointer is
                     // correct.
@@ -162,7 +223,29 @@ impl<T> Gc<T> {
             }
 
         }
+        // Account for the allocation. The safepoints consult `total_bytes` to decide
+        // when to start a cycle; `Gc::new` has no owner/roots so it can't step itself.
+        unsafe { (*heap).total_bytes += size; }
         Self { ptr: core::ptr::NonNull::new(ptr as _).unwrap() }
+    }
+
+    /// Bounded backward write barrier (Lua `barrierback` style). Called whenever the
+    /// mutator takes a mutable borrow of a GC object (via `Tc::rw`). If the object is
+    /// black it may be about to gain a pointer to a white object, which would break the
+    /// tricolor invariant, so we turn it gray and link it onto the `grayagain` list to be
+    /// rescanned once, atomically, in `finish` — NOT back onto the incremental `gray`
+    /// worklist (that could starve the collector). The `color == BLACK` guard means each
+    /// object joins `grayagain` at most once per cycle. No-op unless a collection is
+    /// mid-mark (nothing is black while idle), so the fast path is a single load + branch.
+    #[inline]
+    pub fn write_barrier(&self) {
+        let inner = self.ptr.as_ptr();
+        unsafe {
+            if (*inner).color.get() == BLACK {
+                (*inner).color.set(GRAY);
+                push_grayagain(inner as *const GcInner<()>);
+            }
+        }
     }
 }
 
@@ -177,6 +260,9 @@ impl<T> DerefMut for Gc<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         #[cfg(feature = "gc_sanitize")]
         unsafe { assert!(self.ptr.as_ref().alive.load(Ordering::Acquire), "value is dead") };
+        // Direct mutable access bypasses the interior-mutability path; treat it as a
+        // barrier point too so we never create an untracked black->white edge.
+        self.write_barrier();
         unsafe { &mut self.ptr.as_mut().val }
     }
 }
@@ -204,39 +290,106 @@ impl<T: Hash> Hash for Gc<T> {
 }
 
 impl<T> Mark for Gc<T> {
-    fn mark(&self, owner: &TCellOwner<TcOwner>) {
-        // SAFETY: See default implementation.
+    /// Shading: white -> gray (and enqueue). Unlike the old collector this does *not*
+    /// recurse; the gray worklist drives scanning one level at a time.
+    fn mark(&self, _owner: &TCellOwner<TcOwner>) {
+        let inner = self.ptr.as_ptr();
         unsafe {
-            let state = &mut (*self.ptr.as_ptr()).state;
-            let alive = ALIVE.load(Ordering::Acquire);
-            if *state != alive {
-                *state = alive;
-                (*self.ptr.as_ptr()).val.mark(owner);
+            if (*inner).color.get() == WHITE {
+                (*inner).color.set(GRAY);
+                push_gray(inner as *const GcInner<()>);
             }
-        };
+        }
     }
 }
 
+#[repr(C)]
 struct GcInner<T: ?Sized> {
     next: AtomicPtr<GcInner<()>>,
     finalize: fn(*mut GcInner<()>),
-    state: bool,
+    scan: fn(*const GcInner<()>, &TCellOwner<TcOwner>),
+    color: Cell<u8>,
+    size: usize,
     #[cfg(feature = "gc_sanitize")]
     alive: AtomicBool,
     val: T,
 }
 
+/// A type-erased reference to a live root (the interpreter's `RunState` and the JIT
+/// `Specializer`). Refreshed at every safepoint / before every native call so that the
+/// collector — and `collectgarbage`, which only receives an owner — can find the roots.
+#[derive(Clone, Copy)]
+struct RootRef {
+    ptr: *const (),
+    mark: fn(*const (), &TCellOwner<TcOwner>),
+}
+
+fn root_thunk<T: Mark>(ptr: *const (), owner: &TCellOwner<TcOwner>) {
+    unsafe { (&*(ptr as *const T)).mark(owner) }
+}
+
 static HEAP: AtomicPtr<Heap> = AtomicPtr::new(core::ptr::null_mut());
-#[derive(Default)]
+
+/// Raw pointer to the global heap. All GC-internal mutation goes through raw field
+/// projections off this pointer (never a `&mut Heap`), so that shading — which pushes
+/// onto `heap.gray` — can run while other fields are being read without aliasing UB.
+#[inline]
+fn hp() -> *mut Heap {
+    HEAP.load(Ordering::Acquire)
+}
+
+#[inline]
+fn push_gray(ptr: *const GcInner<()>) {
+    unsafe { (*hp()).gray.push(ptr); }
+}
+
+/// Backward-barrier'd objects: rescanned once, atomically, in `finish` (never fed back
+/// into the incremental `gray` worklist).
+#[inline]
+fn push_grayagain(ptr: *const GcInner<()>) {
+    unsafe { (*hp()).grayagain.push(ptr); }
+}
+
 pub struct Heap {
     top: AtomicPtr<GcInner<()>>,
     roots: BTreeMap<*const (), (Box<dyn Mark>, usize)>,
+    /// Worklist of gray objects awaiting scanning.
+    gray: Vec<*const GcInner<()>>,
+    /// Objects turned back to gray by the write barrier; folded into `gray` and drained
+    /// once during the atomic `finish` (Lua's `grayagain`).
+    grayagain: Vec<*const GcInner<()>>,
+    phase: Phase,
+    /// Live bytes currently tracked by the collector.
+    total_bytes: usize,
+    /// Start a cycle once `total_bytes` reaches this.
+    threshold: usize,
+    /// `collectgarbage("stop")` disables automatic stepping.
+    gc_off: bool,
+    state_root: Option<RootRef>,
+    spec_root: Option<RootRef>,
+}
+
+impl Default for Heap {
+    fn default() -> Self {
+        Self {
+            top: AtomicPtr::new(core::ptr::null_mut()),
+            roots: BTreeMap::new(),
+            gray: Vec::new(),
+            grayagain: Vec::new(),
+            phase: Phase::Idle,
+            total_bytes: 0,
+            threshold: INITIAL_THRESHOLD,
+            gc_off: false,
+            state_root: None,
+            spec_root: None,
+        }
+    }
 }
 
 impl Heap {
     pub fn init() {
         if HEAP.load(Ordering::Acquire) == core::ptr::null_mut() {
-            let heap = Box::leak(Default::default());
+            let heap: &mut Heap = Box::leak(Box::new(Heap::default()));
             if let Err(_) = HEAP.compare_exchange(core::ptr::null_mut(), heap,
                 Ordering::Release, Ordering::Acquire)
             {
@@ -248,36 +401,180 @@ impl Heap {
         }
     }
 
-    /// Sweep all allocation and free unmarked objects.
-    /// SAFETY: All reachable objects must be marked before being called, and any
-    /// objects that haven't been marked must not be used afterwards.
-    pub unsafe fn sweep(owner: &TCellOwner<TcOwner>) {
-        let heap = unsafe { HEAP.load(Ordering::Acquire).as_mut().unwrap() };
-        // Mark all of our rooted objects.
-        for (_ptr, (tr, _)) in &heap.roots {
-            tr.mark(owner);
+    /// Register the current VM roots so incremental stepping and `collectgarbage` can
+    /// reach them. The pointers are only ever dereferenced synchronously (during a step
+    /// or a native call in the same interpreter iteration), while the referents live at
+    /// a stable address.
+    #[inline]
+    pub fn set_roots<S: Mark, P: Mark>(state: &S, spec: &P) {
+        let heap = hp();
+        unsafe {
+            (*heap).state_root = Some(RootRef { ptr: state as *const S as *const (), mark: root_thunk::<S> });
+            (*heap).spec_root = Some(RootRef { ptr: spec as *const P as *const (), mark: root_thunk::<P> });
         }
-        let alive = ALIVE.load(Ordering::Acquire);
-        let mut prev = &raw mut heap.top;
-        let mut current = heap.top.load(Ordering::Acquire);
+    }
+
+    /// Shade every root gray. Snapshots the root references first so no borrow of the
+    /// heap is held while the shading pushes onto the gray worklist.
+    unsafe fn mark_roots(owner: &TCellOwner<TcOwner>) {
+        let heap = hp();
+        let sr = unsafe { (*heap).state_root };
+        let pr = unsafe { (*heap).spec_root };
+        if let Some(r) = sr { (r.mark)(r.ptr, owner); }
+        if let Some(r) = pr { (r.mark)(r.ptr, owner); }
+        let root_ptrs: Vec<*const (dyn Mark)> = unsafe {
+            (*heap).roots.values().map(|(b, _)| &**b as *const (dyn Mark)).collect()
+        };
+        for p in root_ptrs {
+            unsafe { (&*p).mark(owner); }
+        }
+    }
+
+    /// Pop and scan gray objects until either `budget` are processed or the worklist is
+    /// empty. Returns true if the gray set is now empty.
+    unsafe fn mark_some(owner: &TCellOwner<TcOwner>, budget: usize) -> bool {
+        let mut n = 0;
+        while n < budget {
+            let ptr = unsafe { (*hp()).gray.pop() };
+            let Some(ptr) = ptr else { return true; };
+            unsafe {
+                (*ptr).color.set(BLACK);
+                ((*ptr).scan)(ptr, owner);
+            }
+            n += 1;
+        }
+        unsafe { (*hp()).gray.is_empty() }
+    }
+
+    /// Free every white object and recolor survivors back to white for the next cycle.
+    /// Must be called with the gray set fully drained (only white/black remain).
+    unsafe fn sweep_free(_owner: &TCellOwner<TcOwner>) {
+        let heap = hp();
+        let mut prev: *mut AtomicPtr<GcInner<()>> = unsafe { &raw mut (*heap).top };
+        let mut current = unsafe { (*heap).top.load(Ordering::Acquire) };
         while current != core::ptr::null_mut() {
             let next_ptr = unsafe { (*current).next.load(Ordering::Acquire) };
-            if unsafe { (*current).state } != alive {
+            if unsafe { (*current).color.get() } == WHITE {
                 debug!("freeing {current:p}");
-                unsafe { (*prev).store(next_ptr, Ordering::Release) };
-                unsafe { ((*current).finalize)(current.cast()) };
+                unsafe {
+                    (*prev).store(next_ptr, Ordering::Release);
+                    (*heap).total_bytes = (*heap).total_bytes.saturating_sub((*current).size);
+                    ((*current).finalize)(current.cast());
+                }
             } else {
+                // Survived: reset to white for the next cycle.
+                unsafe { (*current).color.set(WHITE); }
                 prev = unsafe { &raw mut (*current).next };
             }
             current = next_ptr;
         }
-        // Flip all live objects back to dead
-        ALIVE.store(!alive, Ordering::Release);
     }
 
-    pub unsafe fn collect(state: &impl Mark, owner: &TCellOwner<TcOwner>) {
-        state.mark(owner);
-        unsafe { Self::sweep(owner) };
+    /// Finish the collection atomically: rescan the roots (catching anything the mutator
+    /// stashed only on the stack since the cycle began), drain the remaining gray set,
+    /// sweep, and re-arm the trigger threshold.
+    unsafe fn finish(owner: &TCellOwner<TcOwner>) {
+        unsafe {
+            Self::mark_roots(owner);
+            // Fold the backward-barrier set into the gray worklist for a single atomic
+            // rescan (each mutated-while-black object appears here at most once per cycle).
+            // The mutator is stopped during `finish`, so the barrier can't add more.
+            let hp = hp();
+            let mut ga = core::mem::take(&mut (*hp).grayagain);
+            (*hp).gray.append(&mut ga);
+            // Drain everything.
+            Self::mark_some(owner, usize::MAX);
+            Self::sweep_free(owner);
+        }
+        let heap = hp();
+        unsafe {
+            (*heap).phase = Phase::Idle;
+            let live = (*heap).total_bytes;
+            (*heap).threshold = core::cmp::max(MIN_THRESHOLD, live.saturating_mul(2));
+        }
+    }
+
+    /// Perform one incremental step of collection. Cheap (a load + compare) when idle
+    /// and under the trigger threshold — this is the common case that makes the new
+    /// collector fast, versus the old "full collect on every allocation".
+    ///
+    /// Private worker: callers must go through the `GcCtx` token (see `Heap::rooted`),
+    /// which guarantees the roots are published first.
+    unsafe fn step_inner(owner: &TCellOwner<TcOwner>) {
+        let heap = hp();
+        unsafe {
+            if (*heap).gc_off { return; }
+
+            // Under gc_stress, collect as aggressively and incrementally as possible
+            // (start immediately, one object per step) to exercise the barrier + gray
+            // worklist on every allocation.
+            #[cfg(feature = "gc_stress")]
+            let (trigger, budget) = (0usize, 1usize);
+            #[cfg(not(feature = "gc_stress"))]
+            let (trigger, budget) = ((*heap).threshold, STEP_BUDGET);
+
+            match (*heap).phase {
+                Phase::Idle => {
+                    if (*heap).total_bytes < trigger { return; }
+                    (*heap).phase = Phase::Mark;
+                    Self::mark_roots(owner);
+                }
+                Phase::Mark => {}
+            }
+
+            if Self::mark_some(owner, budget) {
+                Self::finish(owner);
+            }
+        }
+    }
+
+    /// Synchronously run a full collection to completion. Finishes any in-progress
+    /// incremental cycle. Private worker behind the `GcCtx` token.
+    unsafe fn full_collect_inner(owner: &TCellOwner<TcOwner>) {
+        let heap = hp();
+        unsafe {
+            (*heap).phase = Phase::Mark;
+            Self::finish(owner);
+        }
+    }
+
+    /// Live bytes currently tracked. Backs `collectgarbage("count")`.
+    pub fn live_bytes() -> usize {
+        unsafe { (*hp()).total_bytes }
+    }
+
+    /// Enable/disable automatic collection. Backs `collectgarbage("stop"/"restart")`.
+    pub fn set_gc_off(off: bool) {
+        unsafe { (*hp()).gc_off = off; }
+    }
+
+    /// Sweep all allocation and free unmarked objects: shades all registered roots,
+    /// drains the gray worklist (including anything shaded via `Gc::mark` beforehand),
+    /// then frees the white objects. Private worker behind the `GcCtx` token.
+    /// SAFETY: Any objects not reachable from the roots / prior shading must not be used
+    /// afterwards.
+    unsafe fn sweep_inner(owner: &TCellOwner<TcOwner>) {
+        unsafe {
+            (*hp()).phase = Phase::Mark;
+            Self::finish(owner);
+        }
+    }
+
+    /// Enter a rooting scope via a closure. The `GcCtx` token handed to `f` is the only
+    /// way to drive a collection; when `f` returns (or panics) the published roots are
+    /// cleared, so a stray later collection can never read a dangling root pointer. The
+    /// higher-ranked `'lua` brand makes the token un-storable outside the scope.
+    pub fn rooted<R>(f: impl for<'lua> FnOnce(GcCtx<'lua>) -> R) -> R {
+        let scope = RootScope { _priv: () };
+        f(scope.token())
+    }
+
+    /// Manual (RAII) form of [`Heap::rooted`], for call sites (like the interpreter loop)
+    /// that can't wrap their whole body in a closure. Hold the returned guard for the
+    /// duration of the run and obtain tokens from it via [`RootScope::token`]; roots are
+    /// cleared when the guard drops.
+    pub fn root_scope() -> RootScope {
+        RootScope { _priv: () }
     }
 
     /// Root a GC pointer, so that it is automatically marked by the GC before any sweep.
@@ -286,18 +583,102 @@ impl Heap {
     // TODO: Replace with Root smartpointer instead.
     pub unsafe fn root<T: Mark>(gc: &mut Gc<T>, owner: &mut TCellOwner<TcOwner>) {
         // SAFETY: We have owner. Maybe still kinda sus think about this some more
-        let heap = unsafe { HEAP.load(Ordering::Acquire).as_mut().unwrap() };
+        let heap = hp();
         // Increment the root count for this key
         let ptr = gc.ptr.as_ptr();
         let dt: Box<Gc<T>> = Box::new(gc.clone());
         // SAFETY: Erase the lifetime of Gc<T>. The caller is required to not have the
         // object remain rooted longer than its lifetimes.
         let dt: Box<dyn Mark> = unsafe { core::mem::transmute(dt as Box<dyn Mark>) };
-        heap.roots.entry(ptr.cast()).or_insert_with(|| (dt, 0)).1 += 1;
+        unsafe { (*heap).roots.entry(ptr.cast()).or_insert_with(|| (dt, 0)).1 += 1; }
     }
 
     fn unroot<T>(gc: &Gc<T>, owner: &mut TCellOwner<TcOwner>) {
         // No-op for now?
+    }
+}
+
+/// RAII scope that publishes VM roots and clears them on drop. Obtained from
+/// [`Heap::root_scope`] (or created internally by [`Heap::rooted`]). Hand out `GcCtx`
+/// tokens via [`RootScope::token`]; a token borrows the scope, so it cannot outlive it.
+#[must_use = "dropping the RootScope immediately clears the GC roots"]
+pub struct RootScope {
+    _priv: (),
+}
+
+impl RootScope {
+    /// Mint a capability token, borrowed from this scope so it can't escape.
+    #[inline]
+    pub fn token<'lua>(&'lua self) -> GcCtx<'lua> {
+        GcCtx { _brand: PhantomData }
+    }
+}
+
+impl Drop for RootScope {
+    fn drop(&mut self) {
+        // Clear the published roots so a later stray collection can't read a dangling
+        // RunState/Specializer pointer.
+        let heap = hp();
+        unsafe {
+            (*heap).state_root = None;
+            (*heap).spec_root = None;
+        }
+    }
+}
+
+/// A `'lua`-branded capability token: proof that we are inside a rooting scope. Every
+/// collection entry point requires one, so it is impossible to sweep without having
+/// published roots. `Copy`, so it threads freely (e.g. into `Specializer::run`); the
+/// invariant `'lua` brand keeps it from being stored beyond the scope.
+#[derive(Clone, Copy)]
+pub struct GcCtx<'lua> {
+    _brand: PhantomData<fn(&'lua ()) -> &'lua ()>,
+}
+
+impl<'lua> GcCtx<'lua> {
+    /// Publish the live roots and advance the incremental collector one bounded step.
+    #[inline]
+    pub fn step<S: Mark, P: Mark>(self, state: &S, spec: &P, owner: &TCellOwner<TcOwner>) {
+        Heap::set_roots(state, spec);
+        unsafe { Heap::step_inner(owner) };
+    }
+
+    /// Publish the live roots and run a full synchronous collection.
+    pub fn full_collect<S: Mark, P: Mark>(self, state: &S, spec: &P, owner: &TCellOwner<TcOwner>) {
+        Heap::set_roots(state, spec);
+        unsafe { Heap::full_collect_inner(owner) };
+    }
+
+    /// Sweep using the roots published so far (plus the permanent `Heap::root` set).
+    /// Used by the gc unit tests, which shade objects manually with `Mark::mark`.
+    pub fn sweep(self, owner: &TCellOwner<TcOwner>) {
+        unsafe { Heap::sweep_inner(owner) };
+    }
+
+    /// Publish the live roots without collecting, so a native function entered next (e.g.
+    /// `collectgarbage`) can reach them.
+    #[inline]
+    pub fn publish<S: Mark, P: Mark>(self, state: &S, spec: &P) {
+        Heap::set_roots(state, spec);
+    }
+
+    /// Full collection using the most recently published roots. For `collectgarbage`,
+    /// which cannot receive a token through the fixed native ABI.
+    pub fn full_collect_published(self, owner: &TCellOwner<TcOwner>) {
+        unsafe { Heap::full_collect_inner(owner) };
+    }
+
+    /// One incremental step using the most recently published roots (for `collectgarbage`).
+    pub fn step_published(self, owner: &TCellOwner<TcOwner>) {
+        unsafe { Heap::step_inner(owner) };
+    }
+
+    /// SAFETY: only sound while executing inside a live rooting scope with roots currently
+    /// published. The VM upholds this: a native function is only ever invoked from a
+    /// safepoint that has just called [`GcCtx::publish`].
+    #[inline]
+    pub unsafe fn assume_rooted() -> GcCtx<'lua> {
+        GcCtx { _brand: PhantomData }
     }
 }
 
@@ -337,7 +718,7 @@ mod test {
     fn gc_sweep_empty() {
         Heap::init();
         let owner = TCellOwner::new();
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
     }
 
     #[cfg(feature = "gc_sanitize")]
@@ -347,7 +728,7 @@ mod test {
         let a = Gc::new(1);
         let owner = TCellOwner::new();
         a.mark(&owner);
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         assert_eq!(*a, 1);
     }
 
@@ -358,9 +739,9 @@ mod test {
         let a = Gc::new(1);
         let owner = TCellOwner::new();
         a.mark(&owner);
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         a.mark(&owner);
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         assert_eq!(*a, 1);
     }
 
@@ -371,7 +752,7 @@ mod test {
         let mut a = Gc::new(1);
         let mut owner = TCellOwner::new();
         unsafe { Heap::root(&mut a, &mut owner) };
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         assert_eq!(*a, 1);
     }
 
@@ -382,8 +763,8 @@ mod test {
         let mut a = Gc::new(1);
         let mut owner = TCellOwner::new();
         unsafe { Heap::root(&mut a, &mut owner) };
-        unsafe { Heap::sweep(&owner) };
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
+        Heap::rooted(|gc| gc.sweep(&owner));
         assert_eq!(*a, 1);
     }
 
@@ -394,7 +775,7 @@ mod test {
         Heap::init();
         let a = Gc::new(1);
         let mut owner = TCellOwner::new();
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         assert_eq!(*a, 1); // should panic
     }
 
@@ -407,7 +788,7 @@ mod test {
         let b = Gc::new(2);
         let mut owner = TCellOwner::new();
         a.mark(&owner);
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         assert_eq!(*a, 1);
         assert_eq!(*b, 2); // should panic
     }
@@ -420,9 +801,9 @@ mod test {
         let b = Gc::new(2);
         let mut owner = TCellOwner::new();
         b.mark(&owner);
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         b.mark(&owner);
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         assert_eq!(*b, 2);
     }
 
@@ -436,11 +817,11 @@ mod test {
         let mut owner = TCellOwner::new();
         a.mark(&owner);
         c.mark(&owner);
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         c.mark(&owner);
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         c.mark(&owner);
-        unsafe { Heap::sweep(&owner) };
+        Heap::rooted(|gc| gc.sweep(&owner));
         assert_eq!(*c, 3);
     }
 }
