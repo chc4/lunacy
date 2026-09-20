@@ -355,12 +355,24 @@ impl<T> Tc<T> {
 
     /// Forward (Dijkstra) write barrier: call before storing a pointer to `value` into
     /// this object. If `self` is black, `value` is shaded so the marking frontier advances
-    /// to it, preserving the "no black -> white" invariant. Store sites (Table::set,
-    /// SETLIST, SETUPVAL, upvalue close) call this so the incremental collector stays
-    /// correct while the mutator runs.
+    /// to it, preserving the "no black -> white" invariant. Store sites that write a
+    /// *sub-field* in place (Table::set, SETLIST) call this directly; whole-cell writes
+    /// should use [`Tc::replace`] instead, which can't be misused (barrier + write fused).
     #[inline]
     pub fn barrier<V: Mark>(&self, value: &V, owner: &TCellOwner<TcOwner>) {
         self.0.write_barrier(value, owner);
+    }
+}
+
+impl<T: Mark> Tc<T> {
+    /// Replace the whole cell contents, firing the forward write barrier first. This is
+    /// the misuse-resistant way to store into a `Tc`: the barrier and the write are fused,
+    /// so a caller can't accidentally write a GC pointer without shading it. Prefer this
+    /// over `*tc.rw(owner) = value`.
+    #[inline]
+    pub fn replace(&self, owner: &mut TCellOwner<TcOwner>, value: T) {
+        self.0.write_barrier(&value, owner);
+        *self.0.deref().rw(owner) = value;
     }
 }
 
@@ -929,11 +941,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             // going to be removing it from the stack
             let closed = Tc::new(self.vals[*idx].clone());
             for up_use in upval.1.iter() {
-                let new_val = Upvalue::Closed(closed.clone());
-                // Forward write barrier: storing the fresh (white) closed cell into a
-                // possibly-black upvalue-use cell.
-                up_use.barrier(&new_val, owner);
-                *up_use.rw(owner) = new_val;
+                // `set` fuses the forward write barrier with the write.
+                up_use.replace(owner, Upvalue::Closed(closed.clone()));
             }
         }
     }
@@ -1321,9 +1330,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         Upvalue::Closed(c) => {
                             let c = c.clone();
                             let new_val = state.vals[state.base + a as usize].clone();
-                            // Forward write barrier: storing into a possibly-black upvalue cell.
-                            c.barrier(&new_val, owner);
-                            *c.rw(owner) = new_val;
+                            // `set` fuses the forward write barrier with the write.
+                            c.replace(owner, new_val);
                         },
                     };
                 },
