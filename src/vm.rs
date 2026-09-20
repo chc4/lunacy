@@ -353,14 +353,14 @@ impl<T> Tc<T> {
         self.0.as_ptr().cast()
     }
 
-    /// Mutable access to the cell contents. This inherent method shadows the `TCell::rw`
-    /// reached through `Deref`, so *every* in-place mutation of a GC object funnels
-    /// through here — the single choke point where we fire the incremental GC's write
-    /// barrier before handing out `&mut`.
+    /// Forward (Dijkstra) write barrier: call before storing a pointer to `value` into
+    /// this object. If `self` is black, `value` is shaded so the marking frontier advances
+    /// to it, preserving the "no black -> white" invariant. Store sites (Table::set,
+    /// SETLIST, SETUPVAL, upvalue close) call this so the incremental collector stays
+    /// correct while the mutator runs.
     #[inline]
-    pub fn rw<'a>(&'a self, owner: &'a mut TCellOwner<TcOwner>) -> &'a mut T {
-        self.0.write_barrier();
-        self.0.deref().rw(owner)
+    pub fn barrier<V: Mark>(&self, value: &V, owner: &TCellOwner<TcOwner>) {
+        self.0.write_barrier(value, owner);
     }
 }
 
@@ -461,6 +461,10 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     }
 
     pub fn set(&mut self, owner: &mut TCellOwner<TcOwner>, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
+        // Forward write barrier: storing key/value pointers into this table; if it is
+        // black, shade them so the marking frontier reaches them (no-op for non-GC values).
+        self.barrier(&key, owner);
+        self.barrier(&value, owner);
         match key {
             LValue::Number(n) => {
                 // TODO: sparse arrays
@@ -925,7 +929,11 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             // going to be removing it from the stack
             let closed = Tc::new(self.vals[*idx].clone());
             for up_use in upval.1.iter() {
-                *up_use.rw(owner) = Upvalue::Closed(closed.clone());
+                let new_val = Upvalue::Closed(closed.clone());
+                // Forward write barrier: storing the fresh (white) closed cell into a
+                // possibly-black upvalue-use cell.
+                up_use.barrier(&new_val, owner);
+                *up_use.rw(owner) = new_val;
             }
         }
     }
@@ -1312,7 +1320,10 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         },
                         Upvalue::Closed(c) => {
                             let c = c.clone();
-                            *c.rw(owner) = state.vals[state.base + a as usize].clone()
+                            let new_val = state.vals[state.base + a as usize].clone();
+                            // Forward write barrier: storing into a possibly-black upvalue cell.
+                            c.barrier(&new_val, owner);
+                            *c.rw(owner) = new_val;
                         },
                     };
                 },
@@ -1359,19 +1370,18 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     match state.vals[state.base + a as usize].clone() {
                         LValue::Table(tab) => {
                             assert_ne!(c, 0);
-                            if b == 0 {
-                                let src = state.vals[state.base + a as usize+1..].iter().cloned();
-                                tab.rw(owner).array.splice(
-                                    (c as usize-1)*50..,
-                                    src
-                                ).for_each(drop);
-                            } else {
-                                let src = state.vals[state.base + a as usize+1..=state.base + a as usize+b as usize as usize].iter().cloned();
-                                tab.rw(owner).array.splice(
-                                    (c as usize-1)*50..,
-                                    src
-                                ).for_each(drop);
+                            let start = state.base + a as usize + 1;
+                            let end = if b == 0 { state.vals.len() } else { start + b as usize };
+                            // Forward write barrier: shade the values being stored into the
+                            // (possibly black) table so the marking frontier reaches them.
+                            if tab.0.is_black() {
+                                for i in start..end { state.vals[i].mark(owner); }
                             }
+                            let src = state.vals[start..end].iter().cloned();
+                            tab.rw(owner).array.splice(
+                                (c as usize-1)*50..,
+                                src
+                            ).for_each(drop);
                         },
                         _ => unimplemented!(),
                     }

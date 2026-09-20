@@ -368,6 +368,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Err(lv) => lv.clone(),
                 };
                 let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
+                // Forward write barrier: shade the stored value if the table is black.
+                t.barrier(&kc, owner);
                 let t = t.rw(owner);
                 if t.array.len() <= kb.0 as usize {
                     t.array.resize_with(kb.0 as usize, || LValue::Nil);
@@ -403,6 +405,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Ok(c) => c.into(),
                         Err(lv) => lv.clone(),
                     };
+                    // Forward write barrier: shade the stored value if the table is black.
+                    tab.barrier(&kc, owner);
                     let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
                     debug!("settable_href {:?} {}", &val1, htype);
                     #[cfg(debug_assertions)]
@@ -432,6 +436,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Err(lv) => lv.clone(),
                     };
                     let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
+                    // Forward write barrier: shade the stored key/value if the table is black.
+                    t.barrier(&kb, owner);
+                    t.barrier(&kc, owner);
                     let kc_type = kc.typeof_();
                     if let Some(existing) = t.rw(owner).hash.insert(kb, kc.clone()) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
@@ -474,14 +481,14 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
             match state.vals[state.base + a as usize].clone() {
                 LValue::Table(tab) => {
                     assert_ne!(c, 0);
-                    if b == 0 {
-                        let src = state.vals[state.base + a as usize+1..].iter().cloned();
-                        tab.rw(owner).array.splice(
-                            (c as usize-1)*50..,
-                            src
-                        ).for_each(drop);
-                    } else {
-                        let src = state.vals[state.base + a as usize+1..=state.base + a as usize+b as usize as usize].iter().cloned();
+                    let start = state.base + a as usize + 1;
+                    let end = if b == 0 { state.vals.len() } else { start + b as usize };
+                    // Forward write barrier: shade the values stored into a black table.
+                    if tab.0.is_black() {
+                        for i in start..end { state.vals[i].mark(owner); }
+                    }
+                    {
+                        let src = state.vals[start..end].iter().cloned();
                         tab.rw(owner).array.splice(
                             (c as usize-1)*50..,
                             src

@@ -125,23 +125,26 @@ impl<T: Mark> Mark for Vec<T> {
 // instead of pausing for a full traversal.
 //
 // To keep the tricolor invariant while the mutator runs between increments we use a
-// *bounded backward* write barrier (see `Gc::write_barrier`, funnelled through
-// `Tc::rw`), modelled on Lua's `luaC_barrierback`: mutating a black object turns it
-// gray and links it onto a separate `grayagain` list. Crucially it is *not* put back
-// on the incremental `gray` worklist — that would let a hot mutation loop re-gray an
-// object as fast as the collector re-blackens it, so the gray set would never drain
-// and the cycle could starve forever. Instead, because the barrier only fires on a
-// *black* object (`color == BLACK`), each object joins `grayagain` at most once per
-// cycle, and `grayagain` is rescanned exactly once, atomically, in `finish` (like
-// Lua's atomic phase folding grayagain into gray). That bounds re-scan work to O(objects
-// mutated) per cycle and guarantees progress. (A true forward barrier — shading the
-// written *value* — isn't possible here: the `Tc::rw` choke point sees the mutated
-// object, not the new pointer.)
+// *forward* (Dijkstra) write barrier (`Gc::write_barrier`): whenever the mutator stores
+// a pointer to `value` into a black container, we shade `value` gray — advancing the
+// marking frontier to it. The container stays black. This keeps the strong invariant
+// ("no black object points at a white one") continuously true, and — unlike a backward
+// barrier — pushes work *forward* onto the incremental gray worklist, so the shaded value
+// is traced by ordinary mark steps rather than deferred to the atomic phase. There is no
+// re-graying of already-scanned objects, so a hot mutation loop can't starve the cycle.
 //
-// When the incremental gray set empties we perform an atomic finish (re-scan the roots,
-// fold in `grayagain`, drain) and then an atomic sweep. Because sweep is atomic (no
-// allocation interleaves with it) a single white color is sufficient — new objects are
-// always allocated white and only ever swept after a completed atomic mark.
+// The barrier fires at the individual store sites (Table::set, SETLIST, SETUPVAL, upvalue
+// close, ...) because that is where the written value is visible. It is self-gating: the
+// `is_black` check is false while idle (nothing is black between cycles), so the fast path
+// is a single load + branch.
+//
+// When the incremental gray set empties we perform an atomic finish that re-scans the
+// roots (the value stack / registers have no barrier, so the mutator may have dropped a
+// white object into a register since the last scan) and drains whatever that shades, then
+// an atomic sweep. The atomic phase is therefore bounded by the roots, not by heap
+// mutation. Because sweep is atomic (no allocation interleaves with it) a single white
+// color is sufficient — new objects are always allocated white and only ever swept after
+// a completed atomic mark.
 const WHITE: u8 = 0;
 const GRAY: u8 = 1;
 const BLACK: u8 = 2;
@@ -229,22 +232,23 @@ impl<T> Gc<T> {
         Self { ptr: core::ptr::NonNull::new(ptr as _).unwrap() }
     }
 
-    /// Bounded backward write barrier (Lua `barrierback` style). Called whenever the
-    /// mutator takes a mutable borrow of a GC object (via `Tc::rw`). If the object is
-    /// black it may be about to gain a pointer to a white object, which would break the
-    /// tricolor invariant, so we turn it gray and link it onto the `grayagain` list to be
-    /// rescanned once, atomically, in `finish` — NOT back onto the incremental `gray`
-    /// worklist (that could starve the collector). The `color == BLACK` guard means each
-    /// object joins `grayagain` at most once per cycle. No-op unless a collection is
-    /// mid-mark (nothing is black while idle), so the fast path is a single load + branch.
+    /// True if this object has been fully scanned this cycle (black).
     #[inline]
-    pub fn write_barrier(&self) {
-        let inner = self.ptr.as_ptr();
-        unsafe {
-            if (*inner).color.get() == BLACK {
-                (*inner).color.set(GRAY);
-                push_grayagain(inner as *const GcInner<()>);
-            }
+    pub fn is_black(&self) -> bool {
+        unsafe { (*self.ptr.as_ptr()).color.get() == BLACK }
+    }
+
+    /// Forward (Dijkstra) write barrier. Call at every store of a pointer `value` into
+    /// this object. If `self` is black, storing a pointer to a (possibly white) `value`
+    /// would break the "no black -> white" invariant, so shade `value` — pushing the
+    /// marking frontier forward onto the incremental gray worklist. `self` stays black, so
+    /// there is no re-scanning and no way for a mutation loop to starve the collector; the
+    /// shaded value is traced by ordinary mark steps. No-op while idle (nothing is black),
+    /// so the fast path is a single load + branch.
+    #[inline]
+    pub fn write_barrier<V: Mark>(&self, value: &V, owner: &TCellOwner<TcOwner>) {
+        if self.is_black() {
+            value.mark(owner);
         }
     }
 }
@@ -260,9 +264,6 @@ impl<T> DerefMut for Gc<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         #[cfg(feature = "gc_sanitize")]
         unsafe { assert!(self.ptr.as_ref().alive.load(Ordering::Acquire), "value is dead") };
-        // Direct mutable access bypasses the interior-mutability path; treat it as a
-        // barrier point too so we never create an untracked black->white edge.
-        self.write_barrier();
         unsafe { &mut self.ptr.as_mut().val }
     }
 }
@@ -343,21 +344,11 @@ fn push_gray(ptr: *const GcInner<()>) {
     unsafe { (*hp()).gray.push(ptr); }
 }
 
-/// Backward-barrier'd objects: rescanned once, atomically, in `finish` (never fed back
-/// into the incremental `gray` worklist).
-#[inline]
-fn push_grayagain(ptr: *const GcInner<()>) {
-    unsafe { (*hp()).grayagain.push(ptr); }
-}
-
 pub struct Heap {
     top: AtomicPtr<GcInner<()>>,
     roots: BTreeMap<*const (), (Box<dyn Mark>, usize)>,
     /// Worklist of gray objects awaiting scanning.
     gray: Vec<*const GcInner<()>>,
-    /// Objects turned back to gray by the write barrier; folded into `gray` and drained
-    /// once during the atomic `finish` (Lua's `grayagain`).
-    grayagain: Vec<*const GcInner<()>>,
     phase: Phase,
     /// Live bytes currently tracked by the collector.
     total_bytes: usize,
@@ -375,7 +366,6 @@ impl Default for Heap {
             top: AtomicPtr::new(core::ptr::null_mut()),
             roots: BTreeMap::new(),
             gray: Vec::new(),
-            grayagain: Vec::new(),
             phase: Phase::Idle,
             total_bytes: 0,
             threshold: INITIAL_THRESHOLD,
@@ -475,14 +465,11 @@ impl Heap {
     /// sweep, and re-arm the trigger threshold.
     unsafe fn finish(owner: &TCellOwner<TcOwner>) {
         unsafe {
+            // Re-scan the roots with the mutator stopped: the value stack / registers have
+            // no write barrier, so the mutator may have dropped a white object into a
+            // register since the last scan. The forward barrier already kept every heap
+            // edge sound, so this plus draining is all the atomic phase needs.
             Self::mark_roots(owner);
-            // Fold the backward-barrier set into the gray worklist for a single atomic
-            // rescan (each mutated-while-black object appears here at most once per cycle).
-            // The mutator is stopped during `finish`, so the barrier can't add more.
-            let hp = hp();
-            let mut ga = core::mem::take(&mut (*hp).grayagain);
-            (*hp).gray.append(&mut ga);
-            // Drain everything.
             Self::mark_some(owner, usize::MAX);
             Self::sweep_free(owner);
         }
