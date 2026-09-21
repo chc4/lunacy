@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::collections::BTreeMap;
-use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
+use std::sync::atomic::{Ordering, AtomicBool, AtomicU8, AtomicPtr};
 use crate::vm::{Tc, TcOwner, LValue, LClosure, NClosure, Table, Upvalue};
 use crate::{TCell, TCellOwner};
 use indexmap::IndexMap;
@@ -124,7 +124,9 @@ impl<T: Mark> Mark for Vec<T> {
 // cycle). When the worklist empties, `finish` runs the atomic tail with the mutator
 // stopped: fold in grayagain (see Note [Write barriers]), re-scan the roots, drain, sweep.
 // Sweep is atomic, so one white color suffices: objects allocated mid-cycle are white and
-// cannot be swept before the next completed mark.
+// cannot be swept before the next completed mark. At cycle end every survivor is black, so
+// `sweep_free` flips the white/black interpretation (one global toggle) instead of
+// recoloring each survivor.
 //
 // Note [Write barriers]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -152,9 +154,16 @@ impl<T: Mark> Mark for Vec<T> {
 //
 // All live objects must be reachable through one of these roots before a GC safepoint, or else
 // the object may be collected and freed.
-const WHITE: u8 = 0;
-const GRAY: u8 = 1;
-const BLACK: u8 = 2;
+// "White" and "black" are the two values in {0,1}; which one currently means white
+// (unreached) flips each cycle in `sweep_free`, so all survivors become white again with a
+// single toggle instead of a write per live object. GRAY is the stable third value and is
+// never a flip target.
+const GRAY: u8 = 2;
+static CURRENT_WHITE: AtomicU8 = AtomicU8::new(0);
+#[inline]
+fn white() -> u8 { CURRENT_WHITE.load(Ordering::Acquire) }
+#[inline]
+fn black() -> u8 { white() ^ 1 }
 
 /// Gray objects scanned per incremental step during normal operation.
 const STEP_BUDGET: usize = 512;
@@ -188,7 +197,7 @@ impl<T> Gc<T> {
         let inner = GcInner {
             next: AtomicPtr::new(top),
             // Born white; swept next cycle unless reached. See Note [Incremental GC].
-            color: Cell::new(WHITE),
+            color: Cell::new(white()),
             size,
             #[cfg(feature = "gc_sanitize")]
             finalize: |ptr| unsafe {
@@ -231,7 +240,7 @@ impl<T> Gc<T> {
     /// True if this object has been fully scanned this cycle (black).
     #[inline]
     pub fn is_black(&self) -> bool {
-        unsafe { (*self.ptr.as_ptr()).color.get() == BLACK }
+        unsafe { (*self.ptr.as_ptr()).color.get() == black() }
     }
 
     /// Forward barrier: shade `value` when storing it into this (black) object, so the
@@ -249,7 +258,7 @@ impl<T> Gc<T> {
     pub fn backward_barrier(&self) {
         let inner = self.ptr.as_ptr();
         unsafe {
-            if (*inner).color.get() == BLACK {
+            if (*inner).color.get() == black() {
                 (*inner).color.set(GRAY);
                 push_grayagain(inner);
             }
@@ -300,7 +309,7 @@ impl<T> Mark for Gc<T> {
     fn mark(&self, _owner: &TCellOwner<TcOwner>) {
         let inner = self.ptr.as_ptr();
         unsafe {
-            if (*inner).color.get() == WHITE {
+            if (*inner).color.get() == white() {
                 (*inner).color.set(GRAY);
                 push_gray(inner);
             }
@@ -466,7 +475,7 @@ impl Heap {
             let entry = unsafe { (*hp()).gray.pop() };
             let Some((ptr, scan)) = entry else { return true; };
             unsafe {
-                (*ptr).color.set(BLACK);
+                (*ptr).color.set(black());
                 // SAFETY: `scan` was paired with `ptr` at its push site, so their `T` match.
                 scan(ptr, owner);
             }
@@ -475,18 +484,20 @@ impl Heap {
         unsafe { (*hp()).gray.is_empty() }
     }
 
-    /// Free every white object and recolor survivors back to white for the next cycle.
-    /// Must be called with the gray set fully drained (only white/black remain).
+    /// Free every white object, then flip the white/black interpretation so all survivors
+    /// (currently black) become white for the next cycle without being rewritten. Must be
+    /// called with the gray set fully drained (only white/black remain).
     ///
     /// # Safety:
     ///   * All GC objects which will be used after must have been marked.
     unsafe fn sweep_free(_owner: &TCellOwner<TcOwner>) {
         let heap = hp();
+        let dead = white();
         let mut prev: *mut AtomicPtr<GcInner<()>> = unsafe { &raw mut (*heap).top };
         let mut current = unsafe { (*heap).top.load(Ordering::Acquire) };
         while current != core::ptr::null_mut() {
             let next_ptr = unsafe { (*current).next.load(Ordering::Acquire) };
-            if unsafe { (*current).color.get() } == WHITE {
+            if unsafe { (*current).color.get() } == dead {
                 debug!("freeing {current:p}");
                 unsafe {
                     (*prev).store(next_ptr, Ordering::Release);
@@ -494,12 +505,13 @@ impl Heap {
                     ((*current).finalize)(current.cast());
                 }
             } else {
-                // Survived: reset to white for the next cycle.
-                unsafe { (*current).color.set(WHITE); }
                 prev = unsafe { &raw mut (*current).next };
             }
             current = next_ptr;
         }
+        // Survivors are black; flipping makes them the new white. New black == old dead,
+        // which no live object holds.
+        CURRENT_WHITE.store(dead ^ 1, Ordering::Release);
     }
 
     /// Atomic tail of a cycle: fold in grayagain, re-scan the roots, drain, sweep, and
