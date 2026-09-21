@@ -1,4 +1,4 @@
-#![allow(non_snake_case, unused)]
+#![allow(non_snake_case, non_camel_case_types, unused)]
 use core::fmt::Debug;
 use core::hash::Hash;
 use std::collections::hash_map::Entry;
@@ -358,7 +358,7 @@ impl<T> Tc<T> {
 impl<T: Mark> Tc<T> {
     /// Replace the whole cell contents, firing the write barrier first. Fusing the two is
     /// the misuse-resistant way to store into a non-table `Tc` (upvalue cells) — prefer it
-    /// over `*tc.rw(owner) = value`. See Note [Write barriers] in `gc`.
+    /// over `*tc.rw(owner) = value`. See Note [Write barriers].
     #[inline]
     pub fn replace(&self, owner: &mut TCellOwner<TcOwner>, value: T) {
         self.0.write_barrier(&value, owner);
@@ -450,7 +450,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
 
 impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// Fire the table write barrier before mutating this table's array/hash in place.
-    /// See Note [Write barriers] in `gc`.
+    /// See Note [Write barriers].
     #[inline]
     pub fn barrier_back(&self) {
         self.0.backward_barrier();
@@ -1197,12 +1197,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     };
                     let result: LValue = match opt.as_slice() {
                         // SAFETY: reachable only from a safepoint that just published roots.
-                        // See Note [GC roots] in `gc`.
-                        b"collect" | b"" => { unsafe { GcCtx::assume_rooted() }.full_collect_published(owner); LValue::Number(Number(0.0)) },
+                        // See Note [GC roots].
+                        b"collect" | b"" => { unsafe { GcCtx::assume_rooted().full_collect_published(owner); } LValue::Number(Number(0.0)) },
                         // Live memory in Kbytes, as a (fractional) number.
                         b"count" => LValue::Number(Number(Heap::live_bytes() as f64 / 1024.0)),
                         // Advance one incremental step.
-                        b"step" => { unsafe { GcCtx::assume_rooted() }.step_published(owner); LValue::Bool(false) },
+                        b"step" => { unsafe { GcCtx::assume_rooted().step_published(owner); } LValue::Bool(false) },
                         b"stop" => { Heap::set_gc_off(true); LValue::Number(Number(0.0)) },
                         b"restart" => { Heap::set_gc_off(false); LValue::Number(Number(0.0)) },
                         // Tuning knobs we accept but don't model.
@@ -1275,14 +1275,15 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             }
         };
         // GC rooting scope for this run; roots clear when `_root_scope` drops. See Note
-        // [GC roots] in `gc`.
+        // [GC roots].
         let _root_scope = Heap::root_scope();
         let gc = _root_scope.token();
         // we need to track where to return to, along with the base pointer and where to put return
         // values
         let r_vals = 'int: loop {
+            // SAFETY: at instruction boundaries every live GC value is in the RunState.
             #[cfg(feature = "gc_stress")]
-            { gc.step(&state, &spec, owner); }
+            unsafe { gc.step(&state, &spec, owner); }
 
             let inst = unsafe { state.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[state.pc] };
             state.pc += 1;
@@ -1343,8 +1344,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
                     state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
-                    // GC safepoint. See Note [GC roots] in `gc`.
-                    gc.step(&state, &spec, owner);
+                    // SAFETY: The newly created table was added to the RunState. .
+                    unsafe{ gc.step(&state, &spec, owner); }
                 },
                 Opcode::SELF => {
                     let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);
@@ -1650,7 +1651,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     } else if let LValue::NClosure(ncall) = to_call {
                         let nf = ncall.native.clone();
                         // Publish roots so a native (e.g. `collectgarbage`) can reach them.
-                        // See Note [GC roots] in `gc`.
+                        // See Note [GC roots].
                         gc.publish(&state, &spec);
                         state.call_native(nf, a as u16, b, c, owner);
                         // FIXME(metatables): __call

@@ -1911,12 +1911,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         debug!("run");
         // Republish on entry: `state` was moved into this frame (the caller's pointer is now
         // stale) and a JIT block can call a native before the first safepoint. See Note
-        // [GC roots] in `gc`.
+        // [GC roots].
         gc.publish(&state, &*self);
         loop {
             #[cfg(feature = "gc_stress")]
             {
-                gc.step(&state, &*self, owner);
+                // SAFETY: We have no unrooted variables or parameters.
+                unsafe { gc.step(&state, &*self, owner); }
             }
             let block = &mut self.blocks[id.0];
             #[cfg(feature = "jit")]
@@ -2151,8 +2152,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::GC => {
                     off += 1;
-                    // GC safepoint. See Note [GC roots] in `gc`.
-                    gc.step(&state, &*self, owner);
+                    // GC safepoint. See Note [GC roots].
+                    // SAFETY: We have no stack owned objects, and all previous residual
+                    // operations must have either dropped their objects or published them
+                    // to RunState for them to be accessed after this.
+                    unsafe { gc.step(&state, &*self, owner); }
                 },
             }
         }
