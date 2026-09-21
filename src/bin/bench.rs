@@ -5,7 +5,11 @@ use lunacy::chunk;
 use lunacy::vm;
 
 const TIMES: usize = 10;
-const LBBV: bool = true;
+// LBBV (lazy basic-block versioning / specializer) lives in the `generator`
+// module, gated by the `lbbv` feature (independent of the native `jit`). In
+// interpreter-only builds it is disabled so execution stays in the vm.rs
+// `run()` loop.
+const LBBV: bool = cfg!(feature = "lbbv");
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder().format_timestamp(None).format_source_path(true).init();
@@ -26,9 +30,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
             let mut _r_vals = s.run::<LBBV>(owner, _g.clone(), clos, vec![].into())?;
 
-            let vm::LValue::LClosure(run_iter) = _g.get(owner, &vm::InternString::intern(s.intern(), "run_iter")).ok_or("no run_iter")? else { panic!() };
+            let run_iter_key = vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "run_iter"));
+            let run_iter_boxed = _g.get(owner, &run_iter_key, s.intern()).ok_or("no run_iter")?;
+            let vm::LValue::LClosure(run_iter) = run_iter_boxed.unbox() else { panic!() };
             println!("> starting benchmark");
-            _r_vals = s.run::<LBBV>(owner, _g.clone(), run_iter, vec![vm::LValue::Number(vm::Number(times as f64))].into())?;
+            _r_vals = s.run::<LBBV>(owner, _g.clone(), run_iter, vec![vm::LBoxed::from_number(times as f64)].into())?;
             Ok(())
         })?;
     }

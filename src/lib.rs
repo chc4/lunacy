@@ -9,9 +9,16 @@
 
 pub mod chunk;
 pub mod stack;
+pub mod lboxed;
 pub mod vm;
 pub mod perf;
+// The generator (lazy basic-block versioner / specializer) compiles with the
+// `lbbv` feature; the native code generator adds `jit` on top. Interpreter-only
+// builds (`--no-default-features --features magic`) enable neither and stay
+// entirely in `vm::run`.
+#[cfg(feature = "lbbv")]
 pub mod generator;
+#[cfg(feature = "jit")]
 pub mod jit;
 pub mod gc;
 

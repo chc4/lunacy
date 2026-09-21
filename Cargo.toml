@@ -11,7 +11,12 @@ skip_vec = []
 counters = []
 graph = []
 immediate_jit = []
-jit = []
+# Lazy basic-block versioning (the `generator` specializer). Independent of the
+# native code generator: LBBV can run as a second interpreter tier on its own.
+lbbv = []
+# Native JIT (the dynasm `jit` module). Requires LBBV, since it compiles the
+# specialized blocks LBBV produces.
+jit = ["lbbv"]
 unreachable = []
 gas = []
 magic = [] # Magic JIT intrinsics

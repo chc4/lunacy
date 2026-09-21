@@ -4,6 +4,7 @@ use core::hash::Hash;
 use std::collections::hash_map::Entry;
 use std::num::Wrapping;
 use std::ops::{DerefMut, Index, IndexMut};
+use std::marker::PhantomData;
 use crate::chunk::FunctionBlock;
 use crate::chunk::{InstBits, Constant};
 use crate::stack::ValueStack;
@@ -21,12 +22,21 @@ use indexmap::IndexMap;
 use qcell::{LCell, LCellOwner};
 use crate::{TLCell, TlcOwner, Owner};
 
-use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
+#[cfg(feature = "lbbv")]
+use crate::generator::{Specializer, Context, SubPc};
+
+// `BlockId` and `HashRef` are referenced by `ReturnLocation` / `HashWitness`,
+// which exist in every build, so they live here rather than in the
+// lbbv-gated generator module (which re-imports them).
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Debug)]
+pub struct BlockId(pub usize);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HashRef(pub u8);
 use crate::perf::PerfCounters;
 use crate::gc::{Mark, Heap, Gc, GcCtx};
 use crate::{debug, warn};
 
-pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>;
+pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, IStr<'src>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Number(pub f64);
@@ -385,66 +395,38 @@ pub struct InternedHasher {
     hasher: FxBuildHasher,
 }
 
-pub const fn type_eq<T: ?Sized, U: ?Sized>() -> bool {
-    // Helper trait. `VALUE` is false, except for the specialization of the
-    // case where `T == U`.
-    trait TypeEq<U: ?Sized> {
-        const VALUE: bool;
-    }
-
-    // Default implementation.
-    impl<T: ?Sized, U: ?Sized> TypeEq<U> for T {
-        default const VALUE: bool = false;
-    }
-
-    // Specialization for `T == U`.
-    impl<T: ?Sized> TypeEq<T> for T {
-        const VALUE: bool = true;
-    }
-
-    <T as TypeEq<U>>::VALUE
-}
-
+// A plain `FxBuildHasher` wrapper; the interned-string precomputed-hash
+// optimization lives in `LCanon`'s `Hash` impl.
 impl std::hash::BuildHasher for InternedHasher {
     type Hasher = <FxBuildHasher as BuildHasher>::Hasher;
 
     fn build_hasher(&self) -> Self::Hasher {
         self.hasher.build_hasher()
     }
-
-    fn hash_one<T>(&self, x: T) -> u64
-        where T: Hash
-    {
-        debug!("hashing {:?}", std::any::type_name_of_val(&x));
-        if type_eq::<T, &LValue<'_, '_>>() {
-            let lv: &&LValue<'_, '_> = unsafe { std::mem::transmute(&x) };
-            match lv {
-                LValue::InternedString(i) => {
-                    debug!("interned hash {:?} {}", i.0, i.1);
-                    //assert_eq!(self.hasher.hash_one(i.0), i.1);
-                    return i.1
-                },
-                _ => (),
-            }
-        }
-        self.hasher.hash_one(x)
-    }
 }
 
+// Values are raw `LBoxed`; hash keys are `LCanon`. See Note [Canonical values].
 #[derive(Debug)]
 pub struct Table<'src, 'intern> {
-    pub array: FVec<LValue<'src, 'intern>>,
-    pub hash: IndexMap<LValue<'src, 'intern>, LValue<'src, 'intern>, InternedHasher>,
+    pub array: FVec<LBoxed<'src, 'intern>>,
+    pub hash: IndexMap<LCanon<'src, 'intern>, LBoxed<'src, 'intern>, InternedHasher>,
     pub epoch: usize,
 }
 
 impl<'src, 'intern> Table<'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
-            array: vec![LValue::Nil; array].into(),
+            array: vec![LBoxed::NIL; array].into(),
             hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
             epoch: 0,
         }
+    }
+
+    /// Insert a key/value without an intern arena to canonicalize the key (unlike
+    /// `set`/`get`). Valid only for builtin keys, which are already interned strings
+    /// and so satisfy the canonical-form invariant of Note [Canonical values] directly.
+    pub fn insert_lvalue(&mut self, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
+        self.hash.insert(LCanon(LBoxed::box_lvalue(key)), LBoxed::box_lvalue(value));
     }
 }
 
@@ -456,46 +438,39 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
         self.0.backward_barrier();
     }
 
-    pub fn get(&self, owner: &Owner, key: &LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
-        match key {
-            LValue::Number(n) => Some(self.ro(owner).array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
-            LValue::InternedString(s) => {
-                self.ro(owner).hash.get(key).cloned()
-            },
-            LValue::OwnedString(s) => {
-                self.ro(owner).hash.get(key).cloned()
-            },
-            _ => unimplemented!()
+    /// Look up a key. Numbers index the array part; everything else goes through
+    /// the hash part as an `LCanon`. See Note [Canonical values].
+    #[inline]
+    pub fn get(&self, owner: &Owner, key: &LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> Option<LBoxed<'src, 'intern>> {
+        if let Some(n) = key.as_number() {
+            return Some(self.ro(owner).array.get(n as usize - 1).copied().unwrap_or(LBoxed::NIL));
         }
+        let k = LCanon::new(*key, intern);
+        self.ro(owner).hash.get(&k).copied()
     }
 
-    pub fn set(&mut self, owner: &mut Owner, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
+    #[inline]
+    pub fn set(&mut self, owner: &mut Owner, key: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) {
         self.barrier_back();
-        match key {
-            LValue::Number(n) => {
-                // TODO: sparse arrays
-                if self.rw(owner).array.len() <= n.0 as usize {
-                    self.rw(owner).array.resize_with(n.0 as usize, || LValue::Nil);
-                }
-                self.rw(owner).array[n.0 as usize-1] = value
-            },
-            LValue::InternedString(ref s) => {
-                self.rw(owner).hash.insert(key, value);
-                self.rw(owner).epoch += 1;
-            },
-            LValue::OwnedString(ref s) => {
-                self.rw(owner).hash.insert(key, value);
-                self.rw(owner).epoch += 1;
-            },
-            _ => unimplemented!()
+        if let Some(n) = key.as_number() {
+            // TODO: sparse arrays
+            let n = n as usize;
+            if self.rw(owner).array.len() < n {
+                self.rw(owner).array.resize_with(n, || LBoxed::NIL);
+            }
+            self.rw(owner).array[n - 1] = value;
+            return;
         }
+        let k = LCanon::new(key, intern);
+        self.rw(owner).hash.insert(k, value);
+        self.rw(owner).epoch += 1;
     }
 }
 
 #[repr(u8)]
 #[derive(Hash, Clone)]
 pub enum InternString<'intern, 'src> {
-    Interned(ArenaIntern<'intern, (&'src [u8], u64)>),
+    Interned(ArenaIntern<'intern, IStr<'src>>),
     Owned(Gc<FVec<u8>>),
 }
 
@@ -503,7 +478,7 @@ impl<'intern, 'src> PartialEq for InternString<'intern, 'src> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (InternString::Interned(self_s), InternString::Interned(other_s)) => {
-                if self_s.deref().0.as_ptr() == other_s.deref().0.as_ptr() {
+                if self_s.deref().as_bytes().as_ptr() == other_s.deref().as_bytes().as_ptr() {
                     return true
                 } else {
                     return self_s == other_s
@@ -511,7 +486,7 @@ impl<'intern, 'src> PartialEq for InternString<'intern, 'src> {
             },
             (InternString::Interned(inter), InternString::Owned(own)) |
             (InternString::Owned(own), InternString::Interned(inter)) => {
-                inter.deref().0 == own.as_slice()
+                inter.deref().as_bytes() == own.as_slice()
             },
             (InternString::Owned(self_o), InternString::Owned(other_o)) => {
                 self_o == other_o
@@ -524,7 +499,7 @@ impl<'intern, 'src> PartialOrd for InternString<'intern, 'src> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (InternString::Interned(self_s), InternString::Interned(other_s)) => {
-                if self_s.deref().0.as_ptr() == other_s.deref().0.as_ptr() {
+                if self_s.deref().as_bytes().as_ptr() == other_s.deref().as_bytes().as_ptr() {
                     self_s.partial_cmp(self_s)
                 } else {
                     self_s.partial_cmp(other_s)
@@ -532,7 +507,7 @@ impl<'intern, 'src> PartialOrd for InternString<'intern, 'src> {
             },
             (InternString::Interned(inter), InternString::Owned(own)) |
             (InternString::Owned(own), InternString::Interned(inter)) => {
-                inter.0.partial_cmp(own.as_slice())
+                inter.as_bytes().partial_cmp(own.as_slice())
             },
             (InternString::Owned(self_o), InternString::Owned(other_o)) => {
                 self_o.partial_cmp(other_o)
@@ -546,21 +521,19 @@ impl<'intern, 'src> Eq for InternString<'intern, 'src> { }
 impl<'intern, 'src> Debug for InternString<'intern, 'src> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InternString::Interned(i) => write!(f, "{}", String::from_utf8_lossy(i.0)),
+            InternString::Interned(i) => write!(f, "{}", String::from_utf8_lossy(i.as_bytes())),
             InternString::Owned(o) => write!(f, "{}", String::from_utf8_lossy(o)),
         }
     }
 }
 
 impl<'intern, 'src> InternString<'intern, 'src> {
-    pub fn intern<S: Into<String>>(intern: &'intern internment::Arena<(&'src [u8], u64)>, s: S) -> LValue<'src, 'intern> {
-        // this is stupid: we probably actually need to intern Cow<'src, [u8]>
-        let s: String = s.into();
-        let static_s: &'static [u8] = Box::leak(s.into_boxed_str().into());
+    pub fn intern<S: Into<String>>(intern: &'intern internment::Arena<IStr<'src>>, s: S) -> LValue<'src, 'intern> {
+        let bytes: Vec<u8> = s.into().into_bytes();
         use std::hash::BuildHasher;
-        let hash = FxBuildHasher::default().hash_one(static_s);
-        debug!("interning hash {} for {:?}", hash, static_s);
-        LValue::InternedString(intern.intern((static_s.as_ref(), hash)))
+        let hash = FxBuildHasher::default().hash_one(bytes.as_slice());
+        debug!("interning hash {} for {:?}", hash, bytes);
+        LValue::InternedString(intern.intern(IStr { kind: LBoxed::KIND_INTERNED, bytes: Cow::Owned(bytes), hash }))
     }
 }
 
@@ -569,7 +542,7 @@ impl<'intern, 'src> Deref for InternString<'intern, 'src> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            InternString::Interned(i) => i.deref().0,
+            InternString::Interned(i) => i.deref().as_bytes(),
             InternString::Owned(o) => o.as_ref(),
         }
     }
@@ -584,11 +557,106 @@ pub enum LValue<'src, 'intern> {
     Table(Tc<Table<'src, 'intern>>) = 3,
     // Shared variants get mapped so they have a bit we can check
     // Strings
-    InternedString(ArenaIntern<'intern, (&'src [u8], u64)>) = 4,
-    OwnedString(Tc<FVec<u8>>) = 5,
+    InternedString(ArenaIntern<'intern, IStr<'src>>) = 4,
+    // Strings are immutable, so owned strings need no interior mutability: a
+    // plain `Gc<FVec<u8>>` (not `Tc`) lets their bytes be read without an
+    // `owner`, which is what makes content-based equality/hashing possible.
+    OwnedString(Gc<FVec<u8>>) = 5,
     // Closures
     LClosure(Tc<LClosure<'src, 'intern>>) = 8,
     NClosure(NClosure) = 9,
+}
+
+/// The NuN-boxed value type lives in its own module so its payload field can
+/// stay private (see `lboxed`), which is what makes `LBoxed::unbox` safe.
+pub use crate::lboxed::LBoxed;
+use crate::lboxed::NClosureCell;
+pub use crate::lboxed::IStr;
+
+/// Intern raw bytes into the arena, returning the canonical handle. The bytes are
+/// owned by the record (`Cow::Owned`), so the arena frees a deduped duplicate; it
+/// dedups by content, so equal bytes always yield the same handle.
+pub fn intern_bytes<'src, 'intern>(
+    intern: &'intern internment::Arena<IStr<'src>>,
+    bytes: &[u8],
+) -> ArenaIntern<'intern, IStr<'src>> {
+    use std::hash::BuildHasher;
+    let hash = FxBuildHasher::default().hash_one(bytes);
+    intern.intern(IStr { kind: LBoxed::KIND_INTERNED, bytes: Cow::Owned(bytes.to_vec()), hash })
+}
+
+// Stamp the offset-0 `kind` header of each heap cell at allocation time, so a
+// raw untagged pointer can recover its type. Non-cell allocations use the
+// blanket default (0) from gc::CellKind. (NClosures are leaked, not GC'd, and
+// stamp their header directly in `box_lvalue`.)
+impl<'src, 'intern> crate::gc::CellKind for TLCell<TlcOwner, Table<'src, 'intern>> {
+    fn cell_kind() -> u8 { LBoxed::KIND_TABLE }
+}
+impl<'src, 'intern> crate::gc::CellKind for TLCell<TlcOwner, LClosure<'src, 'intern>> {
+    fn cell_kind() -> u8 { LBoxed::KIND_LCLOSURE }
+}
+impl crate::gc::CellKind for FVec<u8> {
+    fn cell_kind() -> u8 { LBoxed::KIND_OWNED }
+}
+
+// Note [Canonical values]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~
+// `LCanon` is an `LBoxed` in canonical form: equal values have identical bits, so it
+// implements `Hash`/`Eq` by value — comparing the raw bits, pointers included — with no
+// `owner`. `LCanon::new` does the canonicalizing: an owned string is interned, which the
+// arena dedups to the one pointer shared by every string with those bytes. Everything
+// else is already canonical: interned strings are that unique pointer, tables/closures
+// compare by identity, and numbers/bool/nil are their own bits.
+//
+// Hashing agrees with that equality: an interned string hashes by its precomputed content
+// hash (so strings spread by content, not by arena address), everything else by its bits.
+// Equal bits give equal hashes.
+/// An `LBoxed` in canonical form, giving owner-free `Hash`/`Eq`. See Note [Canonical values].
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct LCanon<'src, 'intern>(LBoxed<'src, 'intern>);
+
+impl<'src, 'intern> LCanon<'src, 'intern> {
+    /// Canonicalize an `LBoxed`; see Note [Canonical values]. `unbox` is
+    /// `inline(always)` and this matches a single variant, so it folds to one
+    /// header-tag check (cf. `as_table`).
+    #[inline(always)]
+    pub fn new(v: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> Self {
+        match v.unbox() {
+            LValue::OwnedString(g) => LCanon(LBoxed::interned(intern_bytes(intern, g.as_slice()))),
+            _ => LCanon(v),
+        }
+    }
+
+    #[inline(always)]
+    pub fn boxed(self) -> LBoxed<'src, 'intern> {
+        self.0
+    }
+}
+
+// Equality and hashing per Note [Canonical values].
+impl PartialEq for LCanon<'_, '_> {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.0.bits() == other.0.bits()
+    }
+}
+impl Eq for LCanon<'_, '_> {}
+
+impl Hash for LCanon<'_, '_> {
+    #[inline(always)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self.boxed().unbox() {
+            LValue::InternedString(i) => state.write_u64(i.hash),
+            _ => state.write_u64(self.0.bits()),
+        }
+    }
+}
+
+impl Debug for LCanon<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
 }
 
 #[repr(u8)]
@@ -648,9 +716,9 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                     (LValue::Bool(left_b), LValue::Bool(right_b)) => Ok(left_b < right_b),
                     (LValue::Number(left_n), LValue::Number(right_n)) => Ok(left_n < right_n),
                     (LValue::InternedString(left_s), LValue::InternedString(right_s)) =>
-                        Ok(left_s.0 < right_s.0),
+                        Ok(left_s.as_bytes() < right_s.as_bytes()),
                     (LValue::OwnedString(left_s), LValue::OwnedString(right_s)) =>
-                        Ok(left_s.ro(owner) < right_s.ro(owner)),
+                        Ok(left_s.as_slice() < right_s.as_slice()),
                     _ => panic!()
                 }
             },
@@ -659,7 +727,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                     (LValue::Bool(left_b), LValue::Bool(right_b)) => Ok(left_b <= right_b),
                     (LValue::Number(left_n), LValue::Number(right_n)) => Ok(left_n <= right_n),
                     (LValue::InternedString(left_s), LValue::InternedString(right_s)) =>
-                        Ok(left_s.0 <= right_s.0),
+                        Ok(left_s.as_bytes() <= right_s.as_bytes()),
                     _ => panic!()
                 }
 
@@ -696,8 +764,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn len(&self, owner: &Owner) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match self {
-            LValue::InternedString(s) => Ok(LValue::Number(Number(s.0.len() as _))),
-            LValue::OwnedString(s) => Ok(LValue::Number(Number(s.ro(owner).len() as _))),
+            LValue::InternedString(s) => Ok(LValue::Number(Number(s.as_bytes().len() as _))),
+            LValue::OwnedString(s) => Ok(LValue::Number(Number(s.len() as _))),
             LValue::Table(t) => {
                 // TODO: sparse arrays
                 Ok(LValue::Number(Number(t.ro(owner).array.len() as _)))
@@ -714,25 +782,25 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn as_string(&self, owner: &Owner) -> Option<Tc<FVec<u8>>> {
+    pub fn as_string(&self, owner: &Owner) -> Option<Gc<FVec<u8>>> {
         // TODO: metamethods?
         match self {
-            LValue::OwnedString(s) => Some(s.clone().into()),
-            LValue::InternedString(s) => Some(Tc::new(s.into_ref().0.to_vec().into())),
+            LValue::OwnedString(s) => Some(s.clone()),
+            LValue::InternedString(s) => Some(Gc::new(s.into_ref().as_bytes().to_vec().into())),
             LValue::Number(f) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "{}", f.0);
-                Some(Tc::new(s))
+                Some(Gc::new(s))
             },
             LValue::Table(tc) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "{:?}", tc);
-                Some(Tc::new(s))
+                Some(Gc::new(s))
             },
             LValue::Nil => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "nil");
-                Some(Tc::new(s))
+                Some(Gc::new(s))
 
             },
             LValue::LClosure(l) => {
@@ -740,47 +808,48 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 let line = unsafe { (*l.0.ro(owner).prototype).line_defined };
                 let src = unsafe { &(*l.0.ro(owner).prototype).source };
                 write!(s, "function({:p}, {:?} @ {})", l.as_ptr(), src, line);
-                Some(Tc::new(s))
+                Some(Gc::new(s))
             },
             LValue::NClosure(nf) => {
                 let mut s: FVec<_> = vec![].into();
-                write!(s, "native({:p})", nf.native);
-                Some(Tc::new(s))
+                write!(s, "native({:p})", nf.native());
+                Some(Gc::new(s))
             },
             x => unimplemented!("{:?}", x),
         }
     }
 
-    pub fn as_string_nolock(&self) -> Option<Tc<FVec<u8>>> {
+    pub fn as_string_nolock(&self) -> Option<Gc<FVec<u8>>> {
         // TODO: metamethods?
         match self {
-            LValue::OwnedString(s) => Some(s.clone().into()),
-            LValue::InternedString(s) => Some(Tc::new(s.into_ref().0.to_vec().into())),
+            LValue::OwnedString(s) => Some(s.clone()),
+            LValue::InternedString(s) => Some(Gc::new(s.into_ref().as_bytes().to_vec().into())),
             LValue::Number(f) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "{}", f.0);
-                Some(Tc::new(s))
+                Some(Gc::new(s))
             },
             LValue::Table(tc) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "{:?}", tc);
-                Some(Tc::new(s))
+                Some(Gc::new(s))
             },
             LValue::Nil => None,
             LValue::LClosure(l) => {
                 let mut s: FVec<_> = vec![].into();
                 write!(s, "function({:p})", l.as_ptr());
-                Some(Tc::new(s))
+                Some(Gc::new(s))
             },
             x => unimplemented!("{:?}", x),
         }
     }
 
-    pub fn gettable(&self, owner: &mut Owner, index: Cow<'_, LValue<'src, 'intern>>) -> LValue<'src, 'intern> {
+    pub fn gettable(&self, owner: &mut Owner, index: Cow<'_, LValue<'src, 'intern>>, intern: &'intern internment::Arena<IStr<'src>>) -> LValue<'src, 'intern> {
         let val_b = match self {
             LValue::Table(tab) => {
                 debug!("table {:?}", tab);
-                tab.get(owner, index.deref()).unwrap_or(LValue::Nil)
+                let key = LBoxed::box_lvalue(index.into_owned());
+                tab.get(owner, &key, intern).map(|b| b.unbox()).unwrap_or(LValue::Nil)
             },
             x => unimplemented!("gettable on {:?}", x),
         };
@@ -811,7 +880,7 @@ impl<'src, 'intern> PartialOrd for LConstant<'src, 'intern> {
 #[derive(Debug, Clone)]
 pub enum Upvalue<'src, 'intern> {
     Open(usize), // stack index
-    Closed(Tc<LValue<'src, 'intern>>),
+    Closed(Tc<LBoxed<'src, 'intern>>),
 }
 
 pub type LProto<'src, 'intern> = *const FunctionBlock<'src, LConstant<'src, 'intern>>;
@@ -827,15 +896,17 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
     }
 }
 
-pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LValue<'src, 'intern>]>, &'a LCell<'id, [LValue<'src, 'intern>]>, &mut Owner);
-#[derive(Clone)]
+pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner);
+#[derive(Clone, Copy)]
 pub struct NClosure {
-    pub native: NativeFunc,
+    // A `'static`, non-GC cell (leaked at `new`) whose pointer is the native's
+    // boxed form; the JIT reads `native` through it. See `lboxed::NClosureCell`.
+    pub(crate) cell: &'static NClosureCell,
 }
 
 impl PartialEq for NClosure {
     fn eq(&self, other: &Self) -> bool {
-        core::ptr::fn_addr_eq(self.native, other.native)
+        core::ptr::fn_addr_eq(self.native(), other.native())
     }
 }
 
@@ -843,13 +914,13 @@ impl Eq for NClosure { }
 
 impl Hash for NClosure {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.native.hash(state);
+        self.native().hash(state);
     }
 }
 
 impl<'src> Debug for NClosure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<native function {:p}>", self.native)
+        write!(f, "<native function {:p}>", self.native())
     }
 }
 
@@ -871,11 +942,15 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: NativeFunc) -> Self {
-        NClosure { native }
+        NClosure { cell: NClosureCell::leak(native) }
+    }
+
+    pub fn native(&self) -> NativeFunc {
+        self.cell.native
     }
 
     pub fn get_ptr(&self) -> *const () {
-        self.native as _
+        self.native() as _
     }
 }
 
@@ -908,9 +983,9 @@ impl<'gc> Scoped<'gc> {
 
     /// The interning arena at the scope brand, for `InternString::intern`.
     #[inline]
-    pub fn intern(&self) -> &'gc internment::Arena<(&'gc [u8], u64)> {
+    pub fn intern(&self) -> &'gc internment::Arena<IStr<'gc>> {
         // SAFETY: as `vm`.
-        unsafe { &*(self.intern as *const internment::Arena<(&'gc [u8], u64)>) }
+        unsafe { &*(self.intern as *const internment::Arena<IStr<'gc>>) }
     }
 
     /// Build the global environment table. Scope-gated; see Note [Scoped heap].
@@ -929,7 +1004,7 @@ impl<'gc> Scoped<'gc> {
         clos: Tc<LClosure<'gc, 'gc>>,
         args: ValueStack<'gc, 'gc>,
     ) -> Result<FVec<LValue<'gc, 'gc>>, Box<dyn Error>> {
-        self.vm().run::<LBBV>(self.gc, owner, _G, clos, args)
+        self.vm().run::<LBBV>(self.gc, owner, _G, clos, args, self.intern())
     }
 }
 
@@ -959,6 +1034,81 @@ pub enum ReturnLocation {
     Generator(BlockId, usize),
 }
 
+/// A [`ReturnLocation`] packed into a single register-sized word (see
+/// [`ReturnLocation::pack`]). `#[repr(transparent)]` over `usize`, so it crosses the
+/// JIT/`extern "C"` boundary in one register.
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct PackedLocation(usize);
+
+impl PackedLocation {
+    /// The raw word, for the JIT to load into an argument register.
+    #[inline(always)]
+    pub fn bits(self) -> usize {
+        self.0
+    }
+}
+
+impl ReturnLocation {
+    /// Pack into a `PackedLocation` so it can cross the JIT/`extern "C"` boundary
+    /// without passing a `repr(Rust)` enum by value. Bit 63 selects the variant;
+    /// `Generator` packs `(off << 32) | block` in the low bits (the same layout the
+    /// JIT's `lua_return` already uses for its return encoding).
+    pub fn pack(self) -> PackedLocation {
+        PackedLocation(match self {
+            ReturnLocation::Interpreter(pc) => pc,
+            ReturnLocation::Generator(BlockId(block), off) => (1usize << 63) | (off << 32) | block,
+        })
+    }
+
+    pub fn unpack(p: PackedLocation) -> Self {
+        let p = p.0;
+        if (p >> 63) == 1 {
+            ReturnLocation::Generator(BlockId(p & 0xffff_ffff), (p >> 32) & 0x7fff_ffff)
+        } else {
+            ReturnLocation::Interpreter(p)
+        }
+    }
+}
+
+// Note [Stack frames]
+// ~~~~~~~~~~~~~~~~~~~~
+// A call frame occupies a contiguous span of the register file (`vals`) starting at
+// `base`; `RunState::top` is its dynamic Lua top (the variable-count-span cursor).
+// `call_lua` grows `vals` to fit the callee's `max_stack` and records the caller's
+// state in a `CallstackEntry`; `do_return` pops it and restores that state.
+//
+// The GC marks `0..vals.len()`, so `do_return` shrinks `vals` back down as frames pop,
+// or dead frames would be marked forever. The bound it must never cross is
+// `RunState::natural_max` = `max` over all *live* frames of `base_i + max_stack_i`:
+// truncating below that would strip registers a suspended outer frame still reads. A
+// per-frame `base + max_stack` is only one term of that max (a shallow callee nested
+// in a deeper stack sits below it), so it can't be used directly.
+//
+// `natural_max` follows call/return stack discipline: `call_lua` saves it as the
+// callee's `limit`, then grows it by the callee's frame; `do_return` restores it from
+// `limit` and truncates `vals` to it.
+//
+// MULTRET results are the one thing that can sit *above* `natural_max`: a call
+// returning a variable count writes them from `rloc` up to `rloc + r_count`, which can
+// overshoot the caller's frame, so `do_return` truncates to `limit.max(rloc +
+// r_count)` to keep them. That overshoot is deliberately *not* recorded as any later
+// frame's `limit` (a `limit` is always a `natural_max`), so a subsequent return
+// truncates it away — and that is sound, not a leak of live data, because of a Lua
+// guarantee:
+//
+//   A multi-value expression is only ever consumed *in place* — as the trailing
+//   arguments of a call, the trailing items of a table constructor, or a function's
+//   return list. Lua has no syntax to bind the whole list to a name or to read it
+//   after an intervening call; `local a = f()` keeps only the first value.
+//
+// So consider `foo` doing `t = {multiret()}` (which inflates `vals` with the results
+// above foo's frame) and then calling `bar()`. By the time `bar` is called the results
+// have already been consumed by the `{...}` and are unreachable — nothing in `foo` can
+// name them across the `bar()` call. Hence `bar`'s return truncating `vals` back to
+// foo's `natural_max` cannot drop anything `foo` still uses; it just reclaims the dead
+// overshoot, which is what stops it lingering (and being GC-marked) for the rest of
+// foo's execution.
 #[derive(Debug)]
 pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_limit: usize, pub rloc: usize, pub c: u16 }
 
@@ -970,9 +1120,19 @@ pub struct HashWitness {
     pub epoch: usize,
 }
 
-#[derive(Debug)]
 pub struct RunState<'src, 'intern> {
     pub base: usize,
+    // Dynamic stack top (à la Lua's `L->top`): delimits variable-count spans
+    // (MULTRET call args/results, SETLIST, vararg). Distinct from `vals`'s
+    // length, which is the register-file allocation and is never shrunk below a
+    // live frame. Fixed-register ops index `base + reg`; only the variable-count
+    // (`b == 0` / `c == 0`) handlers read up to `top`.
+    pub top: usize,
+    // The largest register-file extent (`base + max_stack`) over all live frames.
+    // `vals` must never be truncated below this, or a suspended outer frame would
+    // lose registers it still reads. Maintained by `call_lua`/`do_return` (saved as
+    // each frame's `limit`). See Note [Stack frames].
+    pub natural_max: usize,
     pub vals: ValueStack<'src, 'intern>,
     pub pc: usize,
     pub _G: Tc<Table<'src, 'intern>>,
@@ -986,6 +1146,22 @@ pub struct RunState<'src, 'intern> {
     pub trap: bool,
     pub current_off: u16,
     pub gas: i64,
+    /// Intern arena for canonicalizing owned strings at box time.
+    pub intern: &'intern internment::Arena<IStr<'src>>,
+}
+
+// Manual `Debug` (the `intern` arena isn't `Debug`); skips it and the counters.
+impl<'src, 'intern> Debug for RunState<'src, 'intern> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunState")
+            .field("base", &self.base)
+            .field("pc", &self.pc)
+            .field("vals", &self.vals)
+            .field("select", &self.select)
+            .field("trap", &self.trap)
+            .field("gas", &self.gas)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
@@ -1006,16 +1182,18 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     }
 
     #[inline(always)]
+    // Natives take `LBoxed` slice views over the arg/return stack regions, so the
+    // boxed stack is aliased in place with no unbox/rebox copy.
     pub fn call_native(&mut self, nf: NativeFunc, a: u16, b: u16, c: u16, owner: &mut Owner) {
         let args = if b == 0 {
-            &self.vals[self.base + a as usize+1..]
+            &self.vals[self.base + a as usize+1..self.top]
         } else {
             &self.vals[self.base + a as usize+1..=(self.base + a as usize + b as usize - 1)]
         };
         debug!("{:?}", args);
         let returns = if c == 0 {
             // save all returned
-            &self.vals[self.base + a as usize..]
+            &self.vals[self.base + a as usize..self.top]
         }
         else if c == 1 {
             // nothing saved
@@ -1027,47 +1205,58 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         };
         LCellOwner::scope(|mut seq| {
             // Safety: LCellOwner guarantees that the native function can only ever
-            // have mutable access to one slice at a time.
+            // have mutable access to one slice at a time. The transmute wraps the
+            // aliased stack slices in-place as `LCell`s (repr(transparent) over UnsafeCell).
             let args = unsafe { core::mem::transmute(seq.cell(args)) };
             let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
             let ret = (nf)(seq, args, returns, owner);
         });
     }
 
-    pub fn call_lua(&mut self, lclos: Tc<LClosure<'src, 'intern>>,
-        ret_loc: ReturnLocation,
-        a: u16, b: u16, c: u16,
-        owner: &mut Owner) -> usize
+    // `extern "C"` so the JIT can call it directly. The callee closure is read
+    // from slot `a` of the boxed stack, and the return location arrives packed
+    // into a single word (see `ReturnLocation::pack`).
+    pub extern "C" fn call_lua(&mut self, owner: &mut Owner,
+        ret: PackedLocation, a: u16, b: u16, c: u16) -> usize
     {
+        let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
+        let ret_loc = ReturnLocation::unpack(ret);
         // record call stack: we say where to return to and where to put the values
         let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
         let next_base = self.base + a as usize + 1;
+        // The max-extent over the caller and its own ancestors, restored on return so
+        // the stack (and the GC's mark range) shrinks back as frames pop. See Note
+        // [Stack frames].
+        let limit = self.natural_max;
         // push empty stack frame
         if next_base + next_stack > self.vals.len() {
-            self.vals.resize_with(next_base + next_stack, || LValue::Nil);
+            self.vals.resize_with(next_base + next_stack, || LBoxed::NIL);
         }
+        // The callee's frame extends the live max-extent while it runs.
+        self.natural_max = self.natural_max.max(next_base + next_stack);
         self.callstack.push(CallstackEntry {
             clos: self.clos.clone(),
             ret: ret_loc,
             frame: self.base,
-            limit: self.vals.len(),
+            limit,
             rloc: self.base + a as usize,
             witness_frame: self.witness_base,
             witness_limit: self.hash_witnesses.len(),
             c
         });
         self.base = next_base;
+        // Start `top` at the end of the callee's register file.
+        self.top = next_base + next_stack;
         self.witness_base = self.hash_witnesses.len();
         self.clos = lclos.clone();
         next_stack
     }
 
-    pub fn do_return(&mut self, owner: &mut Owner, a: usize, b: usize) -> Result<ReturnLocation, FVec<LValue<'src, 'intern>>> {
+    pub fn do_return(&mut self, owner: &mut Owner, a: usize, b: usize) -> Result<ReturnLocation, FVec<LBoxed<'src, 'intern>>> {
         // we're going to be removing this frame, so close any open
         // upvalues.
         self.close_upvalues(owner);
         self.upvals.truncate(0);
-
 
         let mut r_count = 0 as usize;
         let mut r_vals: FVec<_> = if b == 1 {
@@ -1080,8 +1269,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             debug!("{:?}", r_vals);
             Vec::from(r_vals).into()
         } else if b == 0 {
-            // return all values from R(A) to the ToS
-            let r_vals = &self.vals[self.base + a as usize..];
+            // return all values from R(A) to the current top
+            let r_vals = &self.vals[self.base + a as usize..self.top];
             r_count = r_vals.len() as usize;
             debug!("{:?}", r_vals);
             Vec::from(r_vals).into()
@@ -1089,36 +1278,34 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             unreachable!()
         };
         match self.callstack.pop() {
-            Some(CallstackEntry { clos: ret_clos, ret, frame, witness_frame, limit, witness_limit, rloc, c }) => {
+            Some(CallstackEntry { clos: ret_clos, ret, frame, limit, witness_frame, witness_limit, rloc, c }) => {
                 debug!("{} {:?} {}", self.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, c);
                 self.clos = ret_clos.clone();
-                // copy the return values to the previous frame's return location,
-                // then clean up the popped stack frame
                 self.base = frame;
                 self.witness_base = witness_frame;
+                // The callee frame is gone; the live max-extent is the caller's again.
+                self.natural_max = limit;
+                // Shrink the register file back to the caller's extent (`limit`) so the
+                // popped callee frame stops being marked by the GC. See Note [Stack frames].
                 if c == 1 {
-                    // No values are saved
+                    // results discarded
+                    self.top = rloc;
                     self.vals.truncate(limit);
                 } else if c >= 2 {
-                    // (C-1) values are saved
-                    let parent_stack = unsafe { (*self.clos.ro(owner).prototype).max_stack as usize };
-                    //vals.extend_from_slice(r_vals.as_slice());
-                    for i in 0..(c - 1) {
-                        debug!("huh {} {:?}", i, r_vals.get(i as usize));
-                        // Only copy the correct number of arguments from the CALL
-                        self.vals.get_mut(rloc + i as usize).map(|r| *r = r_vals.get(i as usize).unwrap_or(&LValue::Nil).clone());
+                    // exactly c-1 results, padded with nil
+                    for i in 0..(c as usize - 1) {
+                        self.vals[rloc + i] = r_vals.get(i).copied().unwrap_or(LBoxed::NIL);
                     }
-                    //assert!(limit >= rloc + c as usize - 1);
+                    self.top = rloc + (c as usize - 1);
                     self.vals.truncate(limit);
-                    //self.vals.truncate(rloc + c as usize - 1);
                 } else {
-                    // Multiple return results are saved
+                    // MULTRET: every returned value, which can exceed `limit` when the
+                    // callee returned more than the caller's extent covers.
                     for (i, v) in r_vals.drain(..).enumerate() {
-                        // Only copy the correct number of arguments from the CALL
-                        self.vals.get_mut(rloc + i).map(|r| *r = v);
+                        self.vals[rloc + i] = v;
                     }
-                    debug!("{:?} {}", &self.vals, r_count);
-                    self.vals.truncate(rloc + r_count);
+                    self.top = rloc + r_count;
+                    self.vals.truncate(limit.max(rloc + r_count));
                 }
                 self.hash_witnesses.truncate(witness_limit);
                 return Ok(ret)
@@ -1160,72 +1347,39 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         Self { top_level }
     }
 
-    pub(crate) fn global_env(&self, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Tc<Table<'src, 'intern>> {
+    pub(crate) fn global_env(&self, intern: &'intern internment::Arena<IStr<'src>>) -> Tc<Table<'src, 'intern>> {
         let mut math_tab = Table::new(0, 0);
-        math_tab.hash.insert(InternString::intern(intern, "floor"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-            let f = match args.ro(&seq) {
-                [LValue::Number(f)] => LValue::Number(Number(f.0.floor())),
-                _ => unimplemented!()
+        // Unary float builtins consume the boxed stack directly: decode the one
+        // argument with `as_number()` and write the result back as a boxed double.
+        macro_rules! math1 {
+            ($f:expr) => {
+                LValue::NClosure(NClosure::new(|mut seq, args, returns, _owner| {
+                    let r = match args.ro(&seq) {
+                        [b] => LBoxed::from_number(($f)(b.as_number().unwrap_or_else(|| unimplemented!()))),
+                        _ => unimplemented!(),
+                    };
+                    returns.rw(&mut seq).into_iter().zip([r]).for_each(|(slot, o)| *slot = o);
+                }))
             };
-            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
+        }
+        math_tab.insert_lvalue(InternString::intern(intern, "floor"), math1!(f64::floor));
+        math_tab.insert_lvalue(InternString::intern(intern, "ceil"), math1!(f64::ceil));
+        math_tab.insert_lvalue(InternString::intern(intern, "sqrt"), math1!(f64::sqrt));
+        math_tab.insert_lvalue(InternString::intern(intern, "abs"), math1!(f64::abs));
+        math_tab.insert_lvalue(InternString::intern(intern, "huge"), LValue::NClosure(NClosure::new(|mut seq, args, returns, _owner|{
+            returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::from_number(f64::INFINITY));
         })));
-        math_tab.hash.insert(InternString::intern(intern, "ceil"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-            let f = match args.ro(&seq) {
-                [LValue::Number(f)] => LValue::Number(Number(f.0.ceil())),
-                _ => unimplemented!()
-            };
-            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| {
-                println!("overwriting {:?} with {:?}", *r, o);
-                *r = o
-            }).for_each(drop);
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "sqrt"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-            let f = match args.ro(&seq) {
-                [LValue::Number(f)] => LValue::Number(Number(f.0.sqrt())),
-                _ => unimplemented!()
-            };
-            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "abs"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-            let f = match args.ro(&seq) {
-                [LValue::Number(f)] => LValue::Number(Number(f.0.abs())),
-                _ => unimplemented!()
-            };
-            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "huge"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner|{
-            returns.rw(&mut seq).into_iter().next().map(|r| *r = LValue::Number(Number(f64::INFINITY)));
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "pi"), LValue::Number(Number(std::f64::consts::PI)));
-        math_tab.hash.insert(InternString::intern(intern, "sin"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-            let f = match args.ro(&seq) {
-                [LValue::Number(f)] => LValue::Number(Number(f.0.sin())),
-                _ => unimplemented!()
-            };
-            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "cos"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-            let f = match args.ro(&seq) {
-                [LValue::Number(f)] => LValue::Number(Number(f.0.cos())),
-                _ => unimplemented!()
-            };
-            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
-        })));
-        math_tab.hash.insert(InternString::intern(intern, "tan"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-          let f = match args.ro(&seq) {
-                [LValue::Number(f)] => LValue::Number(Number(f.0.tan())),
-                _ => unimplemented!()
-            };
-            returns.rw(&mut seq).into_iter().zip([f]).map(|(r, o)| *r = o).for_each(drop);
-        })));
+        math_tab.insert_lvalue(InternString::intern(intern, "pi"), LValue::Number(Number(std::f64::consts::PI)));
+        math_tab.insert_lvalue(InternString::intern(intern, "sin"), math1!(f64::sin));
+        math_tab.insert_lvalue(InternString::intern(intern, "cos"), math1!(f64::cos));
+        math_tab.insert_lvalue(InternString::intern(intern, "tan"), math1!(f64::tan));
 
         let mut os_tab = Table::new(0, 0);
-        os_tab.hash.insert(InternString::intern(intern, "exit"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-            let f = match args.ro(&seq) {
-                [LValue::Number(f)] => return std::process::exit(f.0 as i32),
+        os_tab.insert_lvalue(InternString::intern(intern, "exit"), LValue::NClosure(NClosure::new(|seq, args, _returns, _owner| {
+            match args.ro(&seq) {
+                [b] => std::process::exit(b.as_number().unwrap_or_else(|| unimplemented!()) as i32),
                 _ => unimplemented!(),
-            };
-            // No returns
+            }
         })));
 
         let math = (InternString::intern(intern, "math"), LValue::Table(Tc::new(math_tab)));
@@ -1234,30 +1388,27 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             array: vec![].into(),
             hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
-                (InternString::intern(intern, "print"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-                    let s = args.ro(&seq).iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
-                        maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.ro(owner).as_slice()).to_owned()) })
+                (InternString::intern(intern, "print"), LValue::NClosure(NClosure::new(|seq, args, _returns, owner| {
+                    let s = args.ro(&seq).iter().map(|val| val.unbox().as_string(owner)).flat_map(|maybe_str|
+                        maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
                     ).collect::<Vec<_>>();
                     //println!("> {}", String::from_utf8_lossy(s.iter().into()));
                     println!("{}", s.iter().intersperse(&"\t".to_string()).cloned().collect::<String>());
                     // No returns
                 }))),
-                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::new(|seq, args, returns, owner| {
-                    match args.ro(&seq) {
-                        [LValue::Bool(b), ..] => {
-                            if !b {
-                                panic!("lua assert failed");
-                            }
-                        },
-                        _ => { },
-                    };
+                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::new(|seq, args, _returns, _owner| {
+                    if let [b, ..] = args.ro(&seq) {
+                        if let LValue::Bool(false) = b.unbox() {
+                            panic!("lua assert failed");
+                        }
+                    }
                     // No returns
                 }))),
                 // Lua's `collectgarbage(opt [, arg])`: drive the collector explicitly.
                 (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-                    let opt: Vec<u8> = match args.ro(&seq).get(0) {
-                        Some(LValue::InternedString(s)) => s.0.to_vec(),
-                        Some(LValue::OwnedString(s)) => s.ro(owner).as_slice().to_vec(),
+                    let opt: Vec<u8> = match args.ro(&seq).get(0).map(|b| b.unbox()) {
+                        Some(LValue::InternedString(s)) => s.as_bytes().to_vec(),
+                        Some(LValue::OwnedString(s)) => s.as_slice().to_vec(),
                         _ => b"collect".to_vec(),
                     };
                     let result: LValue = match opt.as_slice() {
@@ -1274,11 +1425,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         b"setpause" | b"setstepmul" => LValue::Number(Number(0.0)),
                         _ => LValue::Nil,
                     };
-                    returns.rw(&mut seq).into_iter().next().map(|r| *r = result);
+                    returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::box_lvalue(result));
                 }))),
                 math,
                 os,
-                ].drain(..)
+                ].drain(..).map(|(k, v)| (LCanon(LBoxed::box_lvalue(k)), LBoxed::box_lvalue(v)))
             ),
             epoch: 0,
         });
@@ -1288,7 +1439,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
     }
 
     pub fn rk<'exec>(proto: LProto<'src, 'intern>, base: usize, vals: &'exec ValueStack<'src, 'intern>, r: u16)
-        -> Result<&'exec LConstant<'src, 'intern>, &'exec LValue<'src, 'intern>>
+        -> Result<&'exec LConstant<'src, 'intern>, &'exec LBoxed<'src, 'intern>>
     {
         if (r & 0x100)!=0 {
             let r_const = r & (0xff);
@@ -1305,7 +1456,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
     /// scope is already active on this thread. See Note [Scoped heap].
     pub fn scope<R>(
         &self,
-        intern: &'intern internment::Arena<(&'src [u8], u64)>,
+        intern: &'intern internment::Arena<IStr<'src>>,
         owner: &mut Owner,
         body: impl for<'gc> FnOnce(Scoped<'gc>, &mut Owner) -> R,
     ) -> R {
@@ -1321,12 +1472,22 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         // `body`, so `Heap::reset` frees an unreachable heap.
         let scoped = Scoped {
             vm: self as *const Vm<'src, 'intern> as *const (),
-            intern: intern as *const internment::Arena<(&'src [u8], u64)> as *const (),
+            intern: intern as *const internment::Arena<IStr<'src>> as *const (),
             gc: root_scope.token(),
         };
         let r = body(scoped, owner);
         Heap::reset();
         r
+    }
+
+    /// Resolve an RK operand straight to a boxed value (a constant becomes
+    /// boxed, a register is copied).
+    #[inline(always)]
+    pub fn rk_boxed(rk: Result<&LConstant<'src, 'intern>, &LBoxed<'src, 'intern>>) -> LBoxed<'src, 'intern> {
+        match rk {
+            Ok(c) => LBoxed::from(c),
+            Err(lb) => *lb,
+        }
     }
 
     /// The interpreter entry, gated behind the scope's `GcCtx` token. Crate-private so the only
@@ -1337,18 +1498,27 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         mut _G: Tc<Table<'src, 'intern>>,
         mut clos: Tc<LClosure<'src, 'intern>>,
         mut args: ValueStack<'src, 'intern>,
+        intern: &'intern internment::Arena<IStr<'src>>,
     )
         -> Result<FVec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
-        }, || LValue::Nil);
+        }, || LBoxed::NIL);
 
+        #[cfg(feature = "lbbv")]
         let mut spec = Specializer::new(clos.clone());
+        // Interpreter-only builds have no generator to trace; the GC safepoints
+        // still take a "spec" root, so bind a no-op `()` (Mark's default is a
+        // trivial no-op for non-drop types).
+        #[cfg(not(feature = "lbbv"))]
+        let spec = ();
         let mut state = {
             let mut vals = args;
-            let mut upvals: FVec<(Upvalue, FVec<Tc<Upvalue>>)> = vec![].into();
+            // The top-level frame occupies the whole allocated register file.
+            let top = vals.len();
+            let mut upvals: FVec<(Upvalue<'src, 'intern>, FVec<Tc<Upvalue<'src, 'intern>>>)> = vec![].into();
             let mut base = 0;
             let mut witness_base = 0;
             let mut pc = 0;
@@ -1356,6 +1526,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
             RunState {
                 base,
+                top,
+                natural_max: top,
                 witness_base,
                 pc,
                 _G,
@@ -1369,6 +1541,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 trap: false,
                 current_off: 0,
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
+                intern,
             }
         };
         // `gc` is the scope's rooting token, threaded in by `Scoped::run`; the rooting scope
@@ -1424,12 +1597,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 Opcode::LOADNIL => {
                     let (a, b) = <LOADNIL as InstructionDecode>::Unpack::unpack(inst.0);
-                    state.vals[state.base + a as usize..=state.base + b as usize].iter_mut().for_each(|i| *i = LValue::Nil);
+                    state.vals[state.base + a as usize..=state.base + b as usize].iter_mut().for_each(|i| *i = LBoxed::NIL);
                     ()
                 },
                 Opcode::LOADBOOL => {
                     let (a, b, c) = <LOADBOOL as InstructionDecode>::Unpack::unpack(inst.0);
-                    state.vals[state.base + a as usize] = LValue::Bool(b != 0);
+                    state.vals[state.base + a as usize] = LBoxed::from_bool(b != 0);
                     if c != 0 {
                         state.pc += 1;
                     }
@@ -1438,105 +1611,97 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 Opcode::NEWTABLE => {
                     let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     // TODO: properly decode the "floating point byte" size hints instead
-                    state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
-                    // SAFETY: The newly created table was added to the RunState. .
-                    unsafe{ gc.step(&state, &spec, owner); }
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::Table(Tc::new(Table::new(b as usize, c as usize))));
+                    // SAFETY: the newly created table is reachable through the RunState.
+                    unsafe { gc.step(&state, &spec, owner); }
                 },
                 Opcode::SELF => {
                     let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);
-                    let rb = state.vals[state.base + b as usize].clone();
-                    state.vals[state.base + a as usize + 1] = rb.clone();
-                    let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
-                        Ok(c) => Cow::Owned(LValue::from(c)),
-                        Err(lv) => Cow::Borrowed(lv),
-                    };
-                    let res = rb.gettable(owner, kc);
-                    state.vals[state.base + a as usize] = res;
+                    let rb = state.vals[state.base + b as usize];
+                    state.vals[state.base + a as usize + 1] = rb;
+                    let key = Self::rk_boxed(Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c));
+                    let tab = rb.as_table().unwrap_or_else(|| unimplemented!("self on non-table"));
+                    state.vals[state.base + a as usize] = tab.get(owner, &key, state.intern).unwrap_or(LBoxed::NIL);
                 },
                 Opcode::SETLIST => {
                     let (a, b, c) = <SETLIST as InstructionDecode>::Unpack::unpack(inst.0);
-                    match state.vals[state.base + a as usize].clone() {
-                        LValue::Table(tab) => {
-                            assert_ne!(c, 0);
-                            tab.barrier_back();
-                            let start = state.base + a as usize + 1;
-                            let end = if b == 0 { state.vals.len() } else { start + b as usize };
-                            let src = state.vals[start..end].iter().cloned();
-                            tab.rw(owner).array.splice(
-                                (c as usize-1)*50..,
-                                src
-                            ).for_each(drop);
-                        },
-                        _ => unimplemented!(),
-                    }
+                    let tab = state.vals[state.base + a as usize].as_table().unwrap_or_else(|| unimplemented!("setlist on non-table"));
+                    assert_ne!(c, 0);
+                    tab.barrier_back();
+                    let start = state.base + a as usize + 1;
+                    let end = if b == 0 { state.top } else { start + b as usize };
+                    let src: Vec<LBoxed> = state.vals[start..end].iter().copied().collect();
+                    tab.rw(owner).array.splice((c as usize-1)*50.., src).for_each(drop);
                 },
                 Opcode::GETTABLE => {
                     let (a, b, c) = <GETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("gettable {} {} {}", a, b, c);
-                    let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
-                        Ok(c) => Cow::Owned(LValue::from(c)),
-                        Err(lv) => Cow::Borrowed(lv),
-                    };
-                    debug!("gettable {:?}", &kc);
-                    let val_b = state.vals[state.base + b as usize].clone();
-                    state.vals[state.base + a as usize] = val_b.gettable(owner, kc);
+                    let key = Self::rk_boxed(Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c));
+                    let tab = state.vals[state.base + b as usize].as_table().unwrap_or_else(|| unimplemented!("gettable on non-table"));
+                    state.vals[state.base + a as usize] = tab.get(owner, &key, state.intern).unwrap_or(LBoxed::NIL);
                 },
                 Opcode::SETTABLE => {
                     let (a, b, c) = <SETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("settable {} {} {}", a, b, c);
-                    let kb = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b) {
-                        Ok(b) => b.into(),
-                        Err(lv) => lv.clone(),
-                    };
-                    debug!("settable {:?}", &kb);
-                    let kc = match Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c) {
-                        Ok(c) => c.into(),
-                        Err(lv) => lv.clone(),
-                    };
-                    match &mut state.vals[state.base + a as usize] {
-                        LValue::Table(tab) => {
-                            tab.set(owner, kb, kc)
-                        },
-                        x => { debug!("huh {:?} {:?}", x, kb);
-                            // Handle magic debugging keys
-                            #[cfg(any(debug_assertions, feature = "magic"))]
-                            if let LValue::LClosure(lc) = x && let LValue::InternedString(key) = kb {
-                                println!("{key:?}");
-                                match key.0 {
-                                    x if x == const { "__jit".as_bytes() } => {
-                                        if let Entry::Occupied(mut entry) = spec.versions.entry(lc.rw(owner).prototype) {
-                                            for block in entry.get_mut().values() {
-                                                warn!("Forcing JIT for block {}", block.0);
-                                                spec.blocks[block.0].jit_info.hotness.set(0);
-                                            }
+                    let kb = Self::rk_boxed(Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b));
+                    let kc = Self::rk_boxed(Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c));
+                    let target = state.vals[state.base + a as usize];
+                    if let Some(mut tab) = target.as_table() {
+                        tab.set(owner, kb, kc, state.intern);
+                    } else {
+                        // Handle magic debugging keys (`t.__jit = ...` forces JIT
+                        // compilation). Meaningful only in JIT builds; in the
+                        // interpreter it is a no-op.
+                        // Forcing JIT compilation only means anything with the
+                        // native code generator; it reaches into `jit_info`,
+                        // which only exists under `jit`.
+                        #[cfg(feature = "jit")]
+                        if let (LValue::LClosure(lc), LValue::InternedString(key)) = (target.unbox(), kb.unbox()) {
+                            match key.as_bytes() {
+                                x if x == const { "__jit".as_bytes() } => {
+                                    if let Entry::Occupied(mut entry) = spec.versions.entry(lc.rw(owner).prototype) {
+                                        for block in entry.get_mut().values() {
+                                            warn!("Forcing JIT for block {}", block.0);
+                                            spec.blocks[block.0].jit_info.hotness.set(0);
                                         }
-                                    },
-                                    _ => unimplemented!(),
-                                }
-                            } else {
-                                unimplemented!()
+                                    }
+                                },
+                                _ => unimplemented!(),
                             }
-                            #[cfg(not(any(debug_assertions, feature = "magic")))]
+                        } else {
                             unimplemented!()
-                        },
-                    };
+                        }
+                        // Without the JIT there is nothing to force; treat
+                        // `closure.__jit = ...` as a no-op (matching the JIT
+                        // build's behaviour when no blocks are versioned).
+                        #[cfg(not(feature = "jit"))]
+                        if let (LValue::LClosure(_), LValue::InternedString(key)) = (target.unbox(), kb.unbox()) {
+                            match key.as_bytes() {
+                                x if x == const { "__jit".as_bytes() } => {},
+                                _ => unimplemented!(),
+                            }
+                        } else {
+                            unimplemented!()
+                        }
+                    }
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = <SETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
                     let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("setglobal {} {} {:?}", a, bx, &kst);
-                    state._G.set(owner, kst.into(), state.vals[state.base + a as usize].clone());
+                    state._G.set(owner, kst.into(), state.vals[state.base + a as usize].clone(), state.intern);
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = <GETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
                     let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     // FIXME(error handling)
-                    state.vals[state.base + a as usize] = state._G.get(owner, &kst.into()).unwrap_or((&Constant::Nil).into()).clone();
+                    state.vals[state.base + a as usize] = state._G.get(owner, &kst.into(), state.intern).unwrap_or((&Constant::Nil).into()).clone();
                 },
                 Opcode::TEST => {
                     let (a, _, c) = <TEST as InstructionDecode>::Unpack::unpack(inst.0);
-                    if let LValue::Bool(b) = (state.vals[state.base + a as usize].as_bool(owner)?) && (b as u16) == c {
+                    // R(A) truthiness compared against C, straight off the bits.
+                    if state.vals[state.base + a as usize].truthy() == (c != 0) {
                         // No-op
                     } else {
                         state.pc += 1;
@@ -1544,31 +1709,25 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 },
                 opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = ABC::unpack(inst.0);
-                    debug!("numeric op {} {}", b, c);
                     let kb = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b);
                     let kc = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c);
-                    debug!("{:?} {:?}", &kb, &kc);
-                    let cond = match (opcode, kb, kc) {
-                        (Opcode::EQ, Ok(const_b), Ok(const_c)) => const_b == const_c,
-                        (Opcode::LT, Ok(const_b), Ok(const_c)) => const_b < const_c,
-                        (Opcode::LE, Ok(const_b), Ok(const_c)) => const_b <= const_c,
-
-                        (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.compare(opcode.clone(), const_c.into(), owner).unwrap()
-                        },
-
-                        (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).compare(opcode, dyn_c.clone(), owner).unwrap()
-                        },
-
-                        (_, Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b.compare(opcode, dyn_c.clone(), owner).unwrap()
-                        },
-
-                        _ => panic!()
-
+                    // Numeric fast path: pull both operands out as f64 without
+                    // ever building an `LValue`.
+                    let bn = match kb { Ok(Constant::Number(n)) => Some(n.0), Ok(_) => None, Err(lb) => lb.as_number() };
+                    let cn = match kc { Ok(Constant::Number(n)) => Some(n.0), Ok(_) => None, Err(lb) => lb.as_number() };
+                    let cond = if let (Some(x), Some(y)) = (bn, cn) {
+                        match opcode {
+                            Opcode::EQ => x == y,
+                            Opcode::LT => x < y,
+                            Opcode::LE => x <= y,
+                            _ => unsafe { std::hint::unreachable_unchecked() },
+                        }
+                    } else {
+                        // Fallback (strings / other): decode to the view type.
+                        let lb = match kb { Ok(c) => LValue::from(c), Err(v) => v.unbox() };
+                        let lc = match kc { Ok(c) => LValue::from(c), Err(v) => v.unbox() };
+                        lb.compare(opcode, lc, owner).unwrap()
                     };
-                    debug!("cond {} {}", cond, a);
                     if (cond as u8) != a {
                         state.pc += 1;
                     }
@@ -1576,87 +1735,76 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 opcode @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW)
                 => {
                     let (a, b, c) = ABC::unpack(inst.0);
-                    debug!("{} {} {}", a, b, c);
                     let kb = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b);
                     let kc = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c);
-                    debug!("{:?} {:?}", &kb, &kc);
-                    let res = match (opcode, kb, kc) {
-                        (Opcode::ADD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 + const_c.0)),
-                        (Opcode::SUB, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 - const_c.0)),
-                        (Opcode::MUL, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 * const_c.0)),
-                        (Opcode::DIV, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 / const_c.0)),
-                        (Opcode::MOD, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0 % const_c.0)),
-                        (Opcode::POW, Ok(Constant::Number(const_b)), Ok(Constant::Number(const_c))) =>
-                            LValue::Number(Number(const_b.0.powf(const_c.0))),
-
-                        (_, Ok(const_b), Err(dyn_c)) => {
-                            LValue::from(const_b).numeric_op(opcode, dyn_c)?
-                        },
-
-                        (_, Err(dyn_b), Ok(const_c)) => {
-                            dyn_b.numeric_op(opcode, &const_c.into())?
-                        },
-
-                        (_, Err(dyn_b), Err(dyn_c)) => {
-                            dyn_b.numeric_op(opcode, dyn_c)?
-                        },
-
-                        _ => unimplemented!(),
+                    let bn = match kb { Ok(Constant::Number(n)) => Some(n.0), Ok(_) => None, Err(lb) => lb.as_number() };
+                    let cn = match kc { Ok(Constant::Number(n)) => Some(n.0), Ok(_) => None, Err(lb) => lb.as_number() };
+                    let res = if let (Some(x), Some(y)) = (bn, cn) {
+                        // Numeric fast path: compute in f64 and re-box directly.
+                        let r = match opcode {
+                            Opcode::ADD => x + y,
+                            Opcode::SUB => x - y,
+                            Opcode::MUL => x * y,
+                            Opcode::DIV => x / y,
+                            Opcode::MOD => x % y,
+                            Opcode::POW => x.powf(y),
+                            _ => unsafe { std::hint::unreachable_unchecked() },
+                        };
+                        LBoxed::from_number(r)
+                    } else {
+                        // Fallback (metamethods / coercions): decode to the view type.
+                        let lb = match kb { Ok(c) => LValue::from(c), Err(v) => v.unbox() };
+                        let lc = match kc { Ok(c) => LValue::from(c), Err(v) => v.unbox() };
+                        LBoxed::box_lvalue(lb.numeric_op(opcode, &lc)?)
                     };
-                    debug!("res {:?}", &res);
                     state.vals[state.base + a as usize] = res;
                 },
                 Opcode::UNM => {
                     let (a, b) = <UNM as InstructionDecode>::Unpack::unpack(inst.0);
-                    let res = match &state.vals[state.base + b as usize] {
-                        // TODO: metatables
-                        LValue::Number(n) => LValue::Number(Number(-n.0)),
-                        _ => unimplemented!(),
-                    };
-                    state.vals[state.base + a as usize] = res;
+                    // TODO: metatables
+                    let n = state.vals[state.base + b as usize].as_number().unwrap_or_else(|| unimplemented!("unm on non-number"));
+                    state.vals[state.base + a as usize] = LBoxed::from_number(-n);
                 },
                 Opcode::LEN => {
                     let (a, b) = <LEN as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
-                    state.vals[state.base + a as usize] = state.vals[state.base + b as usize].len(owner)?;
+                    let res = state.vals[state.base + b as usize].unbox().len(owner)?;
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(res);
                 },
                 Opcode::CONCAT => {
                     let (a, b, c) = <CONCAT as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, b);
                     let mut s: FVec<_> = vec![].into();
                     for i in (b as usize)..=(c as usize) {
-                        s.extend_from_slice(&state.vals[state.base + i as usize].as_string(owner).ok_or("nil concat")?.ro(owner))
+                        let val = state.vals[state.base + i as usize].unbox();
+                        s.extend_from_slice(val.as_string(owner).ok_or("nil concat")?.as_slice())
                     }
                     debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-                    state.vals[state.base + a as usize] = LValue::OwnedString(Tc::new(s));
+                    // Concat stays cheap: the result is an owned string, not
+                    // interned. It only gets canonicalized if/when used as a
+                    // table key (via `LCanon`).
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::OwnedString(Gc::new(s)));
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = <FORPREP as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, sbx);
-                    state.vals[state.base + a as usize] =
-                        state.vals[state.base + a as usize].numeric_op(Opcode::SUB, &state.vals[state.base + a as usize + 2]).unwrap();
+                    let init = state.vals[state.base + a as usize].as_number().expect("forprep index non-number");
+                    let step = state.vals[state.base + a as usize + 2].as_number().expect("forprep step non-number");
+                    state.vals[state.base + a as usize] = LBoxed::from_number(init - step);
                     state.pc += sbx as usize;
                 },
                 Opcode::FORLOOP => {
                     let (a, sbx) = <FORLOOP as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {}", a, sbx);
-                    let step = state.vals[state.base + a as usize + 2].clone();
-                    let idx = state.vals[state.base + a as usize].numeric_op(Opcode::ADD, &step).unwrap();
-                    state.vals[state.base + a as usize] = idx.clone();
-                    let limit = state.vals[state.base + a as usize + 1].clone();
-                    let comp = if step.compare(Opcode::LT, LValue::from(&Constant::Number(Number(0.0))), owner)? {
-                        limit.compare(Opcode::LE, idx.clone(), owner)
-                    } else {
-                        idx.clone().compare(Opcode::LE, limit, owner)
-                    };
-                    if comp? {
+                    // Hot numeric loop: step / index / limit are always numbers.
+                    let step = state.vals[state.base + a as usize + 2].as_number().expect("forloop step non-number");
+                    let idx = state.vals[state.base + a as usize].as_number().expect("forloop index non-number") + step;
+                    state.vals[state.base + a as usize] = LBoxed::from_number(idx);
+                    let limit = state.vals[state.base + a as usize + 1].as_number().expect("forloop limit non-number");
+                    let comp = if step < 0.0 { limit <= idx } else { idx <= limit };
+                    if comp {
                         state.pc = (state.pc as isize + sbx as isize) as usize;
-                        state.vals[state.base + a as usize + 3] = idx;
+                        state.vals[state.base + a as usize + 3] = LBoxed::from_number(idx);
                     }
                 },
                 Opcode::JMP => {
@@ -1706,45 +1854,51 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         state.pc += proto.upval_count as usize;
                         //assert_eq!(proto.upval_count, 0);
                     }
-                    state.vals[state.base + a as usize] = LValue::LClosure(Tc::new(fresh));
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::LClosure(Tc::new(fresh)));
                 },
                 Opcode::CALL => {
                     let (a, b, c) = <CALL as InstructionDecode>::Unpack::unpack(inst.0);
                     debug!("{} {} {}", a, b, c);
-                    let to_call = &state.vals[state.base + a as usize];
+                    let to_call = state.vals[state.base + a as usize].unbox();
                     debug!("{:?}", to_call);
                     // push where to return to once we RETURN
-                    if let LValue::LClosure(ref lclos) = to_call.clone() {
-                        let next_stack = state.call_lua(lclos.clone(), ReturnLocation::Interpreter(state.pc),
-                            a as u16, b as u16, c as u16, owner
+                    if let LValue::LClosure(ref lclos) = to_call {
+                        let next_stack = state.call_lua(owner, ReturnLocation::Interpreter(state.pc).pack(),
+                            a as u16, b as u16, c as u16
                         );
-                        if LBBV {
-                            // Lazy basic block versioning
-                            // TODO: only run LBBV for hot code
-                            let types = vec![LType::Unknown; next_stack];
-                            let ctx = Rc::new(Context::new(types));
-                            let versions = spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
-                            let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
-                                *block
-                            } else {
+                        #[cfg(feature = "lbbv")]
+                        {
+                            if LBBV {
+                                // TODO: only run LBBV for hot code
+                                let types = vec![LType::Unknown; next_stack];
+                                let ctx = Rc::new(Context::new(types));
+                                let versions = spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
+                                let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
+                                    *block
+                                } else {
+                                    spec.set_current(lclos.clone());
+                                    spec.block(owner, 0, ctx)
+                                };
+                                debug!("{:?} {block:?}", spec.blocks);
                                 spec.set_current(lclos.clone());
-                                spec.block(owner, 0, ctx)
-                            };
-                            debug!("{:?} {block:?}", spec.blocks);
-                            spec.set_current(lclos.clone());
-                            let (r_state, r_vals) = spec.run(gc, owner, block, state);
-                            state = r_state;
-                            // Unlike a normal call, LBBV might have returned *out* of our current
-                            // function and exitted the top-level.
-                            if let Some(r_vals) = r_vals {
-                                break 'int r_vals;
+                                let (r_state, r_vals) = spec.run(gc, owner, block, state);
+                                state = r_state;
+                                // Unlike a normal call, LBBV might have returned *out* of our current
+                                // function and exitted the top-level.
+                                if let Some(r_vals) = r_vals {
+                                    break 'int r_vals;
+                                }
+                            } else {
+                                state.pc = 0;
                             }
-                        } else {
+                        }
+                        #[cfg(not(feature = "lbbv"))]
+                        {
+                            let _ = next_stack;
                             state.pc = 0;
                         }
-
                     } else if let LValue::NClosure(ncall) = to_call {
-                        let nf = ncall.native.clone();
+                        let nf = ncall.native();
                         // Publish roots so a native (e.g. `collectgarbage`) can reach them.
                         // See Note [GC roots].
                         gc.publish(&state, &spec);
@@ -1774,18 +1928,21 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 _ => (),
             };
         };
-        #[cfg(all(feature = "counters", not(test)))] {
+        #[cfg(all(feature = "counters", feature = "lbbv", not(test)))] {
             println!("counters after run {:?} instructions {:?}", state.counters, spec.count());
         }
+        #[cfg(all(feature = "counters", not(feature = "lbbv"), not(test)))] {
+            println!("counters after run {:?}", state.counters);
+        }
 
-        #[cfg(feature = "graph")]
+        #[cfg(all(feature = "graph", feature = "lbbv"))]
         for proto in unsafe { &(*self.top_level).prototypes.items } {
             let outfile = format!("func_{}.pdf", proto.line_defined);
             spec.dump(owner, proto, outfile.as_str());
         }
 
-
-        Ok(r_vals)
+        // Decode the boxed return values back into the `LValue` view for callers.
+        Ok(r_vals.into_iter().map(|b| b.unbox()).collect::<Vec<_>>().into())
     }
 
 }

@@ -1,12 +1,13 @@
 #![allow(unused_parens)]
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::hash::Hash;
 use std::rc::Rc;
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::collections::BTreeMap;
 use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
-use crate::vm::{Tc, LValue, LClosure, NClosure, Table, Upvalue};
+use crate::vm::{Tc, LValue, LBoxed, LCanon, LClosure, NClosure, Table, Upvalue};
+use crate::vm::FVec;
 use crate::{TLCell, TlcOwner, Owner};
 use indexmap::IndexMap;
 use crate::debug;
@@ -25,6 +26,21 @@ impl<'src, 'intern> Mark for LValue<'src, 'intern> {
             LValue::LClosure(c) => c.mark(owner),
             LValue::NClosure(c) => c.mark(owner),
         }
+    }
+}
+
+impl<'src, 'intern> Mark for LBoxed<'src, 'intern> {
+    // Trace through the decoded value; `LValue::mark` no-ops the non-cell arms.
+    fn mark(&self, owner: &Owner) {
+        self.unbox().mark(owner);
+    }
+}
+
+impl<'src, 'intern> Mark for LCanon<'src, 'intern> {
+    // A canonical value may wrap a table/closure (held by identity), so trace the
+    // underlying boxed value.
+    fn mark(&self, owner: &Owner) {
+        self.boxed().mark(owner);
     }
 }
 
@@ -207,11 +223,26 @@ impl<T> Gc<T> {
         unsafe { &self.ptr.as_ref().val }
     }
 
-    pub fn new(val: T) -> Self {
+    /// The raw address of the `GcInner` allocation.
+    #[inline(always)]
+    pub fn to_addr(&self) -> u64 {
+        self.ptr.as_ptr() as u64
+    }
+
+    /// Reconstruct a `Gc<T>` from an address produced by [`Gc::to_addr`].
+    /// SAFETY: `addr` must be an address returned by `to_addr` for a `Gc<T>`
+    /// of the exact same `T` that is still live.
+    #[inline(always)]
+    pub unsafe fn from_addr(addr: u64) -> Self {
+        Self { ptr: core::ptr::NonNull::new_unchecked(addr as *mut GcInner<T>) }
+    }
+
+    pub fn new(val: T) -> Self where T: CellKind {
         let heap = hp();
         let size = core::mem::size_of::<GcInner<T>>();
         let mut top = unsafe { (*heap).top.load(Ordering::Acquire) };
         let inner = GcInner {
+            kind: <T as CellKind>::cell_kind(),
             next: AtomicPtr::new(top),
             // Born white; swept next cycle unless reached. See Note [Incremental GC].
             color: Cell::new(white()),
@@ -290,14 +321,15 @@ impl<T> core::clone::Clone for Gc<T> {
     }
 }
 
-impl<T> DerefMut for Gc<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        #[cfg(feature = "gc_sanitize")]
-        unsafe { assert!(self.ptr.as_ref().alive.load(Ordering::Acquire), "value is dead") };
-        unsafe { &mut self.ptr.as_mut().val }
+impl<T> core::fmt::Debug for Gc<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "gc({:p})", self.as_ptr())
     }
 }
 
+// `Gc` has no `DerefMut`: it is `Clone`, so several handles can point at one cell
+// and a `&mut` through one could alias another. Mutate through a cell + `Owner`,
+// which serializes access.
 impl<T> Deref for Gc<T> {
     type Target = T;
 
@@ -334,15 +366,39 @@ impl<T> Mark for Gc<T> {
     }
 }
 
+/// `kind` is the cell-type tag read at offset 0 by NuN-boxing (`read_cell_kind`),
+/// so it stays first under `#[repr(C)]`; `vm::IStr` mirrors this to share the read.
+/// The byte-sized fields (`kind`/`color`/`alive`) precede the word-sized ones so
+/// they pack into the leading word. The rest is the tricolor collector's state.
 #[repr(C)]
-struct GcInner<T: ?Sized> {
-    next: AtomicPtr<GcInner<()>>,
-    finalize: fn(*mut GcInner<()>),
+pub(crate) struct GcInner<T: ?Sized> {
+    kind: u8,
     color: Cell<u8>,
-    size: usize,
     #[cfg(feature = "gc_sanitize")]
     alive: AtomicBool,
-    val: T,
+    next: AtomicPtr<GcInner<()>>,
+    finalize: fn(*mut GcInner<()>),
+    size: usize,
+    // `pub(crate)` so the JIT can address a cell's payload with dynasm's typed
+    // offset (`offset_of!(GcInner<_>, val)`).
+    pub(crate) val: T,
+}
+
+/// The cell-type tag for a heap payload `T`, written into `GcInner::kind` at
+/// allocation. Non-cell allocations (upvalue slots, closed-upvalue boxes, etc.)
+/// keep the default `0`, which is never read as an `LBoxed` pointer kind.
+pub trait CellKind {
+    fn cell_kind() -> u8 { 0 }
+}
+impl<T: ?Sized> CellKind for T {
+    default fn cell_kind() -> u8 { 0 }
+}
+
+/// Read the offset-0 type tag of a raw cell pointer (a `GcInner` or a `vm::IStr`).
+/// SAFETY: `addr` must point at a live cell whose layout starts with the tag.
+#[inline(always)]
+pub unsafe fn read_cell_kind(addr: u64) -> u8 {
+    unsafe { *(addr as *const u8) }
 }
 
 /// Shades an object's immediate children. Carried in the worklist entry (not in `GcInner`)

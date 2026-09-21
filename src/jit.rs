@@ -3,9 +3,12 @@ use std::io::Write;
 use std::rc::Rc;
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
-use crate::Owner;
-use crate::vm::{LClosure, LType, LValue, ReturnLocation, RunState, Tc, Vm};
-use crate::generator::{Block, BlockId, Context, Residual, Specializer, SubPc};
+use crate::{Owner, TLCell, TlcOwner};
+use crate::vm::{BlockId, LBoxed, LClosure, LType, LValue, PackedLocation, ReturnLocation, RunState, Tc, Vm};
+use crate::gc::{GcInner, GcCtx};
+use crate::lboxed::NClosureCell;
+use crate::stack::ValueStack;
+use crate::generator::{Block, Context, Residual, Specializer, SubPc};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use rustc_hash::FxBuildHasher;
 
@@ -39,7 +42,7 @@ impl JitInfo {
     }
 }
 
-pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut Owner, &'a mut RunState<'src, 'intern>, *const LValue<'src, 'intern>) -> u64;
+pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut Owner, &'a mut RunState<'src, 'intern>, *const LBoxed<'src, 'intern>) -> u64;
 
 pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)) -> (*const (), usize, usize) {
     let (addr, meta) = (f as *const dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)).to_raw_parts();
@@ -55,56 +58,6 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
     }
 }
 
-#[repr(C)]
-pub struct CallArgs {
-    args_ptr: *const (),
-    args_len: usize,
-    returns_ptr: *const (),
-    returns_len: usize,
-}
-
-#[derive(PartialEq, Eq, core::marker::ConstParamTy)]
-#[repr(u8)]
-enum Count {
-    Zero,
-    One,
-    Many
-}
-
-macro_rules! dispatch_abc {
-    // Base case: emit the function item, cast to a function pointer 
-    // to ensure all match arms unify to the same type.
-    (@munch
-        func: $($func:ident)::+;
-        consts: ($($const:expr),*);
-        rem: ()
-    ) => {
-        ($($func)::+::<$( $const ),*> as *const ())
-    };
-
-    // Recursive case: evaluate the head and append the const generic.
-    (@munch
-        func: $($func:ident)::+;
-        consts: ($($const:expr),*);
-        rem: ($head:expr $(, $tail:expr)*)
-    ) => {
-        match $head {
-            0 => dispatch_abc!(@munch func: $($func)::+; consts: ($($const,)* { Count::Zero }); rem: ($($tail),*)),
-            1 => dispatch_abc!(@munch func: $($func)::+; consts: ($($const,)* { Count::One }); rem: ($($tail),*)),
-            _ => dispatch_abc!(@munch func: $($func)::+; consts: ($($const,)* { Count::Many }); rem: ($($tail),*)),
-        }
-    };
-
-    // Entry point
-    ($($func:ident)::+, $a:expr, $b:expr, $c:expr) => {
-        dispatch_abc!(@munch
-            func: $($func)::+;
-            consts: ();
-            rem: ($a, $b, $c)
-        )
-    };
-}
-
 pub struct JitHelper;
 impl JitHelper {
     pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: u8) -> bool {
@@ -113,7 +66,7 @@ impl JitHelper {
             let state = state as *mut RunState;
             let rs = &*state;
             let val = &rs.vals[rs.base + idx];
-            (val.typeof_() as u8) == expected
+            (val.unbox().typeof_() as u8) == expected
         }
     }
     pub unsafe extern "C" fn check_epoch(state: *mut (), tab: usize, href: u8) -> bool {
@@ -125,7 +78,7 @@ impl JitHelper {
             let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
-            let tab_val = &rs.vals[rs.base + tab];
+            let tab_val = rs.vals[rs.base + tab].unbox();
             let LValue::Table(tab) = tab_val else { unreachable!() };
             debug!("JIT check_epoch sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
             hwit.epoch == tab.ro(owner).epoch
@@ -139,91 +92,20 @@ impl JitHelper {
             let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
-            let tab_val = &rs.vals[rs.base + tab];
+            let tab_val = rs.vals[rs.base + tab].unbox();
             let LValue::Table(tab) = tab_val else { unreachable!() };
             let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
-            (val.typeof_() as u8) == expected
-        }
-    }
-    pub unsafe extern "C" fn check_lua_guard(base_ptr: *const LValue<'static, 'static>, idx: usize, ptr: *const ()) -> bool {
-        unsafe {
-            // Forge an owner
-            let mut owner = ();
-            let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
-            let LValue::LClosure(clos) = &*base_ptr.add(idx) else { unreachable!() };
-            let call = clos.ro(owner).prototype.cast();
-            if call == ptr {
-                // Fallthrough
-                true
-            } else {
-                false
-            }
-        }
-    }
-    pub unsafe extern "C" fn check_native_guard(base_ptr: *const LValue<'static, 'static>, idx: usize, ptr: *const ()) -> bool {
-        unsafe {
-            // Forge an owner
-            let mut owner = ();
-            let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
-            let LValue::NClosure(nf) = &*base_ptr.add(idx) else { unreachable!() };
-            let call = nf.get_ptr();
-            if call == ptr {
-                // Fallthrough
-                true
-            } else {
-                false
-            }
-        }
-    }
-    pub unsafe extern "C" fn prepare_native_call<const A: Count, const B: Count, const C: Count>(state: *mut (), a: u16, b: u16, c: u16) -> CallArgs {
-        unsafe {
-            let state = state as *mut RunState;
-            let mut owner = ();
-            let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
-            let rs = &*state;
-            // The same as RunState::call_native
-            let args = if B == Count::Zero {
-                &rs.vals[rs.base + a as usize+1..]
-            } else {
-                &rs.vals[rs.base + a as usize+1..=(rs.base + a as usize + b as usize - 1)]
-            };
-            debug!("{:?}", args);
-            let returns = if C == Count::Zero {
-                // save all returned
-                &rs.vals[rs.base + a as usize..]
-            } else if C == Count::One {
-                // nothing saved
-                &[]
-            } else {
-                &rs.vals[rs.base + a as usize..=rs.base + a as usize + c as usize - 2]
-            };
-
-            CallArgs {
-                args_ptr: args.as_ptr().cast(),
-                args_len: args.len(),
-                returns_ptr: returns.as_ptr().cast(),
-                returns_len: returns.len()
-            }
+            (val.unbox().typeof_() as u8) == expected
         }
     }
 
-    pub unsafe extern "C" fn prepare_lua_call(state: *mut (), block_id: usize, off: usize, a: u16, b: u16, c: u16) -> *const () {
+    /// Incremental GC safepoint from JIT'd code. The roots (state + specializer)
+    /// were published before entering the JIT and the value stack is mutated in
+    /// place, so `step_published` traces the live state. See Note [GC roots].
+    pub unsafe extern "C" fn gc_safepoint(owner: *mut ()) {
         unsafe {
-            let state = state as *mut RunState;
-            let rs = &mut *state;
-            // Forge an owner.
-            let mut owner = ();
-            let mut owner = (&raw mut owner as *mut Owner).as_mut_unchecked();
-            let lclos = &rs.vals[rs.base + a as usize];
-            let LValue::LClosure(lclos) = lclos else { unreachable!() };
-            debug!("prepare_lua_call {:?} {} {} {} {:?}", rs, a, b, c, lclos);
-            let before = rs.vals.len();
-            debug!("{}", (*lclos.ro(owner).prototype).max_stack);
-            rs.call_lua(lclos.clone(), ReturnLocation::Generator(BlockId(block_id), off), a, b, c, owner);
-            debug!("after call_lua {:?}", rs);
-            let new_stack = rs.vals.stack_ptr.as_non_null_ptr().add(rs.base).as_ptr().cast();
-            warn!("prepare_lua_call returns new stack {new_stack:p} for {base}", base = rs.base);
-            new_stack
+            let owner = &*(owner as *const Owner);
+            GcCtx::assume_rooted().step_published(owner);
         }
     }
 
@@ -539,28 +421,82 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             );
             loop { match res {
                 Residual::Guard { idx, expected } => {
-                    // We map LType variants to be their corresponding LValue tags, except
-                    // for types that have multiple variants which map to the bit position we will
-                    // check is set via `test`.
-                    let tag = match expected {
-                        LType::String => 4,
-                        LType::Closure => 8,
-                        variant => *variant as u8,
-                    };
+                    // NuN-boxed type check on the 8-byte `LBoxed` slot at `base_ptr[idx]`.
+                    // Convention (see generator guard layout): on a *match* we jump to the
+                    // success continuation at `off + 2`; a *mismatch* falls through to the
+                    // deopt thunk at `off + 1`.
+                    //
+                    //   * Number   : the value has any `NUMBER_TAG` bit set.
+                    //   * Nil/Bool : exact immediate compare (nil = 2, false/true = 6/7).
+                    //   * cell types (Table/Closure/String): the value is a raw pointer
+                    //     (no `NOT_CELL_MASK` bits) whose offset-0 header byte is the kind.
+                    //     We must reject non-cells first so we never dereference a double
+                    //     or an immediate.
                     let expected_u8 = *expected as u8;
                     match expected {
-                        LType::Nil | LType::Bool | LType::Number | LType::Table => {
+                        LType::Number => {
                             dynasm!(ops
                                 ; .arch x64
-                                ; cmp BYTE r14 => LValue<'src, 'intern>[*idx as i32], (tag as i8)
+                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                                ; mov rcx, QWORD (LBoxed::NUMBER_TAG as i64)
+                                ; test rax, rcx
                                 ; jnz =>insts[off + 2]
                             );
                         },
-                        LType::Closure | LType::String => {
+                        LType::Nil => {
                             dynasm!(ops
                                 ; .arch x64
-                                ; test BYTE r14 => LValue<'src, 'intern>[*idx as i32], (tag as i8)
-                                ; jnz =>insts[off + 2]
+                                ; cmp QWORD r14 => LBoxed<'src, 'intern>[*idx as i32], (LBoxed::VALUE_NIL as i32)
+                                ; jz =>insts[off + 2]
+                            );
+                        },
+                        LType::Bool => {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                                ; or rax, 1 // false(6) -> 7, true(7) -> 7
+                                ; cmp rax, (LBoxed::VALUE_TRUE as i32)
+                                ; jz =>insts[off + 2]
+                            );
+                        },
+                        LType::Table => {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                                ; mov rcx, QWORD (LBoxed::NOT_CELL_MASK as i64)
+                                ; test rax, rcx
+                                ; jnz >guard_fail // not a cell
+                                ; cmp BYTE [rax], (LBoxed::KIND_TABLE as i8)
+                                ; jz =>insts[off + 2]
+                                ; guard_fail:
+                            );
+                        },
+                        LType::Closure => {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                                ; mov rcx, QWORD (LBoxed::NOT_CELL_MASK as i64)
+                                ; test rax, rcx
+                                ; jnz >guard_fail // not a cell
+                                ; movzx ecx, BYTE [rax]
+                                ; sub ecx, (LBoxed::KIND_LCLOSURE as i32) // LClosure(2)/NClosure(3)
+                                ; cmp ecx, 1
+                                ; jbe =>insts[off + 2]
+                                ; guard_fail:
+                            );
+                        },
+                        LType::String => {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                                ; mov rcx, QWORD (LBoxed::NOT_CELL_MASK as i64)
+                                ; test rax, rcx
+                                ; jnz >guard_fail // not a cell
+                                ; movzx ecx, BYTE [rax]
+                                ; sub ecx, (LBoxed::KIND_OWNED as i32) // Owned(4)/Interned(5)
+                                ; cmp ecx, 1
+                                ; jbe =>insts[off + 2]
+                                ; guard_fail:
                             );
                         },
                         _ => {
@@ -578,26 +514,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::NativeGuard { idx, ptr } => {
+                    // The value is a raw (leaked) `NClosureCell` pointer; load its
+                    // `native` fn pointer and compare to the specialized target.
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r14 // base_ptr
-                        ; mov rsi, WORD (*idx as i32)
-                        ; mov rdx, QWORD (*ptr as i64)
-                        ; call extern (JitHelper::check_native_guard as *const () as usize)
-                        ; test al, al
-                        ; jnz =>insts[off + 2]
+                        ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                        ; mov rcx, QWORD (*ptr as i64)
+                        ; cmp rcx, QWORD rax => NClosureCell.native
+                        ; jz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
                 Residual::LuaGuard { idx, ptr } => {
+                    // The value is a raw `Gc` (GcInner base); step to the inner
+                    // `LClosure` (`GcInner.val`, valid since TCell is transparent)
+                    // and compare its `prototype` to the specialized identity.
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r14 // base_ptr
-                        ; mov rsi, WORD (*idx as i32)
-                        ; mov rdx, QWORD (*ptr as i64)
-                        ; call extern (JitHelper::check_lua_guard as *const () as usize)
-                        ; test al, al
-                        ; jnz =>insts[off + 2]
+                        ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                        ; lea rax, rax => GcInner<TLCell<TlcOwner, LClosure<'src, 'intern>>>.val
+                        ; mov rcx, QWORD (*ptr as i64)
+                        ; cmp rcx, QWORD rax => LClosure<'src, 'intern>.prototype
+                        ; jz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
@@ -665,16 +603,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                     match entry {
                         Some(entry) => {
+                            // Return location for this call site, packed to a single word.
+                            let packed_ret = ReturnLocation::Generator(BlockId(id.0), off + 1).pack();
+                            // Pin the exact monomorphized address of the extern "C" call_lua.
+                            let call_lua: extern "C" fn(&mut RunState<'src, 'intern>, &mut Owner, PackedLocation, u16, u16, u16) -> usize = RunState::call_lua;
                             dynasm!(ops
-                                ; mov rdi, r13 // state
-                                ; mov rsi, WORD (id.0 as i32)
-                                ; mov rdx, WORD ((off + 1) as i32)
+                                ; mov rdi, r13 // &mut RunState
+                                ; mov rsi, r12 // owner
+                                ; mov rdx, QWORD (packed_ret.bits() as i64)
                                 ; mov rcx, WORD (*a as i32)
                                 ; mov  r8, WORD (*b as i32)
                                 ; mov  r9, WORD (*c as i32)
+                                ; call extern (call_lua as *const () as usize)
 
-                                ; call extern (JitHelper::prepare_lua_call as *const () as usize)
-                                ; mov r14, rax
+                                // Reload r14 = callee base ptr = vals.stack_ptr + base*sizeof(LBoxed)
+                                ; lea rcx, r13 => RunState.vals
+                                ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
+                                ; mov rcx, QWORD r13 => RunState.base
+                                ; lea r14, [rax + rcx * 8]
 
                                 // state is already in r13
                                 ; call extern (entry as usize)
@@ -699,23 +645,42 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::NativeCall { nf, a, b, c } => {
-                    let dispatch: *const () = dispatch_abc!(JitHelper::prepare_native_call, a, b, c);
+                    // Native signature `fn(seq, args, returns, owner)` with ZST seq/owner,
+                    // so the two `&[LBoxed]` slice views arrive as (rdi=args ptr, rsi=args
+                    // len, rdx=returns ptr, rcx=returns len); r14 is `&vals[base]`. `a/b/c`
+                    // are compile-time constants, so specialize the lengths per site: a
+                    // fixed count when b/c are non-zero, else `vals.used - base - off` for
+                    // the "to top-of-stack" (0) shape. Then call the native directly.
+                    let (a, b, c) = (*a as i32, *b as i32, *c as i32);
+                    if b == 0 {
+                        dynasm!(ops
+                            ; .arch x64
+                            ; mov rax, QWORD r13 => RunState.top
+                            ; sub rax, QWORD r13 => RunState.base
+                            ; sub rax, (a + 1)
+                            ; mov rsi, rax
+                        );
+                    } else {
+                        dynasm!(ops ; .arch x64 ; mov rsi, (b - 1));
+                    }
+                    if c == 0 {
+                        dynasm!(ops
+                            ; .arch x64
+                            ; mov rax, QWORD r13 => RunState.top
+                            ; sub rax, QWORD r13 => RunState.base
+                            ; sub rax, a
+                            ; mov rcx, rax
+                        );
+                    } else if c == 1 {
+                        dynasm!(ops ; .arch x64 ; xor ecx, ecx);
+                    } else {
+                        dynasm!(ops ; .arch x64 ; mov rcx, (c - 1));
+                    }
                     dynasm!(ops
-                        ; sub rsp, (core::mem::size_of::<CallArgs>() as i32)
-                        ; mov rdi, rsp
-                        ; mov rsi, r13 // state
-                        ; mov rdx, WORD (*a as i32)
-                        ; mov rcx, WORD (*b as i32)
-                        ; mov  r8, WORD (*c as i32)
-                        ; call extern (dispatch as *const () as usize)
-
-                        // NativeFunction is an extern "rust-call" like Exec.
-                        ; mov rdi, rsp => CallArgs.args_ptr
-                        ; mov rsi, rsp => CallArgs.args_len
-                        ; mov rdx, rsp => CallArgs.returns_ptr
-                        ; mov rcx, rsp => CallArgs.returns_len
-                        ; add rsp, (core::mem::size_of::<CallArgs>() as i32)
-                        ; call extern (*nf as usize)
+                        ; .arch x64
+                        ; lea rdi, [r14 + ((a + 1) * 8)] // args ptr = &vals[base + a + 1]
+                        ; lea rdx, [r14 + (a * 8)]       // returns ptr = &vals[base + a]
+                        ; call extern (*nf as usize)     // direct, statically-known target
                     );
                 },
                 Residual::Jump(target) => {
@@ -755,6 +720,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // Should be unreachable, emit a trap
                     dynasm!(ops
                         ; ud2
+                    );
+                },
+                Residual::GC => {
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, r12 // owner
+                        ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
                 Residual::Thunk(_) => {

@@ -88,7 +88,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
         let bytecode = fs::read(&bin_path).unwrap();
         fs::remove_file(&bin_path).unwrap();
 
-        let header = chunk::header(&bytecode[..]).unwrap().1;
+        let header = chunk::header(&bytecode).unwrap().1;
         let intern_strings = internment::Arena::new();
         let header = header.globally_intern(&intern_strings);
 
@@ -103,15 +103,15 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
             let mut _g = s.global_env();
 
             // Override print
-            let print_key = vm::InternString::intern(s.intern(), "print");
-            let custom_print = vm::LValue::NClosure(vm::NClosure::new(|seq, args, _returns, owner| {
-                let s = args.ro(&seq).iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
-                    maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.ro(owner).as_slice()).to_owned()) })
+            let print_key = vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "print"));
+            let custom_print = vm::LBoxed::box_lvalue(vm::LValue::NClosure(vm::NClosure::new(|seq, args, _returns, owner| {
+                let s = args.ro(&seq).iter().map(|val| val.unbox().as_string(owner)).flat_map(|maybe_str|
+                    maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
                 ).collect::<Vec<_>>();
                 let output = s.into_iter().intersperse("\t".to_string()).collect::<String>();
                 CAPTURED.with(|c| c.rw(owner).push(output));
-            }));
-            _g.set(owner, print_key, custom_print);
+            })));
+            _g.set(owner, print_key, custom_print, s.intern());
 
             let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
             let args = vec![].into();

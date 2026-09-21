@@ -11,9 +11,10 @@ use nom::{
 use core::fmt::{Formatter, Debug};
 use std::{ops::RangeFrom, fmt::Display};
 use bitfield::bitfield;
-use crate::vm::{Opcode, Number};
+use crate::vm::{Opcode, Number, IStr};
 
 use internment::Arena;
+#[cfg(feature = "lbbv")]
 use crate::generator;
 
 use log::debug;
@@ -255,8 +256,8 @@ pub fn header(input: &[u8]) -> IResult<&[u8], Header<Constant<PackedString<'_>>>
 
 impl<'src> Constant<PackedString<'src>> {
     #[inline]
-    pub fn globally_intern<'intern>(self, intern: &'intern Arena<(&'src [u8], u64)>)
-        -> Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>
+    pub fn globally_intern<'intern>(self, intern: &'intern Arena<IStr<'src>>)
+        -> Constant<internment::ArenaIntern<'intern, IStr<'src>>>
     {
         match self {
             Constant::Nil => Constant::Nil,
@@ -267,7 +268,7 @@ impl<'src> Constant<PackedString<'src>> {
                     use std::hash::{BuildHasher};
                     let hash = rustc_hash::FxBuildHasher::default().hash_one(s.data);
                     debug!("computed hash {} for {:?}", hash, s.data);
-                    intern.intern((s.data, hash))
+                    intern.intern(IStr { kind: crate::vm::LBoxed::KIND_INTERNED, bytes: std::borrow::Cow::Borrowed(s.data), hash })
                 }
             ),
             _ => unimplemented!()
@@ -277,8 +278,8 @@ impl<'src> Constant<PackedString<'src>> {
 
 impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
     #[inline]
-    pub fn globally_intern<'intern>(self, intern: &'intern Arena<(&'src [u8], u64)>)
-        -> FunctionBlock<'src, Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>>
+    pub fn globally_intern<'intern>(self, intern: &'intern Arena<IStr<'src>>)
+        -> FunctionBlock<'src, Constant<internment::ArenaIntern<'intern, IStr<'src>>>>
     {
         let FunctionBlock {
             line_defined,
@@ -324,8 +325,8 @@ impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
 }
 
 impl<'src> Header<'src, Constant<PackedString<'src>>> {
-    pub fn globally_intern<'intern>(self, intern: &'intern Arena<(&'src [u8], u64)>)
-        -> Header<'src, Constant<internment::ArenaIntern<'intern, (&'src [u8], u64)>>>
+    pub fn globally_intern<'intern>(self, intern: &'intern Arena<IStr<'src>>)
+        -> Header<'src, Constant<internment::ArenaIntern<'intern, IStr<'src>>>>
         where 'src: 'intern
     {
         Header::<'src, _> {

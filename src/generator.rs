@@ -11,14 +11,19 @@ use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Retur
 use qcell::{LCell, LCellOwner};
 use crate::Owner;
 use crate::vm::{Tc, Vm};
+use crate::vm::{BlockId, HashRef};
 use crate::vm::{LClosure, LProto};
-use crate::vm::{LValue, LType, Number, Table, FVec};
+use crate::vm::{LValue, LType, Number, Table, FVec, LBoxed, LCanon, IStr};
 use crate::vm::{InstructionDecode, Unpacker};
 use crate::vm::RunState;
 use crate::vm::LConstant;
 use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
+// The native code generator (`JitContext`) and its per-block `JitInfo` (dynasm
+// buffer + hotness tiering) are only needed with the `jit` feature. LBBV on its
+// own is a second interpreter tier and doesn't touch them.
+#[cfg(feature = "jit")]
 use crate::jit::{JitInfo, JitContext};
 use crate::gc::{Mark, Heap, GcCtx};
 
@@ -55,6 +60,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
 #[derive(Debug)]
 pub struct Block {
     pub instructions: Vec<Residual>,
+    #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
 }
 
@@ -62,6 +68,7 @@ impl Block {
     fn new() -> Self {
         Self {
             instructions: vec![],
+            #[cfg(feature = "jit")]
             jit_info: JitInfo::new(),
         }
     }
@@ -206,13 +213,10 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     fn tostring(&self, owner: &Owner) -> String {
         let lv: LValue = (&self.key).into();
         format!("hkey({}, {})",
-            String::from_utf8_lossy(lv.as_string_nolock().unwrap().ro(owner).as_slice()).to_owned().replace("\0",""),
+            String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
             self.known_type)
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HashRef(pub u8);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResumeArg {
@@ -262,7 +266,7 @@ pub fn emit_getglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>
         // maybe getting _G[kst] should be a yieldop...?
         debug!("getglobal {} = {:?}", dest, &kst);
         yield YieldOp::Exec(ResidualExec::new("getglobal", Rc::new(move |owner, state| {
-            state.vals[state.base + dest as usize] = state._G.get(owner, &(&kst).into()).unwrap_or((&Constant::Nil).into()).clone();
+            state.vals[state.base + dest as usize] = state._G.get(owner, &(&kst).into(), state.intern).unwrap_or((&Constant::Nil).into());
         })));
         yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
         arg
@@ -277,7 +281,7 @@ pub fn emit_setglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>
         // TODO: env shape specialization
         debug!("setglobal {} = {:?}", dest, &kst);
         yield YieldOp::Exec(ResidualExec::new("setglobal", Rc::new(move |owner, state| {
-            state._G.set(owner, (&kst).into(), state.vals[state.base + dest as usize].clone());
+            state._G.set(owner, (&kst).into(), state.vals[state.base + dest as usize], state.intern);
         })));
         arg
     }
@@ -302,8 +306,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::Exec(ResidualExec::new("gettable_href", Rc::new(move |owner, state| {
                 let witness = &state.hash_witnesses[state.witness_base + hc.0 as usize];
                 debug!("gettable_href with {:?} {:?}", &witness, t_htype);
-                let tab = &state.vals[state.base + b];
-                let LValue::Table(tab) = tab else { unreachable!() };
+                let LValue::Table(tab) = state.vals[state.base + b].unbox() else { unreachable!() };
                 #[cfg(debug_assertions)]
                 let witness = witness.as_ref().unwrap();
                 #[cfg(not(debug_assertions))]
@@ -314,27 +317,27 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // Move this into make_href_check since we need it attached to the HashKey instead
                 #[cfg(debug_assertions)]
                 {
-                    let val2 = tab.ro(owner).hash.get::<LValue>(&(&witness.key).into()).unwrap();
+                    let val2 = tab.ro(owner).hash.get(&LCanon::new((&witness.key).into(), state.intern)).copied().unwrap();
                     let full_key = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16);
                     debug!("{:?}", &tab.ro(owner));
                     let Ok(const_key) = full_key else { unreachable!() };
-                    assert_eq!(k, &(const_key.into()) as &LValue);
-                    assert_eq!(val1, val2);
+                    assert_eq!(*k, LCanon::new(LBoxed::from(const_key), state.intern));
+                    assert_eq!(val1.bits(), val2.bits());
                 }
 
                 debug!("gettable_href fetched {a} = {val1:?}");
-                state.vals[state.base + a] = val1.clone();
+                state.vals[state.base + a] = *val1;
             })));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
         } else {
             arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
                 let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
                     Ok(c) => Cow::Owned(LValue::from(c)),
-                    Err(lv) => Cow::Borrowed(lv),
+                    Err(lv) => Cow::Owned(lv.unbox()),
                 };
                 debug!("gettable {:?}", &kc);
-                let val_b = state.vals[state.base + b as usize].clone();
-                state.vals[state.base + a as usize] = val_b.gettable(owner, kc);
+                let val_b = state.vals[state.base + b as usize].unbox();
+                state.vals[state.base + a as usize] = LBoxed::box_lvalue(val_b.gettable(owner, kc, state.intern));
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
         }
@@ -359,20 +362,20 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             // Array part set
             // TODO: MatchedConst
             arg = yield YieldOp::Exec(ResidualExec::new("settable_array", Rc::new(move |owner, state| {
-                let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
-                    Ok(b) => b.into(),
-                    Err(lv) => lv.clone(),
+                let kb: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
+                    Ok(b) => LValue::from(b),
+                    Err(lv) => lv.unbox(),
                 };
                 let LValue::Number(kb) = kb else { unreachable!() };
-                let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                    Ok(c) => c.into(),
-                    Err(lv) => lv.clone(),
+                let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                    Ok(c) => LBoxed::from(c),
+                    Err(lv) => *lv,
                 };
-                let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
+                let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
                 t.barrier_back();
                 let t = t.rw(owner);
                 if t.array.len() <= kb.0 as usize {
-                    t.array.resize_with(kb.0 as usize, || LValue::Nil);
+                    t.array.resize_with(kb.0 as usize, || LBoxed::NIL);
                 }
                 t.array[kb.0 as usize-1] = kc;
             })));
@@ -399,17 +402,16 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let hidx = state.witness_base + hb.0 as usize;
                     let witness = &state.hash_witnesses[hidx];
                     debug!("settable_href with {:?} {:?}", &witness, htype);
-                    let tab = &state.vals[state.base + a];
-                    let LValue::Table(tab) = tab else { unreachable!() };
-                    let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                        Ok(c) => c.into(),
-                        Err(lv) => lv.clone(),
+                    let LValue::Table(tab) = state.vals[state.base + a].unbox() else { unreachable!() };
+                    let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                        Ok(c) => LBoxed::from(c),
+                        Err(lv) => *lv,
                     };
                     tab.barrier_back();
                     let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
                     debug!("settable_href {:?} {}", &val1, htype);
                     #[cfg(debug_assertions)]
-                    assert!(val1.ctypeof_() == htype);
+                    assert!(val1.unbox().ctypeof_() == htype);
                     *val1 = kc;
                     if t_mismatched_type.is_some() {
                         tab.rw(owner).epoch += 1;
@@ -426,20 +428,21 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 }
             } else {
                 arg = yield YieldOp::Exec(ResidualExec::new("settable_hash", Rc::new(move |owner, state| {
-                    let kb = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
-                        Ok(b) => b.into(),
-                        Err(lv) => lv.clone(),
+                    let kb: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
+                        Ok(b) => LBoxed::from(b),
+                        Err(lv) => *lv,
                     };
-                    let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                        Ok(c) => c.into(),
-                        Err(lv) => lv.clone(),
+                    let kb = LCanon::new(kb, state.intern);
+                    let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                        Ok(c) => LBoxed::from(c),
+                        Err(lv) => *lv,
                     };
-                    let LValue::Table(t) = &mut state.vals[state.base + a] else { unreachable!() };
+                    let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
                     t.barrier_back();
-                    let kc_type = kc.typeof_();
-                    if let Some(existing) = t.rw(owner).hash.insert(kb, kc.clone()) {
+                    let kc_type = kc.unbox().typeof_();
+                    if let Some(existing) = t.rw(owner).hash.insert(kb, kc) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
-                        if existing.typeof_() != kc_type {
+                        if existing.unbox().typeof_() != kc_type {
                             t.rw(owner).epoch += 1;
                         }
                     } else {
@@ -460,7 +463,7 @@ pub fn emit_newtable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Exec(ResidualExec::new("newtable", Rc::new(move |owner, state| {
             // TODO: properly decode the "floating point byte" size hints instead
-            state.vals[state.base + a as usize] = LValue::Table(Tc::new(Table::new(b as usize, c as usize)));
+            state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::Table(Tc::new(Table::new(b as usize, c as usize))));
         })));
         yield YieldOp::SetTypes(vec![(a, LType::Table)]);
         yield YieldOp::CollectGarbage;
@@ -475,12 +478,12 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
         // table initialization, which means it is definitely a table and doesn't e.g. have a
         // metatable we have to chain to.
         arg = yield YieldOp::Exec(ResidualExec::new("setlist", Rc::new(move |owner, state| {
-            match state.vals[state.base + a as usize].clone() {
+            match state.vals[state.base + a as usize].unbox() {
                 LValue::Table(tab) => {
                     assert_ne!(c, 0);
                     tab.barrier_back();
                     let start = state.base + a as usize + 1;
-                    let end = if b == 0 { state.vals.len() } else { start + b as usize };
+                    let end = if b == 0 { state.top } else { start + b as usize };
                     let src = state.vals[start..end].iter().cloned();
                     tab.rw(owner).array.splice(
                         (c as usize-1)*50..,
@@ -517,11 +520,11 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 define_exec!(NumericIntInt, [dest: usize, lhs: usize, rhs: usize], [OP: Opcode],
                 |owner, state, dest, lhs, rhs| {
                     debug!("state {:?}", state);
-                    let LValue::Number(dyn_b) = &state.vals[state.base + lhs] else { unreachable!() };
-                    let LValue::Number(dyn_c) = &state.vals[state.base + rhs] else { unreachable!() };
-                    let res = LValue::Number(*dyn_b).numeric_op(OP, &LValue::Number(*dyn_c)).unwrap();
+                    let Some(dyn_b) = state.vals[state.base + lhs].as_number() else { unreachable!() };
+                    let Some(dyn_c) = state.vals[state.base + rhs].as_number() else { unreachable!() };
+                    let res = LValue::Number(Number(dyn_b)).numeric_op(OP, &LValue::Number(Number(dyn_c))).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest] = res;
+                    state.vals[state.base + dest] = LBoxed::box_lvalue(res);
                 });
 
                 yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_int_int", NumericIntInt, {dest: dest, lhs: lhs, rhs: rhs}));
@@ -537,7 +540,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     let LConstant::Number(kc) = krhs else { unreachable!() };
                     let res = LValue::Number(*kb).numeric_op(OP, &LValue::Number(*kc)).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest] = res;
+                    state.vals[state.base + dest] = LBoxed::box_lvalue(res);
                 });
 
                 yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_cint_cint", NumericCintCint, {dest: dest, lhsc: lhsc as usize, rhsc: rhsc as usize}));
@@ -549,10 +552,10 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 |owner, state, dest, lhsc, rhs| {
                     let kb: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc]) };
                     let LConstant::Number(kb) = kb else { unreachable!() };
-                    let dyn_c = &state.vals[state.base + rhs];
-                    let res = LValue::Number(Number(kb.0)).numeric_op(OP, dyn_c).unwrap();
+                    let Some(dyn_c) = state.vals[state.base + rhs].as_number() else { unreachable!() };
+                    let res = LValue::Number(Number(kb.0)).numeric_op(OP, &LValue::Number(Number(dyn_c))).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest] = res;
+                    state.vals[state.base + dest] = LBoxed::box_lvalue(res);
                 });
 
                 yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_cint_int", NumericCintInt, {dest: dest, lhsc: lhsc as usize, rhs: rhs}));
@@ -562,12 +565,12 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
                 define_exec!(NumericIntCint, [dest: usize, lhs: usize, rhsc: usize], [OP: Opcode],
                 |owner, state, dest, lhs, rhsc| {
-                    let dyn_b = &state.vals[state.base + lhs];
+                    let Some(dyn_b) = state.vals[state.base + lhs].as_number() else { unreachable!() };
                     let kc: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc]) };
                     let LConstant::Number(kc) = kc else { unreachable!() };
-                    let res = dyn_b.numeric_op(OP, &LValue::Number(Number(kc.0))).unwrap();
+                    let res = LValue::Number(Number(dyn_b)).numeric_op(OP, &LValue::Number(Number(kc.0))).unwrap();
                     debug!("res {:?}", &res);
-                    state.vals[state.base + dest] = res;
+                    state.vals[state.base + dest] = LBoxed::box_lvalue(res);
                 });
 
 
@@ -626,9 +629,9 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             (ResumeArg::Matched, ResumeArg::Matched) => {
                 define_exec!(CompareIntInt, [a: u8, b: usize, c: usize], [OP: Opcode],
                 |owner, state, dest, lhs, rhs| {
-                    let dyn_b = &state.vals[state.base + b];
-                    let dyn_c = &state.vals[state.base + c];
-                    let cond = dyn_b.compare(OP, dyn_c.clone(), owner).unwrap();
+                    let Some(dyn_b) = state.vals[state.base + b].as_number() else { unreachable!() };
+                    let Some(dyn_c) = state.vals[state.base + c].as_number() else { unreachable!() };
+                    let cond = LValue::Number(Number(dyn_b)).compare(OP, LValue::Number(Number(dyn_c)), owner).unwrap();
                     if (cond as u8) != *a {
                         //debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
@@ -644,8 +647,8 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                 |owner, state, dest, lhs, rhs| {
                     let const_b = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[*rb as usize] };
                     let Constant::Number(Number(_)) = const_b else { unreachable!() };
-                    let dyn_c = &state.vals[state.base + c];
-                    let cond = LValue::from(const_b).compare(OP, dyn_c.clone(), owner).unwrap();
+                    let Some(dyn_c) = state.vals[state.base + c].as_number() else { unreachable!() };
+                    let cond = LValue::from(const_b).compare(OP, LValue::Number(Number(dyn_c)), owner).unwrap();
                     if (cond as u8) != *a {
                         //debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
@@ -659,10 +662,10 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
                 define_exec!(CompareIntCInt, [a: u8, b: usize, rc: usize], [OP: Opcode],
                 |owner, state, dest, lhs, rhs| {
-                    let dyn_b = &state.vals[state.base + b];
+                    let Some(dyn_b) = state.vals[state.base + b].as_number() else { unreachable!() };
                     let const_c = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[*rc as usize] };
                     let Constant::Number(Number(_)) = const_c else { unreachable!() };
-                    let cond = dyn_b.compare(OP, const_c.into(), owner).unwrap();
+                    let cond = LValue::Number(Number(dyn_b)).compare(OP, const_c.into(), owner).unwrap();
                     if (cond as u8) != *a {
                         //debug!("taking comparison jump -> {:?}", taken);
                         state.select = 0;
@@ -705,7 +708,7 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
         arg = yield YieldOp::Guard(a, LType::Bool);
         if let ResumeArg::Matched = arg {
             arg = yield YieldOp::Exec(ResidualExec::new("test_bool", Rc::new(move |owner, state| {
-                let LValue::Bool(b) = state.vals[state.base + a as usize] else { unreachable!() };
+                let LValue::Bool(b) = state.vals[state.base + a as usize].unbox() else { unreachable!() };
                 state.select = (b as u16 == c) as usize;
             })));
             arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
@@ -742,12 +745,12 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
             unimplemented!("__unm metatable");
         };
         arg = yield YieldOp::Exec(ResidualExec::new("unm", Rc::new(move |owner, state| {
-            let res = match &state.vals[state.base + b as usize] {
+            let res = match state.vals[state.base + b as usize].unbox() {
                 // TODO: metatables
                 LValue::Number(n) => LValue::Number(Number(-n.0)),
                 _ => unimplemented!(),
             };
-            state.vals[state.base + a as usize] = res;
+            state.vals[state.base + a as usize] = LBoxed::box_lvalue(res);
         })));
         yield YieldOp::SetTypes(vec![(a, LType::Number)]);
         arg
@@ -760,13 +763,12 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         arg = yield YieldOp::Guard(b, LType::String);
         if ResumeArg::Matched == arg {
             arg = yield YieldOp::Exec(ResidualExec::new("len_str", Rc::new(move |owner, state| {
-                let b = &state.vals[state.base + b];
-                let n = match b {
-                    LValue::OwnedString(s) => { s.ro(owner).len() },
-                    LValue::InternedString(s) => { s.0.len() },
+                let n = match state.vals[state.base + b].unbox() {
+                    LValue::OwnedString(s) => s.as_slice().len(),
+                    LValue::InternedString(s) => s.as_bytes().len(),
                     _ => unreachable!(),
                 };
-                state.vals[state.base + a] = LValue::Number(Number(n as _));
+                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::Number(Number(n as _)));
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Number)]);
             return arg;
@@ -775,9 +777,9 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         if ResumeArg::Matched == arg {
             // TODO: __len metamethod
             arg = yield YieldOp::Exec(ResidualExec::new("len_tab", Rc::new(move |owner, state| {
-                let LValue::Table(b) = &state.vals[state.base + b] else { unreachable!() };
+                let LValue::Table(b) = state.vals[state.base + b].unbox() else { unreachable!() };
                 let n = b.ro(owner).array.len();
-                state.vals[state.base + a] = LValue::Number(Number(n as _));
+                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::Number(Number(n as _)));
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Number)]);
             return arg;
@@ -799,16 +801,14 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
         arg = yield YieldOp::Exec(ResidualExec::new("concat", Rc::new(move |owner, state| {
             let mut s: FVec<_> = vec![].into();
             for i in (b as usize)..=(c as usize) {
-
-                let cont = match &state.vals[state.base + i as usize] {
-                    LValue::OwnedString(s) => s.clone(),
-                    LValue::InternedString(s) => crate::vm::Tc::new(s.into_ref().0.to_vec().into()),
+                match state.vals[state.base + i as usize].unbox() {
+                    LValue::OwnedString(g) => s.extend_from_slice(g.as_slice()),
+                    LValue::InternedString(is) => s.extend_from_slice(is.as_bytes()),
                     _ => unreachable!(),
-                };
-                s.extend_from_slice(cont.ro(owner).as_slice());
+                }
             }
             debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-            state.vals[state.base + a as usize] = LValue::OwnedString(Tc::new(s));
+            state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::new(s)));
         })));
         arg = yield YieldOp::SetTypes(vec![(a, LType::String)]);
         arg
@@ -917,20 +917,18 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
                 yield YieldOp::Exec(ResidualExec::new("forloop_numbers", Rc::new(move |owner, state| {
-                    let idx = &state.vals[state.base + a as usize];
-                    let limit = &state.vals[state.base + a as usize + 1];
-                    let step = &state.vals[state.base + a as usize + 2];
-                    let LValue::Number(nidx) = idx else { unreachable!() };
-                    let LValue::Number(nlimit) = limit else { unreachable!() };
-                    let LValue::Number(nstep) = step else { unreachable!() };
-                    debug!("{:?} {:?} {:?}", idx, limit, step);
-                    let comp = if nstep.0 < 0.0 {
-                        nlimit.0 <= nidx.0
+                    let idx = state.vals[state.base + a as usize];
+                    let Some(nidx) = idx.as_number() else { unreachable!() };
+                    let Some(nlimit) = state.vals[state.base + a as usize + 1].as_number() else { unreachable!() };
+                    let Some(nstep) = state.vals[state.base + a as usize + 2].as_number() else { unreachable!() };
+                    debug!("{:?} {:?} {:?}", nidx, nlimit, nstep);
+                    let comp = if nstep < 0.0 {
+                        nlimit <= nidx
                     } else {
-                        nidx.0 <= nlimit.0
+                        nidx <= nlimit
                     };
                     if comp {
-                        state.vals[state.base + a as usize + 3] = idx.clone();
+                        state.vals[state.base + a as usize + 3] = idx;
                         state.select = 0;
                     } else {
                         state.select = 1;
@@ -969,8 +967,6 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Debug)]
-pub struct BlockId(pub usize);
 pub type Pc = usize;
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 pub struct SubPc(usize, usize);
@@ -1170,6 +1166,7 @@ impl Context {
 pub struct Specializer<'src, 'intern> {
     pub blocks: Vec<Block>,
     pub clos: Tc<LClosure<'src, 'intern>>,
+    #[cfg(feature = "jit")]
     pub jctx: JitContext,
 
     pub versions: std::collections::HashMap<
@@ -1194,6 +1191,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Self {
             blocks: Vec::new(),
             versions: HashMap::default(),
+            #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             clos,
         }
@@ -1393,7 +1391,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // remainder of thunk_coro to hoist specifically the successful type guard for idx in
             // our git history.
             let mut thunk_coro  = thunk_coro.clone();
-            let runtime_type = state.vals[state.base + idx].typeof_();
+            let runtime_type = state.vals[state.base + idx].unbox().typeof_();
             let mut forced_ctx = thunk_ctx.clone();;
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
             forced_mut.types[idx] = CType::Type(runtime_type);
@@ -1414,7 +1412,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // If we're in the success block and the guarded value is a native function, we can
             // also try to emit a guard to specialize the function value as well. This lets us
             // specialize code like `local print = print; print("xyz");`.
-            let idx_ctype = state.vals[state.base + idx].ctypeof_();
+            let idx_ctype = state.vals[state.base + idx].unbox().ctypeof_();
             if let CType::NativeFunction(nf) = &idx_ctype {
                 // We know this original value has the correct native function, and so can compile
                 // a block for it immediately.
@@ -1455,9 +1453,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let thunk_mut = Rc::make_mut(&mut thunk_ctx);
             let hkey = &mut thunk_mut.hkeys[href.0 as usize];
             debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
-            let tab = &state.vals[state.base + idx];
-            let LValue::Table(tab) = tab else { unreachable!() };
-            let Some((index, key, val)) = tab.ro(owner).hash.get_full::<LValue>(&(&hkey.key).into()) else {
+            let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
+            let Some((index, key, val)) = tab.ro(owner).hash.get_full(&LCanon::new((&hkey.key).into(), state.intern)) else {
                 // The table doesn't have this key, which means we should actually just bailout
                 let fail_block = vm.new_block();
                 if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), thunk_coro, ResumeArg::Failed, block_id) {
@@ -1468,7 +1465,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
             debug!("href forced by {tab:?} -> {val:?}");
             // TODO: give the environment a shape as well
-            let discovered_type = val.typeof_();
+            let discovered_type = val.unbox().typeof_();
             hkey.known_type = CType::Type(discovered_type);
             // Initialize the hkey after discovery with a cleared hazard for the index
             if hkey.hazards.len() <= idx {
@@ -1479,7 +1476,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // If we're loading a hashkey from a table and it's a native function, also try to
             // specialize on its value. This lets us devirtualize code like `local t = { print =
             // print }; t.print("xyz");`.
-            if let CType::NativeFunction(nf) = state.vals[state.base + idx].ctypeof_() {
+            if let CType::NativeFunction(nf) = state.vals[state.base + idx].unbox().ctypeof_() {
                 debug!("todo href native function specialization");
             }
 
@@ -1501,8 +1498,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
                 debug!("populating hashkey witness {}", hidx);
                 let witness = &mut state.hash_witnesses[hidx];
-                let LValue::Table(tab) = &state.vals[state.base + idx] else { unreachable!() };
-                let lkey: LValue = (&init_key).into();
+                let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
+                let lkey = LCanon::new((&init_key).into(), state.intern);
                 // Inline cache for assuming the index stays the same
                 match tab.ro(owner).hash.get_index(index) {
                     Some((key, _)) if *key != lkey => {
@@ -1594,10 +1591,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
             vm.blocks[check_block.0].instructions.push(Residual::Exec(ResidualExec::new("epoch_repair", Rc::new(move |owner, state| {
                 // Re-init the witness and jump back to success block
+                let LValue::Table(t) = state.vals[state.base + tab].unbox() else { unreachable!() };
+                let epoch = t.ro(owner).epoch;
                 let Some(witness) = &mut state.hash_witnesses[state.witness_base + href.0 as usize] else { unreachable!() };
-                let LValue::Table(tab) = &state.vals[state.base + tab] else { unreachable!() };
                 debug!("repairing {:?} epoch", href);
-                witness.epoch = tab.ro(owner).epoch;
+                witness.epoch = epoch;
             }))));
             vm.blocks[check_block.0].instructions.push(Residual::Jump(success_block));
         })));
@@ -1828,7 +1826,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         CallTarget::Dynamic(a, b, c) => {
                             if let CType::NativeFunction(nf) = &ctx.types[a] {
                                 self.blocks[block_id.0].instructions.push(Residual::NativeCall {
-                                    nf: nf.native, a: a as u16, b: b as u16, c: c as u16
+                                    nf: nf.native(), a: a as u16, b: b as u16, c: c as u16
                                 });
                             } else if let CType::LuaFunction(lclos) = &ctx.types[a] {
                                 // TODO: we should probably track the number of incoming edges, and
@@ -1907,7 +1905,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut Owner, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, Option<FVec<LValue<'src, 'intern>>>) {
+    pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut Owner, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, Option<FVec<LBoxed<'src, 'intern>>>) {
         let mut off: usize = 0;
         debug!("run");
         // Republish on entry: `state` was moved into this frame (the caller's pointer is now
@@ -1994,7 +1992,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("RUN {:?}", &res);
             match res {
                 Residual::Guard { idx, expected } => {
-                    if state.vals[state.base + idx].typeof_() == expected {
+                    if state.vals[state.base + idx].unbox().typeof_() == expected {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -2002,7 +2000,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::NativeGuard { idx, ptr } => {
-                    if let LValue::NClosure(nf) = &state.vals[state.base + idx] {
+                    if let LValue::NClosure(nf) = state.vals[state.base + idx].unbox() {
 
                         let call = nf.get_ptr();
                         if call == ptr {
@@ -2016,7 +2014,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::LuaGuard { idx, ptr } => {
-                    if let LValue::LClosure(clos) = &state.vals[state.base + idx] {
+                    if let LValue::LClosure(clos) = state.vals[state.base + idx].unbox() {
                         let call = clos.ro(owner).prototype.cast();
                         if call == ptr {
                             // Fallthrough
@@ -2030,8 +2028,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::EpochCheck { tab, href } => {
                     let hwit = &state.hash_witnesses[state.witness_base + href.0 as usize].as_ref().unwrap();
-                    let tab = &state.vals[state.base + tab];
-                    let LValue::Table(tab) = tab else { unreachable!() };
+                    let LValue::Table(tab) = state.vals[state.base + tab].unbox() else { unreachable!() };
                     warn!("epochcheck sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
                     if hwit.epoch == tab.ro(owner).epoch {
                         // Fallthrough
@@ -2042,13 +2039,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::HashGuard { tab, href, expected } => {
                     let hwit = &state.hash_witnesses[state.witness_base + href.0 as usize].as_ref().unwrap();
-                    let tab = &state.vals[state.base + tab];
-                    let LValue::Table(tab) = tab else { unreachable!() };
+                    let LValue::Table(tab) = state.vals[state.base + tab].unbox() else { unreachable!() };
                     let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
-                    let cached_key_val: LValue = (&hwit.key).into();
+                    let cached_key = LCanon::new((&hwit.key).into(), state.intern);
                     #[cfg(debug_assertions)]
-                    assert!(key == &cached_key_val);
-                    if val.typeof_() == expected {
+                    assert!(*key == cached_key);
+                    if val.unbox().typeof_() == expected {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -2067,7 +2063,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     // Safety: transmute the 'static lifetime back down. This is always shorter.
                     let lclos: Tc<LClosure<'src, 'intern>> = unsafe { core::mem::transmute(lclos) };
-                    let next_stack = state.call_lua(lclos.clone(), ReturnLocation::Generator(id, off), a, b, c, owner);
+                    let next_stack = state.call_lua(owner, ReturnLocation::Generator(id, off).pack(), a, b, c);
                     // Either use existing block, compile a new one, or use most
                     // generic.
                     let types = vec![LType::Unknown; next_stack];
@@ -2093,12 +2089,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Call { a, b, c } => {
                     off += 1;
-                    let to_call = &state.vals[state.base + a as usize];
+                    let to_call = state.vals[state.base + a as usize].unbox();
                     debug!("{:?}", to_call);
                     // push where to return to once we RETURN
-                    if let LValue::LClosure(ref lclos) = to_call.clone() {
-                        let next_stack = state.call_lua(lclos.clone(), ReturnLocation::Generator(id, off),
-                            a as u16, b as u16, c as u16, owner
+                    if let LValue::LClosure(ref lclos) = to_call {
+                        let next_stack = state.call_lua(owner, ReturnLocation::Generator(id, off).pack(),
+                            a as u16, b as u16, c as u16
                         );
                         // Either use existing block, compile a new one, or use most
                         // generic.
@@ -2118,7 +2114,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off = 0;
                         continue;
                     } else if let LValue::NClosure(ncall) = to_call {
-                        let nf = ncall.native.clone();
+                        let nf = ncall.native();
                         gc.publish(&state, &*self);
                         state.call_native(nf, a as u16, b, c, owner);
                         // FIXME(metatables): __call
