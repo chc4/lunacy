@@ -590,17 +590,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                 },
                 Residual::LuaCall { lclos, a, b, c } => {
-                    // TODO: For now look up if there is a JIT block for the entrypoint with no known types
+                    // Look up a JIT block for the callee's entrypoint with no known types.
+                    // Any miss (callee never specialized, no matching version, or not yet
+                    // compiled) falls through to a bailout below.
                     let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack.into() };
-                    let types = vec![LType::Unknown; next_stack];
-                    let ctx = Rc::new(Context::new(types));
-                    let versions = self.versions.get(&lclos.ro(owner).prototype).unwrap();
-                    let entry: Option<*const ()> = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
-                        self.blocks[block.0].jit_info.entry.map(|f| f as *const _)
-                    } else {
-                        // This shouldn't ever happen...?
-                        None
-                    };
+                    let ctx = Rc::new(Context::new(vec![LType::Unknown; next_stack]));
+                    let entry: Option<*const ()> = self.versions
+                        .get(&lclos.ro(owner).prototype)
+                        .and_then(|versions| versions.get(&(SubPc::new(0), ctx)))
+                        .and_then(|block| self.blocks[block.0].jit_info.entry.map(|f| f as *const _));
                     match entry {
                         Some(entry) => {
                             // Return location for this call site, packed to a single word.
@@ -635,11 +633,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // Reload the correct base ptr for the remainder of our function
                             );
                         },
-                        Some(_) | None => {
-                            // TODO: Even though we don't have the block it's unavailable now, we
-                            // could emit a patchpoint and fill it in once we emit it. For now, we
-                            // just bailout to the interpreter forever because we missed our
-                            // opportunity.
+                        None => {
+                            // TODO: we could emit a patchpoint and fill it in once the callee
+                            // block is compiled; for now bail to the interpreter for good.
                             emit_bailout(ops, off)
                         },
                     }
