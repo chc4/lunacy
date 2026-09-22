@@ -181,6 +181,56 @@ field (`generator.rs:153`).
 - Perf: `perf` feature emits `/tmp/perf-<pid>.map`; compare nbody / life against
   the interpreter and current JIT.
 
+## 5. Status / staging (implementation)
+
+**The value in the window is the whole `LBoxed` (any type), never an unboxed
+number.** NuN-boxing is the enabler precisely because *every* Lua value — nil,
+bool, number, table, closure, string — is one GPR-sized word, so the register
+window/cache pins arbitrary `LBoxed` values, not just numbers. A window op takes
+`LBoxed` operands and returns an `LBoxed`, reusing the VM's own `LBoxed` /
+`numeric_op` / `box_lvalue` semantics. **Do not reimplement NuN boxing anywhere**
+— that was a wrong turn (a duplicated-constants `lunacy-ops` crate) and has been
+removed.
+
+Verified environment fact: a fresh git worktree is missing the path-dep
+submodules; symlink `dynasm-rs`, `memmap2-rs`, `lua_benchmarking` (and `target`)
+from `/workspace` before building (see memory `nix-devshell`). `just test` is the
+green gate (default features ⇒ jit on).
+
+**M1 — DONE (interpreter windowing, jit splat disabled).** `ExecWindow` is
+**closure-based, exactly like `Exec`** — no op enum, so no processing site
+enumerates users. New `WindowExec { name, ins: SmallVec<u16>, out: u16, body,
+template }` where `body: Fn(&mut Owner, &mut RunState, &[LBoxed]) -> LBoxed`
+receives the values read from `ins` and returns the value written to `out`;
+`owner`/`state` remain for ambient needs (heap/intern/constants) but the *windowed
+operands* flow as values. `Residual::ExecWindow(WindowExec)` +
+`YieldOp::ExecWindow(WindowExec)`. `emit_numeric`'s dynamic value/value arm yields
+one whose closure captures the op and reuses the VM's own
+`numeric_op`/`box_lvalue` (zero duplication); any other op (move, gettable, …) can
+be a window op just by supplying its own closure. `run` executes it generically
+(load `ins` slots → call `body` → store `out`); `dump` prints `window(name)`;
+`jit_block` bails (interpreter runs the closure). Verified: `just test` fully
+green; a hot numeric loop under `immediate_jit` returns the correct result via the
+JIT→bail→interpreter path. No new crate.
+
+**M2 — copy&patch splat. Open design point:** a patchouly `#[stencil]` crate is
+**extraction-only** — compiled by `build.rs` (`patchouly_build::StencilSetup`)
+into an `.rlib` parsed for machine code; it is NOT linked as a normal dependency
+(its generated stencils reference an undefined `copy_and_patch_next` that would
+fail a normal link) and it cannot depend on `lunacy` (build cycle). So the stencil
+body needs `LBoxed`'s real semantics available in a crate that does **not** pull in
+`lunacy`. Plan: factor the value layer (`LBoxed` + immediate number/bool/nil ops +
+`LValue`/`numeric_op` as needed) into a leaf `lunacy-value` crate depended on by
+both `lunacy` and the extraction-only `lunacy-stencils`; the heap-unbox cases stay
+in `lunacy` via a local trait if they entangle GC. Then the `#[stencil]` wrappers
+`#[inline]` the shared `LBoxed` op, extraction emits the stencils, and `jit_block`
+replaces the `ExecWindow` bail with a `PatchBlock` splat. Scope of the split
+(how much of the GC-entangled value model must move) is the thing to nail down
+before writing it.
+
+**M3+.** Register cache / per-block in-set threading (section 2) — pinning
+arbitrary `LBoxed` window values in GPRs across ops.
+
 ### Key code references
 - `generator.rs:150-166` `ResidualExec` (+ reserved `template`), `:1605`
   `compile_one`, `:1908` `run`, `:1922-1976` tier-up + bail codes, `:2058`

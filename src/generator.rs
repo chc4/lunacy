@@ -165,6 +165,43 @@ impl std::fmt::Debug for ResidualExec {
     }
 }
 
+/// A copy&patch "window" operation. Like `ResidualExec`, it is a *closure* (plus,
+/// later, the template extracted from it) so that no processing site — the
+/// interpreter, the JIT splat, `dump` — has to enumerate which op it is. Unlike
+/// `Exec`, its operands are the whole `LBoxed` values living in the register
+/// window: `body` receives the values read from `ins` (in order) and returns the
+/// value written to `out`. Any op whose inputs/outputs are boxed stack values
+/// (numeric, move, gettable, …) can be a window op — not just numbers.
+///
+/// `owner`/`state` are still passed for ambient needs (heap access, interning,
+/// the constant pool); the point is only that the *windowed operands* flow as
+/// values, so the register cache can keep them in GPRs across ops.
+#[derive(Clone)]
+pub struct WindowExec {
+    pub name: &'static str,
+    pub ins: SmallVec<[u16; 4]>,
+    pub out: u16,
+    pub body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>, &'a [LBoxed<'src, 'intern>]) -> LBoxed<'src, 'intern>>,
+    pub template: Option<Rc<dyn Fn()->()>>,
+}
+
+impl WindowExec {
+    pub fn new(
+        name: &'static str,
+        ins: SmallVec<[u16; 4]>,
+        out: u16,
+        body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>, &'a [LBoxed<'src, 'intern>]) -> LBoxed<'src, 'intern>>,
+    ) -> Self {
+        Self { name, ins, out, body, template: None }
+    }
+}
+
+impl std::fmt::Debug for WindowExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "window({}, {:?} -> {})", self.name, self.ins, self.out)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum CallTarget {
     Dynamic(usize, usize, usize),
@@ -180,6 +217,8 @@ pub enum YieldOp {
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
                            // is the expected type
     Exec(ResidualExec), // Emit a residual operation that will be executed
+    ExecWindow(WindowExec), // Emit a copy&patch window op (see WindowExec): a
+                        // closure over LBoxed register-window operands.
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(BlockId), // Emit a jump to the given BlockId
@@ -527,7 +566,19 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     state.vals[state.base + dest] = LBoxed::box_lvalue(res);
                 });
 
-                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_int_int", NumericIntInt, {dest: dest, lhs: lhs, rhs: rhs}));
+                // Both operands are dynamic guarded values: emit a copy&patch
+                // window op. Its operands are the whole boxed LBoxed values (read
+                // from lhs/rhs, written to dest); the closure captures the op and
+                // reuses the VM's own numeric_op/box_lvalue semantics.
+                let op = opcode;
+                yield YieldOp::ExecWindow(WindowExec::new(
+                    "numeric_window",
+                    smallvec::smallvec![lhs as u16, rhs as u16],
+                    dest as u16,
+                    Rc::new(move |_owner, _state, ins: &[LBoxed]| {
+                        LBoxed::box_lvalue(ins[0].unbox().numeric_op(op, &ins[1].unbox()).unwrap())
+                    }),
+                ));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
@@ -999,6 +1050,12 @@ impl std::fmt::Debug for ThunkRef {
 pub enum Residual {
     Guard { idx: usize, expected: LType },
     Exec(ResidualExec),
+    /// A copy&patch "window" op (see `WindowExec`): a closure whose operands are
+    /// whole `LBoxed` values (any type) carried in the register window. Closure-
+    /// based like `Exec`, so processing sites stay generic; the register cache can
+    /// keep the operands pinned in GPRs across ops (M3) and the JIT will (M2) splat
+    /// the extracted template instead of a boxed call.
+    ExecWindow(WindowExec),
     Call { a: u16, b: u16, c: u16 },
     Select(Vec<(&'static str, BlockId)>),
     Jump(BlockId),
@@ -1802,6 +1859,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
                 },
+                CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
+                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
+                },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
                     self.blocks[block_id.0].instructions.push(Residual::GC);
                 },
@@ -2059,6 +2119,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     (f.body)(owner, &mut state);
                 },
+                Residual::ExecWindow(w) => {
+                    off += 1;
+                    // Interpreter tier: retrieve the operand slots as whole boxed
+                    // values, call the window closure, flush the boxed result back
+                    // to the stack. Generic over the op — no enumeration here. The
+                    // JIT keeps these LBoxed values in registers instead of the stack.
+                    let ins: SmallVec<[LBoxed; 4]> =
+                        w.ins.iter().map(|&s| state.vals[state.base + s as usize]).collect();
+                    let res = (w.body)(owner, &mut state, &ins);
+                    state.vals[state.base + w.out as usize] = res;
+                },
                 Residual::LuaCall { lclos, a, b, c } => {
                     off += 1;
                     // Safety: transmute the 'static lifetime back down. This is always shorter.
@@ -2207,6 +2278,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::NativeGuard { idx, ptr } => format!("native_guard({}, {:p})", idx, *ptr),
                         Residual::LuaGuard { idx, ptr } => format!("lua_guard({}, {:p})", idx, *ptr),
                         Residual::Exec(ResidualExec { name, .. }) => format!("exec({})", name),
+                        Residual::ExecWindow(w) => format!("window({})", w.name),
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call { a, b, c } => format!("call({}, {}, {})", a, b, c),
                         Residual::NativeCall { nf, a, b, c } => format!("ncall({:p}, {}, {}, {})", nf, a, b, c),

@@ -725,6 +725,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
+                Residual::ExecWindow(_) => {
+                    // TODO(M2): splat the copy&patch template inline. For now bail
+                    // to the interpreter, which calls the window closure.
+                    emit_bailout(ops, off)
+                },
                 Residual::Thunk(_) => {
                     dynasm!(ops
                         ; mov WORD r13 => RunState.current_off, (off as i16)
