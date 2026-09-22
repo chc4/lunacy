@@ -16,7 +16,12 @@ pub mod jit;
 pub mod gc;
 
 pub use vm::Vm;
-pub use qcell::{TCell, TCellOwner};
+/// Marker branding the per-thread cell owner. `Owner` is unique per thread — a second
+/// `Owner::new` panics — which is what pins one VM per thread; see Note [Scoped heap] in `gc`.
+pub struct TlcOwner;
+/// The cell owner handle, threaded through every read or write of a GC-managed [`TLCell`].
+pub type Owner = qcell::TLCellOwner<TlcOwner>;
+pub use qcell::TLCell;
 
 pub use log::debug;
 pub use log::info;

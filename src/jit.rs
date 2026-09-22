@@ -3,8 +3,8 @@ use std::io::Write;
 use std::rc::Rc;
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
-use qcell::{TCell, TCellOwner};
-use crate::vm::{LClosure, LType, LValue, ReturnLocation, RunState, Tc, TcOwner, Vm};
+use crate::Owner;
+use crate::vm::{LClosure, LType, LValue, ReturnLocation, RunState, Tc, Vm};
 use crate::generator::{Block, BlockId, Context, Residual, Specializer, SubPc};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use rustc_hash::FxBuildHasher;
@@ -39,10 +39,10 @@ impl JitInfo {
     }
 }
 
-pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut TCellOwner<TcOwner>, &'a mut RunState<'src, 'intern>, *const LValue<'src, 'intern>) -> u64;
+pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut Owner, &'a mut RunState<'src, 'intern>, *const LValue<'src, 'intern>) -> u64;
 
-pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>)) -> (*const (), usize, usize) {
-    let (addr, meta) = (f as *const dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>)).to_raw_parts();
+pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)) -> (*const (), usize, usize) {
+    let (addr, meta) = (f as *const dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)).to_raw_parts();
     #[derive(Debug)]
     #[repr(C)]
     struct RawMeta {
@@ -122,7 +122,7 @@ impl JitHelper {
             let state = state as *mut RunState;
             // Forge an owner
             let mut owner = ();
-            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
+            let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
             let tab_val = &rs.vals[rs.base + tab];
@@ -136,7 +136,7 @@ impl JitHelper {
             let state = state as *mut RunState;
             // Forge an owner
             let mut owner = ();
-            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
+            let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
             let tab_val = &rs.vals[rs.base + tab];
@@ -149,7 +149,7 @@ impl JitHelper {
         unsafe {
             // Forge an owner
             let mut owner = ();
-            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
+            let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let LValue::LClosure(clos) = &*base_ptr.add(idx) else { unreachable!() };
             let call = clos.ro(owner).prototype.cast();
             if call == ptr {
@@ -164,7 +164,7 @@ impl JitHelper {
         unsafe {
             // Forge an owner
             let mut owner = ();
-            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
+            let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let LValue::NClosure(nf) = &*base_ptr.add(idx) else { unreachable!() };
             let call = nf.get_ptr();
             if call == ptr {
@@ -179,7 +179,7 @@ impl JitHelper {
         unsafe {
             let state = state as *mut RunState;
             let mut owner = ();
-            let owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_ref_unchecked();
+            let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
             // The same as RunState::call_native
             let args = if B == Count::Zero {
@@ -213,7 +213,7 @@ impl JitHelper {
             let rs = &mut *state;
             // Forge an owner.
             let mut owner = ();
-            let mut owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
+            let mut owner = (&raw mut owner as *mut Owner).as_mut_unchecked();
             let lclos = &rs.vals[rs.base + a as usize];
             let LValue::LClosure(lclos) = lclos else { unreachable!() };
             debug!("prepare_lua_call {:?} {} {} {} {:?}", rs, a, b, c, lclos);
@@ -234,7 +234,7 @@ impl JitHelper {
             #[cfg(debug_assertions)]
             assert_eq!(base_ptr, rs.vals.stack_ptr.as_non_null_ptr().add(rs.base).as_ptr().cast());
             let mut owner = ();
-            let mut owner = (&raw mut owner as *mut TCellOwner<TcOwner>).as_mut_unchecked();
+            let mut owner = (&raw mut owner as *mut Owner).as_mut_unchecked();
             match rs.do_return(owner, a as usize, b as usize) {
                 Ok(ReturnLocation::Interpreter(caller)) => {
                     // Bailout and return to interpreter
@@ -365,7 +365,7 @@ impl JitContext {
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
-    pub fn jit_compile(&mut self, id: BlockId, owner: &mut TCellOwner<TcOwner>) {
+    pub fn jit_compile(&mut self, id: BlockId, owner: &mut Owner) {
         debug!("JIT compiling block {:?}", id);
         let base = self.jctx.end();
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
@@ -467,7 +467,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// JIT compile one block, returning the JIT code offset and optionally the next block to
     /// compile.
-    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, owner: &mut TCellOwner<TcOwner>) -> (AssemblyOffset, Option<BlockId>) {
+    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, owner: &mut Owner) -> (AssemblyOffset, Option<BlockId>) {
         // We try to bias the default exit as the next block to compile. This is only a suggestion,
         // and doesn't affect correctness; `GUARD; JMP failure; RET;` for example may say that
         // `failure` is the "next block" despite not quite being correct.

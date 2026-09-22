@@ -10,6 +10,8 @@ test:
     cargo test --features "gc_sanitize"
     # Interpreter GC stress test
     cargo test --features "gc_stress gc_sanitize"
+    # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
+    cargo test --test gc_reset_frees
 
 [env("RUST_LOG", "debug")]
 [env("RUST_BACKTRACE","1")]

@@ -8,8 +8,9 @@ use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 
 use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, ReturnLocation, Upvalue};
-use qcell::{TCell, TCellOwner, LCell, LCellOwner};
-use crate::vm::{Tc, TcOwner, Vm};
+use qcell::{LCell, LCellOwner};
+use crate::Owner;
+use crate::vm::{Tc, Vm};
 use crate::vm::{LClosure, LProto};
 use crate::vm::{LValue, LType, Number, Table, FVec};
 use crate::vm::{InstructionDecode, Unpacker};
@@ -79,24 +80,24 @@ macro_rules! define_exec {
             $(pub $cap: $cap_ty),*
         }
 
-        impl<$(const $const_param: $const_ty),*> FnOnce<(&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>)> for $name<$($const_param),*> {
+        impl<$(const $const_param: $const_ty),*> FnOnce<(&mut Owner, &mut RunState<'_, '_>)> for $name<$($const_param),*> {
             type Output = ();
             #[inline(always)]
-            extern "rust-call" fn call_once(self, args: (&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>)) {
+            extern "rust-call" fn call_once(self, args: (&mut Owner, &mut RunState<'_, '_>)) {
                 self.call(args)
             }
         }
 
-        impl<$(const $const_param: $const_ty),*> FnMut<(&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>)> for $name<$($const_param),*> {
+        impl<$(const $const_param: $const_ty),*> FnMut<(&mut Owner, &mut RunState<'_, '_>)> for $name<$($const_param),*> {
             #[inline(always)]
-            extern "rust-call" fn call_mut(&mut self, args: (&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>)) {
+            extern "rust-call" fn call_mut(&mut self, args: (&mut Owner, &mut RunState<'_, '_>)) {
                 self.call(args)
             }
         }
 
-        impl<$(const $const_param: $const_ty),*> Fn<(&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>)> for $name<$($const_param),*> {
+        impl<$(const $const_param: $const_ty),*> Fn<(&mut Owner, &mut RunState<'_, '_>)> for $name<$($const_param),*> {
             #[inline(always)]
-            extern "rust-call" fn call(&self, (owner, state): (&mut TCellOwner<TcOwner>, &mut RunState<'_, '_>)) {
+            extern "rust-call" fn call(&self, (owner, state): (&mut Owner, &mut RunState<'_, '_>)) {
                 let $name { $($cap),* } = self;
                 $(let $args = *$cap;)*
                 let $owner = owner;
@@ -141,12 +142,12 @@ pub enum ExecEffect {
 #[derive(Clone)]
 pub struct ResidualExec {
     pub name: &'static str,
-    pub body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>)>,
+    pub body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)>,
     pub template: Option<Rc<dyn Fn()->()>>,
 }
 
 impl ResidualExec {
-    pub fn new(name: &'static str, body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut TCellOwner<TcOwner>, &'b mut RunState<'src, 'intern>)>) -> Self {
+    pub fn new(name: &'static str, body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)>) -> Self {
         Self { name, body, template: None }
     }
 }
@@ -202,7 +203,7 @@ pub struct HashKey<'src, 'intern> {
 }
 
 impl<'src, 'intern> HashKey<'src, 'intern> {
-    fn tostring(&self, owner: &TCellOwner<TcOwner>) -> String {
+    fn tostring(&self, owner: &Owner) -> String {
         let lv: LValue = (&self.key).into();
         format!("hkey({}, {})",
             String::from_utf8_lossy(lv.as_string_nolock().unwrap().ro(owner).as_slice()).to_owned().replace("\0",""),
@@ -992,7 +993,7 @@ impl SubPc {
 }
 
 #[derive(Clone)]
-pub struct ThunkRef(pub Rc<RefCell<dyn FnMut(&mut Specializer, &mut TCellOwner<TcOwner>, &mut RunState, usize) -> ()>>);
+pub struct ThunkRef(pub Rc<RefCell<dyn FnMut(&mut Specializer, &mut Owner, &mut RunState, usize) -> ()>>);
 
 impl std::fmt::Debug for ThunkRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Thunk(...)") }
@@ -1025,7 +1026,7 @@ pub enum CType {
 }
 
 impl Mark for CType {
-    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+    fn mark(&self, owner: &Owner) {
         match self {
             CType::LuaFunction(c) => c.mark(owner),
             _ => { },
@@ -1063,7 +1064,7 @@ pub struct Context {
 }
 
 impl Mark for Context {
-    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+    fn mark(&self, owner: &Owner) {
         for ctype in &self.types {
             ctype.mark(owner);
         }
@@ -1078,14 +1079,14 @@ impl Context {
         }
     }
 
-    fn tostring(&self, owner: &TCellOwner<TcOwner>) -> String {
+    fn tostring(&self, owner: &Owner) -> String {
         format!("context([{}], hkeys: {})",
             self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
             self.hkeys.iter().map(|hk| hk.tostring(owner)).intersperse(",".to_string()).collect::<String>(),
         )
     }
 
-    fn set_types(&mut self, owner: &mut TCellOwner<TcOwner>, ty_effects: Vec<(usize, CType)>) {
+    fn set_types(&mut self, owner: &mut Owner, ty_effects: Vec<(usize, CType)>) {
         for (idx, ty) in ty_effects {
             if idx > self.types.len() {
                 self.types.resize(idx + 1, CType::Type(LType::Unknown));
@@ -1177,7 +1178,7 @@ pub struct Specializer<'src, 'intern> {
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
-    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+    fn mark(&self, owner: &Owner) {
         self.clos.mark(owner);
         for (proto, versions) in &self.versions {
             for (key, blockid) in versions {
@@ -1199,7 +1200,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Create a new block at a Lua bytecode PC
-    pub fn block(&mut self, owner: &mut TCellOwner<TcOwner>, entry: Pc, ctx: Rc<Context>) -> BlockId {
+    pub fn block(&mut self, owner: &mut Owner, entry: Pc, ctx: Rc<Context>) -> BlockId {
         let mut pc = entry;
 
         let block_id = self.new_block();
@@ -1213,7 +1214,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         return block_id;
     }
 
-    pub fn subblock(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: Rc<Context>, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
+    pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
         if let Some(exists) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(pc, ctx.clone())) {
             return exists.clone();
         }
@@ -1234,12 +1235,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
 
     /// Return a specialized block for a given PC and context, compiling a new one if necessary
-    pub fn find(&mut self, owner: &mut TCellOwner<TcOwner>, pc: SubPc, ctx: &Rc<Context>) -> Option<BlockId>
+    pub fn find(&mut self, owner: &mut Owner, pc: SubPc, ctx: &Rc<Context>) -> Option<BlockId>
     {
         self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(pc, ctx.clone())).cloned()
     }
 
-    pub fn compile(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
+    pub fn compile(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
         loop {
             let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
@@ -1378,7 +1379,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
 
-        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The thunk was forced, so now we know the runtime value and if it
             // will pass the guard or not.
             // Instead of emitting a guard against `expected`, we can instead just fill in the real
@@ -1448,7 +1449,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
-        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let thunk_coro = thunk_coro.clone();
             let mut orig_ctx = thunk_ctx.clone();
             let thunk_mut = Rc::make_mut(&mut thunk_ctx);
@@ -1541,7 +1542,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.blocks[block_id.0].instructions.push(Residual::Select(
                 vec![("has_key", has_key), ("missing_key", missing_key)]));
             let missing_coro = thunk_coro.clone();
-            vm.blocks[missing_key.0].instructions.push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+            vm.blocks[missing_key.0].instructions.push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
                 debug!("missing key thunk");
                 // Same as the outer thunk missing the key
                 let fail_block = vm.new_block();
@@ -1559,7 +1560,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_epoch_check(&mut self, owner: &mut TCellOwner<TcOwner>, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId) {
+    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId) {
         // In order to assert that an href is still valid, we need to check that the witnessed
         // epoch is still the same: if so, all of its keys still have the same type as the
         // cached hashkey, and no additional hashkeys were inserted (which may otherwise cause
@@ -1570,7 +1571,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let thunk_coro = thunk_coro.clone();
         self.blocks[block_id.0].instructions.push(Residual::EpochCheck { tab, href });
         // Build the thunk for if we fail the epoch check
-        let fail_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut TCellOwner<TcOwner>, state: &mut RunState, thunk_pc: usize| {
+        let fail_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             debug!("hit epoch fail thunk");
             // The epoch is different, but the actual key type might still be the same.
             // Do another check for the key type, where if it still holds we can update the
@@ -1603,7 +1604,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
     }
 
-    pub fn compile_one<C>(&mut self, owner: &mut TCellOwner<TcOwner>, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
+    pub fn compile_one<C>(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
         loop {
@@ -1906,7 +1907,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut TCellOwner<TcOwner>, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, Option<FVec<LValue<'src, 'intern>>>) {
+    pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut Owner, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, Option<FVec<LValue<'src, 'intern>>>) {
         let mut off: usize = 0;
         debug!("run");
         // Republish on entry: `state` was moved into this frame (the caller's pointer is now
@@ -2179,7 +2180,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         count
     }
 
-    pub fn dump(&self, owner: &TCellOwner<TcOwner>, proto: LProto<'src, 'intern>, filepath: &str) {
+    pub fn dump(&self, owner: &Owner, proto: LProto<'src, 'intern>, filepath: &str) {
         use graphviz_rust::*;
         use graphviz_rust::printer::*;
         use graphviz_rust::cmd::*;

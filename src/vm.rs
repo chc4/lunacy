@@ -18,7 +18,8 @@ use std::io::Write;
 use internment::ArenaIntern;
 use indexmap::IndexMap;
 
-use qcell::{TCell, TCellOwner, LCell, LCellOwner};
+use qcell::{LCell, LCellOwner};
+use crate::{TLCell, TlcOwner, Owner};
 
 use crate::generator::{Specializer, Context, SubPc, BlockId, HashRef};
 use crate::perf::PerfCounters;
@@ -321,8 +322,7 @@ pub type FVec<T> = UnsafeVec<T>;
 #[cfg(not(feature = "skip_vec"))]
 pub type FVec<T> = Vec<T>;
 
-pub struct TcOwner;
-pub struct Tc<T>(pub Gc<TCell<TcOwner, T>>);
+pub struct Tc<T>(pub Gc<TLCell<TlcOwner, T>>);
 
 impl<T> Debug for Tc<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -346,7 +346,7 @@ impl<T> Hash for Tc<T> {
 
 impl<T> Tc<T> {
     pub fn new(val: T) -> Self {
-        Self(Gc::new(TCell::new(val)))
+        Self(Gc::new(TLCell::new(val)))
     }
 
     pub fn as_ptr(&self) -> *const () {
@@ -360,7 +360,7 @@ impl<T: Mark> Tc<T> {
     /// the misuse-resistant way to store into a non-table `Tc` (upvalue cells) — prefer it
     /// over `*tc.rw(owner) = value`. See Note [Write barriers].
     #[inline]
-    pub fn replace(&self, owner: &mut TCellOwner<TcOwner>, value: T) {
+    pub fn replace(&self, owner: &mut Owner, value: T) {
         self.0.write_barrier(&value, owner);
         *self.0.deref().rw(owner) = value;
     }
@@ -373,7 +373,7 @@ impl<T> Clone for Tc<T> {
 }
 
 impl<T> Deref for Tc<T> {
-    type Target = TCell<TcOwner, T>;
+    type Target = TLCell<TlcOwner, T>;
 
     fn deref(&self) -> &Self::Target {
         self.0.deref()
@@ -456,7 +456,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
         self.0.backward_barrier();
     }
 
-    pub fn get(&self, owner: &TCellOwner<TcOwner>, key: &LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
+    pub fn get(&self, owner: &Owner, key: &LValue<'src, 'intern>) -> Option<LValue<'src, 'intern>> {
         match key {
             LValue::Number(n) => Some(self.ro(owner).array.get(n.0 as usize-1).cloned().unwrap_or(LValue::Nil)),
             LValue::InternedString(s) => {
@@ -469,7 +469,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
         }
     }
 
-    pub fn set(&mut self, owner: &mut TCellOwner<TcOwner>, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
+    pub fn set(&mut self, owner: &mut Owner, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
         self.barrier_back();
         match key {
             LValue::Number(n) => {
@@ -618,7 +618,7 @@ impl std::fmt::Display for LType {
 }
 
 impl<'src, 'intern> LValue<'src, 'intern> {
-    pub fn compare(&self, opcode: Opcode, right: Self, owner: &TCellOwner<TcOwner>) -> Result<bool, String> {
+    pub fn compare(&self, opcode: Opcode, right: Self, owner: &Owner) -> Result<bool, String> {
         // TODO: metamethods
         if std::mem::discriminant(self) != std::mem::discriminant(&right) {
             panic!("bad compare");
@@ -693,7 +693,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn len(&self, owner: &TCellOwner<TcOwner>) -> Result<LValue<'src, 'intern>, String> {
+    pub fn len(&self, owner: &Owner) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match self {
             LValue::InternedString(s) => Ok(LValue::Number(Number(s.0.len() as _))),
@@ -706,7 +706,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn as_bool(&self, owner: &TCellOwner<TcOwner>) -> Result<LValue<'src, 'intern>, String> {
+    pub fn as_bool(&self, owner: &Owner) -> Result<LValue<'src, 'intern>, String> {
         match self {
             LValue::Bool(b) => Ok(self.clone()),
             LValue::Nil => Ok(LValue::Bool(false)),
@@ -714,7 +714,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn as_string(&self, owner: &TCellOwner<TcOwner>) -> Option<Tc<FVec<u8>>> {
+    pub fn as_string(&self, owner: &Owner) -> Option<Tc<FVec<u8>>> {
         // TODO: metamethods?
         match self {
             LValue::OwnedString(s) => Some(s.clone().into()),
@@ -776,7 +776,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn gettable(&self, owner: &mut TCellOwner<TcOwner>, index: Cow<'_, LValue<'src, 'intern>>) -> LValue<'src, 'intern> {
+    pub fn gettable(&self, owner: &mut Owner, index: Cow<'_, LValue<'src, 'intern>>) -> LValue<'src, 'intern> {
         let val_b = match self {
             LValue::Table(tab) => {
                 debug!("table {:?}", tab);
@@ -827,7 +827,7 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
     }
 }
 
-pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LValue<'src, 'intern>]>, &'a LCell<'id, [LValue<'src, 'intern>]>, &mut TCellOwner<TcOwner>);
+pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LValue<'src, 'intern>]>, &'a LCell<'id, [LValue<'src, 'intern>]>, &mut Owner);
 #[derive(Clone)]
 pub struct NClosure {
     pub native: NativeFunc,
@@ -886,6 +886,73 @@ pub struct Vm<'src, 'intern> {
     pub top_level: LProto<'src, 'intern>,
 }
 
+/// Branded view of a VM and its arena inside a [`Vm::scope`], at a fresh invariant `'gc`. The
+/// brand confines GC values to the scope. See Note [Scoped heap].
+pub struct Scoped<'gc> {
+    // `*const Vm<'src,'intern>` / `*const Arena<..'src..>`, type-erased and read back at `'gc`.
+    vm: *const (),
+    intern: *const (),
+    // The scope's rooting token; its `'gc` makes `Scoped` invariant (which pins the brand — see
+    // the SAFETY note on `Vm::scope`) and unlocks the crate-private `Vm::run`/`global_env`.
+    gc: GcCtx<'gc>,
+}
+
+impl<'gc> Scoped<'gc> {
+    /// The VM at the scope brand; every GC value it returns is `<'gc,'gc>`.
+    #[inline]
+    pub fn vm(&self) -> &'gc Vm<'gc, 'gc> {
+        // SAFETY: narrowing a `&Vm` whose `'src`/`'intern` outlive `'gc` down to `'gc`. See the
+        // SAFETY note on `Vm::scope`.
+        unsafe { &*(self.vm as *const Vm<'gc, 'gc>) }
+    }
+
+    /// The interning arena at the scope brand, for `InternString::intern`.
+    #[inline]
+    pub fn intern(&self) -> &'gc internment::Arena<(&'gc [u8], u64)> {
+        // SAFETY: as `vm`.
+        unsafe { &*(self.intern as *const internment::Arena<(&'gc [u8], u64)>) }
+    }
+
+    /// Build the global environment table. Scope-gated; see Note [Scoped heap].
+    #[inline]
+    pub fn global_env(&self) -> Tc<Table<'gc, 'gc>> {
+        self.vm().global_env(self.intern())
+    }
+
+    /// Enter the interpreter — the only way in, since `Vm::run` is crate-private. See Note
+    /// [Scoped heap].
+    #[inline]
+    pub fn run<const LBBV: bool>(
+        &self,
+        owner: &mut Owner,
+        _G: Tc<Table<'gc, 'gc>>,
+        clos: Tc<LClosure<'gc, 'gc>>,
+        args: ValueStack<'gc, 'gc>,
+    ) -> Result<FVec<LValue<'gc, 'gc>>, Box<dyn Error>> {
+        self.vm().run::<LBBV>(self.gc, owner, _G, clos, args)
+    }
+}
+
+thread_local! {
+    /// Set while a [`Vm::scope`] is active; enforces non-re-entrancy. See Note [Scoped heap].
+    static IN_SCOPE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII latch for [`Vm::scope`] non-re-entrancy; clears the flag on scope exit.
+struct ScopeGuard;
+impl ScopeGuard {
+    fn enter() -> Self {
+        IN_SCOPE.with(|f| {
+            assert!(!f.get(), "Vm::scope is not re-entrant: a GC scope is already active on this thread");
+            f.set(true);
+        });
+        ScopeGuard
+    }
+}
+impl Drop for ScopeGuard {
+    fn drop(&mut self) { IN_SCOPE.with(|f| f.set(false)); }
+}
+
 #[derive(Debug)]
 pub enum ReturnLocation {
     Interpreter(usize),
@@ -921,10 +988,8 @@ pub struct RunState<'src, 'intern> {
     pub gas: i64,
 }
 
-static ACTIVE: TCell<TcOwner, bool> = TCell::new(true);
-
 impl<'src, 'intern> RunState<'src, 'intern> {
-    pub fn close_upvalues(&mut self, owner: &mut TCellOwner<TcOwner>)
+    pub fn close_upvalues(&mut self, owner: &mut Owner)
     {
         for upval in self.upvals.iter() {
             let idx = match &upval.0 {
@@ -941,7 +1006,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     }
 
     #[inline(always)]
-    pub fn call_native(&mut self, nf: NativeFunc, a: u16, b: u16, c: u16, owner: &mut TCellOwner<TcOwner>) {
+    pub fn call_native(&mut self, nf: NativeFunc, a: u16, b: u16, c: u16, owner: &mut Owner) {
         let args = if b == 0 {
             &self.vals[self.base + a as usize+1..]
         } else {
@@ -972,7 +1037,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     pub fn call_lua(&mut self, lclos: Tc<LClosure<'src, 'intern>>,
         ret_loc: ReturnLocation,
         a: u16, b: u16, c: u16,
-        owner: &mut TCellOwner<TcOwner>) -> usize
+        owner: &mut Owner) -> usize
     {
         // record call stack: we say where to return to and where to put the values
         let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
@@ -997,7 +1062,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
-    pub fn do_return(&mut self, owner: &mut TCellOwner<TcOwner>, a: usize, b: usize) -> Result<ReturnLocation, FVec<LValue<'src, 'intern>>> {
+    pub fn do_return(&mut self, owner: &mut Owner, a: usize, b: usize) -> Result<ReturnLocation, FVec<LValue<'src, 'intern>>> {
         // we're going to be removing this frame, so close any open
         // upvalues.
         self.close_upvalues(owner);
@@ -1067,7 +1132,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 }
 
 impl<'src, 'intern> Mark for RunState<'src, 'intern> {
-    fn mark(&self, owner: &TCellOwner<TcOwner>) {
+    fn mark(&self, owner: &Owner) {
         for val in self.vals.iter() {
             val.mark(owner);
         }
@@ -1095,7 +1160,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         Self { top_level }
     }
 
-    pub fn global_env(&self, owner: &mut TCellOwner<TcOwner>, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Tc<Table<'src, 'intern>> {
+    pub(crate) fn global_env(&self, intern: &'intern internment::Arena<(&'src [u8], u64)>) -> Tc<Table<'src, 'intern>> {
         let mut math_tab = Table::new(0, 0);
         math_tab.hash.insert(InternString::intern(intern, "floor"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
             let f = match args.ro(&seq) {
@@ -1165,7 +1230,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
 
         let math = (InternString::intern(intern, "math"), LValue::Table(Tc::new(math_tab)));
         let os = (InternString::intern(intern, "os"), LValue::Table(Tc::new(os_tab)));
-        let mut _g = Tc::new(Table {
+        let _g = Tc::new(Table {
             array: vec![].into(),
             hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
@@ -1217,9 +1282,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             ),
             epoch: 0,
         });
-        unsafe {
-            Heap::root(&mut _g.0, owner);
-        }
+        // `_g` needs no explicit root: it lives in the `RunState` (`RunState::mark` shades it)
+        // for the whole run, which is the only time a collection can see it. See Note [GC roots].
         _g
     }
 
@@ -1235,8 +1299,41 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
     }
 
-    pub fn run<'lua, const LBBV: bool>(&'lua self,
-        owner: &mut TCellOwner<TcOwner>,
+    /// Run `body` in a generative GC scope. `body` gets a [`Scoped`] view of the VM and arena
+    /// branded with a fresh `'gc`; GC values it produces stay confined to the closure, and the
+    /// heap is freed when it returns, so only GC-free data may be returned out. Panics if a
+    /// scope is already active on this thread. See Note [Scoped heap].
+    pub fn scope<R>(
+        &self,
+        intern: &'intern internment::Arena<(&'src [u8], u64)>,
+        owner: &mut Owner,
+        body: impl for<'gc> FnOnce(Scoped<'gc>, &mut Owner) -> R,
+    ) -> R {
+        let _guard = ScopeGuard::enter();
+        let root_scope = Heap::root_scope();
+        // SAFETY: `Scoped::vm`/`intern` read the erased pointers back at `'gc`, which must not
+        // outlive `'src`/`'intern`. `'gc` is not caller-chosen: the only `'gc`-carrying field is
+        // `gc`, and `RootScope::token` returns `GcCtx<'lua>` borrowing the local `root_scope`.
+        // `GcCtx` (hence `Scoped`) is invariant, so `body(scoped, ..)` instantiates `for<'gc>`
+        // at exactly `'gc = 'lua`. A borrow of a local can't outlive this call, and `'src`/
+        // `'intern` outlive it (they back `&self`/`intern`), so `'src: 'gc` and `'intern: 'gc`:
+        // the reads only shorten lifetimes. `for<'gc>` then confines every `'gc` value to
+        // `body`, so `Heap::reset` frees an unreachable heap.
+        let scoped = Scoped {
+            vm: self as *const Vm<'src, 'intern> as *const (),
+            intern: intern as *const internment::Arena<(&'src [u8], u64)> as *const (),
+            gc: root_scope.token(),
+        };
+        let r = body(scoped, owner);
+        Heap::reset();
+        r
+    }
+
+    /// The interpreter entry, gated behind the scope's `GcCtx` token. Crate-private so the only
+    /// way in is [`Scoped::run`]. See Note [Scoped heap].
+    pub(crate) fn run<'lua, 'gc, const LBBV: bool>(&'lua self,
+        gc: GcCtx<'gc>,
+        owner: &mut Owner,
         mut _G: Tc<Table<'src, 'intern>>,
         mut clos: Tc<LClosure<'src, 'intern>>,
         mut args: ValueStack<'src, 'intern>,
@@ -1274,10 +1371,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
             }
         };
-        // GC rooting scope for this run; roots clear when `_root_scope` drops. See Note
-        // [GC roots].
-        let _root_scope = Heap::root_scope();
-        let gc = _root_scope.token();
+        // `gc` is the scope's rooting token, threaded in by `Scoped::run`; the rooting scope
+        // stays live for the whole `Vm::scope`. See Note [GC roots].
         // we need to track where to return to, along with the base pointer and where to put return
         // values
         let r_vals = 'int: loop {

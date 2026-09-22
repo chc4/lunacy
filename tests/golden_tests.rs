@@ -7,9 +7,14 @@ use regex::Regex;
 use lunacy::Vm;
 use lunacy::chunk;
 use lunacy::vm;
-use qcell::{TCell, TCellOwner};
+use lunacy::{TLCell, TlcOwner, Owner};
 
-static CAPTURED: TCell<vm::TcOwner, Vec<String>> = TCell::new(Vec::new());
+thread_local! {
+    // The owner is per-thread (a second `Owner::new()` on a thread panics), so a shared
+    // `static` cell — which would have to be `Sync` — can't hold it; each test thread gets
+    // its own capture buffer instead.
+    static CAPTURED: TLCell<TlcOwner, Vec<String>> = const { TLCell::new(Vec::new()) };
+}
 
 #[test]
 fn test_golden() {
@@ -87,32 +92,33 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
         let intern_strings = internment::Arena::new();
         let header = header.globally_intern(&intern_strings);
 
-        let mut owner = TCellOwner::new();
+        let mut owner = Owner::new();
         let vm = Vm::new(&header.top_level as *const _);
 
         println!("Running golden test {}", path.display());
-        {
-            *CAPTURED.rw(&mut owner) = Vec::new();
+        // Only the captured output (plain Strings) escapes the scope. See Vm::scope.
+        vm.scope(&intern_strings, &mut owner, |s, owner| -> Vec<String> {
+            CAPTURED.with(|c| *c.rw(owner) = Vec::new());
 
-            let mut _g = vm.global_env(&mut owner, &intern_strings);
+            let mut _g = s.global_env();
 
             // Override print
-            let print_key = vm::InternString::intern(&intern_strings, "print");
+            let print_key = vm::InternString::intern(s.intern(), "print");
             let custom_print = vm::LValue::NClosure(vm::NClosure::new(|seq, args, _returns, owner| {
                 let s = args.ro(&seq).iter().map(|val| val.as_string(owner)).flat_map(|maybe_str|
                     maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.ro(owner).as_slice()).to_owned()) })
                 ).collect::<Vec<_>>();
                 let output = s.into_iter().intersperse("\t".to_string()).collect::<String>();
-                CAPTURED.rw(owner).push(output);
+                CAPTURED.with(|c| c.rw(owner).push(output));
             }));
-            _g.set(&mut owner, print_key, custom_print);
+            _g.set(owner, print_key, custom_print);
 
-            let clos = vm::Tc::new(vm::LClosure::new(vm.top_level));
+            let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
             let args = vec![].into();
 
-            vm.run::<true>(&mut owner, _g.clone(), clos, args).expect("VM failed");
-        }
-        CAPTURED.ro(&owner).clone()
+            s.run::<true>(owner, _g.clone(), clos, args).expect("VM failed");
+            CAPTURED.with(|c| c.ro(owner).clone())
+        })
     };
 
     let table_re = Regex::new(r"(table|tc|native|function):?\s*(0x[0-9a-f]+|\(0x[0-9a-f]+\))").unwrap();
