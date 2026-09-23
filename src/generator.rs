@@ -1233,7 +1233,7 @@ pub struct Specializer<'src, 'intern> {
 
     pub versions: std::collections::HashMap<
         LProto<'src, 'intern>,
-        std::collections::HashMap<(SubPc, Rc<Context>), BlockId>, InternedHasher>,
+        std::collections::HashMap<(SubPc, Rc<Context>), BlockId, rustc_hash::FxBuildHasher>, InternedHasher>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -2141,7 +2141,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // generic.
                     let types = vec![LType::Unknown; next_stack];
                     let ctx = Rc::new(Context::new(types));
-                    let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                    let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
                     let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                         *block
                     } else {
@@ -2173,7 +2173,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // generic.
                         let types = vec![LType::Unknown; next_stack];
                         let ctx = Rc::new(Context::new(types));
-                        let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::new());
+                        let versions = self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
                         let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
                             *block
                         } else {
