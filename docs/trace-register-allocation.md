@@ -105,7 +105,14 @@ pseudo-uses and pseudo-definitions:
   window has one for it, takes a free register if there is one, and otherwise
   is left in memory. At a back edge that keeps the loop-carried values in
   registers across the latch, so the back edge moves them into the head's
-  window instead of the latch storing them and the head reloading them.
+  window instead of the latch storing them and the head reloading them. Side
+  exits get them too: a side exit is a jump to another block, not necessarily
+  the cold path (a polymorphic guard's failure block runs as often as the
+  success path), and the live sets are computed anyway. A pseudo-use never
+  evicts a value the trace wants, only takes a free register, but once in the
+  window it is wanted like any other value by the ops above the exit. A thunk
+  exits to the interpreter, which reads every slot from the stack, so it has no
+  pseudo-uses.
 - *Pseudo-definitions at the start of each block.* The window at a block's
   start, recorded as its entry window, holds only values live into the block:
   going backwards, each op writing a slot removed it from the window, so what
@@ -182,7 +189,5 @@ further down, so the displacement cost needs no look upward.
 
 ## Open questions
 
-- Whether side exits' `live_out` pseudo-uses are worth it, or side traces
-  should simply load what they read.
 - The frequency order among successors that all read zero hotness, beyond the
   tie-breaks above, for the frequency-driven policies.
