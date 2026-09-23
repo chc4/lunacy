@@ -64,6 +64,14 @@ points need nothing in registers; since the interpreter may read any slot
 after an exit, liveness never removes a store of a dirty value, only decides
 which values are worth a register.
 
+The loop step assumes a reducible region, where a loop's header dominates its
+blocks. Lua 5.1 bytecode has no `goto`, so its control flow is reducible, but
+block versioning isn't bound by that: if two paths reach a loop in different
+contexts and join the steady-state loop's versions at different blocks, that
+loop has two entries. The liveness pass checks that the target of each
+retreating edge of its depth-first walk dominates the edge's source, and where
+one doesn't, it treats every slot as live in the blocks of that cycle.
+
 **Allocating a trace.** One backward pass with the wanted window (which slot
 each register should hold) as the register-to-variable map; a slot not in it
 is in its stack home. At a window op:
@@ -91,7 +99,8 @@ the window at its start. Code generation stays forward, as now: each op runs at
 its `SKIP`, dirty values are stored when dropped, at flush points and at exits,
 and each edge between traces is resolved by the existing transfer (stores, then
 a parallel move by windmill peeling). The transfer is emitted at the edge's own
-jump, so critical edges, which the thesis excludes, need no splitting.
+jump, so the critical edges LBBV creates need no splitting (see Trace
+building policies).
 
 ## Trace building policies
 
@@ -101,6 +110,22 @@ benchmarks and window dumps run under each. In particular, single-block traces
 against a frequency-driven policy measures whether traces longer than a block
 improve the code.
 
+The thesis's CFGs have no critical edges; LBBV's do, because a jump or select
+target is looked up by bytecode position and context, so branches rejoin a
+shared version (in life, two blocks each select between the same two blocks).
+Without critical edges, every edge between two blocks of a trace joins
+consecutive blocks, or is a back edge ending the trace. Every policy keeps that
+by construction:
+
+- it never extends a trace across a retreating edge of the region's
+  depth-first walk, so no edge inside a trace goes backwards, reducible or not;
+- it never appends a block that another block of the same trace, other than the
+  last, also jumps to. The join starts a trace of its own instead, entered
+  through edges between traces like any other.
+
+Resolution needs nothing more: its transfers go on each edge's own jump, a
+select emitting a jump per target, so no edge needs splitting.
+
 - **Single-block.** Every block is its own trace: local allocation, with every
   edge between blocks resolved. Traces are allocated in the region's
   depth-first postorder, so a block starts from the entry window of a
@@ -109,7 +134,9 @@ improve the code.
   predecessors in the region are all in traces already (at first, the
   region's entry), preferring the most frequent, and append the most frequent
   successor not yet in a trace until there is none. Traces are allocated in the
-  order found.
+  order found. The thesis proves there is always such a block to start from
+  only for CFGs without critical edges; when there is none, start from the most
+  frequent block not yet in a trace.
 - **Bidirectional.** Start a trace at the most frequent block not yet in one,
   grow it upwards through its most frequent predecessor not in a trace (never
   across a back edge), then downwards as the unidirectional builder does.
