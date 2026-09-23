@@ -564,13 +564,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
         };
 
-        // Charge `cost` residuals of gas at residual `off`, exiting if it runs out.
+        // Charge `cost` residuals of gas at residual `off`, exiting if it runs out
+        // (after `stores`, which bring the stack up to date with the window).
         #[cfg(feature = "gas")]
-        let emit_gas_check = |ops: &mut Assembler, off: usize, cost: usize| {
+        let emit_gas_check = |ops: &mut Assembler, off: usize, cost: usize, stores: &[Emit]| {
             dynasm!(ops
                 ; sub QWORD r13 => RunState.gas, cost as i32
                 ; mov WORD r13 => RunState.current_off, (off as i16)
                 ; ja >have_gas
+            );
+            for &emit in stores {
+                emit_window_move(ops, emit);
+            }
+            dynasm!(ops
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                 ; mov BYTE r13 => RunState.trap, 1
                 ; jmp ->exit_jit
@@ -578,36 +584,44 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             );
         };
 
-        // Window residuals are allocated a run at a time (see Note [Register
-        // window]). Registers carry values within a run only, so a run is entered
-        // at its first residual alone: the others get no label, and a jump to one
-        // fails to assemble.
+        // The window carries values across window residuals and the inline type
+        // guards between them (see Note [Register window]); any other residual
+        // flushes it, after its label, since a guard's success edge may jump there
+        // with the window live. A guard's failure edge is its thunk, reached with
+        // the stack already up to date. Every edge into a label carries the same
+        // window: a window residual following another gets no label, so a jump to
+        // one fails to assemble.
         let window = |r: &Residual| matches!(r, Residual::ExecWindow(_));
+        let inline_guard = |r: &Residual| {
+            matches!(r, Residual::Guard { expected: LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String, .. })
+        };
         let mut alloc = WindowAlloc::default();
         for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
-            let after_window = off > 0 && window(&block.instructions[off - 1]);
-            if after_window && !window(res) {
-                for emit in alloc.flush() {
-                    emit_window_move(ops, emit);
-                }
-            }
-            if window(res) && after_window {
-                // Inside a run, charged for with its first residual.
+            let prev = off.checked_sub(1).map(|p| &block.instructions[p]);
+            let keeps_window = window(res) || inline_guard(res) || prev.is_some_and(|p| inline_guard(p));
+            if window(res) && prev.is_some_and(|p| window(p)) {
+                // Inside a run of window residuals, charged for with its first.
             } else {
                 let label = insts[off];
                 dynasm!(ops
                     ; => label
                 );
+                if !keeps_window {
+                    for emit in alloc.flush() {
+                        emit_window_move(ops, emit);
+                    }
+                }
                 #[cfg(feature = "gas")]
-                emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1));
+                emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1), &alloc.stores());
             }
             loop { match res {
-                Residual::Guard { idx, expected } => {
-                    // NuN-boxed type check on the 8-byte `LBoxed` slot at `base_ptr[idx]`.
-                    // Convention (see generator guard layout): on a *match* we jump to the
-                    // success continuation at `off + 2`; a *mismatch* falls through to the
-                    // deopt thunk at `off + 1`.
+                Residual::Guard { idx, expected } if inline_guard(res) => {
+                    // NuN-boxed type check of the value in `STACK[idx]`: in the window
+                    // register caching it, or else loaded from its stack home. A
+                    // *match* jumps to the success continuation at `off + 2` with the
+                    // window live; a *mismatch* falls through to the deopt thunk at
+                    // `off + 1`, after bringing the stack up to date.
                     //
                     //   * Number   : the value has any `NUMBER_TAG` bit set.
                     //   * Nil/Bool : exact immediate compare (nil = 2, false/true = 6/7).
@@ -615,86 +629,93 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     //     (no `NOT_CELL_MASK` bits) whose offset-0 header byte is the kind.
                     //     We must reject non-cells first so we never dereference a double
                     //     or an immediate.
-                    let expected_u8 = *expected as u8;
+                    //
+                    // `v` holds the value and `m` is scratch for the masks: rax, or r10
+                    // (not a window register) when the value itself is in rax.
+                    let (v, m) = match alloc.register_of(*idx) {
+                        Some(reg) => (WINDOW_REGS[reg], 0 /* rax */),
+                        None => {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                            );
+                            (0 /* rax */, 10 /* r10 */)
+                        }
+                    };
                     match expected {
-                        LType::Number => {
-                            dynasm!(ops
-                                ; .arch x64
-                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
-                                ; mov rcx, QWORD (LBoxed::NUMBER_TAG as i64)
-                                ; test rax, rcx
-                                ; jnz =>insts[off + 2]
-                            );
-                        },
-                        LType::Nil => {
-                            dynasm!(ops
-                                ; .arch x64
-                                ; cmp QWORD r14 => LBoxed<'src, 'intern>[*idx as i32], (LBoxed::VALUE_NIL as i32)
-                                ; jz =>insts[off + 2]
-                            );
-                        },
-                        LType::Bool => {
-                            dynasm!(ops
-                                ; .arch x64
-                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
-                                ; or rax, 1 // false(6) -> 7, true(7) -> 7
-                                ; cmp rax, (LBoxed::VALUE_TRUE as i32)
-                                ; jz =>insts[off + 2]
-                            );
-                        },
-                        LType::Table => {
-                            dynasm!(ops
-                                ; .arch x64
-                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
-                                ; mov rcx, QWORD (LBoxed::NOT_CELL_MASK as i64)
-                                ; test rax, rcx
-                                ; jnz >guard_fail // not a cell
-                                ; cmp BYTE [rax], (LBoxed::KIND_TABLE as i8)
-                                ; jz =>insts[off + 2]
-                                ; guard_fail:
-                            );
-                        },
-                        LType::Closure => {
-                            dynasm!(ops
-                                ; .arch x64
-                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
-                                ; mov rcx, QWORD (LBoxed::NOT_CELL_MASK as i64)
-                                ; test rax, rcx
-                                ; jnz >guard_fail // not a cell
-                                ; movzx ecx, BYTE [rax]
-                                ; sub ecx, (LBoxed::KIND_LCLOSURE as i32) // LClosure(2)/NClosure(3)
-                                ; cmp ecx, 1
-                                ; jbe =>insts[off + 2]
-                                ; guard_fail:
-                            );
-                        },
-                        LType::String => {
-                            dynasm!(ops
-                                ; .arch x64
-                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
-                                ; mov rcx, QWORD (LBoxed::NOT_CELL_MASK as i64)
-                                ; test rax, rcx
-                                ; jnz >guard_fail // not a cell
-                                ; movzx ecx, BYTE [rax]
-                                ; sub ecx, (LBoxed::KIND_OWNED as i32) // Owned(4)/Interned(5)
-                                ; cmp ecx, 1
-                                ; jbe =>insts[off + 2]
-                                ; guard_fail:
-                            );
-                        },
-                        _ => {
-                            dynasm!(ops
-                                ; .arch x64
-                                ; mov rdi, r13 // state
-                                ; mov rsi, WORD (*idx as i32) // idx
-                                ; mov rdx, WORD (expected_u8 as i32) // expected
-                                ; call extern (JitHelper::check_guard as *const () as usize)
-                                ; test al, al
-                                ; jnz =>insts[off + 2]
-                                // Fail: fallthrough to next (off + 1)
-                            );
-                        },
+                        LType::Number => dynasm!(ops
+                            ; .arch x64
+                            ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
+                            ; test Rq(v), Rq(m)
+                            ; jnz =>insts[off + 2]
+                        ),
+                        LType::Nil => dynasm!(ops
+                            ; .arch x64
+                            ; cmp Rq(v), (LBoxed::VALUE_NIL as i32)
+                            ; jz =>insts[off + 2]
+                        ),
+                        LType::Bool => dynasm!(ops
+                            ; .arch x64
+                            ; mov Rq(m), Rq(v)
+                            ; or Rq(m), 1 // false(6) -> 7, true(7) -> 7
+                            ; cmp Rq(m), (LBoxed::VALUE_TRUE as i32)
+                            ; jz =>insts[off + 2]
+                        ),
+                        LType::Table => dynasm!(ops
+                            ; .arch x64
+                            ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
+                            ; test Rq(v), Rq(m)
+                            ; jnz >guard_fail // not a cell
+                            ; cmp BYTE [Rq(v)], (LBoxed::KIND_TABLE as i8)
+                            ; jz =>insts[off + 2]
+                            ; guard_fail:
+                        ),
+                        LType::Closure => dynasm!(ops
+                            ; .arch x64
+                            ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
+                            ; test Rq(v), Rq(m)
+                            ; jnz >guard_fail // not a cell
+                            ; movzx Rd(m), BYTE [Rq(v)]
+                            ; sub Rd(m), (LBoxed::KIND_LCLOSURE as i32) // LClosure(2)/NClosure(3)
+                            ; cmp Rd(m), 1
+                            ; jbe =>insts[off + 2]
+                            ; guard_fail:
+                        ),
+                        LType::String => dynasm!(ops
+                            ; .arch x64
+                            ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
+                            ; test Rq(v), Rq(m)
+                            ; jnz >guard_fail // not a cell
+                            ; movzx Rd(m), BYTE [Rq(v)]
+                            ; sub Rd(m), (LBoxed::KIND_OWNED as i32) // Owned(4)/Interned(5)
+                            ; cmp Rd(m), 1
+                            ; jbe =>insts[off + 2]
+                            ; guard_fail:
+                        ),
+                        _ => unreachable!(),
                     }
+                    assert!(
+                        matches!(block.instructions.get(off + 1), Some(Residual::Thunk(_))),
+                        "a guard's failure edge must be its thunk"
+                    );
+                    for emit in alloc.stores() {
+                        emit_window_move(ops, emit);
+                    }
+                },
+                Residual::Guard { idx, expected } => {
+                    // A type with no inline test: ask `check_guard`. The window was
+                    // flushed, since the call clobbers it.
+                    let expected_u8 = *expected as u8;
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, r13 // state
+                        ; mov rsi, WORD (*idx as i32) // idx
+                        ; mov rdx, WORD (expected_u8 as i32) // expected
+                        ; call extern (JitHelper::check_guard as *const () as usize)
+                        ; test al, al
+                        ; jnz =>insts[off + 2]
+                        // Fail: fallthrough to next (off + 1)
+                    );
                 },
                 Residual::NativeGuard { idx, ptr } => {
                     // The value is a raw (leaked) `NClosureCell` pointer; load its

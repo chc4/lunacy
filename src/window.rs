@@ -69,7 +69,8 @@
 // from the slot's stack home, and cached values displaced from the run are moved
 // to spare registers or evicted. A register holding the only copy of a slot's
 // current value is dirty until flushed to the stack home, at an eviction or when
-// the run of window residuals ends.
+// the run of window residuals ends. An inline type guard does not end the run:
+// it tests the cached register, and stores the dirty ones on its failure path.
 //
 // The interpreter keeps no window between residuals: `ExecWindow` runs the op at
 // `SKIP` 0, loading its inputs from their stack homes and flushing its outputs,

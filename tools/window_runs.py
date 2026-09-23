@@ -27,20 +27,34 @@ def blocks(dot):
         yield int(m.group(1)), entered, [r for r in residuals if r]
 
 
+INLINE_GUARD = re.compile(r'guard\(\d+, (nil|bool|number|string|func|table)\)$')
+
+
 def describe(residuals):
-    """The residuals, each run of window residuals collapsed into its ops."""
+    """The residuals, each run of window residuals collapsed into its ops. An
+    inline type guard and its failure thunk keep the window, so they stay in
+    the run (the count is of window ops alone)."""
     run, out = [], []
+    ops = 0
+    in_guard = False
     for r in residuals:
-        if r.startswith('window('):
+        if in_guard and r == 'thunk':
+            in_guard = False
+        elif r.startswith('window('):
             name, *operands = r[len('window('):-1].split(', ')
             run.append('%s(%s)' % (name, ', '.join(operands)))
+            ops += 1
+        elif run and INLINE_GUARD.match(r):
+            run.append(r)
+            in_guard = True
         else:
+            in_guard = False
             if run:
-                out.append('RUN[%d]: %s' % (len(run), '; '.join(run)))
-                run = []
+                out.append('RUN[%d]: %s' % (ops, '; '.join(run)))
+                run, ops = [], 0
             out.append(r)
     if run:
-        out.append('RUN[%d]: %s' % (len(run), '; '.join(run)))
+        out.append('RUN[%d]: %s' % (ops, '; '.join(run)))
     return out
 
 

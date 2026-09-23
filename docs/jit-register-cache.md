@@ -308,9 +308,15 @@ dynasm relocations to 8-byte pool entries emitted after the region's epilogue
 code is appended after it; equal hole values share one entry);
 direct ones a relocation to a label at the copy's end; other RIP-relative
 references `value_relocation`s to their absolute target (the buffer's base is
-known). Any other residual flushes the window first; residuals inside a run get
-no label, so a jump into a run fails to assemble; with `gas`, a run is charged
-at its first residual. An op whose stencil the copier rejects at every `SKIP`
+known). An inline type guard (every `LType` but `Unknown`) keeps the window:
+it tests the register caching its slot (rax, or r10 when the value is loaded
+into rax, is the mask scratch), jumps to its success edge with the window live,
+and stores the dirty registers on its fall-through failure path into its thunk;
+the gas exit stores them too. Any other residual flushes the window after its
+label, since a guard's success edge may jump there with the window live
+(`Unknown` guards call `check_guard`, so they flush). Window residuals
+following another get no label, so a jump into a run fails to assemble; with
+`gas`, a run is charged at its first residual. An op whose stencil the copier rejects at every `SKIP`
 flushes the window and calls `JitHelper::window_interp`, which runs the op's
 interpreter path on the stack; the run continues in JIT code. (Bailing to the
 interpreter instead would run the rest of the block there on every pass.)
@@ -521,8 +527,10 @@ At an `ExecWindow` with operands `o_0..o_{n-1}` (from the op itself):
 3. **Update**: each output is cached, dirty, in its register, and other copies of
    its slot's older value are dropped.
 
-At a flush point (any residual other than an `ExecWindow`), store every
-dirty register. Calls clobber every register, so the cache is emptied too.
+At a flush point (any residual other than an `ExecWindow` or an inline type
+guard), store every dirty register. Calls clobber every register, so the cache
+is emptied too. An inline guard's failure path stores the dirty registers
+without emptying the cache, which its success path keeps.
 
 **What it gives up**, worked by hand on nbody's steady-state runs: the table
 in section 5 (M2); at most two extra loads per run, no extra stores.

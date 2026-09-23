@@ -25,7 +25,10 @@ use crate::window::{Access, Window, WINDOW};
 //
 // Ties go to the `SKIP` that overwrites the fewest cached values, then to the
 // lowest. An overwritten clean value is dropped, and a later read reloads it.
-// Any other residual ends the run and flushes every dirty register.
+// Any other residual ends the run and flushes every dirty register, except an
+// inline type guard: it tests the register caching its slot, and only its
+// failure path (and a gas exit) stores the dirty registers, leaving the window
+// live on the success path ([`WindowAlloc::stores`]).
 
 /// Location of a value for [`Emit`]: window register `0..WINDOW`, or `SCRATCH`.
 pub const SCRATCH: usize = WINDOW;
@@ -121,14 +124,27 @@ impl WindowAlloc {
         Some(plan.emits)
     }
 
-    /// End the run: flush every dirty register.
-    pub fn flush(&mut self) -> SmallVec<[Emit; WINDOW]> {
-        let cache = core::mem::take(&mut self.cache);
+    /// A register caching `slot`'s current value, if any.
+    pub fn register_of(&self, slot: usize) -> Option<usize> {
+        self.cache.position(slot)
+    }
+
+    /// The stores that bring every dirty slot's stack home up to date, for a
+    /// path leaving the window (the cache itself is kept for the other paths).
+    pub fn stores(&self) -> SmallVec<[Emit; WINDOW]> {
+        let cache = &self.cache;
         cache
             .dirty
             .iter()
             .map(|&slot| Emit::Store { slot, reg: cache.position(slot).expect("dirty slot in a register") })
             .collect()
+    }
+
+    /// End the run: flush every dirty register and empty the window.
+    pub fn flush(&mut self) -> SmallVec<[Emit; WINDOW]> {
+        let stores = self.stores();
+        self.cache = Cache::default();
+        stores
     }
 
     /// Place the op with operand slots `slots` at `skip`.
