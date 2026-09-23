@@ -339,12 +339,12 @@ written):
 
 | run | streaming | floor | with the table ops as `Exec`s |
 |---|---|---|---|
-| `bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step` (11 ops) | 12/2/3 | 10/2 | — |
+| `bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step`; loop step (12 ops) | 13/3/5 | 11/3 | — |
 | `dx = bix - bj.x` | 2/1/1 | 2/1 | 3/2 |
 | `dz = biz - bj.z; dist2 = ...; sqrt`'s upvalue get and argument move | 4/4/6 | 4/4 | 6/6 |
 | `bm = bj.mass * mag; bivx -= dx * bm; ...` | 9/5/4 | 9/5 | 10/6 |
 | `bj.vx = bj.vx + dx * bm` | 4/2/2 | 3/2 | 5/3 |
-| ... plus `j += step` | 6/3/2 | 5/3 | 7/4 |
+| ... plus `j += step`; loop step | 7/4/2 | 6/4 | — |
 | `mag = dt / (mag * dist2)` | 3/2/1 | 3/2 | 3/2 |
 
 Where it loses to the floor, an op placed to read an input in place overwrote a
@@ -459,6 +459,13 @@ an op names:
 - `GetTableHref` declares `(out dest, table)`;
 - `SetTableHref` declares `(table, value)`;
 - `Move` (`emit_move`) declares `(out to, from)`;
+- `LoadK` (`emit_loadk`) declares `(out dest)`, reading the constant from
+  the prototype;
+- `ForLoop` (`emit_forloop`, numbers) declares `(out var, idx, limit, step)`
+  and sets `state.select` for the `Select` after it. It writes the loop
+  variable on both edges, not only when the loop continues: an output is always
+  written back (a conditional write would flush whatever its register held),
+  and the variable is dead once the loop exits;
 - `GetUpval` (`emit_getupval`) declares `(out dest)`. An open upvalue reads a
   stack slot directly, but of an enclosing frame (the running closure's
   upvalues were captured by its parent), never one of this frame's, which the

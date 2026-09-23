@@ -258,25 +258,19 @@ pub enum ResumeArg {
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
+        windowed!(LoadK, [index: u32], [], |owner, state, base| (out dest) {
+            let kst = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize];
+            debug!("{:?}", kst);
+            *dest = kst.into();
+        });
+        let d = yield YieldOp::Storage(dest, Access::Write);
+        let ResumeArg::Storage(d) = d else { unreachable!() };
+        yield YieldOp::ExecWindow(Rc::new(LoadK::new(bx, &[d])));
         match c {
-            LType::Number => {
-                yield YieldOp::Exec(ResidualExec::new("loadk_number", Rc::new(move |owner, state| {
-                    let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
-                    debug!("{:?}", kst);
-                    state.vals[state.base + dest] = kst.into();
-                })));
-                yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
-            },
-            LType::String => {
-                yield YieldOp::Exec(ResidualExec::new("loadk_str", Rc::new(move |owner, state| {
-                    let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
-                    debug!("{:?}", kst);
-                    state.vals[state.base + dest] = kst.into();
-                })));
-                yield YieldOp::SetTypes(vec![(dest, LType::String)]);
-            },
+            LType::Number => yield YieldOp::SetTypes(vec![(dest, LType::Number)]),
+            LType::String => yield YieldOp::SetTypes(vec![(dest, LType::String)]),
             _ => unreachable!(),
-        }
+        };
         return arg;
     }
 }
@@ -976,24 +970,29 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
-                yield YieldOp::Exec(ResidualExec::new("forloop_numbers", Rc::new(move |owner, state| {
-                    let idx = state.vals[state.base + a as usize];
+                // The loop variable is written on both edges, not only when the
+                // loop continues: an output is always written back, and it is
+                // dead once the loop exits (its scope ends there). This also
+                // makes the `SetTypes` below hold on both edges.
+                windowed!(ForLoop, [], [], |owner, state, base| (out var, idx, limit, step) {
                     let Some(nidx) = idx.as_number() else { unreachable!() };
-                    let Some(nlimit) = state.vals[state.base + a as usize + 1].as_number() else { unreachable!() };
-                    let Some(nstep) = state.vals[state.base + a as usize + 2].as_number() else { unreachable!() };
+                    let Some(nlimit) = limit.as_number() else { unreachable!() };
+                    let Some(nstep) = step.as_number() else { unreachable!() };
                     debug!("{:?} {:?} {:?}", nidx, nlimit, nstep);
                     let comp = if nstep < 0.0 {
                         nlimit <= nidx
                     } else {
                         nidx <= nlimit
                     };
-                    if comp {
-                        state.vals[state.base + a as usize + 3] = idx;
-                        state.select = 0;
-                    } else {
-                        state.select = 1;
-                    }
-                })));
+                    *var = idx;
+                    state.select = if comp { 0 } else { 1 };
+                });
+                let v = yield YieldOp::Storage(a + 3, Access::Write);
+                let i = yield YieldOp::Storage(a, Access::Read);
+                let l = yield YieldOp::Storage(a + 1, Access::Read);
+                let s = yield YieldOp::Storage(a + 2, Access::Read);
+                let (ResumeArg::Storage(v), ResumeArg::Storage(i), ResumeArg::Storage(l), ResumeArg::Storage(s)) = (v, i, l, s) else { unreachable!() };
+                yield YieldOp::ExecWindow(Rc::new(ForLoop::new(&[v, i, l, s])));
                 yield YieldOp::SetTypes(vec![(a + 3, LType::Number)]);
             },
             _ => {

@@ -276,6 +276,10 @@ mod tests {
     windowed!(Out, [], [], |owner, state, base| (out d) {
         *d = LBoxed::NIL;
     });
+    windowed!(Loop, [], [], |owner, state, base| (out v, i, l, s) {
+        *v = i;
+        core::hint::black_box((l, s));
+    });
 
     /// An op of a test run: its input slots, then its output slot.
     #[derive(Debug, Clone, Copy)]
@@ -288,8 +292,10 @@ mod tests {
         Get(usize, usize),
         /// A table set, `(table, value)`.
         Set(usize, usize),
-        /// An upvalue get, `(out d)`.
+        /// An upvalue get or constant load, `(out d)`.
         Out(usize),
+        /// A for loop step, `(out var, idx, limit, step)`.
+        Loop(usize, usize, usize, usize),
     }
 
     /// Executes allocator output on symbolic values (slot, version), checking
@@ -356,6 +362,7 @@ mod tests {
                     TestOp::Get(a, d) => Box::new(Get::new(&[t.mint(d), t.mint(a)])),
                     TestOp::Set(a, b) => Box::new(Set::new(&[t.mint(a), t.mint(b)])),
                     TestOp::Out(d) => Box::new(Out::new(&[t.mint(d)])),
+                    TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[t.mint(v), t.mint(i), t.mint(l), t.mint(s)])),
                 }
             })
             .collect();
@@ -379,22 +386,23 @@ mod tests {
         machine
     }
 
-    use TestOp::{Bin as B, Get as G, Out as U, Set as S};
+    use TestOp::{Bin as B, Get as G, Loop as L, Out as U, Set as S};
 
     /// Every run of more than one window op that nbody's `advance` executes in
-    /// its steady state, table gets (G) and sets (S), upvalue gets (U) and moves
-    /// (G's shape) included (slots: dt 2, i 3/5, bi 7, bix..biz 8-10, bimass 11,
+    /// its steady state (`just window-runs nbody`), table gets (G) and sets (S),
+    /// upvalue gets (U), moves (G's shape) and for loop steps (L) included (slots: dt 2, i 3/5, bi 7, bix..biz 8-10, bimass 11,
     /// bivx..bivz 12-14, j 15/17, bj 19, dx..dz 20-22, dist2 23, mag 24, bm 25,
     /// temporaries 15 and 26-27), with the (loads, stores, moves) the streaming
     /// rule gives, worked by hand. The floor is a load per slot read before it is
     /// written and a store per slot written.
     const NBODY: [(&[TestOp], (u32, u32, u32)); 7] = [
-        // bi.vz = bivz; bi.x = bix + dt*bivx; ...; i += step: `bix + t` runs at 0
-        // to read t in place, overwriting the cached bi and bivz (reloaded once
-        // each, floor 10); each store then moves t beside bi.
+        // bi.vz = bivz; bi.x = bix + dt*bivx; ...; i += step; the loop step:
+        // `bix + t` runs at 0 to read t in place, overwriting the cached bi and
+        // bivz (reloaded once each, floor 11); each store then moves t beside bi;
+        // the loop step finds i and step apart and moves both, loading limit.
         (
-            &[S(7, 14), B(2, 12, 15), B(8, 15, 15), S(7, 15), B(2, 13, 15), B(9, 15, 15), S(7, 15), B(2, 14, 15), B(10, 15, 15), S(7, 15), B(3, 5, 3)],
-            (12, 2, 3),
+            &[S(7, 14), B(2, 12, 15), B(8, 15, 15), S(7, 15), B(2, 13, 15), B(9, 15, 15), S(7, 15), B(2, 14, 15), B(10, 15, 15), S(7, 15), B(3, 5, 3), L(3, 4, 5, 6)],
+            (13, 3, 5),
         ),
         // dx = bix - bj.x: the got value moves to the subtract's rhs.
         (&[G(19, 20), B(8, 20, 20)], (2, 1, 1)),
@@ -414,8 +422,9 @@ mod tests {
         // bj.vx = bj.vx + dx * bm: the add overwrites the cached bj, reloaded
         // for the set (floor 3).
         (&[G(19, 26), B(20, 25, 27), B(26, 27, 26), S(19, 26)], (4, 2, 2)),
-        // ... and the inner loop's `j += step`.
-        (&[G(19, 26), B(22, 25, 27), B(26, 27, 26), S(19, 26), B(15, 17, 15)], (6, 3, 2)),
+        // ... and the inner loop's `j += step` and loop step, which reads j and
+        // step in place, loading only limit.
+        (&[G(19, 26), B(22, 25, 27), B(26, 27, 26), S(19, 26), B(15, 17, 15), L(15, 16, 17, 18)], (7, 4, 2)),
         // mag = dt / (mag * dist2): the product moves beside dt.
         (&[B(24, 23, 25), B(2, 25, 24)], (3, 2, 1)),
     ];
@@ -457,37 +466,46 @@ mod tests {
         out
     }
 
-    /// Every run of three ops of every shape, over up to four slots (up to
-    /// renaming, which the allocator is indifferent to), is allocated correctly
-    /// in 4 registers, so that the runs overwrite dirty values.
+    /// Every run of two ops of every shape, and of three ops with at most eight
+    /// operands between them, over up to four slots (up to renaming, which the
+    /// allocator is indifferent to), is allocated correctly in 4 registers, so
+    /// that the runs overwrite dirty values.
     #[test]
     fn exhaustive_small_runs() {
         let arity = |op: &TestOp| match op {
             TestOp::Bin(..) | TestOp::BinLast(..) => 3,
             TestOp::Get(..) | TestOp::Set(..) => 2,
             TestOp::Out(..) => 1,
+            TestOp::Loop(..) => 4,
         };
-        let shapes = [B(0, 0, 0), TestOp::BinLast(0, 0, 0), G(0, 0), S(0, 0), U(0)];
+        let shapes = [B(0, 0, 0), TestOp::BinLast(0, 0, 0), G(0, 0), S(0, 0), U(0), L(0, 0, 0, 0)];
+        let mut runs: Vec<Vec<TestOp>> = Vec::new();
         for x in shapes {
             for y in shapes {
+                runs.push(vec![x, y]);
                 for z in shapes {
-                    let run_shapes = [x, y, z];
-                    for pattern in slot_patterns(run_shapes.iter().map(arity).sum(), 4) {
-                        let mut slots = pattern.into_iter();
-                        let mut next = || slots.next().unwrap();
-                        let ops: Vec<TestOp> = run_shapes
-                            .iter()
-                            .map(|shape| match shape {
-                                TestOp::Bin(..) => B(next(), next(), next()),
-                                TestOp::BinLast(..) => TestOp::BinLast(next(), next(), next()),
-                                TestOp::Get(..) => G(next(), next()),
-                                TestOp::Set(..) => S(next(), next()),
-                                TestOp::Out(..) => U(next()),
-                            })
-                            .collect();
-                        run(4, &ops);
+                    if arity(&x) + arity(&y) + arity(&z) <= 8 {
+                        runs.push(vec![x, y, z]);
                     }
                 }
+            }
+        }
+        for run_shapes in runs {
+            for pattern in slot_patterns(run_shapes.iter().map(arity).sum(), 4) {
+                let mut slots = pattern.into_iter();
+                let mut next = || slots.next().unwrap();
+                let ops: Vec<TestOp> = run_shapes
+                    .iter()
+                    .map(|shape| match shape {
+                        TestOp::Bin(..) => B(next(), next(), next()),
+                        TestOp::BinLast(..) => TestOp::BinLast(next(), next(), next()),
+                        TestOp::Get(..) => G(next(), next()),
+                        TestOp::Set(..) => S(next(), next()),
+                        TestOp::Out(..) => U(next()),
+                        TestOp::Loop(..) => L(next(), next(), next(), next()),
+                    })
+                    .collect();
+                run(4, &ops);
             }
         }
     }
