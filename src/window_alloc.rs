@@ -273,6 +273,9 @@ mod tests {
     windowed!(Set, [], [], |owner, state, base| (a, b) {
         core::hint::black_box((a, b));
     });
+    windowed!(Out, [], [], |owner, state, base| (out d) {
+        *d = LBoxed::NIL;
+    });
 
     /// An op of a test run: its input slots, then its output slot.
     #[derive(Debug, Clone, Copy)]
@@ -285,6 +288,8 @@ mod tests {
         Get(usize, usize),
         /// A table set, `(table, value)`.
         Set(usize, usize),
+        /// An upvalue get, `(out d)`.
+        Out(usize),
     }
 
     /// Executes allocator output on symbolic values (slot, version), checking
@@ -350,6 +355,7 @@ mod tests {
                     TestOp::BinLast(a, b, d) => Box::new(BinLast::new(&[t.mint(a), t.mint(b), t.mint(d)])),
                     TestOp::Get(a, d) => Box::new(Get::new(&[t.mint(d), t.mint(a)])),
                     TestOp::Set(a, b) => Box::new(Set::new(&[t.mint(a), t.mint(b)])),
+                    TestOp::Out(d) => Box::new(Out::new(&[t.mint(d)])),
                 }
             })
             .collect();
@@ -373,10 +379,11 @@ mod tests {
         machine
     }
 
-    use TestOp::{Bin as B, Get as G, Set as S};
+    use TestOp::{Bin as B, Get as G, Out as U, Set as S};
 
     /// Every run of more than one window op that nbody's `advance` executes in
-    /// its steady state (slots: dt 2, i 3/5, bi 7, bix..biz 8-10, bimass 11,
+    /// its steady state, table gets (G) and sets (S), upvalue gets (U) and moves
+    /// (G's shape) included (slots: dt 2, i 3/5, bi 7, bix..biz 8-10, bimass 11,
     /// bivx..bivz 12-14, j 15/17, bj 19, dx..dz 20-22, dist2 23, mag 24, bm 25,
     /// temporaries 15 and 26-27), with the (loads, stores, moves) the streaming
     /// rule gives, worked by hand. The floor is a load per slot read before it is
@@ -391,9 +398,15 @@ mod tests {
         ),
         // dx = bix - bj.x: the got value moves to the subtract's rhs.
         (&[G(19, 20), B(8, 20, 20)], (2, 1, 1)),
-        // dz = biz - bj.z; dist2 = dx*dx + dy*dy + dz*dz: at the floor; three
-        // moves are the squares' copies, the partial sums read in place once.
-        (&[G(19, 22), B(10, 22, 22), B(20, 20, 23), B(21, 21, 24), B(23, 24, 23), B(22, 22, 24), B(23, 24, 23)], (4, 3, 5)),
+        // dz = biz - bj.z; dist2 = dx*dx + dy*dy + dz*dz; then `sqrt(dist2)`'s
+        // upvalue get and argument move: at the floor; three moves are the
+        // squares' copies, the partial sums read in place once, and the move
+        // copies dist2 from its register. The upvalue get drops dz*dz's dead
+        // value in slot 24 unstored.
+        (
+            &[G(19, 22), B(10, 22, 22), B(20, 20, 23), B(21, 21, 24), B(23, 24, 23), B(22, 22, 24), B(23, 24, 23), U(24), G(23, 25)],
+            (4, 4, 6),
+        ),
         // bm = bj.mass * mag; bivx -= dx * bm; ...: at the floor; each `bivx - _`
         // moves its product in, and with the window full bivx and bivy are
         // stored early (their one store each).
@@ -452,8 +465,9 @@ mod tests {
         let arity = |op: &TestOp| match op {
             TestOp::Bin(..) | TestOp::BinLast(..) => 3,
             TestOp::Get(..) | TestOp::Set(..) => 2,
+            TestOp::Out(..) => 1,
         };
-        let shapes = [B(0, 0, 0), TestOp::BinLast(0, 0, 0), G(0, 0), S(0, 0)];
+        let shapes = [B(0, 0, 0), TestOp::BinLast(0, 0, 0), G(0, 0), S(0, 0), U(0)];
         for x in shapes {
             for y in shapes {
                 for z in shapes {
@@ -468,6 +482,7 @@ mod tests {
                                 TestOp::BinLast(..) => TestOp::BinLast(next(), next(), next()),
                                 TestOp::Get(..) => G(next(), next()),
                                 TestOp::Set(..) => S(next(), next()),
+                                TestOp::Out(..) => U(next()),
                             })
                             .collect();
                         run(4, &ops);

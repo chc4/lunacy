@@ -55,8 +55,8 @@
 // choice (e.g. its output first, below its inputs); the allocator handles any.
 // An op's inputs are read-only and only its outputs are written, so the
 // registers outside its run, and its inputs, keep their values. An op's body
-// must reach stack slots only through its operands: any slot may have a newer
-// value in a register than in its stack home.
+// must reach this frame's stack slots only through its operands: any of them
+// may have a newer value in a register than in its stack home.
 //
 // The specializer never chooses registers. Before an `ExecWindow`, the emit site
 // yields a `Storage(slot, access)` for each operand and is resumed with an opaque
@@ -306,7 +306,8 @@ pub(crate) use bind_holes;
 /// * `(operands)` — the window operands in window order: operand `i` is register
 ///   `SKIP + i`. An input is bound in the body as an `LBoxed` value, an output
 ///   (marked `out`) as `&mut LBoxed` to write the result to. The body must not
-///   otherwise read or write stack slots (see Note [Register window]).
+///   otherwise read or write this frame's stack slots (see Note [Register
+///   window]).
 ///
 /// `new(captures.., operands)` takes the operands' [`Gpr`] tokens in the same
 /// order. See Note [Register window].

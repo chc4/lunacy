@@ -63,6 +63,9 @@ pub struct Block {
     pub instructions: Vec<Residual>,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
+    /// Times the interpreter entered the block, shown by `dump`.
+    #[cfg(feature = "graph")]
+    pub entered: u64,
 }
 
 impl Block {
@@ -71,6 +74,8 @@ impl Block {
             instructions: vec![],
             #[cfg(feature = "jit")]
             jit_info: JitInfo::new(),
+            #[cfg(feature = "graph")]
+            entered: 0,
         }
     }
 }
@@ -868,9 +873,13 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Typeof(src);
         if let ResumeArg::Type(t) = arg.clone() {
-            yield YieldOp::Exec(ResidualExec::new("move", Rc::new(move |owner, state| {
-                state.vals[state.base + dest] = state.vals[state.base + src].clone();
-            })));
+            windowed!(Move, [], [], |owner, state, base| (out to, from) {
+                *to = from;
+            });
+            let d = yield YieldOp::Storage(dest, Access::Write);
+            let s = yield YieldOp::Storage(src, Access::Read);
+            let (ResumeArg::Storage(d), ResumeArg::Storage(s)) = (d, s) else { unreachable!() };
+            yield YieldOp::ExecWindow(Rc::new(Move::new(&[d, s])));
             // TODO: track references? see PyLBBV
             debug!("move {} = {} {:?}", dest, src, t);
             yield YieldOp::SetCTypes(vec![(dest, t)]);
@@ -898,19 +907,23 @@ macro_rules! drain {
 pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        arg = yield YieldOp::Exec(ResidualExec::new("getupval", Rc::new(move |owner, state| {
-            let upval = match state.clos.ro(owner).upvalues[b as usize].deref().ro(owner) {
+        windowed!(GetUpval, [index: usize], [], |owner, state, base| (out dest) {
+            let upval = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {
                 Upvalue::Open(o) => {
-                    state.vals[*o as usize].clone()
+                    // The running closure's upvalues were captured by an enclosing
+                    // function, so an open one is a slot of an enclosing frame, not
+                    // one of this frame's (which the window may cache).
+                    assert!(*o < state.base, "open upvalue in the running frame");
+                    state.vals[*o as usize]
                 },
-                Upvalue::Closed(c) => {
-                    c.ro(owner).clone()
-                },
+                Upvalue::Closed(c) => *c.ro(owner),
             };
             debug!("upval {:?}", &upval);
-            state.vals[state.base + a as usize] = upval;
-            debug!("after getupval {:?}", &state.vals[state.base..]);
-        })));
+            *dest = upval;
+        });
+        let d = yield YieldOp::Storage(a, Access::Write);
+        let ResumeArg::Storage(d) = d else { unreachable!() };
+        arg = yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[d])));
         // TODO: We can resolve upvalues to types, but would need to make sure to
         // keep them synced with the type of the stack slot or SETUPVAL/calls.
         arg = yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
@@ -1984,6 +1997,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 unsafe { gc.step(&state, &*self, owner); }
             }
             let block = &mut self.blocks[id.0];
+            #[cfg(feature = "graph")]
+            if off == 0 {
+                block.entered += 1;
+            }
             #[cfg(feature = "jit")]
             if off == 0 && state.gas > 0 {
                 let hot = block.jit_info.hotness.get();
@@ -2331,7 +2348,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let context_str = context_str.replace("}", ")");
 
                 //let label = safe_str(format!("\"{} | {{ {} {} }}\"", block_id, context_str, instructions));
-                let label = safe_str(format!("\"{} | {{ {} {} }}\"", block_id, context_str, instructions.drain(..).intersperse("| ".to_string()).collect::<String>()));
+                #[cfg(feature = "graph")]
+                let entered = format!(" x{}", residuals.entered);
+                #[cfg(not(feature = "graph"))]
+                let entered = "";
+                let label = safe_str(format!("\"{}{} | {{ {} {} }}\"", block_id, entered, context_str, instructions.drain(..).intersperse("| ".to_string()).collect::<String>()));
 
                 let mut stmts = vec![Stmt::Node(node!(block_id;
                     attr!("id", block_id),

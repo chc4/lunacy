@@ -330,7 +330,9 @@ entry index check, load, `jmp` to the continuation); its only relocations are
 its cold panic paths. `just test-stencils` builds with the `stencils` profile,
 every package optimized, so its stencils match release (7 relocations for a
 get, all cold). Both copy at every `SKIP`. The multi-op runs nbody's `advance`
-executes in its steady state (counted per block), with what the streaming
+executes in its steady state (`just window-runs nbody`: the benchmark on the
+LBBV interpreter tier with the `graph` dump, which counts each block's entries;
+`tools/window_runs.py` lists each block's window runs, hottest first), with what the streaming
 allocator emits in the 8-register window, worked by hand (loads/stores/moves;
 the floor is a load per slot read before it is written and a store per slot
 written):
@@ -339,7 +341,7 @@ written):
 |---|---|---|---|
 | `bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step` (11 ops) | 12/2/3 | 10/2 | — |
 | `dx = bix - bj.x` | 2/1/1 | 2/1 | 3/2 |
-| `dz = biz - bj.z; dist2 = ...` | 4/3/5 | 4/3 | 5/4 |
+| `dz = biz - bj.z; dist2 = ...; sqrt`'s upvalue get and argument move | 4/4/6 | 4/4 | 6/6 |
 | `bm = bj.mass * mag; bivx -= dx * bm; ...` | 9/5/4 | 9/5 | 10/6 |
 | `bj.vx = bj.vx + dx * bm` | 4/2/2 | 3/2 | 5/3 |
 | ... plus `j += step` | 6/3/2 | 5/3 | 7/4 |
@@ -455,7 +457,15 @@ an op names:
 
 - `NumericIntInt` declares `(out dest, lhs, rhs)`;
 - `GetTableHref` declares `(out dest, table)`;
-- `SetTableHref` declares `(table, value)`.
+- `SetTableHref` declares `(table, value)`;
+- `Move` (`emit_move`) declares `(out to, from)`;
+- `GetUpval` (`emit_getupval`) declares `(out dest)`. An open upvalue reads a
+  stack slot directly, but of an enclosing frame (the running closure's
+  upvalues were captured by its parent), never one of this frame's, which the
+  window caches; the op asserts it.
+
+`href_init` stays an `Exec` closure: it is long, and copying it into the code
+at every use would cost more than it saves.
 
 ### The allocator
 

@@ -31,6 +31,16 @@ test-stencils:
     cargo test --features check_windows --test golden_tests {{STENCIL_OPT}}
     cargo test --features immediate_jit --test golden_tests {{STENCIL_OPT}}
 
+# Runs of window residuals in a benchmark (docs/jit-register-cache.md): run it on
+# the LBBV interpreter tier (every block entry counted, none hidden by the JIT)
+# with the `graph` dump, then list each function's blocks with window runs,
+# hottest first.
+window-runs benchmark times='20':
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    rm -f func_*.dot func_*.pdf
+    cargo run --release --no-default-features --features "lbbv graph" --bin bench -- {{benchmark}}.bin {{times}}
+    python3 tools/window_runs.py func_*.dot
+
 [env("RUST_LOG", "debug")]
 [env("RUST_BACKTRACE","1")]
 test-debug:
