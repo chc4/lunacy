@@ -174,10 +174,10 @@ the edges between its consecutive blocks all go forward, reducible or not.
   across a back edge), then downwards as the unidirectional builder does.
   Traces are allocated in the order found.
 
-The frequency-driven policies need a block's most frequent successor. The
-hotness countdown stops at zero, so the blocks of the loop that triggered
-compilation all read about zero; among equally hot successors, they prefer the
-block's final jump to a guard's failure jump, and a select's first target.
+The frequency-driven policies need a block's most frequent successor, by the
+hotness countdown. It stops at zero, so successors that tie have both reached
+the compile threshold and are both hot, and which one comes first matters
+little: the lowest block id.
 
 ## What it replaces
 
@@ -186,8 +186,3 @@ block's live-out from its hottest planned successor, and the rules estimating
 a displaced value's cost from how the ops above it use its slot. Within a
 trace, what is wanted after a point is exactly what the pass has seen used
 further down, so the displacement cost needs no look upward.
-
-## Open questions
-
-- The frequency order among successors that all read zero hotness, beyond the
-  tie-breaks above, for the frequency-driven policies.
