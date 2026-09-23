@@ -134,16 +134,18 @@ opaque closure so the JIT can't see its dataflow. Window ops make it visible
 - **`YieldOp::Storage(slot, Access)` → `ResumeArg::Storage(Gpr)`:** the emit
   site gets an **opaque token** per operand, minted by the specializer and
   recorded as `Residual::Storage(token, access)`. LBBV does no register
-  allocation. The **JIT allocates when it processes `Residual::Storage`**:
-  linear scan, reusing the register already caching the slot, else a free one,
-  else evicting (flushing) the oldest; `Access::Read` loads the slot.
+  allocation.
 - **`Residual::ExecWindow(Rc<dyn Window>)`**, built from those tokens: inputs are
   read-only and only outputs are written back (`windowed!(.., (a, b) -> (d))`),
-  so a register caching a slot only ever holds that slot's value. JIT mode: map
-  the operand tokens to their registers, emit `stencil(regs)`, and defer flushing
-  as long as only `Storage`/`ExecWindow` follow. Interpreter mode: operand `i` in
-  window register `i`; load the inputs from their stack homes, run, flush the
-  outputs (`Storage` is a no-op).
+  so a register caching a slot only ever holds that slot's value. An op always
+  runs on a contiguous run of the window, `w[SKIP..SKIP + arity]`.
+- **JIT mode** (`src/window_alloc.rs`, `Note [Window allocation]`): `Storage`
+  only records its token; the op, with all of its operands known, is placed at
+  the cheapest `SKIP` by resculpting the window from `SKIP` on — inputs moved
+  from the register caching them or loaded, displaced values moved to spare
+  registers or evicted — with a one-op lookahead. Flushing is deferred to the
+  end of the run. Interpreter mode: the op at `SKIP` 0; load the inputs from
+  their stack homes, run, flush the outputs (`Storage` is a no-op).
 
 **Copy&patch (the part worth the machinery).** Instead of emitting a `call` to
 the `Exec` closure body, splat the op's compiled **template/stencil** into the
@@ -211,10 +213,9 @@ green gate (default features ⇒ jit on).
   like `define_exec!` — all of an op's code (static and dynamic) stays in its
   `emit_*`. It generates a struct of **captures** (hole values) + the operands'
   `Gpr` tokens implementing the `Window` trait, an `#[inline(always)]` body
-  shared by both tiers, and `__stencil::<REGS>`, where `REGS` packs each
-  operand's window register (every combination is instantiated;
-  `stencil(regs)` picks one for the registers the JIT allocated). Inputs are
-  bound as values and only outputs are written back. `src/window.rs` holds only
+  shared by both tiers, and `__stencil::<SKIP>`, with operand `i` in window
+  register `SKIP + i` (`stencil(skip)`). Inputs are bound as values and only
+  outputs are written back. `src/window.rs` holds only
   the mechanism (macro, `Window`, tokens, `Capture`, holes, copier); no op
   templates.
 - Captures: any `Copy` type of at most 8 bytes (blanket `Capture` impl, raw bits).
@@ -252,7 +253,7 @@ green gate (default features ⇒ jit on).
   back into the original function). An opt-level 0 `NumericIntInt` has one
   (unfolded `match OP`); optimized builds don't. The copier (`Image::load`,
   `stencil_body`, `assemble`) returns a `StencilError` rather than panicking, so
-  the JIT can fall back to calling the op's body; `check_windows` skips (and
+  the JIT can leave the op to the interpreter; `check_windows` skips (and
   logs) ops it rejects. Debug builds are otherwise copyable now
   (their un-inlined helper calls and assertion panics are just relocations). The
   interpreter runs any window op regardless.
@@ -266,13 +267,12 @@ stencil itself: holes read 0 until patched). The first user is `emit_numeric`'s
 dynamic int-int arm: `windowed!(NumericIntInt, [], [OP: Opcode], .. (lhs, rhs) -> (dest))`
 inline (body = the VM's own `numeric_op`/`box_lvalue`), operands bound by three
 `Storage`s, instance picked with `dispatch_numeric_window!` for all six opcodes;
-the constant-operand arms keep their `Exec` closures. `jit_block` emits nothing
-for `Storage` and bails on `ExecWindow`.
+the constant-operand arms keep their `Exec` closures.
 
 Verification:
-- `just test` green, including the window tests in debug: a chain over arbitrary
-  registers of (2, 3, 4, nil) — w3 = w1 + w2, w0 = w0 * w3, w0 += 0.5 (hole) →
-  Flush, with w1/w2 unchanged; a stencil calling an out-of-line helper (its call
+- `just test` green, including the window tests in debug: a chain shifting along
+  (2, 3, 4, nil) — Add at 0, Mul at 1, AddK at 2 (hole) → Flush, inputs
+  unchanged; a stencil calling an out-of-line helper (its call
   appears in `relocations()` and the copy calls it correctly); a branchy stencil
   whose both arms fall through; and two outputs writing one slot is rejected.
 - Golden `window_chain.lua`: dependent arithmetic in one block becomes a single
@@ -290,18 +290,54 @@ Verification:
 - Pre-existing bug, untouched: `numeric_op` MOD is truncated `%`, not Lua's
   floored modulo (`-3 % 7` gives `-3`).
 
-**M2 — next.** Splat in `jit_block`: for each `ExecWindow`, copy its stencil
-body into the dynasm assembler with a RIP-relative relocation per hole to a pool
-label, and emit the pool at the epilogue so `finalize` patches every hole load.
-Hand dynasm each body's `holes`, `nexts` and `relocations()` as relocations
-(pool labels, a label at the copy's end, and absolute targets) so `finalize`
-patches them all at once. Needs the JIT's allocation at `Residual::Storage`
-(section 3: token → register, loading `Access::Read` slots not already cached,
-flushing evicted and run-ending dirty registers), and a generic
-fallback for ops the copier rejects (it returns a `StencilError`: call the
-body instead of splatting). Open items: jump
-tables (copy the table and rebase its entries, if a real op needs one); check
-fat-LTO release builds keep each op's continuation as a real tail target.
+**M2 — DONE: JIT register allocation + stencil splat.** `src/window_alloc.rs`
+allocates each run of window residuals (see `Note [Window allocation]`);
+`jit_block` lowers its plan (loads/stores against r14, moves between
+r15/rdi/rsi/rdx with rax as scratch) and splats each op's stencil body between
+`sub rsp, 8`/`add rsp, 8` (block code keeps rsp 16-aligned; stencils expect the
+alignment just after a call). Holes and indirect continuation references become
+dynasm relocations to 8-byte pool entries emitted after the region's epilogue;
+direct ones a relocation to a label at the copy's end; other RIP-relative
+references `value_relocation`s to their absolute target (the buffer's base is
+known). Any other residual flushes the window first; residuals inside a run get
+no label, so a jump into a run fails to assemble; with `gas`, a run is charged
+at its first residual. An op whose stencil the copier rejects at every `SKIP`
+flushes and bails to the interpreter, which runs it from the stack.
+
+Hand analysis that shaped the allocator (nbody `advance`, 4-register window,
+3-wide `(lhs, rhs) -> (dest)` ops at `SKIP` 0 or 1):
+- block 94 (`dz = biz - dz; dist2 = dx*dx + dy*dy + dz*dz`): 5 loads, 3 stores,
+  7 moves vs 12 loads/6 stores through the stack (floor 4/3; one spill of `dz`,
+  since only one register is spare beside a 3-register op);
+- block 100 (`bm`, `bivx/y/z -= d* * bm`): 10 loads, 5 stores vs 16/8 (floor
+  9/5); the allocator also finds a 6-move plan against 8 by hand.
+Lessons: a result lands at `SKIP+2`, so it is read in place only as the next
+op's `rhs` at `SKIP+1` (else one move); `x*x` needs a copy; evicting a dirty
+value costs a store only if the slot is written again later in the run
+(otherwise it is the run-end store moved earlier); eviction is otherwise by
+farthest next read. Both runs are unit tests pinning these counts, plus an
+exhaustive correctness sweep executing plans on a symbolic machine.
+
+Verification: `just test` (adds the golden suite with `immediate_jit`: in debug
+the copier rejects `NumericIntInt`'s jump table, exercising the fallback) and
+`just test-stencils` (adds it at opt-2, where window ops run as splatted
+stencils under the allocator). Golden `window_nbody.lua` runs `advance` hot.
+
+Open items:
+- A stencil whose `become` is followed by cold code (e.g. a panic path, which
+  `unreachable!()` in an op body produces) is rejected: the copier requires the
+  `become` to be the last instruction. Supporting it means copying the whole
+  body and jumping over the cold code to the fall-through point (plus a trap
+  after it).
+- A wider window (more of preserve-none's argument registers) would remove the
+  spills a 3-wide op forces in a 4-register window.
+- Jump tables in stencils. (Fat-LTO release builds do keep each op's
+  continuation a real tail target: `just run nbody` copies all 8
+  `NumericIntInt` stencils it uses.)
+- Pre-existing, untouched: `Vm::call_native` mishandles a native call whose last
+  argument is a multi-result native call — `print(floor(1.5), floor(2.5),
+  floor(3.5))` at top level prints `1 2 3 3.5`, and inside a loop it panicked
+  with a slice-index error.
 
 **M3+.** Register cache / per-block in-set threading (section 2) — pinning
 arbitrary `LBoxed` window values in GPRs across ops.

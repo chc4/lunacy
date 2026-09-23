@@ -10,6 +10,8 @@ test:
     cargo test --features "gc_sanitize"
     # Interpreter GC stress test
     cargo test --features "gc_stress gc_sanitize"
+    # Golden suite with every block JIT compiled on first run
+    cargo test --features "immediate_jit gc_sanitize" --test golden_tests
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     cargo test --test gc_reset_frees
 
@@ -18,13 +20,16 @@ test:
 # tests also run in `just test` (debug); this runs them against optimized
 # stencils, then the golden suite with `check_windows`: every window op the
 # interpreter executes is also copy&patched and run natively, and the results
-# must match. (At opt-level 0, `NumericIntInt` keeps a jump table from the
-# unfolded `match OP`, which the copier rejects, so the check skips it.)
+# must match. Then the golden suite with every block JIT compiled, so window ops
+# run as copied stencils under the JIT's register allocation. (At opt-level 0,
+# `NumericIntInt` keeps a jump table from the unfolded `match OP`, which the
+# copier rejects: the check skips it and the JIT calls into the interpreter.)
 STENCIL_OPT := "--config 'profile.dev.package.lunacy.opt-level=2' --config 'profile.dev.package.lunacy.debug-assertions=false' --config 'profile.dev.package.lunacy.overflow-checks=false'"
 [env("RUST_BACKTRACE","1")]
 test-stencils:
     cargo test --features check_windows --lib window:: {{STENCIL_OPT}}
     cargo test --features check_windows --test golden_tests {{STENCIL_OPT}}
+    cargo test --features immediate_jit --test golden_tests {{STENCIL_OPT}}
 
 [env("RUST_LOG", "debug")]
 [env("RUST_BACKTRACE","1")]

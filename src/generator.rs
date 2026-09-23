@@ -539,8 +539,10 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
                 windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (lhs, rhs) -> (dest) {
-                    let Some(l) = lhs.as_number() else { unreachable!() };
-                    let Some(r) = rhs.as_number() else { unreachable!() };
+                    // Guarded numbers. Unchecked, since a panic path would follow
+                    // the stencil's `become`, which must be its last instruction.
+                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
+                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
                     *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                 });
 

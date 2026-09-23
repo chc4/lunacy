@@ -23,6 +23,8 @@ pub mod generator;
 #[cfg(feature = "lbbv")]
 pub mod window;
 #[cfg(feature = "jit")]
+pub mod window_alloc;
+#[cfg(feature = "jit")]
 pub mod jit;
 pub mod gc;
 

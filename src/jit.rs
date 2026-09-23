@@ -9,7 +9,11 @@ use crate::gc::{GcInner, GcCtx};
 use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::generator::{Block, Context, Residual, Specializer, SubPc};
+use crate::window::{stencil_body, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
+use crate::window_alloc::{Emit, Step, WindowAlloc};
+use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
+use smallvec::SmallVec;
 use rustc_hash::FxBuildHasher;
 
 use log::debug;
@@ -145,11 +149,112 @@ impl JitHelper {
 
 type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
 
+/// The window registers `w0..w3` in the order the stencil ABI passes them (the
+/// `rust-preserve-none` arguments after owner, state and base in r12, r13, r14),
+/// then `SCRATCH`.
+const WINDOW_REGS: [u8; WINDOW + 1] = [15 /* r15 */, 7 /* rdi */, 6 /* rsi */, 2 /* rdx */, 0 /* rax */];
+
+/// An 8-byte entry of the pool emitted after a compiled region's code.
+enum PoolEntry {
+    Value(u64),
+    /// The absolute address of a label.
+    Address(DynamicLabel),
+}
+
+type Pool = Vec<(DynamicLabel, PoolEntry)>;
+
+/// Window-op stencils copied out of this executable, by stencil address.
+#[derive(Default)]
+pub struct Stencils {
+    image: Option<Result<Image, StencilError>>,
+    bodies: HashMap<usize, Result<Rc<Body>, StencilError>, FxBuildHasher>,
+}
+
+impl Stencils {
+    fn body(&mut self, op: &dyn Window, skip: usize) -> Result<Rc<Body>, StencilError> {
+        let image = self.image.get_or_insert_with(Image::load).as_ref().map_err(Clone::clone)?;
+        self.bodies
+            .entry(op.stencil(skip))
+            .or_insert_with(|| {
+                unsafe { stencil_body(image, op, skip) }
+                    .map(Rc::new)
+                    .inspect_err(|e| warn!("window op not copied, calling into the interpreter instead: {e}"))
+            })
+            .clone()
+    }
+}
+
+/// Emit an allocator instruction other than `Emit::Op`.
+fn emit_window_move(ops: &mut Assembler, emit: Emit) {
+    let reg = |r: usize| WINDOW_REGS[r];
+    match emit {
+        Emit::Load { reg: r, slot } => dynasm!(ops
+            ; .arch x64
+            ; mov Rq(reg(r)), QWORD [r14 + (slot * 8) as i32]
+        ),
+        Emit::Store { slot, reg: r } => dynasm!(ops
+            ; .arch x64
+            ; mov QWORD [r14 + (slot * 8) as i32], Rq(reg(r))
+        ),
+        Emit::Move { dst, src } => dynasm!(ops
+            ; .arch x64
+            ; mov Rq(reg(dst)), Rq(reg(src))
+        ),
+        Emit::Op { .. } => unreachable!("an op is splatted"),
+    }
+}
+
+/// Copy a stencil body into the code: holes are repointed at pool entries with
+/// the op's captures, references to the op's continuation at the copy's end, and
+/// every other RIP-relative reference at its original target. The body is entered
+/// with the stack aligned as just after a call, as it was compiled to expect.
+fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool) {
+    enum Site {
+        Value(u64),
+        Absolute(usize),
+        Fall,
+        FallAddress,
+    }
+    let mut sites: SmallVec<[(usize, usize, Site); 8]> = SmallVec::new();
+    sites.extend(body.holes.iter().map(|&(r, i)| (r.end, r.field, Site::Value(captures[i]))));
+    sites.extend(body.relocations().iter().map(|r| (r.end, r.field, Site::Absolute(r.target))));
+    sites.extend(body.nexts.iter().map(|n| match *n {
+        NextRef::Direct(r) => (r.end, r.field, Site::Fall),
+        NextRef::Indirect(r) => (r.end, r.field, Site::FallAddress),
+    }));
+    sites.sort_by_key(|&(end, ..)| end);
+
+    let rel32 = |kind| dynasmrt::x64::X64Relocation::from_size(kind, RelocationSize::DWord);
+    let fall = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64 ; sub rsp, 8);
+    let mut at = 0;
+    for (end, field, site) in sites {
+        ops.extend(&body.code[at..end]);
+        at = end;
+        let field_offset = (end - field) as u8;
+        match site {
+            Site::Absolute(target) => ops.value_relocation(target, field_offset, 0, rel32(RelocationKind::RelToAbs)),
+            Site::Fall => ops.dynamic_relocation(fall, 0, field_offset, 0, rel32(RelocationKind::Relative)),
+            Site::Value(_) | Site::FallAddress => {
+                let entry = ops.new_dynamic_label();
+                pool.push((entry, match site {
+                    Site::Value(value) => PoolEntry::Value(value),
+                    _ => PoolEntry::Address(fall),
+                }));
+                ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
+            }
+        }
+    }
+    ops.extend(&body.code[at..]);
+    dynasm!(ops ; .arch x64 ; =>fall ; add rsp, 8);
+}
+
 const JIT_SIZE: usize = 0x1000 * 16;
 pub struct JitContext {
     pub memory: std::cell::Cell<dynasmrt::mmap::ExecutableBuffer>,
     pub blocks: HashMap<BlockId, JitPtr, FxBuildHasher>,
     pub pending: BTreeMap<BlockId, DynamicLabel>,
+    pub stencils: Stencils,
     pub used: usize,
     pub perf_map: Option<std::cell::RefCell<std::fs::File>>,
 }
@@ -179,6 +284,7 @@ impl JitContext {
             memory: Cell::new(memory.make_exec().unwrap()),
             blocks: HashMap::default(),
             pending: BTreeMap::new(),
+            stencils: Stencils::default(),
             used: 0,
             perf_map,
         }
@@ -267,6 +373,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // JitHelper function calls.
 
         let mut compiled_offsets = Vec::new();
+        let mut pool = Pool::new();
         // We may have already JIT this block, if it was jumped to by another block
         // first. In that case we just have to jump to it.
         let mut successor = None;
@@ -279,7 +386,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
             self.jctx.blocks.insert(id, new_block);
             let start_off = ops.offset().0;
-            let (_block, entry_succ) = self.jit_block(id, &mut ops, owner);
+            let (_block, entry_succ) = self.jit_block(id, &mut ops, &mut pool, owner);
             successor = entry_succ;
             compiled_offsets.push((id, start_off, ops.offset().0));
         }
@@ -303,7 +410,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             dynasm!(ops
                 ; =>pending_label
             );
-            let (_block, next_succ) = self.jit_block(pending_block, &mut ops, owner);
+            let (_block, next_succ) = self.jit_block(pending_block, &mut ops, &mut pool, owner);
             successor = next_succ;
             compiled_offsets.push((pending_block, pending_start.0, ops.offset().0));
             self.jctx.reserve(ops.offset().0 - pending_start.0);
@@ -319,6 +426,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; ret
         );
         self.jctx.reserve(ops.offset().0 - epilogue.0);
+
+        let pool_start = ops.offset();
+        ops.align(8, 0xcc);
+        for (label, entry) in pool {
+            let value = match entry {
+                PoolEntry::Value(value) => value,
+                PoolEntry::Address(target) => {
+                    let offset = ops.labels().resolve_dynamic(target).expect("pool entry for a placed label");
+                    (base.0 as usize + offset.0) as u64
+                }
+            };
+            dynasm!(ops ; =>label);
+            ops.extend(&value.to_le_bytes());
+        }
+        self.jctx.reserve(ops.offset().0 - pool_start.0);
 
         debug!("drained pending");
         let buf = ops.finalize().unwrap();
@@ -349,7 +471,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// JIT compile one block, returning the JIT code offset and optionally the next block to
     /// compile.
-    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, owner: &mut Owner) -> (AssemblyOffset, Option<BlockId>) {
+    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, pool: &mut Pool, owner: &mut Owner) -> (AssemblyOffset, Option<BlockId>) {
         // We try to bias the default exit as the next block to compile. This is only a suggestion,
         // and doesn't affect correctness; `GUARD; JMP failure; RET;` for example may say that
         // `failure` is the "next block" despite not quite being correct.
@@ -403,15 +525,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
         };
 
-        for (off, res) in block.instructions.iter().enumerate() {
-            debug!("JIT operation {res:?}");
-            let label = insts[off];
+        // Charge `cost` residuals of gas at residual `off`, exiting if it runs out.
+        #[cfg(feature = "gas")]
+        let emit_gas_check = |ops: &mut Assembler, off: usize, cost: usize| {
             dynasm!(ops
-                ; => label
-            );
-            #[cfg(feature = "gas")]
-            dynasm!(ops
-                ; sub QWORD r13 => RunState.gas, 1
+                ; sub QWORD r13 => RunState.gas, cost as i32
                 ; mov WORD r13 => RunState.current_off, (off as i16)
                 ; ja >have_gas
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
@@ -419,6 +537,40 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; jmp ->exit_jit
                 ; have_gas:
             );
+        };
+
+        // Window residuals are allocated a run at a time (see Note [Register
+        // window]). Registers carry values within a run only, so a run is entered
+        // at its first residual alone: the others get no label, and a jump to one
+        // fails to assemble.
+        let window = |r: &Residual| matches!(r, Residual::Storage(..) | Residual::ExecWindow(_));
+        let mut alloc = WindowAlloc::default();
+        for (off, res) in block.instructions.iter().enumerate() {
+            debug!("JIT operation {res:?}");
+            let after_window = off > 0 && window(&block.instructions[off - 1]);
+            if after_window && !window(res) {
+                for emit in alloc.flush() {
+                    emit_window_move(ops, emit);
+                }
+            }
+            if window(res) && after_window {
+                // Inside a run, charged for with its first residual.
+            } else {
+                let label = insts[off];
+                dynasm!(ops
+                    ; => label
+                );
+                let run = block.instructions[off..].iter().take_while(|r| window(r)).count();
+                if run > 0 {
+                    alloc.begin(block.instructions[off..off + run].iter().map(|r| match r {
+                        Residual::Storage(gpr, access) => Step::Storage(*gpr, *access),
+                        Residual::ExecWindow(w) => Step::Op(&**w),
+                        _ => unreachable!(),
+                    }));
+                }
+                #[cfg(feature = "gas")]
+                emit_gas_check(ops, off, run.max(1));
+            }
             loop { match res {
                 Residual::Guard { idx, expected } => {
                     // NuN-boxed type check on the 8-byte `LBoxed` slot at `base_ptr[idx]`.
@@ -725,14 +877,32 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
-                // Register allocation for window ops belongs here, at `Storage`
-                // (see Note [Register window]). Until the JIT splats window ops,
-                // every value stays in its stack home: a token needs no register
-                // and a window op bails to the interpreter, which runs it from the
-                // stack.
-                Residual::Storage(..) => {},
-                Residual::ExecWindow(_) => {
-                    emit_bailout(ops, off)
+                Residual::Storage(gpr, access) => alloc.storage(*gpr, *access),
+                Residual::ExecWindow(w) => {
+                    let stencils = &mut self.jctx.stencils;
+                    let skips: SmallVec<[usize; WINDOW]> =
+                        (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(&**w, skip).is_ok()).collect();
+                    match alloc.op(&**w, skips) {
+                        Some(emits) => {
+                            for emit in emits {
+                                match emit {
+                                    Emit::Op { skip } => {
+                                        let body = stencils.body(&**w, skip).expect("a usable skip");
+                                        splat(ops, &body, &w.captures(), pool);
+                                    }
+                                    emit => emit_window_move(ops, emit),
+                                }
+                            }
+                        }
+                        // No stencil to copy: the interpreter runs the op from
+                        // the stack.
+                        None => {
+                            for emit in alloc.flush() {
+                                emit_window_move(ops, emit);
+                            }
+                            emit_bailout(ops, off)
+                        }
+                    }
                 },
                 Residual::Thunk(_) => {
                     dynasm!(ops
@@ -746,6 +916,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     emit_bailout(ops, off)
                 }
             }; break; }
+        }
+        for emit in alloc.flush() {
+            emit_window_move(ops, emit);
         }
 
         (entry, successor)
