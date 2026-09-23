@@ -260,14 +260,14 @@ mod tests {
     use std::collections::HashMap;
 
     // Ops of each shape, their operands in window order as the emit sites
-    // declare them, and one with its output last.
-    windowed!(Bin, [], [], |owner, state, base| (out d, a, b) {
+    // declare them, and one with its output first.
+    windowed!(Bin, [], [], |owner, state, base| (a, b, out d) {
         *d = LBoxed::from_number(a.as_number().unwrap_unchecked() + b.as_number().unwrap_unchecked());
     });
-    windowed!(BinLast, [], [], |owner, state, base| (a, b, out d) {
+    windowed!(BinFirst, [], [], |owner, state, base| (out d, a, b) {
         *d = LBoxed::from_number(a.as_number().unwrap_unchecked() + b.as_number().unwrap_unchecked());
     });
-    windowed!(Get, [], [], |owner, state, base| (out d, a) {
+    windowed!(Get, [], [], |owner, state, base| (a, out d) {
         *d = a;
     });
     windowed!(Set, [], [], |owner, state, base| (a, b) {
@@ -276,25 +276,26 @@ mod tests {
     windowed!(Out, [], [], |owner, state, base| (out d) {
         *d = LBoxed::NIL;
     });
-    windowed!(Loop, [], [], |owner, state, base| (out v, i, l, s) {
+    windowed!(Loop, [], [], |owner, state, base| (i, l, s, p, out v) {
         *v = i;
-        core::hint::black_box((l, s));
+        core::hint::black_box((l, s, p));
     });
 
     /// An op of a test run: its input slots, then its output slot.
     #[derive(Debug, Clone, Copy)]
     enum TestOp {
-        /// Arithmetic, `(out d, a, b)`.
+        /// Arithmetic, `(a, b, out d)`.
         Bin(usize, usize, usize),
-        /// Arithmetic declared `(a, b, out d)`.
-        BinLast(usize, usize, usize),
-        /// A table get, `(out d, table)`.
+        /// Arithmetic declared `(out d, a, b)`.
+        BinFirst(usize, usize, usize),
+        /// A table get or move, `(a, out d)`.
         Get(usize, usize),
         /// A table set, `(table, value)`.
         Set(usize, usize),
         /// An upvalue get or constant load, `(out d)`.
         Out(usize),
-        /// A for loop step, `(out var, idx, limit, step)`.
+        /// A for loop step, `(idx, limit, step, prev, out var)` with `prev` and
+        /// `var` the same slot.
         Loop(usize, usize, usize, usize),
     }
 
@@ -357,12 +358,12 @@ mod tests {
             .iter()
             .map(|op| -> Box<dyn Window> {
                 match *op {
-                    TestOp::Bin(a, b, d) => Box::new(Bin::new(&[t.mint(d), t.mint(a), t.mint(b)])),
-                    TestOp::BinLast(a, b, d) => Box::new(BinLast::new(&[t.mint(a), t.mint(b), t.mint(d)])),
-                    TestOp::Get(a, d) => Box::new(Get::new(&[t.mint(d), t.mint(a)])),
+                    TestOp::Bin(a, b, d) => Box::new(Bin::new(&[t.mint(a), t.mint(b), t.mint(d)])),
+                    TestOp::BinFirst(a, b, d) => Box::new(BinFirst::new(&[t.mint(d), t.mint(a), t.mint(b)])),
+                    TestOp::Get(a, d) => Box::new(Get::new(&[t.mint(a), t.mint(d)])),
                     TestOp::Set(a, b) => Box::new(Set::new(&[t.mint(a), t.mint(b)])),
                     TestOp::Out(d) => Box::new(Out::new(&[t.mint(d)])),
-                    TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[t.mint(v), t.mint(i), t.mint(l), t.mint(s)])),
+                    TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[t.mint(i), t.mint(l), t.mint(s), t.mint(v), t.mint(v)])),
                 }
             })
             .collect();
@@ -396,52 +397,58 @@ mod tests {
     /// rule gives, worked by hand. The floor is a load per slot read before it is
     /// written and a store per slot written.
     const NBODY: [(&[TestOp], (u32, u32, u32)); 7] = [
-        // bi.vz = bivz; bi.x = bix + dt*bivx; ...; i += step; the loop step:
-        // `bix + t` runs at 0 to read t in place, overwriting the cached bi and
-        // bivz (reloaded once each, floor 11); each store then moves t beside bi;
-        // the loop step finds i and step apart and moves both, loading limit.
+        // bi.vz = bivz; bi.x = bix + dt*bivx; ...; i += step; the loop step: at
+        // the floor. Each `dt*bivx` result lands where `bix + _` starts, read
+        // in place with bix loaded below it; each store then moves bi beside t;
+        // the loop step finds nothing in place (moving i and step, loading
+        // limit and the loop variable) and its five registers overwrite t,
+        // stored then instead of at the end.
         (
             &[S(7, 14), B(2, 12, 15), B(8, 15, 15), S(7, 15), B(2, 13, 15), B(9, 15, 15), S(7, 15), B(2, 14, 15), B(10, 15, 15), S(7, 15), B(3, 5, 3), L(3, 4, 5, 6)],
-            (13, 3, 5),
+            (12, 3, 6),
         ),
-        // dx = bix - bj.x: the got value moves to the subtract's rhs.
-        (&[G(19, 20), B(8, 20, 20)], (2, 1, 1)),
+        // dx = bix - bj.x: the got value is read in place as the rhs.
+        (&[G(19, 20), B(8, 20, 20)], (2, 1, 0)),
         // dz = biz - bj.z; dist2 = dx*dx + dy*dy + dz*dz; then `sqrt(dist2)`'s
-        // upvalue get and argument move: at the floor; three moves are the
-        // squares' copies, the partial sums read in place once, and the move
-        // copies dist2 from its register. The upvalue get drops dz*dz's dead
-        // value in slot 24 unstored.
+        // upvalue get and argument move: the squares' dead inputs sit between
+        // the live dz and dist2, so `dy*dy` finds no three registers free of a
+        // dirty value and spills dist2 (a store and a reload over the floor).
         (
             &[G(19, 22), B(10, 22, 22), B(20, 20, 23), B(21, 21, 24), B(23, 24, 23), B(22, 22, 24), B(23, 24, 23), U(24), G(23, 25)],
-            (4, 4, 6),
+            (5, 5, 5),
         ),
-        // bm = bj.mass * mag; bivx -= dx * bm; ...: at the floor; each `bivx - _`
-        // moves its product in, and with the window full bivx and bivy are
-        // stored early (their one store each).
-        (&[G(19, 25), B(25, 24, 25), B(20, 25, 26), B(12, 26, 12), B(21, 25, 26), B(13, 26, 13), B(22, 25, 26), B(14, 26, 14), B(11, 24, 25)], (9, 5, 4)),
-        // bj.vx = bj.vx + dx * bm: the add overwrites the cached bj, reloaded
-        // for the set (floor 3).
-        (&[G(19, 26), B(20, 25, 27), B(26, 27, 26), S(19, 26)], (4, 2, 2)),
-        // ... and the inner loop's `j += step` and loop step, which reads j and
-        // step in place, loading only limit.
-        (&[G(19, 26), B(22, 25, 27), B(26, 27, 26), S(19, 26), B(15, 17, 15), L(15, 16, 17, 18)], (7, 4, 2)),
-        // mag = dt / (mag * dist2): the product moves beside dt.
-        (&[B(24, 23, 25), B(2, 25, 24)], (3, 2, 1)),
+        // bm = bj.mass * mag; bivx -= dx * bm; ...: `dx * bm` reads bm in place
+        // over the cached mag, reloaded for `bimass * mag`; bivy is stored
+        // early (its one store).
+        (&[G(19, 25), B(25, 24, 25), B(20, 25, 26), B(12, 26, 12), B(21, 25, 26), B(13, 26, 13), B(22, 25, 26), B(14, 26, 14), B(11, 24, 25)], (10, 5, 3)),
+        // bj.vx = bj.vx + dx * bm: at the floor; bj.vx moves beside the product
+        // and the sum beside bj.
+        (&[G(19, 26), B(20, 25, 27), B(26, 27, 26), S(19, 26)], (3, 2, 2)),
+        // ... and the inner loop's `j += step` and loop step: at the floor; the
+        // loop step moves j and step, loading limit and the loop variable.
+        (&[G(19, 26), B(22, 25, 27), B(26, 27, 26), S(19, 26), B(15, 17, 15), L(15, 16, 17, 18)], (7, 4, 4)),
+        // mag = dt / (mag * dist2): the product is read in place as the rhs.
+        (&[B(24, 23, 25), B(2, 25, 24)], (3, 2, 0)),
     ];
 
     #[test]
     fn nbody() {
-        for (ops, want) in NBODY {
-            let m = run(WINDOW, ops);
-            assert_eq!((m.loads, m.stores, m.moves), want, "{ops:?}: {m:?}");
-        }
+        let wrong: Vec<String> = NBODY
+            .iter()
+            .filter_map(|(ops, want)| {
+                let m = run(WINDOW, ops);
+                let got = (m.loads, m.stores, m.moves);
+                (got != *want).then(|| format!("{ops:?}: (loads, stores, moves) {got:?}, want {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// The allocator places ops by their operands' accesses, not a layout:
-    /// declaring the output last allocates the same run just as well.
+    /// declaring the output first allocates the same run just as well.
     #[test]
     fn operand_order() {
-        let ops = [TestOp::BinLast(20, 20, 23), TestOp::BinLast(21, 21, 24), TestOp::BinLast(23, 24, 23)];
+        let ops = [TestOp::BinFirst(20, 20, 23), TestOp::BinFirst(21, 21, 24), TestOp::BinFirst(23, 24, 23)];
         let m = run(WINDOW, &ops);
         assert_eq!((m.loads, m.stores), (2, 2), "{m:?}");
     }
@@ -466,23 +473,25 @@ mod tests {
         out
     }
 
-    /// Every run of two ops of every shape, and of three ops with at most eight
-    /// operands between them, over up to four slots (up to renaming, which the
-    /// allocator is indifferent to), is allocated correctly in 4 registers, so
-    /// that the runs overwrite dirty values.
+    /// Every run of two or three ops of every shape with at most eight operands
+    /// between them, over up to four slots (up to renaming, which the allocator
+    /// is indifferent to), is allocated correctly in 4 registers (or as many as
+    /// its widest op), so that the runs overwrite dirty values.
     #[test]
     fn exhaustive_small_runs() {
         let arity = |op: &TestOp| match op {
-            TestOp::Bin(..) | TestOp::BinLast(..) => 3,
+            TestOp::Bin(..) | TestOp::BinFirst(..) => 3,
             TestOp::Get(..) | TestOp::Set(..) => 2,
             TestOp::Out(..) => 1,
-            TestOp::Loop(..) => 4,
+            TestOp::Loop(..) => 5,
         };
-        let shapes = [B(0, 0, 0), TestOp::BinLast(0, 0, 0), G(0, 0), S(0, 0), U(0), L(0, 0, 0, 0)];
+        let shapes = [B(0, 0, 0), TestOp::BinFirst(0, 0, 0), G(0, 0), S(0, 0), U(0), L(0, 0, 0, 0)];
         let mut runs: Vec<Vec<TestOp>> = Vec::new();
         for x in shapes {
             for y in shapes {
-                runs.push(vec![x, y]);
+                if arity(&x) + arity(&y) <= 8 {
+                    runs.push(vec![x, y]);
+                }
                 for z in shapes {
                     if arity(&x) + arity(&y) + arity(&z) <= 8 {
                         runs.push(vec![x, y, z]);
@@ -498,14 +507,14 @@ mod tests {
                     .iter()
                     .map(|shape| match shape {
                         TestOp::Bin(..) => B(next(), next(), next()),
-                        TestOp::BinLast(..) => TestOp::BinLast(next(), next(), next()),
+                        TestOp::BinFirst(..) => TestOp::BinFirst(next(), next(), next()),
                         TestOp::Get(..) => G(next(), next()),
                         TestOp::Set(..) => S(next(), next()),
                         TestOp::Out(..) => U(next()),
                         TestOp::Loop(..) => L(next(), next(), next(), next()),
                     })
                     .collect();
-                run(4, &ops);
+                run(ops.iter().map(arity).max().unwrap().max(4), &ops);
             }
         }
     }

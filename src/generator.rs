@@ -322,7 +322,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
-            windowed!(GetTableHref, [href: u8, key: usize], [], |owner, state, base| (out dest, table) {
+            windowed!(GetTableHref, [href: u8, key: usize], [], |owner, state, base| (table, out dest) {
                 let witness = &state.hash_witnesses[state.witness_base + href as usize];
                 debug!("gettable_href with {:?}", &witness);
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -347,10 +347,10 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 debug!("gettable_href fetched {val1:?}");
                 *dest = *val1;
             });
-            let d = yield YieldOp::Storage(a, Access::Write);
             let t = yield YieldOp::Storage(b, Access::Read);
-            let (ResumeArg::Storage(d), ResumeArg::Storage(t)) = (d, t) else { unreachable!() };
-            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[d, t])));
+            let d = yield YieldOp::Storage(a, Access::Write);
+            let (ResumeArg::Storage(t), ResumeArg::Storage(d)) = (t, d) else { unreachable!() };
+            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[t, d])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
         } else {
             arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
@@ -561,7 +561,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (out dest, lhs, rhs) {
+                windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
                     // Guarded numbers. Unchecked, so that no panic path follows the
                     // stencil's `become` and the copy can slice it off.
                     let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
@@ -569,11 +569,11 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                 });
 
-                let d = yield YieldOp::Storage(dest, Access::Write);
                 let l = yield YieldOp::Storage(lhs, Access::Read);
                 let r = yield YieldOp::Storage(rhs, Access::Read);
-                let (ResumeArg::Storage(d), ResumeArg::Storage(l), ResumeArg::Storage(r)) = (d, l, r) else { unreachable!() };
-                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt, (&[d, l, r])));
+                let d = yield YieldOp::Storage(dest, Access::Write);
+                let (ResumeArg::Storage(l), ResumeArg::Storage(r), ResumeArg::Storage(d)) = (l, r, d) else { unreachable!() };
+                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt, (&[l, r, d])));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
@@ -867,13 +867,13 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Typeof(src);
         if let ResumeArg::Type(t) = arg.clone() {
-            windowed!(Move, [], [], |owner, state, base| (out to, from) {
+            windowed!(Move, [], [], |owner, state, base| (from, out to) {
                 *to = from;
             });
-            let d = yield YieldOp::Storage(dest, Access::Write);
             let s = yield YieldOp::Storage(src, Access::Read);
-            let (ResumeArg::Storage(d), ResumeArg::Storage(s)) = (d, s) else { unreachable!() };
-            yield YieldOp::ExecWindow(Rc::new(Move::new(&[d, s])));
+            let d = yield YieldOp::Storage(dest, Access::Write);
+            let (ResumeArg::Storage(s), ResumeArg::Storage(d)) = (s, d) else { unreachable!() };
+            yield YieldOp::ExecWindow(Rc::new(Move::new(&[s, d])));
             // TODO: track references? see PyLBBV
             debug!("move {} = {} {:?}", dest, src, t);
             yield YieldOp::SetCTypes(vec![(dest, t)]);
@@ -970,11 +970,10 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
-                // The loop variable is written on both edges, not only when the
-                // loop continues: an output is always written back, and it is
-                // dead once the loop exits (its scope ends there). This also
-                // makes the `SetTypes` below hold on both edges.
-                windowed!(ForLoop, [], [], |owner, state, base| (out var, idx, limit, step) {
+                // The loop variable is set only when the loop continues. An output
+                // is always written back, so it also reads the variable's previous
+                // value (`prev`, the same slot) and writes that back on exit.
+                windowed!(ForLoop, [], [], |owner, state, base| (idx, limit, step, prev, out var) {
                     let Some(nidx) = idx.as_number() else { unreachable!() };
                     let Some(nlimit) = limit.as_number() else { unreachable!() };
                     let Some(nstep) = step.as_number() else { unreachable!() };
@@ -984,15 +983,16 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
                     } else {
                         nidx <= nlimit
                     };
-                    *var = idx;
+                    *var = if comp { idx } else { prev };
                     state.select = if comp { 0 } else { 1 };
                 });
-                let v = yield YieldOp::Storage(a + 3, Access::Write);
                 let i = yield YieldOp::Storage(a, Access::Read);
                 let l = yield YieldOp::Storage(a + 1, Access::Read);
                 let s = yield YieldOp::Storage(a + 2, Access::Read);
-                let (ResumeArg::Storage(v), ResumeArg::Storage(i), ResumeArg::Storage(l), ResumeArg::Storage(s)) = (v, i, l, s) else { unreachable!() };
-                yield YieldOp::ExecWindow(Rc::new(ForLoop::new(&[v, i, l, s])));
+                let p = yield YieldOp::Storage(a + 3, Access::Read);
+                let v = yield YieldOp::Storage(a + 3, Access::Write);
+                let (ResumeArg::Storage(i), ResumeArg::Storage(l), ResumeArg::Storage(s), ResumeArg::Storage(p), ResumeArg::Storage(v)) = (i, l, s, p, v) else { unreachable!() };
+                yield YieldOp::ExecWindow(Rc::new(ForLoop::new(&[i, l, s, p, v])));
                 yield YieldOp::SetTypes(vec![(a + 3, LType::Number)]);
             },
             _ => {

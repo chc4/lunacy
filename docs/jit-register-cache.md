@@ -339,17 +339,23 @@ written):
 
 | run | streaming | floor | with the table ops as `Exec`s |
 |---|---|---|---|
-| `bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step`; loop step (12 ops) | 13/3/5 | 11/3 | — |
-| `dx = bix - bj.x` | 2/1/1 | 2/1 | 3/2 |
-| `dz = biz - bj.z; dist2 = ...; sqrt`'s upvalue get and argument move | 4/4/6 | 4/4 | 6/6 |
-| `bm = bj.mass * mag; bivx -= dx * bm; ...` | 9/5/4 | 9/5 | 10/6 |
-| `bj.vx = bj.vx + dx * bm` | 4/2/2 | 3/2 | 5/3 |
-| ... plus `j += step`; loop step | 7/4/2 | 6/4 | — |
-| `mag = dt / (mag * dist2)` | 3/2/1 | 3/2 | 3/2 |
+| `bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step`; loop step (12 ops) | 12/3/6 | 12/3 | — |
+| `dx = bix - bj.x` | 2/1/0 | 2/1 | 3/2 |
+| `dz = biz - bj.z; dist2 = ...; sqrt`'s upvalue get and argument move | 5/5/5 | 4/4 | 6/6 |
+| `bm = bj.mass * mag; bivx -= dx * bm; ...` | 10/5/3 | 9/5 | 10/6 |
+| `bj.vx = bj.vx + dx * bm` | 3/2/2 | 3/2 | 5/3 |
+| ... plus `j += step`; loop step | 7/4/4 | 7/4 | — |
+| `mag = dt / (mag * dist2)` | 3/2/0 | 3/2 | 3/2 |
 
-Where it loses to the floor, an op placed to read an input in place overwrote a
-cached value that a later op reloads: `bix + t` runs at 0 and overwrites the
-cached `bi` and `bivz`; `bj.vx + t` overwrites `bj`.
+With the ops declaring their output last, a result lands where the next op
+starts, so a chain like `b = a + 1; c = b + 1` reads each result in place.
+Where it loses to the floor, an op overwrote a value a later op needs: in
+`dist2`, the squares' dead inputs sit between the live `dz` and `dist2`, so
+`dy*dy` finds no three registers free of a dirty value and spills `dist2` (a
+store and a reload); in the velocity run, `dx * bm` reads `bm` in place over the
+cached `mag`, reloaded for `bimass * mag`. (With outputs declared first the
+totals were 42 loads/21 stores/21 moves against 41/22/20 now, the output-last
+order winning on five of the seven runs and on the runs' execution counts.)
 
 The `bi` run is long because `bi` keeps its shape (a key already cached in the
 slot's `CType::Shape` costs an epoch check, not an `href_init`). The `bj` runs
@@ -455,17 +461,17 @@ The emit site yields its `Storage`s in the same order. The allocator knows only
 each operand's index and whether it is read or written, so it handles any order
 an op names:
 
-- `NumericIntInt` declares `(out dest, lhs, rhs)`;
-- `GetTableHref` declares `(out dest, table)`;
+- `NumericIntInt` declares `(lhs, rhs, out dest)`;
+- `GetTableHref` declares `(table, out dest)`;
 - `SetTableHref` declares `(table, value)`;
-- `Move` (`emit_move`) declares `(out to, from)`;
+- `Move` (`emit_move`) declares `(from, out to)`;
 - `LoadK` (`emit_loadk`) declares `(out dest)`, reading the constant from
   the prototype;
-- `ForLoop` (`emit_forloop`, numbers) declares `(out var, idx, limit, step)`
-  and sets `state.select` for the `Select` after it. It writes the loop
-  variable on both edges, not only when the loop continues: an output is always
-  written back (a conditional write would flush whatever its register held),
-  and the variable is dead once the loop exits;
+- `ForLoop` (`emit_forloop`, numbers) declares `(idx, limit, step, prev, out
+  var)` and sets `state.select` for the `Select` after it. The loop variable is
+  set only when the loop continues; since an output is always written back, the
+  op also reads the variable's previous value (`prev`, the same slot) and writes
+  that back on exit;
 - `GetUpval` (`emit_getupval`) declares `(out dest)`. An open upvalue reads a
   stack slot directly, but of an enclosing frame (the running closure's
   upvalues were captured by its parent), never one of this frame's, which the

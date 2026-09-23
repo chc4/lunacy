@@ -52,7 +52,8 @@
 // op always runs on a contiguous run of the window: operand `i`, in the order
 // the op declares its operands, is register `SKIP + i`, and
 // `Window::stencil(skip)` is the instance for that `SKIP`. The order is the op's
-// choice (e.g. its output first, below its inputs); the allocator handles any.
+// choice (e.g. its output last, where the next op can start); the allocator
+// handles any.
 // An op's inputs are read-only and only its outputs are written, so the
 // registers outside its run, and its inputs, keep their values. An op's body
 // must reach this frame's stack slots only through its operands: any of them
