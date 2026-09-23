@@ -647,11 +647,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         // The window carries values across window residuals, the inline type
         // guards between them, and jumps to other blocks (see Note [Window
-        // allocation]); any other residual flushes it, after its label, since a
-        // guard's success edge may jump there with the window live. A guard's
-        // failure edge is its thunk, reached with the stack already up to date.
-        // Every edge into a label carries the same window: a window residual
-        // following another gets no label, so a jump to one fails to assemble.
+        // allocation]). A thunk stores the dirty registers before it exits; any
+        // other residual flushes the window after its label, since a guard's
+        // success edge may jump there with the window live. A guard's failure
+        // edge is an ordinary fall through (docs/jit-register-cache.md, "Flush
+        // points"). Every edge into a label carries the same window: a jump or
+        // thunk leaves the window as it was, for the guard success edge that
+        // reaches the residual after it, and a window residual following another
+        // gets no label, so a jump to one fails to assemble.
         let window = |r: &Residual| matches!(r, Residual::ExecWindow(_));
         let inline_guard = |r: &Residual| {
             matches!(r, Residual::Guard { expected: LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String, .. })
@@ -661,7 +664,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("JIT operation {res:?}");
             window_dump!(self.jctx, "  {off:3} {res}");
             let prev = off.checked_sub(1).map(|p| &block.instructions[p]);
-            let keeps_window = window(res) || inline_guard(res) || jump(res) || prev.is_some_and(|p| inline_guard(p));
+            let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_));
             if window(res) && prev.is_some_and(|p| window(p)) {
                 // Inside a run of window residuals, charged for with its first.
             } else {
@@ -683,9 +686,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Guard { idx, expected } if inline_guard(res) => {
                     // NuN-boxed type check of the value in `STACK[idx]`: in the window
                     // register caching it, or else loaded from its stack home. A
-                    // *match* jumps to the success continuation at `off + 2` with the
-                    // window live; a *mismatch* falls through to the deopt thunk at
-                    // `off + 1`, after bringing the stack up to date.
+                    // *match* jumps to the success continuation at `off + 2`, a
+                    // *mismatch* falls through to the failure edge at `off + 1`,
+                    // both with the window live.
                     //
                     //   * Number   : the value has any `NUMBER_TAG` bit set.
                     //   * Nil/Bool : exact immediate compare (nil = 2, false/true = 6/7).
@@ -697,8 +700,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // `v` holds the value: its window register, or else r10. rax,
                     // never a window register, is scratch for the masks.
                     let m = 0; // rax
-                    window_dump!(self.jctx, "      tests {}; failure path: {}",
-                        alloc.register_of(*idx).map_or(format!("[{idx}]"), |reg| format!("w{reg}")), emits_line(&alloc.stores()));
+                    window_dump!(self.jctx, "      tests {}",
+                        alloc.register_of(*idx).map_or(format!("[{idx}]"), |reg| format!("w{reg}")));
                     let v = match alloc.register_of(*idx) {
                         Some(reg) => WINDOW_REGS[reg],
                         None => {
@@ -760,13 +763,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; guard_fail:
                         ),
                         _ => unreachable!(),
-                    }
-                    assert!(
-                        matches!(block.instructions.get(off + 1), Some(Residual::Thunk(_))),
-                        "a guard's failure edge must be its thunk"
-                    );
-                    for emit in alloc.stores() {
-                        emit_window_move(ops, emit);
                     }
                 },
                 Residual::Guard { idx, expected } => {
@@ -958,8 +954,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     emit_jump(ops, &alloc, target,
                         off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none());
                     successor = Some(*target);
-                    // Nothing falls through with this window.
-                    alloc = WindowAlloc::default();
                 },
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
@@ -992,7 +986,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; ud2
                     );
-                    alloc = WindowAlloc::default();
                 },
                 Residual::GC => {
                     dynasm!(ops
@@ -1039,6 +1032,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::Thunk(_) => {
+                    let stores = alloc.stores();
+                    window_dump!(self.jctx, "      exit after {}", emits_line(&stores));
+                    for emit in stores {
+                        emit_window_move(ops, emit);
+                    }
                     dynasm!(ops
                         ; mov WORD r13 => RunState.current_off, (off as i16)
                         ; mov rax, QWORD (((-4i32 as u64) << 32 | (id.0 as u64)) as i64)
@@ -1051,9 +1049,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }; break; }
             window_dump!(self.jctx, "      window {}", alloc.cache());
-        }
-        for emit in alloc.flush() {
-            emit_window_move(ops, emit);
         }
 
         (entry, successor)

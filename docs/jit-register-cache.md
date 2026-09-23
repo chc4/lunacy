@@ -310,10 +310,14 @@ direct ones a relocation to a label at the copy's end; other RIP-relative
 references `value_relocation`s to their absolute target (the buffer's base is
 known). An inline type guard (every `LType` but `Unknown`) keeps the window:
 it tests the register caching its slot, or else loads the slot into r10 (rax,
-never a window register, is the mask scratch), jumps to its success edge with the window live,
-and stores the dirty registers on its fall-through failure path into its thunk;
-the gas exit stores them too. A `Jump` or `Select` keeps the window too, and
-transfers it to the target block's (below). Any other residual flushes the window after its
+never a window register, is the mask scratch), and both its edges carry the
+window on: the success edge to its label, the failure edge falling through to
+the residual after it, an ordinary edge (section 2, "Flush points") — its
+thunk, which stores the dirty registers before it exits, or once the thunk is
+forced a jump to the failure block. The gas exit stores the dirty registers
+too. A `Jump` or `Select` keeps the window, and transfers it to the target
+block's (below). Neither a thunk nor a jump changes the window, so the guard's
+success edge reaches the residual after them with the window it left. Any other residual flushes the window after its
 label, since a guard's success edge may jump there with the window live
 (`Unknown` guards call `check_guard`, so they flush). Window residuals
 following another get no label, so a jump into a run fails to assemble; with
@@ -530,8 +534,7 @@ At an `ExecWindow` with operands `o_0..o_{n-1}` (from the op itself):
 
 At a flush point (any residual other than an `ExecWindow`, an inline type
 guard or a jump), store every dirty register. Calls clobber every register, so
-the cache is emptied too. An inline guard's failure path stores the dirty
-registers without emptying the cache, which its success path keeps.
+the cache is emptied too.
 
 `just window-dump <benchmark>` shows what the allocator actually did
 (feature `window_dump`, written to `window_dump.txt`): per compiled region,

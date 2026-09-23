@@ -70,7 +70,7 @@
 // to spare registers or evicted. A register holding the only copy of a slot's
 // current value is dirty until flushed to the stack home, at an eviction or when
 // the run of window residuals ends. An inline type guard does not end the run:
-// it tests the cached register, and stores the dirty ones on its failure path.
+// it tests the cached register, and both its edges carry the window on.
 //
 // The interpreter keeps no window between residuals: `ExecWindow` runs the op's
 // body on its operands' stack homes (`Window::on_stack`: inputs read from them,

@@ -26,9 +26,11 @@ use crate::window::{Access, Window, WINDOW};
 // Ties go to the `SKIP` that overwrites the fewest cached values, then to the
 // lowest. An overwritten clean value is dropped, and a later read reloads it.
 // Any other residual ends the run and flushes every dirty register, except an
-// inline type guard: it tests the register caching its slot, and only its
-// failure path (and a gas exit) stores the dirty registers, leaving the window
-// live on the success path ([`WindowAlloc::stores`]).
+// inline type guard: it tests the register caching its slot, and both its
+// edges carry the window on, the failure edge falling through to the residual
+// after it (a thunk, which stores the dirty registers before it exits, or a
+// jump). A gas exit stores them too, without ending the run
+// ([`WindowAlloc::stores`]).
 //
 // Jumps carry the window across block edges too. Each block is entered with
 // the window it was compiled for: a block first reached by a jump is compiled to
