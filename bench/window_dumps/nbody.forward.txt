@@ -1,0 +1,2128 @@
+== region entered at block 270
+block 270 hotness 0 entered with {}
+    0 exec(href_init)
+      window {}
+    1 select
+      to block 271 (entered with {}): 
+      to block 272 (entered with {}): 
+      window {}
+block 271 hotness 1 entered with {}
+    0 jump(273)
+      to block 273 (entered with {}): 
+      window {}
+block 273 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 20)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[20]*}
+    1 window(NumericIntInt, 8, 20, out 20)
+      w0 <- [8]; op at w0
+      window {w0=[8] w2=[20]*}
+    2 exec(href_init)
+      flush: [20] <- w2
+      window {}
+    3 select
+      to block 274 (entered with {}): 
+      to block 275 (entered with {}): 
+      window {}
+block 272 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 274 hotness 1 entered with {}
+    0 jump(276)
+      to block 276 (entered with {}): 
+      window {}
+block 276 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 21)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[21]*}
+    1 window(NumericIntInt, 9, 21, out 21)
+      w0 <- [9]; op at w0
+      window {w0=[9] w2=[21]*}
+    2 exec(href_init)
+      flush: [21] <- w2
+      window {}
+    3 select
+      to block 277 (entered with {}): 
+      to block 278 (entered with {}): 
+      window {}
+block 275 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 277 hotness 1 entered with {}
+    0 jump(279)
+      to block 279 (entered with {}): 
+      window {}
+block 279 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 22)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[22]*}
+    1 window(NumericIntInt, 10, 22, out 22)
+      w0 <- [10]; op at w0
+      window {w0=[10] w2=[22]*}
+    2 window(NumericIntInt, 20, 20, out 23)
+      w3 <- [20]; w4 <- w3; op at w3
+      window {w0=[10] w2=[22]* w3=[20] w4=[20] w5=[23]*}
+    3 window(NumericIntInt, 21, 21, out 24)
+      [23] <- w5; w5 <- [21]; w6 <- w5; op at w5
+      window {w0=[10] w2=[22]* w3=[20] w4=[20] w5=[21] w6=[21] w7=[24]*}
+    4 window(NumericIntInt, 23, 24, out 23)
+      w3 <- [23]; w4 <- w7; op at w3
+      window {w0=[10] w2=[22]* w4=[24]* w5=[23]* w6=[21] w7=[24]*}
+    5 window(NumericIntInt, 22, 22, out 24)
+      w1 <- w2; op at w1
+      window {w0=[10] w1=[22]* w2=[22]* w3=[24]* w5=[23]* w6=[21]}
+    6 window(NumericIntInt, 23, 24, out 23)
+      w2 <- w5; op at w2
+      window {w0=[10] w1=[22]* w3=[24]* w4=[23]* w6=[21]}
+    7 window(GetUpval, out 24)
+      op at w2
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w6=[21]}
+    8 window(Move, 23, out 25)
+      op at w4
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w5=[25]* w6=[21]}
+    9 guard(24, func)
+      tests w2
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w5=[25]* w6=[21]}
+   10 thunk
+      exit after [22] <- w1; [24] <- w2; [23] <- w4; [25] <- w5
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w5=[25]* w6=[21]}
+   11 native_guard(24, 0x573b9f2ed490)
+      flush: [22] <- w1; [24] <- w2; [23] <- w4; [25] <- w5
+      window {}
+   12 thunk
+      exit after 
+      window {}
+   13 jump(280)
+      to block 280 (entered with {}): 
+      window {}
+block 280 hotness 1 entered with {}
+    0 ncall(0x573ba05b6f68, 24, 2, 2)
+      window {}
+    1 guard(24, number)
+      tests [24]
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 jump(281)
+      to block 281 (entered with {}): 
+      window {}
+block 281 hotness 1 entered with {}
+    0 window(NumericIntInt, 24, 23, out 25)
+      w0 <- [24]; w1 <- [23]; op at w0
+      window {w0=[24] w1=[23] w2=[25]*}
+    1 window(NumericIntInt, 2, 25, out 24)
+      w1 <- [2]; op at w1
+      window {w1=[2] w2=[25]* w3=[24]*}
+    2 exec(href_init)
+      flush: [25] <- w2; [24] <- w3
+      window {}
+    3 select
+      to block 282 (entered with {}): 
+      to block 283 (entered with {}): 
+      window {}
+block 278 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 282 hotness 1 entered with {}
+    0 jump(284)
+      to block 284 (entered with {}): 
+      window {}
+block 284 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 25)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[25]*}
+    1 window(NumericIntInt, 25, 24, out 25)
+      w2 <- [24]; op at w1
+      window {w0=[19] w2=[24] w3=[25]*}
+    2 window(NumericIntInt, 20, 25, out 26)
+      w2 <- [20]; op at w2
+      window {w0=[19] w2=[20] w3=[25]* w4=[26]*}
+    3 window(NumericIntInt, 12, 26, out 12)
+      w5 <- [12]; w6 <- w4; op at w5
+      window {w0=[19] w2=[20] w3=[25]* w4=[26]* w6=[26]* w7=[12]*}
+    4 window(NumericIntInt, 21, 25, out 26)
+      w2 <- [21]; op at w2
+      window {w0=[19] w2=[21] w3=[25]* w4=[26]* w7=[12]*}
+    5 window(NumericIntInt, 13, 26, out 13)
+      w5 <- w4; w4 <- [13]; op at w4
+      window {w0=[19] w2=[21] w3=[25]* w5=[26]* w6=[13]* w7=[12]*}
+    6 window(NumericIntInt, 22, 25, out 26)
+      w2 <- [22]; op at w2
+      window {w0=[19] w2=[22] w3=[25]* w4=[26]* w6=[13]* w7=[12]*}
+    7 window(NumericIntInt, 14, 26, out 14)
+      w0 <- [14]; w1 <- w4; op at w0
+      window {w1=[26]* w2=[14]* w3=[25]* w4=[26]* w6=[13]* w7=[12]*}
+    8 window(NumericIntInt, 11, 24, out 25)
+      w3 <- [11]; w4 <- [24]; op at w3
+      window {w1=[26]* w2=[14]* w3=[11] w4=[24] w5=[25]* w6=[13]* w7=[12]*}
+    9 exec(href_init)
+      flush: [25] <- w5; [26] <- w1; [12] <- w7; [13] <- w6; [14] <- w2
+      window {}
+   10 select
+      to block 285 (entered with {}): 
+      to block 286 (entered with {}): 
+      window {}
+block 283 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 285 hotness 1 entered with {}
+    0 jump(287)
+      to block 287 (entered with {}): 
+      window {}
+block 287 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 26)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[26]*}
+    1 window(NumericIntInt, 20, 25, out 27)
+      w2 <- [20]; w3 <- [25]; op at w2
+      window {w0=[19] w1=[26]* w2=[20] w3=[25] w4=[27]*}
+    2 window(NumericIntInt, 26, 27, out 26)
+      w3 <- w1; op at w3
+      window {w0=[19] w2=[20] w4=[27]* w5=[26]*}
+    3 window(SetTableHref, 19, 26)
+      w1 <- w5; op at w0
+      window {w0=[19] w1=[26]* w2=[20] w4=[27]* w5=[26]*}
+    4 exec(href_init)
+      flush: [26] <- w1; [27] <- w4
+      window {}
+    5 select
+      to block 288 (entered with {}): 
+      to block 289 (entered with {}): 
+      window {}
+block 286 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 288 hotness 1 entered with {}
+    0 jump(290)
+      to block 290 (entered with {}): 
+      window {}
+block 290 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 26)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[26]*}
+    1 window(NumericIntInt, 21, 25, out 27)
+      w2 <- [21]; w3 <- [25]; op at w2
+      window {w0=[19] w1=[26]* w2=[21] w3=[25] w4=[27]*}
+    2 window(NumericIntInt, 26, 27, out 26)
+      w3 <- w1; op at w3
+      window {w0=[19] w2=[21] w4=[27]* w5=[26]*}
+    3 window(SetTableHref, 19, 26)
+      w1 <- w5; op at w0
+      window {w0=[19] w1=[26]* w2=[21] w4=[27]* w5=[26]*}
+    4 exec(href_init)
+      flush: [26] <- w1; [27] <- w4
+      window {}
+    5 select
+      to block 291 (entered with {}): 
+      to block 292 (entered with {}): 
+      window {}
+block 289 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 291 hotness 1 entered with {}
+    0 jump(293)
+      to block 293 (entered with {}): 
+      window {}
+block 293 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 26)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[26]*}
+    1 window(NumericIntInt, 22, 25, out 27)
+      w2 <- [22]; w3 <- [25]; op at w2
+      window {w0=[19] w1=[26]* w2=[22] w3=[25] w4=[27]*}
+    2 window(NumericIntInt, 26, 27, out 26)
+      w3 <- w1; op at w3
+      window {w0=[19] w2=[22] w4=[27]* w5=[26]*}
+    3 window(SetTableHref, 19, 26)
+      w1 <- w5; op at w0
+      window {w0=[19] w1=[26]* w2=[22] w4=[27]* w5=[26]*}
+    4 window(NumericIntInt, 15, 17, out 15)
+      w5 <- [15]; w6 <- [17]; op at w5
+      window {w0=[19] w1=[26]* w2=[22] w4=[27]* w6=[17] w7=[15]*}
+    5 window(ForLoop, 15, 16, 17, 18, out 18)
+      [27] <- w4; w2 <- w7; w3 <- [16]; w4 <- w6; w5 <- [18]; op at w2
+      window {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}
+    6 select
+      to block 269 (entered with {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}): 
+      to block 263 (entered with {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}): 
+      window {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}
+block 263 hotness 23 entered with {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}
+    0 epoch(7, HashRef(4))
+      flush: [26] <- w1; [15] <- w2; [18] <- w6
+      window {}
+    1 thunk
+      exit after 
+      window {}
+    2 jump(264)
+      to block 264 (entered with {}): 
+      window {}
+block 264 hotness 23 entered with {}
+    0 window(SetTableHref, 7, 12)
+      w0 <- [7]; w1 <- [12]; op at w0
+      window {w0=[7] w1=[12]}
+    1 epoch(7, HashRef(5))
+      flush: 
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 jump(265)
+      to block 265 (entered with {}): 
+      window {}
+block 265 hotness 23 entered with {}
+    0 window(SetTableHref, 7, 13)
+      w0 <- [7]; w1 <- [13]; op at w0
+      window {w0=[7] w1=[13]}
+    1 epoch(7, HashRef(6))
+      flush: 
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 jump(266)
+      to block 266 (entered with {}): 
+      window {}
+block 266 hotness 23 entered with {}
+    0 window(SetTableHref, 7, 14)
+      w0 <- [7]; w1 <- [14]; op at w0
+      window {w0=[7] w1=[14]}
+    1 window(NumericIntInt, 2, 12, out 15)
+      w2 <- [2]; w3 <- [12]; op at w2
+      window {w0=[7] w1=[14] w2=[2] w3=[12] w4=[15]*}
+    2 window(NumericIntInt, 8, 15, out 15)
+      w3 <- [8]; op at w3
+      window {w0=[7] w1=[14] w2=[2] w3=[8] w5=[15]*}
+    3 window(SetTableHref, 7, 15)
+      w4 <- w0; op at w4
+      window {w0=[7] w1=[14] w2=[2] w3=[8] w4=[7] w5=[15]*}
+    4 window(NumericIntInt, 2, 13, out 15)
+      w3 <- [13]; op at w2
+      window {w0=[7] w1=[14] w2=[2] w3=[13] w4=[15]*}
+    5 window(NumericIntInt, 9, 15, out 15)
+      w3 <- [9]; op at w3
+      window {w0=[7] w1=[14] w2=[2] w3=[9] w5=[15]*}
+    6 window(SetTableHref, 7, 15)
+      w4 <- w0; op at w4
+      window {w0=[7] w1=[14] w2=[2] w3=[9] w4=[7] w5=[15]*}
+    7 window(NumericIntInt, 2, 14, out 15)
+      w0 <- w2; op at w0
+      window {w0=[2] w1=[14] w2=[15]* w3=[9] w4=[7]}
+    8 window(NumericIntInt, 10, 15, out 15)
+      w1 <- [10]; op at w1
+      window {w0=[2] w1=[10] w3=[15]* w4=[7]}
+    9 window(SetTableHref, 7, 15)
+      w2 <- w4; op at w2
+      window {w0=[2] w1=[10] w2=[7] w3=[15]* w4=[7]}
+   10 window(NumericIntInt, 3, 5, out 3)
+      w5 <- [3]; w6 <- [5]; op at w5
+      window {w0=[2] w1=[10] w2=[7] w3=[15]* w4=[7] w6=[5] w7=[3]*}
+   11 window(ForLoop, 3, 4, 5, 6, out 6)
+      [15] <- w3; w1 <- w7; w2 <- [4]; w3 <- w6; w4 <- [6]; op at w1
+      window {w0=[2] w1=[3]* w2=[4] w3=[5] w5=[6]* w6=[5] w7=[3]*}
+   12 select
+      to block 268 (entered with {w0=[2] w1=[3]* w2=[4] w3=[5] w5=[6]* w6=[5] w7=[3]*}): 
+      to block 267 (entered with {w0=[2] w1=[3]* w2=[4] w3=[5] w5=[6]* w6=[5] w7=[3]*}): 
+      window {w0=[2] w1=[3]* w2=[4] w3=[5] w5=[6]* w6=[5] w7=[3]*}
+block 267 hotness 54 entered with {w0=[2] w1=[3]* w2=[4] w3=[5] w5=[6]* w6=[5] w7=[3]*}
+    0 ret
+      flush: [3] <- w1; [6] <- w5
+      window {}
+block 268 hotness 23 entered with {w0=[2] w1=[3]* w2=[4] w3=[5] w5=[6]* w6=[5] w7=[3]*}
+    0 window(GetTableIndex, 0, 6, out 7)
+      w4 <- [0]; op at w4
+      window {w0=[2] w1=[3]* w2=[4] w3=[5] w4=[0] w5=[6]* w6=[7]* w7=[3]*}
+    1 guard(7, table)
+      tests w6
+      window {w0=[2] w1=[3]* w2=[4] w3=[5] w4=[0] w5=[6]* w6=[7]* w7=[3]*}
+    2 thunk
+      exit after [3] <- w1; [6] <- w5; [7] <- w6
+      window {w0=[2] w1=[3]* w2=[4] w3=[5] w4=[0] w5=[6]* w6=[7]* w7=[3]*}
+    3 jump(294)
+      to block 294 (entered with {w0=[2] w1=[3]* w2=[4] w3=[5] w4=[0] w5=[6]* w6=[7]* w7=[3]*}): 
+      window {w0=[2] w1=[3]* w2=[4] w3=[5] w4=[0] w5=[6]* w6=[7]* w7=[3]*}
+block 294 hotness 22 entered with {w0=[2] w1=[3]* w2=[4] w3=[5] w4=[0] w5=[6]* w6=[7]* w7=[3]*}
+    0 exec(href_init)
+      flush: [3] <- w1; [6] <- w5; [7] <- w6
+      window {}
+    1 select
+      to block 295 (entered with {}): 
+      to block 296 (entered with {}): 
+      window {}
+block 269 hotness 0 entered with {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}
+    0 window(GetTableIndex, 0, 18, out 19)
+      w5 <- [0]; op at w5
+      window {w1=[26]* w2=[15]* w3=[16] w4=[17] w5=[0] w6=[18]* w7=[19]*}
+    1 guard(19, table)
+      tests w7
+      window {w1=[26]* w2=[15]* w3=[16] w4=[17] w5=[0] w6=[18]* w7=[19]*}
+    2 thunk
+      exit after [26] <- w1; [15] <- w2; [18] <- w6; [19] <- w7
+      window {w1=[26]* w2=[15]* w3=[16] w4=[17] w5=[0] w6=[18]* w7=[19]*}
+    3 jump(270)
+      to block 270 (compiled, entered with {}): [26] <- w1; [15] <- w2; [18] <- w6; [19] <- w7
+      window {w1=[26]* w2=[15]* w3=[16] w4=[17] w5=[0] w6=[18]* w7=[19]*}
+block 292 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 295 hotness 23 entered with {}
+    0 jump(297)
+      to block 297 (entered with {}): 
+      window {}
+block 297 hotness 23 entered with {}
+    0 window(GetTableHref, 7, out 8)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[8]*}
+    1 exec(href_init)
+      flush: [8] <- w1
+      window {}
+    2 select
+      to block 298 (entered with {}): 
+      to block 299 (entered with {}): 
+      window {}
+block 296 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 298 hotness 23 entered with {}
+    0 jump(300)
+      to block 300 (entered with {}): 
+      window {}
+block 300 hotness 23 entered with {}
+    0 window(GetTableHref, 7, out 9)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[9]*}
+    1 exec(href_init)
+      flush: [9] <- w1
+      window {}
+    2 select
+      to block 301 (entered with {}): 
+      to block 302 (entered with {}): 
+      window {}
+block 299 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 301 hotness 23 entered with {}
+    0 jump(303)
+      to block 303 (entered with {}): 
+      window {}
+block 303 hotness 23 entered with {}
+    0 window(GetTableHref, 7, out 10)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[10]*}
+    1 exec(href_init)
+      flush: [10] <- w1
+      window {}
+    2 select
+      to block 304 (entered with {}): 
+      to block 305 (entered with {}): 
+      window {}
+block 302 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 304 hotness 23 entered with {}
+    0 jump(306)
+      to block 306 (entered with {}): 
+      window {}
+block 306 hotness 23 entered with {}
+    0 window(GetTableHref, 7, out 11)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[11]*}
+    1 exec(href_init)
+      flush: [11] <- w1
+      window {}
+    2 select
+      to block 307 (entered with {}): 
+      to block 308 (entered with {}): 
+      window {}
+block 305 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 307 hotness 23 entered with {}
+    0 jump(309)
+      to block 309 (entered with {}): 
+      window {}
+block 309 hotness 23 entered with {}
+    0 window(GetTableHref, 7, out 12)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[12]*}
+    1 exec(href_init)
+      flush: [12] <- w1
+      window {}
+    2 select
+      to block 310 (entered with {}): 
+      to block 311 (entered with {}): 
+      window {}
+block 308 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 310 hotness 23 entered with {}
+    0 jump(312)
+      to block 312 (entered with {}): 
+      window {}
+block 312 hotness 23 entered with {}
+    0 window(GetTableHref, 7, out 13)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[13]*}
+    1 exec(href_init)
+      flush: [13] <- w1
+      window {}
+    2 select
+      to block 313 (entered with {}): 
+      to block 314 (entered with {}): 
+      window {}
+block 311 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 313 hotness 23 entered with {}
+    0 jump(315)
+      to block 315 (entered with {}): 
+      window {}
+block 315 hotness 23 entered with {}
+    0 window(GetTableHref, 7, out 14)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[14]*}
+    1 exec(numeric_int_cint_ADD)
+      flush: [14] <- w1
+      window {}
+    2 window(Move, 1, out 16)
+      w0 <- [1]; op at w0
+      window {w0=[1] w1=[16]*}
+    3 window(LoadKNumber, out 17)
+      op at w2
+      window {w0=[1] w1=[16]* w2=[17]*}
+    4 window(NumericIntInt, 15, 17, out 15)
+      w3 <- [15]; w4 <- w2; op at w3
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w5=[15]*}
+    5 jump(316)
+      to block 316 (entered with {w0=[1] w1=[16]* w2=[17]* w4=[17]* w5=[15]*}): 
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w5=[15]*}
+block 316 hotness 23 entered with {w0=[1] w1=[16]* w2=[17]* w4=[17]* w5=[15]*}
+    0 window(NumericIntInt, 15, 17, out 15)
+      w6 <- w2; op at w5
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+    1 guard(16, number)
+      tests w1
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+    2 thunk
+      exit after [16] <- w1; [17] <- w2; [15] <- w7
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+    3 jump(317)
+      to block 317 (entered with {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}): 
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+block 317 hotness 23 entered with {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+    0 window(ForLoop, 15, 16, 17, 18, out 18)
+      w0 <- w7; w3 <- [18]; op at w0
+      window {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+    1 select
+      to block 319 (entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}): 
+      to block 318 (entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}): 
+      window {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+block 314 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 318 hotness 54 entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+    0 window(SetTableHref, 7, 12)
+      w2 <- [7]; w3 <- [12]; op at w2
+      window {w0=[15]* w1=[16]* w2=[7] w3=[12] w4=[18]* w6=[17]* w7=[15]*}
+    1 window(SetTableHref, 7, 13)
+      w3 <- [13]; op at w2
+      window {w0=[15]* w1=[16]* w2=[7] w3=[13] w4=[18]* w6=[17]* w7=[15]*}
+    2 window(SetTableHref, 7, 14)
+      w3 <- [14]; op at w2
+      window {w0=[15]* w1=[16]* w2=[7] w3=[14] w4=[18]* w6=[17]* w7=[15]*}
+    3 window(NumericIntInt, 2, 12, out 15)
+      [18] <- w4; w3 <- [2]; w4 <- [12]; op at w3
+      window {w1=[16]* w2=[7] w3=[2] w4=[12] w5=[15]* w6=[17]*}
+    4 window(NumericIntInt, 8, 15, out 15)
+      w2 <- [8]; w3 <- w5; op at w2
+      window {w1=[16]* w2=[8] w4=[15]* w6=[17]*}
+    5 window(SetTableHref, 7, 15)
+      w3 <- [7]; op at w3
+      window {w1=[16]* w2=[8] w3=[7] w4=[15]* w6=[17]*}
+    6 window(NumericIntInt, 2, 13, out 15)
+      w3 <- [2]; w4 <- [13]; op at w3
+      window {w1=[16]* w2=[8] w3=[2] w4=[13] w5=[15]* w6=[17]*}
+    7 window(NumericIntInt, 9, 15, out 15)
+      w2 <- [9]; w3 <- w5; op at w2
+      window {w1=[16]* w2=[9] w4=[15]* w6=[17]*}
+    8 window(SetTableHref, 7, 15)
+      w3 <- [7]; op at w3
+      window {w1=[16]* w2=[9] w3=[7] w4=[15]* w6=[17]*}
+    9 window(NumericIntInt, 2, 14, out 15)
+      w3 <- [2]; w4 <- [14]; op at w3
+      window {w1=[16]* w2=[9] w3=[2] w4=[14] w5=[15]* w6=[17]*}
+   10 window(NumericIntInt, 10, 15, out 15)
+      w2 <- [10]; w3 <- w5; op at w2
+      window {w1=[16]* w2=[10] w4=[15]* w6=[17]*}
+   11 window(SetTableHref, 7, 15)
+      w3 <- [7]; op at w3
+      window {w1=[16]* w2=[10] w3=[7] w4=[15]* w6=[17]*}
+   12 window(NumericIntInt, 3, 5, out 3)
+      [17] <- w6; w5 <- [3]; w6 <- [5]; op at w5
+      window {w1=[16]* w2=[10] w3=[7] w4=[15]* w6=[5] w7=[3]*}
+   13 window(ForLoop, 3, 4, 5, 6, out 6)
+      [15] <- w4; w2 <- w7; w3 <- [4]; w4 <- w6; w5 <- [6]; op at w2
+      window {w1=[16]* w2=[3]* w3=[4] w4=[5] w6=[6]* w7=[3]*}
+   14 select
+      to block 268 (compiled, entered with {w0=[2] w1=[3]* w2=[4] w3=[5] w5=[6]* w6=[5] w7=[3]*}): [16] <- w1; w0 <- [2]; w1 <- w2; w2 <- w3; w3 <- w4; w5 <- w6; w6 <- w4
+      to block 267 (compiled, entered with {w0=[2] w1=[3]* w2=[4] w3=[5] w5=[6]* w6=[5] w7=[3]*}): [16] <- w1; w0 <- [2]; w1 <- w2; w2 <- w3; w3 <- w4; w5 <- w6; w6 <- w4
+      window {w1=[16]* w2=[3]* w3=[4] w4=[5] w6=[6]* w7=[3]*}
+block 319 hotness 33 entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+    0 window(GetTableIndex, 0, 18, out 19)
+      w3 <- [0]; op at w3
+      window {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+    1 guard(19, table)
+      tests w5
+      window {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+    2 thunk
+      exit after [16] <- w1; [17] <- w2; [15] <- w0; [18] <- w4; [19] <- w5
+      window {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+    3 jump(320)
+      to block 320 (entered with {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}): 
+      window {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+block 320 hotness 32 entered with {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+    0 exec(href_init)
+      flush: [16] <- w1; [17] <- w2; [15] <- w0; [18] <- w4; [19] <- w5
+      window {}
+    1 select
+      to block 321 (entered with {}): 
+      to block 322 (entered with {}): 
+      window {}
+block 321 hotness 33 entered with {}
+    0 jump(323)
+      to block 323 (entered with {}): 
+      window {}
+block 323 hotness 33 entered with {}
+    0 window(GetTableHref, 19, out 20)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[20]*}
+    1 window(NumericIntInt, 8, 20, out 20)
+      w0 <- [8]; op at w0
+      window {w0=[8] w2=[20]*}
+    2 exec(href_init)
+      flush: [20] <- w2
+      window {}
+    3 select
+      to block 324 (entered with {}): 
+      to block 325 (entered with {}): 
+      window {}
+block 322 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 324 hotness 33 entered with {}
+    0 jump(326)
+      to block 326 (entered with {}): 
+      window {}
+block 326 hotness 33 entered with {}
+    0 window(GetTableHref, 19, out 21)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[21]*}
+    1 window(NumericIntInt, 9, 21, out 21)
+      w0 <- [9]; op at w0
+      window {w0=[9] w2=[21]*}
+    2 exec(href_init)
+      flush: [21] <- w2
+      window {}
+    3 select
+      to block 327 (entered with {}): 
+      to block 328 (entered with {}): 
+      window {}
+block 325 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 327 hotness 33 entered with {}
+    0 jump(329)
+      to block 329 (entered with {}): 
+      window {}
+block 329 hotness 33 entered with {}
+    0 window(GetTableHref, 19, out 22)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[22]*}
+    1 window(NumericIntInt, 10, 22, out 22)
+      w0 <- [10]; op at w0
+      window {w0=[10] w2=[22]*}
+    2 window(NumericIntInt, 20, 20, out 23)
+      w3 <- [20]; w4 <- w3; op at w3
+      window {w0=[10] w2=[22]* w3=[20] w4=[20] w5=[23]*}
+    3 window(NumericIntInt, 21, 21, out 24)
+      [23] <- w5; w5 <- [21]; w6 <- w5; op at w5
+      window {w0=[10] w2=[22]* w3=[20] w4=[20] w5=[21] w6=[21] w7=[24]*}
+    4 window(NumericIntInt, 23, 24, out 23)
+      w3 <- [23]; w4 <- w7; op at w3
+      window {w0=[10] w2=[22]* w4=[24]* w5=[23]* w6=[21] w7=[24]*}
+    5 window(NumericIntInt, 22, 22, out 24)
+      w1 <- w2; op at w1
+      window {w0=[10] w1=[22]* w2=[22]* w3=[24]* w5=[23]* w6=[21]}
+    6 window(NumericIntInt, 23, 24, out 23)
+      w2 <- w5; op at w2
+      window {w0=[10] w1=[22]* w3=[24]* w4=[23]* w6=[21]}
+    7 window(GetUpval, out 24)
+      op at w2
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w6=[21]}
+    8 window(Move, 23, out 25)
+      op at w4
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w5=[25]* w6=[21]}
+    9 guard(24, func)
+      tests w2
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w5=[25]* w6=[21]}
+   10 thunk
+      exit after [22] <- w1; [24] <- w2; [23] <- w4; [25] <- w5
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w5=[25]* w6=[21]}
+   11 native_guard(24, 0x573b9f2ed490)
+      flush: [22] <- w1; [24] <- w2; [23] <- w4; [25] <- w5
+      window {}
+   12 thunk
+      exit after 
+      window {}
+   13 jump(330)
+      to block 330 (entered with {}): 
+      window {}
+block 330 hotness 33 entered with {}
+    0 ncall(0x573ba05d8838, 24, 2, 2)
+      window {}
+    1 guard(24, number)
+      tests [24]
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 jump(331)
+      to block 331 (entered with {}): 
+      window {}
+block 331 hotness 33 entered with {}
+    0 window(NumericIntInt, 24, 23, out 25)
+      w0 <- [24]; w1 <- [23]; op at w0
+      window {w0=[24] w1=[23] w2=[25]*}
+    1 window(NumericIntInt, 2, 25, out 24)
+      w1 <- [2]; op at w1
+      window {w1=[2] w2=[25]* w3=[24]*}
+    2 exec(href_init)
+      flush: [25] <- w2; [24] <- w3
+      window {}
+    3 select
+      to block 332 (entered with {}): 
+      to block 333 (entered with {}): 
+      window {}
+block 328 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 332 hotness 33 entered with {}
+    0 jump(334)
+      to block 334 (entered with {}): 
+      window {}
+block 334 hotness 33 entered with {}
+    0 window(GetTableHref, 19, out 25)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[25]*}
+    1 window(NumericIntInt, 25, 24, out 25)
+      w2 <- [24]; op at w1
+      window {w0=[19] w2=[24] w3=[25]*}
+    2 window(NumericIntInt, 20, 25, out 26)
+      w2 <- [20]; op at w2
+      window {w0=[19] w2=[20] w3=[25]* w4=[26]*}
+    3 window(NumericIntInt, 12, 26, out 12)
+      w5 <- [12]; w6 <- w4; op at w5
+      window {w0=[19] w2=[20] w3=[25]* w4=[26]* w6=[26]* w7=[12]*}
+    4 window(NumericIntInt, 21, 25, out 26)
+      w2 <- [21]; op at w2
+      window {w0=[19] w2=[21] w3=[25]* w4=[26]* w7=[12]*}
+    5 window(NumericIntInt, 13, 26, out 13)
+      w5 <- w4; w4 <- [13]; op at w4
+      window {w0=[19] w2=[21] w3=[25]* w5=[26]* w6=[13]* w7=[12]*}
+    6 window(NumericIntInt, 22, 25, out 26)
+      w2 <- [22]; op at w2
+      window {w0=[19] w2=[22] w3=[25]* w4=[26]* w6=[13]* w7=[12]*}
+    7 window(NumericIntInt, 14, 26, out 14)
+      w0 <- [14]; w1 <- w4; op at w0
+      window {w1=[26]* w2=[14]* w3=[25]* w4=[26]* w6=[13]* w7=[12]*}
+    8 window(NumericIntInt, 11, 24, out 25)
+      w3 <- [11]; w4 <- [24]; op at w3
+      window {w1=[26]* w2=[14]* w3=[11] w4=[24] w5=[25]* w6=[13]* w7=[12]*}
+    9 exec(href_init)
+      flush: [25] <- w5; [26] <- w1; [12] <- w7; [13] <- w6; [14] <- w2
+      window {}
+   10 select
+      to block 335 (entered with {}): 
+      to block 336 (entered with {}): 
+      window {}
+block 333 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 335 hotness 33 entered with {}
+    0 jump(337)
+      to block 337 (entered with {}): 
+      window {}
+block 337 hotness 33 entered with {}
+    0 window(GetTableHref, 19, out 26)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[26]*}
+    1 window(NumericIntInt, 20, 25, out 27)
+      w2 <- [20]; w3 <- [25]; op at w2
+      window {w0=[19] w1=[26]* w2=[20] w3=[25] w4=[27]*}
+    2 window(NumericIntInt, 26, 27, out 26)
+      w3 <- w1; op at w3
+      window {w0=[19] w2=[20] w4=[27]* w5=[26]*}
+    3 window(SetTableHref, 19, 26)
+      w1 <- w5; op at w0
+      window {w0=[19] w1=[26]* w2=[20] w4=[27]* w5=[26]*}
+    4 exec(href_init)
+      flush: [26] <- w1; [27] <- w4
+      window {}
+    5 select
+      to block 338 (entered with {}): 
+      to block 339 (entered with {}): 
+      window {}
+block 336 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 338 hotness 33 entered with {}
+    0 jump(259)
+      to block 259 (entered with {}): 
+      window {}
+block 259 hotness 22 entered with {}
+    0 window(GetTableHref, 19, out 26)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[26]*}
+    1 window(NumericIntInt, 21, 25, out 27)
+      w2 <- [21]; w3 <- [25]; op at w2
+      window {w0=[19] w1=[26]* w2=[21] w3=[25] w4=[27]*}
+    2 window(NumericIntInt, 26, 27, out 26)
+      w3 <- w1; op at w3
+      window {w0=[19] w2=[21] w4=[27]* w5=[26]*}
+    3 window(SetTableHref, 19, 26)
+      w1 <- w5; op at w0
+      window {w0=[19] w1=[26]* w2=[21] w4=[27]* w5=[26]*}
+    4 exec(href_init)
+      flush: [26] <- w1; [27] <- w4
+      window {}
+    5 select
+      to block 260 (entered with {}): 
+      to block 261 (entered with {}): 
+      window {}
+block 260 hotness 22 entered with {}
+    0 jump(262)
+      to block 262 (entered with {}): 
+      window {}
+block 262 hotness 22 entered with {}
+    0 window(GetTableHref, 19, out 26)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[26]*}
+    1 window(NumericIntInt, 22, 25, out 27)
+      w2 <- [22]; w3 <- [25]; op at w2
+      window {w0=[19] w1=[26]* w2=[22] w3=[25] w4=[27]*}
+    2 window(NumericIntInt, 26, 27, out 26)
+      w3 <- w1; op at w3
+      window {w0=[19] w2=[22] w4=[27]* w5=[26]*}
+    3 window(SetTableHref, 19, 26)
+      w1 <- w5; op at w0
+      window {w0=[19] w1=[26]* w2=[22] w4=[27]* w5=[26]*}
+    4 window(NumericIntInt, 15, 17, out 15)
+      w5 <- [15]; w6 <- [17]; op at w5
+      window {w0=[19] w1=[26]* w2=[22] w4=[27]* w6=[17] w7=[15]*}
+    5 window(ForLoop, 15, 16, 17, 18, out 18)
+      [27] <- w4; w2 <- w7; w3 <- [16]; w4 <- w6; w5 <- [18]; op at w2
+      window {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}
+    6 select
+      to block 269 (compiled, entered with {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}): 
+      to block 263 (compiled, entered with {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}): 
+      window {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}
+block 261 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 339 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+== region entered at block 269
+block 269 compiled already, entered with {w0=[19] w1=[26]* w2=[15]* w3=[16] w4=[17] w6=[18]* w7=[15]*}: w0 <- [19]; w1 <- [26]; w2 <- [15]; w3 <- [16]; w4 <- [17]; w6 <- [18]; w7 <- [15]
+== region entered at block 259
+block 259 compiled already, entered with {}: 
+== region entered at block 208
+block 208 hotness 0 entered with {}
+    0 guard(0, table)
+      tests [0]
+      window {}
+    1 thunk
+      exit after 
+      window {}
+    2 jump(209)
+      to block 209 (entered with {}): 
+      window {}
+block 209 hotness 0 entered with {}
+    0 guard(6, number)
+      tests [6]
+      window {}
+    1 thunk
+      exit after 
+      window {}
+    2 jump(210)
+      to block 210 (entered with {}): 
+      window {}
+block 210 hotness 1 entered with {}
+    0 window(GetTableIndex, 0, 6, out 7)
+      w0 <- [0]; w1 <- [6]; op at w0
+      window {w0=[0] w1=[6] w2=[7]*}
+    1 guard(7, table)
+      tests w2
+      window {w0=[0] w1=[6] w2=[7]*}
+    2 thunk
+      exit after [7] <- w2
+      window {w0=[0] w1=[6] w2=[7]*}
+    3 jump(211)
+      to block 211 (entered with {w0=[0] w1=[6] w2=[7]*}): 
+      window {w0=[0] w1=[6] w2=[7]*}
+block 211 hotness 0 entered with {w0=[0] w1=[6] w2=[7]*}
+    0 exec(href_init)
+      flush: [7] <- w2
+      window {}
+    1 select
+      to block 212 (entered with {}): 
+      to block 213 (entered with {}): 
+      window {}
+block 212 hotness 1 entered with {}
+    0 jump(214)
+      to block 214 (entered with {}): 
+      window {}
+block 214 hotness 1 entered with {}
+    0 window(GetTableHref, 7, out 8)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[8]*}
+    1 exec(href_init)
+      flush: [8] <- w1
+      window {}
+    2 select
+      to block 215 (entered with {}): 
+      to block 216 (entered with {}): 
+      window {}
+block 213 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 215 hotness 1 entered with {}
+    0 jump(217)
+      to block 217 (entered with {}): 
+      window {}
+block 217 hotness 1 entered with {}
+    0 window(GetTableHref, 7, out 9)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[9]*}
+    1 exec(href_init)
+      flush: [9] <- w1
+      window {}
+    2 select
+      to block 218 (entered with {}): 
+      to block 219 (entered with {}): 
+      window {}
+block 216 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 218 hotness 1 entered with {}
+    0 jump(220)
+      to block 220 (entered with {}): 
+      window {}
+block 220 hotness 1 entered with {}
+    0 window(GetTableHref, 7, out 10)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[10]*}
+    1 exec(href_init)
+      flush: [10] <- w1
+      window {}
+    2 select
+      to block 221 (entered with {}): 
+      to block 222 (entered with {}): 
+      window {}
+block 219 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 221 hotness 1 entered with {}
+    0 jump(223)
+      to block 223 (entered with {}): 
+      window {}
+block 223 hotness 1 entered with {}
+    0 window(GetTableHref, 7, out 11)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[11]*}
+    1 exec(href_init)
+      flush: [11] <- w1
+      window {}
+    2 select
+      to block 224 (entered with {}): 
+      to block 225 (entered with {}): 
+      window {}
+block 222 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 224 hotness 1 entered with {}
+    0 jump(226)
+      to block 226 (entered with {}): 
+      window {}
+block 226 hotness 1 entered with {}
+    0 window(GetTableHref, 7, out 12)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[12]*}
+    1 exec(href_init)
+      flush: [12] <- w1
+      window {}
+    2 select
+      to block 227 (entered with {}): 
+      to block 228 (entered with {}): 
+      window {}
+block 225 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 227 hotness 1 entered with {}
+    0 jump(229)
+      to block 229 (entered with {}): 
+      window {}
+block 229 hotness 1 entered with {}
+    0 window(GetTableHref, 7, out 13)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[13]*}
+    1 exec(href_init)
+      flush: [13] <- w1
+      window {}
+    2 select
+      to block 230 (entered with {}): 
+      to block 231 (entered with {}): 
+      window {}
+block 228 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 230 hotness 1 entered with {}
+    0 jump(232)
+      to block 232 (entered with {}): 
+      window {}
+block 232 hotness 1 entered with {}
+    0 window(GetTableHref, 7, out 14)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[14]*}
+    1 exec(numeric_int_cint_ADD)
+      flush: [14] <- w1
+      window {}
+    2 window(Move, 1, out 16)
+      w0 <- [1]; op at w0
+      window {w0=[1] w1=[16]*}
+    3 window(LoadKNumber, out 17)
+      op at w2
+      window {w0=[1] w1=[16]* w2=[17]*}
+    4 window(NumericIntInt, 15, 17, out 15)
+      w3 <- [15]; w4 <- w2; op at w3
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w5=[15]*}
+    5 jump(233)
+      to block 233 (entered with {w0=[1] w1=[16]* w2=[17]* w4=[17]* w5=[15]*}): 
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w5=[15]*}
+block 233 hotness 1 entered with {w0=[1] w1=[16]* w2=[17]* w4=[17]* w5=[15]*}
+    0 window(NumericIntInt, 15, 17, out 15)
+      w6 <- w2; op at w5
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+    1 guard(16, number)
+      tests w1
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+    2 thunk
+      exit after [16] <- w1; [17] <- w2; [15] <- w7
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+    3 jump(234)
+      to block 234 (entered with {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}): 
+      window {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+block 234 hotness 1 entered with {w0=[1] w1=[16]* w2=[17]* w4=[17]* w6=[17]* w7=[15]*}
+    0 window(ForLoop, 15, 16, 17, 18, out 18)
+      w0 <- w7; w3 <- [18]; op at w0
+      window {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+    1 select
+      to block 236 (entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}): 
+      to block 235 (entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}): 
+      window {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+block 231 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 235 hotness 64 entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+    0 window(SetTableHref, 7, 12)
+      w2 <- [7]; w3 <- [12]; op at w2
+      window {w0=[15]* w1=[16]* w2=[7] w3=[12] w4=[18]* w6=[17]* w7=[15]*}
+    1 window(SetTableHref, 7, 13)
+      w3 <- [13]; op at w2
+      window {w0=[15]* w1=[16]* w2=[7] w3=[13] w4=[18]* w6=[17]* w7=[15]*}
+    2 window(SetTableHref, 7, 14)
+      w3 <- [14]; op at w2
+      window {w0=[15]* w1=[16]* w2=[7] w3=[14] w4=[18]* w6=[17]* w7=[15]*}
+    3 thunk
+      exit after [16] <- w1; [17] <- w6; [15] <- w0; [18] <- w4
+      window {w0=[15]* w1=[16]* w2=[7] w3=[14] w4=[18]* w6=[17]* w7=[15]*}
+block 236 hotness 0 entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+    0 guard(18, number)
+      tests w4
+      window {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+    1 thunk
+      exit after [16] <- w1; [17] <- w2; [15] <- w0; [18] <- w4
+      window {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+    2 jump(237)
+      to block 237 (entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}): 
+      window {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+block 237 hotness 1 entered with {w0=[15]* w1=[16]* w2=[17]* w4=[18]* w6=[17]* w7=[15]*}
+    0 window(GetTableIndex, 0, 18, out 19)
+      w3 <- [0]; op at w3
+      window {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+    1 guard(19, table)
+      tests w5
+      window {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+    2 thunk
+      exit after [16] <- w1; [17] <- w2; [15] <- w0; [18] <- w4; [19] <- w5
+      window {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+    3 jump(238)
+      to block 238 (entered with {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}): 
+      window {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+block 238 hotness 0 entered with {w0=[15]* w1=[16]* w2=[17]* w3=[0] w4=[18]* w5=[19]* w6=[17]* w7=[15]*}
+    0 exec(href_init)
+      flush: [16] <- w1; [17] <- w2; [15] <- w0; [18] <- w4; [19] <- w5
+      window {}
+    1 select
+      to block 239 (entered with {}): 
+      to block 240 (entered with {}): 
+      window {}
+block 239 hotness 1 entered with {}
+    0 jump(241)
+      to block 241 (entered with {}): 
+      window {}
+block 241 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 20)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[20]*}
+    1 window(NumericIntInt, 8, 20, out 20)
+      w0 <- [8]; op at w0
+      window {w0=[8] w2=[20]*}
+    2 exec(href_init)
+      flush: [20] <- w2
+      window {}
+    3 select
+      to block 242 (entered with {}): 
+      to block 243 (entered with {}): 
+      window {}
+block 240 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 242 hotness 1 entered with {}
+    0 jump(244)
+      to block 244 (entered with {}): 
+      window {}
+block 244 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 21)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[21]*}
+    1 window(NumericIntInt, 9, 21, out 21)
+      w0 <- [9]; op at w0
+      window {w0=[9] w2=[21]*}
+    2 exec(href_init)
+      flush: [21] <- w2
+      window {}
+    3 select
+      to block 245 (entered with {}): 
+      to block 246 (entered with {}): 
+      window {}
+block 243 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 245 hotness 1 entered with {}
+    0 jump(247)
+      to block 247 (entered with {}): 
+      window {}
+block 247 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 22)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[22]*}
+    1 window(NumericIntInt, 10, 22, out 22)
+      w0 <- [10]; op at w0
+      window {w0=[10] w2=[22]*}
+    2 window(NumericIntInt, 20, 20, out 23)
+      w3 <- [20]; w4 <- w3; op at w3
+      window {w0=[10] w2=[22]* w3=[20] w4=[20] w5=[23]*}
+    3 window(NumericIntInt, 21, 21, out 24)
+      [23] <- w5; w5 <- [21]; w6 <- w5; op at w5
+      window {w0=[10] w2=[22]* w3=[20] w4=[20] w5=[21] w6=[21] w7=[24]*}
+    4 window(NumericIntInt, 23, 24, out 23)
+      w3 <- [23]; w4 <- w7; op at w3
+      window {w0=[10] w2=[22]* w4=[24]* w5=[23]* w6=[21] w7=[24]*}
+    5 window(NumericIntInt, 22, 22, out 24)
+      w1 <- w2; op at w1
+      window {w0=[10] w1=[22]* w2=[22]* w3=[24]* w5=[23]* w6=[21]}
+    6 window(NumericIntInt, 23, 24, out 23)
+      w2 <- w5; op at w2
+      window {w0=[10] w1=[22]* w3=[24]* w4=[23]* w6=[21]}
+    7 window(GetUpval, out 24)
+      op at w2
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w6=[21]}
+    8 window(Move, 23, out 25)
+      op at w4
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w5=[25]* w6=[21]}
+    9 guard(24, func)
+      tests w2
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w5=[25]* w6=[21]}
+   10 thunk
+      exit after [22] <- w1; [24] <- w2; [23] <- w4; [25] <- w5
+      window {w0=[10] w1=[22]* w2=[24]* w4=[23]* w5=[25]* w6=[21]}
+   11 native_guard(24, 0x573b9f2ed490)
+      flush: [22] <- w1; [24] <- w2; [23] <- w4; [25] <- w5
+      window {}
+   12 thunk
+      exit after 
+      window {}
+   13 jump(248)
+      to block 248 (entered with {}): 
+      window {}
+block 248 hotness 1 entered with {}
+    0 ncall(0x573ba0599528, 24, 2, 2)
+      window {}
+    1 guard(24, number)
+      tests [24]
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 jump(249)
+      to block 249 (entered with {}): 
+      window {}
+block 249 hotness 1 entered with {}
+    0 window(NumericIntInt, 24, 23, out 25)
+      w0 <- [24]; w1 <- [23]; op at w0
+      window {w0=[24] w1=[23] w2=[25]*}
+    1 guard(2, number)
+      tests [2]
+      window {w0=[24] w1=[23] w2=[25]*}
+    2 thunk
+      exit after [25] <- w2
+      window {w0=[24] w1=[23] w2=[25]*}
+    3 jump(250)
+      to block 250 (entered with {w0=[24] w1=[23] w2=[25]*}): 
+      window {w0=[24] w1=[23] w2=[25]*}
+block 250 hotness 1 entered with {w0=[24] w1=[23] w2=[25]*}
+    0 window(NumericIntInt, 2, 25, out 24)
+      w1 <- [2]; op at w1
+      window {w1=[2] w2=[25]* w3=[24]*}
+    1 exec(href_init)
+      flush: [25] <- w2; [24] <- w3
+      window {}
+    2 select
+      to block 251 (entered with {}): 
+      to block 252 (entered with {}): 
+      window {}
+block 246 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 251 hotness 1 entered with {}
+    0 jump(253)
+      to block 253 (entered with {}): 
+      window {}
+block 253 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 25)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[25]*}
+    1 window(NumericIntInt, 25, 24, out 25)
+      w2 <- [24]; op at w1
+      window {w0=[19] w2=[24] w3=[25]*}
+    2 window(NumericIntInt, 20, 25, out 26)
+      w2 <- [20]; op at w2
+      window {w0=[19] w2=[20] w3=[25]* w4=[26]*}
+    3 window(NumericIntInt, 12, 26, out 12)
+      w5 <- [12]; w6 <- w4; op at w5
+      window {w0=[19] w2=[20] w3=[25]* w4=[26]* w6=[26]* w7=[12]*}
+    4 window(NumericIntInt, 21, 25, out 26)
+      w2 <- [21]; op at w2
+      window {w0=[19] w2=[21] w3=[25]* w4=[26]* w7=[12]*}
+    5 window(NumericIntInt, 13, 26, out 13)
+      w5 <- w4; w4 <- [13]; op at w4
+      window {w0=[19] w2=[21] w3=[25]* w5=[26]* w6=[13]* w7=[12]*}
+    6 window(NumericIntInt, 22, 25, out 26)
+      w2 <- [22]; op at w2
+      window {w0=[19] w2=[22] w3=[25]* w4=[26]* w6=[13]* w7=[12]*}
+    7 window(NumericIntInt, 14, 26, out 14)
+      w0 <- [14]; w1 <- w4; op at w0
+      window {w1=[26]* w2=[14]* w3=[25]* w4=[26]* w6=[13]* w7=[12]*}
+    8 window(NumericIntInt, 11, 24, out 25)
+      w3 <- [11]; w4 <- [24]; op at w3
+      window {w1=[26]* w2=[14]* w3=[11] w4=[24] w5=[25]* w6=[13]* w7=[12]*}
+    9 exec(href_init)
+      flush: [25] <- w5; [26] <- w1; [12] <- w7; [13] <- w6; [14] <- w2
+      window {}
+   10 select
+      to block 254 (entered with {}): 
+      to block 255 (entered with {}): 
+      window {}
+block 252 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 254 hotness 1 entered with {}
+    0 jump(256)
+      to block 256 (entered with {}): 
+      window {}
+block 256 hotness 1 entered with {}
+    0 window(GetTableHref, 19, out 26)
+      w0 <- [19]; op at w0
+      window {w0=[19] w1=[26]*}
+    1 window(NumericIntInt, 20, 25, out 27)
+      w2 <- [20]; w3 <- [25]; op at w2
+      window {w0=[19] w1=[26]* w2=[20] w3=[25] w4=[27]*}
+    2 window(NumericIntInt, 26, 27, out 26)
+      w3 <- w1; op at w3
+      window {w0=[19] w2=[20] w4=[27]* w5=[26]*}
+    3 window(SetTableHref, 19, 26)
+      w1 <- w5; op at w0
+      window {w0=[19] w1=[26]* w2=[20] w4=[27]* w5=[26]*}
+    4 exec(href_init)
+      flush: [26] <- w1; [27] <- w4
+      window {}
+    5 select
+      to block 257 (entered with {}): 
+      to block 258 (entered with {}): 
+      window {}
+block 255 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 257 hotness 1 entered with {}
+    0 jump(259)
+      to block 259 (compiled, entered with {}): 
+      window {}
+block 258 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+== region entered at block 201
+block 201 hotness 0 entered with {}
+    0 lcall(0x573ba0581748, 7, 4, 1)
+      window {}
+    1 window(NumericIntInt, 3, 5, out 3)
+      w0 <- [3]; w1 <- [5]; op at w0
+      window {w1=[5] w2=[3]*}
+    2 window(ForLoop, 3, 4, 5, 6, out 6)
+      w3 <- [4]; w4 <- w1; w5 <- [6]; op at w2
+      window {w1=[5] w2=[3]* w3=[4] w4=[5] w6=[6]*}
+    3 select
+      to block 203 (entered with {w1=[5] w2=[3]* w3=[4] w4=[5] w6=[6]*}): 
+      to block 202 (entered with {w1=[5] w2=[3]* w3=[4] w4=[5] w6=[6]*}): 
+      window {w1=[5] w2=[3]* w3=[4] w4=[5] w6=[6]*}
+block 202 hotness 64 entered with {w1=[5] w2=[3]* w3=[4] w4=[5] w6=[6]*}
+    0 window(GetUpval, out 3)
+      op at w0
+      window {w0=[3]* w1=[5] w3=[4] w4=[5] w6=[6]*}
+    1 exec(getglobal)
+      flush: [3] <- w0; [6] <- w6
+      window {}
+    2 window(Move, 2, out 5)
+      w0 <- [2]; op at w0
+      window {w0=[2] w1=[5]*}
+    3 thunk
+      exit after [5] <- w1
+      window {w0=[2] w1=[5]*}
+block 203 hotness 0 entered with {w1=[5] w2=[3]* w3=[4] w4=[5] w6=[6]*}
+    0 window(GetUpval, out 7)
+      op at w0
+      window {w0=[7]* w1=[5] w2=[3]* w3=[4] w4=[5] w6=[6]*}
+    1 exec(getglobal)
+      flush: [3] <- w2; [6] <- w6; [7] <- w0
+      window {}
+    2 window(Move, 2, out 9)
+      w0 <- [2]; op at w0
+      window {w0=[2] w1=[9]*}
+    3 window(LoadKNumber, out 10)
+      op at w2
+      window {w0=[2] w1=[9]* w2=[10]*}
+    4 guard(7, func)
+      tests [7]
+      window {w0=[2] w1=[9]* w2=[10]*}
+    5 thunk
+      exit after [9] <- w1; [10] <- w2
+      window {w0=[2] w1=[9]* w2=[10]*}
+    6 lua_guard(7, 0x573ba0518500)
+      flush: [9] <- w1; [10] <- w2
+      window {}
+    7 thunk
+      exit after 
+      window {}
+    8 jump(201)
+      to block 201 (compiled, entered with {}): 
+      window {}
+== region entered at block 204
+block 204 hotness 0 entered with {}
+    0 window(LoadKNumber, out 3)
+      op at w0
+      window {w0=[3]*}
+    1 window(Move, 1, out 4)
+      w1 <- [1]; op at w1
+      window {w0=[3]* w1=[1] w2=[4]*}
+    2 window(LoadKNumber, out 5)
+      op at w3
+      window {w0=[3]* w1=[1] w2=[4]* w3=[5]*}
+    3 window(NumericIntInt, 3, 5, out 3)
+      w4 <- w0; w5 <- w3; op at w4
+      window {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}
+    4 jump(205)
+      to block 205 (entered with {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}): 
+      window {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}
+block 205 hotness 0 entered with {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}
+    0 window(NumericIntInt, 3, 5, out 3)
+      w4 <- w6; op at w4
+      window {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}
+    1 guard(4, number)
+      tests w2
+      window {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}
+    2 thunk
+      exit after [3] <- w6; [4] <- w2; [5] <- w3
+      window {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}
+    3 jump(206)
+      to block 206 (entered with {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}): 
+      window {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}
+block 206 hotness 0 entered with {w1=[1] w2=[4]* w3=[5]* w5=[5]* w6=[3]*}
+    0 window(ForLoop, 3, 4, 5, 6, out 6)
+      w1 <- w6; w4 <- [6]; op at w1
+      window {w1=[3]* w2=[4]* w3=[5]* w5=[6]* w6=[3]*}
+    1 select
+      to block 208 (compiled, entered with {}): [3] <- w1; [4] <- w2; [5] <- w3; [6] <- w5
+      to block 207 (entered with {w1=[3]* w2=[4]* w3=[5]* w5=[6]* w6=[3]*}): 
+      window {w1=[3]* w2=[4]* w3=[5]* w5=[6]* w6=[3]*}
+block 207 hotness 64 entered with {w1=[3]* w2=[4]* w3=[5]* w5=[6]* w6=[3]*}
+    0 ret
+      flush: [3] <- w1; [4] <- w2; [5] <- w3; [6] <- w5
+      window {}
+== region entered at block 203
+block 203 compiled already, entered with {w1=[5] w2=[3]* w3=[4] w4=[5] w6=[6]*}: w1 <- [5]; w2 <- [3]; w3 <- [4]; w4 <- [5]; w6 <- [6]
+== region entered at block 140
+block 140 hotness 0 entered with {}
+    0 ncall(0x573ba055dd28, 20, 2, 2)
+      window {}
+    1 exec(href_init)
+      window {}
+    2 select
+      to block 141 (entered with {}): 
+      to block 142 (entered with {}): 
+      window {}
+block 141 hotness 0 entered with {}
+    0 jump(143)
+      to block 143 (entered with {}): 
+      window {}
+block 143 hotness 0 entered with {}
+    0 window(GetTableHref, 16, out 21)
+      w0 <- [16]; op at w0
+      window {w0=[16] w1=[21]*}
+    1 window(NumericIntInt, 11, 21, out 21)
+      w0 <- [11]; op at w0
+      window {w0=[11] w2=[21]*}
+    2 guard(20, number)
+      tests [20]
+      window {w0=[11] w2=[21]*}
+    3 thunk
+      exit after [21] <- w2
+      window {w0=[11] w2=[21]*}
+    4 jump(144)
+      to block 144 (entered with {w0=[11] w2=[21]*}): 
+      window {w0=[11] w2=[21]*}
+block 144 hotness 0 entered with {w0=[11] w2=[21]*}
+    0 window(NumericIntInt, 21, 20, out 21)
+      w3 <- [20]; op at w2
+      window {w0=[11] w3=[20] w4=[21]*}
+    1 window(NumericIntInt, 2, 21, out 2)
+      w3 <- [2]; op at w3
+      window {w0=[11] w4=[21]* w5=[2]*}
+    2 window(NumericIntInt, 12, 14, out 12)
+      w1 <- [12]; w2 <- [14]; op at w1
+      window {w0=[11] w2=[14] w3=[12]* w4=[21]* w5=[2]*}
+    3 window(ForLoop, 12, 13, 14, 15, out 15)
+      [21] <- w4; w0 <- w3; w1 <- [13]; w3 <- [15]; op at w0
+      window {w0=[12]* w1=[13] w2=[14] w4=[15]* w5=[2]*}
+    4 select
+      to block 148 (entered with {w0=[12]* w1=[13] w2=[14] w4=[15]* w5=[2]*}): 
+      to block 145 (entered with {w0=[12]* w1=[13] w2=[14] w4=[15]* w5=[2]*}): 
+      window {w0=[12]* w1=[13] w2=[14] w4=[15]* w5=[2]*}
+block 142 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 145 hotness 39 entered with {w0=[12]* w1=[13] w2=[14] w4=[15]* w5=[2]*}
+    0 window(NumericIntInt, 3, 5, out 3)
+      w1 <- [3]; w2 <- [5]; op at w1
+      window {w0=[12]* w2=[5] w3=[3]* w4=[15]* w5=[2]*}
+    1 window(ForLoop, 3, 4, 5, 6, out 6)
+      [15] <- w4; [2] <- w5; w4 <- [4]; w5 <- w2; w6 <- [6]; op at w3
+      window {w0=[12]* w2=[5] w3=[3]* w4=[4] w5=[5] w7=[6]*}
+    2 select
+      to block 147 (entered with {w0=[12]* w2=[5] w3=[3]* w4=[4] w5=[5] w7=[6]*}): 
+      to block 146 (entered with {w0=[12]* w2=[5] w3=[3]* w4=[4] w5=[5] w7=[6]*}): 
+      window {w0=[12]* w2=[5] w3=[3]* w4=[4] w5=[5] w7=[6]*}
+block 146 hotness 64 entered with {w0=[12]* w2=[5] w3=[3]* w4=[4] w5=[5] w7=[6]*}
+    0 ret
+      flush: [12] <- w0; [3] <- w3; [6] <- w7
+      window {}
+block 147 hotness 39 entered with {w0=[12]* w2=[5] w3=[3]* w4=[4] w5=[5] w7=[6]*}
+    0 window(GetTableIndex, 0, 6, out 7)
+      w4 <- [0]; w5 <- w7; op at w4
+      window {w0=[12]* w2=[5] w3=[3]* w4=[0] w5=[6]* w6=[7]* w7=[6]*}
+    1 guard(7, table)
+      tests w6
+      window {w0=[12]* w2=[5] w3=[3]* w4=[0] w5=[6]* w6=[7]* w7=[6]*}
+    2 thunk
+      exit after [12] <- w0; [3] <- w3; [6] <- w5; [7] <- w6
+      window {w0=[12]* w2=[5] w3=[3]* w4=[0] w5=[6]* w6=[7]* w7=[6]*}
+    3 jump(159)
+      to block 159 (entered with {w0=[12]* w2=[5] w3=[3]* w4=[0] w5=[6]* w6=[7]* w7=[6]*}): 
+      window {w0=[12]* w2=[5] w3=[3]* w4=[0] w5=[6]* w6=[7]* w7=[6]*}
+block 159 hotness 38 entered with {w0=[12]* w2=[5] w3=[3]* w4=[0] w5=[6]* w6=[7]* w7=[6]*}
+    0 exec(href_init)
+      flush: [12] <- w0; [3] <- w3; [6] <- w5; [7] <- w6
+      window {}
+    1 select
+      to block 160 (entered with {}): 
+      to block 161 (entered with {}): 
+      window {}
+block 148 hotness 25 entered with {w0=[12]* w1=[13] w2=[14] w4=[15]* w5=[2]*}
+    0 window(GetTableIndex, 0, 15, out 16)
+      w1 <- [0]; w2 <- w4; op at w1
+      window {w0=[12]* w1=[0] w2=[15]* w3=[16]* w4=[15]* w5=[2]*}
+    1 window(GetTableHref, 7, out 17)
+      w6 <- [7]; op at w6
+      window {w0=[12]* w1=[0] w2=[15]* w3=[16]* w4=[15]* w5=[2]* w6=[7] w7=[17]*}
+    2 guard(16, table)
+      tests w3
+      window {w0=[12]* w1=[0] w2=[15]* w3=[16]* w4=[15]* w5=[2]* w6=[7] w7=[17]*}
+    3 thunk
+      exit after [2] <- w5; [12] <- w0; [15] <- w2; [16] <- w3; [17] <- w7
+      window {w0=[12]* w1=[0] w2=[15]* w3=[16]* w4=[15]* w5=[2]* w6=[7] w7=[17]*}
+    4 jump(149)
+      to block 149 (entered with {w0=[12]* w1=[0] w2=[15]* w3=[16]* w4=[15]* w5=[2]* w6=[7] w7=[17]*}): 
+      window {w0=[12]* w1=[0] w2=[15]* w3=[16]* w4=[15]* w5=[2]* w6=[7] w7=[17]*}
+block 149 hotness 24 entered with {w0=[12]* w1=[0] w2=[15]* w3=[16]* w4=[15]* w5=[2]* w6=[7] w7=[17]*}
+    0 exec(href_init)
+      flush: [2] <- w5; [12] <- w0; [15] <- w2; [16] <- w3; [17] <- w7
+      window {}
+    1 select
+      to block 150 (entered with {}): 
+      to block 151 (entered with {}): 
+      window {}
+block 150 hotness 25 entered with {}
+    0 jump(152)
+      to block 152 (entered with {}): 
+      window {}
+block 152 hotness 25 entered with {}
+    0 window(GetTableHref, 16, out 18)
+      w0 <- [16]; op at w0
+      window {w0=[16] w1=[18]*}
+    1 window(NumericIntInt, 17, 18, out 17)
+      w0 <- [17]; op at w0
+      window {w1=[18]* w2=[17]*}
+    2 window(GetTableHref, 7, out 18)
+      w3 <- [7]; op at w3
+      window {w2=[17]* w3=[7] w4=[18]*}
+    3 exec(href_init)
+      flush: [18] <- w4; [17] <- w2
+      window {}
+    4 select
+      to block 153 (entered with {}): 
+      to block 154 (entered with {}): 
+      window {}
+block 151 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 153 hotness 25 entered with {}
+    0 jump(155)
+      to block 155 (entered with {}): 
+      window {}
+block 155 hotness 25 entered with {}
+    0 window(GetTableHref, 16, out 19)
+      w0 <- [16]; op at w0
+      window {w0=[16] w1=[19]*}
+    1 window(NumericIntInt, 18, 19, out 18)
+      w0 <- [18]; op at w0
+      window {w1=[19]* w2=[18]*}
+    2 window(GetTableHref, 7, out 19)
+      w3 <- [7]; op at w3
+      window {w2=[18]* w3=[7] w4=[19]*}
+    3 exec(href_init)
+      flush: [19] <- w4; [18] <- w2
+      window {}
+    4 select
+      to block 156 (entered with {}): 
+      to block 157 (entered with {}): 
+      window {}
+block 154 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 156 hotness 25 entered with {}
+    0 jump(158)
+      to block 158 (entered with {}): 
+      window {}
+block 158 hotness 6 entered with {}
+    0 window(GetTableHref, 16, out 20)
+      w0 <- [16]; op at w0
+      window {w0=[16] w1=[20]*}
+    1 window(NumericIntInt, 19, 20, out 19)
+      w0 <- [19]; op at w0
+      window {w1=[20]* w2=[19]*}
+    2 window(GetUpval, out 20)
+      op at w0
+      window {w0=[20]* w2=[19]*}
+    3 window(NumericIntInt, 17, 17, out 21)
+      w3 <- [17]; w4 <- w3; op at w3
+      window {w0=[20]* w2=[19]* w3=[17] w4=[17] w5=[21]*}
+    4 window(NumericIntInt, 18, 18, out 22)
+      [21] <- w5; w5 <- [18]; w6 <- w5; op at w5
+      window {w0=[20]* w2=[19]* w3=[17] w4=[17] w5=[18] w6=[18] w7=[22]*}
+    5 window(NumericIntInt, 21, 22, out 21)
+      w3 <- [21]; w4 <- w7; op at w3
+      window {w0=[20]* w2=[19]* w4=[22]* w5=[21]* w6=[18] w7=[22]*}
+    6 window(NumericIntInt, 19, 19, out 22)
+      w1 <- w2; op at w1
+      window {w0=[20]* w1=[19]* w2=[19]* w3=[22]* w5=[21]* w6=[18]}
+    7 window(NumericIntInt, 21, 22, out 21)
+      w2 <- w5; op at w2
+      window {w0=[20]* w1=[19]* w3=[22]* w4=[21]* w6=[18]}
+    8 guard(20, func)
+      tests w0
+      window {w0=[20]* w1=[19]* w3=[22]* w4=[21]* w6=[18]}
+    9 thunk
+      exit after [20] <- w0; [19] <- w1; [22] <- w3; [21] <- w4
+      window {w0=[20]* w1=[19]* w3=[22]* w4=[21]* w6=[18]}
+   10 native_guard(20, 0x573b9f2ed490)
+      flush: [20] <- w0; [19] <- w1; [22] <- w3; [21] <- w4
+      window {}
+   11 thunk
+      exit after 
+      window {}
+   12 jump(140)
+      to block 140 (compiled, entered with {}): 
+      window {}
+block 157 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 160 hotness 39 entered with {}
+    0 jump(162)
+      to block 162 (entered with {}): 
+      window {}
+block 162 hotness 39 entered with {}
+    0 window(GetTableHref, 7, out 8)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[8]*}
+    1 exec(href_init)
+      flush: [8] <- w1
+      window {}
+    2 select
+      to block 163 (entered with {}): 
+      to block 164 (entered with {}): 
+      window {}
+block 161 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 163 hotness 39 entered with {}
+    0 jump(165)
+      to block 165 (entered with {}): 
+      window {}
+block 165 hotness 39 entered with {}
+    0 window(GetTableHref, 7, out 9)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[9]*}
+    1 exec(href_init)
+      flush: [9] <- w1
+      window {}
+    2 select
+      to block 166 (entered with {}): 
+      to block 167 (entered with {}): 
+      window {}
+block 164 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 166 hotness 39 entered with {}
+    0 jump(168)
+      to block 168 (entered with {}): 
+      window {}
+block 168 hotness 39 entered with {}
+    0 window(GetTableHref, 7, out 10)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[10]*}
+    1 exec(href_init)
+      flush: [10] <- w1
+      window {}
+    2 select
+      to block 169 (entered with {}): 
+      to block 170 (entered with {}): 
+      window {}
+block 167 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 169 hotness 39 entered with {}
+    0 jump(171)
+      to block 171 (entered with {}): 
+      window {}
+block 171 hotness 39 entered with {}
+    0 window(GetTableHref, 7, out 11)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[11]*}
+    1 exec(numeric_cint_int_MUL)
+      flush: [11] <- w1
+      window {}
+    2 window(NumericIntInt, 8, 8, out 13)
+      w0 <- [8]; w1 <- w0; op at w0
+      window {w0=[8] w1=[8] w2=[13]*}
+    3 window(NumericIntInt, 9, 9, out 14)
+      w3 <- [9]; w4 <- w3; op at w3
+      window {w0=[8] w1=[8] w2=[13]* w3=[9] w4=[9] w5=[14]*}
+    4 window(NumericIntInt, 13, 14, out 13)
+      w4 <- w2; op at w4
+      window {w0=[8] w1=[8] w3=[9] w5=[14]* w6=[13]*}
+    5 window(NumericIntInt, 10, 10, out 14)
+      w2 <- [10]; w3 <- w2; op at w2
+      window {w0=[8] w1=[8] w2=[10] w3=[10] w4=[14]* w6=[13]*}
+    6 window(NumericIntInt, 13, 14, out 13)
+      w3 <- w6; op at w3
+      window {w0=[8] w1=[8] w2=[10] w4=[14]* w5=[13]*}
+    7 window(NumericIntInt, 12, 13, out 12)
+      w6 <- w5; w5 <- [12]; op at w5
+      window {w0=[8] w1=[8] w2=[10] w4=[14]* w6=[13]* w7=[12]*}
+    8 window(NumericIntInt, 2, 12, out 2)
+      w1 <- [2]; w2 <- w7; op at w1
+      window {w0=[8] w2=[12]* w3=[2]* w4=[14]* w6=[13]* w7=[12]*}
+    9 exec(numeric_int_cint_ADD)
+      flush: [13] <- w6; [14] <- w4; [12] <- w2; [2] <- w3
+      window {}
+   10 window(Move, 1, out 13)
+      w0 <- [1]; op at w0
+      window {w0=[1] w1=[13]*}
+   11 window(LoadKNumber, out 14)
+      op at w2
+      window {w0=[1] w1=[13]* w2=[14]*}
+   12 window(NumericIntInt, 12, 14, out 12)
+      w3 <- [12]; w4 <- w2; op at w3
+      window {w0=[1] w1=[13]* w2=[14]* w4=[14]* w5=[12]*}
+   13 jump(172)
+      to block 172 (entered with {w0=[1] w1=[13]* w2=[14]* w4=[14]* w5=[12]*}): 
+      window {w0=[1] w1=[13]* w2=[14]* w4=[14]* w5=[12]*}
+block 172 hotness 39 entered with {w0=[1] w1=[13]* w2=[14]* w4=[14]* w5=[12]*}
+    0 window(NumericIntInt, 12, 14, out 12)
+      w6 <- w2; op at w5
+      window {w0=[1] w1=[13]* w2=[14]* w4=[14]* w6=[14]* w7=[12]*}
+    1 guard(13, number)
+      tests w1
+      window {w0=[1] w1=[13]* w2=[14]* w4=[14]* w6=[14]* w7=[12]*}
+    2 thunk
+      exit after [13] <- w1; [14] <- w2; [12] <- w7
+      window {w0=[1] w1=[13]* w2=[14]* w4=[14]* w6=[14]* w7=[12]*}
+    3 jump(173)
+      to block 173 (entered with {w0=[1] w1=[13]* w2=[14]* w4=[14]* w6=[14]* w7=[12]*}): 
+      window {w0=[1] w1=[13]* w2=[14]* w4=[14]* w6=[14]* w7=[12]*}
+block 173 hotness 39 entered with {w0=[1] w1=[13]* w2=[14]* w4=[14]* w6=[14]* w7=[12]*}
+    0 window(ForLoop, 12, 13, 14, 15, out 15)
+      w0 <- w7; w3 <- [15]; op at w0
+      window {w0=[12]* w1=[13]* w2=[14]* w4=[15]* w6=[14]* w7=[12]*}
+    1 select
+      to block 177 (entered with {w0=[12]* w1=[13]* w2=[14]* w4=[15]* w6=[14]* w7=[12]*}): 
+      to block 174 (entered with {w0=[12]* w1=[13]* w2=[14]* w4=[15]* w6=[14]* w7=[12]*}): 
+      window {w0=[12]* w1=[13]* w2=[14]* w4=[15]* w6=[14]* w7=[12]*}
+block 170 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 174 hotness 58 entered with {w0=[12]* w1=[13]* w2=[14]* w4=[15]* w6=[14]* w7=[12]*}
+    0 window(NumericIntInt, 3, 5, out 3)
+      w5 <- [3]; w6 <- [5]; op at w5
+      window {w0=[12]* w1=[13]* w2=[14]* w4=[15]* w6=[5] w7=[3]*}
+    1 window(ForLoop, 3, 4, 5, 6, out 6)
+      [15] <- w4; w3 <- w7; w4 <- [4]; w5 <- w6; w6 <- [6]; op at w3
+      window {w0=[12]* w1=[13]* w2=[14]* w3=[3]* w4=[4] w5=[5] w7=[6]*}
+    2 select
+      to block 176 (entered with {w0=[12]* w1=[13]* w2=[14]* w3=[3]* w4=[4] w5=[5] w7=[6]*}): 
+      to block 175 (entered with {w0=[12]* w1=[13]* w2=[14]* w3=[3]* w4=[4] w5=[5] w7=[6]*}): 
+      window {w0=[12]* w1=[13]* w2=[14]* w3=[3]* w4=[4] w5=[5] w7=[6]*}
+block 175 hotness 58 entered with {w0=[12]* w1=[13]* w2=[14]* w3=[3]* w4=[4] w5=[5] w7=[6]*}
+    0 ret
+      flush: [13] <- w1; [14] <- w2; [12] <- w0; [3] <- w3; [6] <- w7
+      window {}
+block 176 hotness 64 entered with {w0=[12]* w1=[13]* w2=[14]* w3=[3]* w4=[4] w5=[5] w7=[6]*}
+    0 window(GetTableIndex, 0, 6, out 7)
+      w4 <- [0]; w5 <- w7; op at w4
+      window {w0=[12]* w1=[13]* w2=[14]* w3=[3]* w4=[0] w5=[6]* w6=[7]* w7=[6]*}
+    1 thunk
+      exit after [13] <- w1; [14] <- w2; [12] <- w0; [3] <- w3; [6] <- w5; [7] <- w6
+      window {w0=[12]* w1=[13]* w2=[14]* w3=[3]* w4=[0] w5=[6]* w6=[7]* w7=[6]*}
+block 177 hotness 45 entered with {w0=[12]* w1=[13]* w2=[14]* w4=[15]* w6=[14]* w7=[12]*}
+    0 window(GetTableIndex, 0, 15, out 16)
+      w3 <- [0]; op at w3
+      window {w0=[12]* w1=[13]* w2=[14]* w3=[0] w4=[15]* w5=[16]* w6=[14]* w7=[12]*}
+    1 exec(href_init)
+      flush: [13] <- w1; [14] <- w2; [12] <- w0; [15] <- w4; [16] <- w5
+      window {}
+    2 select
+      to block 178 (entered with {}): 
+      to block 179 (entered with {}): 
+      window {}
+block 178 hotness 45 entered with {}
+    0 jump(180)
+      to block 180 (entered with {}): 
+      window {}
+block 180 hotness 45 entered with {}
+    0 window(GetTableHref, 7, out 17)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[17]*}
+    1 guard(16, table)
+      tests [16]
+      window {w0=[7] w1=[17]*}
+    2 thunk
+      exit after [17] <- w1
+      window {w0=[7] w1=[17]*}
+    3 jump(181)
+      to block 181 (entered with {w0=[7] w1=[17]*}): 
+      window {w0=[7] w1=[17]*}
+block 181 hotness 44 entered with {w0=[7] w1=[17]*}
+    0 exec(href_init)
+      flush: [17] <- w1
+      window {}
+    1 select
+      to block 182 (entered with {}): 
+      to block 183 (entered with {}): 
+      window {}
+block 179 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 182 hotness 45 entered with {}
+    0 jump(184)
+      to block 184 (entered with {}): 
+      window {}
+block 184 hotness 45 entered with {}
+    0 window(GetTableHref, 16, out 18)
+      w0 <- [16]; op at w0
+      window {w0=[16] w1=[18]*}
+    1 window(NumericIntInt, 17, 18, out 17)
+      w0 <- [17]; op at w0
+      window {w1=[18]* w2=[17]*}
+    2 exec(href_init)
+      flush: [18] <- w1; [17] <- w2
+      window {}
+    3 select
+      to block 185 (entered with {}): 
+      to block 186 (entered with {}): 
+      window {}
+block 183 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 185 hotness 45 entered with {}
+    0 jump(187)
+      to block 187 (entered with {}): 
+      window {}
+block 187 hotness 45 entered with {}
+    0 window(GetTableHref, 7, out 18)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[18]*}
+    1 exec(href_init)
+      flush: [18] <- w1
+      window {}
+    2 select
+      to block 188 (entered with {}): 
+      to block 189 (entered with {}): 
+      window {}
+block 186 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 188 hotness 45 entered with {}
+    0 jump(190)
+      to block 190 (entered with {}): 
+      window {}
+block 190 hotness 45 entered with {}
+    0 window(GetTableHref, 16, out 19)
+      w0 <- [16]; op at w0
+      window {w0=[16] w1=[19]*}
+    1 window(NumericIntInt, 18, 19, out 18)
+      w0 <- [18]; op at w0
+      window {w1=[19]* w2=[18]*}
+    2 exec(href_init)
+      flush: [19] <- w1; [18] <- w2
+      window {}
+    3 select
+      to block 191 (entered with {}): 
+      to block 192 (entered with {}): 
+      window {}
+block 189 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 191 hotness 45 entered with {}
+    0 jump(193)
+      to block 193 (entered with {}): 
+      window {}
+block 193 hotness 45 entered with {}
+    0 window(GetTableHref, 7, out 19)
+      w0 <- [7]; op at w0
+      window {w0=[7] w1=[19]*}
+    1 exec(href_init)
+      flush: [19] <- w1
+      window {}
+    2 select
+      to block 194 (entered with {}): 
+      to block 195 (entered with {}): 
+      window {}
+block 192 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 194 hotness 45 entered with {}
+    0 jump(158)
+      to block 158 (compiled, entered with {}): 
+      window {}
+block 195 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+== region entered at block 72
+block 72 hotness 0 entered with {}
+    0 window(GetTableHref, 9, out 11)
+      w0 <- [9]; op at w0
+      window {w0=[9] w1=[11]*}
+    1 window(NumericIntInt, 11, 10, out 11)
+      w2 <- [10]; op at w1
+      window {w0=[9] w2=[10] w3=[11]*}
+    2 window(NumericIntInt, 3, 11, out 3)
+      w2 <- [3]; op at w2
+      window {w0=[9] w3=[11]* w4=[3]*}
+    3 exec(href_init)
+      flush: [11] <- w3; [3] <- w4
+      window {}
+    4 select
+      to block 73 (entered with {}): 
+      to block 74 (entered with {}): 
+      window {}
+block 73 hotness 0 entered with {}
+    0 jump(75)
+      to block 75 (entered with {}): 
+      window {}
+block 75 hotness 0 entered with {}
+    0 window(GetTableHref, 9, out 11)
+      w0 <- [9]; op at w0
+      window {w0=[9] w1=[11]*}
+    1 window(NumericIntInt, 11, 10, out 11)
+      w2 <- [10]; op at w1
+      window {w0=[9] w2=[10] w3=[11]*}
+    2 window(NumericIntInt, 4, 11, out 4)
+      w2 <- [4]; op at w2
+      window {w0=[9] w3=[11]* w4=[4]*}
+    3 window(NumericIntInt, 5, 7, out 5)
+      w5 <- [5]; w6 <- [7]; op at w5
+      window {w0=[9] w3=[11]* w4=[4]* w6=[7] w7=[5]*}
+    4 window(ForLoop, 5, 6, 7, 8, out 8)
+      [11] <- w3; [4] <- w4; w1 <- w7; w2 <- [6]; w3 <- w6; w4 <- [8]; op at w1
+      window {w0=[9] w1=[5]* w2=[6] w3=[7] w5=[8]* w6=[7] w7=[5]*}
+    5 select
+      to block 77 (entered with {w0=[9] w1=[5]* w2=[6] w3=[7] w5=[8]* w6=[7] w7=[5]*}): 
+      to block 76 (entered with {w0=[9] w1=[5]* w2=[6] w3=[7] w5=[8]* w6=[7] w7=[5]*}): 
+      window {w0=[9] w1=[5]* w2=[6] w3=[7] w5=[8]* w6=[7] w7=[5]*}
+block 74 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 76 hotness 52 entered with {w0=[9] w1=[5]* w2=[6] w3=[7] w5=[8]* w6=[7] w7=[5]*}
+    0 exec(gettable)
+      flush: [5] <- w1; [8] <- w5
+      window {}
+    1 exec(unm)
+      window {}
+    2 window(GetUpval, out 7)
+      op at w0
+      window {w0=[7]*}
+    3 guard(7, number)
+      tests w0
+      window {w0=[7]*}
+    4 thunk
+      exit after [7] <- w0
+      window {w0=[7]*}
+    5 jump(87)
+      to block 87 (entered with {w0=[7]*}): 
+      window {w0=[7]*}
+block 87 hotness 52 entered with {w0=[7]*}
+    0 window(NumericIntInt, 6, 7, out 6)
+      w1 <- [6]; w2 <- w0; op at w1
+      window {w0=[7]* w2=[7]* w3=[6]*}
+    1 guard(5, table)
+      tests [5]
+      window {w0=[7]* w2=[7]* w3=[6]*}
+    2 thunk
+      exit after [7] <- w0; [6] <- w3
+      window {w0=[7]* w2=[7]* w3=[6]*}
+    3 jump(88)
+      to block 88 (entered with {w0=[7]* w2=[7]* w3=[6]*}): 
+      window {w0=[7]* w2=[7]* w3=[6]*}
+block 88 hotness 52 entered with {w0=[7]* w2=[7]* w3=[6]*}
+    0 exec(settable_hash)
+      flush: [7] <- w0; [6] <- w3
+      window {}
+    1 exec(gettable)
+      window {}
+    2 exec(unm)
+      window {}
+    3 window(GetUpval, out 7)
+      op at w0
+      window {w0=[7]*}
+    4 guard(7, number)
+      tests w0
+      window {w0=[7]*}
+    5 thunk
+      exit after [7] <- w0
+      window {w0=[7]*}
+    6 jump(89)
+      to block 89 (entered with {w0=[7]*}): 
+      window {w0=[7]*}
+block 89 hotness 52 entered with {w0=[7]*}
+    0 window(NumericIntInt, 6, 7, out 6)
+      w1 <- [6]; w2 <- w0; op at w1
+      window {w0=[7]* w2=[7]* w3=[6]*}
+    1 guard(5, table)
+      tests [5]
+      window {w0=[7]* w2=[7]* w3=[6]*}
+    2 thunk
+      exit after [7] <- w0; [6] <- w3
+      window {w0=[7]* w2=[7]* w3=[6]*}
+    3 jump(90)
+      to block 90 (entered with {w0=[7]* w2=[7]* w3=[6]*}): 
+      window {w0=[7]* w2=[7]* w3=[6]*}
+block 90 hotness 52 entered with {w0=[7]* w2=[7]* w3=[6]*}
+    0 exec(settable_hash)
+      flush: [7] <- w0; [6] <- w3
+      window {}
+    1 exec(gettable)
+      window {}
+    2 exec(unm)
+      window {}
+    3 window(GetUpval, out 7)
+      op at w0
+      window {w0=[7]*}
+    4 guard(7, number)
+      tests w0
+      window {w0=[7]*}
+    5 thunk
+      exit after [7] <- w0
+      window {w0=[7]*}
+    6 jump(91)
+      to block 91 (entered with {w0=[7]*}): 
+      window {w0=[7]*}
+block 91 hotness 52 entered with {w0=[7]*}
+    0 window(NumericIntInt, 6, 7, out 6)
+      w1 <- [6]; w2 <- w0; op at w1
+      window {w0=[7]* w2=[7]* w3=[6]*}
+    1 guard(5, table)
+      tests [5]
+      window {w0=[7]* w2=[7]* w3=[6]*}
+    2 thunk
+      exit after [7] <- w0; [6] <- w3
+      window {w0=[7]* w2=[7]* w3=[6]*}
+    3 jump(92)
+      to block 92 (entered with {w0=[7]* w2=[7]* w3=[6]*}): 
+      window {w0=[7]* w2=[7]* w3=[6]*}
+block 92 hotness 52 entered with {w0=[7]* w2=[7]* w3=[6]*}
+    0 exec(settable_hash)
+      flush: [7] <- w0; [6] <- w3
+      window {}
+    1 ret
+      window {}
+block 77 hotness 12 entered with {w0=[9] w1=[5]* w2=[6] w3=[7] w5=[8]* w6=[7] w7=[5]*}
+    0 window(GetTableIndex, 0, 8, out 9)
+      w4 <- [0]; op at w4
+      window {w1=[5]* w2=[6] w3=[7] w4=[0] w5=[8]* w6=[9]* w7=[5]*}
+    1 guard(9, table)
+      tests w6
+      window {w1=[5]* w2=[6] w3=[7] w4=[0] w5=[8]* w6=[9]* w7=[5]*}
+    2 thunk
+      exit after [5] <- w1; [8] <- w5; [9] <- w6
+      window {w1=[5]* w2=[6] w3=[7] w4=[0] w5=[8]* w6=[9]* w7=[5]*}
+    3 jump(78)
+      to block 78 (entered with {w1=[5]* w2=[6] w3=[7] w4=[0] w5=[8]* w6=[9]* w7=[5]*}): 
+      window {w1=[5]* w2=[6] w3=[7] w4=[0] w5=[8]* w6=[9]* w7=[5]*}
+block 78 hotness 11 entered with {w1=[5]* w2=[6] w3=[7] w4=[0] w5=[8]* w6=[9]* w7=[5]*}
+    0 exec(href_init)
+      flush: [5] <- w1; [8] <- w5; [9] <- w6
+      window {}
+    1 select
+      to block 79 (entered with {}): 
+      to block 80 (entered with {}): 
+      window {}
+block 79 hotness 12 entered with {}
+    0 jump(81)
+      to block 81 (entered with {}): 
+      window {}
+block 81 hotness 12 entered with {}
+    0 window(GetTableHref, 9, out 10)
+      w0 <- [9]; op at w0
+      window {w0=[9] w1=[10]*}
+    1 exec(href_init)
+      flush: [10] <- w1
+      window {}
+    2 select
+      to block 82 (entered with {}): 
+      to block 83 (entered with {}): 
+      window {}
+block 80 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 82 hotness 12 entered with {}
+    0 jump(84)
+      to block 84 (entered with {}): 
+      window {}
+block 84 hotness 12 entered with {}
+    0 window(GetTableHref, 9, out 11)
+      w0 <- [9]; op at w0
+      window {w0=[9] w1=[11]*}
+    1 window(NumericIntInt, 11, 10, out 11)
+      w2 <- [10]; op at w1
+      window {w0=[9] w2=[10] w3=[11]*}
+    2 window(NumericIntInt, 2, 11, out 2)
+      w2 <- [2]; op at w2
+      window {w0=[9] w3=[11]* w4=[2]*}
+    3 exec(href_init)
+      flush: [11] <- w3; [2] <- w4
+      window {}
+    4 select
+      to block 85 (entered with {}): 
+      to block 86 (entered with {}): 
+      window {}
+block 83 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}
+block 85 hotness 12 entered with {}
+    0 jump(72)
+      to block 72 (compiled, entered with {}): 
+      window {}
+block 86 hotness 64 entered with {}
+    0 thunk
+      exit after 
+      window {}

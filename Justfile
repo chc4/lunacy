@@ -48,6 +48,17 @@ window-dump benchmark times='20':
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo run --release --features window_dump --bin bench -- {{benchmark}}.bin {{times}}
 
+# Save a benchmark's window dump as bench/window_dumps/<benchmark>.<name>.txt, a
+# reference to compare window allocators against with `just window-dump-stats`.
+window-dump-save benchmark name times='20':
+    just window-dump {{benchmark}} {{times}}
+    mkdir -p bench/window_dumps
+    cp window_dump.txt bench/window_dumps/{{benchmark}}.{{name}}.txt
+
+# The loads, stores and moves in window dumps, over all blocks and hot ones.
+window-dump-stats *dumps='bench/window_dumps/*.txt':
+    python3 tools/window_dump_stats.py {{dumps}}
+
 [env("RUST_LOG", "debug")]
 [env("RUST_BACKTRACE","1")]
 test-debug:
