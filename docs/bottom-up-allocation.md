@@ -36,15 +36,18 @@ The pass processes the region's blocks in the order of a min-heap keyed by
 `(hotness, -id)`:
 
 - **Hotness** is the countdown to the compile threshold, so the hottest blocks
-  come first and colder ones adapt to them. It stops at zero, so every block
-  that has reached the threshold ties.
-- **Among ties, the highest block id comes first.** Block ids are allocated
+  come first and colder ones adapt to them. It stops at zero, but a region is
+  compiled as soon as a block is entered at zero, so the blocks at zero then
+  are those entered as often as that block: the innermost hot loop. Blocks of
+  an enclosing loop, such as the inner loop's exit, and colder paths, such as
+  a guard's rarely taken failure block, are still counting down.
+- **Among equal hotness, the highest block id comes first.** Block ids are allocated
   from a monotonic counter as the specializer reaches new code, so a block's
   successors in straight-line code have higher ids than it. The last block of
   a run is processed first, and each block after the successors created after
   it.
 
-So within a hot loop, whose blocks all tie, the last block, usually the latch,
+So within a hot loop, whose blocks are equally hot, the last block, usually the latch,
 is processed first, and the rest follow back up the loop. A branch into code
 that is still cold is processed after the hot path and adapts to it.
 
@@ -235,12 +238,4 @@ This proposal doesn't add lookahead.
 
 ## Open questions
 
-- Nested hot loops tie too. An inner loop's latch has two successors: the
-  loop's first block across the back edge (a lower id, not processed yet) and
-  the inner loop's exit into the outer loop (created later, so a higher id,
-  processed first). The latch then takes its live-out from the exit, run once
-  per outer iteration, instead of from nothing, and a failure jump's target,
-  created when the guard first failed, likewise wins over the block's
-  continuation. Telling these apart needs hotness that doesn't stop at the
-  threshold.
 - Which back-edge treatment above, or something else.
