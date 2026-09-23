@@ -6,3 +6,4 @@ Cargo.lock
 flake.lock
 .gdb_history
 rustc-ice*
+hyperfine*-vs-*
