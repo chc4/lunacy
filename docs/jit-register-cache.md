@@ -47,7 +47,7 @@ in GPRs across JIT code instead of round-tripping every operand through
   in-buffer backedges hit this path too) → `jmp extern target_ptr`. Otherwise a
   pending `DynamicLabel` and `jmp =>label`.
 
-### Tier-up and bailout
+### Tier-up and bailout (the crux — I kept getting this wrong)
 
 - **Tier-up:** in `run` (`generator.rs:1922-1937`), at `off==0` a block's hotness
   counts down from `INITIAL_HOTNESS` (64; 0 with `immediate_jit`). At 0 it
@@ -64,7 +64,7 @@ in GPRs across JIT code instead of round-tripping every operand through
 
 ---
 
-## 2. The register cache model
+## 2. The register cache model (corrected, final understanding)
 
 Values cached in GPRs are threaded **across blocks** via per-block register
 sets, à la tree register allocation (Rong 2009). The canonical home of every
@@ -75,8 +75,9 @@ Rules — this is the whole allocator:
 
 1. **Fresh block ⇒ empty in-set.** A block that doesn't exist yet has no
    recorded in-set; it is empty. No choice, no phase-ordering, no discovery
-   pre-pass: choosing a loop header's in-set to carry registers around the
-   backedge is a trace-JIT concern and does not apply.
+   pre-pass. (Earlier I invented a "choose the header in-set to favor the
+   backedge / loop-carried-registers" problem — that is **trace-JIT thinking and
+   does not apply.** Scrap it.)
 2. **Straightline / successor edge ⇒ inherit, no moves.** A block compiled as the
    successor in the same `jit()` call adopts the predecessor's **out-set** as its
    **in-set**. This is the register carry — regs stay live across the edge.
@@ -128,20 +129,16 @@ Consequences (not new rules — just applications):
 ## 3. Making dataflow visible + copy&patch
 
 The allocator needs to know which slots each op reads/writes; today `Exec` is an
-opaque closure so the JIT can't see its dataflow. Window ops make it visible
-(details in `Note [Register window]`, `src/window.rs`):
+opaque closure so the JIT can't see its dataflow:
 
-- **`Residual::ExecWindow(Rc<dyn Window>)`**, built from its operands' stack
-  slots and their accesses (LBBV does no register allocation): inputs are
-  read-only and only outputs are written back (`windowed!(.., (a, b, out d))`),
-  so a register caching a slot only ever holds that slot's value. An op always
-  runs on a contiguous run of the window, `w[SKIP..SKIP + arity]`, its operands
-  in the order it declares them.
-- **JIT mode** (`src/window_alloc.rs`, `Note [Window allocation]`, section 6):
-  a streaming allocator: each op, its operands known from the op itself, is
-  placed at the `SKIP` whose resculpt emits least, and flushing is deferred to
-  the end of the run. Interpreter mode: the op's body on its operands' stack homes
-  (`Window::on_stack`: read the inputs, run, write the outputs; no window).
+- **`Residual::ExecWindow(op)`**, roughly
+  `|[[_; SLOTS], a] -> [[_; SLOTS], a] { become _r([a+1]) }`: the op names its
+  operands directly by their stack slots, and the stack window plus
+  register-carried values flow between stencils by tail call. Interpreter mode:
+  retrieve stack slots, call, flush stack slots. JIT mode: the register
+  allocator reconciles the op's operands with the current window (the live
+  `slot→register` map) at the op, deferring flushing as long as we only see
+  more `ExecWindow` ops.
 
 **Copy&patch (the part worth the machinery).** Instead of emitting a `call` to
 the `Exec` closure body, splat the op's compiled **template/stencil** into the
@@ -161,9 +158,8 @@ field (`generator.rs:153`).
 ## 4. Implementation plan (ordering)
 
 1. **Expose dataflow.** Give the JIT visibility into each exec's read/write slots
-   — either the `ExecWindow` residuals above, or a `reads/writes`
-   annotation on `ResidualExec`. No behavior change; interpreter keeps calling
-   the body.
+   — the `ExecWindow` residuals above, naming their operands' stack slots. No
+   behavior change; interpreter keeps calling the body.
 2. **JIT-local `slot→Gpr` cache** in `jit_block`: linear-scan allocation,
    oldest-eviction (evict→flush to stack home). Implement the per-block in-set /
    out-set recording + the reconciliation primitive (rules 1-5). Still call the
@@ -183,227 +179,6 @@ field (`generator.rs:153`).
 - Perf: `perf` feature emits `/tmp/perf-<pid>.map`; compare nbody / life against
   the interpreter and current JIT.
 
-## 5. Status / staging (implementation)
-
-**The value in the window is the whole `LBoxed` (any type), never an unboxed
-number.** NuN-boxing is the enabler precisely because *every* Lua value — nil,
-bool, number, table, closure, string — is one GPR-sized word, so the register
-window/cache pins arbitrary `LBoxed` values, not just numbers. A window op takes
-`LBoxed` operands and returns an `LBoxed`, reusing the VM's own `LBoxed` /
-`numeric_op` / `box_lvalue` semantics. **Never reimplement NuN boxing**: op
-bodies use the VM's own.
-
-Verified environment fact: a fresh git worktree is missing the path-dep
-submodules; symlink `dynasm-rs`, `memmap2-rs`, `lua_benchmarking` (and `target`)
-from `/workspace` before building (see memory `nix-devshell`). `just test` is the
-green gate (default features ⇒ jit on).
-
-**Proven model (`src/bin/windowed.rs`, then ported to `src/window.rs`).**
-- The register window is **scalar** `rust-preserve-none` params, never
-  `[LBoxed; N]`: Rust passes arrays by pointer whatever the ABI, which puts the
-  window in memory. (`unadjusted` isn't available on this toolchain.) Stencil ABI:
-  fixed params `owner, state, base` (r12/r13/r14, the JIT's pinned regs) then the
-  window `w0..w7` = r15, rdi, rsi, rdx, rcx, r8, r9, r11. preserve-none passes
-  12 integer arguments in registers, but the 12th, rax, can't be a window
-  register: a `become` compiled as an indirect jump through the GOT has LLVM load
-  its target into rax even when rax carries an argument (it is the only register
-  eligible for the target outside the arguments), and that load stays in the
-  copy — `check_windows` caught it clobbering w8. `owner` is a ZST token that
-  can be forged at JIT/interpreter transitions (the JIT helpers already do);
-  dropping it as a stencil param would free r12 for a 9th window register.
-- `windowed!(Name, [captures], [const params], |owner, state, base| (out d, a, b) { body })`
-  is a **generic**, op-agnostic mechanism used inline at the emit site, exactly
-  like `define_exec!` — all of an op's code (static and dynamic) stays in its
-  `emit_*`. It generates a struct of **captures** (hole values) + the operands'
-  stack slots implementing the `Window` trait, an `#[inline(always)]` body
-  shared by both tiers, and `__stencil::<SKIP>`, with operand `i` in window
-  register `SKIP + i` (`stencil(skip)`). Inputs are bound as values and only
-  outputs are written back. `src/window.rs` holds only
-  the mechanism (macro, `Window`, `Capture`, holes, copier); no op
-  templates.
-- Captures: any `Copy` type of at most 8 bytes (blanket `Capture` impl, raw bits).
-  Holes are `extern_weak` statics (`__lunacy_holeN`), read through a const-generic
-  index so monomorphization picks the hole; an op with more captures than
-  `MAX_HOLES` references `unresolved_window_hole__too_many_captures`, a plain
-  (non-weak) never-defined extern, so it fails loudly at link time (verified).
-- Under plain PIE a hole read is a RIP-relative load from the hole's GOT slot.
-  Holes can't be found by scanning for `0x0` or by operand order, so the copier
-  reads this executable's own dynamic relocations (goblin, GLOB_DAT → GOT slot),
-  matches each disp32's RIP target, and repoints it at a shared value pool laid
-  after the code (the dynasm path will do this with pool labels + `finalize`).
-- Each op's stencils end in `become` to the op's **own** private continuation
-  (`inline(never)`, and it `black_box`es the window — an empty internal callee
-  lets LLVM delete the tail call and every computation feeding the window).
-- The copier (`stencil_body`) decodes the stencil with yaxpeax-x86. Well-formed =
-  every exit jumps to the continuation (`jmp rel32`, `jmp *[rip+got]`, or
-  `jmp *reg` loaded from the GOT slot — rustc uses `-Z plt=no`, and LLVM may
-  hoist that load above the epilogue), redirected to the copy's end so the next
-  stencil falls through. A final `become` is sliced off; when cold code follows
-  it (a panic path, ending in a call that never returns — table ops have
-  several), the whole body is copied with a `ud2` after it. Every other RIP-relative reference is reported with its field, the
-  end of its instruction (the true RIP base, even with a trailing immediate) and
-  its absolute target:
-  - `holes` — loads of a hole's GOT slot → repointed at the pool;
-  - `nexts` — other references to the continuation (a duplicated tail) → the
-    copy's fall-through point (direct), or a pool slot holding it (indirect).
-    Handled but not yet observed in practice;
-  - `relocations()` — everything else: calls out of line (e.g. `IndexMap`), GOT
-    slots, rodata → re-targeted at their original absolute address, in rel32
-    range because JIT memory is mapped within ±2GiB of the binary.
-  In the JIT all three become dynasm relocations patched at `finalize`;
-  `assemble` does the same by hand in a near-mapped buffer.
-- Calls are fine anywhere (they return). A jump that leaves the stencil without
-  being a `become` would skip the rest of the chain, so the copier rejects it:
-  a sibling tail call, or an indirect jump like a jump table (its entries lead
-  back into the original function). An opt-level 0 `NumericIntInt` has one
-  (unfolded `match OP`); optimized builds don't. The copier (`Image::load`,
-  `stencil_body`, `assemble`) returns a `StencilError` rather than panicking, so
-  the JIT can call the op's body instead; `check_windows` fails on an op it
-  rejects in an optimized build (and skips it, logged, in a debug one).
-  `LoadK` is split per constant kind for this: converting any constant is a
-  `match` on its kind, which compiles to a jump table. Debug builds are otherwise copyable now
-  (their un-inlined helper calls and assertion panics are just relocations). The
-  interpreter runs any window op regardless.
-
-**M1 — DONE: generic windowed ops in the generator (JIT splat still disabled).**
-`Residual::ExecWindow(Rc<dyn Window>)`, like `Exec`'s closure, keeps processing
-sites generic; its operands are stack slots (section 3). The
-interpreter runs `<dyn Window>::interp`: load the inputs from their stack homes,
-run the body with captures from the struct, flush the outputs (it can't run the
-stencil itself: holes read 0 until patched). The first user is `emit_numeric`'s
-dynamic int-int arm: `windowed!(NumericIntInt, [], [OP: Opcode], .. (lhs, rhs, out dest))`
-inline (body = the VM's own `numeric_op`/`box_lvalue`), its operands three
-stack slots, instance picked with `dispatch_numeric_window!` for all six opcodes;
-the constant-operand arms keep their `Exec` closures.
-
-Verification:
-- `just test` green, including the window tests in debug: a chain shifting along
-  (2, 3, 4, nil) — Add at 0, Mul at 1, AddK at 2 (hole) → Flush, inputs
-  unchanged; a stencil calling an out-of-line helper (its call
-  appears in `relocations()` and the copy calls it correctly); a branchy stencil
-  whose both arms fall through; and two outputs writing one slot is rejected.
-- Golden `window_chain.lua`: dependent arithmetic in one block becomes a single
-  run of `ExecWindow` residuals (visible in the `graph` feature's
-  `func_N.dot`).
-- `just test-stencils` (opt-2): the same tests on optimized stencils, then the
-  golden suite with feature `check_windows`, which copy&patches **every window
-  op the interpreter executes** (the real emit-site ops) and asserts the native
-  result matches the interpreter bit for bit. `NumericIntInt` MOD/POW (libm
-  calls, relocated) pass it at opt-2.
-- Note: the specializer only runs for *calls* to Lua functions; top-level chunk
-  code stays in the plain interpreter, so test programs must do their work inside
-  a function. An arithmetic program run that way matches reference Lua in the
-  debug build, `immediate_jit`, and under `check_windows` (~700k LBBV residuals).
-- Pre-existing bug, untouched: `numeric_op` MOD is truncated `%`, not Lua's
-  floored modulo (`-3 % 7` gives `-3`).
-
-**M2 — DONE: JIT register allocation + stencil splat.** `src/window_alloc.rs`
-allocates each run of window residuals (section 6, `Note [Window allocation]`);
-`jit_block` lowers its plan (loads/stores against r14, moves between the window
-registers with rax as scratch) and splats each op's stencil body between
-`sub rsp, 8`/`add rsp, 8` (block code keeps rsp 16-aligned; stencils expect the
-alignment just after a call). Holes and indirect continuation references become
-dynasm relocations to 8-byte pool entries emitted after the region's epilogue
-(one pool per compiled region, since a pool can't grow in place while later
-code is appended after it; equal hole values share one entry);
-direct ones a relocation to a label at the copy's end; other RIP-relative
-references `value_relocation`s to their absolute target (the buffer's base is
-known). An inline type guard (every `LType` but `Unknown`) keeps the window:
-it tests the register caching its slot, or else loads the slot into r10 (rax,
-never a window register, is the mask scratch), and both its edges carry the
-window on: the success edge to its label, the failure edge falling through to
-the residual after it, an ordinary edge (section 2, "Flush points") — its
-thunk, which stores the dirty registers before it exits, or once the thunk is
-forced a jump to the failure block. The gas exit stores the dirty registers
-too. A `Jump` or `Select` keeps the window, and transfers it to the target
-block's (below). Neither a thunk nor a jump changes the window, so the guard's
-success edge reaches the residual after them with the window it left. Any other residual flushes the window after its
-label, since a guard's success edge may jump there with the window live
-(`Unknown` guards call `check_guard`, so they flush). Window residuals
-following another get no label, so a jump into a run fails to assemble; with
-`gas`, a run is charged at its first residual. An op whose stencil the copier rejects at every `SKIP`
-flushes the window and calls `JitHelper::window_interp`, which runs the op's
-interpreter path on the stack; the run continues in JIT code. (Bailing to the
-interpreter instead would run the rest of the block there on every pass.)
-
-The allocator's tests execute its output on a symbolic machine (every op
-reads the current value of each input, every store writes a current value, the
-run's end leaves the stack up to date): nbody's steady-state runs, pinned to the
-counts worked by hand below, and an exhaustive sweep over every run of three
-ops of four shapes, one declaring its output last, in a 4-register window.
-
-**Table ops as window ops.** `emit_gettable`'s `gettable_href` is
-`GetTableHref: (table) -> (dest)` (captures: the witness index, and the constant
-key for the debug check) and `emit_settable`'s `settable_href`, when the value
-is in a register, `SetTableHref: (table, value) -> ()` (captures: the witness
-index and the value's expected `LType` for the debug check; const param: whether
-the store retypes the key and bumps the epoch); a constant value keeps an `Exec`
-closure, sharing the store with the window op. In release a get's stencil is a
-20-instruction hot path with no calls (witness bounds check, table tag check,
-entry index check, load, `jmp` to the continuation); its only relocations are
-its cold panic paths. `just test-stencils` builds with the `stencils` profile,
-every package optimized, so its stencils match release (7 relocations for a
-get, all cold). Both copy at every `SKIP`. The multi-op runs nbody's `advance`
-executes in its steady state (`just window-runs nbody`: the benchmark on the
-LBBV interpreter tier with the `graph` dump, which counts each block's entries;
-`tools/window_runs.py` lists each block's window runs, hottest first), with what the streaming
-allocator emits in the 8-register window, worked by hand (loads/stores/moves;
-the floor is a load per slot read before it is written and a store per slot
-written):
-
-| run | streaming | floor | with the table ops as `Exec`s |
-|---|---|---|---|
-| `bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step`; loop step (12 ops) | 12/3/6 | 12/3 | — |
-| `dx = bix - bj.x` | 2/1/0 | 2/1 | 3/2 |
-| `dz = biz - bj.z; dist2 = ...; sqrt`'s upvalue get and argument move | 5/5/5 | 4/4 | 6/6 |
-| `bm = bj.mass * mag; bivx -= dx * bm; ...` | 10/5/3 | 9/5 | 10/6 |
-| `bj.vx = bj.vx + dx * bm` | 3/2/2 | 3/2 | 5/3 |
-| ... plus `j += step`; loop step | 7/4/4 | 7/4 | — |
-| `mag = dt / (mag * dist2)` | 3/2/0 | 3/2 | 3/2 |
-
-With the ops declaring their output last, a result lands where the next op
-starts, so a chain like `b = a + 1; c = b + 1` reads each result in place.
-Where it loses to the floor, an op overwrote a value a later op needs: in
-`dist2`, the squares' dead inputs sit between the live `dz` and `dist2`, so
-`dy*dy` finds no three registers free of a dirty value and spills `dist2` (a
-store and a reload); in the velocity run, `dx * bm` reads `bm` in place over the
-cached `mag`, reloaded for `bimass * mag`. (With outputs declared first the
-totals were 42 loads/21 stores/21 moves against 41/22/20 now, the output-last
-order winning on five of the seven runs and on the runs' execution counts.)
-
-The `bi` run is long because `bi` keeps its shape (a key already cached in the
-slot's `CType::Shape` costs an epoch check, not an `href_init`). The `bj` runs
-are short because the inner loop's `bj = bodies[j]` is an array get that
-resets slot 19 to plain `Table`, dropping the shape, so each field of each new
-`bj` runs `href_init` + `select` (a runtime key lookup and a block split) every
-iteration; likewise `bi = bodies[i]` in the outer loop.
-
-Verification: `just test` (adds the golden suite with `immediate_jit`: in debug
-the copier rejects `NumericIntInt`'s jump table, exercising the fallback) and
-`just test-stencils` (adds it at opt-2, where window ops run as splatted
-stencils under the allocator). Golden `window_nbody.lua` runs `advance` hot.
-
-Open items:
-- A copied body with cold code after its `become` keeps the `become` as a
-  jump over the cold code (for a GOT-indirect `become`, a load from the pool and
-  an indirect jump). Laying the hot path out so the jump becomes a fall-through
-  would need the body's blocks reordered.
-- A window op's body reaching stack slots other than through its operands is a
-  documented rule (Note [Register window]), not a checked one.
-- Longer `bj` runs need the array get `bodies[j]` to yield a guardable shape
-  (all bodies share one), so its fields cost an epoch/shape check instead of an
-  `href_init` + block split per field per iteration: a specializer change.
-- Jump tables in stencils. (Fat-LTO release builds do keep each op's
-  continuation a real tail target: `just run nbody` copies all 8
-  `NumericIntInt` stencils it uses.)
-- Pre-existing, untouched: `Vm::call_native` mishandles a native call whose last
-  argument is a multi-result native call — `print(floor(1.5), floor(2.5),
-  floor(3.5))` at top level prints `1 2 3 3.5`, and inside a loop it panicked
-  with a slice-index error.
-
-**M3+.** Register cache / per-block in-set threading (section 2) — pinning
-arbitrary `LBoxed` window values in GPRs across ops.
-
 ### Key code references
 - `generator.rs:150-166` `ResidualExec` (+ reserved `template`), `:1605`
   `compile_one`, `:1908` `run`, `:1922-1976` tier-up + bail codes, `:2058`
@@ -412,168 +187,3 @@ arbitrary `LBoxed` window values in GPRs across ops.
   `:352` `jit_block`, `:362` `emit_jump`, `:383` `emit_bailout`, `:436-514`
   inline guards via r14, `:570` `Exec` static call, `:592/643` Lua/NativeCall,
   `:691` Ret, `:702` Select, `:721` `Residual::GC`, `:728` Thunk bail.
-
----
-
-## 6. Register allocation: a streaming forward pass
-
-`src/window_alloc.rs` allocates window registers the way copy-and-patch does:
-one forward pass, a few register comparisons per op. It spends no compile time
-on placement quality inside a run (no next-use scan, relocation of displaced
-values, eviction ranking or lookahead): that is the wrong trade for a JIT, and
-within one block it matters little when we compile a tree of blocks. Decided:
-cache every slot; flush at block boundaries (every run ends at a non-window
-residual) before carrying the cache across straightline edges; no in-place
-updates.
-
-### What copy-and-patch does (Xu & Kjolstad, OOPSLA 2021, §3–4)
-
-- "we repurpose the function prototype and the calling convention as a register
-  allocation protocol, where each function parameter implicitly corresponds to
-  some physical register". A value that must survive a stencil is a
-  **pass-through parameter**, passed "from the argument to the continuation
-  verbatim". That is our window, and `SKIP` is the number of pass-through
-  registers below an op.
-- Registers hold expression temporaries only: "we only use registers to
-  preserve temporary values produced while evaluating an expression". Locals
-  live in memory.
-- One forward pass, "a post-order traversal of the AST to abstractly evaluate
-  the expression", over "the stack of outstanding temporary operands". An op
-  takes its operands from the top of that stack and pushes its result. It is "a
-  simplified version of the Simple Sethi-Ullman Algorithm that does not choose
-  between the orders of evaluating a node's children", chosen for "its very low
-  overhead and little loss of practical effectiveness". Temporaries beyond the
-  register budget spill to stack slots, and temporaries live across a call are
-  spilled, since the callee gets every register.
-- Quality is deliberately secondary: a mem2reg pass gave "up to 10% execution
-  performance boost, but results in about 33× slower compilation. We deemed this
-  trade-off as not worthwhile."
-
-### What carries over
-
-The stack discipline rests on two properties of AST temporaries that our
-operands lack:
-
-1. A temporary is used once, so an op's operands die at the op and its result
-   can take their place. Lua slots are registers of a register machine: `bm` is
-   read three times in one run, and locals are read throughout a block.
-2. The result overwrites the operands' registers. Our inputs are read-only: an op
-   never overwrites the register of a slot it reads, so a cached slot's register
-   only ever holds that slot's value.
-
-So we take the **streaming** part and not the exact stack discipline:
-
-- one forward pass, during codegen;
-- a few register comparisons of work per op;
-- no lookahead, and no analysis of the run or of the block tree beforehand.
-
-### Operand order belongs to the op
-
-`windowed!` declares one ordered operand list, each operand marked as an input
-or an output, e.g. `(out c, a, b)`. Operand `i` is window register `SKIP + i`.
-The emit site passes its operands' stack slots in the same order. The allocator knows only
-each operand's index and whether it is read or written, so it handles any order
-an op names:
-
-- `NumericIntInt` declares `(lhs, rhs, out dest)`;
-- `GetTableHref` declares `(table, out dest)`;
-- `SetTableHref` declares `(table, value)`;
-- `GetTableIndex` (`emit_gettable`, a number key in a register) declares
-  `(table, key, out dest)` and `SetTableIndex` (`emit_settable`, key and value
-  in registers) `(table, key, value)`, both through `Table::get`/`set`, which
-  index the array part by number; constant keys or values keep their `Exec`
-  closures;
-- `Move` (`emit_move`) declares `(from, out to)`;
-- `LoadKNumber` / `LoadKString` (`emit_loadk`) declare `(out dest)`, reading
-  the constant from the prototype (one op per kind: converting any constant is
-  a `match` on its kind, which compiles to a jump table the copier rejects);
-- `ForLoop` (`emit_forloop`, numbers) declares `(idx, limit, step, prev, out
-  var)` and sets `state.select` for the `Select` after it. The loop variable is
-  set only when the loop continues; since an output is always written back, the
-  op also reads the variable's previous value (`prev`, the same slot) and writes
-  that back on exit;
-- `GetUpval` (`emit_getupval`) declares `(out dest)`. An open upvalue reads a
-  stack slot directly, but of an enclosing frame (the running closure's
-  upvalues were captured by its parent), never one of this frame's, which the
-  window caches; the op asserts it.
-
-`href_init` stays an `Exec` closure: it is long, and copying it into the code
-at every use would cost more than it saves.
-
-### The allocator
-
-State, carried from op to op:
-
-- `regs[0..WINDOW]`: the slot whose current value each register caches, if any;
-- `dirty`: cached slots whose stack home is stale.
-
-There is no liveness. Every cached value is only a cache: overwriting a clean
-one drops it, and a later read reloads it; overwriting a dirty one stores it
-first.
-
-At an `ExecWindow` with operands `o_0..o_{n-1}` (from the op itself):
-
-1. **Pick `SKIP`** from `0..=WINDOW-n`, the cheapest by what it would emit:
-   - an input already in its register costs nothing;
-   - an input cached in another register costs a move;
-   - an uncached input costs a load;
-   - a dirty value the span overwrites costs a store, unless it survives
-     elsewhere (in another register, or as one of the op's inputs) or is an
-     older value of one of the op's outputs, which the op rewrites.
-
-   Ties go to the `SKIP` whose span overwrites the fewest cached values, then to
-   the lowest. That is on the order of `WINDOW × n` register comparisons per
-   op.
-2. **Emit**, in this order:
-   - the stores;
-   - the moves and loads into the span, as one parallel move (reads before
-     writes, cycles through the scratch register);
-   - the stencil.
-3. **Update**: each output is cached, dirty, in its register, and other copies of
-   its slot's older value are dropped.
-
-At a flush point (any residual other than an `ExecWindow`, an inline type
-guard or a jump), store every dirty register. Calls clobber every register, so
-the cache is emptied too.
-
-`just window-dump <benchmark>` shows what the allocator actually did
-(feature `window_dump`, written to `window_dump.txt`): per compiled region,
-each block's entry window, then per residual its loads, stores and moves (`op
-at wN` is the `SKIP` it ran at), the register a guard tests and its failure
-path's stores, what each jump transfers, and the window after it (`w1=[5]*`:
-w1 caches slot 5, dirty).
-
-**Block edges.** Each block is compiled to be entered with a window, recorded
-with its code (`JitBlock`, or `Pending` until it is compiled):
-
-- The block `jit_compile` starts at is entered with an empty window.
-- A block first reached by a jump (or `Select` edge) is entered with the
-  jumping block's window at the jump: the edge needs no code, and when the
-  target is compiled next the jump is elided as before.
-- Any other jump to a block, compiled or pending (a second predecessor, a
-  backedge, a `jmp extern` into an earlier region), transfers the window to
-  the target's: stores of the dirty values the target doesn't carry dirty,
-  then one parallel move filling its registers from registers or stack homes
-  (`WindowAlloc::transfer`), sequentialized by windmill peeling through rax
-  (`Note [Parallel moves]`).
-- `jit_compile` of a block already compiled (the interpreter entering it)
-  loads the block's window from the stack before jumping to it.
-
-A loop header compiled first is entered with an empty window, so its backedge
-flushes; one reached forward first keeps the preheader's window, which its
-backedge restores.
-
-**What it gives up**, worked by hand on nbody's steady-state runs: the table
-in section 5 (M2); at most two extra loads per run, no extra stores.
-
-### Not done
-
-A block's entry window is whatever its first predecessor left, not what the
-block reads: a register it never uses is still restored on every other edge
-into it (a backedge reloading a value the loop never touches).
-
-LuaJIT-style bottom-up assignment over the compiled region (a backward pass
-over the transitive closure of blocks before codegen, each operand's register
-stored compactly for the forward pass) would place values better across
-blocks, at the cost of a pass over the region and the storage for its results.
-Revisit with measurements.
