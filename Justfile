@@ -13,6 +13,16 @@ test:
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     cargo test --test gc_reset_frees
 
+# Copy&patch window stencils (src/window.rs): only valid when built optimized
+# (debug builds add precondition-check calls), so the lunacy crate is built at
+# opt-level 2 without debug assertions for this run.
+[env("RUST_BACKTRACE","1")]
+test-stencils:
+    cargo test --lib window:: \
+        --config 'profile.dev.package.lunacy.opt-level=2' \
+        --config 'profile.dev.package.lunacy.debug-assertions=false' \
+        --config 'profile.dev.package.lunacy.overflow-checks=false'
+
 [env("RUST_LOG", "debug")]
 [env("RUST_BACKTRACE","1")]
 test-debug:

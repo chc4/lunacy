@@ -3,6 +3,8 @@
 #![feature(coroutines, coroutine_trait, coroutine_clone, stmt_expr_attributes)]
 // For JIT
 #![feature(ptr_metadata, rust_preserve_none_cc, iter_map_windows)]
+// For copy&patch window stencils
+#![feature(linkage, explicit_tail_calls)]
 #![feature(fn_traits, unboxed_closures, adt_const_params)]
 // For GC
 #![feature(core_intrinsics, generic_const_exprs)]
@@ -18,6 +20,8 @@ pub mod perf;
 // entirely in `vm::run`.
 #[cfg(feature = "lbbv")]
 pub mod generator;
+#[cfg(feature = "lbbv")]
+pub mod window;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod gc;

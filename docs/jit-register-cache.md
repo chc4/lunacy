@@ -197,36 +197,52 @@ submodules; symlink `dynasm-rs`, `memmap2-rs`, `lua_benchmarking` (and `target`)
 from `/workspace` before building (see memory `nix-devshell`). `just test` is the
 green gate (default features ⇒ jit on).
 
-**M1 — DONE (interpreter windowing, jit splat disabled).** `ExecWindow` is
-**closure-based, exactly like `Exec`** — no op enum, so no processing site
-enumerates users. New `WindowExec { name, ins: SmallVec<u16>, out: u16, body,
-template }` where `body: Fn(&mut Owner, &mut RunState, &[LBoxed]) -> LBoxed`
-receives the values read from `ins` and returns the value written to `out`;
-`owner`/`state` remain for ambient needs (heap/intern/constants) but the *windowed
-operands* flow as values. `Residual::ExecWindow(WindowExec)` +
-`YieldOp::ExecWindow(WindowExec)`. `emit_numeric`'s dynamic value/value arm yields
-one whose closure captures the op and reuses the VM's own
-`numeric_op`/`box_lvalue` (zero duplication); any other op (move, gettable, …) can
-be a window op just by supplying its own closure. `run` executes it generically
-(load `ins` slots → call `body` → store `out`); `dump` prints `window(name)`;
-`jit_block` bails (interpreter runs the closure). Verified: `just test` fully
-green; a hot numeric loop under `immediate_jit` returns the correct result via the
-JIT→bail→interpreter path. No new crate.
+**Proven model (`src/bin/windowed.rs`, then ported to `src/window.rs`).**
+- The register window is **scalar** `rust-preserve-none` params, never
+  `[LBoxed; N]`: Rust passes arrays by pointer whatever the ABI, which puts the
+  window in memory. (`unadjusted` isn't available on this toolchain.) Stencil ABI:
+  fixed params `owner, state, base` (r12/r13/r14, the JIT's pinned regs) then the
+  window `w0..w3` = r15, rdi, rsi, rdx.
+- `windowed!` declares an op once: a struct of **captures** (hole values) + each
+  operand's load/store stack slot, implementing the `Window` trait; an
+  `#[inline(always)]` body shared by both tiers; and `__stencil::<K>`, where `K`
+  is the window **shift** (operands at `w[K..K+ARITY]`), ending in
+  `become __next(..)`.
+- Holes are `extern_weak` statics (`__lunacy_holeN`): under plain PIE a read is a
+  RIP-relative load from the hole's GOT slot. They can't be found by scanning
+  for `0x0` or by operand order, so the copier reads this executable's own
+  dynamic relocations (goblin, GLOB_DAT → GOT slot), matches each disp32's RIP
+  target, and repoints it at a shared value pool laid after the code (the dynasm
+  path will do this with pool labels + `finalize`).
+- The trailing `become` jmp is asserted to be the stencil's last instruction
+  (symtab size) and sliced, so the window falls through into the next stencil.
+- Stencils must be copy&patch-safe: no non-hole RIP-relative refs (no panics, no
+  calls — MOD/POW call libm, so they stay `Exec`), and built optimized (debug
+  builds add precondition-check calls). `just test-stencils` runs the copy&patch
+  test at opt-2; `just test` skips it in debug.
 
-**M2 — copy&patch splat. Open design point:** a patchouly `#[stencil]` crate is
-**extraction-only** — compiled by `build.rs` (`patchouly_build::StencilSetup`)
-into an `.rlib` parsed for machine code; it is NOT linked as a normal dependency
-(its generated stencils reference an undefined `copy_and_patch_next` that would
-fail a normal link) and it cannot depend on `lunacy` (build cycle). So the stencil
-body needs `LBoxed`'s real semantics available in a crate that does **not** pull in
-`lunacy`. Plan: factor the value layer (`LBoxed` + immediate number/bool/nil ops +
-`LValue`/`numeric_op` as needed) into a leaf `lunacy-value` crate depended on by
-both `lunacy` and the extraction-only `lunacy-stencils`; the heap-unbox cases stay
-in `lunacy` via a local trait if they entangle GC. Then the `#[stencil]` wrappers
-`#[inline]` the shared `LBoxed` op, extraction emits the stencils, and `jit_block`
-replaces the `ExecWindow` bail with a `PatchBlock` splat. Scope of the split
-(how much of the GC-entangled value model must move) is the thing to nail down
-before writing it.
+**M1 — DONE: windowed stencils in the generator (JIT splat still disabled).**
+`Residual::ExecWindow(Rc<dyn Window>)` replaces the old slice-closure
+`WindowExec`; like `Exec`'s closure it keeps processing sites generic. The
+interpreter runs `Window::interp`: load the operand slots, run the body with
+captures from the struct, flush (it can't run the stencil itself: holes read 0
+until patched). `emit_numeric` emits `NumAdd/Sub/Mul/Div` (both operands in the
+window), `Num{Op}K` (constant rhs as a capture) and `NumK{Op}` (constant lhs as a
+capture); the constant comes from a new `YieldOp::ConstNumber`. MOD/POW and
+const-const keep their `Exec` closures. `jit_block` still bails on `ExecWindow`.
+Verified: `just test` green; `just test-stencils` passes, copy&patching the real
+stencils into (a,b,c) → Add@1 → Mul@0 → AddK@0 (hole) → Flush; disasm shows pure
+GPR code; an arithmetic program matches reference Lua in LBBV-without-jit and
+`immediate_jit`. (Pre-existing bug, untouched: `numeric_op` MOD is truncated
+`%`, not Lua's floored modulo — `-3 % 7` gives `-3`.)
+
+**M2 — next.** Splat in `jit_block`: for each `ExecWindow`, copy its stencil
+body into the dynasm assembler with a RIP-relative relocation per hole to a pool
+label, and emit the pool at the epilogue so `finalize` patches every hole load.
+Needs the window-offset choice (the register allocator, below) and a
+Storage/Flush boundary around window runs. Open item: debug JIT builds need
+optimized stencils (e.g. a profile override for lunacy), and release uses fat
+LTO — check that it keeps `__next` as a real, un-inlined weak target.
 
 **M3+.** Register cache / per-block in-set threading (section 2) — pinning
 arbitrary `LBoxed` window values in GPRs across ops.
