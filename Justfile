@@ -41,6 +41,13 @@ window-runs benchmark times='20':
     cargo run --release --no-default-features --features "lbbv graph" --bin bench -- {{benchmark}}.bin {{times}}
     python3 tools/window_runs.py func_*.dot
 
+# The JIT's window allocation for a benchmark, in window_dump.txt: each compiled
+# block's entry window, then per residual its loads, stores and moves, what each
+# jump transfers, and the window after it.
+window-dump benchmark times='20':
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    cargo run --release --features window_dump --bin bench -- {{benchmark}}.bin {{times}}
+
 [env("RUST_LOG", "debug")]
 [env("RUST_BACKTRACE","1")]
 test-debug:

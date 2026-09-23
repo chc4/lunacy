@@ -24,6 +24,7 @@ unreachable = []
 gas = []
 magic = [] # Magic JIT intrinsics
 perf = [] # Create perf JIT map file
+window_dump = ["jit"] # Dump the JIT's window allocation to window_dump.txt
 gc_sanitize = []
 gc_stress = []
 gc_test = []

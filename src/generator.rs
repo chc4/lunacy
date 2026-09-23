@@ -175,6 +175,33 @@ pub struct ResidualExec {
     pub template: Option<Rc<dyn Fn()->()>>,
 }
 
+/// A residual as the graph and window dumps label it.
+impl std::fmt::Display for Residual {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Residual::Guard { idx, expected } => write!(f, "guard({}, {})", idx, expected),
+            Residual::NativeGuard { idx, ptr } => write!(f, "native_guard({}, {:p})", idx, *ptr),
+            Residual::LuaGuard { idx, ptr } => write!(f, "lua_guard({}, {:p})", idx, *ptr),
+            Residual::Exec(ResidualExec { name, .. }) => write!(f, "exec({})", name),
+            Residual::ExecWindow(w) => write!(f, "window({}{})", w.name(),
+                w.operands().iter().zip(w.accesses()).map(|(slot, access)| match access {
+                    Access::Read => format!(", {slot}"),
+                    Access::Write => format!(", out {slot}"),
+                }).collect::<String>()),
+            Residual::Jump(target) => write!(f, "jump({})", target.0),
+            Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
+            Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
+            Residual::LuaCall { lclos, a, b, c } => write!(f, "lcall({:p}, {}, {}, {})", lclos, a, b, c),
+            Residual::HashGuard { tab, href, expected } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
+            Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
+            Residual::Thunk(_) => write!(f, "thunk"),
+            Residual::Select(targets) => write!(f, "select"),
+            Residual::Ret(_, _, _) => write!(f, "ret"),
+            Residual::GC => write!(f, "gc"),
+        }
+    }
+}
+
 impl ResidualExec {
     pub fn new(name: &'static str, body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)>) -> Self {
         Self { name, body, template: None }
@@ -2275,28 +2302,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
 
                 for (off, res) in residuals.instructions.iter().enumerate() {
-                    let inst_label = match res {
-                        Residual::Guard { idx, expected } => format!("guard({}, {})", idx, expected),
-                        Residual::NativeGuard { idx, ptr } => format!("native_guard({}, {:p})", idx, *ptr),
-                        Residual::LuaGuard { idx, ptr } => format!("lua_guard({}, {:p})", idx, *ptr),
-                        Residual::Exec(ResidualExec { name, .. }) => format!("exec({})", name),
-                        Residual::ExecWindow(w) => format!("window({}{})", w.name(),
-                            w.operands().iter().zip(w.accesses()).map(|(slot, access)| match access {
-                                Access::Read => format!(", {slot}"),
-                                Access::Write => format!(", out {slot}"),
-                            }).collect::<String>()),
-                        Residual::Jump(target) => format!("jump({})", target.0),
-                        Residual::Call { a, b, c } => format!("call({}, {}, {})", a, b, c),
-                        Residual::NativeCall { nf, a, b, c } => format!("ncall({:p}, {}, {}, {})", nf, a, b, c),
-                        Residual::LuaCall { lclos, a, b, c } => format!("lcall({:p}, {}, {}, {})", lclos, a, b, c),
-                        Residual::HashGuard { tab, href, expected } => format!("hguard({}, {:?}, {})", tab, href, expected),
-                        Residual::EpochCheck { tab, href } => format!("epoch({}, {:?})", tab, href),
-                        Residual::Thunk(_) => format!("thunk"),
-                        Residual::Select(targets) => format!("select"),
-                        Residual::Ret(_, _, _) => format!("ret"),
-                        Residual::GC => format!("gc"),
-
-                    };
+                    let inst_label = res.to_string();
                     instructions.push(inst_label);
                     match res {
                         Residual::Jump(target) => {

@@ -160,6 +160,23 @@ impl JitHelper {
 
 type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
 
+/// Write a line to `window_dump.txt` (feature `window_dump`, `just
+/// window-dump`): each compiled block's window allocation.
+macro_rules! window_dump {
+    ($jctx:expr, $($arg:tt)*) => {
+        #[cfg(feature = "window_dump")]
+        if let Some(dump) = &$jctx.window_dump {
+            writeln!(dump.borrow_mut(), $($arg)*).ok();
+        }
+    };
+}
+
+/// Allocator code as one line, for `window_dump!`.
+#[cfg(feature = "window_dump")]
+fn emits_line(emits: &[Emit]) -> String {
+    emits.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+}
+
 /// The window registers `w0..w7` in the order the stencil ABI passes them (the
 /// `rust-preserve-none` arguments after owner, state and base in r12, r13, r14),
 /// then `SCRATCH`: rax, which every stencil clobbers (LLVM loads its `become`
@@ -296,6 +313,7 @@ pub struct JitContext {
     pub stencils: Stencils,
     pub used: usize,
     pub perf_map: Option<std::cell::RefCell<std::fs::File>>,
+    pub window_dump: Option<std::cell::RefCell<std::fs::File>>,
 }
 
 #[derive(Copy, Clone)]
@@ -333,6 +351,11 @@ impl JitContext {
                 std::fs::File::create(path).ok().map(|f| std::cell::RefCell::new(f))
             };
         }
+        let mut window_dump = None;
+        #[cfg(feature = "window_dump")]
+        {
+            window_dump = std::fs::File::create("window_dump.txt").ok().map(std::cell::RefCell::new);
+        }
         Self {
             memory: Cell::new(memory.make_exec().unwrap()),
             blocks: HashMap::default(),
@@ -340,6 +363,7 @@ impl JitContext {
             stencils: Stencils::default(),
             used: 0,
             perf_map,
+            window_dump,
         }
     }
 
@@ -408,6 +432,7 @@ impl JitContext {
 impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn jit_compile(&mut self, id: BlockId, owner: &mut Owner) {
         debug!("JIT compiling block {:?}", id);
+        window_dump!(self.jctx, "== region entered at block {}", id.0);
         let base = self.jctx.end();
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
         let entry = ops.offset();
@@ -432,7 +457,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut successor = None;
         if let Some(block) = self.jctx.blocks.get(&id) {
             // Load the window the block is entered with.
-            for emit in WindowAlloc::default().transfer(&block.window) {
+            let loads = WindowAlloc::default().transfer(&block.window);
+            window_dump!(self.jctx, "block {} compiled already, entered with {}: {}", id.0, block.window, emits_line(&loads));
+            for emit in loads {
                 emit_window_move(&mut ops, emit);
             }
             dynasm!(ops
@@ -538,6 +565,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let block = &self.blocks[id.0];
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
         let mut alloc = WindowAlloc::entering(self.jctx.blocks[&id].window.clone());
+        window_dump!(self.jctx, "block {} entered with {}", id.0, alloc.cache());
 
         // Jump to `target`, or fall through to it if `skip`, transferring the
         // window to the one it is entered with: a block not yet compiled or
@@ -545,7 +573,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool| {
             if let Some(target_block) = self.jctx.blocks.get(target) {
                 // We already JIT compiled the block, and can jump to it directly.
-                for emit in alloc.transfer(&target_block.window) {
+                let transfer = alloc.transfer(&target_block.window);
+                window_dump!(self.jctx, "      to block {} (compiled, entered with {}): {}", target.0, target_block.window, emits_line(&transfer));
+                for emit in transfer {
                     emit_window_move(ops, emit);
                 }
                 if !skip {
@@ -559,7 +589,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // relocation.
                 let pending = self.jctx.pending.entry(*target)
                     .or_insert_with(|| Pending { label: ops.new_dynamic_label(), window: alloc.cache().clone() });
-                for emit in alloc.transfer(&pending.window) {
+                let transfer = alloc.transfer(&pending.window);
+                window_dump!(self.jctx, "      to block {} (entered with {}): {}", target.0, pending.window, emits_line(&transfer));
+                for emit in transfer {
                     emit_window_move(ops, emit);
                 }
                 if !skip {
@@ -627,6 +659,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_));
         for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
+            window_dump!(self.jctx, "  {off:3} {res}");
             let prev = off.checked_sub(1).map(|p| &block.instructions[p]);
             let keeps_window = window(res) || inline_guard(res) || jump(res) || prev.is_some_and(|p| inline_guard(p));
             if window(res) && prev.is_some_and(|p| window(p)) {
@@ -636,8 +669,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 dynasm!(ops
                     ; => label
                 );
-                if !keeps_window {
-                    for emit in alloc.flush() {
+                if !keeps_window && !alloc.is_empty() {
+                    let stores = alloc.flush();
+                    window_dump!(self.jctx, "      flush: {}", emits_line(&stores));
+                    for emit in stores {
                         emit_window_move(ops, emit);
                     }
                 }
@@ -662,6 +697,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // `v` holds the value: its window register, or else r10. rax,
                     // never a window register, is scratch for the masks.
                     let m = 0; // rax
+                    window_dump!(self.jctx, "      tests {}; failure path: {}",
+                        alloc.register_of(*idx).map_or(format!("[{idx}]"), |reg| format!("w{reg}")), emits_line(&alloc.stores()));
                     let v = match alloc.register_of(*idx) {
                         Some(reg) => WINDOW_REGS[reg],
                         None => {
@@ -970,6 +1007,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(&**w, skip).is_ok()).collect();
                     match alloc.op(&**w, skips) {
                         Some(emits) => {
+                            window_dump!(self.jctx, "      {}", emits_line(&emits));
                             for emit in emits {
                                 match emit {
                                     Emit::Op { skip } => {
@@ -982,7 +1020,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                         // No stencil to copy: call the op's body on the stack.
                         None => {
-                            for emit in alloc.flush() {
+                            let stores = alloc.flush();
+                            window_dump!(self.jctx, "      no stencil: flush {}, then call window_interp", emits_line(&stores));
+                            for emit in stores {
                                 emit_window_move(ops, emit);
                             }
                             let (op, vtable) = (Rc::as_ptr(w) as *const dyn Window).to_raw_parts();
@@ -1010,6 +1050,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     emit_bailout(ops, off)
                 }
             }; break; }
+            window_dump!(self.jctx, "      window {}", alloc.cache());
         }
         for emit in alloc.flush() {
             emit_window_move(ops, emit);

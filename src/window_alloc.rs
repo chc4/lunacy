@@ -73,6 +73,29 @@ pub enum Emit {
     Op { skip: usize },
 }
 
+/// Window register `reg` (or `SCRATCH`) by name, for dumps.
+struct Reg(usize);
+
+impl std::fmt::Display for Reg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            SCRATCH => write!(f, "scratch"),
+            reg => write!(f, "w{reg}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Emit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Emit::Load { reg, slot } => write!(f, "{} <- [{slot}]", Reg(reg)),
+            Emit::Store { slot, reg } => write!(f, "[{slot}] <- {}", Reg(reg)),
+            Emit::Move { dst, src } => write!(f, "{} <- {}", Reg(dst), Reg(src)),
+            Emit::Op { skip } => write!(f, "op at w{skip}"),
+        }
+    }
+}
+
 impl Emit {
     fn cost(self) -> u32 {
         match self {
@@ -91,6 +114,22 @@ pub struct Cache {
     regs: [Option<usize>; WINDOW],
     /// Cached slots whose stack home is stale.
     dirty: SmallVec<[usize; WINDOW]>,
+}
+
+/// Each register caching a slot, as `w1=[5]`, marked `*` if dirty.
+impl std::fmt::Display for Cache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut sep = "";
+        write!(f, "{{")?;
+        for (reg, slot) in self.regs.iter().enumerate() {
+            if let Some(slot) = slot {
+                let dirty = if self.dirty.contains(slot) { "*" } else { "" };
+                write!(f, "{sep}{}=[{slot}]{dirty}", Reg(reg))?;
+                sep = " ";
+            }
+        }
+        write!(f, "}}")
+    }
 }
 
 impl Cache {
