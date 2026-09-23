@@ -341,16 +341,18 @@ key for the debug check) and `emit_settable`'s `settable_href`, when the value
 is in a register, `SetTableHref: (table, value) -> ()` (captures: the witness
 index and the value's expected `LType` for the debug check; const param: whether
 the store retypes the key and bumps the epoch); a constant value keeps an `Exec`
-closure, sharing the store with the window op. Their stencils call into the
-table code (23 relocations for a get) and all copy at every `SKIP`. They join
-runs, but runs still end at each `href_init` + `select`: a field not yet seen
-needs a runtime key lookup and a block split. The multi-op runs of nbody's
-`advance` with them, worked by hand for the 8-register window (loads/stores/
-moves; loads and stores at the floor):
+closure, sharing the store with the window op. In release a get's stencil is a
+20-instruction hot path with no calls (witness bounds check, table tag check,
+entry index check, load, `jmp` to the continuation); its only relocations are
+its cold panic paths. `just test-stencils` builds with the `stencils` profile,
+every package optimized, so its stencils match release (7 relocations for a
+get, all cold). Both copy at every `SKIP`. The multi-op runs nbody's `advance`
+executes in its steady state (counted per block), worked by hand for the
+8-register window (loads/stores/moves; loads and stores at the floor):
 
 | run | now | with the table ops as `Exec`s |
 |---|---|---|
-| `bi.vx, bi.vy, bi.vz = bivx, bivy, bivz` (3 sets) | 4/0/0 | 6 loads |
+| `bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step` (11 ops) | 10/2/4 | — |
 | `dx = bix - bj.x` | 2/1/0 | 3/2 |
 | `dz = biz - bj.z; dist2 = ...` | 4/3/5 | 5/4 |
 | `bm = bj.mass * mag; bivx -= dx * bm; ...` | 9/5/4 | 10/6 |
@@ -360,8 +362,17 @@ moves; loads and stores at the floor):
 
 In `bj.vx = bj.vx + dx * bm` both moves are forced by the window's shape: the
 got value must sit right before the product, whose op covers the register the
-get left it in, and `bj` must sit right before the sum. The allocator's tests
-pin every row, and the exhaustive sweep covers all three op shapes.
+get left it in, and `bj` must sit right before the sum. In the 11-op run each
+of the three `bi.? = t` stores needs `bi` copied in right before `t` (3 moves)
+and `bivz` moves beside `dt` (1). The allocator matches every row; its tests pin
+them, and the exhaustive sweep covers all three op shapes.
+
+The `bi` run is long because `bi` keeps its shape (a key already cached in the
+slot's `CType::Shape` costs an epoch check, not an `href_init`). The `bj` runs
+are short because the inner loop's `bj = bodies[j]` is an array get that
+resets slot 19 to plain `Table`, dropping the shape, so each field of each new
+`bj` runs `href_init` + `select` (a runtime key lookup and a block split) every
+iteration; likewise `bi = bodies[i]` in the outer loop.
 
 Verification: `just test` (adds the golden suite with `immediate_jit`: in debug
 the copier rejects `NumericIntInt`'s jump table, exercising the fallback) and
@@ -375,6 +386,9 @@ Open items:
   would need the body's blocks reordered.
 - A window op's body reaching stack slots other than through its operands is a
   documented rule (Note [Register window]), not a checked one.
+- Longer `bj` runs need the array get `bodies[j]` to yield a guardable shape
+  (all bodies share one), so its fields cost an epoch/shape check instead of an
+  `href_init` + block split per field per iteration: a specializer change.
 - Jump tables in stencils. (Fat-LTO release builds do keep each op's
   continuation a real tail target: `just run nbody` copies all 8
   `NumericIntInt` stencils it uses.)

@@ -556,15 +556,22 @@ mod tests {
         B(11, 24, 25),
     ];
 
-    /// Every run of more than one window op in nbody's `advance`, table gets (G)
-    /// and sets (S) included (slots: dt 2, bi 7, bix..biz 8-10, bimass 11,
-    /// bivx..bivz 12-14, j 15/17, bj 19, dx..dz 20-22, dist2 23, mag 24, bm 25,
-    /// temporaries 26-27), with the (loads, stores, moves) worked by hand for
-    /// the whole window. Loads and stores are at the floor: a load per slot read
-    /// before it is written, a store per slot written.
+    /// Every run of more than one window op that nbody's `advance` executes in
+    /// its steady state, table gets (G) and sets (S) included (slots: dt 2, i
+    /// 3/5, bi 7, bix..biz 8-10, bimass 11, bivx..bivz 12-14, j 15/17, bj 19,
+    /// dx..dz 20-22, dist2 23, mag 24, bm 25, temporaries 15 and 26-27), with the
+    /// (loads, stores, moves) worked by hand for the whole window. Loads and
+    /// stores are at the floor: a load per slot read before it is written, a
+    /// store per slot written.
     const NBODY: [(&[TestOp], (u32, u32, u32)); 7] = [
-        // bi.vx, bi.vy, bi.vz = bivx, bivy, bivz: the table stays put.
-        (&[S(7, 12), S(7, 13), S(7, 14)], (4, 0, 0)),
+        // bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step:
+        // each store needs bi copied in right before its value, which the
+        // previous op produced where it had read its own input; bivz, cached by
+        // the first store, moves beside dt.
+        (
+            &[S(7, 14), B(2, 12, 15), B(8, 15, 15), S(7, 15), B(2, 13, 15), B(9, 15, 15), S(7, 15), B(2, 14, 15), B(10, 15, 15), S(7, 15), B(3, 5, 3)],
+            (10, 2, 4),
+        ),
         // dx = bix - bj.x: the value got reads in place as the rhs.
         (&[G(19, 20), B(8, 20, 20)], (2, 1, 0)),
         // dz = biz - bj.z; dist2 = dx*dx + dy*dy + dz*dz: as DIST2, with dz got
