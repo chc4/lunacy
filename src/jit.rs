@@ -2,7 +2,6 @@
 use std::io::Write;
 use std::rc::Rc;
 use std::cell::Cell;
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, BTreeMap};
 use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{BlockId, LBoxed, LClosure, LType, LValue, PackedLocation, ReturnLocation, RunState, Tc, Vm};
@@ -591,50 +590,55 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Plan the window allocation of the region compiled from `entry`: the blocks
-    /// reachable from it not compiled yet, each placed bottom-up after the
-    /// successors it reaches first in the order `(hotness, -id)`. See
-    /// docs/bottom-up-allocation.md.
+    /// reachable from it not compiled yet, each placed bottom-up in a depth-first
+    /// postorder, so after its successors except across the edge closing a
+    /// cycle. See Note [Window allocation].
     fn plan_region(&mut self, entry: BlockId) -> Plans {
-        let mut region = vec![entry];
+        let targets = |block: BlockId| -> SmallVec<[BlockId; 4]> { self.blocks[block.0].instructions.iter().flat_map(jump_targets).collect() };
+        let mut postorder = Vec::new();
         let mut seen: HashSet<BlockId, FxBuildHasher> = HashSet::default();
         seen.insert(entry);
-        let mut next = 0;
-        while let Some(&block) = region.get(next) {
-            next += 1;
-            for target in self.blocks[block.0].instructions.iter().flat_map(jump_targets) {
-                if !self.jctx.blocks.contains_key(&target) && seen.insert(target) {
-                    region.push(target);
+        let mut stack = vec![(entry, targets(entry), 0)];
+        while let Some((block, successors, next)) = stack.last_mut() {
+            match successors.get(*next).copied() {
+                Some(target) => {
+                    *next += 1;
+                    if !self.jctx.blocks.contains_key(&target) && seen.insert(target) {
+                        stack.push((target, targets(target), 0));
+                    }
+                }
+                None => {
+                    postorder.push(*block);
+                    stack.pop();
                 }
             }
         }
-        region.sort_by_key(|block| (self.blocks[block.0].jit_info.hotness.get(), Reverse(block.0)));
         let mut plans = Plans::default();
-        let mut order: HashMap<BlockId, usize, FxBuildHasher> = HashMap::default();
-        for (rank, &block) in region.iter().enumerate() {
-            let plan = self.plan_block(block, &plans, &order);
+        for block in postorder {
+            let plan = self.plan_block(block, &plans);
             plans.insert(block, plan);
-            order.insert(block, rank);
         }
         plans
     }
 
-    /// Place a block's window ops bottom-up, from the entry window of the
-    /// successor planned first (or compiled already) as its live-out. `order` ranks the
-    /// blocks planned so far.
-    fn plan_block(&mut self, id: BlockId, plans: &Plans, order: &HashMap<BlockId, usize, FxBuildHasher>) -> BlockPlan {
+    /// Place a block's window ops bottom-up, from the entry window of its hottest
+    /// successor planned (or compiled) already as its live-out: of equally hot
+    /// ones, a later jump's before an earlier one's, and a select's first target.
+    fn plan_block(&mut self, id: BlockId, plans: &Plans) -> BlockPlan {
         let block = &self.blocks[id.0];
+        let blocks = &self.blocks;
         let compiled = &self.jctx.blocks;
         let stencils = &mut self.jctx.stencils;
         let live_out = block
             .instructions
             .iter()
+            .rev()
             .flat_map(jump_targets)
             .filter_map(|target| match compiled.get(&target) {
-                Some(done) => Some((0, target, *done.window.regs())),
-                None => plans.get(&target).map(|plan| (order[&target] + 1, target, plan.entry)),
+                Some(done) => Some((target, *done.window.regs())),
+                None => plans.get(&target).map(|plan| (target, plan.entry)),
             })
-            .min_by_key(|&(rank, _, _)| rank)
-            .map(|(_, target, entry)| (target, entry));
+            .min_by_key(|&(target, _)| blocks[target.0].jit_info.hotness.get());
         // The usable `SKIP`s of each window op; one with none is called, a flush.
         let skips: Vec<SmallVec<[usize; WINDOW]>> = block
             .instructions

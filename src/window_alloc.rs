@@ -11,7 +11,7 @@ use crate::window::{Access, Window, WINDOW};
 // ~~~~~~~~~~~~~~~~~~~~~~~~
 // Each register caches at most one slot's current value, and a cached slot is
 // dirty while its stack home is stale. Allocation has two passes over a
-// compiled region (docs/bottom-up-allocation.md):
+// compiled region:
 //
 // * Backward, deciding placements. A `Placement` says which slot's current
 //   value the code after a point wants in each register. Walking a block from

@@ -7,7 +7,7 @@ that code over every block and over the hot blocks (hotness 0: those entered as
 often as the block that triggered compilation), so two allocators' dumps of the
 same benchmark can be compared. With `--blocks`, it lists each hot block's
 counts in every dump side by side instead (every block's, with `--all`), where
-they differ. See docs/bottom-up-allocation.md.
+they differ.
 """
 import argparse
 import re
