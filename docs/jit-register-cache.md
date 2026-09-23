@@ -304,7 +304,9 @@ allocates each run of window residuals (section 6, `Note [Window allocation]`);
 registers with r10 as scratch) and splats each op's stencil body between
 `sub rsp, 8`/`add rsp, 8` (block code keeps rsp 16-aligned; stencils expect the
 alignment just after a call). Holes and indirect continuation references become
-dynasm relocations to 8-byte pool entries emitted after the region's epilogue;
+dynasm relocations to 8-byte pool entries emitted after the region's epilogue
+(one pool per compiled region, since a pool can't grow in place while later
+code is appended after it; equal hole values share one entry);
 direct ones a relocation to a label at the copy's end; other RIP-relative
 references `value_relocation`s to their absolute target (the buffer's base is
 known). Any other residual flushes the window first; residuals inside a run get

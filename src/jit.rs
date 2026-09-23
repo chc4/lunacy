@@ -165,7 +165,30 @@ enum PoolEntry {
     Address(DynamicLabel),
 }
 
-type Pool = Vec<(DynamicLabel, PoolEntry)>;
+/// The pool of a compiled region: its entries in order, each equal value once.
+#[derive(Default)]
+struct Pool {
+    entries: Vec<(DynamicLabel, PoolEntry)>,
+    values: HashMap<u64, DynamicLabel, FxBuildHasher>,
+}
+
+impl Pool {
+    /// The label of an entry holding `value`.
+    fn value(&mut self, ops: &mut Assembler, value: u64) -> DynamicLabel {
+        *self.values.entry(value).or_insert_with(|| {
+            let label = ops.new_dynamic_label();
+            self.entries.push((label, PoolEntry::Value(value)));
+            label
+        })
+    }
+
+    /// The label of a new entry holding the absolute address of `target`.
+    fn address(&mut self, ops: &mut Assembler, target: DynamicLabel) -> DynamicLabel {
+        let label = ops.new_dynamic_label();
+        self.entries.push((label, PoolEntry::Address(target)));
+        label
+    }
+}
 
 /// Window-op stencils copied out of this executable, by stencil address.
 #[derive(Default)]
@@ -239,12 +262,12 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
         match site {
             Site::Absolute(target) => ops.value_relocation(target, field_offset, 0, rel32(RelocationKind::RelToAbs)),
             Site::Fall => ops.dynamic_relocation(fall, 0, field_offset, 0, rel32(RelocationKind::Relative)),
-            Site::Value(_) | Site::FallAddress => {
-                let entry = ops.new_dynamic_label();
-                pool.push((entry, match site {
-                    Site::Value(value) => PoolEntry::Value(value),
-                    _ => PoolEntry::Address(fall),
-                }));
+            Site::Value(value) => {
+                let entry = pool.value(ops, value);
+                ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
+            }
+            Site::FallAddress => {
+                let entry = pool.address(ops, fall);
                 ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
         }
@@ -377,7 +400,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // JitHelper function calls.
 
         let mut compiled_offsets = Vec::new();
-        let mut pool = Pool::new();
+        let mut pool = Pool::default();
         // We may have already JIT this block, if it was jumped to by another block
         // first. In that case we just have to jump to it.
         let mut successor = None;
@@ -433,7 +456,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         let pool_start = ops.offset();
         ops.align(8, 0xcc);
-        for (label, entry) in pool {
+        for (label, entry) in pool.entries {
             let value = match entry {
                 PoolEntry::Value(value) => value,
                 PoolEntry::Address(target) => {
@@ -921,3 +944,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Equal values share one pool entry; each address gets its own.
+    #[test]
+    fn pool_dedups_values() {
+        let mut ops = Assembler::new(0);
+        let mut pool = Pool::default();
+        let a = pool.value(&mut ops, 7);
+        let b = pool.value(&mut ops, 9);
+        assert_eq!(pool.value(&mut ops, 7), a);
+        assert_ne!(a, b);
+        let fall = ops.new_dynamic_label();
+        assert_ne!(pool.address(&mut ops, fall), pool.address(&mut ops, fall));
+        assert_eq!(pool.entries.len(), 4);
+    }
+}
