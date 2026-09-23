@@ -23,9 +23,14 @@ use crate::window::{Access, Window, WINDOW};
 //   displaced: moved back after the op from a copy that survives it, or from
 //   the first free register outside the run, where it waits (a move), or else
 //   reloaded after the op. The placement before the op has its inputs at `SKIP
-//   + i`, and the displaced values that wait. Ties go to the lowest `SKIP`. An
-//   inline guard is a read of its slot: the placement before it keeps the slot
-//   where it is, or puts it in the first free register.
+//   + i`, and the displaced values that wait. Ties go to the highest `SKIP`:
+//   the use places a value, and its definer, placed later, must put its output
+//   there, at the definer's `SKIP` plus the output's index, which for an op
+//   with its outputs last is above the definer's inputs. A use placed high
+//   leaves its definers room below it; one placed at the bottom of the window
+//   wants values where no such definer can write. An inline guard is a read
+//   of its slot: the placement before it keeps the slot where it is, or puts
+//   it in the first free register.
 //
 // * Forward, generating code, doing exactly what the backward pass decided.
 //   Before each window op, the window is reconciled with the placement planned
@@ -288,7 +293,7 @@ impl WindowAlloc {
                 let (cost, before) = self.place_at(slots, accesses, skip, after);
                 (cost, skip, before)
             })
-            .min_by_key(|&(cost, skip, _)| (cost, skip))
+            .min_by_key(|&(cost, skip, _)| (cost, std::cmp::Reverse(skip)))
             .map(|(_, skip, before)| (skip, before))
     }
 
