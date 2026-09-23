@@ -156,6 +156,14 @@ hyperfine benchmark times='10': unsafe-compile interpreter-compile
         "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \
         "./target/release/bench {{benchmark}}.bin {{times}}" \
         "./target/unsafe/bench {{benchmark}}.bin {{times}}"
+# Compare the trace-building policies of the window allocator on a benchmark
+# (LUNACY_TRACES; see docs/trace-register-allocation.md).
+hyperfine-traces benchmark times='10':
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    cargo build --release --bin bench
+    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-traces.md -L policy single,unidirectional,bidirectional \
+        "LUNACY_TRACES={policy} ./target/release/bench {{benchmark}}.bin {{times}}"
+
 # Compare this checkout's release build against revision `ref`'s on one
 # benchmark: `ref` is built in a detached worktree under target/compare/ (kept
 # for reruns, its submodules linked to this checkout's).

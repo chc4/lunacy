@@ -73,8 +73,11 @@ blocks. Lua 5.1 bytecode has no `goto`, so its control flow is reducible, but
 block versioning isn't bound by that: if two paths reach a loop in different
 contexts and join the steady-state loop's versions at different blocks, that
 loop has two entries. The liveness pass checks that the target of each
-retreating edge of its depth-first walk dominates the edge's source, and where
-one doesn't, it treats every slot as live in the blocks of that cycle.
+retreating edge of its depth-first walk dominates the edge's source, and if one
+doesn't, it treats every slot the region reads (or that a block outside it
+wants in a register) as live into every block of the region. Fixing up only
+the cycle's blocks would be unsound: blocks the pass visited before the fix
+computed their sets from the cycle's.
 
 **Allocating a trace.** One backward pass with the wanted window (which slot
 each register should hold) as the register-to-variable map; a slot not in it

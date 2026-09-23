@@ -11,24 +11,21 @@ use crate::window::{Access, Window, WINDOW};
 // ~~~~~~~~~~~~~~~~~~~~~~~~
 // Each register caches at most one slot's current value, and a cached slot is
 // dirty while its stack home is stale. Allocation has two passes over a
-// compiled region:
+// compiled region, trace by trace (see Note [Trace register allocation]):
 //
 // * Backward, deciding placements. A `Placement` says which slot's current
-//   value the code after a point wants in each register. Walking a block from
+//   value the code after a point wants in each register. Walking a trace from
 //   its end, each window op is placed ([`WindowAlloc::place`]) at the usable
 //   `SKIP` that forces the fewest moves and loads after it, at `MEMORY_COST` per
-//   load or store and `MOVE_COST` per move: a move for an output wanted in a
-//   register other than its own, and for an input wanted unchanged in another
-//   register too. A wanted value in the op's run that the op doesn't leave
-//   there is displaced: it costs a move if a copy survives the op, and
-//   otherwise depends on how the ops above, since the last flush, use its slot
-//   ([`Above`]). Unused, it is loaded once wherever that is, so it is dropped
-//   for nothing; read or written, it waits in the lowest free register outside
-//   the run (a move), or is loaded again after the op (and stored first, if
-//   written). The placement before the op has its inputs at `SKIP + i`, and the
-//   displaced values that wait. Ties go to the lowest `SKIP`. An inline guard is
-//   a read of its slot: the placement before it keeps the slot where it is, or
-//   puts it in the lowest free register.
+//   load and `MOVE_COST` per move: a move for an output wanted in a register
+//   other than its own, and for an input wanted unchanged in another register
+//   too. A wanted value in the op's run that the op doesn't leave there is
+//   displaced: moved back after the op from a copy that survives it, or from
+//   the first free register outside the run, where it waits (a move), or else
+//   reloaded after the op. The placement before the op has its inputs at `SKIP
+//   + i`, and the displaced values that wait. Ties go to the lowest `SKIP`. An
+//   inline guard is a read of its slot: the placement before it keeps the slot
+//   where it is, or puts it in the first free register.
 //
 // * Forward, generating code. Each window op runs at its planned `SKIP`
 //   ([`WindowAlloc::op`]): its inputs are moved or loaded into its run as one
@@ -141,21 +138,6 @@ impl Packed {
     pub fn unpack(self) -> Placement {
         self.0.map(|byte| (byte != u8::MAX).then_some(byte as usize))
     }
-}
-
-/// How the window ops before an op, since the last flush, use a slot: what a
-/// value of it displaced by the op costs. See Note [Window allocation].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Above {
-    /// Neither read nor written, since a flush: loaded once, wherever that is.
-    /// (Before a block's first flush, a value can arrive in a register instead,
-    /// so there it counts as `Read`.)
-    Unused,
-    /// Read: loaded for those reads, then again after the op unless it waits
-    /// in a register.
-    Read,
-    /// Written: in a register since, stored and reloaded unless it waits in one.
-    Written,
 }
 
 /// Which slot each window register caches, and which of them are dirty: the
@@ -290,23 +272,16 @@ impl WindowAlloc {
 
     /// Place `op` before the placement `after`: the usable `SKIP` from `skips`
     /// forcing the fewest moves and loads after it, and the placement it wants
-    /// before it. `above` says how the ops before this one, since the last flush,
-    /// use a slot. `None` if there is no usable `SKIP`. See Note [Window
+    /// before it. `None` if there is no usable `SKIP`. See Note [Window
     /// allocation].
-    pub fn place(
-        &self,
-        op: &dyn Window,
-        skips: impl IntoIterator<Item = usize>,
-        after: &Placement,
-        above: impl Fn(usize) -> Above,
-    ) -> Option<(usize, Placement)> {
+    pub fn place(&self, op: &dyn Window, skips: impl IntoIterator<Item = usize>, after: &Placement) -> Option<(usize, Placement)> {
         let slots = op.operands();
         let accesses = op.accesses();
         skips
             .into_iter()
             .filter(|&skip| skip + slots.len() <= self.width)
             .map(|skip| {
-                let (cost, before) = self.place_at(slots, accesses, skip, after, &above);
+                let (cost, before) = self.place_at(slots, accesses, skip, after);
                 (cost, skip, before)
             })
             .min_by_key(|&(cost, skip, _)| (cost, skip))
@@ -315,7 +290,7 @@ impl WindowAlloc {
 
     /// The cost of placing an op at `skip` before `after`, and the placement it
     /// wants before it.
-    fn place_at(&self, slots: &[usize], accesses: &[Access], skip: usize, after: &Placement, above: &impl Fn(usize) -> Above) -> (u32, Placement) {
+    fn place_at(&self, slots: &[usize], accesses: &[Access], skip: usize, after: &Placement) -> (u32, Placement) {
         let run = skip..skip + slots.len();
         let output = |slot: usize| slots.iter().zip(accesses).any(|(&s, &a)| s == slot && a == Access::Write);
         // What a register of the run holds after the op: its output, or its
@@ -350,20 +325,15 @@ impl WindowAlloc {
             }
             before[reg] = (accesses[reg - skip] == Access::Read).then_some(slots[reg - skip]);
         }
-        // A displaced value is moved in after the op from a copy before it, or
-        // loaded after the op, which is free for one the ops above don't use.
-        // One they use waits in a free register outside the run, or is loaded
-        // again (and stored first, if written above).
+        // A displaced value is moved back after the op from a copy that survives
+        // it, or from a free register outside the run where it waits, or else
+        // reloaded after the op.
         for slot in displaced {
-            let used = above(slot);
             if before.contains(&Some(slot)) {
                 cost += MOVE_COST;
-            } else if used == Above::Unused {
             } else if let Some(reg) = (0..self.width).find(|reg| !run.contains(reg) && before[*reg].is_none()) {
                 before[reg] = Some(slot);
                 cost += MOVE_COST;
-            } else if used == Above::Written {
-                cost += 2 * MEMORY_COST;
             } else {
                 cost += MEMORY_COST;
             }
@@ -633,24 +603,8 @@ mod tests {
         let mut alloc = WindowAlloc::with_width(width);
         let mut after: Placement = [None; WINDOW];
         let mut skips = Vec::new();
-        // Per slot, how many of the ops not yet placed read and write it.
-        let mut uses: HashMap<(usize, Access), usize> = HashMap::new();
-        for w in &windows {
-            for (&slot, &access) in w.operands().iter().zip(w.accesses()) {
-                *uses.entry((slot, access)).or_default() += 1;
-            }
-        }
         for w in windows.iter().rev() {
-            for (&slot, &access) in w.operands().iter().zip(w.accesses()) {
-                *uses.get_mut(&(slot, access)).unwrap() -= 1;
-            }
-            let count = |slot, access| uses.get(&(slot, access)).copied().unwrap_or(0);
-            let above = |slot| match (count(slot, Access::Write), count(slot, Access::Read)) {
-                (0, 0) => Above::Unused,
-                (0, _) => Above::Read,
-                _ => Above::Written,
-            };
-            let (skip, before) = alloc.place(&**w, 0..WINDOW, &after, above).unwrap();
+            let (skip, before) = alloc.place(&**w, 0..WINDOW, &after).unwrap();
             skips.push(skip);
             after = before;
         }

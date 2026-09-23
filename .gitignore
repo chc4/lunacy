@@ -7,4 +7,5 @@ flake.lock
 .gdb_history
 rustc-ice*
 hyperfine*-vs-*
+hyperfine*-traces.md
 window_dump.txt

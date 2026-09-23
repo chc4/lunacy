@@ -2,7 +2,7 @@
 use std::io::Write;
 use std::rc::Rc;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::{HashMap, BTreeMap};
 use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{BlockId, LBoxed, LClosure, LType, LValue, PackedLocation, ReturnLocation, RunState, Tc, Vm};
 use crate::gc::{GcInner, GcCtx};
@@ -10,7 +10,8 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::generator::{Block, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
-use crate::window_alloc::{Above, Cache, Emit, Packed, Placement, WindowAlloc};
+use crate::window_alloc::{Cache, Emit, Packed, Placement, WindowAlloc};
+use crate::trace::{Block as TraceBlock, Event, Policy, Region, Slots};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use smallvec::SmallVec;
@@ -314,6 +315,8 @@ pub struct JitContext {
     pub used: usize,
     pub perf_map: Option<std::cell::RefCell<std::fs::File>>,
     pub window_dump: Option<std::cell::RefCell<std::fs::File>>,
+    /// How regions are partitioned into traces (`LUNACY_TRACES`).
+    pub trace_policy: Policy,
 }
 
 #[derive(Copy, Clone)]
@@ -394,6 +397,7 @@ impl JitContext {
             used: 0,
             perf_map,
             window_dump,
+            trace_policy: Policy::from_env(),
         }
     }
 
@@ -593,121 +597,138 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Plan the window allocation of the region compiled from `entry`: the blocks
-    /// reachable from it not compiled yet, each placed bottom-up in a depth-first
-    /// postorder, so after its successors except across the edge closing a
-    /// cycle. See Note [Window allocation].
+    /// reachable from it not compiled yet, partitioned into traces by the JIT's
+    /// policy, each trace placed by one backward pass. See Note [Trace register
+    /// allocation].
     fn plan_region(&mut self, entry: BlockId) -> Plans {
-        let targets = |block: BlockId| -> SmallVec<[BlockId; 4]> { self.blocks[block.0].instructions.iter().flat_map(jump_targets).collect() };
-        let mut postorder = Vec::new();
-        let mut seen: HashSet<BlockId, FxBuildHasher> = HashSet::default();
-        seen.insert(entry);
-        let mut stack = vec![(entry, targets(entry), 0)];
-        while let Some((block, successors, next)) = stack.last_mut() {
-            match successors.get(*next).copied() {
-                Some(target) => {
-                    *next += 1;
-                    if !self.jctx.blocks.contains_key(&target) && seen.insert(target) {
-                        stack.push((target, targets(target), 0));
-                    }
-                }
-                None => {
-                    postorder.push(*block);
-                    stack.pop();
+        let mut ids = vec![entry];
+        let mut index: HashMap<BlockId, usize, FxBuildHasher> = HashMap::default();
+        index.insert(entry, 0);
+        let mut next = 0;
+        while let Some(&block) = ids.get(next) {
+            next += 1;
+            for target in self.blocks[block.0].instructions.iter().flat_map(jump_targets) {
+                if !self.jctx.blocks.contains_key(&target) && !index.contains_key(&target) {
+                    index.insert(target, ids.len());
+                    ids.push(target);
                 }
             }
         }
+        // The usable `SKIP`s of each window op; one with none is called, a flush.
+        let stencils = &mut self.jctx.stencils;
+        let skips: Vec<Vec<SmallVec<[usize; WINDOW]>>> = ids
+            .iter()
+            .map(|block| {
+                self.blocks[block.0]
+                    .instructions
+                    .iter()
+                    .map(|res| match res {
+                        Residual::ExecWindow(w) => (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(&**w, skip).is_ok()).collect(),
+                        _ => SmallVec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        let slots_of = |placement: &Placement| {
+            let mut slots = Slots::default();
+            placement.iter().flatten().for_each(|&slot| slots.insert(slot));
+            slots
+        };
+        let region = Region::new(
+            ids.iter()
+                .zip(&skips)
+                .map(|(block, skips)| {
+                    let mut events = Vec::new();
+                    for (off, res) in self.blocks[block.0].instructions.iter().enumerate() {
+                        match res {
+                            Residual::ExecWindow(w) if !skips[off].is_empty() => {
+                                let operands = w.operands().iter().zip(w.accesses());
+                                events.extend(operands.clone().filter(|(_, a)| **a == Access::Read).map(|(&slot, _)| Event::Read(slot)));
+                                events.extend(operands.filter(|(_, a)| **a == Access::Write).map(|(&slot, _)| Event::Write(slot)));
+                            }
+                            Residual::Guard { idx, .. } if inline_guard(res) => events.push(Event::Read(*idx)),
+                            Residual::Jump(_) | Residual::Select(_) => {
+                                for target in jump_targets(res) {
+                                    events.push(match index.get(&target) {
+                                        Some(&i) => Event::Edge(i),
+                                        None => Event::Exit(slots_of(self.jctx.blocks[&target].window.regs())),
+                                    });
+                                }
+                            }
+                            // An exit to the interpreter, which reads the stack.
+                            Residual::Thunk(_) => {}
+                            _ => events.push(Event::Flush),
+                        }
+                    }
+                    TraceBlock { events, hotness: self.blocks[block.0].jit_info.hotness.get(), id: block.0 }
+                })
+                .collect(),
+        );
+        let live_in = region.liveness();
+        let traces = region.traces(self.jctx.trace_policy);
+        window_dump!(self.jctx, "traces {}", traces.iter().map(|trace| trace.iter().map(|&b| ids[b].0.to_string()).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" | "));
         let mut plans = Plans::default();
-        for block in postorder {
-            let plan = self.plan_block(block, &plans);
-            plans.insert(block, plan);
+        for trace in &traces {
+            for (pos, &b) in trace.iter().enumerate().rev() {
+                let next = trace.get(pos + 1).map(|&n| ids[n]);
+                let plan = self.plan_block(ids[b], next, &skips[b], &index, &live_in, &plans);
+                plans.insert(ids[b], plan);
+            }
         }
         plans
     }
 
-    /// Place a block's window ops bottom-up, from the entry window of its hottest
-    /// successor planned (or compiled) already as its live-out: of equally hot
-    /// ones, a later jump's before an earlier one's, and a select's first target.
-    fn plan_block(&mut self, id: BlockId, plans: &Plans) -> BlockPlan {
+    /// Place a block's window ops by one backward pass (see Note [Window
+    /// allocation]), continuing into `next`, the block after it in its trace, or
+    /// if it ends its trace into its hottest target with an entry window already.
+    /// Every other target's slots are pseudo-uses where it jumps: live into the
+    /// target (its entry window's, if it has one), they keep or take a free
+    /// register, else stay in their stack homes.
+    fn plan_block(
+        &self,
+        id: BlockId,
+        next: Option<BlockId>,
+        skips: &[SmallVec<[usize; WINDOW]>],
+        index: &HashMap<BlockId, usize, FxBuildHasher>,
+        live_in: &[Slots],
+        plans: &Plans,
+    ) -> BlockPlan {
         let block = &self.blocks[id.0];
-        let blocks = &self.blocks;
-        let compiled = &self.jctx.blocks;
-        let stencils = &mut self.jctx.stencils;
-        let live_out = block
-            .instructions
-            .iter()
-            .rev()
-            .flat_map(jump_targets)
-            .filter_map(|target| match compiled.get(&target) {
-                Some(done) => Some((target, *done.window.regs())),
-                None => plans.get(&target).map(|plan| (target, plan.entry.unpack())),
-            })
-            .min_by_key(|&(target, _)| blocks[target.0].jit_info.hotness.get());
-        // The usable `SKIP`s of each window op; one with none is called, a flush.
-        let skips: Vec<SmallVec<[usize; WINDOW]>> = block
-            .instructions
-            .iter()
-            .map(|res| match res {
-                Residual::ExecWindow(w) => (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(&**w, skip).is_ok()).collect(),
-                _ => SmallVec::new(),
-            })
-            .collect();
-        let flushes = |off: usize| match &block.instructions[off] {
-            Residual::ExecWindow(_) => skips[off].is_empty(),
-            Residual::Jump(_) | Residual::Select(_) | Residual::Thunk(_) => false,
-            res => !inline_guard(res),
+        let window_of = |target: BlockId| match self.jctx.blocks.get(&target) {
+            Some(done) => Some(*done.window.regs()),
+            None => plans.get(&target).map(|plan| plan.entry.unpack()),
         };
-        // The slots a residual reads and writes from the window: a window op's
-        // operands, and the slot an inline guard tests.
-        let operands = |res: &Residual| -> SmallVec<[(usize, Access); WINDOW]> {
-            match res {
-                Residual::ExecWindow(w) => w.operands().iter().copied().zip(w.accesses().iter().copied()).collect(),
-                Residual::Guard { idx, .. } if inline_guard(res) => smallvec::smallvec![(*idx, Access::Read)],
-                _ => SmallVec::new(),
-            }
-        };
-        // Per slot and access, how many residuals before `end`, since the flush
-        // before it, use it so; and whether that reaches the block's start, where
-        // a value can arrive in a register instead of from the stack.
-        let uses_before = |end: usize| {
-            let mut uses: HashMap<(usize, Access), usize, FxBuildHasher> = HashMap::default();
-            let mut entered = true;
-            for off in (0..end).rev() {
-                if flushes(off) {
-                    entered = false;
-                    break;
-                }
-                for operand in operands(&block.instructions[off]) {
-                    *uses.entry(operand).or_default() += 1;
-                }
-            }
-            (uses, entered)
-        };
+        let continues = next.or_else(|| {
+            block
+                .instructions
+                .iter()
+                .flat_map(jump_targets)
+                .filter(|&target| window_of(target).is_some())
+                .min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0))
+        });
         let alloc = WindowAlloc::default();
         let mut placed = vec![NOT_PLACED; block.instructions.len()];
         let mut want: Placement = [None; WINDOW];
-        let (mut uses, mut entered) = uses_before(block.instructions.len());
         for (off, res) in block.instructions.iter().enumerate().rev() {
-            if let Some((target, entry)) = live_out {
-                if jump_targets(res).contains(&target) {
-                    want = entry;
+            let targets = jump_targets(res);
+            if let Some(target) = continues.filter(|target| targets.contains(target)) {
+                want = window_of(target).expect("the trace continues into a planned block");
+            }
+            for target in targets.into_iter().filter(|&target| Some(target) != continues) {
+                let used = match window_of(target) {
+                    Some(window) => window.into_iter().flatten().collect::<SmallVec<[usize; WINDOW]>>(),
+                    None => live_in[index[&target]].iter().collect(),
+                };
+                for slot in used {
+                    if !want.contains(&Some(slot)) {
+                        let Some(reg) = want.iter().position(Option::is_none) else { break };
+                        want[reg] = Some(slot);
+                    }
                 }
             }
-            if !flushes(off) {
-                for operand in operands(res) {
-                    *uses.get_mut(&operand).expect("counted") -= 1;
-                }
-            }
-            let count = |slot, access| uses.get(&(slot, access)).copied().unwrap_or(0);
-            // Unused above the block's start, a slot is read from the block's
-            // entry window, where the predecessor can leave it in a register.
-            let above = |slot| match (count(slot, Access::Write), count(slot, Access::Read)) {
-                (0, 0) if !entered => Above::Unused,
-                (0, _) => Above::Read,
-                _ => Above::Written,
-            };
             match res {
                 Residual::ExecWindow(w) if !skips[off].is_empty() => {
-                    let (skip, before) = alloc.place(&**w, skips[off].iter().copied(), &want, above).expect("a usable SKIP");
+                    let (skip, before) = alloc.place(&**w, skips[off].iter().copied(), &want).expect("a usable SKIP");
                     placed[off] = skip as u8;
                     want = before;
                 }
@@ -720,11 +741,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     }
                 }
-                _ if flushes(off) => {
-                    want = [None; WINDOW];
-                    (uses, entered) = uses_before(off);
-                }
-                _ => {}
+                Residual::Jump(_) | Residual::Select(_) | Residual::Thunk(_) => {}
+                _ => want = [None; WINDOW],
             }
         }
         BlockPlan { entry: Packed::pack(&want), placed }

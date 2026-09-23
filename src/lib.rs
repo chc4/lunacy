@@ -25,6 +25,8 @@ pub mod window;
 #[cfg(feature = "jit")]
 pub mod window_alloc;
 #[cfg(feature = "jit")]
+pub mod trace;
+#[cfg(feature = "jit")]
 pub mod jit;
 pub mod gc;
 
