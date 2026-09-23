@@ -7,14 +7,19 @@ and what a block's entry window holds have no model behind them.
 
 ## The model
 
+The thesis separates what a trace is from how traces are built: the allocation
+works on any partition into traces, and building them is a policy, of which it
+evaluates two and names a third.
+
 - **Traces.** The control-flow graph is partitioned into traces: sequences of
   blocks where each block's successor in the trace is one of its CFG
   successors, and no edge inside a trace is a back edge. Every block is in
-  exactly one trace. The unidirectional builder starts a trace at a block whose
-  predecessors are all in traces already (at first, the entry), preferring the
-  most frequent, and appends the most frequent successor not yet in a trace
-  until there is none. Every other edge out of a trace's blocks is an edge
-  between traces, into another trace's head or middle.
+  exactly one trace. Every other edge is an edge between traces, into another
+  trace's head or middle.
+- **Trace building**, a policy producing a partition and the order its traces
+  are allocated in (see Trace building policies below). The thesis prefers the
+  unidirectional builder, and notes that with every block its own trace, trace
+  register allocation is local register allocation.
 - **Global liveness**, computed once: `live_in` and `live_out` per block. A
   block's `live_out` is a pseudo-use at its end, keeping values alive for the
   traces that branch off it; a trace head's `live_in` is a pseudo-definition.
@@ -23,7 +28,8 @@ and what a block's entry window holds have no model behind them.
   (Wimmer and Franz 2010). No fixpoint: in SSA form a value live at a loop
   header can't be killed inside the loop. Inside a trace, liveness has no
   holes, since a trace is a straight line.
-- **Allocation, one trace at a time**, most important first. The bottom-up
+- **Allocation, one trace at a time**, in the policy's order, most important
+  first. The bottom-up
   strategy is one backward pass over a trace with a map from registers to
   variables and from variables to locations: per instruction, its outputs first
   (their registers become free), then its inputs (where they already are, else
@@ -42,15 +48,11 @@ and what a block's entry window holds have no model behind them.
 straight line whose guards branch off it. A guard's failure edge is either its
 thunk, an exit to the interpreter where the dirty registers are stored, or,
 once the thunk is forced, a jump to another block, an edge between traces. A
-select's targets are edges too. A trace follows each block's most frequent
-successor, so a chain of small blocks joined by jumps, like life's
-neighbour-count loop, is one trace allocated in one backward pass, where the
-per-block planning had a reconciliation at every jump.
-
-**Frequency.** The builder needs to pick a block's most frequent successor.
-The hotness countdown stops at zero, so the blocks of the loop that triggered
-compilation all read about zero. Among equally hot successors, prefer the
-block's final jump to a guard's failure jump, and a select's first target.
+select's targets are edges too. Which of these edges join blocks of one trace
+is up to the building policy. Under a policy following frequent successors, a
+chain of small blocks joined by jumps, like life's neighbour-count loop, is one
+trace allocated in one backward pass; with single-block traces, every jump is
+an edge between traces, reconciled like the per-block planning did.
 
 **Liveness of slots.** Variables are stack slots, not SSA values: a slot can be
 redefined inside a loop. The single pass with loop-header propagation then
@@ -91,9 +93,32 @@ and each edge between traces is resolved by the existing transfer (stores, then
 a parallel move by windmill peeling). The transfer is emitted at the edge's own
 jump, so critical edges, which the thesis excludes, need no splitting.
 
-**Order.** Traces are allocated in the order the builder finds them, the one
-from the region's entry first, so a colder trace starts from the entry window
-of the hotter trace it jumps into.
+## Trace building policies
+
+The allocation is correct for any partition into traces, so the policy is
+selectable (a feature, or a switch on the JIT context), letting the same
+benchmarks and window dumps run under each. In particular, single-block traces
+against a frequency-driven policy measures whether traces longer than a block
+improve the code.
+
+- **Single-block.** Every block is its own trace: local allocation, with every
+  edge between blocks resolved. Traces are allocated in the region's
+  depth-first postorder, so a block starts from the entry window of a
+  successor allocated already (every one but a loop's closing edge's target).
+- **Unidirectional** (the thesis's choice). Start a trace at a block whose
+  predecessors in the region are all in traces already (at first, the
+  region's entry), preferring the most frequent, and append the most frequent
+  successor not yet in a trace until there is none. Traces are allocated in the
+  order found.
+- **Bidirectional.** Start a trace at the most frequent block not yet in one,
+  grow it upwards through its most frequent predecessor not in a trace (never
+  across a back edge), then downwards as the unidirectional builder does.
+  Traces are allocated in the order found.
+
+The frequency-driven policies need a block's most frequent successor. The
+hotness countdown stops at zero, so the blocks of the loop that triggered
+compilation all read about zero; among equally hot successors, they prefer the
+block's final jump to a guard's failure jump, and a select's first target.
 
 ## What it replaces
 
@@ -108,4 +133,4 @@ further down, so the displacement cost needs no look upward.
 - Whether side exits' `live_out` pseudo-uses are worth it, or side traces
   should simply load what they read.
 - The frequency order among successors that all read zero hotness, beyond the
-  tie-breaks above.
+  tie-breaks above, for the frequency-driven policies.
