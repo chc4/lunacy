@@ -140,8 +140,8 @@ opaque closure so the JIT can't see its dataflow. Window ops make it visible
 - **JIT mode** (`src/window_alloc.rs`, `Note [Window allocation]`, section 6):
   a streaming allocator: each op, its operands known from the op itself, is
   placed at the `SKIP` whose resculpt emits least, and flushing is deferred to
-  the end of the run. Interpreter mode: the op at `SKIP` 0; load the inputs from
-  their stack homes, run, flush the outputs.
+  the end of the run. Interpreter mode: the op's body on its operands' stack homes
+  (`Window::on_stack`: read the inputs, run, write the outputs; no window).
 
 **Copy&patch (the part worth the machinery).** Instead of emitting a `call` to
 the `Exec` closure body, splat the op's compiled **template/stencil** into the

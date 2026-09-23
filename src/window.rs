@@ -72,9 +72,10 @@
 // the run of window residuals ends. An inline type guard does not end the run:
 // it tests the cached register, and stores the dirty ones on its failure path.
 //
-// The interpreter keeps no window between residuals: `ExecWindow` runs the op at
-// `SKIP` 0, loading its inputs from their stack homes and flushing its outputs,
-// so resuming a block at any residual is sound.
+// The interpreter keeps no window between residuals: `ExecWindow` runs the op's
+// body on its operands' stack homes (`Window::on_stack`: inputs read from them,
+// outputs written to them, no window), so resuming a block at any residual is
+// sound.
 
 use std::collections::HashMap;
 
@@ -219,22 +220,33 @@ pub trait Window: std::fmt::Debug {
         w: &mut Regs<'src, 'intern>,
         skip: usize,
     );
+    /// Run the body on the operands' stack homes: inputs read from and outputs
+    /// written to them directly, with no window.
+    fn on_stack<'src, 'intern>(&self, owner: &mut Owner, state: &mut RunState<'src, 'intern>);
 }
 
 impl dyn Window {
-    /// Interpreter tier: load the inputs from their stack homes, run the body,
-    /// flush the outputs. See Note [Register window].
+    /// Interpreter tier: run the op on its operands' stack homes. See Note
+    /// [Register window].
     pub fn interp<'src, 'intern>(&self, owner: &mut Owner, state: &mut RunState<'src, 'intern>) {
+        #[cfg(feature = "check_windows")]
+        self.interp_checked(owner, state);
+        #[cfg(not(feature = "check_windows"))]
+        self.on_stack(owner, state);
+    }
+
+    /// `interp` through a window, checked against the op's copy&patched stencil
+    /// (see `check`).
+    #[cfg(feature = "check_windows")]
+    fn interp_checked<'src, 'intern>(&self, owner: &mut Owner, state: &mut RunState<'src, 'intern>) {
         let operands = self.operands().iter().zip(self.accesses()).enumerate();
         let mut w = [LBoxed::NIL; WINDOW];
         for (i, (slot, _)) in operands.clone().filter(|(_, (_, a))| **a == Access::Read) {
             w[i] = state.vals[state.base + slot];
         }
         let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
-        #[cfg(feature = "check_windows")]
         let before = w;
         unsafe { self.run(owner, state, base, &mut w, 0) };
-        #[cfg(feature = "check_windows")]
         check::check(self, owner, state, base, before, &w);
         for (i, (slot, _)) in operands.filter(|(_, (_, a))| **a == Access::Write) {
             state.vals[state.base + slot] = w[i];
@@ -440,6 +452,18 @@ macro_rules! windowed {
             ) {
                 assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
                 unsafe { Self::__window($(self.$cap,)* owner, state, base, w, skip) }
+            }
+            fn on_stack<'src, 'intern>(
+                &self,
+                owner: &mut $crate::Owner,
+                state: &mut $crate::vm::RunState<'src, 'intern>,
+            ) {
+                let at = state.base;
+                let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(at).as_ptr() };
+                $( let $in = state.vals[at + self.operands[$ii]]; )*
+                $( let mut $out = $crate::lboxed::LBoxed::NIL; )*
+                unsafe { Self::__run($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                $( state.vals[at + self.operands[$oi]] = $out; )*
             }
         }
     };
