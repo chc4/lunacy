@@ -354,6 +354,14 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             });
             arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[b, a])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
+        } else if let ResumeArg::Matched = (yield YieldOp::GuardRk(c, LType::Number)) {
+            // A number key in a register: the array part.
+            windowed!(GetTableIndex, [], [], |owner, state, base| (table, key, out dest) {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                *dest = tab.get(owner, &key, state.intern).unwrap_or(LBoxed::NIL);
+            });
+            arg = yield YieldOp::ExecWindow(Rc::new(GetTableIndex::new(&[b, c, a])));
+            yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
         } else {
             arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
                 let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
@@ -383,7 +391,14 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         }
         // TODO: table shape specialization
         arg = yield YieldOp::GuardRk(b, LType::Number);
-        if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
+        if arg == ResumeArg::Matched && c & 0x100 == 0 {
+            // A number key and the value in registers: the array part.
+            windowed!(SetTableIndex, [], [], |owner, state, base| (table, key, value) {
+                let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
+                tab.set(owner, key, value, state.intern);
+            });
+            arg = yield YieldOp::ExecWindow(Rc::new(SetTableIndex::new(&[a, b, c])));
+        } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
             // Array part set
             // TODO: MatchedConst
             arg = yield YieldOp::Exec(ResidualExec::new("settable_array", Rc::new(move |owner, state| {

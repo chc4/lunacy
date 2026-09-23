@@ -467,6 +467,11 @@ an op names:
 - `NumericIntInt` declares `(lhs, rhs, out dest)`;
 - `GetTableHref` declares `(table, out dest)`;
 - `SetTableHref` declares `(table, value)`;
+- `GetTableIndex` (`emit_gettable`, a number key in a register) declares
+  `(table, key, out dest)` and `SetTableIndex` (`emit_settable`, key and value
+  in registers) `(table, key, value)`, both through `Table::get`/`set`, which
+  index the array part by number; constant keys or values keep their `Exec`
+  closures;
 - `Move` (`emit_move`) declares `(from, out to)`;
 - `LoadKNumber` / `LoadKString` (`emit_loadk`) declare `(out dest)`, reading
   the constant from the prototype (one op per kind: converting any constant is

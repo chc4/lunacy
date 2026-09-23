@@ -258,6 +258,9 @@ mod tests {
     windowed!(Set, [], [], |owner, state, base| (a, b) {
         core::hint::black_box((a, b));
     });
+    windowed!(Store, [], [], |owner, state, base| (a, b, c) {
+        core::hint::black_box((a, b, c));
+    });
     windowed!(Out, [], [], |owner, state, base| (out d) {
         *d = LBoxed::NIL;
     });
@@ -277,6 +280,8 @@ mod tests {
         Get(usize, usize),
         /// A table set, `(table, value)`.
         Set(usize, usize),
+        /// An array set, `(table, key, value)`.
+        Store(usize, usize, usize),
         /// An upvalue get or constant load, `(out d)`.
         Out(usize),
         /// A for loop step, `(idx, limit, step, prev, out var)` with `prev` and
@@ -346,6 +351,7 @@ mod tests {
                     TestOp::BinFirst(a, b, d) => Box::new(BinFirst::new(&[d, a, b])),
                     TestOp::Get(a, d) => Box::new(Get::new(&[a, d])),
                     TestOp::Set(a, b) => Box::new(Set::new(&[a, b])),
+                    TestOp::Store(a, b, c) => Box::new(Store::new(&[a, b, c])),
                     TestOp::Out(d) => Box::new(Out::new(&[d])),
                     TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[i, l, s, v, v])),
                 }
@@ -461,12 +467,12 @@ mod tests {
     #[test]
     fn exhaustive_small_runs() {
         let arity = |op: &TestOp| match op {
-            TestOp::Bin(..) | TestOp::BinFirst(..) => 3,
+            TestOp::Bin(..) | TestOp::BinFirst(..) | TestOp::Store(..) => 3,
             TestOp::Get(..) | TestOp::Set(..) => 2,
             TestOp::Out(..) => 1,
             TestOp::Loop(..) => 5,
         };
-        let shapes = [B(0, 0, 0), TestOp::BinFirst(0, 0, 0), G(0, 0), S(0, 0), U(0), L(0, 0, 0, 0)];
+        let shapes = [B(0, 0, 0), TestOp::BinFirst(0, 0, 0), G(0, 0), S(0, 0), TestOp::Store(0, 0, 0), U(0), L(0, 0, 0, 0)];
         let mut runs: Vec<Vec<TestOp>> = Vec::new();
         for x in shapes {
             for y in shapes {
@@ -491,6 +497,7 @@ mod tests {
                         TestOp::BinFirst(..) => TestOp::BinFirst(next(), next(), next()),
                         TestOp::Get(..) => G(next(), next()),
                         TestOp::Set(..) => S(next(), next()),
+                        TestOp::Store(..) => TestOp::Store(next(), next(), next()),
                         TestOp::Out(..) => U(next()),
                         TestOp::Loop(..) => L(next(), next(), next(), next()),
                     })
