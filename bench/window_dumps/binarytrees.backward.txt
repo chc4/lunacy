@@ -1,0 +1,447 @@
+== region entered at block 3
+region entry block 3 loads w0 <- [1]
+block 3 hotness 0 entered with {w0=[1]}
+    0 guard(1, number)
+      tests w0
+      window {w0=[1]}
+    1 thunk
+      exit after 
+      window {w0=[1]}
+    2 jump(4)
+      to block 4 (entered with {}): 
+      window {w0=[1]}
+block 4 hotness 1 entered with {}
+    0 exec(comp_cint_int_LT)
+      window {}
+    1 select
+      to block 7 (entered with {w0=[0]}): w0 <- [0]
+      to block 5 (entered with {}): 
+      window {}
+block 5 hotness 37 entered with {}
+    0 jump(6)
+      to block 6 (entered with {}): 
+      window {}
+block 6 hotness 37 entered with {}
+    0 exec(newtable)
+      window {}
+    1 gc
+      window {}
+    2 window(Move, 0, out 3)
+      w0 <- [0]; op at w0
+      window {w0=[0] w1=[3]*}
+    3 exec(setlist)
+      flush: [3] <- w1
+      window {}
+    4 ret
+      window {}
+block 7 hotness 27 entered with {w0=[0]}
+    0 guard(0, number)
+      tests w0
+      window {w0=[0]}
+    1 thunk
+      exit after 
+      window {w0=[0]}
+    2 jump(8)
+      to block 8 (entered with {w0=[0] w1=[0]}): w1 <- w0
+      window {w0=[0]}
+block 8 hotness 28 entered with {w0=[0] w1=[0]}
+    0 window(NumericIntInt, 0, 0, out 2)
+      op at w0
+      window {w0=[0] w1=[0] w2=[2]*}
+    1 exec(numeric_int_cint_SUB)
+      flush: [2] <- w2
+      window {}
+    2 window(GetUpval, out 3)
+      op at w0
+      window {w0=[3]*}
+    3 exec(numeric_int_cint_SUB)
+      flush: [3] <- w0
+      window {}
+    4 window(Move, 1, out 5)
+      w0 <- [1]; op at w0
+      window {w0=[1] w1=[5]*}
+    5 guard(3, func)
+      tests [3]
+      window {w0=[1] w1=[5]*}
+    6 thunk
+      exit after [5] <- w1
+      window {w0=[1] w1=[5]*}
+    7 lua_guard(3, 0x593bbfc7a9e0)
+      flush: [5] <- w1
+      window {}
+    8 thunk
+      exit after 
+      window {}
+    9 jump(9)
+      to block 9 (entered with {}): 
+      window {}
+block 9 hotness 28 entered with {}
+    0 lcall(0x593bbfc844f8, 3, 3, 2)
+      window {}
+    1 window(GetUpval, out 4)
+      w1 <- [2]; op at w0
+      window {w0=[4]* w1=[2]}
+    2 window(Move, 2, out 5)
+      op at w1
+      window {w0=[4]* w1=[2] w2=[5]*}
+    3 window(Move, 1, out 6)
+      w1 <- [1]; [5] <- w2; op at w1
+      window {w0=[4]* w1=[1] w2=[6]*}
+    4 guard(4, func)
+      tests w0
+      window {w0=[4]* w1=[1] w2=[6]*}
+    5 thunk
+      exit after [4] <- w0; [6] <- w2
+      window {w0=[4]* w1=[1] w2=[6]*}
+    6 lua_guard(4, 0x593bbfc7a9e0)
+      flush: [4] <- w0; [6] <- w2
+      window {}
+    7 thunk
+      exit after 
+      window {}
+    8 jump(10)
+      to block 10 (entered with {}): 
+      window {}
+block 10 hotness 37 entered with {}
+    0 lcall(0x593bbfc84328, 4, 3, 2)
+      window {}
+    1 exec(newtable)
+      window {}
+    2 gc
+      window {}
+    3 window(Move, 0, out 6)
+      w0 <- [0]; op at w0
+      window {w0=[0] w1=[6]*}
+    4 window(Move, 3, out 7)
+      w0 <- [3]; [6] <- w1; op at w0
+      window {w0=[3] w1=[7]*}
+    5 window(Move, 4, out 8)
+      w0 <- [4]; [7] <- w1; op at w0
+      window {w0=[4] w1=[8]*}
+    6 exec(setlist)
+      flush: [8] <- w1
+      window {}
+    7 ret
+      window {}
+== region entered at block 10
+block 10 compiled already, entered with {}: 
+== region entered at block 12
+region entry block 12 loads w0 <- [0]
+block 12 hotness 0 entered with {w0=[0]}
+    0 guard(0, table)
+      tests w0
+      window {w0=[0]}
+    1 thunk
+      exit after 
+      window {w0=[0]}
+    2 jump(13)
+      to block 13 (entered with {}): 
+      window {w0=[0]}
+block 13 hotness 1 entered with {}
+    0 exec(len_tab)
+      window {}
+    1 exec(comp_int_cint_EQ)
+      window {}
+    2 select
+      to block 16 (entered with {}): 
+      to block 14 (entered with {}): 
+      window {}
+block 14 hotness 37 entered with {}
+    0 jump(15)
+      to block 15 (entered with {}): 
+      window {}
+block 15 hotness 37 entered with {}
+    0 exec(gettable)
+      window {}
+    1 ret
+      window {}
+block 16 hotness 28 entered with {}
+    0 exec(gettable)
+      window {}
+    1 window(GetUpval, out 2)
+      op at w0
+      window {w0=[2]*}
+    2 exec(gettable)
+      flush: [2] <- w0
+      window {}
+    3 guard(2, func)
+      tests [2]
+      window {}
+    4 thunk
+      exit after 
+      window {}
+    5 lua_guard(2, 0x593bbfc7aac0)
+      window {}
+    6 thunk
+      exit after 
+      window {}
+    7 jump(17)
+      to block 17 (entered with {}): 
+      window {}
+block 17 hotness 28 entered with {}
+    0 lcall(0x593bbfc81d48, 2, 2, 2)
+      window {}
+    1 guard(1, number)
+      tests [1]
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 jump(18)
+      to block 18 (entered with {w0=[2]}): w0 <- [2]
+      window {}
+block 18 hotness 36 entered with {w0=[2]}
+    0 guard(2, number)
+      tests w0
+      window {w0=[2]}
+    1 thunk
+      exit after 
+      window {w0=[2]}
+    2 jump(19)
+      to block 19 (entered with {w0=[1] w1=[2]}): w1 <- w0; w0 <- [1]
+      window {w0=[2]}
+block 19 hotness 37 entered with {w0=[1] w1=[2]}
+    0 window(NumericIntInt, 1, 2, out 1)
+      op at w0
+      window {w1=[2] w2=[1]*}
+    1 window(GetUpval, out 2)
+      op at w0
+      window {w0=[2]* w2=[1]*}
+    2 exec(gettable)
+      flush: [1] <- w2; [2] <- w0
+      window {}
+    3 guard(2, func)
+      tests [2]
+      window {}
+    4 thunk
+      exit after 
+      window {}
+    5 lua_guard(2, 0x593bbfc7aac0)
+      window {}
+    6 thunk
+      exit after 
+      window {}
+    7 jump(20)
+      to block 20 (entered with {}): 
+      window {}
+block 20 hotness 37 entered with {}
+    0 lcall(0x593bbff202f8, 2, 2, 2)
+      window {}
+    1 guard(2, number)
+      tests [2]
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 jump(21)
+      to block 21 (entered with {w0=[1] w1=[2]}): w0 <- [1]; w1 <- [2]
+      window {}
+block 21 hotness 41 entered with {w0=[1] w1=[2]}
+    0 window(NumericIntInt, 1, 2, out 1)
+      op at w0
+      window {w1=[2] w2=[1]*}
+    1 ret
+      flush: [1] <- w2
+      window {}
+== region entered at block 18
+block 18 compiled already, entered with {w0=[2]}: w0 <- [2]
+== region entered at block 21
+block 21 compiled already, entered with {w0=[1] w1=[2]}: w0 <- [1]; w1 <- [2]
+== region entered at block 35
+region entry block 35 loads 
+block 35 hotness 0 entered with {}
+    0 lcall(0x593bbfdbb918, 14, 3, 0)
+      window {}
+    1 guard(13, func)
+      tests [13]
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 lua_guard(13, 0x593bbfc7aac0)
+      window {}
+    4 thunk
+      exit after 
+      window {}
+    5 jump(36)
+      to block 36 (entered with {}): 
+      window {}
+block 36 hotness 0 entered with {}
+    0 lcall(0x593bbfdb97a8, 13, 0, 2)
+      window {}
+    1 guard(13, number)
+      tests [13]
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 jump(37)
+      to block 37 (entered with {w1=[7] w2=[2] w3=[13]}): w1 <- [7]; w2 <- [2]; w3 <- [13]
+      window {}
+block 37 hotness 0 entered with {w1=[7] w2=[2] w3=[13]}
+    0 window(NumericIntInt, 2, 13, out 13)
+      op at w2
+      window {w1=[7] w2=[2] w4=[13]*}
+    1 window(GetUpval, out 14)
+      op at w0
+      window {w0=[14]* w1=[7] w2=[2] w4=[13]*}
+    2 window(GetUpval, out 15)
+      [14] <- w0; op at w0
+      window {w0=[15]* w1=[7] w2=[2] w4=[13]*}
+    3 window(LoadKNumber, out 16)
+      op at w2
+      window {w0=[15]* w1=[7] w2=[16]* w4=[13]*}
+    4 window(Move, 7, out 17)
+      [16] <- w2; op at w1
+      window {w0=[15]* w1=[7] w2=[17]* w4=[13]*}
+    5 guard(15, func)
+      tests w0
+      window {w0=[15]* w1=[7] w2=[17]* w4=[13]*}
+    6 thunk
+      exit after [13] <- w4; [15] <- w0; [17] <- w2
+      window {w0=[15]* w1=[7] w2=[17]* w4=[13]*}
+    7 lua_guard(15, 0x593bbfc7a9e0)
+      flush: [13] <- w4; [15] <- w0; [17] <- w2
+      window {}
+    8 thunk
+      exit after 
+      window {}
+    9 jump(38)
+      to block 38 (entered with {}): 
+      window {}
+block 38 hotness 0 entered with {}
+    0 lcall(0x593bbfdbf778, 15, 3, 0)
+      window {}
+    1 guard(14, func)
+      tests [14]
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 lua_guard(14, 0x593bbfc7aac0)
+      window {}
+    4 thunk
+      exit after 
+      window {}
+    5 jump(39)
+      to block 39 (entered with {}): 
+      window {}
+block 39 hotness 0 entered with {}
+    0 lcall(0x593bbfdbcd88, 14, 0, 2)
+      window {}
+    1 guard(14, number)
+      tests [14]
+      window {}
+    2 thunk
+      exit after 
+      window {}
+    3 jump(40)
+      to block 40 (entered with {w0=[13] w1=[14] w3=[10] w4=[11] w5=[12] w6=[7] w7=[9]}): w0 <- [13]; w1 <- [14]; w3 <- [10]; w4 <- [11]; w5 <- [12]; w6 <- [7]; w7 <- [9]
+      window {}
+block 40 hotness 0 entered with {w0=[13] w1=[14] w3=[10] w4=[11] w5=[12] w6=[7] w7=[9]}
+    0 window(NumericIntInt, 13, 14, out 2)
+      op at w0
+      window {w0=[13] w1=[14] w2=[2]* w3=[10] w4=[11] w5=[12] w6=[7] w7=[9]}
+    1 window(NumericIntInt, 9, 11, out 9)
+      w0 <- w7; w1 <- w4; [2] <- w2; op at w0
+      window {w1=[11] w2=[9]* w3=[10] w4=[11] w5=[12] w6=[7]}
+    2 window(ForLoop, 9, 10, 11, 12, out 12)
+      w1 <- w6; op at w2
+      window {w1=[7] w2=[9]* w3=[10] w4=[11] w6=[12]*}
+    3 select
+      to block 45 (entered with {w1=[7]}): [9] <- w2; [12] <- w6
+      to block 41 (entered with {w0=[0] w1=[4] w2=[6] w4=[5] w5=[6] w6=[7] w7=[1]}): [9] <- w2; [12] <- w6; w0 <- [0]; w2 <- [6]; w4 <- [5]; w5 <- [6]; w6 <- w1; w1 <- [4]; w7 <- [1]
+      window {w1=[7] w2=[9]* w3=[10] w4=[11] w6=[12]*}
+block 41 hotness 64 entered with {w0=[0] w1=[4] w2=[6] w4=[5] w5=[6] w6=[7] w7=[1]}
+    0 window(NumericIntInt, 4, 6, out 4)
+      op at w1
+      window {w0=[0] w2=[6] w3=[4]* w4=[5] w5=[6] w6=[7] w7=[1]}
+    1 window(ForLoop, 4, 5, 6, 7, out 7)
+      w1 <- w0; w2 <- w7; op at w3
+      window {w0=[0] w1=[0] w2=[1] w3=[4]* w4=[5] w5=[6] w7=[7]*}
+    2 select
+      to block 43 (entered with {w1=[0] w2=[1] w3=[7]*}): [4] <- w3; w3 <- w7
+      to block 42 (entered with {w0=[3]}): [4] <- w3; [7] <- w7; w0 <- [3]
+      window {w0=[0] w1=[0] w2=[1] w3=[4]* w4=[5] w5=[6] w7=[7]*}
+block 42 hotness 64 entered with {w0=[3]}
+    0 window(GetUpval, out 4)
+      op at w1
+      window {w0=[3] w1=[4]*}
+    1 window(Move, 3, out 5)
+      [4] <- w1; op at w0
+      window {w0=[3] w1=[5]*}
+    2 thunk
+      exit after [5] <- w1
+      window {w0=[3] w1=[5]*}
+block 43 hotness 64 entered with {w1=[0] w2=[1] w3=[7]*}
+    0 window(NumericIntInt, 1, 7, out 8)
+      op at w2
+      window {w1=[0] w2=[1] w3=[7]* w4=[8]*}
+    1 window(NumericIntInt, 8, 0, out 8)
+      w0 <- w4; op at w0
+      window {w1=[0] w2=[8]* w3=[7]*}
+    2 exec(numeric_cint_int_POW)
+      flush: [7] <- w3; [8] <- w2
+      window {}
+    3 window(LoadKNumber, out 9)
+      w2 <- [8]; w5 <- [12]; w6 <- [7]; op at w0
+      window {w0=[9]* w2=[8] w5=[12] w6=[7]}
+    4 window(Move, 8, out 10)
+      op at w2
+      window {w0=[9]* w2=[8] w3=[10]* w5=[12] w6=[7]}
+    5 window(LoadKNumber, out 11)
+      op at w1
+      window {w0=[9]* w1=[11]* w2=[8] w3=[10]* w5=[12] w6=[7]}
+    6 window(NumericIntInt, 9, 11, out 9)
+      w4 <- w1; op at w0
+      window {w1=[11]* w2=[9]* w3=[10]* w4=[11]* w5=[12] w6=[7]}
+    7 jump(44)
+      to block 44 (entered with {w0=[9]* w1=[11]* w3=[10]* w4=[11]* w5=[12] w6=[7]}): w0 <- w2
+      window {w1=[11]* w2=[9]* w3=[10]* w4=[11]* w5=[12] w6=[7]}
+block 44 hotness 64 entered with {w0=[9]* w1=[11]* w3=[10]* w4=[11]* w5=[12] w6=[7]}
+    0 window(NumericIntInt, 9, 11, out 9)
+      op at w0
+      window {w1=[11]* w2=[9]* w3=[10]* w4=[11]* w5=[12] w6=[7]}
+    1 window(ForLoop, 9, 10, 11, 12, out 12)
+      w1 <- w6; op at w2
+      window {w1=[7] w2=[9]* w3=[10]* w4=[11]* w6=[12]*}
+    2 select
+      to block 45 (entered with {w1=[7]}): [9] <- w2; [10] <- w3; [11] <- w4; [12] <- w6
+      to block 41 (compiled, entered with {w0=[0] w1=[4] w2=[6] w4=[5] w5=[6] w6=[7] w7=[1]}): [9] <- w2; [10] <- w3; [11] <- w4; [12] <- w6; w0 <- [0]; w2 <- [6]; w4 <- [5]; w5 <- [6]; w6 <- w1; w1 <- [4]; w7 <- [1]
+      window {w1=[7] w2=[9]* w3=[10]* w4=[11]* w6=[12]*}
+block 45 hotness 0 entered with {w1=[7]}
+    0 window(GetUpval, out 13)
+      op at w0
+      window {w0=[13]* w1=[7]}
+    1 window(GetUpval, out 14)
+      [13] <- w0; op at w0
+      window {w0=[14]* w1=[7]}
+    2 window(LoadKNumber, out 15)
+      op at w2
+      window {w0=[14]* w1=[7] w2=[15]*}
+    3 window(Move, 7, out 16)
+      [15] <- w2; op at w1
+      window {w0=[14]* w1=[7] w2=[16]*}
+    4 guard(14, func)
+      tests w0
+      window {w0=[14]* w1=[7] w2=[16]*}
+    5 thunk
+      exit after [14] <- w0; [16] <- w2
+      window {w0=[14]* w1=[7] w2=[16]*}
+    6 lua_guard(14, 0x593bbfc7a9e0)
+      flush: [14] <- w0; [16] <- w2
+      window {}
+    7 thunk
+      exit after 
+      window {}
+    8 jump(35)
+      to block 35 (compiled, entered with {}): 
+      window {}
+== region entered at block 36
+block 36 compiled already, entered with {}: 
+== region entered at block 37
+block 37 compiled already, entered with {w1=[7] w2=[2] w3=[13]}: w1 <- [7]; w2 <- [2]; w3 <- [13]
+== region entered at block 39
+block 39 compiled already, entered with {}: 
+== region entered at block 40
+block 40 compiled already, entered with {w0=[13] w1=[14] w3=[10] w4=[11] w5=[12] w6=[7] w7=[9]}: w0 <- [13]; w1 <- [14]; w3 <- [10]; w4 <- [11]; w5 <- [12]; w6 <- [7]; w7 <- [9]

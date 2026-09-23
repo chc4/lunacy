@@ -1,6 +1,7 @@
 //! Register allocation for window ops in the JIT: which window register caches
-//! which stack slot, decided op by op in one forward pass. See Note [Register
-//! window] and Note [Window allocation].
+//! which stack slot. Placements are decided bottom-up over a compiled region,
+//! then code is generated top-down. See Note [Register window] and Note [Window
+//! allocation].
 
 use smallvec::SmallVec;
 
@@ -8,38 +9,49 @@ use crate::window::{Access, Window, WINDOW};
 
 // Note [Window allocation]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
-// A streaming allocator, like copy-and-patch's (Xu & Kjolstad, OOPSLA 2021): one
-// forward pass during codegen, a few register comparisons per op, no lookahead
-// and no liveness. Each register caches at most one slot's current value, and a
-// cached slot is dirty while its stack home is stale. At an `ExecWindow`, its
-// operands known from the op itself, the op runs at the usable `SKIP` whose resculpt of
-// `w[SKIP..]` emits least, at `MEMORY_COST` per load or store and `MOVE_COST`
-// per register move:
+// Each register caches at most one slot's current value, and a cached slot is
+// dirty while its stack home is stale. Allocation has two passes over a
+// compiled region (docs/bottom-up-allocation.md):
 //
-// * an input already in its register costs nothing, one cached in another
-//   register a move, and an uncached one a load (a repeated input copies its
-//   first use);
-// * a dirty value the op's run overwrites is stored first, unless it survives
-//   elsewhere (in another register, or as one of the op's inputs) or the op
-//   rewrites its slot.
+// * Backward, deciding placements. A `Placement` says which slot's current
+//   value the code after a point wants in each register. Walking a block from
+//   its end, each window op is placed ([`WindowAlloc::place`]) at the usable
+//   `SKIP` that forces the fewest moves and loads after it, at `MEMORY_COST` per
+//   load or store and `MOVE_COST` per move: a move for an output wanted in a
+//   register other than its own, and for an input wanted unchanged in another
+//   register too. A wanted value in the op's run that the op doesn't leave
+//   there is displaced: it costs a move if a copy survives the op, and
+//   otherwise depends on how the ops above, since the last flush, use its slot
+//   ([`Above`]). Unused, it is loaded once wherever that is, so it is dropped
+//   for nothing; read or written, it waits in the lowest free register outside
+//   the run (a move), or is loaded again after the op (and stored first, if
+//   written). The placement before the op has its inputs at `SKIP + i`, and the
+//   displaced values that wait. Ties go to the lowest `SKIP`. An inline guard is
+//   a read of its slot: the placement before it keeps the slot where it is, or
+//   puts it in the lowest free register.
 //
-// Ties go to the `SKIP` that overwrites the fewest cached values, then to the
-// lowest. An overwritten clean value is dropped, and a later read reloads it.
-// Any other residual ends the run and flushes every dirty register, except an
-// inline type guard: it tests the register caching its slot, and both its
-// edges carry the window on, the failure edge falling through to the residual
-// after it (a thunk, which stores the dirty registers before it exits, or a
-// jump). A gas exit stores them too, without ending the run
-// ([`WindowAlloc::stores`]).
+// * Forward, generating code. Before each window op, the window is reconciled
+//   with the placement before it ([`WindowAlloc::reconcile`]): the dirty values
+//   it overwrites that survive nowhere else are stored, then its wanted
+//   registers are filled as one parallel move (see Note [Parallel moves]).
+//   The op then runs at its `SKIP` ([`WindowAlloc::op`]). Registers a placement
+//   doesn't care about keep their values.
 //
-// Jumps carry the window across block edges too. Each block is entered with
-// the window it was compiled for: a block first reached by a jump is compiled to
-// expect the jumping block's window, and any other jump to it transfers the
-// window to that one ([`WindowAlloc::transfer`]): dirty values the target
-// doesn't carry dirty are stored, then its registers are filled as one parallel
-// move (see Note [Parallel moves]). A block entered from the interpreter
-// expects an empty window, or else an entry stub loads its window from the
-// stack.
+// Any other residual ends a run of window ops and flushes every dirty
+// register, except an inline type guard: it tests the register caching its
+// slot, and both its edges carry the window on, the failure edge falling
+// through to the residual after it (a thunk, which stores the dirty registers
+// before it exits, or a jump). A gas exit stores them too, without ending the
+// run ([`WindowAlloc::stores`]).
+//
+// Jumps carry the window across block edges. Each block is entered with a
+// window planned for it (the slots it and its successors read before writing,
+// where they read them), and any jump to it transfers the window to that one
+// ([`WindowAlloc::transfer`]): dirty values the target doesn't carry dirty are
+// stored, then its registers are filled as one parallel move. A block's entry
+// window takes its dirty slots from the first jump to it that is compiled. The
+// entry stub, for a block entered from the interpreter, loads its window from
+// the stack.
 
 // Note [Parallel moves]
 // ~~~~~~~~~~~~~~~~~~~~~
@@ -108,6 +120,25 @@ impl Emit {
     }
 }
 
+/// The slot whose current value each window register should hold, if any. See
+/// Note [Window allocation].
+pub type Placement = [Option<usize>; WINDOW];
+
+/// How the window ops before an op, since the last flush, use a slot: what a
+/// value of it displaced by the op costs. See Note [Window allocation].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Above {
+    /// Neither read nor written, since a flush: loaded once, wherever that is.
+    /// (Before a block's first flush, a value can arrive in a register instead,
+    /// so there it counts as `Read`.)
+    Unused,
+    /// Read: loaded for those reads, then again after the op unless it waits
+    /// in a register.
+    Read,
+    /// Written: in a register since, stored and reloaded unless it waits in one.
+    Written,
+}
+
 /// Which slot each window register caches, and which of them are dirty: the
 /// window between residuals, and a block's window on entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -135,6 +166,18 @@ impl std::fmt::Display for Cache {
 }
 
 impl Cache {
+    /// A block's entry window: `regs`, each slot dirty if it is dirty in `from`,
+    /// the window of the first jump to the block.
+    pub fn entry(regs: Placement, from: &Cache) -> Cache {
+        let dirty = from.dirty.iter().filter(|slot| regs.contains(&Some(**slot))).copied().collect();
+        Cache { regs, dirty }
+    }
+
+    /// The slot each register caches.
+    pub fn regs(&self) -> &Placement {
+        &self.regs
+    }
+
     fn position(&self, slot: usize) -> Option<usize> {
         self.regs.iter().position(|&s| s == Some(slot))
     }
@@ -224,6 +267,128 @@ impl WindowAlloc {
             .min_by_key(|plan| (plan.cost, plan.overwritten, plan.skip))?;
         self.cache = plan.after;
         Some(plan.emits)
+    }
+
+    /// Place `op` before the placement `after`: the usable `SKIP` from `skips`
+    /// forcing the fewest moves and loads after it, and the placement it wants
+    /// before it. `above` says how the ops before this one, since the last flush,
+    /// use a slot. `None` if there is no usable `SKIP`. See Note [Window
+    /// allocation].
+    pub fn place(
+        &self,
+        op: &dyn Window,
+        skips: impl IntoIterator<Item = usize>,
+        after: &Placement,
+        above: impl Fn(usize) -> Above,
+    ) -> Option<(usize, Placement)> {
+        let slots = op.operands();
+        let accesses = op.accesses();
+        skips
+            .into_iter()
+            .filter(|&skip| skip + slots.len() <= self.width)
+            .map(|skip| {
+                let (cost, before) = self.place_at(slots, accesses, skip, after, &above);
+                (cost, skip, before)
+            })
+            .min_by_key(|&(cost, skip, _)| (cost, skip))
+            .map(|(_, skip, before)| (skip, before))
+    }
+
+    /// The cost of placing an op at `skip` before `after`, and the placement it
+    /// wants before it.
+    fn place_at(&self, slots: &[usize], accesses: &[Access], skip: usize, after: &Placement, above: &impl Fn(usize) -> Above) -> (u32, Placement) {
+        let run = skip..skip + slots.len();
+        let output = |slot: usize| slots.iter().zip(accesses).any(|(&s, &a)| s == slot && a == Access::Write);
+        // What a register of the run holds after the op: its output, or its
+        // input unless the op rewrites that slot.
+        let left = |reg: usize| {
+            let i = reg - skip;
+            match accesses[i] {
+                Access::Write => Some(slots[i]),
+                Access::Read => (!output(slots[i])).then_some(slots[i]),
+            }
+        };
+        let mut cost = 0;
+        for (reg, want) in after.iter().enumerate() {
+            if want.is_some_and(|slot| output(slot)) && !(run.contains(&reg) && left(reg) == *want) {
+                cost += MOVE_COST;
+            }
+        }
+        // An input wanted unchanged after the op in a register other than its
+        // own must be in both before it: a move.
+        for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
+            let elsewhere = (0..self.width).any(|reg| reg != skip + i && after[reg] == Some(slot));
+            if access == Access::Read && !output(slot) && elsewhere && after[skip + i] != Some(slot) {
+                cost += MOVE_COST;
+            }
+        }
+        // Outputs' old values are dead before the op; the run holds its inputs.
+        let mut before = after.map(|want| want.filter(|&slot| !output(slot)));
+        let mut displaced: SmallVec<[usize; WINDOW]> = SmallVec::new();
+        for reg in run.clone() {
+            if let Some(slot) = after[reg].filter(|&slot| !output(slot) && left(reg) != Some(slot)) {
+                displaced.push(slot);
+            }
+            before[reg] = (accesses[reg - skip] == Access::Read).then_some(slots[reg - skip]);
+        }
+        // A displaced value is moved in after the op from a copy before it, or
+        // loaded after the op, which is free for one the ops above don't use.
+        // One they use waits in a free register outside the run, or is loaded
+        // again (and stored first, if written above).
+        for slot in displaced {
+            let used = above(slot);
+            if before.contains(&Some(slot)) {
+                cost += MOVE_COST;
+            } else if used == Above::Unused {
+            } else if let Some(reg) = (0..self.width).find(|reg| !run.contains(reg) && before[*reg].is_none()) {
+                before[reg] = Some(slot);
+                cost += MOVE_COST;
+            } else if used == Above::Written {
+                cost += 2 * MEMORY_COST;
+            } else {
+                cost += MEMORY_COST;
+            }
+        }
+        (cost, before)
+    }
+
+    /// Make the window hold `want` in each register it names, before `op`,
+    /// leaving the others as they are: store the dirty values overwritten that
+    /// survive nowhere else and that `op` doesn't rewrite, then fill the named
+    /// registers as one parallel move (a slot loaded into several registers is
+    /// loaded once and copied). See Note [Window allocation].
+    pub fn reconcile(&mut self, want: &Placement, op: &dyn Window) -> SmallVec<[Emit; 16]> {
+        let rewritten = |slot: usize| op.operands().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a == Access::Write);
+        let now = &self.cache;
+        let mut after = now.regs;
+        for (reg, slot) in want.iter().enumerate() {
+            if slot.is_some() {
+                after[reg] = *slot;
+            }
+        }
+        let mut emits: SmallVec<[Emit; 16]> = now
+            .dirty
+            .iter()
+            .filter(|slot| !after.contains(&Some(**slot)) && !rewritten(**slot))
+            .map(|&slot| Emit::Store { slot, reg: now.position(slot).expect("dirty slot in a register") })
+            .collect();
+        let mut moves: SmallVec<[(usize, Source); 8]> = SmallVec::new();
+        let mut copies: SmallVec<[(usize, usize); WINDOW]> = SmallVec::new();
+        for (reg, &slot) in want.iter().enumerate() {
+            let Some(slot) = slot.filter(|&slot| now.regs[reg] != Some(slot)) else { continue };
+            match now.position(slot) {
+                Some(src) => moves.push((reg, Source::Reg(src))),
+                None => match moves.iter().find(|(_, src)| *src == Source::Memory(slot)) {
+                    Some(&(first, _)) => copies.push((reg, first)),
+                    None => moves.push((reg, Source::Memory(slot))),
+                },
+            }
+        }
+        parallel_move(&mut moves, &mut emits);
+        emits.extend(copies.into_iter().map(|(dst, src)| Emit::Move { dst, src }));
+        let dirty = now.dirty.iter().filter(|slot| after.contains(&Some(**slot))).copied().collect();
+        self.cache = Cache { regs: after, dirty };
+        emits
     }
 
     /// A register caching `slot`'s current value, if any.
@@ -460,9 +625,8 @@ mod tests {
 
     /// Allocate and execute a run in a window of `width` registers, returning
     /// the machine for its counts.
-    fn run(width: usize, ops: &[TestOp]) -> Machine {
-        let windows: Vec<Box<dyn Window>> = ops
-            .iter()
+    fn windows(ops: &[TestOp]) -> Vec<Box<dyn Window>> {
+        ops.iter()
             .map(|op| -> Box<dyn Window> {
                 match *op {
                     TestOp::Bin(a, b, d) => Box::new(Bin::new(&[a, b, d])),
@@ -474,7 +638,11 @@ mod tests {
                     TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[i, l, s, v, v])),
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    fn run(width: usize, ops: &[TestOp]) -> Machine {
+        let windows = windows(ops);
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
         for w in &windows {
@@ -482,6 +650,51 @@ mod tests {
                 machine.exec(emit, Some(&**w));
             }
         }
+        finish(alloc, machine, ops)
+    }
+
+    /// Place a run bottom-up, with nothing wanted after it, then execute it in a
+    /// window of `width` registers, returning the machine for its counts.
+    fn run_backward(width: usize, ops: &[TestOp]) -> Machine {
+        let windows = windows(ops);
+        let mut alloc = WindowAlloc::with_width(width);
+        let mut after: Placement = [None; WINDOW];
+        let mut placed = Vec::new();
+        // Per slot, how many of the ops not yet placed read and write it.
+        let mut uses: HashMap<(usize, Access), usize> = HashMap::new();
+        for w in &windows {
+            for (&slot, &access) in w.operands().iter().zip(w.accesses()) {
+                *uses.entry((slot, access)).or_default() += 1;
+            }
+        }
+        for w in windows.iter().rev() {
+            for (&slot, &access) in w.operands().iter().zip(w.accesses()) {
+                *uses.get_mut(&(slot, access)).unwrap() -= 1;
+            }
+            let count = |slot, access| uses.get(&(slot, access)).copied().unwrap_or(0);
+            let above = |slot| match (count(slot, Access::Write), count(slot, Access::Read)) {
+                (0, 0) => Above::Unused,
+                (0, _) => Above::Read,
+                _ => Above::Written,
+            };
+            let (skip, before) = alloc.place(&**w, 0..WINDOW, &after, above).unwrap();
+            placed.push((skip, before));
+            after = before;
+        }
+        let mut machine = Machine::default();
+        for (w, (skip, want)) in windows.iter().zip(placed.into_iter().rev()) {
+            for emit in alloc.reconcile(&want, &**w) {
+                machine.exec(emit, None);
+            }
+            for emit in alloc.op(&**w, [skip]).unwrap() {
+                machine.exec(emit, Some(&**w));
+            }
+        }
+        finish(alloc, machine, ops)
+    }
+
+    /// Flush the window and check the stack holds every slot's latest version.
+    fn finish(mut alloc: WindowAlloc, mut machine: Machine, ops: &[TestOp]) -> Machine {
         for emit in alloc.flush() {
             machine.exec(emit, None);
         }
@@ -536,6 +749,27 @@ mod tests {
         (&[B(24, 23, 25), B(2, 25, 24)], (3, 2, 0)),
     ];
 
+    /// The runs of `NBODY` placed bottom-up, with nothing wanted after them:
+    /// (loads, stores, moves). About even with streaming, weighting memory 4 to a
+    /// move's 1: fewer loads and stores in `dist2` and the loop tail, more moves
+    /// where `bi` is stored to from a different register each time. Placing
+    /// bottom-up pays off across block edges, which a single run doesn't show.
+    const NBODY_BACKWARD: [(u32, u32, u32); 7] = [(12, 3, 11), (2, 1, 0), (4, 4, 8), (9, 6, 5), (3, 2, 2), (7, 4, 3), (3, 2, 1)];
+
+    #[test]
+    fn nbody_backward() {
+        let wrong: Vec<String> = NBODY
+            .iter()
+            .zip(NBODY_BACKWARD)
+            .filter_map(|((ops, _), want)| {
+                let m = run_backward(WINDOW, ops);
+                let got = (m.loads, m.stores, m.moves);
+                (got != want).then(|| format!("{ops:?}: (loads, stores, moves) {got:?}, want {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     #[test]
     fn nbody() {
         let wrong: Vec<String> = NBODY
@@ -581,7 +815,8 @@ mod tests {
     /// Every run of two or three ops of every shape with at most eight operands
     /// between them, over up to four slots (up to renaming, which the allocator
     /// is indifferent to), is allocated correctly in 4 registers (or as many as
-    /// its widest op), so that the runs overwrite dirty values.
+    /// its widest op), so that the runs overwrite dirty values, both streaming
+    /// and bottom-up.
     #[test]
     fn exhaustive_small_runs() {
         let arity = |op: &TestOp| match op {
@@ -620,7 +855,9 @@ mod tests {
                         TestOp::Loop(..) => L(next(), next(), next(), next()),
                     })
                     .collect();
-                run(ops.iter().map(arity).max().unwrap().max(4), &ops);
+                let width = ops.iter().map(arity).max().unwrap().max(4);
+                run(width, &ops);
+                run_backward(width, &ops);
             }
         }
     }

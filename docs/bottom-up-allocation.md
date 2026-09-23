@@ -28,7 +28,7 @@ it.
 ## The processing order
 
 An edge's reconciliation is free when its source is processed after its
-target: the source then starts from the target's used-in (below) and computes
+target: the source then starts from the target's entry window (below) and computes
 the target's reads where they're read. So the processing order decides which
 edges cost moves.
 
@@ -65,8 +65,8 @@ failure block. The backward pass treats every block as a straight line:
   carries the reconciliation on its success edge. Otherwise the failure jump
   reconciles by parallel moves.
 
-A guard reads its slot wherever it is (a window register, or the stack home)
-and adds no wants.
+A guard reads its slot wherever it is (a window register, or the stack home),
+so it is a read like a window op's input (below).
 
 ## The backward pass
 
@@ -79,51 +79,66 @@ into the `W` before it:
   would force after the op, at the same costs as today (a load or store 4, a
   move 1):
   - an output that `W` wants in a register other than `SKIP + j` costs a move;
+  - an input that `W` wants unchanged in a register other than `SKIP + i`
+    costs a move, since it must be in both before the op;
   - a wanted value in a register of the op's run that the op doesn't leave
-    there (an output of a different slot, or an input of a different slot)
-    costs a move, from a free register outside the run where it waits during
-    the op, or a load if there is none.
+    there (an output of a different slot, or an input of a different slot) is
+    *displaced*. It costs a move if a copy of it survives the op elsewhere.
+    Otherwise what it costs depends on how the residuals above the op, back to
+    the last flush point, use its slot. If they don't, it is loaded once
+    wherever that happens, so dropping it and loading it after the op costs
+    nothing more. If they read or write it, it waits in a free register outside
+    the run (a move), or else is loaded again after the op (and stored first,
+    if written above).
 
   Ties go to the lowest `SKIP`. The `W` before the op is the `W` after it with
   the op's outputs removed (their old values are dead before the op, unless
-  also inputs), its inputs at `SKIP + i`, and each displaced value in the lowest
-  free register outside the run, or dropped (reloaded after the op) if there
-  is none.
+  also inputs), its inputs at `SKIP + i`, and each displaced value that waits
+  in the lowest free register outside the run.
 - **Flush point** (any residual other than a window op, inline guard, thunk or
   jump). It clobbers the registers or reads the stack, so nothing survives it
   in a register: `W` before it is empty, and the values `W` wants after it are
   loaded after it.
-- **Guard, thunk, jump.** Transparent, except where the live-out applies (see
+- **Inline guard.** A read of its slot: `W` before it keeps the slot where
+  `W` has it, or else puts it in the lowest free register, if any, so the code
+  above leaves it there for the test.
+- **Thunk, jump.** Transparent, except where the live-out applies (see
   Extended basic blocks).
 
-### Used-in and live-out
-
-Two per-block sets connect the blocks, each with one job:
+### Used-in, live-out and the entry window
 
 - **used-in(B)**: the slots B itself reads before writing them, each with the
-  register B's backward pass placed it in at B's start. It is B's own
-  requirement, not its successors': a slot only a later block reads is not in
-  it. It is B's entry window, what every edge into B must deliver.
-- **live-out(B)**: the used-in of whichever of B's successors was processed
-  first, the hottest one by the processing order. It starts B's backward pass,
-  so B's definitions of those slots are placed where that successor reads them.
-  It is empty when no successor was processed before B, as for a loop's latch,
-  whose successor is the loop's first block.
+  register B's backward pass placed it in at B's start.
+- **live-out(B)**: the entry window of whichever of B's successors was
+  processed first, the hottest one by the processing order. It starts B's
+  backward pass, so B's definitions of those slots are placed where that
+  successor reads them. It is empty when no successor was processed before B,
+  as for a loop's latch, whose successor is the loop's first block.
+- **The entry window of B**, what every edge into B must deliver, is `W` at
+  B's start: its used-in, and the live-out values B passes through without
+  touching them, where its successor wants them, while registers remain. That
+  is live-in with placements.
 
-Both are known when B is processed: live-out from successors already
-processed, and used-in from B's own pass, as `W` at B's start restricted to
-the slots B reads. A slot in `W` at B's end that B neither
-reads nor writes is not carried into B's used-in. The pass keeps it in its
-register while no op of B needs that register, and otherwise drops it. The
-forward pass then loads it wherever `W` first wants it again, at the latest
-before B's jump.
+Implementing it showed the entry window can't be just the used-in. LBBV splits
+a loop body into many small blocks, each a guard and a jump, so most values
+pass through blocks that don't read them: in life's neighbour count, the
+accumulator is read every other block. With the used-in alone as the entry
+window, every block that didn't read it made its predecessor store it and its
+successor reload it.
+
+For the same reason, a value displaced in the part of a block before its first
+flush point isn't free to drop even when the ops above don't use it: it arrives
+in a register from the predecessor, so dropping it costs a load, and a store
+upstream if dirty. There it counts as read above (it waits in a free register,
+or is loaded again). Only after a flush point, where it would come from the
+stack anyway, is dropping it free.
 
 A block's other successors reconcile by parallel moves on their edges. An edge
 into a block compiled in an earlier region delivers that block's recorded entry
-window, which acts as its used-in.
+window.
 
 The pass records, per window op, its `SKIP` and the `W` before it; per block,
-its used-in. That is a few bytes per window op and a register map per block.
+its entry window. That is a few bytes per window op and a register map per block.
 It visits each residual once, trying at most `WINDOW` placements per window op,
 and each block goes through the heap once.
 
@@ -138,13 +153,13 @@ when a transfer drops them, at flush points, and by a thunk before it exits).
 At each window op it reconciles the cache with the recorded `W` before the op
 (stores of dropped dirty values, then one parallel move of register moves and
 loads), then runs the op at its recorded `SKIP`. A jump reconciles the cache
-with its target's used-in. The moves an op's placement costs after it happen at
+with its target's entry window. The moves an op's placement costs after it happen at
 the next reconciliation, the next op's or the block's final jump. Otherwise
 the reconciliations are empty where the backward pass placed values where they
 are wanted. That includes the edge to the successor the block's live-out came
-from, since that is its used-in.
+from, since that is its entry window.
 
-The entry stub loads the entry block's used-in from the stack, since the
+The entry stub loads the entry block's entry window from the stack, since the
 interpreter enters from memory.
 
 ## Loops
@@ -211,11 +226,11 @@ This proposal doesn't add lookahead.
 ## Departures from `docs/jit-register-cache.md`
 
 - **Rules 1 and 4:** a block no longer enters with an empty window because it
-  is fresh. Every block enters with its used-in (the slots it reads, where it
-  reads them), including the region's entry (loaded by the entry stub) and a
-  loop header.
+  is fresh. Every block enters with its entry window (the slots it and its
+  successors read, where they read them), including the region's entry
+  (loaded by the entry stub) and a loop header.
 - **Rule 2** reverses direction. The successor doesn't adopt the predecessor's
-  out-set; the predecessor delivers the successor's used-in. The edge to the
+  out-set; the predecessor delivers the successor's entry window. The edge to the
   successor its live-out came from carries only the moves that follow the
   block's last op,
   which are none when that op's outputs could land where the successor wants

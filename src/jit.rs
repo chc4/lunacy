@@ -2,15 +2,16 @@
 use std::io::Write;
 use std::rc::Rc;
 use std::cell::Cell;
-use std::collections::{HashMap, BTreeMap};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet, BTreeMap};
 use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{BlockId, LBoxed, LClosure, LType, LValue, PackedLocation, ReturnLocation, RunState, Tc, Vm};
 use crate::gc::{GcInner, GcCtx};
 use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::generator::{Block, Context, Residual, Specializer, SubPc};
-use crate::window::{stencil_body, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
-use crate::window_alloc::{Cache, Emit, WindowAlloc};
+use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
+use crate::window_alloc::{Above, Cache, Emit, Placement, WindowAlloc};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use smallvec::SmallVec;
@@ -333,6 +334,33 @@ pub struct Pending {
     window: Cache,
 }
 
+/// Where the backward pass placed a block's window ops. See Note [Window
+/// allocation].
+pub struct BlockPlan {
+    /// The registers of its entry window: the slots it and its successors read
+    /// before writing, where they read them.
+    entry: Placement,
+    /// Per residual, for a window op with a stencil: its `SKIP` and the placement
+    /// it wants before it.
+    ops: Vec<Option<(usize, Placement)>>,
+}
+
+type Plans = HashMap<BlockId, BlockPlan, FxBuildHasher>;
+
+/// A type guard tested inline, in the window register caching its slot.
+fn inline_guard(res: &Residual) -> bool {
+    matches!(res, Residual::Guard { expected: LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String, .. })
+}
+
+/// The blocks a residual jumps to.
+fn jump_targets(res: &Residual) -> SmallVec<[BlockId; 2]> {
+    match res {
+        Residual::Jump(target) => smallvec::smallvec![*target],
+        Residual::Select(targets) => targets.iter().map(|target| target.1).collect(),
+        _ => SmallVec::new(),
+    }
+}
+
 impl JitContext {
     pub fn new() -> Self {
         let near = Self::find_near();
@@ -452,6 +480,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         let mut compiled_offsets = Vec::new();
         let mut pool = Pool::default();
+        let mut plans = Plans::default();
         // We may have already JIT this block, if it was jumped to by another block
         // first. In that case we just have to jump to it.
         let mut successor = None;
@@ -466,11 +495,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; jmp extern block.ptr.0 as usize
             );
         } else {
+            plans = self.plan_region(id);
+            // Load the window the block is entered with, clean from the stack.
+            let window = Cache::entry(plans[&id].entry, &Cache::default());
+            let loads = WindowAlloc::default().transfer(&window);
+            window_dump!(self.jctx, "region entry block {} loads {}", id.0, emits_line(&loads));
+            for emit in loads {
+                emit_window_move(&mut ops, emit);
+            }
             // We need to skip over the uncommitted prologue
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
-            self.jctx.blocks.insert(id, JitBlock { ptr: new_block, window: Cache::default() });
+            self.jctx.blocks.insert(id, JitBlock { ptr: new_block, window });
             let start_off = ops.offset().0;
-            let (_block, entry_succ) = self.jit_block(id, &mut ops, &mut pool, owner);
+            let (_block, entry_succ) = self.jit_block(id, &mut ops, &mut pool, owner, &plans);
             successor = entry_succ;
             compiled_offsets.push((id, start_off, ops.offset().0));
         }
@@ -494,7 +531,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             dynasm!(ops
                 ; =>pending.label
             );
-            let (_block, next_succ) = self.jit_block(pending_block, &mut ops, &mut pool, owner);
+            let (_block, next_succ) = self.jit_block(pending_block, &mut ops, &mut pool, owner, &plans);
             successor = next_succ;
             compiled_offsets.push((pending_block, pending_start.0, ops.offset().0));
             self.jctx.reserve(ops.offset().0 - pending_start.0);
@@ -553,9 +590,142 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
     }
 
+    /// Plan the window allocation of the region compiled from `entry`: the blocks
+    /// reachable from it not compiled yet, each placed bottom-up after the
+    /// successors it reaches first in the order `(hotness, -id)`. See
+    /// docs/bottom-up-allocation.md.
+    fn plan_region(&mut self, entry: BlockId) -> Plans {
+        let mut region = vec![entry];
+        let mut seen: HashSet<BlockId, FxBuildHasher> = HashSet::default();
+        seen.insert(entry);
+        let mut next = 0;
+        while let Some(&block) = region.get(next) {
+            next += 1;
+            for target in self.blocks[block.0].instructions.iter().flat_map(jump_targets) {
+                if !self.jctx.blocks.contains_key(&target) && seen.insert(target) {
+                    region.push(target);
+                }
+            }
+        }
+        region.sort_by_key(|block| (self.blocks[block.0].jit_info.hotness.get(), Reverse(block.0)));
+        let mut plans = Plans::default();
+        let mut order: HashMap<BlockId, usize, FxBuildHasher> = HashMap::default();
+        for (rank, &block) in region.iter().enumerate() {
+            let plan = self.plan_block(block, &plans, &order);
+            plans.insert(block, plan);
+            order.insert(block, rank);
+        }
+        plans
+    }
+
+    /// Place a block's window ops bottom-up, from the entry window of the
+    /// successor planned first (or compiled already) as its live-out. `order` ranks the
+    /// blocks planned so far.
+    fn plan_block(&mut self, id: BlockId, plans: &Plans, order: &HashMap<BlockId, usize, FxBuildHasher>) -> BlockPlan {
+        let block = &self.blocks[id.0];
+        let compiled = &self.jctx.blocks;
+        let stencils = &mut self.jctx.stencils;
+        let live_out = block
+            .instructions
+            .iter()
+            .flat_map(jump_targets)
+            .filter_map(|target| match compiled.get(&target) {
+                Some(done) => Some((0, target, *done.window.regs())),
+                None => plans.get(&target).map(|plan| (order[&target] + 1, target, plan.entry)),
+            })
+            .min_by_key(|&(rank, _, _)| rank)
+            .map(|(_, target, entry)| (target, entry));
+        // The usable `SKIP`s of each window op; one with none is called, a flush.
+        let skips: Vec<SmallVec<[usize; WINDOW]>> = block
+            .instructions
+            .iter()
+            .map(|res| match res {
+                Residual::ExecWindow(w) => (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(&**w, skip).is_ok()).collect(),
+                _ => SmallVec::new(),
+            })
+            .collect();
+        let flushes = |off: usize| match &block.instructions[off] {
+            Residual::ExecWindow(_) => skips[off].is_empty(),
+            Residual::Jump(_) | Residual::Select(_) | Residual::Thunk(_) => false,
+            res => !inline_guard(res),
+        };
+        // The slots a residual reads and writes from the window: a window op's
+        // operands, and the slot an inline guard tests.
+        let operands = |res: &Residual| -> SmallVec<[(usize, Access); WINDOW]> {
+            match res {
+                Residual::ExecWindow(w) => w.operands().iter().copied().zip(w.accesses().iter().copied()).collect(),
+                Residual::Guard { idx, .. } if inline_guard(res) => smallvec::smallvec![(*idx, Access::Read)],
+                _ => SmallVec::new(),
+            }
+        };
+        // Per slot and access, how many residuals before `end`, since the flush
+        // before it, use it so; and whether that reaches the block's start, where
+        // a value can arrive in a register instead of from the stack.
+        let uses_before = |end: usize| {
+            let mut uses: HashMap<(usize, Access), usize, FxBuildHasher> = HashMap::default();
+            let mut entered = true;
+            for off in (0..end).rev() {
+                if flushes(off) {
+                    entered = false;
+                    break;
+                }
+                for operand in operands(&block.instructions[off]) {
+                    *uses.entry(operand).or_default() += 1;
+                }
+            }
+            (uses, entered)
+        };
+        let alloc = WindowAlloc::default();
+        let mut ops = vec![None; block.instructions.len()];
+        let mut want: Placement = [None; WINDOW];
+        let (mut uses, mut entered) = uses_before(block.instructions.len());
+        for (off, res) in block.instructions.iter().enumerate().rev() {
+            if let Some((target, entry)) = live_out {
+                if jump_targets(res).contains(&target) {
+                    want = entry;
+                }
+            }
+            if !flushes(off) {
+                for operand in operands(res) {
+                    *uses.get_mut(&operand).expect("counted") -= 1;
+                }
+            }
+            let count = |slot, access| uses.get(&(slot, access)).copied().unwrap_or(0);
+            // Unused above the block's start, a slot is read from the block's
+            // entry window, where the predecessor can leave it in a register.
+            let above = |slot| match (count(slot, Access::Write), count(slot, Access::Read)) {
+                (0, 0) if !entered => Above::Unused,
+                (0, _) => Above::Read,
+                _ => Above::Written,
+            };
+            match res {
+                Residual::ExecWindow(w) if !skips[off].is_empty() => {
+                    let (skip, before) = alloc.place(&**w, skips[off].iter().copied(), &want, above).expect("a usable SKIP");
+                    ops[off] = Some((skip, before));
+                    want = before;
+                }
+                // An inline guard tests its slot where the window has it: keep it
+                // in a register, if one is free.
+                Residual::Guard { idx, .. } if inline_guard(res) => {
+                    if !want.contains(&Some(*idx)) {
+                        if let Some(reg) = want.iter().position(Option::is_none) {
+                            want[reg] = Some(*idx);
+                        }
+                    }
+                }
+                _ if flushes(off) => {
+                    want = [None; WINDOW];
+                    (uses, entered) = uses_before(off);
+                }
+                _ => {}
+            }
+        }
+        BlockPlan { entry: want, ops }
+    }
+
     /// JIT compile one block, returning the JIT code offset and optionally the next block to
     /// compile.
-    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, pool: &mut Pool, owner: &mut Owner) -> (AssemblyOffset, Option<BlockId>) {
+    pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, pool: &mut Pool, owner: &mut Owner, plans: &Plans) -> (AssemblyOffset, Option<BlockId>) {
         // We try to bias the default exit as the next block to compile. This is only a suggestion,
         // and doesn't affect correctness; `GUARD; JMP failure; RET;` for example may say that
         // `failure` is the "next block" despite not quite being correct.
@@ -568,8 +738,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         window_dump!(self.jctx, "block {} hotness {} entered with {}", id.0, block.jit_info.hotness.get(), alloc.cache());
 
         // Jump to `target`, or fall through to it if `skip`, transferring the
-        // window to the one it is entered with: a block not yet compiled or
-        // pending is entered with the current window, so it needs no code.
+        // window to the one it is entered with: its planned entry window, dirty where the
+        // first jump to it compiled delivers it dirty.
         let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool| {
             if let Some(target_block) = self.jctx.blocks.get(target) {
                 // We already JIT compiled the block, and can jump to it directly.
@@ -587,8 +757,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // The block could already be pending from another block in this assembler
                 // set. Use it if it already exists, otherwise create a new label for our
                 // relocation.
-                let pending = self.jctx.pending.entry(*target)
-                    .or_insert_with(|| Pending { label: ops.new_dynamic_label(), window: alloc.cache().clone() });
+                let pending = self.jctx.pending.entry(*target).or_insert_with(|| Pending {
+                    label: ops.new_dynamic_label(),
+                    window: Cache::entry(plans[target].entry, alloc.cache()),
+                });
                 let transfer = alloc.transfer(&pending.window);
                 window_dump!(self.jctx, "      to block {} (entered with {}): {}", target.0, pending.window, emits_line(&transfer));
                 for emit in transfer {
@@ -656,9 +828,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // reaches the residual after it, and a window residual following another
         // gets no label, so a jump to one fails to assemble.
         let window = |r: &Residual| matches!(r, Residual::ExecWindow(_));
-        let inline_guard = |r: &Residual| {
-            matches!(r, Residual::Guard { expected: LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String, .. })
-        };
         let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_));
         for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
@@ -996,10 +1165,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::ExecWindow(w) => {
                     let stencils = &mut self.jctx.stencils;
-                    let skips: SmallVec<[usize; WINDOW]> =
-                        (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(&**w, skip).is_ok()).collect();
-                    match alloc.op(&**w, skips) {
-                        Some(emits) => {
+                    match plans[&id].ops[off] {
+                        Some((skip, want)) => {
+                            let mut emits = alloc.reconcile(&want, &**w);
+                            emits.extend(alloc.op(&**w, [skip]).expect("a placed op runs at its SKIP"));
                             window_dump!(self.jctx, "      {}", emits_line(&emits));
                             for emit in emits {
                                 match emit {

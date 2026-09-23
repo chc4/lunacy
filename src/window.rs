@@ -174,7 +174,7 @@ impl<T: Copy + std::fmt::Debug + 'static> Capture for T {
 // ---- operands -------------------------------------------------------------
 
 /// How an op uses one of its operands' slots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Access {
     /// The op reads the slot's value.
     Read,
