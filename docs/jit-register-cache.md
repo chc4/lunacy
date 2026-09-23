@@ -533,6 +533,13 @@ guard or a jump), store every dirty register. Calls clobber every register, so
 the cache is emptied too. An inline guard's failure path stores the dirty
 registers without emptying the cache, which its success path keeps.
 
+`just window-dump <benchmark>` shows what the allocator actually did
+(feature `window_dump`, written to `window_dump.txt`): per compiled region,
+each block's entry window, then per residual its loads, stores and moves (`op
+at wN` is the `SKIP` it ran at), the register a guard tests and its failure
+path's stores, what each jump transfers, and the window after it (`w1=[5]*`:
+w1 caches slot 5, dirty).
+
 **Block edges.** Each block is compiled to be entered with a window, recorded
 with its code (`JitBlock`, or `Pending` until it is compiled):
 
