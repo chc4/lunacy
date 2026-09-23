@@ -725,9 +725,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
+                // The JIT doesn't hold values in the register window yet: every
+                // value is in its stack home, so bindings need no code and a
+                // window op bails to the interpreter, which runs it from the
+                // stack. See Note [Register window].
+                Residual::Storage(..) => {},
                 Residual::ExecWindow(_) => {
-                    // TODO(M2): splat the copy&patch template inline. For now bail
-                    // to the interpreter, which calls the window closure.
                     emit_bailout(ops, off)
                 },
                 Residual::Thunk(_) => {

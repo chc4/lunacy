@@ -47,7 +47,7 @@ in GPRs across JIT code instead of round-tripping every operand through
   in-buffer backedges hit this path too) → `jmp extern target_ptr`. Otherwise a
   pending `DynamicLabel` and `jmp =>label`.
 
-### Tier-up and bailout (the crux — I kept getting this wrong)
+### Tier-up and bailout
 
 - **Tier-up:** in `run` (`generator.rs:1922-1937`), at `off==0` a block's hotness
   counts down from `INITIAL_HOTNESS` (64; 0 with `immediate_jit`). At 0 it
@@ -64,7 +64,7 @@ in GPRs across JIT code instead of round-tripping every operand through
 
 ---
 
-## 2. The register cache model (corrected, final understanding)
+## 2. The register cache model
 
 Values cached in GPRs are threaded **across blocks** via per-block register
 sets, à la tree register allocation (Rong 2009). The canonical home of every
@@ -75,9 +75,8 @@ Rules — this is the whole allocator:
 
 1. **Fresh block ⇒ empty in-set.** A block that doesn't exist yet has no
    recorded in-set; it is empty. No choice, no phase-ordering, no discovery
-   pre-pass. (Earlier I invented a "choose the header in-set to favor the
-   backedge / loop-carried-registers" problem — that is **trace-JIT thinking and
-   does not apply.** Scrap it.)
+   pre-pass: choosing a loop header's in-set to carry registers around the
+   backedge is a trace-JIT concern and does not apply.
 2. **Straightline / successor edge ⇒ inherit, no moves.** A block compiled as the
    successor in the same `jit()` call adopts the predecessor's **out-set** as its
    **in-set**. This is the register carry — regs stay live across the edge.
@@ -129,17 +128,24 @@ Consequences (not new rules — just applications):
 ## 3. Making dataflow visible + copy&patch
 
 The allocator needs to know which slots each op reads/writes; today `Exec` is an
-opaque closure so the JIT can't see its dataflow. Two mechanisms from the plan:
+opaque closure so the JIT can't see its dataflow. Window ops make it visible
+(details in `Note [Register window]`, `src/window.rs`):
 
-- **`Residual::Storage` → `Option<Gpr>` token:** allocate a GPR token for a slot
-  via linear scan, evicting the oldest under register pressure (evict = flush to
-  stack home). Interpreter mode: retrieve stack slot, use, flush.
-- **`Residual::ExecWindow(template, operands)`**, roughly
-  `|[[_; SLOTS], a] -> [[_; SLOTS], a] { become _r([a+1]) }` with
-  `operands = vec![Gpr(a)]`: the stack window plus register-carried values flow
-  between stencils by tail call. Interpreter mode: retrieve stack slot, call,
-  flush stack slot. JIT mode: use the live `slot→Gpr` map to defer flushing as
-  long as we only see more `Storage`/`ExecWindow` ops.
+- **`YieldOp::Storage(slot, Access)` → `ResumeArg::Storage(Gpr)`:** the emit
+  site asks for each operand's slot to be bound to a window register and gets a
+  `Gpr` token (register + stack home), recorded as `Residual::Storage`.
+  Allocation is linear scan: a bound slot keeps its register, else a free
+  register, else evict the least recently bound (evict = flush to stack home).
+  The op in flight's bindings are pinned. The bindings are replayed from the
+  block's trailing run of `Storage`/`ExecWindow` residuals, so any other residual
+  starts the next run empty (it may reference the stack or clobber registers).
+- **`Residual::ExecWindow(Rc<dyn Window>)`**, built from those tokens: inputs are
+  read-only and only outputs are written back (`windowed!(.., (a, b) -> (d))`),
+  so a register bound to a slot only ever holds that slot's value. The
+  specializer checks that an op's operands are exactly the live bindings made
+  for it. Interpreter mode: load the inputs from their stack homes, run, flush
+  the outputs (`Storage` is a no-op). JIT mode: use the live `slot→Gpr`
+  bindings to defer flushing across the run.
 
 **Copy&patch (the part worth the machinery).** Instead of emitting a `call` to
 the `Exec` closure body, splat the op's compiled **template/stencil** into the
@@ -188,9 +194,8 @@ number.** NuN-boxing is the enabler precisely because *every* Lua value — nil,
 bool, number, table, closure, string — is one GPR-sized word, so the register
 window/cache pins arbitrary `LBoxed` values, not just numbers. A window op takes
 `LBoxed` operands and returns an `LBoxed`, reusing the VM's own `LBoxed` /
-`numeric_op` / `box_lvalue` semantics. **Do not reimplement NuN boxing anywhere**
-— that was a wrong turn (a duplicated-constants `lunacy-ops` crate) and has been
-removed.
+`numeric_op` / `box_lvalue` semantics. **Never reimplement NuN boxing**: op
+bodies use the VM's own.
 
 Verified environment fact: a fresh git worktree is missing the path-dep
 submodules; symlink `dynasm-rs`, `memmap2-rs`, `lua_benchmarking` (and `target`)
@@ -203,14 +208,16 @@ green gate (default features ⇒ jit on).
   window in memory. (`unadjusted` isn't available on this toolchain.) Stencil ABI:
   fixed params `owner, state, base` (r12/r13/r14, the JIT's pinned regs) then the
   window `w0..w3` = r15, rdi, rsi, rdx.
-- `windowed!(Name, [captures], [const params], |owner, state, base| (operands) { body })`
+- `windowed!(Name, [captures], [const params], |owner, state, base| (inputs) -> (outputs) { body })`
   is a **generic**, op-agnostic mechanism used inline at the emit site, exactly
   like `define_exec!` — all of an op's code (static and dynamic) stays in its
-  `emit_*`. It generates a struct of **captures** (hole values) + each operand's
-  load/store stack slot implementing the `Window` trait, an `#[inline(always)]`
-  body shared by both tiers, and `__stencil::<K>` where `K` is the window
-  **shift** (operands at `w[K..K+ARITY]`). `src/window.rs` holds only the
-  mechanism (macro, `Window`, `Capture`, holes, copier); no op templates.
+  `emit_*`. It generates a struct of **captures** (hole values) + the operands'
+  `Gpr` tokens implementing the `Window` trait, an `#[inline(always)]` body
+  shared by both tiers, and `__stencil::<REGS>`, where `REGS` packs each
+  operand's window register (every combination is instantiated; `stencil()`
+  picks the one for the op's tokens). Inputs are bound as values and only
+  outputs are written back. `src/window.rs` holds only the mechanism (macro,
+  `Window`, `Bindings`, `Capture`, holes, copier); no op templates.
 - Captures: any `Copy` type of at most 8 bytes (blanket `Capture` impl, raw bits).
   Holes are `extern_weak` statics (`__lunacy_holeN`), read through a const-generic
   index so monomorphization picks the hole; an op with more captures than
@@ -252,21 +259,27 @@ green gate (default features ⇒ jit on).
   interpreter runs any window op regardless.
 
 **M1 — DONE: generic windowed ops in the generator (JIT splat still disabled).**
-`Residual::ExecWindow(Rc<dyn Window>)` replaces the old slice-closure
-`WindowExec`; like `Exec`'s closure it keeps processing sites generic. The
-interpreter runs `<dyn Window>::interp`: load the operand slots, run the body with
-captures from the struct, flush (it can't run the stencil itself: holes read 0
-until patched). The first user is `emit_numeric`'s dynamic int-int arm, which
-declares `windowed!(NumericIntInt, [], [OP: Opcode], ..)` inline (body = the VM's
-own `numeric_op`/`box_lvalue`) and picks the instance with
-`dispatch_numeric_window!` for all six opcodes; the constant-operand arms keep
-their `Exec` closures. `jit_block` still bails on `ExecWindow`.
+`Residual::ExecWindow(Rc<dyn Window>)`, like `Exec`'s closure, keeps processing
+sites generic; its operands are bound by `Residual::Storage` (section 3). The
+interpreter runs `<dyn Window>::interp`: load the inputs from their stack homes,
+run the body with captures from the struct, flush the outputs (it can't run the
+stencil itself: holes read 0 until patched). The first user is `emit_numeric`'s
+dynamic int-int arm: `windowed!(NumericIntInt, [], [OP: Opcode], .. (lhs, rhs) -> (dest))`
+inline (body = the VM's own `numeric_op`/`box_lvalue`), operands bound by three
+`Storage`s, instance picked with `dispatch_numeric_window!` for all six opcodes;
+the constant-operand arms keep their `Exec` closures. `jit_block` emits nothing
+for `Storage` and bails on `ExecWindow`.
 
 Verification:
-- `just test` green, including the window tests in debug: a (a,b,c) chain →
-  Add@1 → Mul@0 → AddK@0 (hole) → Flush; a stencil calling an out-of-line helper
-  (its call appears in `relocations()` and the copy calls it correctly); and a
-  branchy stencil whose both arms fall through.
+- `just test` green, including the window tests in debug: a chain over arbitrary
+  registers of (2, 3, 4, nil) — w3 = w1 + w2, w0 = w0 * w3, w0 += 0.5 (hole) →
+  Flush, with w1/w2 unchanged; a stencil calling an out-of-line helper (its call
+  appears in `relocations()` and the copy calls it correctly); a branchy stencil
+  whose both arms fall through; and the allocator (reuse, least-recent eviction,
+  pinning, and `check` rejecting stray/unread/evicted operands).
+- Golden `window_chain.lua`: dependent arithmetic in one block becomes a single
+  run of window ops with bindings carried between them (visible in the `graph`
+  feature's `func_N.dot`).
 - `just test-stencils` (opt-2): the same tests on optimized stencils, then the
   golden suite with feature `check_windows`, which copy&patches **every window
   op the interpreter executes** (the real emit-site ops) and asserts the native
@@ -284,8 +297,9 @@ body into the dynasm assembler with a RIP-relative relocation per hole to a pool
 label, and emit the pool at the epilogue so `finalize` patches every hole load.
 Hand dynasm each body's `holes`, `nexts` and `relocations()` as relocations
 (pool labels, a label at the copy's end, and absolute targets) so `finalize`
-patches them all at once. Needs the window-offset choice (the register
-allocator, below), a Storage/Flush boundary around window runs, and a generic
+patches them all at once. Needs the JIT to load `Access::Read` bindings that
+aren't already in their register, flush evicted and run-ending dirty bindings,
+and a generic
 fallback for ops the copier rejects (it returns a `StencilError`: call the
 body instead of splatting). Open items: jump
 tables (copy the table and rebase its entries, if a real op needs one); check

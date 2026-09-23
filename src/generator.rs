@@ -20,7 +20,7 @@ use crate::vm::LConstant;
 use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
-use crate::window::{windowed, Window};
+use crate::window::{windowed, Access, Bindings, Event, Gpr, Window};
 // The native code generator (`JitContext`) and its per-block `JitInfo` (dynasm
 // buffer + hotness tiering) are only needed with the `jit` feature. LBBV on its
 // own is a second interpreter tier and doesn't touch them.
@@ -130,21 +130,20 @@ macro_rules! dispatch_numeric {
     };
 }
 
-/// `dispatch_numeric!` for window ops: pick the `[OP: Opcode]` instance of a
-/// `windowed!` op and construct it with `new(args..)`.
+/// `dispatch_numeric!` for window ops: the `[OP: Opcode]` instance of a
+/// `windowed!` op, constructed with `new($args)`.
 macro_rules! dispatch_numeric_window {
-    ($opcode:expr, $name:ident, $($arg:expr),*) => {{
-        let w: Rc<dyn Window> = match $opcode {
-            Opcode::ADD => Rc::new($name::<{Opcode::ADD}>::new($($arg),*)),
+    ($opcode:expr, $name:ident, ($($arg:expr),*)) => {
+        match $opcode {
+            Opcode::ADD => Rc::new($name::<{Opcode::ADD}>::new($($arg),*)) as Rc<dyn Window>,
             Opcode::SUB => Rc::new($name::<{Opcode::SUB}>::new($($arg),*)),
             Opcode::MUL => Rc::new($name::<{Opcode::MUL}>::new($($arg),*)),
             Opcode::DIV => Rc::new($name::<{Opcode::DIV}>::new($($arg),*)),
             Opcode::MOD => Rc::new($name::<{Opcode::MOD}>::new($($arg),*)),
             Opcode::POW => Rc::new($name::<{Opcode::POW}>::new($($arg),*)),
             _ => unreachable!(),
-        };
-        w
-    }};
+        }
+    };
 }
 
 macro_rules! dispatch_compare {
@@ -198,7 +197,10 @@ pub enum YieldOp {
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
                            // is the expected type
     Exec(ResidualExec), // Emit a residual operation that will be executed
-    ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op (see crate::window).
+    Storage(usize, Access), // Resumed with Storage(Gpr): STACK[idx] bound to a register-window
+                            // register for the next ExecWindow. See Note [Register window].
+    ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op over the registers bound by the
+                                // preceding Storage ops.
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(BlockId), // Emit a jump to the given BlockId
@@ -246,6 +248,7 @@ pub enum ResumeArg {
     Type(CType),
     BlockId(BlockId),
     HashRef(HashRef, CType),
+    Storage(Gpr),
 }
 
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -536,16 +539,17 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                // Both operands are dynamic guarded numbers: a window op, its
-                // operands the whole LBoxed values in the register window.
-                windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (a, b) {
-                    let Some(l) = a.as_number() else { core::hint::unreachable_unchecked() };
-                    let Some(r) = b.as_number() else { core::hint::unreachable_unchecked() };
-                    *a = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
+                windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (lhs, rhs) -> (dest) {
+                    let Some(l) = lhs.as_number() else { unreachable!() };
+                    let Some(r) = rhs.as_number() else { unreachable!() };
+                    *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                 });
 
-                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt,
-                    &[lhs as u16, rhs as u16], &[Some(dest as u16), None]));
+                let l = yield YieldOp::Storage(lhs, Access::Read);
+                let r = yield YieldOp::Storage(rhs, Access::Read);
+                let d = yield YieldOp::Storage(dest, Access::Write);
+                let (ResumeArg::Storage(l), ResumeArg::Storage(r), ResumeArg::Storage(d)) = (l, r, d) else { unreachable!() };
+                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt, (&[l, r, d])));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
@@ -1021,6 +1025,9 @@ pub enum Residual {
     /// `Exec`'s closure, so processing sites never enumerate ops. Its operands
     /// are whole `LBoxed` values held in the register window.
     ExecWindow(Rc<dyn Window>),
+    /// Binds a stack slot to a register of the window for the next `ExecWindow`.
+    /// See Note [Register window].
+    Storage(Gpr, Access),
     Call { a: u16, b: u16, c: u16 },
     Select(Vec<(&'static str, BlockId)>),
     Jump(BlockId),
@@ -1033,6 +1040,19 @@ pub enum Residual {
     LuaCall { lclos: Tc<LClosure<'static, 'static>>, a: u16, b: u16, c: u16 },
     LuaGuard { idx: usize, ptr: *const () },
     GC,
+}
+
+/// The register-window bindings live at the end of `instructions`, replayed from
+/// its trailing run of window residuals. See Note [Register window].
+fn window_bindings(instructions: &[Residual]) -> Bindings {
+    let run = instructions
+        .iter()
+        .rposition(|r| !matches!(r, Residual::Storage(..) | Residual::ExecWindow(_)))
+        .map_or(0, |i| i + 1);
+    Bindings::replay(instructions[run..].iter().map(|r| match r {
+        Residual::Storage(gpr, access) => Event::Storage(*gpr, *access),
+        _ => Event::Op,
+    }))
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1824,9 +1844,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
                 },
+                CoroutineState::Yielded(YieldOp::Storage(slot, access)) => {
+                    let instructions = &mut self.blocks[block_id.0].instructions;
+                    let gpr = window_bindings(instructions).bind(slot);
+                    instructions.push(Residual::Storage(gpr, access));
+                    arg = ResumeArg::Storage(gpr);
+                },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
-                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
-                },                CoroutineState::Yielded(YieldOp::CollectGarbage) => {
+                    let instructions = &mut self.blocks[block_id.0].instructions;
+                    window_bindings(instructions).check(&*w);
+                    instructions.push(Residual::ExecWindow(w));
+                },
+                CoroutineState::Yielded(YieldOp::CollectGarbage) => {
                     self.blocks[block_id.0].instructions.push(Residual::GC);
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {
@@ -2085,9 +2114,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::ExecWindow(w) => {
                     off += 1;
-                    // Interpreter tier: retrieve the operand slots, run the
-                    // window's body, flush.
                     w.interp(owner, &mut state);
+                },
+                Residual::Storage(..) => {
+                    // See Note [Register window].
+                    off += 1;
                 },
                 Residual::LuaCall { lclos, a, b, c } => {
                     off += 1;
@@ -2238,6 +2269,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::LuaGuard { idx, ptr } => format!("lua_guard({}, {:p})", idx, *ptr),
                         Residual::Exec(ResidualExec { name, .. }) => format!("exec({})", name),
                         Residual::ExecWindow(w) => format!("window({})", w.name()),
+                        Residual::Storage(gpr, access) => format!("storage({} -> w{}, {access:?})", gpr.slot(), gpr.reg()),
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call { a, b, c } => format!("call({}, {}, {})", a, b, c),
                         Residual::NativeCall { nf, a, b, c } => format!("ncall({:p}, {}, {}, {})", nf, a, b, c),
