@@ -10,7 +10,7 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::generator::{Block, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
-use crate::window_alloc::{Above, Cache, Emit, Placement, WindowAlloc};
+use crate::window_alloc::{Above, Cache, Emit, Packed, Placement, WindowAlloc};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use smallvec::SmallVec;
@@ -338,11 +338,14 @@ pub struct Pending {
 pub struct BlockPlan {
     /// The registers of its entry window: the slots it and its successors read
     /// before writing, where they read them.
-    entry: Placement,
-    /// Per residual, for a window op with a stencil: its `SKIP` and the placement
-    /// it wants before it.
-    ops: Vec<Option<(usize, Placement)>>,
+    entry: Packed,
+    /// Per residual, the `SKIP` of a window op with a stencil, else `NOT_PLACED`.
+    placed: Vec<u8>,
 }
+
+/// A residual the backward pass didn't place: not a window op, or one with no
+/// stencil.
+const NOT_PLACED: u8 = u8::MAX;
 
 type Plans = HashMap<BlockId, BlockPlan, FxBuildHasher>;
 
@@ -496,7 +499,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         } else {
             plans = self.plan_region(id);
             // Load the window the block is entered with, clean from the stack.
-            let window = Cache::entry(plans[&id].entry, &Cache::default());
+            let window = Cache::entry(plans[&id].entry.unpack(), &Cache::default());
             let loads = WindowAlloc::default().transfer(&window);
             window_dump!(self.jctx, "region entry block {} loads {}", id.0, emits_line(&loads));
             for emit in loads {
@@ -636,7 +639,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .flat_map(jump_targets)
             .filter_map(|target| match compiled.get(&target) {
                 Some(done) => Some((target, *done.window.regs())),
-                None => plans.get(&target).map(|plan| (target, plan.entry)),
+                None => plans.get(&target).map(|plan| (target, plan.entry.unpack())),
             })
             .min_by_key(|&(target, _)| blocks[target.0].jit_info.hotness.get());
         // The usable `SKIP`s of each window op; one with none is called, a flush.
@@ -680,7 +683,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             (uses, entered)
         };
         let alloc = WindowAlloc::default();
-        let mut ops = vec![None; block.instructions.len()];
+        let mut placed = vec![NOT_PLACED; block.instructions.len()];
         let mut want: Placement = [None; WINDOW];
         let (mut uses, mut entered) = uses_before(block.instructions.len());
         for (off, res) in block.instructions.iter().enumerate().rev() {
@@ -705,7 +708,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             match res {
                 Residual::ExecWindow(w) if !skips[off].is_empty() => {
                     let (skip, before) = alloc.place(&**w, skips[off].iter().copied(), &want, above).expect("a usable SKIP");
-                    ops[off] = Some((skip, before));
+                    placed[off] = skip as u8;
                     want = before;
                 }
                 // An inline guard tests its slot where the window has it: keep it
@@ -724,7 +727,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 _ => {}
             }
         }
-        BlockPlan { entry: want, ops }
+        BlockPlan { entry: Packed::pack(&want), placed }
     }
 
     /// JIT compile one block, returning the JIT code offset and optionally the next block to
@@ -763,7 +766,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // relocation.
                 let pending = self.jctx.pending.entry(*target).or_insert_with(|| Pending {
                     label: ops.new_dynamic_label(),
-                    window: Cache::entry(plans[target].entry, alloc.cache()),
+                    window: Cache::entry(plans[target].entry.unpack(), alloc.cache()),
                 });
                 let transfer = alloc.transfer(&pending.window);
                 window_dump!(self.jctx, "      to block {} (entered with {}): {}", target.0, pending.window, emits_line(&transfer));
@@ -1169,10 +1172,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::ExecWindow(w) => {
                     let stencils = &mut self.jctx.stencils;
-                    match plans[&id].ops[off] {
-                        Some((skip, want)) => {
-                            let mut emits = alloc.reconcile(&want, &**w);
-                            emits.extend(alloc.op(&**w, [skip]).expect("a placed op runs at its SKIP"));
+                    match Some(plans[&id].placed[off]).filter(|&skip| skip != NOT_PLACED) {
+                        Some(skip) => {
+                            let emits = alloc.op(&**w, [skip as usize]).expect("a placed op runs at its SKIP");
                             window_dump!(self.jctx, "      {}", emits_line(&emits));
                             for emit in emits {
                                 match emit {

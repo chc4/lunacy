@@ -30,12 +30,13 @@ use crate::window::{Access, Window, WINDOW};
 //   a read of its slot: the placement before it keeps the slot where it is, or
 //   puts it in the lowest free register.
 //
-// * Forward, generating code. Before each window op, the window is reconciled
-//   with the placement before it ([`WindowAlloc::reconcile`]): the dirty values
-//   it overwrites that survive nowhere else are stored, then its wanted
-//   registers are filled as one parallel move (see Note [Parallel moves]).
-//   The op then runs at its `SKIP` ([`WindowAlloc::op`]). Registers a placement
-//   doesn't care about keep their values.
+// * Forward, generating code. Each window op runs at its planned `SKIP`
+//   ([`WindowAlloc::op`]): its inputs are moved or loaded into its run as one
+//   parallel move (see Note [Parallel moves]), after storing the dirty values
+//   the run overwrites that survive nowhere else and that the op doesn't
+//   rewrite. The rest of the window keeps its values. Only each op's `SKIP` and
+//   each block's entry window are kept from the backward pass ([`Packed`]); the
+//   placements between ops are rebuilt forward.
 //
 // Any other residual ends a run of window ops and flushes every dirty
 // register, except an inline type guard: it tests the register caching its
@@ -123,6 +124,24 @@ impl Emit {
 /// The slot whose current value each window register should hold, if any. See
 /// Note [Window allocation].
 pub type Placement = [Option<usize>; WINDOW];
+
+/// A `Placement` in a byte per register, to keep per block: a Lua frame has at
+/// most 250 slots, so a slot fits in a byte, with `u8::MAX` for none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Packed([u8; WINDOW]);
+
+impl Packed {
+    pub fn pack(placement: &Placement) -> Packed {
+        Packed(placement.map(|slot| match slot {
+            None => u8::MAX,
+            Some(slot) => u8::try_from(slot).ok().filter(|&byte| byte != u8::MAX).expect("a frame slot below 255"),
+        }))
+    }
+
+    pub fn unpack(self) -> Placement {
+        self.0.map(|byte| (byte != u8::MAX).then_some(byte as usize))
+    }
+}
 
 /// How the window ops before an op, since the last flush, use a slot: what a
 /// value of it displaced by the op costs. See Note [Window allocation].
@@ -352,45 +371,6 @@ impl WindowAlloc {
         (cost, before)
     }
 
-    /// Make the window hold `want` in each register it names, before `op`,
-    /// leaving the others as they are: store the dirty values overwritten that
-    /// survive nowhere else and that `op` doesn't rewrite, then fill the named
-    /// registers as one parallel move (a slot loaded into several registers is
-    /// loaded once and copied). See Note [Window allocation].
-    pub fn reconcile(&mut self, want: &Placement, op: &dyn Window) -> SmallVec<[Emit; 16]> {
-        let rewritten = |slot: usize| op.operands().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a == Access::Write);
-        let now = &self.cache;
-        let mut after = now.regs;
-        for (reg, slot) in want.iter().enumerate() {
-            if slot.is_some() {
-                after[reg] = *slot;
-            }
-        }
-        let mut emits: SmallVec<[Emit; 16]> = now
-            .dirty
-            .iter()
-            .filter(|slot| !after.contains(&Some(**slot)) && !rewritten(**slot))
-            .map(|&slot| Emit::Store { slot, reg: now.position(slot).expect("dirty slot in a register") })
-            .collect();
-        let mut moves: SmallVec<[(usize, Source); 8]> = SmallVec::new();
-        let mut copies: SmallVec<[(usize, usize); WINDOW]> = SmallVec::new();
-        for (reg, &slot) in want.iter().enumerate() {
-            let Some(slot) = slot.filter(|&slot| now.regs[reg] != Some(slot)) else { continue };
-            match now.position(slot) {
-                Some(src) => moves.push((reg, Source::Reg(src))),
-                None => match moves.iter().find(|(_, src)| *src == Source::Memory(slot)) {
-                    Some(&(first, _)) => copies.push((reg, first)),
-                    None => moves.push((reg, Source::Memory(slot))),
-                },
-            }
-        }
-        parallel_move(&mut moves, &mut emits);
-        emits.extend(copies.into_iter().map(|(dst, src)| Emit::Move { dst, src }));
-        let dirty = now.dirty.iter().filter(|slot| after.contains(&Some(**slot))).copied().collect();
-        self.cache = Cache { regs: after, dirty };
-        emits
-    }
-
     /// A register caching `slot`'s current value, if any.
     pub fn register_of(&self, slot: usize) -> Option<usize> {
         self.cache.position(slot)
@@ -575,15 +555,12 @@ mod tests {
     /// Executes allocator output on symbolic values (slot, version), checking
     /// that every op reads the current version of its inputs, every store writes
     /// a current version, and after the run the stack holds every slot's latest
-    /// version; counts the memory accesses and moves.
+    /// version.
     #[derive(Debug, Default)]
     struct Machine {
         memory: HashMap<usize, u32>,
         current: HashMap<usize, u32>,
         regs: [Option<(usize, u32)>; WINDOW + 1],
-        loads: u32,
-        stores: u32,
-        moves: u32,
     }
 
     impl Machine {
@@ -594,17 +571,14 @@ mod tests {
             match emit {
                 Emit::Load { reg, slot } => {
                     self.regs[reg] = Some((slot, Self::version(&self.memory, slot)));
-                    self.loads += 1;
                 }
                 Emit::Store { slot, reg } => {
                     let current = Self::version(&self.current, slot);
                     assert_eq!(self.regs[reg], Some((slot, current)), "store of a stale value");
                     self.memory.insert(slot, current);
-                    self.stores += 1;
                 }
                 Emit::Move { dst, src } => {
                     self.regs[dst] = self.regs[src];
-                    self.moves += 1;
                 }
                 Emit::Op { skip } => {
                     let op = op.expect("an op");
@@ -623,8 +597,6 @@ mod tests {
         }
     }
 
-    /// Allocate and execute a run in a window of `width` registers, returning
-    /// the machine for its counts.
     fn windows(ops: &[TestOp]) -> Vec<Box<dyn Window>> {
         ops.iter()
             .map(|op| -> Box<dyn Window> {
@@ -641,7 +613,8 @@ mod tests {
             .collect()
     }
 
-    fn run(width: usize, ops: &[TestOp]) -> Machine {
+    /// Allocate a run streaming and execute it in a window of `width` registers.
+    fn run(width: usize, ops: &[TestOp]) {
         let windows = windows(ops);
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
@@ -653,13 +626,13 @@ mod tests {
         finish(alloc, machine, ops)
     }
 
-    /// Place a run bottom-up, with nothing wanted after it, then execute it in a
-    /// window of `width` registers, returning the machine for its counts.
-    fn run_backward(width: usize, ops: &[TestOp]) -> Machine {
+    /// Place a run bottom-up, with nothing wanted after it, then execute it at
+    /// those `SKIP`s in a window of `width` registers.
+    fn run_backward(width: usize, ops: &[TestOp]) {
         let windows = windows(ops);
         let mut alloc = WindowAlloc::with_width(width);
         let mut after: Placement = [None; WINDOW];
-        let mut placed = Vec::new();
+        let mut skips = Vec::new();
         // Per slot, how many of the ops not yet placed read and write it.
         let mut uses: HashMap<(usize, Access), usize> = HashMap::new();
         for w in &windows {
@@ -678,14 +651,11 @@ mod tests {
                 _ => Above::Written,
             };
             let (skip, before) = alloc.place(&**w, 0..WINDOW, &after, above).unwrap();
-            placed.push((skip, before));
+            skips.push(skip);
             after = before;
         }
         let mut machine = Machine::default();
-        for (w, (skip, want)) in windows.iter().zip(placed.into_iter().rev()) {
-            for emit in alloc.reconcile(&want, &**w) {
-                machine.exec(emit, None);
-            }
+        for (w, skip) in windows.iter().zip(skips.into_iter().rev()) {
             for emit in alloc.op(&**w, [skip]).unwrap() {
                 machine.exec(emit, Some(&**w));
             }
@@ -694,7 +664,7 @@ mod tests {
     }
 
     /// Flush the window and check the stack holds every slot's latest version.
-    fn finish(mut alloc: WindowAlloc, mut machine: Machine, ops: &[TestOp]) -> Machine {
+    fn finish(mut alloc: WindowAlloc, mut machine: Machine, ops: &[TestOp]) {
         for emit in alloc.flush() {
             machine.exec(emit, None);
         }
@@ -702,95 +672,9 @@ mod tests {
         for (&slot, &version) in &machine.current {
             assert_eq!(Machine::version(&machine.memory, slot), version, "slot {slot} not flushed in {ops:?}");
         }
-        machine
     }
 
     use TestOp::{Bin as B, Get as G, Loop as L, Out as U, Set as S};
-
-    /// Every run of more than one window op that nbody's `advance` executes in
-    /// its steady state (`just window-runs nbody`), table gets (G) and sets (S),
-    /// upvalue gets (U), moves (G's shape) and for loop steps (L) included (slots: dt 2, i 3/5, bi 7, bix..biz 8-10, bimass 11,
-    /// bivx..bivz 12-14, j 15/17, bj 19, dx..dz 20-22, dist2 23, mag 24, bm 25,
-    /// temporaries 15 and 26-27), with the (loads, stores, moves) the streaming
-    /// rule gives, worked by hand. The floor is a load per slot read before it is
-    /// written and a store per slot written.
-    const NBODY: [(&[TestOp], (u32, u32, u32)); 7] = [
-        // bi.vz = bivz; bi.x = bix + dt*bivx; ...; i += step; the loop step: at
-        // the floor. Each `dt*bivx` result lands where `bix + _` starts, read
-        // in place with bix loaded below it; each store then moves bi beside t;
-        // the loop step finds nothing in place (moving i and step, loading
-        // limit and the loop variable) and its five registers overwrite t,
-        // stored then instead of at the end.
-        (
-            &[S(7, 14), B(2, 12, 15), B(8, 15, 15), S(7, 15), B(2, 13, 15), B(9, 15, 15), S(7, 15), B(2, 14, 15), B(10, 15, 15), S(7, 15), B(3, 5, 3), L(3, 4, 5, 6)],
-            (12, 3, 6),
-        ),
-        // dx = bix - bj.x: the got value is read in place as the rhs.
-        (&[G(19, 20), B(8, 20, 20)], (2, 1, 0)),
-        // dz = biz - bj.z; dist2 = dx*dx + dy*dy + dz*dz; then `sqrt(dist2)`'s
-        // upvalue get and argument move: the squares' dead inputs sit between
-        // the live dz and dist2, so `dy*dy` finds no three registers free of a
-        // dirty value and spills dist2 (a store and a reload over the floor).
-        (
-            &[G(19, 22), B(10, 22, 22), B(20, 20, 23), B(21, 21, 24), B(23, 24, 23), B(22, 22, 24), B(23, 24, 23), U(24), G(23, 25)],
-            (5, 5, 5),
-        ),
-        // bm = bj.mass * mag; bivx -= dx * bm; ...: `dx * bm` reads bm in place
-        // over the cached mag, reloaded for `bimass * mag`; bivy is stored
-        // early (its one store).
-        (&[G(19, 25), B(25, 24, 25), B(20, 25, 26), B(12, 26, 12), B(21, 25, 26), B(13, 26, 13), B(22, 25, 26), B(14, 26, 14), B(11, 24, 25)], (10, 5, 3)),
-        // bj.vx = bj.vx + dx * bm: at the floor; bj.vx moves beside the product
-        // and the sum beside bj.
-        (&[G(19, 26), B(20, 25, 27), B(26, 27, 26), S(19, 26)], (3, 2, 2)),
-        // ... and the inner loop's `j += step` and loop step: at the floor; the
-        // loop step moves j and step, loading limit and the loop variable.
-        (&[G(19, 26), B(22, 25, 27), B(26, 27, 26), S(19, 26), B(15, 17, 15), L(15, 16, 17, 18)], (7, 4, 4)),
-        // mag = dt / (mag * dist2): the product is read in place as the rhs.
-        (&[B(24, 23, 25), B(2, 25, 24)], (3, 2, 0)),
-    ];
-
-    /// The runs of `NBODY` placed bottom-up, with nothing wanted after them:
-    /// (loads, stores, moves). About even with streaming, weighting memory 4 to a
-    /// move's 1: fewer loads and stores in `dist2` and the loop tail, more moves
-    /// where `bi` is stored to from a different register each time. Placing
-    /// bottom-up pays off across block edges, which a single run doesn't show.
-    const NBODY_BACKWARD: [(u32, u32, u32); 7] = [(12, 3, 11), (2, 1, 0), (4, 4, 8), (9, 6, 5), (3, 2, 2), (7, 4, 3), (3, 2, 1)];
-
-    #[test]
-    fn nbody_backward() {
-        let wrong: Vec<String> = NBODY
-            .iter()
-            .zip(NBODY_BACKWARD)
-            .filter_map(|((ops, _), want)| {
-                let m = run_backward(WINDOW, ops);
-                let got = (m.loads, m.stores, m.moves);
-                (got != want).then(|| format!("{ops:?}: (loads, stores, moves) {got:?}, want {want:?}"))
-            })
-            .collect();
-        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    }
-
-    #[test]
-    fn nbody() {
-        let wrong: Vec<String> = NBODY
-            .iter()
-            .filter_map(|(ops, want)| {
-                let m = run(WINDOW, ops);
-                let got = (m.loads, m.stores, m.moves);
-                (got != *want).then(|| format!("{ops:?}: (loads, stores, moves) {got:?}, want {want:?}"))
-            })
-            .collect();
-        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    }
-
-    /// The allocator places ops by their operands' accesses, not a layout:
-    /// declaring the output first allocates the same run just as well.
-    #[test]
-    fn operand_order() {
-        let ops = [TestOp::BinFirst(20, 20, 23), TestOp::BinFirst(21, 21, 24), TestOp::BinFirst(23, 24, 23)];
-        let m = run(WINDOW, &ops);
-        assert_eq!((m.loads, m.stores), (2, 2), "{m:?}");
-    }
 
     /// Every sequence of `len` slots over at most `max` distinct slots, up to
     /// renaming: slots numbered in order of first use.
