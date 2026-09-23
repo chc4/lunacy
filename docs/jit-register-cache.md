@@ -132,20 +132,18 @@ opaque closure so the JIT can't see its dataflow. Window ops make it visible
 (details in `Note [Register window]`, `src/window.rs`):
 
 - **`YieldOp::Storage(slot, Access)` → `ResumeArg::Storage(Gpr)`:** the emit
-  site asks for each operand's slot to be bound to a window register and gets a
-  `Gpr` token (register + stack home), recorded as `Residual::Storage`.
-  Allocation is linear scan: a bound slot keeps its register, else a free
-  register, else evict the least recently bound (evict = flush to stack home).
-  The op in flight's bindings are pinned. The bindings are replayed from the
-  block's trailing run of `Storage`/`ExecWindow` residuals, so any other residual
-  starts the next run empty (it may reference the stack or clobber registers).
+  site gets an **opaque token** per operand, minted by the specializer and
+  recorded as `Residual::Storage(token, access)`. LBBV does no register
+  allocation. The **JIT allocates when it processes `Residual::Storage`**:
+  linear scan, reusing the register already caching the slot, else a free one,
+  else evicting (flushing) the oldest; `Access::Read` loads the slot.
 - **`Residual::ExecWindow(Rc<dyn Window>)`**, built from those tokens: inputs are
   read-only and only outputs are written back (`windowed!(.., (a, b) -> (d))`),
-  so a register bound to a slot only ever holds that slot's value. The
-  specializer checks that an op's operands are exactly the live bindings made
-  for it. Interpreter mode: load the inputs from their stack homes, run, flush
-  the outputs (`Storage` is a no-op). JIT mode: use the live `slot→Gpr`
-  bindings to defer flushing across the run.
+  so a register caching a slot only ever holds that slot's value. JIT mode: map
+  the operand tokens to their registers, emit `stencil(regs)`, and defer flushing
+  as long as only `Storage`/`ExecWindow` follow. Interpreter mode: operand `i` in
+  window register `i`; load the inputs from their stack homes, run, flush the
+  outputs (`Storage` is a no-op).
 
 **Copy&patch (the part worth the machinery).** Instead of emitting a `call` to
 the `Exec` closure body, splat the op's compiled **template/stencil** into the
@@ -214,10 +212,11 @@ green gate (default features ⇒ jit on).
   `emit_*`. It generates a struct of **captures** (hole values) + the operands'
   `Gpr` tokens implementing the `Window` trait, an `#[inline(always)]` body
   shared by both tiers, and `__stencil::<REGS>`, where `REGS` packs each
-  operand's window register (every combination is instantiated; `stencil()`
-  picks the one for the op's tokens). Inputs are bound as values and only
-  outputs are written back. `src/window.rs` holds only the mechanism (macro,
-  `Window`, `Bindings`, `Capture`, holes, copier); no op templates.
+  operand's window register (every combination is instantiated;
+  `stencil(regs)` picks one for the registers the JIT allocated). Inputs are
+  bound as values and only outputs are written back. `src/window.rs` holds only
+  the mechanism (macro, `Window`, tokens, `Capture`, holes, copier); no op
+  templates.
 - Captures: any `Copy` type of at most 8 bytes (blanket `Capture` impl, raw bits).
   Holes are `extern_weak` statics (`__lunacy_holeN`), read through a const-generic
   index so monomorphization picks the hole; an op with more captures than
@@ -275,11 +274,10 @@ Verification:
   registers of (2, 3, 4, nil) — w3 = w1 + w2, w0 = w0 * w3, w0 += 0.5 (hole) →
   Flush, with w1/w2 unchanged; a stencil calling an out-of-line helper (its call
   appears in `relocations()` and the copy calls it correctly); a branchy stencil
-  whose both arms fall through; and the allocator (reuse, least-recent eviction,
-  pinning, and `check` rejecting stray/unread/evicted operands).
+  whose both arms fall through; and two outputs writing one slot is rejected.
 - Golden `window_chain.lua`: dependent arithmetic in one block becomes a single
-  run of window ops with bindings carried between them (visible in the `graph`
-  feature's `func_N.dot`).
+  run of `Storage`/`ExecWindow` residuals (visible in the `graph` feature's
+  `func_N.dot`).
 - `just test-stencils` (opt-2): the same tests on optimized stencils, then the
   golden suite with feature `check_windows`, which copy&patches **every window
   op the interpreter executes** (the real emit-site ops) and asserts the native
@@ -297,9 +295,9 @@ body into the dynasm assembler with a RIP-relative relocation per hole to a pool
 label, and emit the pool at the epilogue so `finalize` patches every hole load.
 Hand dynasm each body's `holes`, `nexts` and `relocations()` as relocations
 (pool labels, a label at the copy's end, and absolute targets) so `finalize`
-patches them all at once. Needs the JIT to load `Access::Read` bindings that
-aren't already in their register, flush evicted and run-ending dirty bindings,
-and a generic
+patches them all at once. Needs the JIT's allocation at `Residual::Storage`
+(section 3: token → register, loading `Access::Read` slots not already cached,
+flushing evicted and run-ending dirty registers), and a generic
 fallback for ops the copier rejects (it returns a `StencilError`: call the
 body instead of splatting). Open items: jump
 tables (copy the table and rebase its entries, if a real op needs one); check

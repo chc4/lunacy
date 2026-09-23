@@ -20,7 +20,7 @@ use crate::vm::LConstant;
 use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
-use crate::window::{windowed, Access, Bindings, Event, Gpr, Window};
+use crate::window::{windowed, Access, Gpr, Tokens, Window};
 // The native code generator (`JitContext`) and its per-block `JitInfo` (dynasm
 // buffer + hotness tiering) are only needed with the `jit` feature. LBBV on its
 // own is a second interpreter tier and doesn't touch them.
@@ -197,10 +197,9 @@ pub enum YieldOp {
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
                            // is the expected type
     Exec(ResidualExec), // Emit a residual operation that will be executed
-    Storage(usize, Access), // Resumed with Storage(Gpr): STACK[idx] bound to a register-window
-                            // register for the next ExecWindow. See Note [Register window].
-    ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op over the registers bound by the
-                                // preceding Storage ops.
+    Storage(usize, Access), // Resumed with Storage(Gpr), an opaque token for STACK[idx] as an
+                            // operand of the next ExecWindow. See Note [Register window].
+    ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op over preceding Storage tokens
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(BlockId), // Emit a jump to the given BlockId
@@ -1025,8 +1024,8 @@ pub enum Residual {
     /// `Exec`'s closure, so processing sites never enumerate ops. Its operands
     /// are whole `LBoxed` values held in the register window.
     ExecWindow(Rc<dyn Window>),
-    /// Binds a stack slot to a register of the window for the next `ExecWindow`.
-    /// See Note [Register window].
+    /// A stack slot as an operand of the next `ExecWindow`, named by an opaque
+    /// token. See Note [Register window].
     Storage(Gpr, Access),
     Call { a: u16, b: u16, c: u16 },
     Select(Vec<(&'static str, BlockId)>),
@@ -1040,19 +1039,6 @@ pub enum Residual {
     LuaCall { lclos: Tc<LClosure<'static, 'static>>, a: u16, b: u16, c: u16 },
     LuaGuard { idx: usize, ptr: *const () },
     GC,
-}
-
-/// The register-window bindings live at the end of `instructions`, replayed from
-/// its trailing run of window residuals. See Note [Register window].
-fn window_bindings(instructions: &[Residual]) -> Bindings {
-    let run = instructions
-        .iter()
-        .rposition(|r| !matches!(r, Residual::Storage(..) | Residual::ExecWindow(_)))
-        .map_or(0, |i| i + 1);
-    Bindings::replay(instructions[run..].iter().map(|r| match r {
-        Residual::Storage(gpr, access) => Event::Storage(*gpr, *access),
-        _ => Event::Op,
-    }))
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1214,6 +1200,8 @@ pub struct Specializer<'src, 'intern> {
     pub versions: std::collections::HashMap<
         LProto<'src, 'intern>,
         std::collections::HashMap<(SubPc, Rc<Context>), BlockId>, InternedHasher>,
+    /// Mints the `Storage` tokens of window ops.
+    pub tokens: Tokens,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -1236,6 +1224,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             clos,
+            tokens: Tokens::default(),
         }
     }
 
@@ -1845,15 +1834,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
                 },
                 CoroutineState::Yielded(YieldOp::Storage(slot, access)) => {
-                    let instructions = &mut self.blocks[block_id.0].instructions;
-                    let gpr = window_bindings(instructions).bind(slot);
-                    instructions.push(Residual::Storage(gpr, access));
+                    let gpr = self.tokens.mint(slot);
+                    self.blocks[block_id.0].instructions.push(Residual::Storage(gpr, access));
                     arg = ResumeArg::Storage(gpr);
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
-                    let instructions = &mut self.blocks[block_id.0].instructions;
-                    window_bindings(instructions).check(&*w);
-                    instructions.push(Residual::ExecWindow(w));
+                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
                     self.blocks[block_id.0].instructions.push(Residual::GC);
@@ -2268,8 +2254,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::NativeGuard { idx, ptr } => format!("native_guard({}, {:p})", idx, *ptr),
                         Residual::LuaGuard { idx, ptr } => format!("lua_guard({}, {:p})", idx, *ptr),
                         Residual::Exec(ResidualExec { name, .. }) => format!("exec({})", name),
-                        Residual::ExecWindow(w) => format!("window({})", w.name()),
-                        Residual::Storage(gpr, access) => format!("storage({} -> w{}, {access:?})", gpr.slot(), gpr.reg()),
+                        Residual::ExecWindow(w) => format!("window({}{})", w.name(),
+                            w.operands().iter().map(|gpr| format!(", t{}", gpr.id())).collect::<String>()),
+                        Residual::Storage(gpr, access) => format!("storage(t{} = {}, {access:?})", gpr.id(), gpr.slot()),
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call { a, b, c } => format!("call({}, {}, {})", a, b, c),
                         Residual::NativeCall { nf, a, b, c } => format!("ncall({:p}, {}, {}, {})", nf, a, b, c),

@@ -46,34 +46,31 @@
 // ~~~~~~~~~~~~~~~~~~~~~~
 // A window op's operands are whole `LBoxed` values held in the register window:
 // `WINDOW` registers, passed between stencils as the scalar params `w0..w3`.
-// Which register holds which stack slot is decided by the specializer, not by
-// the op: before an `ExecWindow` the emit site yields a `Storage(slot, access)`
-// for each operand and is resumed with a `Gpr` token binding that slot (its
-// stack home) to a register. The op is built from those tokens, and its stencil
-// is the instance for exactly those registers.
 //
-// Bindings are allocated by linear scan (`Bindings::bind`): a slot that is
-// already bound keeps its register, otherwise it takes a free register or evicts
-// the least recently bound one. Registers bound for the op in flight are pinned
-// until it runs, so an op's operands never evict each other. The bindings are
-// replayed from the block's trailing run of `Storage`/`ExecWindow` residuals, so
-// any other residual ends the run and the next run starts with an empty window:
-// other residuals may reference the stack (invariant 1) or clobber registers
-// (invariant 2).
+// The specializer never chooses registers. Before an `ExecWindow`, the emit site
+// yields a `Storage(slot, access)` for each operand and is resumed with an opaque
+// `Gpr` token naming that use of the slot; the op is built from the tokens.
+// `Residual::Storage(token, access)` records each one.
+//
+// The JIT allocates registers as it processes `Residual::Storage`: it gives the
+// token a register (reusing the one already caching the slot, else a free one,
+// else evicting — flushing — the oldest), loading the slot for `Access::Read`.
+// At the `ExecWindow` it maps the operand tokens to their registers and emits
+// `Window::stencil(regs)`, the stencil instance for exactly those registers. A
+// written register is dirty until flushed to its stack home at an eviction or a
+// flush point.
 //
 // An op's inputs are read-only and only its outputs are written back, so a
-// register bound to a slot only ever holds that slot's value.
+// register caching a slot is only ever overwritten by a value for that slot.
 //
 // The interpreter keeps no window between residuals: `Storage` is a no-op, and
-// `ExecWindow` loads its inputs from their stack homes, runs, and flushes its
-// outputs. In the JIT, `Access::Read` means the register must hold the slot's
-// value when the op runs, and `Access::Write` that the op's result becomes the
-// slot's value, to be flushed to its stack home when the binding ends.
+// `ExecWindow` places operand `i` in window register `i`, loads the inputs from
+// their stack homes, runs, and flushes the outputs. It never depends on an
+// earlier `Storage`, so resuming a block at any residual is sound.
 
 use std::collections::HashMap;
 
 use dynasmrt::mmap::{ExecutableBuffer, MutableBuffer};
-use indexmap::IndexMap;
 use smallvec::SmallVec;
 
 use crate::lboxed::LBoxed;
@@ -161,12 +158,10 @@ impl<T: Copy + std::fmt::Debug + 'static> Capture for T {
     }
 }
 
-// ---- register bindings ----------------------------------------------------
+// ---- storage tokens -------------------------------------------------------
 
 /// Bits of a stencil's `REGS` per operand.
 pub const REG_BITS: u32 = WINDOW.trailing_zeros();
-// `select_stencil!` enumerates the registers 0..4 literally.
-const _: () = assert!(WINDOW == 4);
 
 /// The window register of operand `i` in a stencil's `REGS`.
 #[doc(hidden)]
@@ -175,117 +170,53 @@ pub const fn operand_reg(regs: usize, i: usize) -> usize {
     (regs >> (REG_BITS as usize * i)) & (WINDOW - 1)
 }
 
-/// A stack slot bound to a register of the window. Outside this module, minted
-/// only by [`Bindings::bind`]. See Note [Register window].
+/// An opaque token for one use of a stack slot by a window op, minted by
+/// [`Tokens::mint`]. See Note [Register window].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Gpr {
-    reg: u8,
+    id: u32,
     slot: u16,
 }
 
 impl Gpr {
-    pub fn reg(self) -> usize {
-        self.reg as usize
+    /// Unique among the tokens minted by one [`Tokens`].
+    pub fn id(self) -> u32 {
+        self.id
     }
-    /// The bound slot, relative to the frame's base.
+    /// The slot, relative to the frame's base.
     pub fn slot(self) -> usize {
         self.slot as usize
     }
 }
 
-/// How an op uses the slot a `Storage` binds.
+/// Mints [`Gpr`] tokens.
+#[derive(Debug, Default)]
+pub struct Tokens(u32);
+
+impl Tokens {
+    pub fn mint(&mut self, slot: usize) -> Gpr {
+        let id = self.0;
+        self.0 = self.0.checked_add(1).expect("storage tokens exhausted");
+        Gpr { id, slot: slot.try_into().expect("stack slot out of range for a storage token") }
+    }
+}
+
+/// How an op uses the slot a `Storage` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
-    /// The op reads the slot's value (and may also write it).
+    /// The op reads the slot's value.
     Read,
     /// The op only writes the slot.
     Write,
 }
 
-/// A window residual, as replayed by [`Bindings::replay`].
-#[derive(Debug, Clone, Copy)]
-pub enum Event {
-    Storage(Gpr, Access),
-    Op,
-}
-
-/// The register bindings live at the end of a run of window residuals. See
-/// Note [Register window].
-#[derive(Debug, Default)]
-pub struct Bindings {
-    /// Live bindings by slot, least recently bound first.
-    live: IndexMap<usize, Gpr>,
-    /// Registers bound since the last op, and whether any binding read the slot.
-    pinned: SmallVec<[(usize, Access); WINDOW]>,
-}
-
-impl Bindings {
-    pub fn replay(run: impl IntoIterator<Item = Event>) -> Self {
-        let mut bindings = Self::default();
-        for event in run {
-            match event {
-                Event::Storage(gpr, access) => bindings.record(gpr, access),
-                Event::Op => bindings.pinned.clear(),
-            }
-        }
-        bindings
-    }
-
-    fn record(&mut self, gpr: Gpr, access: Access) {
-        // Evict the register's previous binding; re-binding a slot makes it the
-        // most recent.
-        self.live.retain(|&slot, bound| bound.reg != gpr.reg && slot != gpr.slot());
-        self.live.insert(gpr.slot(), gpr);
-        match self.pinned.iter_mut().find(|(reg, _)| *reg == gpr.reg()) {
-            Some((_, pinned)) if access == Access::Read => *pinned = Access::Read,
-            Some(_) => {}
-            None => self.pinned.push((gpr.reg(), access)),
-        }
-    }
-
-    fn is_pinned(&self, reg: usize) -> bool {
-        self.pinned.iter().any(|&(pinned, _)| pinned == reg)
-    }
-
-    /// Bind `slot` to a register for the next op.
-    pub fn bind(&self, slot: usize) -> Gpr {
-        if let Some(&gpr) = self.live.get(&slot) {
-            return gpr;
-        }
-        let reg = (0..WINDOW)
-            .find(|&reg| !self.live.values().any(|bound| bound.reg() == reg))
-            .or_else(|| self.live.values().map(|bound| bound.reg()).find(|&reg| !self.is_pinned(reg)))
-            .expect("a window op needs more registers than the window has");
-        Gpr { reg: reg as u8, slot: slot.try_into().expect("stack slot out of range for a window binding") }
-    }
-
-    /// Check that `op`'s operands are exactly the bindings made for it: each is
-    /// live and pinned, and each input was bound for reading.
-    pub fn check(&self, op: &dyn Window) {
-        let name = op.name();
-        for (i, gpr) in op.operands().iter().enumerate() {
-            assert_eq!(self.live.get(&gpr.slot()), Some(gpr), "{name}: operand {gpr:?} is not a live binding");
-            let access = self.pinned.iter().find(|&&(reg, _)| reg == gpr.reg()).map(|&(_, access)| access);
-            assert!(access.is_some(), "{name}: operand {gpr:?} was not bound for this op");
-            if i < op.inputs() {
-                assert_eq!(access, Some(Access::Read), "{name}: input {gpr:?} was not bound for reading");
-            }
-        }
-        for &(reg, _) in &self.pinned {
-            assert!(op.operands().iter().any(|gpr| gpr.reg() == reg), "{name}: register {reg} was bound but is not an operand");
-        }
-    }
-}
-
-/// Check a window op's operand tokens (inputs, then outputs): registers and slots
-/// correspond one to one, and no two outputs share a register.
+/// Check a window op's operand tokens (inputs, then outputs): no two outputs
+/// write the same slot.
 #[doc(hidden)]
 pub fn check_operands(name: &str, operands: &[Gpr], inputs: usize) {
-    for (i, a) in operands.iter().enumerate() {
-        for b in &operands[i + 1..] {
-            assert_eq!(a.reg == b.reg, a.slot == b.slot, "{name}: operands {a:?} and {b:?} conflict");
-            assert!(i < inputs || a != b, "{name}: outputs {a:?} and {b:?} coincide");
-        }
+    let outputs = &operands[inputs..];
+    for (i, a) in outputs.iter().enumerate() {
+        assert!(outputs[i + 1..].iter().all(|b| b.slot != a.slot), "{name}: two outputs write slot {}", a.slot);
     }
 }
 
@@ -294,44 +225,50 @@ pub fn check_operands(name: &str, operands: &[Gpr], inputs: usize) {
 /// A copy&patch window op, as stored in `Residual::ExecWindow`.
 pub trait Window: std::fmt::Debug {
     fn name(&self) -> &'static str;
-    /// The operands' bindings: the inputs, then the outputs.
+    /// The operands' tokens: the inputs, then the outputs.
     fn operands(&self) -> &[Gpr];
     /// Number of inputs among `operands`.
     fn inputs(&self) -> usize;
     /// Hole values, in `__lunacy_holeN` order.
     fn captures(&self) -> Captures;
-    /// Address of the stencil for this op's operand registers.
-    fn stencil(&self) -> usize;
+    /// Address of the stencil with operand `i` in window register `regs[i]`.
+    fn stencil(&self, regs: &[usize]) -> usize;
     /// Address of this op's `become` continuation (what every one of its
     /// stencils ends by jumping to, and what the copier slices off).
     fn next(&self) -> usize;
-    /// Run the body on the window `w`, with the captures from `self`.
+    /// Run the body on the window `w`, operand `i` in register `regs[i]`, with
+    /// the captures from `self`.
     unsafe fn run<'src, 'intern>(
         &self,
         owner: &mut Owner,
         state: &mut RunState<'src, 'intern>,
         base: *mut LBoxed<'src, 'intern>,
         w: &mut Regs<'src, 'intern>,
+        regs: &[usize],
     );
 }
+
+/// Operand `i` in window register `i`.
+const IDENTITY: [usize; WINDOW] = [0, 1, 2, 3];
 
 impl dyn Window {
     /// Interpreter tier: load the inputs from their stack homes, run the body,
     /// flush the outputs. See Note [Register window].
     pub fn interp<'src, 'intern>(&self, owner: &mut Owner, state: &mut RunState<'src, 'intern>) {
-        let (inputs, outputs) = self.operands().split_at(self.inputs());
+        let operands = self.operands();
+        let regs = &IDENTITY[..operands.len()];
         let mut w = [LBoxed::NIL; WINDOW];
-        for gpr in inputs {
-            w[gpr.reg()] = state.vals[state.base + gpr.slot()];
+        for (i, gpr) in operands[..self.inputs()].iter().enumerate() {
+            w[i] = state.vals[state.base + gpr.slot()];
         }
         let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
         #[cfg(feature = "check_windows")]
         let before = w;
-        unsafe { self.run(owner, state, base, &mut w) };
+        unsafe { self.run(owner, state, base, &mut w, regs) };
         #[cfg(feature = "check_windows")]
-        check::check(self, owner, state, base, before, &w);
-        for gpr in outputs {
-            state.vals[state.base + gpr.slot()] = w[gpr.reg()];
+        check::check(self, regs, owner, state, base, before, &w);
+        for (i, gpr) in operands.iter().enumerate().skip(self.inputs()) {
+            state.vals[state.base + gpr.slot()] = w[i];
         }
     }
 }
@@ -360,7 +297,7 @@ macro_rules! bind_holes {
 #[doc(hidden)]
 pub(crate) use bind_holes;
 
-/// The address of `Self::__stencil::<REGS>` for the registers of `$operands`:
+/// The address of `Self::__stencil::<REGS>` for the operand registers `$regs`:
 /// one match per operand, so every combination is instantiated.
 #[doc(hidden)]
 macro_rules! select_stencil {
@@ -368,7 +305,7 @@ macro_rules! select_stencil {
         Self::__stencil::<{ $regs }> as *const () as usize
     };
     ($operands:expr, $i:expr, $regs:expr; $op:ident $($rest:ident)*) => {
-        match $operands[$i].reg() {
+        match $operands[$i] {
             0 => $crate::window::select_stencil!($operands, $i + 1, $regs; $($rest)*),
             1 => $crate::window::select_stencil!($operands, $i + 1, $regs | (1 << ($crate::window::REG_BITS as usize * ($i))); $($rest)*),
             2 => $crate::window::select_stencil!($operands, $i + 1, $regs | (2 << ($crate::window::REG_BITS as usize * ($i))); $($rest)*),
@@ -386,7 +323,7 @@ pub(crate) use select_stencil;
 /// windowed!(Name, [k: f64], [OP: Opcode], |owner, state, base| (a, b) -> (d) {
 ///     *d = /* ... uses a, b, k, OP, owner, state, base ... */;
 /// });
-/// let w: Rc<dyn Window> = Rc::new(Name::<{ Opcode::ADD }>::new(k, &[a, b, d]));
+/// let w: Rc<dyn Window> = Rc::new(Name::<{ Opcode::ADD }>::new(k, &[a, b, d])); // `Gpr` tokens
 /// ```
 ///
 /// * `[captures]` — struct fields, and the stencil's holes (at most `MAX_HOLES`;
@@ -511,8 +448,9 @@ macro_rules! windowed {
             fn captures(&self) -> $crate::window::Captures {
                 ::smallvec::smallvec![$($crate::window::Capture::to_bits(self.$cap)),*]
             }
-            fn stencil(&self) -> usize {
-                $crate::window::select_stencil!(self.operands, 0usize, 0usize; $($in)* $($out)*)
+            fn stencil(&self, regs: &[usize]) -> usize {
+                assert_eq!(regs.len(), Self::ARITY, "{}: wrong number of operand registers", stringify!($name));
+                $crate::window::select_stencil!(regs, 0usize, 0usize; $($in)* $($out)*)
             }
             fn next(&self) -> usize { Self::__next as *const () as usize }
             unsafe fn run<'src, 'intern>(
@@ -521,8 +459,10 @@ macro_rules! windowed {
                 state: &mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 w: &mut $crate::window::Regs<'src, 'intern>,
+                regs: &[usize],
             ) {
-                unsafe { Self::__window($(self.$cap,)* owner, state, base, w, |i| self.operands[i].reg()) }
+                assert_eq!(regs.len(), Self::ARITY, "{}: wrong number of operand registers", stringify!($name));
+                unsafe { Self::__window($(self.$cap,)* owner, state, base, w, |i| regs[i]) }
             }
         }
     };
@@ -707,7 +647,7 @@ const RELATIVE_BRANCHES: [yaxpeax_x86::long_mode::Opcode; 23] = {
     ]
 };
 
-/// Copy `op`'s stencil (the instance for its operand registers).
+/// Copy `op`'s stencil with operand `i` in window register `regs[i]`.
 ///
 /// A well-formed stencil ends in its `become`: its last instruction is a tail
 /// jump to the op's continuation, which is sliced off so the next stencil falls
@@ -716,12 +656,12 @@ const RELATIVE_BRANCHES: [yaxpeax_x86::long_mode::Opcode; 23] = {
 /// the body need no fixup (one to the sliced tail becomes a fall-through into the
 /// next stencil, as it should). A stencil that can't be copied this way is an
 /// error, not a panic, so the JIT can call the op's body instead.
-pub unsafe fn stencil_body(image: &Image, op: &dyn Window) -> Result<Body, StencilError> {
+pub unsafe fn stencil_body(image: &Image, op: &dyn Window, regs: &[usize]) -> Result<Body, StencilError> {
     use yaxpeax_arch::LengthedInstruction;
     use yaxpeax_x86::long_mode::{InstDecoder, Instruction, Opcode, Operand, RegSpec};
 
     let name = op.name();
-    let addr = op.stencil();
+    let addr = op.stencil(regs);
     let &size = image.sizes.get(&addr).ok_or(StencilError::NotInSymtab { op: name })?;
     let code = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
 
@@ -883,14 +823,15 @@ fn near_hint(len: usize) -> Result<*mut core::ffi::c_void, StencilError> {
         .ok_or_else(|| StencilError::Map("no free gap within rel32 range".into()))
 }
 
-/// Copy&patch the stencils of `ops` into one executable buffer near the binary: bodies concatenated (so the
+/// Copy&patch the stencils of `ops` (each with its operand registers) into one
+/// executable buffer near the binary: bodies concatenated (so the
 /// register window falls through), then `tail`, then the shared pool of hole
 /// values. Every hole is repointed at its pool slot, every reference to an op's
 /// continuation at that copy's fall-through point (the next stencil), and every
 /// other RIP-relative reference is re-targeted at its original absolute address.
 pub unsafe fn assemble(
     image: &Image,
-    ops: &[&dyn Window],
+    ops: &[(&dyn Window, &[usize])],
     tail: &[u8],
 ) -> Result<ExecutableBuffer, StencilError> {
     let mut code = Vec::new();
@@ -898,8 +839,8 @@ pub unsafe fn assemble(
     let mut relocs: Vec<RipRel> = Vec::new();
     // Each continuation reference, with its copy's fall-through offset.
     let mut nexts: Vec<(NextRef, usize)> = Vec::new();
-    for &op in ops {
-        let body = unsafe { stencil_body(image, op) }?;
+    for &(op, regs) in ops {
+        let body = unsafe { stencil_body(image, op, regs) }?;
         let captures = op.captures();
         let at = code.len();
         let shift = |r: RipRel| RipRel { field: r.field + at, end: r.end + at, ..r };
@@ -950,11 +891,12 @@ pub unsafe fn assemble(
     buf.make_exec().map_err(map_err)
 }
 
-/// Operands for an op that reads the whole window, register `i` as operand `i`.
-/// Its stencil never touches the stack, so the slots are arbitrary.
+/// Operand tokens for an op that reads the whole window (at registers
+/// `IDENTITY`). Its stencil never touches the stack, so the slots are arbitrary.
 #[cfg(any(test, feature = "check_windows"))]
 fn whole_window() -> [Gpr; WINDOW] {
-    core::array::from_fn(|i| Gpr { reg: i as u8, slot: i as u16 })
+    let mut tokens = Tokens::default();
+    core::array::from_fn(|i| tokens.mint(i))
 }
 
 /// Differential check (feature `check_windows`): every window op the interpreter
@@ -993,6 +935,7 @@ mod check {
 
     pub(super) fn check<'src, 'intern>(
         op: &dyn Window,
+        regs: &[usize],
         owner: &mut Owner,
         state: &mut RunState<'src, 'intern>,
         base: *mut LBoxed<'src, 'intern>,
@@ -1007,8 +950,8 @@ mod check {
             });
             let flush = CheckFlush::new(c.out as u64, &whole_window());
             let image = &c.image;
-            let program = c.programs.entry((op.stencil(), op.captures())).or_insert_with(|| {
-                unsafe { assemble(image, &[op, &flush], &[0xc3]) }
+            let program = c.programs.entry((op.stencil(regs), op.captures())).or_insert_with(|| {
+                unsafe { assemble(image, &[(op, regs), (&flush, &IDENTITY)], &[0xc3]) }
                     .inspect_err(|e| crate::warn!("check_windows: not checked: {e}"))
                     .ok()
             });
@@ -1034,7 +977,6 @@ mod check {
 mod tests {
     use super::*;
     use dynasmrt::AssemblyOffset;
-    use std::rc::Rc;
 
     // Test-local window ops, declared exactly as an emit site would.
     windowed!(TAdd, [], [], |owner, state, base| (a, b) -> (d) {
@@ -1076,9 +1018,6 @@ mod tests {
         }
     });
 
-    fn gpr(reg: u8, slot: u16) -> Gpr {
-        Gpr { reg, slot }
-    }
 
     fn entry_of(exec: &ExecutableBuffer) -> extern "rust-preserve-none" fn(
         usize,
@@ -1098,9 +1037,10 @@ mod tests {
     #[test]
     fn copy_and_patch_branches() {
         let image = Image::load().unwrap();
-        let branch = TBranch::new(&[gpr(0, 0), gpr(0, 0)]);
+        let mut tokens = Tokens::default();
+        let branch = TBranch::new(&[tokens.mint(0), tokens.mint(0)]);
         let flush = Flush::new(&whole_window());
-        let exec = unsafe { assemble(&image, &[&branch, &flush], &[0xc3]) }.unwrap();
+        let exec = unsafe { assemble(&image, &[(&branch, &[0, 0]), (&flush, &IDENTITY)], &[0xc3]) }.unwrap();
         for (x, want) in [(-2.0, -5.0), (2.0, 102.0)] {
             let mut out = [LBoxed::NIL; WINDOW];
             entry_of(&exec)(0, 0, out.as_mut_ptr(), LBoxed::from_number(x), LBoxed::NIL, LBoxed::NIL, LBoxed::NIL);
@@ -1113,11 +1053,12 @@ mod tests {
     #[test]
     fn copy_and_patch_relocates_calls() {
         let image = Image::load().unwrap();
-        let call = TCall::new(&[gpr(0, 0), gpr(0, 0)]);
+        let mut tokens = Tokens::default();
+        let call = TCall::new(&[tokens.mint(0), tokens.mint(0)]);
         let flush = Flush::new(&whole_window());
 
         let helper = out_of_line as *const () as usize;
-        let body = unsafe { stencil_body(&image, &call) }.unwrap();
+        let body = unsafe { stencil_body(&image, &call, &[0, 0]) }.unwrap();
         assert!(
             body.relocations().iter().any(|r| r.target == helper
                 || unsafe { *(r.target as *const usize) } == helper),
@@ -1125,7 +1066,7 @@ mod tests {
             body.relocations()
         );
 
-        let exec = unsafe { assemble(&image, &[&call, &flush], &[0xc3]) }.unwrap();
+        let exec = unsafe { assemble(&image, &[(&call, &[0, 0]), (&flush, &IDENTITY)], &[0xc3]) }.unwrap();
         let mut out = [LBoxed::NIL; WINDOW];
         entry_of(&exec)(0, 0, out.as_mut_ptr(), LBoxed::from_number(2.0), LBoxed::NIL, LBoxed::NIL, LBoxed::NIL);
         assert_eq!(out[0].as_number(), Some(7.0));
@@ -1137,11 +1078,14 @@ mod tests {
     #[test]
     fn copy_and_patch_chain() {
         let image = Image::load().unwrap();
-        let add = TAdd::new(&[gpr(1, 1), gpr(2, 2), gpr(3, 3)]);
-        let mul = TMul::new(&[gpr(0, 0), gpr(3, 3), gpr(0, 0)]);
-        let addk = TAddK::new(0.5, &[gpr(0, 0), gpr(0, 0)]);
+        let mut t = Tokens::default();
+        let add = TAdd::new(&[t.mint(1), t.mint(2), t.mint(3)]);
+        let mul = TMul::new(&[t.mint(0), t.mint(3), t.mint(0)]);
+        let addk = TAddK::new(0.5, &[t.mint(0), t.mint(0)]);
         let flush = Flush::new(&whole_window());
-        let exec = unsafe { assemble(&image, &[&add, &mul, &addk, &flush], &[0xc3]) }.unwrap();
+        let ops: [(&dyn Window, &[usize]); 4] =
+            [(&add, &[1, 2, 3]), (&mul, &[0, 3, 0]), (&addk, &[0, 0]), (&flush, &IDENTITY)];
+        let exec = unsafe { assemble(&image, &ops, &[0xc3]) }.unwrap();
 
         let mut out = [LBoxed::NIL; WINDOW];
         entry_of(&exec)(
@@ -1157,109 +1101,14 @@ mod tests {
         assert_eq!(out, [Some(2.0 * (3.0 + 4.0) + 0.5), Some(3.0), Some(4.0), Some(7.0)]);
     }
 
-    /// A specializer's view of a block: bind through `Bindings` replayed from the
-    /// window residuals emitted so far.
-    #[derive(Default)]
-    struct Run(Vec<(Option<(Gpr, Access)>, Option<Rc<dyn Window>>)>);
-
-    impl Run {
-        fn bindings(&self) -> Bindings {
-            Bindings::replay(self.0.iter().map(|(storage, _)| match storage {
-                Some((gpr, access)) => Event::Storage(*gpr, *access),
-                None => Event::Op,
-            }))
-        }
-        fn storage(&mut self, slot: usize, access: Access) -> Gpr {
-            let gpr = self.bindings().bind(slot);
-            self.0.push((Some((gpr, access)), None));
-            gpr
-        }
-        fn op(&mut self, op: impl Window + 'static) {
-            self.bindings().check(&op);
-            self.0.push((None, Some(Rc::new(op))));
-        }
-        /// `d = a + b` over stack slots.
-        fn add(&mut self, a: usize, b: usize, d: usize) -> [Gpr; 3] {
-            let ga = self.storage(a, Access::Read);
-            let gb = self.storage(b, Access::Read);
-            let gd = self.storage(d, Access::Write);
-            self.op(TAdd::new(&[ga, gb, gd]));
-            [ga, gb, gd]
-        }
-    }
-
-    /// A bound slot keeps its register; a new one takes a free register, then
-    /// evicts the least recently bound; binding a slot again refreshes it.
     #[test]
-    fn bindings_linear_scan() {
-        let mut run = Run::default();
-        let [a, b, c] = run.add(10, 11, 12);
-        assert_eq!([a.reg(), b.reg(), c.reg()], [0, 1, 2]);
-        // 10 is reused (and refreshed), 13 takes the last free register.
-        let [a2, _, d] = run.add(10, 12, 13);
-        assert_eq!((a2, d.reg()), (a, 3));
-        // The least recently bound is now 11, then 10.
-        let [_, _, e] = run.add(12, 13, 14);
-        assert_eq!(e.reg(), b.reg());
-        let [_, _, f] = run.add(14, 13, 15);
-        assert_eq!(f.reg(), a.reg());
-    }
-
-    /// Output-in-place: the output binds the same register as the input slot.
-    #[test]
-    fn bindings_in_place_output() {
-        let mut run = Run::default();
-        let [a, _, d] = run.add(10, 11, 10);
-        assert_eq!(a, d);
-    }
-
-    /// An op's own bindings are pinned: binding more registers than the window
-    /// has before the op runs is a specializer bug.
-    #[test]
-    #[should_panic(expected = "more registers than the window has")]
-    fn bindings_pinned_overflow() {
-        let mut run = Run::default();
-        for slot in 0..=WINDOW {
-            run.storage(slot, Access::Read);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "was bound but is not an operand")]
-    fn check_rejects_stray_binding() {
-        let mut run = Run::default();
-        let a = run.storage(10, Access::Read);
-        let b = run.storage(11, Access::Read);
-        let d = run.storage(12, Access::Write);
-        run.storage(13, Access::Read);
-        run.op(TAdd::new(&[a, b, d]));
-    }
-
-    #[test]
-    #[should_panic(expected = "was not bound for reading")]
-    fn check_rejects_unread_input() {
-        let mut run = Run::default();
-        let a = run.storage(10, Access::Read);
-        let b = run.storage(11, Access::Write);
-        let d = run.storage(12, Access::Write);
-        run.op(TAdd::new(&[a, b, d]));
-    }
-
-    #[test]
-    #[should_panic(expected = "is not a live binding")]
-    fn check_rejects_evicted_operand() {
-        let mut run = Run::default();
-        let [a, ..] = run.add(10, 11, 12);
-        run.add(13, 14, 15);
-        let b = run.storage(11, Access::Read);
-        let d = run.storage(12, Access::Write);
-        // Slot 10 was evicted by 14, so its token is stale.
-        run.op(TAdd::new(&[a, b, d]));
-    }
-
-    #[test]
-    #[should_panic(expected = "conflict")]
-    fn operands_one_slot_per_register() {
-        TAdd::new(&[gpr(0, 10), gpr(0, 11), gpr(1, 12)]);
+    #[should_panic(expected = "two outputs write slot 10")]
+    fn operands_distinct_outputs() {
+        windowed!(TSwap, [], [], |owner, state, base| (a, b) -> (c, d) {
+            *c = b;
+            *d = a;
+        });
+        let mut t = Tokens::default();
+        TSwap::new(&[t.mint(10), t.mint(11), t.mint(10), t.mint(10)]);
     }
 }

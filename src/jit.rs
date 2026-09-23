@@ -725,10 +725,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
-                // The JIT doesn't hold values in the register window yet: every
-                // value is in its stack home, so bindings need no code and a
-                // window op bails to the interpreter, which runs it from the
-                // stack. See Note [Register window].
+                // Register allocation for window ops belongs here, at `Storage`
+                // (see Note [Register window]). Until the JIT splats window ops,
+                // every value stays in its stack home: a token needs no register
+                // and a window op bails to the interpreter, which runs it from the
+                // stack.
                 Residual::Storage(..) => {},
                 Residual::ExecWindow(_) => {
                     emit_bailout(ops, off)
