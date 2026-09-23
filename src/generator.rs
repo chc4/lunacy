@@ -323,7 +323,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
-            windowed!(GetTableHref, [href: u8, key: usize], [], |owner, state, base| (table) -> (dest) {
+            windowed!(GetTableHref, [href: u8, key: usize], [], |owner, state, base| (out dest, table) {
                 let witness = &state.hash_witnesses[state.witness_base + href as usize];
                 debug!("gettable_href with {:?}", &witness);
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -348,10 +348,10 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 debug!("gettable_href fetched {val1:?}");
                 *dest = *val1;
             });
-            let t = yield YieldOp::Storage(b, Access::Read);
             let d = yield YieldOp::Storage(a, Access::Write);
-            let (ResumeArg::Storage(t), ResumeArg::Storage(d)) = (t, d) else { unreachable!() };
-            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[t, d])));
+            let t = yield YieldOp::Storage(b, Access::Read);
+            let (ResumeArg::Storage(d), ResumeArg::Storage(t)) = (d, t) else { unreachable!() };
+            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[d, t])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
         } else {
             arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
@@ -443,7 +443,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let expected = htype.as_ltype();
                 let retype = mismatched_type.is_some();
                 if c & 0x100 == 0 {
-                    windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: bool], |owner, state, base| (table, value) -> () {
+                    windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: bool], |owner, state, base| (table, value) {
                         store(owner, state, table, value, href, expected, RETYPE);
                     });
                     let t = yield YieldOp::Storage(a, Access::Read);
@@ -562,7 +562,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (lhs, rhs) -> (dest) {
+                windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (out dest, lhs, rhs) {
                     // Guarded numbers. Unchecked, so that no panic path follows the
                     // stencil's `become` and the copy can slice it off.
                     let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
@@ -570,11 +570,11 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                 });
 
+                let d = yield YieldOp::Storage(dest, Access::Write);
                 let l = yield YieldOp::Storage(lhs, Access::Read);
                 let r = yield YieldOp::Storage(rhs, Access::Read);
-                let d = yield YieldOp::Storage(dest, Access::Write);
-                let (ResumeArg::Storage(l), ResumeArg::Storage(r), ResumeArg::Storage(d)) = (l, r, d) else { unreachable!() };
-                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt, (&[l, r, d])));
+                let (ResumeArg::Storage(d), ResumeArg::Storage(l), ResumeArg::Storage(r)) = (d, l, r) else { unreachable!() };
+                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt, (&[d, l, r])));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },

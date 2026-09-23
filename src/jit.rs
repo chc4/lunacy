@@ -10,7 +10,7 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::generator::{Block, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
-use crate::window_alloc::{Emit, Step, WindowAlloc};
+use crate::window_alloc::{Emit, WindowAlloc};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use smallvec::SmallVec;
@@ -564,16 +564,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 dynasm!(ops
                     ; => label
                 );
-                let run = block.instructions[off..].iter().take_while(|r| window(r)).count();
-                if run > 0 {
-                    alloc.begin(block.instructions[off..off + run].iter().map(|r| match r {
-                        Residual::Storage(gpr, access) => Step::Storage(*gpr, *access),
-                        Residual::ExecWindow(w) => Step::Op(&**w),
-                        _ => unreachable!(),
-                    }));
-                }
                 #[cfg(feature = "gas")]
-                emit_gas_check(ops, off, run.max(1));
+                emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1));
             }
             loop { match res {
                 Residual::Guard { idx, expected } => {

@@ -136,17 +136,15 @@ opaque closure so the JIT can't see its dataflow. Window ops make it visible
   recorded as `Residual::Storage(token, access)`. LBBV does no register
   allocation.
 - **`Residual::ExecWindow(Rc<dyn Window>)`**, built from those tokens: inputs are
-  read-only and only outputs are written back (`windowed!(.., (a, b) -> (d))`),
+  read-only and only outputs are written back (`windowed!(.., (out d, a, b))`),
   so a register caching a slot only ever holds that slot's value. An op always
-  runs on a contiguous run of the window, `w[SKIP..SKIP + arity]`.
-- **JIT mode** (`src/window_alloc.rs`, `Note [Window allocation]`; to be replaced
-  by the streaming allocator proposed in section 6): `Storage` only records its
-  token; the op, with all of its operands known, is placed at
-  the cheapest `SKIP` by resculpting the window from `SKIP` on — inputs moved
-  from the register caching them or loaded, displaced values moved to spare
-  registers or evicted — with a one-op lookahead. Flushing is deferred to the
-  end of the run. Interpreter mode: the op at `SKIP` 0; load the inputs from
-  their stack homes, run, flush the outputs (`Storage` is a no-op).
+  runs on a contiguous run of the window, `w[SKIP..SKIP + arity]`, its operands
+  in the order it declares them.
+- **JIT mode** (`src/window_alloc.rs`, `Note [Window allocation]`, section 6):
+  a streaming allocator. `Storage` only records its token; the op is placed at
+  the `SKIP` whose resculpt emits least, and flushing is deferred to the end of
+  the run. Interpreter mode: the op at `SKIP` 0; load the inputs from their
+  stack homes, run, flush the outputs (`Storage` is a no-op).
 
 **Copy&patch (the part worth the machinery).** Instead of emitting a `call` to
 the `Exec` closure body, splat the op's compiled **template/stencil** into the
@@ -216,7 +214,7 @@ green gate (default features ⇒ jit on).
   copy — `check_windows` caught it clobbering w8. `owner` is a ZST token that
   can be forged at JIT/interpreter transitions (the JIT helpers already do);
   dropping it as a stencil param would free r12 for a 9th window register.
-- `windowed!(Name, [captures], [const params], |owner, state, base| (inputs) -> (outputs) { body })`
+- `windowed!(Name, [captures], [const params], |owner, state, base| (out d, a, b) { body })`
   is a **generic**, op-agnostic mechanism used inline at the emit site, exactly
   like `define_exec!` — all of an op's code (static and dynamic) stays in its
   `emit_*`. It generates a struct of **captures** (hole values) + the operands'
@@ -301,8 +299,7 @@ Verification:
   floored modulo (`-3 % 7` gives `-3`).
 
 **M2 — DONE: JIT register allocation + stencil splat.** `src/window_alloc.rs`
-allocates each run of window residuals (see `Note [Window allocation]`; its
-allocation is to be replaced, see section 6);
+allocates each run of window residuals (section 6, `Note [Window allocation]`);
 `jit_block` lowers its plan (loads/stores against r14, moves between the window
 registers with r10 as scratch) and splats each op's stencil body between
 `sub rsp, 8`/`add rsp, 8` (block code keeps rsp 16-aligned; stencils expect the
@@ -315,27 +312,11 @@ no label, so a jump into a run fails to assemble; with `gas`, a run is charged
 at its first residual. An op whose stencil the copier rejects at every `SKIP`
 flushes and bails to the interpreter, which runs it from the stack.
 
-Hand analysis that shaped the allocator (nbody `advance`, worked for a
-4-register window, 3-wide `(lhs, rhs) -> (dest)` ops at `SKIP` 0 or 1, to
-study register pressure):
-- block 94 (`dz = biz - dz; dist2 = dx*dx + dy*dy + dz*dz`): 5 loads, 3 stores,
-  7 moves vs 12 loads/6 stores through the stack (floor 4/3; one spill of `dz`,
-  since only one register is spare beside a 3-register op);
-- block 100 (`bm`, `bivx/y/z -= d* * bm`): 10 loads, 5 stores vs 16/8 (floor
-  9/5); the allocator also finds a 6-move plan against 8 by hand.
-Lessons: a result lands at `SKIP+2`, so it is read in place only as the next
-op's `rhs` at `SKIP+1` (else one move); `x*x` needs a copy; evicting a dirty
-value costs a store only if the slot is written again later in the run
-(otherwise it is the run-end store moved earlier); eviction is otherwise by
-farthest next read. Both runs are unit tests pinning these counts at width 4
-(the allocator takes a width for testing) and at the full 8-register window,
-where nothing is evicted and both reach the load/store floor (every slot read
-before written loaded once, every written slot stored once): 4 loads/3
-stores/5 moves and 9/5/4. Block 94's 5 moves are the minimum by hand: a copy
-for each of `dx*dx`, `dy*dy`, `dz*dz`, and each `dist2 += t` needs one, since
-putting `t` right after `dist2` means running its producer at `SKIP+1`, whose
-span covers `dist2`. Plus an
-exhaustive correctness sweep at width 4 executing plans on a symbolic machine.
+The allocator's tests execute its output on a symbolic machine (every op
+reads the current value of each input, every store writes a current value, the
+run's end leaves the stack up to date): nbody's steady-state runs, pinned to the
+counts worked by hand below, and an exhaustive sweep over every run of three
+ops of four shapes, one declaring its output last, in a 4-register window.
 
 **Table ops as window ops.** `emit_gettable`'s `gettable_href` is
 `GetTableHref: (table) -> (dest)` (captures: the witness index, and the constant
@@ -349,25 +330,24 @@ entry index check, load, `jmp` to the continuation); its only relocations are
 its cold panic paths. `just test-stencils` builds with the `stencils` profile,
 every package optimized, so its stencils match release (7 relocations for a
 get, all cold). Both copy at every `SKIP`. The multi-op runs nbody's `advance`
-executes in its steady state (counted per block), worked by hand for the
-8-register window (loads/stores/moves; loads and stores at the floor):
+executes in its steady state (counted per block), with what the streaming
+allocator emits in the 8-register window, worked by hand (loads/stores/moves;
+the floor is a load per slot read before it is written and a store per slot
+written):
 
-| run | now | with the table ops as `Exec`s |
-|---|---|---|
-| `bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step` (11 ops) | 10/2/4 | — |
-| `dx = bix - bj.x` | 2/1/0 | 3/2 |
-| `dz = biz - bj.z; dist2 = ...` | 4/3/5 | 5/4 |
-| `bm = bj.mass * mag; bivx -= dx * bm; ...` | 9/5/4 | 10/6 |
-| `bj.vx = bj.vx + dx * bm` | 3/2/2 | 5/3 |
-| ... plus `j += step` | 5/3/2 | 7/4 |
-| `mag = dt / (mag * dist2)` | 3/2/0 | 3/2 |
+| run | streaming | floor | with the table ops as `Exec`s |
+|---|---|---|---|
+| `bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step` (11 ops) | 12/2/3 | 10/2 | — |
+| `dx = bix - bj.x` | 2/1/1 | 2/1 | 3/2 |
+| `dz = biz - bj.z; dist2 = ...` | 4/3/5 | 4/3 | 5/4 |
+| `bm = bj.mass * mag; bivx -= dx * bm; ...` | 9/5/4 | 9/5 | 10/6 |
+| `bj.vx = bj.vx + dx * bm` | 4/2/2 | 3/2 | 5/3 |
+| ... plus `j += step` | 6/3/2 | 5/3 | 7/4 |
+| `mag = dt / (mag * dist2)` | 3/2/1 | 3/2 | 3/2 |
 
-In `bj.vx = bj.vx + dx * bm` both moves are forced by the window's shape: the
-got value must sit right before the product, whose op covers the register the
-get left it in, and `bj` must sit right before the sum. In the 11-op run each
-of the three `bi.? = t` stores needs `bi` copied in right before `t` (3 moves)
-and `bivz` moves beside `dt` (1). The allocator matches every row; its tests pin
-them, and the exhaustive sweep covers all three op shapes.
+Where it loses to the floor, an op placed to read an input in place overwrote a
+cached value that a later op reloads: `bix + t` runs at 0 and overwrites the
+cached `bi` and `bivz`; `bj.vx + t` overwrites `bj`.
 
 The `bi` run is long because `bi` keeps its shape (a key already cached in the
 slot's `CType::Shape` costs an epoch check, not an `href_init`). The `bj` runs
@@ -413,13 +393,16 @@ arbitrary `LBoxed` window values in GPRs across ops.
 
 ---
 
-## 6. Register allocation: a streaming forward pass (proposal, for review)
+## 6. Register allocation: a streaming forward pass
 
-This replaces the allocator in `src/window_alloc.rs`. That one spends compile
-time on placement quality inside one run: a backward scan for next uses,
-relocating displaced values into spare registers, ranking evictions, and a
-lookahead. That is the wrong trade for a JIT, and within one block it matters
-little when we compile a tree of blocks.
+`src/window_alloc.rs` allocates window registers the way copy-and-patch does:
+one forward pass, a few register comparisons per op. It spends no compile time
+on placement quality inside a run (no next-use scan, relocation of displaced
+values, eviction ranking or lookahead): that is the wrong trade for a JIT, and
+within one block it matters little when we compile a tree of blocks. Decided:
+cache every slot; flush at block boundaries (every run ends at a non-window
+residual) before carrying the cache across straightline edges; no in-place
+updates.
 
 ### What copy-and-patch does (Xu & Kjolstad, OOPSLA 2021, §3–4)
 
@@ -470,12 +453,9 @@ The emit site yields its `Storage`s in the same order. The allocator knows only
 each operand's index and whether it is read or written, so it handles any order
 an op names:
 
-- `NumericIntInt` would declare `[dest, lhs, rhs]`, so a result lands below
-  where the next op's inputs go;
-- `GetTableHref` would declare `[dest, table]`;
-- `SetTableHref` would declare `[table, value]`.
-
-`window::position` goes away.
+- `NumericIntInt` declares `(out dest, lhs, rhs)`;
+- `GetTableHref` declares `(out dest, table)`;
+- `SetTableHref` declares `(table, value)`.
 
 ### The allocator
 
@@ -495,12 +475,13 @@ first.
    - an input already in its register costs nothing;
    - an input cached in another register costs a move;
    - an uncached input costs a load;
-   - a dirty value in the span costs a store, unless it is an older value of
-     one of the op's outputs, which the op rewrites.
+   - a dirty value the span overwrites costs a store, unless it survives
+     elsewhere (in another register, or as one of the op's inputs) or is an
+     older value of one of the op's outputs, which the op rewrites.
 
    Ties go to the `SKIP` whose span overwrites the fewest cached values, then to
-   the lowest. That is `WINDOW × n` register comparisons (8 × 3 for a numeric
-   op).
+   the lowest. That is on the order of `WINDOW × n` register comparisons per
+   op.
 2. **Emit**, in this order:
    - the stores;
    - the moves and loads into the span, as one parallel move (reads before
@@ -512,49 +493,13 @@ first.
 At a flush point (any residual other than `Storage`/`ExecWindow`), store every
 dirty register. Calls clobber every register, so the cache is emptied too.
 
-**What it gives up, worked by hand** on nbody's steady-state 11-op run
-`bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step` in 8
-registers, with ops in `[out, in, ...]` order:
+**What it gives up**, worked by hand on nbody's steady-state runs: the table
+in section 5 (M2); at most two extra loads per run, no extra stores.
 
-- The first `dt*bivx` takes free registers (`t15`, `dt`, `bivx` at `w2..w4`).
-- `bix + t15` then runs at 0 to read `t15` in place, which overwrites the
-  cached `bi` and `bivz`.
-- The first `bi.x = t15` reloads `bi`.
-- Each later group finds `dt` still at `w3` and `bi` at `w5`, so it needs one
-  move (for `t15`) per store.
+### Not done
 
-That comes to 12 loads, 2 stores and 3 moves. The floor is 10 loads and 2
-stores, and the best plan (a search) does 10/2/2. The nbody tests would pin
-the counts the streaming rule gives, worked by hand like this. The
-symbolic-machine correctness checks and the exhaustive sweep stay.
-
-### Code changes
-
-- **`windowed!`:** the ordered operand list with in/out markers. The emit sites
-  yield their `Storage`s in that order. `window::position` goes.
-- **`window_alloc`:** the streaming allocator above replaces `begin`'s
-  next-use scan, the placement search, relocation and eviction ranking.
-  - `begin` shrinks to resetting the state; there is nothing to precompute.
-  - `op` takes the op's usable `SKIP`s from the copier directly.
-  - The JIT keeps calling `storage` / `op` / `flush`.
-- **Not in this change:** LuaJIT-style bottom-up assignment over the compiled
-  region. That would be a backward pass over the transitive closure of blocks
-  before codegen, storing each token's register compactly for the forward pass.
-  It would place values better across blocks, but costs a pass over the region
-  and the storage for its results. The paper suggests the streaming pass is the
-  right first step; revisit with measurements.
-
-### Decisions for review
-
-1. **Cache every slot, or only expression temporaries** as the paper does. In
-   Lua bytecode the temporaries are the slots at and above the active locals,
-   allocated like a stack (luac's `freereg`). Knowing that per pc needs each
-   prototype's active-local count, which stripped debug info may lack. The
-   design above caches every slot and needs nothing extra.
-2. **Across blocks:** carry the cache along straightline successor edges from the
-   start (section 2, rule 2), or flush at every block boundary first and add
-   the carry afterwards.
-3. **In-place updates:** whether an output may share an input's register when both
-   name the same slot. That is an in-place update like `t = bix + t`, the paper's
-   "result replaces the operand", and it would need its own stencil variant.
-   Not proposed now.
+LuaJIT-style bottom-up assignment over the compiled region (a backward pass
+over the transitive closure of blocks before codegen, each token's register
+stored compactly for the forward pass) would place values better across
+blocks, at the cost of a pass over the region and the storage for its results.
+Revisit with measurements.

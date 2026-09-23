@@ -13,8 +13,8 @@
 //!   register window as **scalar** `LBoxed` params `w0..w7` (r15, rdi, rsi, rdx, rcx, r8, r9, r11; see
 //!   `WINDOW`).
 //!   Scalars, not `[LBoxed; N]`, because Rust passes arrays by pointer whatever
-//!   the ABI, which would put the window in memory. `SKIP` is where the op's
-//!   operands start: operand `i` is `w[SKIP + i]` (see Note [Register window]).
+//!   the ABI, which would put the window in memory. Operand `i`, in the order
+//!   the op declares them, is `w[SKIP + i]` (see Note [Register window]).
 //!   The stencil ends in `become` to
 //!   the op's own continuation, which the copier slices off so the window falls
 //!   through into the next stencil.
@@ -49,12 +49,14 @@
 // ~~~~~~~~~~~~~~~~~~~~~~
 // A window op's operands are whole `LBoxed` values held in the register window:
 // `WINDOW` registers, passed between stencils as the scalar params `w0..w7`. An
-// op always runs on a contiguous run of the window: operand `i` (inputs, then
-// outputs) is register `SKIP + i`, and `Window::stencil(skip)` is the instance
-// for that `SKIP`. An op's inputs are read-only and only its outputs are written,
-// so the registers outside its run, and its inputs, keep their values. An op's
-// body must reach stack slots only through its operands: any slot may have a
-// newer value in a register than in its stack home.
+// op always runs on a contiguous run of the window: operand `i`, in the order
+// the op declares its operands, is register `SKIP + i`, and
+// `Window::stencil(skip)` is the instance for that `SKIP`. The order is the op's
+// choice (e.g. its output first, below its inputs); the allocator handles any.
+// An op's inputs are read-only and only its outputs are written, so the
+// registers outside its run, and its inputs, keep their values. An op's body
+// must reach stack slots only through its operands: any slot may have a newer
+// value in a register than in its stack home.
 //
 // The specializer never chooses registers. Before an `ExecWindow`, the emit site
 // yields a `Storage(slot, access)` for each operand and is resumed with an opaque
@@ -211,13 +213,13 @@ pub enum Access {
     Write,
 }
 
-/// Check a window op's operand tokens (inputs, then outputs): no two outputs
-/// write the same slot.
+/// Check a window op's operand tokens against its operands' accesses: no two
+/// outputs write the same slot.
 #[doc(hidden)]
-pub fn check_operands(name: &str, operands: &[Gpr], inputs: usize) {
-    let outputs = &operands[inputs..];
-    for (i, a) in outputs.iter().enumerate() {
-        assert!(outputs[i + 1..].iter().all(|b| b.slot != a.slot), "{name}: two outputs write slot {}", a.slot);
+pub fn check_operands(name: &str, operands: &[Gpr], accesses: &[Access]) {
+    let outputs = || operands.iter().zip(accesses).filter(|(_, a)| **a == Access::Write).map(|(g, _)| g);
+    for (i, a) in outputs().enumerate() {
+        assert!(outputs().skip(i + 1).all(|b| b.slot != a.slot), "{name}: two outputs write slot {}", a.slot);
     }
 }
 
@@ -226,21 +228,21 @@ pub fn check_operands(name: &str, operands: &[Gpr], inputs: usize) {
 /// A copy&patch window op, as stored in `Residual::ExecWindow`.
 pub trait Window: std::fmt::Debug {
     fn name(&self) -> &'static str;
-    /// The operands' tokens: the inputs, then the outputs.
+    /// The operands' tokens, in the order the op declares them: operand `i` is
+    /// window register `SKIP + i`.
     fn operands(&self) -> &[Gpr];
-    /// Number of inputs among `operands`.
-    fn inputs(&self) -> usize;
+    /// Whether each operand is read (an input) or written (an output).
+    fn accesses(&self) -> &'static [Access];
     /// Hole values, in `__lunacy_holeN` order.
     fn captures(&self) -> Captures;
     /// Number of operands: the op runs on `w[skip..skip + arity()]`.
     fn arity(&self) -> usize;
-    /// Address of the stencil with operand `i` in window register `skip + i`.
+    /// Address of the stencil running at `skip`.
     fn stencil(&self, skip: usize) -> usize;
     /// Address of this op's `become` continuation (what every one of its
     /// stencils ends by jumping to, and what the copier slices off).
     fn next(&self) -> usize;
-    /// Run the body on the window `w`, operand `i` in register `skip + i`, with
-    /// the captures from `self`.
+    /// Run the body on the window `w` at `skip`, with the captures from `self`.
     unsafe fn run<'src, 'intern>(
         &self,
         owner: &mut Owner,
@@ -255,9 +257,9 @@ impl dyn Window {
     /// Interpreter tier: load the inputs from their stack homes, run the body,
     /// flush the outputs. See Note [Register window].
     pub fn interp<'src, 'intern>(&self, owner: &mut Owner, state: &mut RunState<'src, 'intern>) {
-        let operands = self.operands();
+        let operands = self.operands().iter().zip(self.accesses()).enumerate();
         let mut w = [LBoxed::NIL; WINDOW];
-        for (i, gpr) in operands[..self.inputs()].iter().enumerate() {
+        for (i, (gpr, _)) in operands.clone().filter(|(_, (_, a))| **a == Access::Read) {
             w[i] = state.vals[state.base + gpr.slot()];
         }
         let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
@@ -266,21 +268,13 @@ impl dyn Window {
         unsafe { self.run(owner, state, base, &mut w, 0) };
         #[cfg(feature = "check_windows")]
         check::check(self, owner, state, base, before, &w);
-        for (i, gpr) in operands.iter().enumerate().skip(self.inputs()) {
+        for (i, (gpr, _)) in operands.filter(|(_, (_, a))| **a == Access::Write) {
             state.vals[state.base + gpr.slot()] = w[i];
         }
     }
 }
 
 // ---- windowed! ------------------------------------------------------------
-
-#[doc(hidden)]
-macro_rules! count_idents {
-    () => { 0usize };
-    ($h:ident $($t:ident)*) => { 1usize + $crate::window::count_idents!($($t)*) };
-}
-#[doc(hidden)]
-pub(crate) use count_idents;
 
 /// Bind each capture from its hole, `I` counting up from 0 at compile time.
 #[doc(hidden)]
@@ -299,31 +293,48 @@ pub(crate) use bind_holes;
 /// Declare a window op, usable at any emit site (like `define_exec!`):
 ///
 /// ```ignore
-/// windowed!(Name, [k: f64], [OP: Opcode], |owner, state, base| (a, b) -> (d) {
+/// windowed!(Name, [k: f64], [OP: Opcode], |owner, state, base| (out d, a, b) {
 ///     *d = /* ... uses a, b, k, OP, owner, state, base ... */;
 /// });
-/// let w: Rc<dyn Window> = Rc::new(Name::<{ Opcode::ADD }>::new(k, &[a, b, d])); // `Gpr` tokens
+/// let w: Rc<dyn Window> = Rc::new(Name::<{ Opcode::ADD }>::new(k, &[d, a, b])); // `Gpr` tokens
 /// ```
 ///
 /// * `[captures]` — struct fields, and the stencil's holes (at most `MAX_HOLES`;
 ///   more fails at link time; any [`Capture`] type).
 /// * `[const params]` — compile-time parameters baked into the stencil.
 /// * `|owner, state, base|` — names for the fixed params.
-/// * `(inputs) -> (outputs)` — the window operands: inputs are bound in the body
-///   as `LBoxed` values, outputs as `&mut LBoxed` to write the result to. The
-///   body must not otherwise read or write stack slots (see Note [Register
-///   window]).
+/// * `(operands)` — the window operands in window order: operand `i` is register
+///   `SKIP + i`. An input is bound in the body as an `LBoxed` value, an output
+///   (marked `out`) as `&mut LBoxed` to write the result to. The body must not
+///   otherwise read or write stack slots (see Note [Register window]).
 ///
-/// `new(captures.., operands)` takes the operands' [`Gpr`] tokens, inputs then
-/// outputs. See Note [Register window].
+/// `new(captures.., operands)` takes the operands' [`Gpr`] tokens in the same
+/// order. See Note [Register window].
 macro_rules! windowed {
     (
         $(#[$meta:meta])*
         $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
         [$($cp:ident : $cpt:ty),* $(,)?],
-        |$owner:ident, $state:ident, $base:ident| ($($in:ident),* $(,)?) -> ($($out:ident),* $(,)?)
+        |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
         $body:block
+    ) => {
+        $crate::window::windowed!(@sort
+            [$(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body]
+            [] [] [] (0usize) $($operands)*
+        );
+    };
+    // Sort the operands into inputs and outputs, each with its window offset,
+    // and their accesses in window order.
+    (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) out $op:ident $(, $($rest:tt)*)?) => {
+        $crate::window::windowed!(@sort $decl [$($in)*] [$($out)* ($op, $i)] [$($acc)* Write] ($i + 1) $($($rest)*)?);
+    };
+    (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) $op:ident $(, $($rest:tt)*)?) => {
+        $crate::window::windowed!(@sort $decl [$($in)* ($op, $i)] [$($out)*] [$($acc)* Read] ($i + 1) $($($rest)*)?);
+    };
+    (@sort
+        [$(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block]
+        [$(($in:ident, $ii:expr))*] [$(($out:ident, $oi:expr))*] [$($acc:ident)*] ($arity:expr)
     ) => {
         $(#[$meta])*
         #[derive(Debug, Clone)]
@@ -334,15 +345,15 @@ macro_rules! windowed {
 
         #[allow(unused_variables, unused_mut, unused_assignments, unused_unsafe, clippy::too_many_arguments)]
         impl<$(const $cp: $cpt),*> $name<$($cp),*> {
-            pub const INPUTS: usize = $crate::window::count_idents!($($in)*);
-            pub const ARITY: usize = Self::INPUTS + $crate::window::count_idents!($($out)*);
+            pub const ARITY: usize = $arity;
+            const ACCESSES: &'static [$crate::window::Access] = &[$($crate::window::Access::$acc),*];
             const FITS: () = assert!(Self::ARITY <= $crate::window::WINDOW, "more operands than window registers");
 
-            /// `operands`: the inputs' tokens, then the outputs'.
+            /// `operands`: the operands' tokens, in window order.
             pub fn new($($cap: $cty,)* operands: &[$crate::window::Gpr]) -> Self {
                 let () = Self::FITS;
                 assert_eq!(operands.len(), Self::ARITY, "{}: wrong number of operands", stringify!($name));
-                $crate::window::check_operands(stringify!($name), operands, Self::INPUTS);
+                $crate::window::check_operands(stringify!($name), operands, Self::ACCESSES);
                 Self { $($cap,)* operands: operands.into() }
             }
 
@@ -359,8 +370,8 @@ macro_rules! windowed {
                 unsafe { $body }
             }
 
-            /// Run the body on the window `w`, operand `i` in register `skip + i`:
-            /// read the inputs, write back only the outputs.
+            /// Run the body on the window `w` at `skip`: read the inputs, write
+            /// back only the outputs.
             #[inline(always)]
             unsafe fn __window<'a, 'b, 'src, 'intern>(
                 $($cap: $cty,)*
@@ -370,15 +381,13 @@ macro_rules! windowed {
                 w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
                 skip: usize,
             ) {
-                let mut i = skip;
-                $( let $in = w[i]; i += 1; )*
-                $( let mut $out = w[i]; i += 1; )*
+                $( let $in = w[skip + $ii]; )*
+                $( let mut $out = w[skip + $oi]; )*
                 unsafe { Self::__run($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
-                let mut i = skip + Self::INPUTS;
-                $( w[i] = $out; i += 1; )*
+                $( w[skip + $oi] = $out; )*
             }
 
-            /// The stencil with operand `i` in window register `SKIP + i`.
+            /// The stencil running at `SKIP`.
             pub extern "rust-preserve-none" fn __stencil<'a, 'b, 'src, 'intern, const SKIP: usize>(
                 owner: &'a mut $crate::Owner,
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
@@ -432,7 +441,7 @@ macro_rules! windowed {
         impl<$(const $cp: $cpt),*> $crate::window::Window for $name<$($cp),*> {
             fn name(&self) -> &'static str { stringify!($name) }
             fn operands(&self) -> &[$crate::window::Gpr] { &self.operands }
-            fn inputs(&self) -> usize { Self::INPUTS }
+            fn accesses(&self) -> &'static [$crate::window::Access] { Self::ACCESSES }
             fn captures(&self) -> $crate::window::Captures {
                 ::smallvec::smallvec![$($crate::window::Capture::to_bits(self.$cap)),*]
             }
@@ -646,7 +655,7 @@ const RELATIVE_BRANCHES: [yaxpeax_x86::long_mode::Opcode; 23] = {
     ]
 };
 
-/// Copy `op`'s stencil with operand `i` in window register `skip + i`.
+/// Copy `op`'s stencil running at `skip`.
 ///
 /// Every exit of a well-formed stencil is its `become`: a tail jump to the op's
 /// continuation, which the copy redirects to its end, where the next stencil
@@ -961,7 +970,7 @@ mod check {
 
     // Writes the window to the address in its capture (a hole), so observing the
     // result doesn't depend on `base`, which the op under test may use.
-    windowed!(CheckFlush, [out: u64], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7) -> () {
+    windowed!(CheckFlush, [out: u64], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7) {
         let out = out as *mut [u64; WINDOW];
         *out = [w0, w1, w2, w3, w4, w5, w6, w7].map(|w| w.bits());
     });
@@ -1012,17 +1021,17 @@ mod tests {
     use super::*;
 
     // Test-local window ops, declared exactly as an emit site would.
-    windowed!(TAdd, [], [], |owner, state, base| (a, b) -> (d) {
+    windowed!(TAdd, [], [], |owner, state, base| (out d, a, b) {
         *d = LBoxed::from_number(a.as_number().unwrap_unchecked() + b.as_number().unwrap_unchecked());
     });
-    windowed!(TMul, [], [], |owner, state, base| (a, b) -> (d) {
+    windowed!(TMul, [], [], |owner, state, base| (out d, a, b) {
         *d = LBoxed::from_number(a.as_number().unwrap_unchecked() * b.as_number().unwrap_unchecked());
     });
-    windowed!(TAddK, [k: f64], [], |owner, state, base| (a) -> (d) {
+    windowed!(TAddK, [k: f64], [], |owner, state, base| (out d, a) {
         *d = LBoxed::from_number(a.as_number().unwrap_unchecked() + k);
     });
     // Flush the whole window to `base[0..WINDOW]`, to observe the result.
-    windowed!(Flush, [], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7) -> () {
+    windowed!(Flush, [], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7) {
         *(base as *mut [LBoxed; WINDOW]) = [w0, w1, w2, w3, w4, w5, w6, w7];
     });
 
@@ -1033,13 +1042,13 @@ mod tests {
     extern "C" fn out_of_line(x: f64) -> f64 {
         core::hint::black_box(x * 3.0 + 1.0)
     }
-    windowed!(TCall, [], [], |owner, state, base| (a) -> (d) {
+    windowed!(TCall, [], [], |owner, state, base| (out d, a) {
         *d = LBoxed::from_number(out_of_line(a.as_number().unwrap_unchecked()));
     });
 
     // A branchy stencil: one arm calls out, the other doesn't, which invites the
     // compiler to duplicate the `become` onto each path.
-    windowed!(TBranch, [], [], |owner, state, base| (a) -> (d) {
+    windowed!(TBranch, [], [], |owner, state, base| (out d, a) {
         let x = a.as_number().unwrap_unchecked();
         if x < 0.0 {
             *d = LBoxed::from_number(out_of_line(x));
@@ -1069,8 +1078,8 @@ mod tests {
         let exec = unsafe { assemble(&image, &[(&branch, 0), (&flush, 0)], &[0xc3]) }.unwrap();
         for (x, want) in [(-2.0, -5.0), (2.0, 102.0)] {
             let mut out = [LBoxed::NIL; WINDOW];
-            run(&exec, &[x], &mut out);
-            assert_eq!([out[0].as_number(), out[1].as_number()], [Some(x), Some(want)], "input {x}");
+            run(&exec, &[0.0, x], &mut out);
+            assert_eq!([out[0].as_number(), out[1].as_number()], [Some(want), Some(x)], "input {x}");
         }
     }
 
@@ -1094,28 +1103,29 @@ mod tests {
 
         let exec = unsafe { assemble(&image, &[(&call, 0), (&flush, 0)], &[0xc3]) }.unwrap();
         let mut out = [LBoxed::NIL; WINDOW];
-        run(&exec, &[2.0], &mut out);
-        assert_eq!([out[0].as_number(), out[1].as_number()], [Some(2.0), Some(7.0)]);
+        run(&exec, &[0.0, 2.0], &mut out);
+        assert_eq!([out[0].as_number(), out[1].as_number()], [Some(7.0), Some(2.0)]);
     }
 
-    /// Copy&patch a chain shifting along the window and run it on (2, 3, 4, nil..):
-    /// Add at 0 (w2 = w0 + w1), Mul at 1 (w3 = w1 * w2), AddK at 2 (w3 = w2 +
-    /// 0.5, a capture/hole), then Flush. Inputs are never written.
+    /// Copy&patch a chain shifting along the window, as a stack evaluates
+    /// `(w2 + w3) * w2`, and run it on (0, 0, 3, 4, nil..): Add at 1 (w1 = w2 +
+    /// w3), Mul at 0 reading that result in place (w0 = w1 * w2), AddK at 2 (w2 =
+    /// w3 + 0.5, a capture/hole), then Flush. Inputs are never written.
     #[test]
     fn copy_and_patch_chain() {
         let image = Image::load().unwrap();
         let mut t = Tokens::default();
-        let add = TAdd::new(&[t.mint(0), t.mint(1), t.mint(2)]);
-        let mul = TMul::new(&[t.mint(1), t.mint(2), t.mint(3)]);
+        let add = TAdd::new(&[t.mint(1), t.mint(2), t.mint(3)]);
+        let mul = TMul::new(&[t.mint(0), t.mint(1), t.mint(2)]);
         let addk = TAddK::new(0.5, &[t.mint(2), t.mint(3)]);
         let flush = Flush::new(&whole_window());
-        let ops: [(&dyn Window, usize); 4] = [(&add, 0), (&mul, 1), (&addk, 2), (&flush, 0)];
+        let ops: [(&dyn Window, usize); 4] = [(&add, 1), (&mul, 0), (&addk, 2), (&flush, 0)];
         let exec = unsafe { assemble(&image, &ops, &[0xc3]) }.unwrap();
 
         let mut out = [LBoxed::NIL; WINDOW];
-        run(&exec, &[2.0, 3.0, 4.0], &mut out);
+        run(&exec, &[0.0, 0.0, 3.0, 4.0], &mut out);
         let out = out.map(|v| v.as_number());
-        assert_eq!(out[..4], [Some(2.0), Some(3.0), Some(5.0), Some(5.5)]);
+        assert_eq!(out[..4], [Some(21.0), Some(7.0), Some(4.5), Some(4.0)]);
         assert!(out[4..].iter().all(Option::is_none));
     }
 
@@ -1133,7 +1143,7 @@ mod tests {
             let mut out = [LBoxed::NIL; WINDOW];
             run(&exec, &values, &mut out);
             let mut want = values;
-            want[skip + 2] = values[skip] + values[skip + 1];
+            want[skip] = values[skip + 1] + values[skip + 2];
             assert_eq!(out.map(|v| v.as_number()), want.map(Some), "Add at {skip}");
         }
     }
@@ -1141,7 +1151,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "two outputs write slot 10")]
     fn operands_distinct_outputs() {
-        windowed!(TSwap, [], [], |owner, state, base| (a, b) -> (c, d) {
+        windowed!(TSwap, [], [], |owner, state, base| (a, b, out c, out d) {
             *c = b;
             *d = a;
         });
