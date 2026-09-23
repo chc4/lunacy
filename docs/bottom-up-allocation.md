@@ -150,37 +150,25 @@ interpreter enters from memory.
 ## Loops
 
 A loop's blocks are equally hot, so the processing order takes them from the
-highest id down: the latch first, before the loop's first block, its
-successor across the back edge. The back edge is then the one edge of the loop
-processed before its target, and its reconciliation runs every iteration. For
-a loop whose blocks all run on every iteration, it costs the same on whichever
-of the loop's edges it lands. (With LBBV the loop's first iteration is peeled
-while the specialization context reaches its fixpoint, so the steady-state
-loop is entered from the peeled iteration by an ordinary edge, processed after
-the loop.)
+highest id down: the latch first, then back up the loop to its first block,
+each block adapting to the one after it. The loop's first block therefore
+enters with the registers the loop body reads its values in, and the code
+before the loop delivers them there. (With LBBV the loop's first iteration is
+peeled while the specialization context reaches its fixpoint; the peeled
+iteration is colder than the loop, so it is processed after it and adapts to
+it.)
 
-Placements around a cycle depend on each other, so some reconciliation on it
-is unavoidable in general. What is open is how much the back edge costs:
-
-- **Nothing wanted at the latch's end.** Its live-out is empty. The values it
-  leaves for the loop's first block (the loop-carried ones, such as the loop
-  variables) are placed without regard to where they're read next, and the back
-  edge moves them there. That is a move each while they stay in
-  registers. One the pass dropped, because it wasn't wanted and a later op
-  needed its register, costs a store and a load.
-- **A second pass over the loop.** Once the loop's blocks are processed,
-  process them again, with the loop's first block's used-in as the latch's
-  live-out. The loop-carried values are then computed where they're read next.
-  The second pass can change the first block's used-in itself, since its
-  successors' used-in changed, and the back edge then reconciles with the new
-  one. That means fewer moves, and none only when it doesn't change. The cost
-  is one more pass over each loop's blocks.
+The back edge is the one edge of the loop processed before its target: when
+the latch is processed, nothing yet says where the loop's first block reads
+the values the latch computes for it (the loop-carried ones, such as the loop
+variables), so the latch places them wherever its own ops do. The back edge
+moves them into place, a move each per iteration, or a store and a load for
+one the latch dropped because a later op needed its register.
 
 As I remember LuaJIT's assembler, it puts this reconciliation on the same edge.
 It assembles the loop body backwards from the loop's end and emits a shuffle of
-the loop-carried values (its PHIs) there, with register hints so that a value's
-definition tends to land where the loop's start reads it. That is worth
-checking against its source.
+the loop-carried values (its PHIs) there. That is worth checking against its
+source.
 
 ## Worked by hand
 
@@ -235,7 +223,3 @@ This proposal doesn't add lookahead.
 - **Rules 3 and 5, and the flush invariants,** are unchanged. Other edges
   reconcile by parallel moves, and the entry stub loads a block's entry window
   from the stack.
-
-## Open questions
-
-- Which back-edge treatment above, or something else.
