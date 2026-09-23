@@ -138,6 +138,19 @@ hyperfine benchmark times='10': unsafe-compile interpreter-compile
         "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \
         "./target/release/bench {{benchmark}}.bin {{times}}" \
         "./target/unsafe/bench {{benchmark}}.bin {{times}}"
+# Compare this checkout's release build against revision `ref`'s on one
+# benchmark: `ref` is built in a detached worktree under target/compare/ (kept
+# for reruns, its submodules linked to this checkout's).
+hyperfine-vs ref benchmark times='10':
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    cargo build --release --bin bench
+    test -d target/compare/{{ref}} || git worktree add --detach target/compare/{{ref}} {{ref}}
+    git -C target/compare/{{ref}} checkout --detach {{ref}}
+    for module in dynasm-rs memmap2-rs; do test -L target/compare/{{ref}}/$module || { rmdir target/compare/{{ref}}/$module && ln -s "$(realpath $module)" target/compare/{{ref}}/$module; }; done
+    cd target/compare/{{ref}} && cargo build --release --bin bench
+    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-vs-{{ref}}.md \
+        "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \
+        "./target/release/bench {{benchmark}}.bin {{times}}"
 hyperfine-jit benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin bench
