@@ -25,46 +25,28 @@ thunk is forced into a jump. A block compiled in an earlier region stops the
 walk: it is entered with its recorded window, a fixed constraint on edges into
 it.
 
-Every block needs an **entry count**, how often the interpreter has entered
-it. The hotness counter doesn't serve: it counts down to the compile threshold
-and stops at zero, so by the time a region is compiled every block of its hot
-loops, and any block entered as often as the threshold, reads zero. A count that
-keeps going (like the `graph` feature's) orders them, and blocks in deeper loop
-nests have higher counts.
-
-A block's **preferred successor** is its most-entered one: its final jump's
-target, a select's target, or a guard's failure jump, whichever the
-interpreter entered most.
-
-## The processing order: chains
+## The processing order
 
 An edge's reconciliation is free when its source is processed after its
 target: the source then starts from the target's used-in (below) and computes
-the target's reads where they're read. So the order decides which edges cost
-moves. Processing strictly hottest first isn't enough. A block would be
-processed before its colder successors, so its edge into even a slightly
-colder successor would cost moves, and in a loop `H → {A (90%), B (10%)} → L →
-H` that is the edge `H → A` on 90% of iterations.
+the target's reads where they're read. So the processing order decides which
+edges cost moves.
 
-Instead the pass processes **chains**. Pop the most-entered unprocessed block
-from a max-heap of the region's blocks keyed by entry count, and follow
-preferred successors from it until reaching one of:
+The pass processes the region's blocks in the order of a min-heap keyed by
+`(hotness, -id)`:
 
-- a block already processed;
-- a block outside the region;
-- a block already on the chain, which means the chain went round a loop.
+- **Hotness** is the countdown to the compile threshold, so the hottest blocks
+  come first and colder ones adapt to them. It stops at zero, so every block
+  that has reached the threshold ties.
+- **Among ties, the highest block id comes first.** Block ids are allocated
+  from a monotonic counter as the specializer reaches new code, so a block's
+  successors in straight-line code have higher ids than it. The last block of
+  a run is processed first, and each block after the successors created after
+  it.
 
-Then process the chain from its end back to its start, so each block is
-processed after its preferred successor, and repeat until the heap is empty.
-In the example the chain is `H → A → L`, closed by `L → H`, processed `L`, `A`,
-`H`. Then `B`, whose preferred successor `L` is processed, forms a chain of its
-own. The only edges processed before their targets are a closed chain's
-closing edge (`L → H`) and edges to a successor that isn't its source's
-preferred one, which is colder by definition (`H → B`). Hot code is placed first
-and colder code adapts to it.
-
-Code layout follows the chains, each block's preferred successor right after
-it, so the hot path falls through with its jumps elided.
+So within a hot loop, whose blocks all tie, the last block, usually the latch,
+is processed first, and the rest follow back up the loop. A branch into code
+that is still cold is processed after the hot path and adapts to it.
 
 ## Extended basic blocks
 
@@ -74,12 +56,11 @@ is either the thunk (it stores the dirty registers and exits) or a jump to the
 failure block. The backward pass treats every block as a straight line:
 
 - a thunk adds no wants, since it takes whatever window it finds;
-- a failure jump to a block that isn't the preferred successor adds no wants;
-  its edge reconciles by parallel moves, off the hot path;
-- a failure jump to the preferred successor is where the block's live-out
-  (below) applies, at the guard instead of at the block's end. The rest of the
-  block after the guard is then the colder path, and its success edge carries
-  the reconciliation.
+- a failure jump adds no wants, unless its target is the successor the
+  block's live-out (below) comes from: then the live-out applies at the guard
+  instead of at the block's end, and the rest of the block after the guard
+  carries the reconciliation on its success edge. Otherwise the failure jump
+  reconciles by parallel moves.
 
 A guard reads its slot wherever it is (a window register, or the stack home)
 and adds no wants.
@@ -120,14 +101,15 @@ Two per-block sets connect the blocks, each with one job:
   register B's backward pass placed it in at B's start. It is B's own
   requirement, not its successors': a slot only a later block reads is not in
   it. It is B's entry window, what every edge into B must deliver.
-- **live-out(B)**: the used-in of B's preferred successor, when that was
-  processed first. It starts B's backward pass, so B's definitions of those
-  slots are placed where the successor reads them. It is empty for a chain's
-  closing block, whose preferred successor is the chain's own start.
+- **live-out(B)**: the used-in of whichever of B's successors was processed
+  first, the hottest one by the processing order. It starts B's backward pass,
+  so B's definitions of those slots are placed where that successor reads them.
+  It is empty when no successor was processed before B, as for a loop's latch,
+  whose successor is the loop's first block.
 
-Both are known when B is processed: live-out because the chain order processes
-B's preferred successor first, and used-in from B's own pass, as `W` at B's
-start restricted to the slots B reads. A slot in `W` at B's end that B neither
+Both are known when B is processed: live-out from successors already
+processed, and used-in from B's own pass, as `W` at B's start restricted to
+the slots B reads. A slot in `W` at B's end that B neither
 reads nor writes is not carried into B's used-in. The pass keeps it in its
 register while no op of B needs that register, and otherwise drops it. The
 forward pass then loads it wherever `W` first wants it again, at the latest
@@ -142,6 +124,9 @@ its used-in. That is a few bytes per window op and a register map per block.
 It visits each residual once, trying at most `WINDOW` placements per window op,
 and each block goes through the heap once.
 
+Code layout is unchanged: each block's fall-through successor right after it,
+its jump elided.
+
 ## The forward pass
 
 Code generation stays top-down, as now: the cache it tracks is what the
@@ -153,40 +138,40 @@ loads), then runs the op at its recorded `SKIP`. A jump reconciles the cache
 with its target's used-in. The moves an op's placement costs after it happen at
 the next reconciliation, the next op's or the block's final jump. Otherwise
 the reconciliations are empty where the backward pass placed values where they
-are wanted. That includes the edge to the preferred successor, since the
-block's live-out is its used-in.
+are wanted. That includes the edge to the successor the block's live-out came
+from, since that is its used-in.
 
 The entry stub loads the entry block's used-in from the stack, since the
 interpreter enters from memory.
 
 ## Loops
 
-A loop's blocks are entered about equally often, so the chain from its hottest
-block follows the loop round and closes on itself. The closing block, usually
-the latch, is processed first, before its successor at the chain's start. Its
-closing edge is the one edge of the loop processed before its target, and its
-reconciliation runs every iteration. For a loop whose blocks all run on every
-iteration, it costs the same on whichever of the loop's edges it lands.
-(With LBBV the loop's first iteration is peeled while the specialization
-context reaches its fixpoint, so the steady-state loop is entered from the
-peeled iteration by an ordinary edge, processed after the loop.)
+A loop's blocks are equally hot, so the processing order takes them from the
+highest id down: the latch first, before the loop's first block, its
+successor across the back edge. The back edge is then the one edge of the loop
+processed before its target, and its reconciliation runs every iteration. For
+a loop whose blocks all run on every iteration, it costs the same on whichever
+of the loop's edges it lands. (With LBBV the loop's first iteration is peeled
+while the specialization context reaches its fixpoint, so the steady-state
+loop is entered from the peeled iteration by an ordinary edge, processed after
+the loop.)
 
 Placements around a cycle depend on each other, so some reconciliation on it
-is unavoidable in general. What is open is how much the closing edge costs:
+is unavoidable in general. What is open is how much the back edge costs:
 
-- **Nothing wanted at the closing block's end.** Its live-out is empty. The
-  values it leaves for the chain's start (the loop-carried ones, such as the
-  loop variables) are placed without regard to where they're read next, and the
-  closing edge moves them there. That is a move each while they stay in
+- **Nothing wanted at the latch's end.** Its live-out is empty. The values it
+  leaves for the loop's first block (the loop-carried ones, such as the loop
+  variables) are placed without regard to where they're read next, and the back
+  edge moves them there. That is a move each while they stay in
   registers. One the pass dropped, because it wasn't wanted and a later op
   needed its register, costs a store and a load.
-- **A second pass over the chain.** Once the chain is processed, process it
-  again, with the chain start's used-in as the closing block's live-out. The
-  loop-carried values are then computed where they're read next. The second
-  pass can change the chain start's used-in itself, since its successors'
-  used-in changed, and the closing edge then reconciles with the new one. That
-  means fewer moves, and none only when it doesn't change. The cost is one more
-  pass over each closed chain.
+- **A second pass over the loop.** Once the loop's blocks are processed,
+  process them again, with the loop's first block's used-in as the latch's
+  live-out. The loop-carried values are then computed where they're read next.
+  The second pass can change the first block's used-in itself, since its
+  successors' used-in changed, and the back edge then reconciles with the new
+  one. That means fewer moves, and none only when it doesn't change. The cost
+  is one more pass over each loop's blocks.
 
 As I remember LuaJIT's assembler, it puts this reconciliation on the same edge.
 It assembles the loop body backwards from the loop's end and emits a shuffle of
@@ -240,7 +225,8 @@ This proposal doesn't add lookahead.
   loop header.
 - **Rule 2** reverses direction. The successor doesn't adopt the predecessor's
   out-set; the predecessor delivers the successor's used-in. The edge to the
-  preferred successor carries only the moves that follow the block's last op,
+  successor its live-out came from carries only the moves that follow the
+  block's last op,
   which are none when that op's outputs could land where the successor wants
   them.
 - **Rules 3 and 5, and the flush invariants,** are unchanged. Other edges
@@ -249,7 +235,12 @@ This proposal doesn't add lookahead.
 
 ## Open questions
 
-- Where the entry counts come from: a count kept alongside the hotness
-  countdown, or the countdown replaced by a count compared against the
+- Nested hot loops tie too. An inner loop's latch has two successors: the
+  loop's first block across the back edge (a lower id, not processed yet) and
+  the inner loop's exit into the outer loop (created later, so a higher id,
+  processed first). The latch then takes its live-out from the exit, run once
+  per outer iteration, instead of from nothing, and a failure jump's target,
+  created when the guard first failed, likewise wins over the block's
+  continuation. Telling these apart needs hotness that doesn't stop at the
   threshold.
-- Which closing-edge treatment above, or something else.
+- Which back-edge treatment above, or something else.
