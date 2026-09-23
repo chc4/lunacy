@@ -309,8 +309,8 @@ code is appended after it; equal hole values share one entry);
 direct ones a relocation to a label at the copy's end; other RIP-relative
 references `value_relocation`s to their absolute target (the buffer's base is
 known). An inline type guard (every `LType` but `Unknown`) keeps the window:
-it tests the register caching its slot (rax, or r10 when the value is loaded
-into rax, is the mask scratch), jumps to its success edge with the window live,
+it tests the register caching its slot, or else loads the slot into the move
+scratch r10 (rax, never a window register, is the mask scratch), jumps to its success edge with the window live,
 and stores the dirty registers on its fall-through failure path into its thunk;
 the gas exit stores them too. Any other residual flushes the window after its
 label, since a guard's success edge may jump there with the window live

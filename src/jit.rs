@@ -10,7 +10,7 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::generator::{Block, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
-use crate::window_alloc::{Emit, WindowAlloc};
+use crate::window_alloc::{Emit, WindowAlloc, SCRATCH};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use smallvec::SmallVec;
@@ -630,16 +630,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     //     We must reject non-cells first so we never dereference a double
                     //     or an immediate.
                     //
-                    // `v` holds the value and `m` is scratch for the masks: rax, or r10
-                    // (not a window register) when the value itself is in rax.
-                    let (v, m) = match alloc.register_of(*idx) {
-                        Some(reg) => (WINDOW_REGS[reg], 0 /* rax */),
+                    // `v` holds the value: its window register, or else the move
+                    // scratch r10. rax, never a window register, is scratch for the masks.
+                    let m = 0; // rax
+                    let v = match alloc.register_of(*idx) {
+                        Some(reg) => WINDOW_REGS[reg],
                         None => {
                             dynasm!(ops
                                 ; .arch x64
-                                ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                                ; mov r10, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
                             );
-                            (0 /* rax */, 10 /* r10 */)
+                            WINDOW_REGS[SCRATCH]
                         }
                     };
                     match expected {
