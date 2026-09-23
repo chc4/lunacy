@@ -22,12 +22,16 @@ evaluates two and names a third.
   register allocation is local register allocation.
 - **Global liveness**, computed once: `live_in` and `live_out` per block. A
   block's `live_out` is a pseudo-use at its end, keeping values alive for the
-  traces that branch off it; a trace head's `live_in` is a pseudo-definition.
-  It is one backward pass over the blocks in reverse postorder, plus, for each
-  loop, adding what is live into its header to every block of the loop
-  (Wimmer and Franz 2010). No fixpoint: in SSA form a value live at a loop
-  header can't be killed inside the loop. Inside a trace, liveness has no
-  holes, since a trace is a straight line.
+  traces that branch off it; a trace head's `live_in` is a pseudo-definition
+  of the values entering it, placed at the top of the head (under SSA that is
+  sound: a value that couldn't be defined there would have a definition in the
+  head, so it isn't live in). It is one backward pass over the blocks in
+  reverse postorder, plus, for each loop, adding what is live into its header
+  to every block of the loop (Wimmer and Franz 2010). No fixpoint: in SSA form
+  a value live at a loop header can't be killed inside the loop.
+- **No lifetime holes**, a separate property: a trace is a straight line, so a
+  variable's live range within it is one interval, and one linear pass over
+  the trace allocates it.
 - **Allocation, one trace at a time**, in the policy's order, most important
   first. The bottom-up
   strategy is one backward pass over a trace with a map from registers to
@@ -87,11 +91,28 @@ is in its stack home. At a window op:
 4. its inputs are at `SKIP + i`.
 
 An inline guard is a use of its slot: it keeps the slot where it is, or takes
-the first free register. A flush point empties the window. The pass starts from
-the entry window of the trace's allocated successor, if any, and adds each
-side exit's `live_out` as a use that may stay in the stack home (it takes a
-register only if one is free), as the thesis does for values that may be on the
-stack.
+the first free register. A flush point empties the window.
+
+**Liveness in the pass.** The global live sets enter the pass as the thesis's
+pseudo-uses and pseudo-definitions:
+
+- *Pseudo-uses at edges leaving the trace.* At the trace's final jump, if its
+  target has a recorded start window (a trace allocated already), the window
+  becomes that. At any other edge leaving the trace, whose target has no window
+  yet (a side exit to a trace not allocated yet, the final jump to one, or a
+  back edge to the trace's own head), each slot live into the target is used
+  there as a use that may stay in its stack home: it keeps its register if the
+  window has one for it, takes a free register if there is one, and otherwise
+  is left in memory. At a back edge that keeps the loop-carried values in
+  registers across the latch, so the back edge moves them into the head's
+  window instead of the latch storing them and the head reloading them.
+- *Pseudo-definitions at the start of each block.* The window at a block's
+  start, recorded as its entry window, holds only values live into the block:
+  going backwards, each op writing a slot removed it from the window, so what
+  is left is the incoming value, defined at the block's top. Slots aren't SSA,
+  but the walk resolves which value a slot names at each point, so the
+  pseudo-definition needs no more. A slot live in but not in the window
+  arrives in its stack home.
 
 **What is kept.** Per window op its `SKIP`, and per block the window at its
 start, which every edge entering it other than from its predecessor in the
