@@ -27,11 +27,22 @@
 //! the same body with captures from the struct: load the operand slots, run,
 //! flush.
 //!
-//! For the JIT to splat a stencil, its body must be copy&patch-safe: no
-//! RIP-relative references other than holes (no panic paths, no calls to
-//! non-inlined functions), and it must be built optimized (debug builds add
-//! precondition-check calls); see `just test-stencils`. The interpreter tier runs
-//! any window op regardless.
+//! Copying a stencil (`stencil_body`) decodes it (yaxpeax-x86). A well-formed
+//! stencil's last instruction is its `become`: a tail jump to the op's
+//! continuation, sliced off so the next stencil falls through. Every other
+//! RIP-relative reference in the body is reported so it can be re-targeted
+//! wherever the body lands: hole loads (repointed at the op's capture values),
+//! other continuation references (at the copy's fall-through point), and
+//! everything else — calls out of line (e.g. into `IndexMap`), GOT slots,
+//! rodata — at its original absolute address, which stays in rel32 range because
+//! JIT memory is mapped within ±2GiB of the binary. In the JIT these all become
+//! dynasm relocations patched at `finalize`; `assemble` does the same by hand.
+//! Calls are fine anywhere (they return), but a jump that leaves the stencil
+//! without being a `become` would skip the rest of the chain, so it is rejected
+//! loudly: a sibling tail call, or an indirect jump such as a jump table (whose
+//! entries lead back into the original function). An opt-level 0 build of
+//! `NumericIntInt` hits the latter (`match OP` isn't folded); optimized builds
+//! don't. The interpreter tier runs any window op regardless.
 
 use std::collections::HashMap;
 
@@ -334,15 +345,15 @@ pub(crate) use windowed;
 
 // ---- copy&patch -----------------------------------------------------------
 
-/// What the copier needs from this executable's own ELF: each hole's GOT slot
-/// and each function's size (to assert the trailing `become`), at runtime
+/// What the copier needs from this executable's own ELF image: each hole's GOT
+/// slot and each function's size (to find the trailing `become`), at runtime
 /// addresses.
-pub struct Relocs {
-    holes: [Option<u64>; MAX_HOLES],
-    sizes: HashMap<u64, u64>,
+pub struct Image {
+    holes: [Option<usize>; MAX_HOLES],
+    sizes: HashMap<usize, usize>,
 }
 
-impl Relocs {
+impl Image {
     pub fn load() -> Self {
         let bytes = std::fs::read("/proc/self/exe").expect("read own executable");
         let elf = goblin::elf::Elf::parse(&bytes).expect("parse own ELF");
@@ -353,7 +364,7 @@ impl Relocs {
             .find(|s| elf.strtab.get_at(s.st_name) == Some("__lunacy_window_anchor"))
             .expect("window anchor in symtab")
             .st_value;
-        let bias = (__lunacy_window_anchor as *const () as u64).wrapping_sub(anchor);
+        let bias = (__lunacy_window_anchor as *const () as usize).wrapping_sub(anchor as usize);
 
         let hole_index = |name: &str| match name {
             "__lunacy_hole0" => Some(0),
@@ -369,7 +380,7 @@ impl Relocs {
                 .and_then(|s| elf.dynstrtab.get_at(s.st_name))
                 .unwrap_or("");
             if let Some(i) = hole_index(name) {
-                holes[i] = Some(bias.wrapping_add(r.r_offset));
+                holes[i] = Some(bias.wrapping_add(r.r_offset as usize));
             }
         }
 
@@ -377,102 +388,313 @@ impl Relocs {
             .syms
             .iter()
             .filter(|s| s.is_function() && s.st_size != 0)
-            .map(|s| (bias.wrapping_add(s.st_value), s.st_size))
+            .map(|s| (bias.wrapping_add(s.st_value as usize), s.st_size as usize))
             .collect();
-        Relocs { holes, sizes }
+        Image { holes, sizes }
     }
 }
 
-/// A stencil's code with its trailing `become` sliced off, and the disp32 offset
-/// of each hole load in it (tagged with the hole index).
+/// A RIP-relative reference in a stencil body: the `width`-byte displacement at
+/// `field` is measured from the end of its instruction, `end`, and reaches the
+/// absolute address `target`. Wherever the body is placed, rewrite the field so
+/// it still reaches `target` (or, for a hole, its pool slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RipRel {
+    pub field: usize,
+    pub end: usize,
+    pub width: usize,
+    pub target: usize,
+}
+
+impl RipRel {
+    /// Point this reference at `target`, with the body placed at `base`.
+    /// Panics if `target` is out of rel32 range from there.
+    fn patch(&self, code: &mut [u8], base: usize, target: usize) {
+        assert_eq!(self.width, 4, "only 32-bit displacements can be re-targeted");
+        let disp = (target as i64).wrapping_sub((base + self.end) as i64);
+        let disp: i32 = disp
+            .try_into()
+            .unwrap_or_else(|_| panic!("{target:#x} is out of rel32 range of the copy at {base:#x}"));
+        code[self.field..self.field + 4].copy_from_slice(&disp.to_le_bytes());
+    }
+}
+
+/// A stencil's code with its trailing `become` sliced off, and every
+/// RIP-relative reference in it.
 pub struct Body {
     pub code: Vec<u8>,
-    pub holes: SmallVec<[(usize, usize); MAX_HOLES]>,
+    /// Hole loads (RIP-relative operands of a hole's GOT slot), with the hole
+    /// index: repointed at the op's capture values in the shared pool.
+    pub holes: SmallVec<[(RipRel, usize); MAX_HOLES]>,
+    /// Every other RIP-relative reference: memory operands (GOT slots, rodata,
+    /// ...) and relative calls/jumps leaving the body. They must keep reaching
+    /// their absolute `target` wherever the body is copied; the JIT hands them to
+    /// dynasm as relocations patched in `finalize` along with the hole pool (JIT
+    /// memory is mapped within ±2GiB of the binary, so rel32 still reaches).
+    pub relocs: Vec<RipRel>,
+    /// References to the op's continuation besides the sliced trailing
+    /// `become` — e.g. a tail the compiler duplicated onto another path. Every
+    /// `become` means "fall through to the next stencil", so each must reach the
+    /// copy's fall-through point (its end); the JIT relocates them against a
+    /// label there.
+    pub nexts: Vec<NextRef>,
 }
 
-/// Copy `op`'s stencil at window offset `k`. Asserts its last instruction is the
-/// `become` jmp to the op's continuation (slicing it for fall-through is only
-/// valid then) and finds its hole loads by matching each disp32's RIP target
-/// against a hole's GOT slot.
-pub unsafe fn stencil_body(relocs: &Relocs, op: &dyn Window, k: usize) -> Body {
+/// A reference to the continuation inside a stencil body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextRef {
+    /// A `jmp rel32` to it (or a `lea` of its address): re-target at the
+    /// fall-through point itself.
+    Direct(RipRel),
+    /// A load from a GOT slot holding it (`mov reg, [rip+got]` feeding a
+    /// `jmp *reg`, or `jmp *[rip+got]`): repoint at a pool slot holding the
+    /// fall-through point's address.
+    Indirect(RipRel),
+}
+
+impl Body {
+    /// The non-hole RIP-relative references to re-target when this body is
+    /// placed somewhere else.
+    pub fn relocations(&self) -> &[RipRel] {
+        &self.relocs
+    }
+}
+
+/// Opcodes whose first operand is a relative branch target (mirrors
+/// yaxpeax-x86's private `RELATIVE_BRANCHES`).
+const RELATIVE_BRANCHES: [yaxpeax_x86::long_mode::Opcode; 23] = {
+    use yaxpeax_x86::long_mode::Opcode::*;
+    [
+        JMP, CALL, JRCXZ, JECXZ, LOOP, LOOPZ, LOOPNZ, JO, JNO, JB, JNB, JZ, JNZ, JNA, JA, JS, JNS,
+        JP, JNP, JL, JGE, JLE, JG,
+    ]
+};
+
+/// Copy `op`'s stencil at window offset `k`.
+///
+/// A well-formed stencil ends in its `become`: its last instruction is a tail
+/// jump to the op's continuation, which is sliced off so the next stencil falls
+/// through. The rest is decoded to find every RIP-relative reference: loads of a
+/// hole's GOT slot are holes, the rest are relocations. Branches that stay within
+/// the body need no fixup (one to the sliced tail becomes a fall-through into the
+/// next stencil, as it should).
+pub unsafe fn stencil_body(image: &Image, op: &dyn Window, k: usize) -> Body {
+    use yaxpeax_arch::LengthedInstruction;
+    use yaxpeax_x86::long_mode::{InstDecoder, Instruction, Opcode, Operand, RegSpec};
+
     let addr = op.stencil(k);
-    let size = *relocs.sizes.get(&(addr as u64)).expect("stencil in symtab") as usize;
+    let size = *image.sizes.get(&addr).expect("stencil in symtab");
     let code = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
+    let name = op.name();
+
+    // Decode the whole stencil: (offset, end, instruction).
+    let decoder = InstDecoder::default();
+    let mut insts: Vec<(usize, usize, Instruction)> = Vec::new();
+    let mut off = 0;
+    while off < size {
+        let inst = decoder
+            .decode_slice(&code[off..])
+            .unwrap_or_else(|e| panic!("{name}: undecodable stencil byte at +{off:#x}: {e}"));
+        let end = off + inst.len().to_const() as usize;
+        insts.push((off, end, inst));
+        off = end;
+    }
+    assert_eq!(off, size, "{name}: stencil doesn't end on an instruction boundary");
+
+    // An instruction's RIP-relative memory operand, as (disp field offset,
+    // absolute target). The displacement is followed only by the instruction's
+    // immediate (if any), so it sits just before it.
+    let rip_operand = |off: usize, end: usize, inst: &Instruction| -> Option<(usize, usize)> {
+        let mut imm_bytes = 0;
+        let mut disp = None;
+        for i in 0..inst.operand_count() {
+            match inst.operand(i) {
+                Operand::ImmediateI8 { .. } | Operand::ImmediateU8 { .. } => imm_bytes += 1,
+                Operand::ImmediateI16 { .. } | Operand::ImmediateU16 { .. } => imm_bytes += 2,
+                Operand::ImmediateI32 { .. } | Operand::ImmediateU32 { .. } => imm_bytes += 4,
+                Operand::Disp { base, disp: d } | Operand::DispMasked { base, disp: d, .. }
+                    if base == RegSpec::RIP =>
+                {
+                    disp = Some(d)
+                }
+                _ => {}
+            }
+        }
+        let disp = disp?;
+        let field = end - imm_bytes - 4;
+        assert_eq!(
+            i32::from_le_bytes(code[field..field + 4].try_into().unwrap()),
+            disp,
+            "{name}: RIP displacement not where expected at +{off:#x}"
+        );
+        Some((field, (addr + end).wrapping_add(disp as isize as usize)))
+    };
+
+    // Whether instruction `i` jumps to the continuation. rustc builds with
+    // `-Z plt=no`, so depending on whether the continuation is known to be local
+    // that's `jmp rel32`, `jmp *[rip+got]`, or `jmp *reg` with `reg` loaded from
+    // the GOT slot earlier (LLVM hoists that load above the epilogue). A GOT slot
+    // holds the loader-relocated address, so read it to check.
     let next = op.next();
-    // The RIP-relative target of a disp32 ending at `end` (exclusive).
-    let rip_target = |end: usize| {
-        let disp = i32::from_le_bytes(code[end - 4..end].try_into().unwrap());
-        addr.wrapping_add(end).wrapping_add(disp as isize as usize)
+    let got = |slot: usize| unsafe { core::ptr::read_unaligned(slot as *const usize) };
+    let jumps_to_next = |i: usize| {
+        let (off, end, inst) = &insts[i];
+        inst.opcode() == Opcode::JMP
+            && match inst.operand(0) {
+                Operand::ImmediateI32 { imm } => (addr + end).wrapping_add(imm as isize as usize) == next,
+                Operand::Register { reg } => insts[..i]
+                    .iter()
+                    .rev()
+                    .take_while(|(_, _, i)| i.opcode() != Opcode::CALL)
+                    .find(|(_, _, i)| {
+                        i.operand_count() > 0 && matches!(i.operand(0), Operand::Register { reg: r } if r == reg)
+                    })
+                    .is_some_and(|(o, e, i)| {
+                        i.opcode() == Opcode::MOV && rip_operand(*o, *e, i).is_some_and(|(_, t)| got(t) == next)
+                    }),
+                _ => rip_operand(*off, *end, inst).is_some_and(|(_, t)| got(t) == next),
+            }
     };
-    // The `become` must be the stencil's last instruction(s), jumping to this
-    // op's continuation. rustc builds with `-Z plt=no`, so depending on whether
-    // the continuation is known to be local, the tail is one of:
-    //   e9 rel32                           jmp next
-    //   ff 25 disp32                       jmp *[rip+got]
-    //   48 8b 05 disp32 ; ff e0            mov rax, [rip+got] ; jmp *rax
-    // (a GOT slot holds the loader-relocated address, so read it to check).
-    let got = |slot: usize| unsafe { *(slot as *const usize) };
-    let body_len = if size >= 5 && code[size - 5] == 0xe9 && rip_target(size) == next {
-        size - 5
-    } else if size >= 6 && code[size - 6..size - 4] == [0xff, 0x25] && got(rip_target(size)) == next {
-        size - 6
-    } else if size >= 9
-        && code[size - 9..size - 6] == [0x48, 0x8b, 0x05]
-        && code[size - 2..] == [0xff, 0xe0]
-        && got(rip_target(size - 2)) == next
-    {
-        size - 9
-    } else {
-        panic!("{} stencil at offset {k} does not end in `become` to its continuation", op.name());
-    };
-    let code = code[..body_len].to_vec();
+
+    // The tail: the last instruction must jump to the continuation.
+    let last = insts.len() - 1;
+    assert!(jumps_to_next(last), "{name} stencil at offset {k} does not end in `become` to its continuation");
+    let body_len = insts[last].0;
 
     let mut holes = SmallVec::new();
-    let mut p = 0;
-    while p + 4 <= code.len() {
-        let disp = i32::from_le_bytes(code[p..p + 4].try_into().unwrap());
-        let target = (addr as u64).wrapping_add((p + 4) as u64).wrapping_add(disp as i64 as u64);
-        if let Some(i) = relocs.holes.iter().position(|h| *h == Some(target)) {
-            holes.push((p, i));
-            p += 4;
-        } else {
-            p += 1;
+    let mut relocs = Vec::new();
+    let mut nexts = Vec::new();
+    for (i, (off, end, inst)) in insts[..last].iter().enumerate() {
+        let (off, end) = (*off, *end);
+        // Relative branches: operand 0 is the displacement from `end`.
+        let rel = match inst.operand(0) {
+            Operand::ImmediateI8 { imm } => Some((imm as i64, 1)),
+            Operand::ImmediateI32 { imm } => Some((imm as i64, 4)),
+            _ => None,
+        };
+        match rel {
+            Some((rel, width)) if RELATIVE_BRANCHES.contains(&inst.opcode()) => {
+                let target = (addr + end).wrapping_add(rel as isize as usize);
+                if !(addr..=addr + body_len).contains(&target) {
+                    assert_eq!(width, 4, "{name}: short branch leaves the stencil");
+                    let rel = RipRel { field: end - 4, end, width, target };
+                    if target == next {
+                        // Another `become` (e.g. a duplicated tail).
+                        nexts.push(NextRef::Direct(rel));
+                    } else if inst.opcode() == Opcode::CALL {
+                        relocs.push(rel);
+                    } else {
+                        // A jump out that isn't a `become` never falls through
+                        // to the next stencil (e.g. a sibling tail call).
+                        panic!("{name}: stencil at offset {k} jumps out to {target:#x} at +{off:#x}");
+                    }
+                }
+            }
+            // An indirect jump that isn't a `become` (e.g. through a jump table,
+            // whose entries lead back into the original function) can't be
+            // followed, so the copy would leave the chain.
+            _ if inst.opcode() == Opcode::JMP && !jumps_to_next(i) => {
+                panic!("{name}: stencil at offset {k} has an indirect jump (jump table?) at +{off:#x}");
+            }
+            _ => {}
+        }
+        // RIP-relative memory operands: a hole's GOT slot, the continuation (its
+        // address, or a slot holding it), or anything else.
+        if let Some((field, target)) = rip_operand(off, end, inst) {
+            let rel = RipRel { field, end, width: 4, target };
+            if let Some(i) = image.holes.iter().position(|h| *h == Some(target)) {
+                holes.push((rel, i));
+            } else if inst.opcode() == Opcode::LEA && target == next {
+                nexts.push(NextRef::Direct(rel));
+            } else if inst.opcode() != Opcode::LEA && got(target) == next {
+                nexts.push(NextRef::Indirect(rel));
+            } else {
+                relocs.push(rel);
+            }
         }
     }
-    Body { code, holes }
+    Body { code: code[..body_len].to_vec(), holes, relocs, nexts }
+}
+
+/// A mapping hint within ±2GiB of this binary with room for `len` bytes, so
+/// rel32 references in copied stencils still reach their targets (the same
+/// placement the JIT's code buffer uses).
+fn near_hint(len: usize) -> *mut core::ffi::c_void {
+    let target = __lunacy_window_anchor as *const () as usize;
+    let len = len.next_multiple_of(4096);
+    let max = 1usize << 31;
+    rsprocmaps::from_path("/proc/self/maps")
+        .unwrap()
+        .map_windows(|[first, second]| {
+            let (Ok(first), Ok(second)) = (first, second) else { return None };
+            let start = first.address_range.end as usize;
+            let gap = (second.address_range.begin as usize).saturating_sub(start);
+            (gap >= len && target.abs_diff(start) + len < max).then_some(start)
+        })
+        .flatten()
+        .next()
+        .expect("no free mapping within rel32 range of the binary") as *mut _
 }
 
 /// Copy&patch `ops` — each a window op and the window offset its operands sit
-/// at — into one executable buffer: bodies concatenated (so the register window
-/// falls through), then `tail`, then the shared hole-value pool every hole load
-/// is repointed at.
-pub unsafe fn assemble(relocs: &Relocs, ops: &[(&dyn Window, usize)], tail: &[u8]) -> ExecutableBuffer {
+/// at — into one executable buffer near the binary: bodies concatenated (so the
+/// register window falls through), then `tail`, then the shared pool of hole
+/// values. Every hole is repointed at its pool slot, every reference to an op's
+/// continuation at that copy's fall-through point (the next stencil), and every
+/// other RIP-relative reference is re-targeted at its original absolute address.
+pub unsafe fn assemble(image: &Image, ops: &[(&dyn Window, usize)], tail: &[u8]) -> ExecutableBuffer {
     let mut code = Vec::new();
-    let mut patches: Vec<(usize, u64)> = Vec::new();
+    let mut holes: Vec<(RipRel, u64)> = Vec::new();
+    let mut relocs: Vec<RipRel> = Vec::new();
+    // Each continuation reference, with its copy's fall-through offset.
+    let mut nexts: Vec<(NextRef, usize)> = Vec::new();
     for &(op, k) in ops {
-        let body = unsafe { stencil_body(relocs, op, k) };
+        let body = unsafe { stencil_body(image, op, k) };
         let captures = op.captures();
-        let base = code.len();
+        let at = code.len();
+        let shift = |r: RipRel| RipRel { field: r.field + at, end: r.end + at, ..r };
         code.extend_from_slice(&body.code);
-        for &(off, i) in &body.holes {
-            patches.push((base + off, captures[i]));
-        }
+        let fall = code.len();
+        holes.extend(body.holes.iter().map(|&(r, i)| (shift(r), captures[i])));
+        relocs.extend(body.relocs.iter().map(|&r| shift(r)));
+        nexts.extend(body.nexts.iter().map(|n| match *n {
+            NextRef::Direct(r) => (NextRef::Direct(shift(r)), fall),
+            NextRef::Indirect(r) => (NextRef::Indirect(shift(r)), fall),
+        }));
     }
     code.extend_from_slice(tail);
-
     while code.len() % 8 != 0 {
-        code.push(0x90);
+        code.push(0xcc);
     }
+    // The pool: hole values, then one slot per indirect continuation reference
+    // (filled with its fall-through address once the buffer's address is known).
     let pool = code.len();
-    for (i, &(disp_off, val)) in patches.iter().enumerate() {
-        let slot = pool + i * 8;
+    for &(_, val) in &holes {
         code.extend_from_slice(&val.to_le_bytes());
-        let disp = slot as i64 - (disp_off as i64 + 4);
-        code[disp_off..disp_off + 4].copy_from_slice(&(disp as i32).to_le_bytes());
     }
+    let indirect = nexts.iter().filter(|(n, _)| matches!(n, NextRef::Indirect(_))).count();
+    code.resize(code.len() + indirect * 8, 0);
 
-    let mut buf = MutableBuffer::new(code.len()).unwrap();
+    let mut buf = MutableBuffer::new_with_hint(code.len(), near_hint(code.len())).unwrap();
     buf.set_len(code.len());
+    let base = buf.as_mut_ptr() as usize;
+    for (i, (r, _)) in holes.iter().enumerate() {
+        r.patch(&mut code, base, base + pool + i * 8);
+    }
+    let mut slot = pool + holes.len() * 8;
+    for &(n, fall) in &nexts {
+        match n {
+            NextRef::Direct(r) => r.patch(&mut code, base, base + fall),
+            NextRef::Indirect(r) => {
+                code[slot..slot + 8].copy_from_slice(&((base + fall) as u64).to_le_bytes());
+                r.patch(&mut code, base, base + slot);
+                slot += 8;
+            }
+        }
+    }
+    for r in &relocs {
+        r.patch(&mut code, base, r.target);
+    }
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), buf.as_mut_ptr(), code.len()) };
     buf.make_exec().unwrap()
 }
@@ -501,7 +723,7 @@ mod check {
     });
 
     struct Checker {
-        relocs: Relocs,
+        image: Image,
         out: *mut [u64; WINDOW],
         programs: HashMap<(usize, Captures), ExecutableBuffer>,
     }
@@ -520,16 +742,16 @@ mod check {
     ) {
         CHECKER.with_borrow_mut(|c| {
             let c = c.get_or_insert_with(|| Checker {
-                relocs: Relocs::load(),
+                image: Image::load(),
                 out: Box::leak(Box::new([0u64; WINDOW])),
                 programs: HashMap::new(),
             });
             let flush = CheckFlush::new(c.out as u64, &[0; WINDOW], &[None; WINDOW]);
-            let relocs = &c.relocs;
+            let image = &c.image;
             let exec = c
                 .programs
                 .entry((op.stencil(0), op.captures()))
-                .or_insert_with(|| unsafe { assemble(relocs, &[(op, 0), (&flush, 0)], &[0xc3]) });
+                .or_insert_with(|| unsafe { assemble(image, &[(op, 0), (&flush, 0)], &[0xc3]) });
             let entry: extern "rust-preserve-none" fn(
                 &mut Owner,
                 &mut RunState<'src, 'intern>,
@@ -570,29 +792,92 @@ mod tests {
         *base.add(3) = *d;
     });
 
+    // A stencil that calls out of line (as table get/set through `IndexMap`
+    // will): the call is a non-hole RIP-relative reference the copier must
+    // re-target.
+    #[inline(never)]
+    extern "C" fn out_of_line(x: f64) -> f64 {
+        core::hint::black_box(x * 3.0 + 1.0)
+    }
+    windowed!(TCall, [], [], |owner, state, base| (a) {
+        *a = LBoxed::from_number(out_of_line(a.as_number().unwrap_unchecked()));
+    });
+
+    // A branchy stencil: one arm calls out, the other doesn't, which invites the
+    // compiler to duplicate the `become` onto each path.
+    windowed!(TBranch, [], [], |owner, state, base| (a) {
+        let x = a.as_number().unwrap_unchecked();
+        if x < 0.0 {
+            *a = LBoxed::from_number(out_of_line(x));
+        } else {
+            *a = LBoxed::from_number(x + 100.0);
+        }
+    });
+
+    /// Both arms of a branchy stencil fall through to the next stencil, however
+    /// many `become`s the compiler left in it.
+    #[test]
+    fn copy_and_patch_branches() {
+        let image = Image::load();
+        let branch = TBranch::new(&[0], &[None]);
+        let flush = Flush::new(&[0; 4], &[None; 4]);
+        let exec = unsafe { assemble(&image, &[(&branch, 0), (&flush, 0)], &[0xc3]) };
+        for (x, want) in [(-2.0, -5.0), (2.0, 102.0)] {
+            let mut out = [LBoxed::NIL; WINDOW];
+            entry_of(&exec)(0, 0, out.as_mut_ptr(), LBoxed::from_number(x), LBoxed::NIL, LBoxed::NIL, LBoxed::NIL);
+            assert_eq!(out[0].as_number(), Some(want), "input {x}");
+        }
+    }
+
+    fn entry_of(exec: &ExecutableBuffer) -> extern "rust-preserve-none" fn(
+        usize,
+        usize,
+        *mut LBoxed<'static, 'static>,
+        LBoxed<'static, 'static>,
+        LBoxed<'static, 'static>,
+        LBoxed<'static, 'static>,
+        LBoxed<'static, 'static>,
+    ) {
+        // Same ABI as a stencil, with the (unused here) owner/state as raw words.
+        unsafe { core::mem::transmute(exec.ptr(AssemblyOffset(0))) }
+    }
+
+    /// The out-of-line call shows up in `relocations()` (directly, or through
+    /// the GOT slot it calls through), and the copy still calls it correctly.
+    #[test]
+    fn copy_and_patch_relocates_calls() {
+        let image = Image::load();
+        let call = TCall::new(&[0], &[None]);
+        let flush = Flush::new(&[0; 4], &[None; 4]);
+
+        let helper = out_of_line as *const () as usize;
+        let body = unsafe { stencil_body(&image, &call, 0) };
+        assert!(
+            body.relocations().iter().any(|r| r.target == helper
+                || unsafe { *(r.target as *const usize) } == helper),
+            "call to the helper not among {:x?}",
+            body.relocations()
+        );
+
+        let exec = unsafe { assemble(&image, &[(&call, 0), (&flush, 0)], &[0xc3]) };
+        let mut out = [LBoxed::NIL; WINDOW];
+        entry_of(&exec)(0, 0, out.as_mut_ptr(), LBoxed::from_number(2.0), LBoxed::NIL, LBoxed::NIL, LBoxed::NIL);
+        assert_eq!(out[0].as_number(), Some(7.0));
+    }
+
     /// Copy&patch a chain over the register window and run it: prepare
     /// (a, b, c), Add at offset 1 (b+c), Mul at offset 0 (a*prev), AddK at offset
     /// 0 (a capture/hole), then Flush.
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "stencils must be built optimized: run `just test-stencils`")]
     fn copy_and_patch_chain() {
-        let relocs = Relocs::load();
+        let image = Image::load();
         let add = TAdd::new(&[0, 0], &[None, None]);
         let mul = TMul::new(&[0, 0], &[None, None]);
         let addk = TAddK::new(0.5, &[0], &[None]);
         let flush = Flush::new(&[0; 4], &[None; 4]);
         let ops: [(&dyn Window, usize); 4] = [(&add, 1), (&mul, 0), (&addk, 0), (&flush, 0)];
-        let exec = unsafe { assemble(&relocs, &ops, &[0xc3]) };
-        // Same ABI as a stencil, with the (unused here) owner/state as raw words.
-        let entry: extern "rust-preserve-none" fn(
-            usize,
-            usize,
-            *mut LBoxed<'static, 'static>,
-            LBoxed<'static, 'static>,
-            LBoxed<'static, 'static>,
-            LBoxed<'static, 'static>,
-            LBoxed<'static, 'static>,
-        ) = unsafe { core::mem::transmute(exec.ptr(AssemblyOffset(0))) };
+        let exec = unsafe { assemble(&image, &ops, &[0xc3]) };
+        let entry = entry_of(&exec);
 
         let mut out = [LBoxed::NIL; WINDOW];
         entry(

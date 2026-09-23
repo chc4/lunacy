@@ -223,16 +223,30 @@ green gate (default features ⇒ jit on).
   after the code (the dynasm path will do this with pool labels + `finalize`).
 - Each op's stencils end in `become` to the op's **own** private continuation
   (`inline(never)`, and it `black_box`es the window — an empty internal callee
-  lets LLVM delete the tail call and every computation feeding the window). The
-  copier asserts the `become` is the stencil's last instruction(s) and targets
-  that continuation, then slices it. rustc builds with `-Z plt=no` and lib crates
-  are PIC, so the tail is `jmp rel32`, `jmp *[rip+got]`, or
-  `mov rax,[rip+got]; jmp *rax`; the copier accepts exactly those, reading the GOT
-  slot to check the target.
-- Stencils must be copy&patch-safe: no non-hole RIP-relative refs (no panics, no
-  calls), and built optimized (debug builds add precondition-check calls). An op
-  that isn't safe is rejected loudly by the copier: e.g. `NumericIntInt` MOD/POW
-  (libm calls) fail the tail assertion. The interpreter runs any window op.
+  lets LLVM delete the tail call and every computation feeding the window).
+- The copier (`stencil_body`) decodes the stencil with yaxpeax-x86. Well-formed =
+  the last instruction jumps to the continuation (`jmp rel32`, `jmp *[rip+got]`,
+  or `jmp *reg` loaded from the GOT slot — rustc uses `-Z plt=no`, and LLVM may
+  hoist that load above the epilogue); it is sliced so the next stencil falls
+  through. Every other RIP-relative reference is reported with its field, the
+  end of its instruction (the true RIP base, even with a trailing immediate) and
+  its absolute target:
+  - `holes` — loads of a hole's GOT slot → repointed at the pool;
+  - `nexts` — other references to the continuation (a duplicated tail) → the
+    copy's fall-through point (direct), or a pool slot holding it (indirect).
+    Handled but not yet observed in practice;
+  - `relocations()` — everything else: calls out of line (e.g. `IndexMap`), GOT
+    slots, rodata → re-targeted at their original absolute address, in rel32
+    range because JIT memory is mapped within ±2GiB of the binary.
+  In the JIT all three become dynasm relocations patched at `finalize`;
+  `assemble` does the same by hand in a near-mapped buffer.
+- Calls are fine anywhere (they return). A jump that leaves the stencil without
+  being a `become` would skip the rest of the chain, so it is rejected loudly: a
+  sibling tail call, or an indirect jump like a jump table (its entries lead back
+  into the original function). An opt-level 0 `NumericIntInt` has one (unfolded
+  `match OP`); optimized builds don't. Debug builds are otherwise copyable now
+  (their un-inlined helper calls and assertion panics are just relocations). The
+  interpreter runs any window op regardless.
 
 **M1 — DONE: generic windowed ops in the generator (JIT splat still disabled).**
 `Residual::ExecWindow(Rc<dyn Window>)` replaces the old slice-closure
@@ -246,12 +260,15 @@ own `numeric_op`/`box_lvalue`) and picks the instance with
 their `Exec` closures. `jit_block` still bails on `ExecWindow`.
 
 Verification:
-- `just test` green.
-- `just test-stencils` (opt-2): copy&patches a test-local chain (a,b,c) → Add@1 →
-  Mul@0 → AddK@0 (hole) → Flush and checks it; then runs the golden suite with
-  feature `check_windows`, which copy&patches **every window op the interpreter
-  executes** (the real emit-site ops) and asserts the native result matches the
-  interpreter bit for bit.
+- `just test` green, including the window tests in debug: a (a,b,c) chain →
+  Add@1 → Mul@0 → AddK@0 (hole) → Flush; a stencil calling an out-of-line helper
+  (its call appears in `relocations()` and the copy calls it correctly); and a
+  branchy stencil whose both arms fall through.
+- `just test-stencils` (opt-2): the same tests on optimized stencils, then the
+  golden suite with feature `check_windows`, which copy&patches **every window
+  op the interpreter executes** (the real emit-site ops) and asserts the native
+  result matches the interpreter bit for bit. `NumericIntInt` MOD/POW (libm
+  calls, relocated) pass it at opt-2.
 - Note: the specializer only runs for *calls* to Lua functions; top-level chunk
   code stays in the plain interpreter, so test programs must do their work inside
   a function. An arithmetic program run that way matches reference Lua in the
@@ -262,11 +279,14 @@ Verification:
 **M2 — next.** Splat in `jit_block`: for each `ExecWindow`, copy its stencil
 body into the dynasm assembler with a RIP-relative relocation per hole to a pool
 label, and emit the pool at the epilogue so `finalize` patches every hole load.
-Needs the window-offset choice (the register allocator, below), a Storage/Flush
-boundary around window runs, and a generic fallback for ops the copier rejects
-(call the body instead of splatting). Open items: debug JIT builds need
-optimized stencils (e.g. a profile override for lunacy); check fat-LTO release
-builds keep each op's continuation as a real tail target.
+Hand dynasm each body's `holes`, `nexts` and `relocations()` as relocations
+(pool labels, a label at the copy's end, and absolute targets) so `finalize`
+patches them all at once. Needs the window-offset choice (the register
+allocator, below), a Storage/Flush boundary around window runs, and a generic
+fallback for ops the copier rejects (call the body instead of splatting — the
+copier should return an error rather than panic for that). Open items: jump
+tables (copy the table and rebase its entries, if a real op needs one); check
+fat-LTO release builds keep each op's continuation as a real tail target.
 
 **M3+.** Register cache / per-block in-set threading (section 2) — pinning
 arbitrary `LBoxed` window values in GPRs across ops.
