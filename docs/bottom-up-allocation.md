@@ -72,18 +72,36 @@ into the `W` before it:
   loaded after it.
 - **Guard, thunk, jump.** Transparent: `W` is unchanged.
 
-A block's end starts from its **live-out**: the wanted window of its
-fall-through successor's entry. Its other successors (the other targets of a
-select, failure jumps) are reconciled by parallel moves on their edges. A
-successor not yet processed, the target of a back edge, has no known entry yet:
-its live-out is empty. A block compiled in an earlier region wants its
-recorded window.
+### Used-in and live-out
 
-A block's `W` at its start is its **used-in**: the values it and its
-successors want in registers on entry, recorded as its entry window. The pass
-records, per window op, its `SKIP` and the `W` before it; per block, its
-used-in. That is a few bytes per window op and a register map per block. It
-visits each residual once, trying at most `WINDOW` placements per window op.
+Two per-block sets connect the blocks, each with one job:
+
+- **used-in(B)**: the slots B itself reads before writing them, each with the
+  register B's backward pass placed it in at B's start. It is B's own
+  requirement, not its successors': a slot only a later block reads is not in
+  it. It is B's entry window, what every edge into B must deliver.
+- **live-out(B)**: what B's successors read of B's window, their used-in. It
+  starts B's backward pass: `W` at B's end is the used-in of its fall-through
+  successor, so B's definitions of those slots are placed where the successor
+  reads them.
+
+Both are known when B is processed: live-out from its successors, which the
+postorder visits first, and used-in from B's own pass, as `W` at B's start
+restricted to the slots B reads. A slot in `W` at B's end that B neither reads
+nor writes is not carried into B's used-in. The pass keeps it in its register
+while no op of B needs that register, and otherwise drops it. The forward pass
+then loads it wherever `W` first wants it again, at the latest before B's
+jump.
+
+A block's other successors (the other targets of a select, failure jumps) are
+reconciled by parallel moves on their edges. The target of a back edge isn't
+processed yet when B is, so a latch's live-out is empty (see Loop headers). An
+edge into a block compiled in an earlier region delivers that block's recorded
+entry window, which acts as its used-in.
+
+The pass records, per window op, its `SKIP` and the `W` before it; per block,
+its used-in. That is a few bytes per window op and a register map per block.
+It visits each residual once, trying at most `WINDOW` placements per window op.
 
 ## The forward pass
 
@@ -96,8 +114,8 @@ loads), then runs the op at its recorded `SKIP`. A jump reconciles the cache
 with its target's used-in. The moves an op's placement costs after it happen at
 the next reconciliation, the next op's or the block's final jump. Otherwise
 the reconciliations are empty where the backward pass placed values where they
-are wanted. That includes the fall-through edge, since its target's used-in is
-where the block's live-out came from.
+are wanted. That includes the fall-through edge, since the block's live-out
+is its target's used-in.
 
 The entry stub loads the entry block's used-in from the stack, since the
 interpreter enters from memory.
@@ -109,16 +127,15 @@ reaches its fixpoint, so the steady-state loop header is its own block. Its
 predecessors are the peeled iteration (a forward edge) and the latch (the back
 edge).
 
-**Baseline.** The latch is processed before the header, so its back edge sees an
-empty live-out: it places its values freely, and its jump to the header
-reconciles with the header's used-in by parallel moves each iteration. The
-header's used-in comes from the loop body, not from what the peeled iteration
-left, and the peeled iteration's live-out is that used-in. So values live
-through the loop, such as its invariants and the loop variables, arrive from
-the peeled iteration where the body wants them. As I remember LuaJIT's
-assembler, it gets the same bias by assembling the loop body first and the
-pre-roll after, with a shuffle of the loop-carried values at the loop's end.
-That is worth checking against its source before relying on it.
+**Baseline.** The latch is processed before the header, so its live-out is
+empty: it places its values freely, and its jump to the header reconciles with
+the header's used-in by parallel moves each iteration. The header's used-in is
+what the header block itself reads, placed where its own ops want it, not what
+the peeled iteration happened to leave. The peeled iteration's live-out is that
+used-in, so it computes those values straight into place. As I remember
+LuaJIT's assembler, it gets the same bias by assembling the loop body first and
+the pre-roll after, with a shuffle of the loop-carried values at the loop's
+end. That is worth checking against its source before relying on it.
 
 **Using the back edges.** A second backward pass over just the loop's blocks,
 with the header's used-in as the latch's live-out, would compute the
@@ -168,8 +185,9 @@ This proposal doesn't add lookahead.
 ## Departures from `docs/jit-register-cache.md`
 
 - **Rules 1 and 4:** a block no longer enters with an empty window because it
-  is fresh. Every block enters with its used-in, including the region's entry
-  (loaded by the entry stub) and a loop header.
+  is fresh. Every block enters with its used-in (the slots it reads, where it
+  reads them), including the region's entry (loaded by the entry stub) and a
+  loop header.
 - **Rule 2** reverses direction. The successor doesn't adopt the predecessor's
   out-set; the predecessor delivers the successor's used-in. The fall-through
   edge carries only the moves that follow the block's last op, which are none
