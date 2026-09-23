@@ -129,8 +129,10 @@ struct Plan {
 
 /// Allocates the window registers of a run of window residuals. See Note
 /// [Window allocation].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WindowAlloc {
+    /// Window registers in use: `WINDOW`, or fewer to test register pressure.
+    width: usize,
     state: State,
     /// Tokens recorded by `Storage` since the last op.
     pending: SmallVec<[(Gpr, Access); WINDOW]>,
@@ -139,7 +141,18 @@ pub struct WindowAlloc {
     op: usize,
 }
 
+impl Default for WindowAlloc {
+    fn default() -> Self {
+        Self::with_width(WINDOW)
+    }
+}
+
 impl WindowAlloc {
+    fn with_width(width: usize) -> Self {
+        assert!(width <= WINDOW);
+        WindowAlloc { width, state: State::default(), pending: SmallVec::new(), run: Vec::new(), op: 0 }
+    }
+
     /// Start a run of window residuals.
     pub fn begin<'a>(&mut self, run: impl IntoIterator<Item = Step<'a>>) {
         assert!(self.is_empty(), "a window run began before the last one was flushed");
@@ -199,7 +212,7 @@ impl WindowAlloc {
 
         let plan = skips
             .into_iter()
-            .filter(|&skip| skip + operands.len() <= WINDOW)
+            .filter(|&skip| skip + operands.len() <= self.width)
             .map(|skip| self.plan(&self.state, k, skip))
             .min_by_key(|plan| (plan.cost + self.best_cost(&plan.after, k + 1), plan.cost, plan.skip))?;
         self.state = plan.after;
@@ -220,7 +233,7 @@ impl WindowAlloc {
     /// The cost of the cheapest plan for op `k` from `state` (0 past the run).
     fn best_cost(&self, state: &State, k: usize) -> u32 {
         let Some(info) = self.run.get(k) else { return 0 };
-        (0..=WINDOW - info.slots.len()).map(|skip| self.plan(state, k, skip).cost).min().unwrap_or(0)
+        (0..=self.width - info.slots.len()).map(|skip| self.plan(state, k, skip).cost).min().unwrap_or(0)
     }
 
     /// Resculpt the window from `now` for op `k` at `skip`.
@@ -242,7 +255,7 @@ impl WindowAlloc {
         let mut keep: SmallVec<[usize; WINDOW]> = SmallVec::new();
         let mut homeless: SmallVec<[(usize, usize); WINDOW]> = SmallVec::new();
         let mut spare: SmallVec<[usize; WINDOW]> = SmallVec::new();
-        for reg in 0..WINDOW {
+        for reg in 0..self.width {
             let Some(slot) = now.regs[reg] else {
                 if !span.contains(&reg) {
                     spare.push(reg);
@@ -269,7 +282,7 @@ impl WindowAlloc {
         // is the store the run's end would do, and frees the register.
         let mut stores: SmallVec<[(usize, usize); WINDOW]> = SmallVec::new();
         keep.retain(|&mut slot| {
-            let reg = (0..WINDOW).find(|r| !span.contains(r) && now.regs[*r] == Some(slot)).unwrap();
+            let reg = (0..self.width).find(|r| !span.contains(r) && now.regs[*r] == Some(slot)).unwrap();
             if matches!(next_after(slot), Next::Read(_)) {
                 return true;
             }
@@ -477,8 +490,9 @@ mod tests {
         }
     }
 
-    /// Allocate and execute a run, returning the machine for its counts.
-    fn run(ops: &[TestOp]) -> Machine {
+    /// Allocate and execute a run in a window of `width` registers, returning
+    /// the machine for its counts.
+    fn run(width: usize, ops: &[TestOp]) -> Machine {
         let mut tokens = Tokens::default();
         let windows: Vec<Box<dyn Window>> = ops
             .iter()
@@ -493,7 +507,7 @@ mod tests {
             let accesses = (0..w.operands().len()).map(|i| if i < w.inputs() { Access::Read } else { Access::Write });
             w.operands().iter().zip(accesses).map(|(g, a)| Step::Storage(*g, a)).chain([Step::Op(w)]).collect()
         }
-        let mut alloc = WindowAlloc::default();
+        let mut alloc = WindowAlloc::with_width(width);
         alloc.begin(windows.iter().flat_map(|w| steps(&**w)));
         let mut machine = Machine::default();
         for w in &windows {
@@ -519,32 +533,41 @@ mod tests {
 
     /// nbody `advance`, block 94: `dz = biz - dz; t23 = dx*dx; t24 = dy*dy;
     /// t23 += t24; t24 = dz*dz; t23 += t24` (slots: biz 10, dx 20, dy 21, dz 22).
-    /// Worked by hand, a 4-register window does it in 5 loads, 3 stores and 7
-    /// moves (the floor is 4 loads and 3 stores: only one register is spare
-    /// beside a 3-register op, so dz is evicted once), against 12 loads and 6
-    /// stores through the stack.
-    #[test]
-    fn nbody_dist2() {
-        let m = run(&[B(10, 22, 22), B(20, 20, 23), B(21, 21, 24), B(23, 24, 23), B(22, 22, 24), B(23, 24, 23)]);
-        assert_eq!((m.loads, m.stores, m.moves), (5, 3, 7), "{m:?}");
-    }
+    const DIST2: [TestOp; 6] = [B(10, 22, 22), B(20, 20, 23), B(21, 21, 24), B(23, 24, 23), B(22, 22, 24), B(23, 24, 23)];
 
     /// nbody `advance`, block 100: `bm = bm * mag; t26 = dx * bm; bivx -= t26;
-    /// ...; bm = bimass * mag` (bivx 12, bm 25, mag 24, dx 20, t26 26). Worked
-    /// by hand: 10 loads and 5 stores (floor 9 and 5), against 16 and 8; the
-    /// allocator needs 6 moves, 2 fewer than the hand plan.
+    /// ...; bm = bimass * mag` (bivx 12, bm 25, mag 24, dx 20, t26 26).
+    const VELOCITY: [TestOp; 8] = [
+        B(25, 24, 25),
+        B(20, 25, 26),
+        B(12, 26, 12),
+        B(21, 25, 26),
+        B(13, 26, 13),
+        B(22, 25, 26),
+        B(14, 26, 14),
+        B(11, 24, 25),
+    ];
+
+    /// The whole window reaches the floor on both runs: every slot loaded at
+    /// most once and stored once (4 loads and 3 stores, against 12 and 6 through
+    /// the stack; 9 and 5 against 16 and 8).
     #[test]
-    fn nbody_velocity() {
-        let m = run(&[
-            B(25, 24, 25),
-            B(20, 25, 26),
-            B(12, 26, 12),
-            B(21, 25, 26),
-            B(13, 26, 13),
-            B(22, 25, 26),
-            B(14, 26, 14),
-            B(11, 24, 25),
-        ]);
+    fn nbody_full_window() {
+        let m = run(WINDOW, &DIST2);
+        assert_eq!((m.loads, m.stores, m.moves), (4, 3, 5), "{m:?}");
+        let m = run(WINDOW, &VELOCITY);
+        assert_eq!((m.loads, m.stores, m.moves), (9, 5, 4), "{m:?}");
+    }
+
+    /// Under pressure, in 4 registers (one spare beside a 3-register op), both
+    /// runs match or beat plans worked by hand: DIST2 in 5 loads, 3 stores and
+    /// 7 moves (dz is evicted once), VELOCITY in 10 loads and 5 stores with 6
+    /// moves (8 by hand).
+    #[test]
+    fn nbody_four_registers() {
+        let m = run(4, &DIST2);
+        assert_eq!((m.loads, m.stores, m.moves), (5, 3, 7), "{m:?}");
+        let m = run(4, &VELOCITY);
         assert_eq!((m.loads, m.stores, m.moves), (10, 5, 6), "{m:?}");
     }
 
@@ -570,7 +593,8 @@ mod tests {
 
     /// Every run of three ops, over up to five slots for binary ops alone and
     /// four with unary ones mixed in, is allocated correctly (up to renaming
-    /// slots, which the allocator is indifferent to).
+    /// slots, which the allocator is indifferent to), in 4 registers so that the
+    /// runs evict.
     #[test]
     fn exhaustive_small_runs() {
         for shapes in 0..8u32 {
@@ -583,7 +607,7 @@ mod tests {
                     .iter()
                     .map(|&arity| if arity == 3 { B(next(), next(), next()) } else { TestOp::Un(next(), next()) })
                     .collect();
-                run(&ops);
+                run(4, &ops);
             }
         }
     }
@@ -595,7 +619,7 @@ mod tests {
             SmallVec::from_slice(&[(0, Source::Reg(1)), (1, Source::Reg(0)), (2, Source::Memory(7))]);
         let mut emits = SmallVec::new();
         assert_eq!(sequentialize(&mut moves, &mut emits), 1);
-        let mut regs = [10, 11, 12, 13, 0];
+        let mut regs: [usize; WINDOW + 1] = core::array::from_fn(|r| 10 + r);
         for emit in emits {
             match emit {
                 Emit::Move { dst, src } => regs[dst] = regs[src],

@@ -207,7 +207,14 @@ green gate (default features ⇒ jit on).
   `[LBoxed; N]`: Rust passes arrays by pointer whatever the ABI, which puts the
   window in memory. (`unadjusted` isn't available on this toolchain.) Stencil ABI:
   fixed params `owner, state, base` (r12/r13/r14, the JIT's pinned regs) then the
-  window `w0..w3` = r15, rdi, rsi, rdx.
+  window `w0..w7` = r15, rdi, rsi, rdx, rcx, r8, r9, r11. preserve-none passes
+  12 integer arguments in registers, but the 12th, rax, can't be a window
+  register: a `become` compiled as an indirect jump through the GOT has LLVM load
+  its target into rax even when rax carries an argument (it is the only register
+  eligible for the target outside the arguments), and that load stays in the
+  copy — `check_windows` caught it clobbering w8. `owner` is a ZST token that
+  can be forged at JIT/interpreter transitions (the JIT helpers already do);
+  dropping it as a stencil param would free r12 for a 9th window register.
 - `windowed!(Name, [captures], [const params], |owner, state, base| (inputs) -> (outputs) { body })`
   is a **generic**, op-agnostic mechanism used inline at the emit site, exactly
   like `define_exec!` — all of an op's code (static and dynamic) stays in its
@@ -292,8 +299,8 @@ Verification:
 
 **M2 — DONE: JIT register allocation + stencil splat.** `src/window_alloc.rs`
 allocates each run of window residuals (see `Note [Window allocation]`);
-`jit_block` lowers its plan (loads/stores against r14, moves between
-r15/rdi/rsi/rdx with rax as scratch) and splats each op's stencil body between
+`jit_block` lowers its plan (loads/stores against r14, moves between the window
+registers with r10 as scratch) and splats each op's stencil body between
 `sub rsp, 8`/`add rsp, 8` (block code keeps rsp 16-aligned; stencils expect the
 alignment just after a call). Holes and indirect continuation references become
 dynasm relocations to 8-byte pool entries emitted after the region's epilogue;
@@ -304,8 +311,9 @@ no label, so a jump into a run fails to assemble; with `gas`, a run is charged
 at its first residual. An op whose stencil the copier rejects at every `SKIP`
 flushes and bails to the interpreter, which runs it from the stack.
 
-Hand analysis that shaped the allocator (nbody `advance`, 4-register window,
-3-wide `(lhs, rhs) -> (dest)` ops at `SKIP` 0 or 1):
+Hand analysis that shaped the allocator (nbody `advance`, worked for a
+4-register window, 3-wide `(lhs, rhs) -> (dest)` ops at `SKIP` 0 or 1, to
+study register pressure):
 - block 94 (`dz = biz - dz; dist2 = dx*dx + dy*dy + dz*dz`): 5 loads, 3 stores,
   7 moves vs 12 loads/6 stores through the stack (floor 4/3; one spill of `dz`,
   since only one register is spare beside a 3-register op);
@@ -315,8 +323,15 @@ Lessons: a result lands at `SKIP+2`, so it is read in place only as the next
 op's `rhs` at `SKIP+1` (else one move); `x*x` needs a copy; evicting a dirty
 value costs a store only if the slot is written again later in the run
 (otherwise it is the run-end store moved earlier); eviction is otherwise by
-farthest next read. Both runs are unit tests pinning these counts, plus an
-exhaustive correctness sweep executing plans on a symbolic machine.
+farthest next read. Both runs are unit tests pinning these counts at width 4
+(the allocator takes a width for testing) and at the full 8-register window,
+where nothing is evicted and both reach the load/store floor (every slot read
+before written loaded once, every written slot stored once): 4 loads/3
+stores/5 moves and 9/5/4. Block 94's 5 moves are the minimum by hand: a copy
+for each of `dx*dx`, `dy*dy`, `dz*dz`, and each `dist2 += t` needs one, since
+putting `t` right after `dist2` means running its producer at `SKIP+1`, whose
+span covers `dist2`. Plus an
+exhaustive correctness sweep at width 4 executing plans on a symbolic machine.
 
 Verification: `just test` (adds the golden suite with `immediate_jit`: in debug
 the copier rejects `NumericIntInt`'s jump table, exercising the fallback) and
@@ -329,8 +344,6 @@ Open items:
   `become` to be the last instruction. Supporting it means copying the whole
   body and jumping over the cold code to the fall-through point (plus a trap
   after it).
-- A wider window (more of preserve-none's argument registers) would remove the
-  spills a 3-wide op forces in a 4-register window.
 - Jump tables in stencils. (Fat-LTO release builds do keep each op's
   continuation a real tail target: `just run nbody` copies all 8
   `NumericIntInt` stencils it uses.)

@@ -149,10 +149,14 @@ impl JitHelper {
 
 type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
 
-/// The window registers `w0..w3` in the order the stencil ABI passes them (the
+/// The window registers `w0..w7` in the order the stencil ABI passes them (the
 /// `rust-preserve-none` arguments after owner, state and base in r12, r13, r14),
-/// then `SCRATCH`.
-const WINDOW_REGS: [u8; WINDOW + 1] = [15 /* r15 */, 7 /* rdi */, 6 /* rsi */, 2 /* rdx */, 0 /* rax */];
+/// then `SCRATCH`: r10, which is not an argument register and only holds a value
+/// within one sequence of moves.
+const WINDOW_REGS: [u8; WINDOW + 1] = [
+    15, /* r15 */ 7, /* rdi */ 6, /* rsi */ 2, /* rdx */ 1, /* rcx */
+    8, /* r8 */ 9, /* r9 */ 11, /* r11 */ 10, /* r10 */
+];
 
 /// An 8-byte entry of the pool emitted after a compiled region's code.
 enum PoolEntry {
