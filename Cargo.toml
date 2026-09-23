@@ -17,6 +17,9 @@ lbbv = []
 # Native JIT (the dynasm `jit` module). Requires LBBV, since it compiles the
 # specialized blocks LBBV produces.
 jit = ["lbbv"]
+# Differential-check every window op the interpreter runs against its
+# copy&patched stencil (see src/window.rs; needs an optimized build).
+check_windows = ["lbbv"]
 unreachable = []
 gas = []
 magic = [] # Magic JIT intrinsics

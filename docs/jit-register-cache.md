@@ -203,46 +203,70 @@ green gate (default features ⇒ jit on).
   window in memory. (`unadjusted` isn't available on this toolchain.) Stencil ABI:
   fixed params `owner, state, base` (r12/r13/r14, the JIT's pinned regs) then the
   window `w0..w3` = r15, rdi, rsi, rdx.
-- `windowed!` declares an op once: a struct of **captures** (hole values) + each
-  operand's load/store stack slot, implementing the `Window` trait; an
-  `#[inline(always)]` body shared by both tiers; and `__stencil::<K>`, where `K`
-  is the window **shift** (operands at `w[K..K+ARITY]`), ending in
-  `become __next(..)`.
-- Holes are `extern_weak` statics (`__lunacy_holeN`): under plain PIE a read is a
-  RIP-relative load from the hole's GOT slot. They can't be found by scanning
-  for `0x0` or by operand order, so the copier reads this executable's own
-  dynamic relocations (goblin, GLOB_DAT → GOT slot), matches each disp32's RIP
-  target, and repoints it at a shared value pool laid after the code (the dynasm
-  path will do this with pool labels + `finalize`).
-- The trailing `become` jmp is asserted to be the stencil's last instruction
-  (symtab size) and sliced, so the window falls through into the next stencil.
+- `windowed!(Name, [captures], [const params], |owner, state, base| (operands) { body })`
+  is a **generic**, op-agnostic mechanism used inline at the emit site, exactly
+  like `define_exec!` — all of an op's code (static and dynamic) stays in its
+  `emit_*`. It generates a struct of **captures** (hole values) + each operand's
+  load/store stack slot implementing the `Window` trait, an `#[inline(always)]`
+  body shared by both tiers, and `__stencil::<K>` where `K` is the window
+  **shift** (operands at `w[K..K+ARITY]`). `src/window.rs` holds only the
+  mechanism (macro, `Window`, `Capture`, holes, copier); no op templates.
+- Captures: any `Copy` type of at most 8 bytes (blanket `Capture` impl, raw bits).
+  Holes are `extern_weak` statics (`__lunacy_holeN`), read through a const-generic
+  index so monomorphization picks the hole; an op with more captures than
+  `MAX_HOLES` references `unresolved_window_hole__too_many_captures`, a plain
+  (non-weak) never-defined extern, so it fails loudly at link time (verified).
+- Under plain PIE a hole read is a RIP-relative load from the hole's GOT slot.
+  Holes can't be found by scanning for `0x0` or by operand order, so the copier
+  reads this executable's own dynamic relocations (goblin, GLOB_DAT → GOT slot),
+  matches each disp32's RIP target, and repoints it at a shared value pool laid
+  after the code (the dynasm path will do this with pool labels + `finalize`).
+- Each op's stencils end in `become` to the op's **own** private continuation
+  (`inline(never)`, and it `black_box`es the window — an empty internal callee
+  lets LLVM delete the tail call and every computation feeding the window). The
+  copier asserts the `become` is the stencil's last instruction(s) and targets
+  that continuation, then slices it. rustc builds with `-Z plt=no` and lib crates
+  are PIC, so the tail is `jmp rel32`, `jmp *[rip+got]`, or
+  `mov rax,[rip+got]; jmp *rax`; the copier accepts exactly those, reading the GOT
+  slot to check the target.
 - Stencils must be copy&patch-safe: no non-hole RIP-relative refs (no panics, no
-  calls — MOD/POW call libm, so they stay `Exec`), and built optimized (debug
-  builds add precondition-check calls). `just test-stencils` runs the copy&patch
-  test at opt-2; `just test` skips it in debug.
+  calls), and built optimized (debug builds add precondition-check calls). An op
+  that isn't safe is rejected loudly by the copier: e.g. `NumericIntInt` MOD/POW
+  (libm calls) fail the tail assertion. The interpreter runs any window op.
 
-**M1 — DONE: windowed stencils in the generator (JIT splat still disabled).**
+**M1 — DONE: generic windowed ops in the generator (JIT splat still disabled).**
 `Residual::ExecWindow(Rc<dyn Window>)` replaces the old slice-closure
 `WindowExec`; like `Exec`'s closure it keeps processing sites generic. The
-interpreter runs `Window::interp`: load the operand slots, run the body with
+interpreter runs `<dyn Window>::interp`: load the operand slots, run the body with
 captures from the struct, flush (it can't run the stencil itself: holes read 0
-until patched). `emit_numeric` emits `NumAdd/Sub/Mul/Div` (both operands in the
-window), `Num{Op}K` (constant rhs as a capture) and `NumK{Op}` (constant lhs as a
-capture); the constant comes from a new `YieldOp::ConstNumber`. MOD/POW and
-const-const keep their `Exec` closures. `jit_block` still bails on `ExecWindow`.
-Verified: `just test` green; `just test-stencils` passes, copy&patching the real
-stencils into (a,b,c) → Add@1 → Mul@0 → AddK@0 (hole) → Flush; disasm shows pure
-GPR code; an arithmetic program matches reference Lua in LBBV-without-jit and
-`immediate_jit`. (Pre-existing bug, untouched: `numeric_op` MOD is truncated
-`%`, not Lua's floored modulo — `-3 % 7` gives `-3`.)
+until patched). The first user is `emit_numeric`'s dynamic int-int arm, which
+declares `windowed!(NumericIntInt, [], [OP: Opcode], ..)` inline (body = the VM's
+own `numeric_op`/`box_lvalue`) and picks the instance with
+`dispatch_numeric_window!` for all six opcodes; the constant-operand arms keep
+their `Exec` closures. `jit_block` still bails on `ExecWindow`.
+
+Verification:
+- `just test` green.
+- `just test-stencils` (opt-2): copy&patches a test-local chain (a,b,c) → Add@1 →
+  Mul@0 → AddK@0 (hole) → Flush and checks it; then runs the golden suite with
+  feature `check_windows`, which copy&patches **every window op the interpreter
+  executes** (the real emit-site ops) and asserts the native result matches the
+  interpreter bit for bit.
+- Note: the specializer only runs for *calls* to Lua functions; top-level chunk
+  code stays in the plain interpreter, so test programs must do their work inside
+  a function. An arithmetic program run that way matches reference Lua in the
+  debug build, `immediate_jit`, and under `check_windows` (~700k LBBV residuals).
+- Pre-existing bug, untouched: `numeric_op` MOD is truncated `%`, not Lua's
+  floored modulo (`-3 % 7` gives `-3`).
 
 **M2 — next.** Splat in `jit_block`: for each `ExecWindow`, copy its stencil
 body into the dynasm assembler with a RIP-relative relocation per hole to a pool
 label, and emit the pool at the epilogue so `finalize` patches every hole load.
-Needs the window-offset choice (the register allocator, below) and a
-Storage/Flush boundary around window runs. Open item: debug JIT builds need
-optimized stencils (e.g. a profile override for lunacy), and release uses fat
-LTO — check that it keeps `__next` as a real, un-inlined weak target.
+Needs the window-offset choice (the register allocator, below), a Storage/Flush
+boundary around window runs, and a generic fallback for ops the copier rejects
+(call the body instead of splatting). Open items: debug JIT builds need
+optimized stencils (e.g. a profile override for lunacy); check fat-LTO release
+builds keep each op's continuation as a real tail target.
 
 **M3+.** Register cache / per-block in-set threading (section 2) — pinning
 arbitrary `LBoxed` window values in GPRs across ops.

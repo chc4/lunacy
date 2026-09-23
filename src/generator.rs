@@ -20,7 +20,7 @@ use crate::vm::LConstant;
 use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
-use crate::window::{self, Window};
+use crate::window::{windowed, Window};
 // The native code generator (`JitContext`) and its per-block `JitInfo` (dynasm
 // buffer + hotness tiering) are only needed with the `jit` feature. LBBV on its
 // own is a second interpreter tier and doesn't touch them.
@@ -130,6 +130,23 @@ macro_rules! dispatch_numeric {
     };
 }
 
+/// `dispatch_numeric!` for window ops: pick the `[OP: Opcode]` instance of a
+/// `windowed!` op and construct it with `new(args..)`.
+macro_rules! dispatch_numeric_window {
+    ($opcode:expr, $name:ident, $($arg:expr),*) => {{
+        let w: Rc<dyn Window> = match $opcode {
+            Opcode::ADD => Rc::new($name::<{Opcode::ADD}>::new($($arg),*)),
+            Opcode::SUB => Rc::new($name::<{Opcode::SUB}>::new($($arg),*)),
+            Opcode::MUL => Rc::new($name::<{Opcode::MUL}>::new($($arg),*)),
+            Opcode::DIV => Rc::new($name::<{Opcode::DIV}>::new($($arg),*)),
+            Opcode::MOD => Rc::new($name::<{Opcode::MOD}>::new($($arg),*)),
+            Opcode::POW => Rc::new($name::<{Opcode::POW}>::new($($arg),*)),
+            _ => unreachable!(),
+        };
+        w
+    }};
+}
+
 macro_rules! dispatch_compare {
     ($opcode:expr, $label:expr, $name:ident, {$($cap:ident: $val:expr),*}) => {
         match $opcode {
@@ -182,7 +199,6 @@ pub enum YieldOp {
                            // is the expected type
     Exec(ResidualExec), // Emit a residual operation that will be executed
     ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op (see crate::window).
-    ConstNumber(usize), // Resumed with Number(n) for the numeric constant CONSTANT[idx]
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(BlockId), // Emit a jump to the given BlockId
@@ -230,7 +246,6 @@ pub enum ResumeArg {
     Type(CType),
     BlockId(BlockId),
     HashRef(HashRef, CType),
-    Number(f64),
 }
 
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -521,24 +536,16 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                define_exec!(NumericIntInt, [dest: usize, lhs: usize, rhs: usize], [OP: Opcode],
-                |owner, state, dest, lhs, rhs| {
-                    debug!("state {:?}", state);
-                    let Some(dyn_b) = state.vals[state.base + lhs].as_number() else { unreachable!() };
-                    let Some(dyn_c) = state.vals[state.base + rhs].as_number() else { unreachable!() };
-                    let res = LValue::Number(Number(dyn_b)).numeric_op(OP, &LValue::Number(Number(dyn_c))).unwrap();
-                    debug!("res {:?}", &res);
-                    state.vals[state.base + dest] = LBoxed::box_lvalue(res);
+                // Both operands are dynamic guarded numbers: a window op, its
+                // operands the whole LBoxed values in the register window.
+                windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (a, b) {
+                    let Some(l) = a.as_number() else { core::hint::unreachable_unchecked() };
+                    let Some(r) = b.as_number() else { core::hint::unreachable_unchecked() };
+                    *a = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                 });
 
-                // Both operands are dynamic guarded numbers: emit a copy&patch
-                // window op (whole LBoxed operands in the register window), unless
-                // the op has no copy&patch-safe body yet (MOD/POW).
-                if let Some(w) = window::numeric(opcode, dest, lhs, rhs) {
-                    yield YieldOp::ExecWindow(w);
-                } else {
-                    yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_int_int", NumericIntInt, {dest: dest, lhs: lhs, rhs: rhs}));
-                }
+                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt,
+                    &[lhs as u16, rhs as u16], &[Some(dest as u16), None]));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
@@ -569,14 +576,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     state.vals[state.base + dest] = LBoxed::box_lvalue(res);
                 });
 
-                // Constant lhs: a window op with the constant as a capture (hole).
-                let k = yield YieldOp::ConstNumber(lhsc);
-                let ResumeArg::Number(k) = k else { unreachable!() };
-                if let Some(w) = window::numeric_const(opcode, dest, rhs, k, false) {
-                    yield YieldOp::ExecWindow(w);
-                } else {
-                    yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_cint_int", NumericCintInt, {dest: dest, lhsc: lhsc as usize, rhs: rhs}));
-                }
+                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_cint_int", NumericCintInt, {dest: dest, lhsc: lhsc as usize, rhs: rhs}));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
@@ -592,14 +592,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 });
 
 
-                // Constant rhs: a window op with the constant as a capture (hole).
-                let k = yield YieldOp::ConstNumber(rhsc);
-                let ResumeArg::Number(k) = k else { unreachable!() };
-                if let Some(w) = window::numeric_const(opcode, dest, lhs, k, true) {
-                    yield YieldOp::ExecWindow(w);
-                } else {
-                    yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_int_cint", NumericIntCint, {dest: dest, lhs: lhs, rhsc: rhsc as usize}));
-                }
+                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_int_cint", NumericIntCint, {dest: dest, lhs: lhs, rhsc: rhsc as usize}));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
@@ -1833,15 +1826,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
-                },
-                CoroutineState::Yielded(YieldOp::ConstNumber(k)) => {
-                    let proto = self.clos.ro(owner).prototype;
-                    let crate::chunk::Constant::Number(n) = (unsafe { &(&(*proto).constants.items)[k] }) else {
-                        unreachable!("ConstNumber on a non-number constant")
-                    };
-                    arg = ResumeArg::Number(n.0);
-                },
-                CoroutineState::Yielded(YieldOp::CollectGarbage) => {
+                },                CoroutineState::Yielded(YieldOp::CollectGarbage) => {
                     self.blocks[block_id.0].instructions.push(Residual::GC);
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {

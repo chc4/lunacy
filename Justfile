@@ -15,13 +15,14 @@ test:
 
 # Copy&patch window stencils (src/window.rs): only valid when built optimized
 # (debug builds add precondition-check calls), so the lunacy crate is built at
-# opt-level 2 without debug assertions for this run.
+# opt-level 2 without debug assertions for this run. The golden suite runs with
+# `check_windows`: every window op the interpreter executes is also
+# copy&patched and run natively, and the results must match.
+STENCIL_OPT := "--config 'profile.dev.package.lunacy.opt-level=2' --config 'profile.dev.package.lunacy.debug-assertions=false' --config 'profile.dev.package.lunacy.overflow-checks=false'"
 [env("RUST_BACKTRACE","1")]
 test-stencils:
-    cargo test --lib window:: \
-        --config 'profile.dev.package.lunacy.opt-level=2' \
-        --config 'profile.dev.package.lunacy.debug-assertions=false' \
-        --config 'profile.dev.package.lunacy.overflow-checks=false'
+    cargo test --features check_windows --lib window:: {{STENCIL_OPT}}
+    cargo test --features check_windows --test golden_tests {{STENCIL_OPT}}
 
 [env("RUST_LOG", "debug")]
 [env("RUST_BACKTRACE","1")]
