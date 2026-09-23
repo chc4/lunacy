@@ -261,8 +261,10 @@ green gate (default features ⇒ jit on).
   back into the original function). An opt-level 0 `NumericIntInt` has one
   (unfolded `match OP`); optimized builds don't. The copier (`Image::load`,
   `stencil_body`, `assemble`) returns a `StencilError` rather than panicking, so
-  the JIT can leave the op to the interpreter; `check_windows` skips (and
-  logs) ops it rejects. Debug builds are otherwise copyable now
+  the JIT can call the op's body instead; `check_windows` fails on an op it
+  rejects in an optimized build (and skips it, logged, in a debug one).
+  `LoadK` is split per constant kind for this: converting any constant is a
+  `match` on its kind, which compiles to a jump table. Debug builds are otherwise copyable now
   (their un-inlined helper calls and assertion panics are just relocations). The
   interpreter runs any window op regardless.
 
@@ -312,7 +314,9 @@ references `value_relocation`s to their absolute target (the buffer's base is
 known). Any other residual flushes the window first; residuals inside a run get
 no label, so a jump into a run fails to assemble; with `gas`, a run is charged
 at its first residual. An op whose stencil the copier rejects at every `SKIP`
-flushes and bails to the interpreter, which runs it from the stack.
+flushes the window and calls `JitHelper::window_interp`, which runs the op's
+interpreter path on the stack; the run continues in JIT code. (Bailing to the
+interpreter instead would run the rest of the block there on every pass.)
 
 The allocator's tests execute its output on a symbolic machine (every op
 reads the current value of each input, every store writes a current value, the

@@ -43,7 +43,7 @@
 //! jump table (whose entries lead back into the original function). An opt-level
 //! 0 build of `NumericIntInt` hits the latter (`match OP` isn't folded);
 //! optimized builds don't. The interpreter tier runs any window op regardless,
-//! and the JIT leaves an op the copier rejects to the interpreter.
+//! and the JIT calls the body of an op the copier rejects.
 
 // Note [Register window]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -669,7 +669,7 @@ const RELATIVE_BRANCHES: [yaxpeax_x86::long_mode::Opcode; 23] = {
 /// relocations. Branches that stay within the body need no fixup (one to the
 /// sliced tail becomes a fall-through into the next stencil, as it should). A
 /// stencil that can't be copied this way is an error, not a panic, so the JIT
-/// can leave the op to the interpreter.
+/// can call the op's body instead.
 pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Result<Body, StencilError> {
     use yaxpeax_arch::LengthedInstruction;
     use yaxpeax_x86::long_mode::{InstDecoder, Instruction, Opcode, Operand, RegSpec};
@@ -1005,9 +1005,17 @@ mod check {
             let flush = CheckFlush::new(c.out as u64, &whole_window());
             let image = &c.image;
             let program = c.programs.entry((op.stencil(0), op.captures())).or_insert_with(|| {
-                unsafe { assemble(image, &[(op, 0), (&flush, 0)], &[0xc3]) }
-                    .inspect_err(|e| crate::warn!("check_windows: not checked: {e}"))
-                    .ok()
+                match unsafe { assemble(image, &[(op, 0), (&flush, 0)], &[0xc3]) } {
+                    Ok(exec) => Some(exec),
+                    // Debug builds' stencils can keep what optimized ones fold
+                    // away (e.g. a jump table for an unfolded `match OP`), but an
+                    // optimized stencil the copier rejects is a bug to fix.
+                    Err(e) if cfg!(debug_assertions) => {
+                        crate::warn!("check_windows: not checked: {e}");
+                        None
+                    }
+                    Err(e) => panic!("check_windows: {e}"),
+                }
             });
             let Some(exec) = program else { return };
             unsafe { enter(exec, owner, state, base, before) };

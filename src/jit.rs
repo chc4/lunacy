@@ -103,6 +103,17 @@ impl JitHelper {
         }
     }
 
+    /// Run a window op whose stencil the copier rejected, through its
+    /// interpreter path: operands from their stack homes, outputs flushed.
+    pub unsafe extern "C" fn window_interp(owner: *mut (), state: *mut (), op: *const (), vtable: *const ()) {
+        unsafe {
+            let op: *const dyn Window = core::ptr::from_raw_parts(op, core::mem::transmute(vtable));
+            let owner = &mut *(owner as *mut Owner);
+            let state = &mut *(state as *mut RunState<'static, 'static>);
+            (*op).interp(owner, state);
+        }
+    }
+
     /// Incremental GC safepoint from JIT'd code. The roots (state + specializer)
     /// were published before entering the JIT and the value stack is mutated in
     /// place, so `step_published` traces the live state. See Note [GC roots].
@@ -205,7 +216,7 @@ impl Stencils {
             .or_insert_with(|| {
                 unsafe { stencil_body(image, op, skip) }
                     .map(Rc::new)
-                    .inspect_err(|e| warn!("window op not copied, calling into the interpreter instead: {e}"))
+                    .inspect_err(|e| warn!("window op not copied, calling its body instead: {e}"))
             })
             .clone()
     }
@@ -914,13 +925,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 }
                             }
                         }
-                        // No stencil to copy: the interpreter runs the op from
-                        // the stack.
+                        // No stencil to copy: call the op's body on the stack.
                         None => {
                             for emit in alloc.flush() {
                                 emit_window_move(ops, emit);
                             }
-                            emit_bailout(ops, off)
+                            let (op, vtable) = (Rc::as_ptr(w) as *const dyn Window).to_raw_parts();
+                            let vtable: *const () = unsafe { core::mem::transmute(vtable) };
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rdi, r12 // owner
+                                ; mov rsi, r13 // state
+                                ; mov rdx, QWORD (op as i64)
+                                ; mov rcx, QWORD (vtable as i64)
+                                ; call extern (JitHelper::window_interp as *const () as usize)
+                            );
                         }
                     }
                 },

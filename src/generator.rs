@@ -258,19 +258,29 @@ pub enum ResumeArg {
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        windowed!(LoadK, [index: u32], [], |owner, state, base| (out dest) {
-            let kst = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize];
-            debug!("{:?}", kst);
-            *dest = kst.into();
+        // One op per constant kind: converting any constant is a `match` on its
+        // kind, which compiles to a jump table the copier can't copy.
+        windowed!(LoadKNumber, [index: u32], [], |owner, state, base| (out dest) {
+            let Constant::Number(n) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
+            *dest = LBoxed::from_number(n.0);
+        });
+        windowed!(LoadKString, [index: u32], [], |owner, state, base| (out dest) {
+            let Constant::String(s) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
+            *dest = LBoxed::interned(*s);
         });
         let d = yield YieldOp::Storage(dest, Access::Write);
         let ResumeArg::Storage(d) = d else { unreachable!() };
-        yield YieldOp::ExecWindow(Rc::new(LoadK::new(bx, &[d])));
         match c {
-            LType::Number => yield YieldOp::SetTypes(vec![(dest, LType::Number)]),
-            LType::String => yield YieldOp::SetTypes(vec![(dest, LType::String)]),
+            LType::Number => {
+                yield YieldOp::ExecWindow(Rc::new(LoadKNumber::new(bx, &[d])));
+                yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+            },
+            LType::String => {
+                yield YieldOp::ExecWindow(Rc::new(LoadKString::new(bx, &[d])));
+                yield YieldOp::SetTypes(vec![(dest, LType::String)]);
+            },
             _ => unreachable!(),
-        };
+        }
         return arg;
     }
 }

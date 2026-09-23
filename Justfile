@@ -97,11 +97,11 @@ gdb-benchmark benchmark:
     cargo build --release --bin bench
     gdb --args ./target/release/bench {{benchmark}}.bin
 
-flamegraph benchmark:
+flamegraph benchmark times='10':
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     -rm /tmp/perf-*.map
-    cargo flamegraph --features "perf" --bin bench -- {{benchmark}}.bin
-    firefox -new-tab flamegraph.svg
+    cargo flamegraph --features "perf" --bin bench -- {{benchmark}}.bin {{times}}
+    -firefox -new-tab flamegraph.svg
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 

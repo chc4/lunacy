@@ -46,6 +46,8 @@
             pkgs.hyperfine    # used by the `just hyperfine*` recipes
             pkgs.graphviz     # `dot`, which the `graph` feature renders block graphs with
             pkgs.python3      # tools/window_runs.py (`just window-runs`)
+            pkgs.perf         # `just flamegraph`
+            pkgs.cargo-flamegraph
           ];
 
           # mimalloc (and other -sys crates) need a C toolchain to build.
