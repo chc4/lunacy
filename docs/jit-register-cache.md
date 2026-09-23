@@ -139,8 +139,9 @@ opaque closure so the JIT can't see its dataflow. Window ops make it visible
   read-only and only outputs are written back (`windowed!(.., (a, b) -> (d))`),
   so a register caching a slot only ever holds that slot's value. An op always
   runs on a contiguous run of the window, `w[SKIP..SKIP + arity]`.
-- **JIT mode** (`src/window_alloc.rs`, `Note [Window allocation]`): `Storage`
-  only records its token; the op, with all of its operands known, is placed at
+- **JIT mode** (`src/window_alloc.rs`, `Note [Window allocation]`; to be replaced
+  by the streaming allocator proposed in section 6): `Storage` only records its
+  token; the op, with all of its operands known, is placed at
   the cheapest `SKIP` by resculpting the window from `SKIP` on — inputs moved
   from the register caching them or loaded, displaced values moved to spare
   registers or evicted — with a one-op lookahead. Flushing is deferred to the
@@ -300,7 +301,8 @@ Verification:
   floored modulo (`-3 % 7` gives `-3`).
 
 **M2 — DONE: JIT register allocation + stencil splat.** `src/window_alloc.rs`
-allocates each run of window residuals (see `Note [Window allocation]`);
+allocates each run of window residuals (see `Note [Window allocation]`; its
+allocation is to be replaced, see section 6);
 `jit_block` lowers its plan (loads/stores against r14, moves between the window
 registers with r10 as scratch) and splats each op's stencil body between
 `sub rsp, 8`/`add rsp, 8` (block code keeps rsp 16-aligned; stencils expect the
@@ -408,3 +410,151 @@ arbitrary `LBoxed` window values in GPRs across ops.
   `:352` `jit_block`, `:362` `emit_jump`, `:383` `emit_bailout`, `:436-514`
   inline guards via r14, `:570` `Exec` static call, `:592/643` Lua/NativeCall,
   `:691` Ret, `:702` Select, `:721` `Residual::GC`, `:728` Thunk bail.
+
+---
+
+## 6. Register allocation: a streaming forward pass (proposal, for review)
+
+This replaces the allocator in `src/window_alloc.rs`. That one spends compile
+time on placement quality inside one run: a backward scan for next uses,
+relocating displaced values into spare registers, ranking evictions, and a
+lookahead. That is the wrong trade for a JIT, and within one block it matters
+little when we compile a tree of blocks.
+
+### What copy-and-patch does (Xu & Kjolstad, OOPSLA 2021, §3–4)
+
+- "we repurpose the function prototype and the calling convention as a register
+  allocation protocol, where each function parameter implicitly corresponds to
+  some physical register". A value that must survive a stencil is a
+  **pass-through parameter**, passed "from the argument to the continuation
+  verbatim". That is our window, and `SKIP` is the number of pass-through
+  registers below an op.
+- Registers hold expression temporaries only: "we only use registers to
+  preserve temporary values produced while evaluating an expression". Locals
+  live in memory.
+- One forward pass, "a post-order traversal of the AST to abstractly evaluate
+  the expression", over "the stack of outstanding temporary operands". An op
+  takes its operands from the top of that stack and pushes its result. It is "a
+  simplified version of the Simple Sethi-Ullman Algorithm that does not choose
+  between the orders of evaluating a node's children", chosen for "its very low
+  overhead and little loss of practical effectiveness". Temporaries beyond the
+  register budget spill to stack slots, and temporaries live across a call are
+  spilled, since the callee gets every register.
+- Quality is deliberately secondary: a mem2reg pass gave "up to 10% execution
+  performance boost, but results in about 33× slower compilation. We deemed this
+  trade-off as not worthwhile."
+
+### What carries over
+
+The stack discipline rests on two properties of AST temporaries that our
+operands lack:
+
+1. A temporary is used once, so an op's operands die at the op and its result
+   can take their place. Lua slots are registers of a register machine: `bm` is
+   read three times in one run, and locals are read throughout a block.
+2. The result overwrites the operands' registers. Our inputs are read-only: an op
+   never overwrites the register of a slot it reads, so a cached slot's register
+   only ever holds that slot's value.
+
+So we take the **streaming** part and not the exact stack discipline:
+
+- one forward pass, during codegen;
+- a few register comparisons of work per op;
+- no lookahead, and no analysis of the run or of the block tree beforehand.
+
+### Operand order belongs to the op
+
+`windowed!` declares one ordered operand list, each operand marked as an input
+or an output, e.g. `(out c, a, b)`. Operand `i` is window register `SKIP + i`.
+The emit site yields its `Storage`s in the same order. The allocator knows only
+each operand's index and whether it is read or written, so it handles any order
+an op names:
+
+- `NumericIntInt` would declare `[dest, lhs, rhs]`, so a result lands below
+  where the next op's inputs go;
+- `GetTableHref` would declare `[dest, table]`;
+- `SetTableHref` would declare `[table, value]`.
+
+`window::position` goes away.
+
+### The allocator
+
+State, carried from op to op:
+
+- `regs[0..WINDOW]`: the slot whose current value each register caches, if any;
+- `dirty`: cached slots whose stack home is stale.
+
+There is no liveness. Every cached value is only a cache: overwriting a clean
+one drops it, and a later read reloads it; overwriting a dirty one stores it
+first.
+
+`Storage` records its token and decides nothing. At an `ExecWindow` with operands
+`o_0..o_{n-1}`:
+
+1. **Pick `SKIP`** from `0..=WINDOW-n`, the cheapest by what it would emit:
+   - an input already in its register costs nothing;
+   - an input cached in another register costs a move;
+   - an uncached input costs a load;
+   - a dirty value in the span costs a store, unless it is an older value of
+     one of the op's outputs, which the op rewrites.
+
+   Ties go to the `SKIP` whose span overwrites the fewest cached values, then to
+   the lowest. That is `WINDOW × n` register comparisons (8 × 3 for a numeric
+   op).
+2. **Emit**, in this order:
+   - the stores;
+   - the moves and loads into the span, as one parallel move (reads before
+     writes, cycles through the scratch register);
+   - the stencil.
+3. **Update**: each output is cached, dirty, in its register, and other copies of
+   its slot's older value are dropped.
+
+At a flush point (any residual other than `Storage`/`ExecWindow`), store every
+dirty register. Calls clobber every register, so the cache is emptied too.
+
+**What it gives up, worked by hand** on nbody's steady-state 11-op run
+`bi.vz = bivz; bi.x = bix + dt*bivx; bi.y = ...; bi.z = ...; i += step` in 8
+registers, with ops in `[out, in, ...]` order:
+
+- The first `dt*bivx` takes free registers (`t15`, `dt`, `bivx` at `w2..w4`).
+- `bix + t15` then runs at 0 to read `t15` in place, which overwrites the
+  cached `bi` and `bivz`.
+- The first `bi.x = t15` reloads `bi`.
+- Each later group finds `dt` still at `w3` and `bi` at `w5`, so it needs one
+  move (for `t15`) per store.
+
+That comes to 12 loads, 2 stores and 3 moves. The floor is 10 loads and 2
+stores, and the best plan (a search) does 10/2/2. The nbody tests would pin
+the counts the streaming rule gives, worked by hand like this. The
+symbolic-machine correctness checks and the exhaustive sweep stay.
+
+### Code changes
+
+- **`windowed!`:** the ordered operand list with in/out markers. The emit sites
+  yield their `Storage`s in that order. `window::position` goes.
+- **`window_alloc`:** the streaming allocator above replaces `begin`'s
+  next-use scan, the placement search, relocation and eviction ranking.
+  - `begin` shrinks to resetting the state; there is nothing to precompute.
+  - `op` takes the op's usable `SKIP`s from the copier directly.
+  - The JIT keeps calling `storage` / `op` / `flush`.
+- **Not in this change:** LuaJIT-style bottom-up assignment over the compiled
+  region. That would be a backward pass over the transitive closure of blocks
+  before codegen, storing each token's register compactly for the forward pass.
+  It would place values better across blocks, but costs a pass over the region
+  and the storage for its results. The paper suggests the streaming pass is the
+  right first step; revisit with measurements.
+
+### Decisions for review
+
+1. **Cache every slot, or only expression temporaries** as the paper does. In
+   Lua bytecode the temporaries are the slots at and above the active locals,
+   allocated like a stack (luac's `freereg`). Knowing that per pc needs each
+   prototype's active-local count, which stripped debug info may lack. The
+   design above caches every slot and needs nothing extra.
+2. **Across blocks:** carry the cache along straightline successor edges from the
+   start (section 2, rule 2), or flush at every block boundary first and add
+   the carry afterwards.
+3. **In-place updates:** whether an output may share an input's register when both
+   name the same slot. That is an in-place update like `t = bix + t`, the paper's
+   "result replaces the operand", and it would need its own stencil variant.
+   Not proposed now.
