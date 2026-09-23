@@ -202,9 +202,9 @@ pub enum YieldOp {
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
                            // is the expected type
     Exec(ResidualExec), // Emit a residual operation that will be executed
-    Storage(usize, Access), // Resumed with Storage(Gpr), an opaque token for STACK[idx] as an
+    Storage(usize), // Resumed with Storage(Gpr), an opaque token for STACK[idx] as an
                             // operand of the next ExecWindow. See Note [Register window].
-    ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op over preceding Storage tokens
+    ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op over Storage tokens
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(BlockId), // Emit a jump to the given BlockId
@@ -268,7 +268,7 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
             let Constant::String(s) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
             *dest = LBoxed::interned(*s);
         });
-        let d = yield YieldOp::Storage(dest, Access::Write);
+        let d = yield YieldOp::Storage(dest);
         let ResumeArg::Storage(d) = d else { unreachable!() };
         match c {
             LType::Number => {
@@ -357,8 +357,8 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 debug!("gettable_href fetched {val1:?}");
                 *dest = *val1;
             });
-            let t = yield YieldOp::Storage(b, Access::Read);
-            let d = yield YieldOp::Storage(a, Access::Write);
+            let t = yield YieldOp::Storage(b);
+            let d = yield YieldOp::Storage(a);
             let (ResumeArg::Storage(t), ResumeArg::Storage(d)) = (t, d) else { unreachable!() };
             arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[t, d])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
@@ -455,8 +455,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: bool], |owner, state, base| (table, value) {
                         store(owner, state, table, value, href, expected, RETYPE);
                     });
-                    let t = yield YieldOp::Storage(a, Access::Read);
-                    let v = yield YieldOp::Storage(c, Access::Read);
+                    let t = yield YieldOp::Storage(a);
+                    let v = yield YieldOp::Storage(c);
                     let (ResumeArg::Storage(t), ResumeArg::Storage(v)) = (t, v) else { unreachable!() };
                     arg = yield YieldOp::ExecWindow(if retype {
                         Rc::new(SetTableHref::<true>::new(hb.0, expected, &[t, v]))
@@ -579,9 +579,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                 });
 
-                let l = yield YieldOp::Storage(lhs, Access::Read);
-                let r = yield YieldOp::Storage(rhs, Access::Read);
-                let d = yield YieldOp::Storage(dest, Access::Write);
+                let l = yield YieldOp::Storage(lhs);
+                let r = yield YieldOp::Storage(rhs);
+                let d = yield YieldOp::Storage(dest);
                 let (ResumeArg::Storage(l), ResumeArg::Storage(r), ResumeArg::Storage(d)) = (l, r, d) else { unreachable!() };
                 yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt, (&[l, r, d])));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
@@ -880,8 +880,8 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
             windowed!(Move, [], [], |owner, state, base| (from, out to) {
                 *to = from;
             });
-            let s = yield YieldOp::Storage(src, Access::Read);
-            let d = yield YieldOp::Storage(dest, Access::Write);
+            let s = yield YieldOp::Storage(src);
+            let d = yield YieldOp::Storage(dest);
             let (ResumeArg::Storage(s), ResumeArg::Storage(d)) = (s, d) else { unreachable!() };
             yield YieldOp::ExecWindow(Rc::new(Move::new(&[s, d])));
             // TODO: track references? see PyLBBV
@@ -925,7 +925,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             debug!("upval {:?}", &upval);
             *dest = upval;
         });
-        let d = yield YieldOp::Storage(a, Access::Write);
+        let d = yield YieldOp::Storage(a);
         let ResumeArg::Storage(d) = d else { unreachable!() };
         arg = yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[d])));
         // TODO: We can resolve upvalues to types, but would need to make sure to
@@ -996,11 +996,11 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
                     *var = if comp { idx } else { prev };
                     state.select = if comp { 0 } else { 1 };
                 });
-                let i = yield YieldOp::Storage(a, Access::Read);
-                let l = yield YieldOp::Storage(a + 1, Access::Read);
-                let s = yield YieldOp::Storage(a + 2, Access::Read);
-                let p = yield YieldOp::Storage(a + 3, Access::Read);
-                let v = yield YieldOp::Storage(a + 3, Access::Write);
+                let i = yield YieldOp::Storage(a);
+                let l = yield YieldOp::Storage(a + 1);
+                let s = yield YieldOp::Storage(a + 2);
+                let p = yield YieldOp::Storage(a + 3);
+                let v = yield YieldOp::Storage(a + 3);
                 let (ResumeArg::Storage(i), ResumeArg::Storage(l), ResumeArg::Storage(s), ResumeArg::Storage(p), ResumeArg::Storage(v)) = (i, l, s, p, v) else { unreachable!() };
                 yield YieldOp::ExecWindow(Rc::new(ForLoop::new(&[i, l, s, p, v])));
                 yield YieldOp::SetTypes(vec![(a + 3, LType::Number)]);
@@ -1072,9 +1072,6 @@ pub enum Residual {
     /// `Exec`'s closure, so processing sites never enumerate ops. Its operands
     /// are whole `LBoxed` values held in the register window.
     ExecWindow(Rc<dyn Window>),
-    /// A stack slot as an operand of the next `ExecWindow`, named by an opaque
-    /// token. See Note [Register window].
-    Storage(Gpr, Access),
     Call { a: u16, b: u16, c: u16 },
     Select(Vec<(&'static str, BlockId)>),
     Jump(BlockId),
@@ -1881,10 +1878,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
                 },
-                CoroutineState::Yielded(YieldOp::Storage(slot, access)) => {
-                    let gpr = self.tokens.mint(slot);
-                    self.blocks[block_id.0].instructions.push(Residual::Storage(gpr, access));
-                    arg = ResumeArg::Storage(gpr);
+                CoroutineState::Yielded(YieldOp::Storage(slot)) => {
+                    arg = ResumeArg::Storage(self.tokens.mint(slot));
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
@@ -2154,10 +2149,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     w.interp(owner, &mut state);
                 },
-                Residual::Storage(..) => {
-                    // See Note [Register window].
-                    off += 1;
-                },
                 Residual::LuaCall { lclos, a, b, c } => {
                     off += 1;
                     // Safety: transmute the 'static lifetime back down. This is always shorter.
@@ -2307,8 +2298,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::LuaGuard { idx, ptr } => format!("lua_guard({}, {:p})", idx, *ptr),
                         Residual::Exec(ResidualExec { name, .. }) => format!("exec({})", name),
                         Residual::ExecWindow(w) => format!("window({}{})", w.name(),
-                            w.operands().iter().map(|gpr| format!(", t{}", gpr.id())).collect::<String>()),
-                        Residual::Storage(gpr, access) => format!("storage(t{} = {}, {access:?})", gpr.id(), gpr.slot()),
+                            w.operands().iter().zip(w.accesses()).map(|(gpr, access)| match access {
+                                Access::Read => format!(", {}", gpr.slot()),
+                                Access::Write => format!(", out {}", gpr.slot()),
+                            }).collect::<String>()),
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call { a, b, c } => format!("call({}, {}, {})", a, b, c),
                         Residual::NativeCall { nf, a, b, c } => format!("ncall({:p}, {}, {}, {})", nf, a, b, c),

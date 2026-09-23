@@ -582,7 +582,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // window]). Registers carry values within a run only, so a run is entered
         // at its first residual alone: the others get no label, and a jump to one
         // fails to assemble.
-        let window = |r: &Residual| matches!(r, Residual::Storage(..) | Residual::ExecWindow(_));
+        let window = |r: &Residual| matches!(r, Residual::ExecWindow(_));
         let mut alloc = WindowAlloc::default();
         for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
@@ -908,7 +908,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
-                Residual::Storage(gpr, access) => alloc.storage(*gpr, *access),
                 Residual::ExecWindow(w) => {
                     let stencils = &mut self.jctx.stencils;
                     let skips: SmallVec<[usize; WINDOW]> =

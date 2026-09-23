@@ -131,20 +131,19 @@ The allocator needs to know which slots each op reads/writes; today `Exec` is an
 opaque closure so the JIT can't see its dataflow. Window ops make it visible
 (details in `Note [Register window]`, `src/window.rs`):
 
-- **`YieldOp::Storage(slot, Access)` → `ResumeArg::Storage(Gpr)`:** the emit
-  site gets an **opaque token** per operand, minted by the specializer and
-  recorded as `Residual::Storage(token, access)`. LBBV does no register
-  allocation.
+- **`YieldOp::Storage(slot)` → `ResumeArg::Storage(Gpr)`:** the emit site gets
+  an **opaque token** per operand, minted by the specializer. LBBV does no
+  register allocation, and the tokens leave no residual of their own.
 - **`Residual::ExecWindow(Rc<dyn Window>)`**, built from those tokens: inputs are
-  read-only and only outputs are written back (`windowed!(.., (out d, a, b))`),
+  read-only and only outputs are written back (`windowed!(.., (a, b, out d))`),
   so a register caching a slot only ever holds that slot's value. An op always
   runs on a contiguous run of the window, `w[SKIP..SKIP + arity]`, its operands
   in the order it declares them.
 - **JIT mode** (`src/window_alloc.rs`, `Note [Window allocation]`, section 6):
-  a streaming allocator. `Storage` only records its token; the op is placed at
-  the `SKIP` whose resculpt emits least, and flushing is deferred to the end of
-  the run. Interpreter mode: the op at `SKIP` 0; load the inputs from their
-  stack homes, run, flush the outputs (`Storage` is a no-op).
+  a streaming allocator: each op, its operands known from the op itself, is
+  placed at the `SKIP` whose resculpt emits least, and flushing is deferred to
+  the end of the run. Interpreter mode: the op at `SKIP` 0; load the inputs from
+  their stack homes, run, flush the outputs.
 
 **Copy&patch (the part worth the machinery).** Instead of emitting a `call` to
 the `Exec` closure body, splat the op's compiled **template/stencil** into the
@@ -164,7 +163,7 @@ field (`generator.rs:153`).
 ## 4. Implementation plan (ordering)
 
 1. **Expose dataflow.** Give the JIT visibility into each exec's read/write slots
-   — either the `Storage`/`ExecWindow` residuals above, or a `reads/writes`
+   — either the `ExecWindow` residuals above, or a `reads/writes`
    annotation on `ResidualExec`. No behavior change; interpreter keeps calling
    the body.
 2. **JIT-local `slot→Gpr` cache** in `jit_block`: linear-scan allocation,
@@ -270,13 +269,13 @@ green gate (default features ⇒ jit on).
 
 **M1 — DONE: generic windowed ops in the generator (JIT splat still disabled).**
 `Residual::ExecWindow(Rc<dyn Window>)`, like `Exec`'s closure, keeps processing
-sites generic; its operands are bound by `Residual::Storage` (section 3). The
+sites generic; its operands are `Storage` tokens (section 3). The
 interpreter runs `<dyn Window>::interp`: load the inputs from their stack homes,
 run the body with captures from the struct, flush the outputs (it can't run the
 stencil itself: holes read 0 until patched). The first user is `emit_numeric`'s
-dynamic int-int arm: `windowed!(NumericIntInt, [], [OP: Opcode], .. (lhs, rhs) -> (dest))`
-inline (body = the VM's own `numeric_op`/`box_lvalue`), operands bound by three
-`Storage`s, instance picked with `dispatch_numeric_window!` for all six opcodes;
+dynamic int-int arm: `windowed!(NumericIntInt, [], [OP: Opcode], .. (lhs, rhs, out dest))`
+inline (body = the VM's own `numeric_op`/`box_lvalue`), its operands three
+`Storage` tokens, instance picked with `dispatch_numeric_window!` for all six opcodes;
 the constant-operand arms keep their `Exec` closures.
 
 Verification:
@@ -286,7 +285,7 @@ Verification:
   appears in `relocations()` and the copy calls it correctly); a branchy stencil
   whose both arms fall through; and two outputs writing one slot is rejected.
 - Golden `window_chain.lua`: dependent arithmetic in one block becomes a single
-  run of `Storage`/`ExecWindow` residuals (visible in the `graph` feature's
+  run of `ExecWindow` residuals (visible in the `graph` feature's
   `func_N.dot`).
 - `just test-stencils` (opt-2): the same tests on optimized stencils, then the
   golden suite with feature `check_windows`, which copy&patches **every window
@@ -463,7 +462,7 @@ So we take the **streaming** part and not the exact stack discipline:
 
 `windowed!` declares one ordered operand list, each operand marked as an input
 or an output, e.g. `(out c, a, b)`. Operand `i` is window register `SKIP + i`.
-The emit site yields its `Storage`s in the same order. The allocator knows only
+The emit site mints its operands' tokens in the same order. The allocator knows only
 each operand's index and whether it is read or written, so it handles any order
 an op names:
 
@@ -471,8 +470,9 @@ an op names:
 - `GetTableHref` declares `(table, out dest)`;
 - `SetTableHref` declares `(table, value)`;
 - `Move` (`emit_move`) declares `(from, out to)`;
-- `LoadK` (`emit_loadk`) declares `(out dest)`, reading the constant from
-  the prototype;
+- `LoadKNumber` / `LoadKString` (`emit_loadk`) declare `(out dest)`, reading
+  the constant from the prototype (one op per kind: converting any constant is
+  a `match` on its kind, which compiles to a jump table the copier rejects);
 - `ForLoop` (`emit_forloop`, numbers) declares `(idx, limit, step, prev, out
   var)` and sets `state.select` for the `Select` after it. The loop variable is
   set only when the loop continues; since an output is always written back, the
@@ -497,8 +497,7 @@ There is no liveness. Every cached value is only a cache: overwriting a clean
 one drops it, and a later read reloads it; overwriting a dirty one stores it
 first.
 
-`Storage` records its token and decides nothing. At an `ExecWindow` with operands
-`o_0..o_{n-1}`:
+At an `ExecWindow` with operands `o_0..o_{n-1}` (from the op itself):
 
 1. **Pick `SKIP`** from `0..=WINDOW-n`, the cheapest by what it would emit:
    - an input already in its register costs nothing;
@@ -519,7 +518,7 @@ first.
 3. **Update**: each output is cached, dirty, in its register, and other copies of
    its slot's older value are dropped.
 
-At a flush point (any residual other than `Storage`/`ExecWindow`), store every
+At a flush point (any residual other than an `ExecWindow`), store every
 dirty register. Calls clobber every register, so the cache is emptied too.
 
 **What it gives up**, worked by hand on nbody's steady-state runs: the table

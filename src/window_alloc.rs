@@ -4,15 +4,15 @@
 
 use smallvec::SmallVec;
 
-use crate::window::{Access, Gpr, Window, WINDOW};
+use crate::window::{Access, Window, WINDOW};
 
 // Note [Window allocation]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
 // A streaming allocator, like copy-and-patch's (Xu & Kjolstad, OOPSLA 2021): one
 // forward pass during codegen, a few register comparisons per op, no lookahead
 // and no liveness. Each register caches at most one slot's current value, and a
-// cached slot is dirty while its stack home is stale. `Storage` only records its
-// token. At an `ExecWindow` the op runs at the usable `SKIP` whose resculpt of
+// cached slot is dirty while its stack home is stale. At an `ExecWindow`, its
+// operands known from the op itself, the op runs at the usable `SKIP` whose resculpt of
 // `w[SKIP..]` emits least, at `MEMORY_COST` per load or store and `MOVE_COST`
 // per register move:
 //
@@ -88,8 +88,6 @@ pub struct WindowAlloc {
     /// Window registers in use: `WINDOW`, or fewer to test register pressure.
     width: usize,
     cache: Cache,
-    /// Tokens recorded by `Storage` since the last op.
-    pending: SmallVec<[(Gpr, Access); WINDOW]>,
 }
 
 impl Default for WindowAlloc {
@@ -101,30 +99,18 @@ impl Default for WindowAlloc {
 impl WindowAlloc {
     fn with_width(width: usize) -> Self {
         assert!(width <= WINDOW);
-        WindowAlloc { width, cache: Cache::default(), pending: SmallVec::new() }
+        WindowAlloc { width, cache: Cache::default() }
     }
 
-    /// Whether no register holds a value and no token is pending.
+    /// Whether no register holds a value.
     pub fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.cache.regs.iter().all(Option::is_none)
-    }
-
-    /// A `Storage` of the run.
-    pub fn storage(&mut self, gpr: Gpr, access: Access) {
-        self.pending.push((gpr, access));
+        self.cache.regs.iter().all(Option::is_none)
     }
 
     /// The next op of the run: resculpt the window for it at the cheapest of the
     /// `skips` it can run at, and run it. `None` if there are none.
     pub fn op(&mut self, op: &dyn Window, skips: impl IntoIterator<Item = usize>) -> Option<SmallVec<[Emit; 16]>> {
-        let name = op.name();
         let accesses = op.accesses();
-        assert_eq!(self.pending.len(), op.operands().len(), "{name}: operands without a Storage");
-        for (i, ((gpr, access), operand)) in self.pending.iter().zip(op.operands()).enumerate() {
-            assert_eq!(gpr, operand, "{name}: operand {i} is not the token of its Storage");
-            assert_eq!(*access, accesses[i], "{name}: operand {i} was stored as {access:?}");
-        }
-        self.pending.clear();
         let slots: SmallVec<[usize; WINDOW]> = op.operands().iter().map(|gpr| gpr.slot()).collect();
         let plan = skips
             .into_iter()
@@ -137,7 +123,6 @@ impl WindowAlloc {
 
     /// End the run: flush every dirty register.
     pub fn flush(&mut self) -> SmallVec<[Emit; WINDOW]> {
-        assert!(self.pending.is_empty(), "a window run ended between a Storage and its op");
         let cache = core::mem::take(&mut self.cache);
         cache
             .dirty
@@ -370,9 +355,6 @@ mod tests {
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
         for w in &windows {
-            for (gpr, access) in w.operands().iter().zip(w.accesses()) {
-                alloc.storage(*gpr, *access);
-            }
             for emit in alloc.op(&**w, 0..WINDOW).unwrap() {
                 machine.exec(emit, Some(&**w));
             }

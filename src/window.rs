@@ -59,24 +59,23 @@
 // must reach this frame's stack slots only through its operands: any of them
 // may have a newer value in a register than in its stack home.
 //
-// The specializer never chooses registers. Before an `ExecWindow`, the emit site
-// yields a `Storage(slot, access)` for each operand and is resumed with an opaque
-// `Gpr` token naming that use of the slot; the op is built from the tokens.
-// `Residual::Storage(token, access)` records each one.
+// The specializer never chooses registers. For each operand, the emit site
+// yields a `Storage(slot)` and is resumed with an opaque `Gpr` token naming that
+// use of the slot; the op is built from the tokens, and its `ExecWindow` is the
+// only residual.
 //
-// The JIT allocates registers (`crate::window_alloc`). `Storage` only records the
-// token as an operand of the next op; at the `ExecWindow`, knowing all of its
-// operands, the JIT picks `SKIP` and resculpts the window from `SKIP` on: each
+// The JIT allocates registers (`crate::window_alloc`) at each `ExecWindow`,
+// knowing all of its operands from the op: it picks `SKIP` and resculpts the
+// window from `SKIP` on: each
 // input is moved there from the register already caching its slot, or loaded
 // from the slot's stack home, and cached values displaced from the run are moved
 // to spare registers or evicted. A register holding the only copy of a slot's
 // current value is dirty until flushed to the stack home, at an eviction or when
 // the run of window residuals ends.
 //
-// The interpreter keeps no window between residuals: `Storage` is a no-op, and
-// `ExecWindow` runs the op at `SKIP` 0, loading its inputs from their stack homes
-// and flushing its outputs. It never depends on an earlier `Storage`, so resuming
-// a block at any residual is sound.
+// The interpreter keeps no window between residuals: `ExecWindow` runs the op at
+// `SKIP` 0, loading its inputs from their stack homes and flushing its outputs,
+// so resuming a block at any residual is sound.
 
 use std::collections::HashMap;
 
@@ -183,10 +182,6 @@ pub struct Gpr {
 }
 
 impl Gpr {
-    /// Unique among the tokens minted by one [`Tokens`].
-    pub fn id(self) -> u32 {
-        self.id
-    }
     /// The slot, relative to the frame's base.
     pub fn slot(self) -> usize {
         self.slot as usize
@@ -205,7 +200,7 @@ impl Tokens {
     }
 }
 
-/// How an op uses the slot a `Storage` names.
+/// How an op uses one of its operands' slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     /// The op reads the slot's value.

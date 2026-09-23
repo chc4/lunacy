@@ -2,8 +2,8 @@
 """List the runs of window residuals in `graph` feature dumps (func_N.dot).
 
 Each block is printed with how many times the interpreter entered it (hottest
-first), its residuals, and each run of `Storage`/`ExecWindow` residuals as the
-ops it holds, operands in window order by stack slot, outputs marked `out`.
+first), its residuals, and each run of `ExecWindow` residuals as the ops it
+holds, operands in window order by stack slot, outputs marked `out`.
 See docs/jit-register-cache.md; `just window-runs` produces the dumps.
 """
 import argparse
@@ -11,7 +11,6 @@ import re
 import sys
 
 BLOCK = re.compile(r'(\d+)\[id=\d+,shape=record,label="(.*?)"\]\n')
-STORAGE = re.compile(r'storage\(t(\d+) = (\d+), (Read|Write)\)')
 
 
 def blocks(dot):
@@ -30,14 +29,11 @@ def blocks(dot):
 
 def describe(residuals):
     """The residuals, each run of window residuals collapsed into its ops."""
-    tokens, run, out = {}, [], []
+    run, out = [], []
     for r in residuals:
-        storage = STORAGE.fullmatch(r)
-        if storage:
-            tokens[storage.group(1)] = ('out ' if storage.group(3) == 'Write' else '') + storage.group(2)
-        elif r.startswith('window('):
+        if r.startswith('window('):
             name, *operands = r[len('window('):-1].split(', ')
-            run.append('%s(%s)' % (name, ', '.join(tokens[t[1:]] for t in operands)))
+            run.append('%s(%s)' % (name, ', '.join(operands)))
         else:
             if run:
                 out.append('RUN[%d]: %s' % (len(run), '; '.join(run)))
