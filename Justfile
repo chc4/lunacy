@@ -19,7 +19,7 @@ test:
 # stencils, then the golden suite with `check_windows`: every window op the
 # interpreter executes is also copy&patched and run natively, and the results
 # must match. (At opt-level 0, `NumericIntInt` keeps a jump table from the
-# unfolded `match OP`, which the copier rejects.)
+# unfolded `match OP`, which the copier rejects, so the check skips it.)
 STENCIL_OPT := "--config 'profile.dev.package.lunacy.opt-level=2' --config 'profile.dev.package.lunacy.debug-assertions=false' --config 'profile.dev.package.lunacy.overflow-checks=false'"
 [env("RUST_BACKTRACE","1")]
 test-stencils:

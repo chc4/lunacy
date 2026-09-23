@@ -18,7 +18,7 @@ lbbv = []
 # specialized blocks LBBV produces.
 jit = ["lbbv"]
 # Differential-check every window op the interpreter runs against its
-# copy&patched stencil (see src/window.rs; needs an optimized build).
+# copy&patched stencil (see src/window.rs; ops the copier rejects are skipped).
 check_windows = ["lbbv"]
 unreachable = []
 gas = []

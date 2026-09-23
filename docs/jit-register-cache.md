@@ -241,10 +241,13 @@ green gate (default features ⇒ jit on).
   In the JIT all three become dynasm relocations patched at `finalize`;
   `assemble` does the same by hand in a near-mapped buffer.
 - Calls are fine anywhere (they return). A jump that leaves the stencil without
-  being a `become` would skip the rest of the chain, so it is rejected loudly: a
-  sibling tail call, or an indirect jump like a jump table (its entries lead back
-  into the original function). An opt-level 0 `NumericIntInt` has one (unfolded
-  `match OP`); optimized builds don't. Debug builds are otherwise copyable now
+  being a `become` would skip the rest of the chain, so the copier rejects it:
+  a sibling tail call, or an indirect jump like a jump table (its entries lead
+  back into the original function). An opt-level 0 `NumericIntInt` has one
+  (unfolded `match OP`); optimized builds don't. The copier (`Image::load`,
+  `stencil_body`, `assemble`) returns a `StencilError` rather than panicking, so
+  the JIT can fall back to calling the op's body; `check_windows` skips (and
+  logs) ops it rejects. Debug builds are otherwise copyable now
   (their un-inlined helper calls and assertion panics are just relocations). The
   interpreter runs any window op regardless.
 
@@ -283,8 +286,8 @@ Hand dynasm each body's `holes`, `nexts` and `relocations()` as relocations
 (pool labels, a label at the copy's end, and absolute targets) so `finalize`
 patches them all at once. Needs the window-offset choice (the register
 allocator, below), a Storage/Flush boundary around window runs, and a generic
-fallback for ops the copier rejects (call the body instead of splatting — the
-copier should return an error rather than panic for that). Open items: jump
+fallback for ops the copier rejects (it returns a `StencilError`: call the
+body instead of splatting). Open items: jump
 tables (copy the table and rebase its entries, if a real op needs one); check
 fat-LTO release builds keep each op's continuation as a real tail target.
 
