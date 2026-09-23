@@ -93,9 +93,9 @@ side exit's `live_out` as a use that may stay in the stack home (it takes a
 register only if one is free), as the thesis does for values that may be on the
 stack.
 
-**What is kept.** Per window op its `SKIP`; per block that an edge between
-traces enters (trace heads, and blocks entered in the middle of their trace),
-the window at its start. Code generation stays forward, as now: each op runs at
+**What is kept.** Per window op its `SKIP`, and per block the window at its
+start, which every edge entering it other than from its predecessor in the
+trace is resolved into. Code generation stays forward, as now: each op runs at
 its `SKIP`, dirty values are stored when dropped, at flush points and at exits,
 and each edge between traces is resolved by the existing transfer (stores, then
 a parallel move by windmill peeling). The transfer is emitted at the edge's own
@@ -114,17 +114,21 @@ The thesis's CFGs have no critical edges; LBBV's do, because a jump or select
 target is looked up by bytecode position and context, so branches rejoin a
 shared version (in life, two blocks each select between the same two blocks).
 Without critical edges, every edge between two blocks of a trace joins
-consecutive blocks, or is a back edge ending the trace. Every policy keeps that
-by construction:
+consecutive blocks, or is a back edge ending the trace. With them, a trace can
+also have a forward edge skipping blocks (from `T[i]` to a join `T[j]`, `j > i +
+1`), a back edge leaving from its middle (a latch whose select exits the loop,
+with the exit appended after it), or a block jumping to itself.
 
-- it never extends a trace across a retreating edge of the region's
-  depth-first walk, so no edge inside a trace goes backwards, reducible or not;
-- it never appends a block that another block of the same trace, other than the
-  last, also jumps to. The join starts a trace of its own instead, entered
-  through edges between traces like any other.
-
-Resolution needs nothing more: its transfers go on each edge's own jump, a
-select emitting a jump per target, so no edge needs splitting.
+None of these need the policy to avoid them. The backward pass only relies on
+the definition: along each edge between consecutive blocks of a trace, the
+window wanted at the start of `T[i + 1]` is the one at the end of `T[i]`. Every
+other edge entering a block, from the same trace or another, is resolved at its
+own jump by a transfer into the window recorded at the target's start, as
+entries into the middle of a trace are in the thesis; a select emits a jump per
+target, so no edge needs splitting. A window is recorded at the start of every
+block of a trace. The only rule policies keep is the definition's: a trace is
+never extended across a retreating edge of the region's depth-first walk, so
+the edges between its consecutive blocks all go forward, reducible or not.
 
 - **Single-block.** Every block is its own trace: local allocation, with every
   edge between blocks resolved. Traces are allocated in the region's
