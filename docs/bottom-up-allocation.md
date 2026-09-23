@@ -122,27 +122,42 @@ interpreter enters from memory.
 
 ## Loop headers
 
-With LBBV, a loop's first iteration is peeled while the specialization context
-reaches its fixpoint, so the steady-state loop header is its own block. Its
-predecessors are the peeled iteration (a forward edge) and the latch (the back
-edge).
+A loop header is the target of a back edge (an edge to a block still on the
+search stack), and that matters for one reason: in postorder, the back edge is
+the only edge whose source is processed before its target. Every other edge's
+source starts its backward pass from its target's used-in, so the target's
+reads are computed where they're read, and the edge costs nothing when those
+placements fit. The latch can't do that. The header's used-in depends on the
+header's successors, which lead around the loop to the latch itself. So the
+back edge is where a loop's placements meet, and its reconciliation runs every
+iteration. (With LBBV the loop's first iteration is peeled while the
+specialization context reaches its fixpoint, so the steady-state header's
+other predecessor is the peeled iteration, an ordinary forward edge.)
 
-**Baseline.** The latch is processed before the header, so its live-out is
-empty: it places its values freely, and its jump to the header reconciles with
-the header's used-in by parallel moves each iteration. The header's used-in is
-what the header block itself reads, placed where its own ops want it, not what
-the peeled iteration happened to leave. The peeled iteration's live-out is that
-used-in, so it computes those values straight into place. As I remember
-LuaJIT's assembler, it gets the same bias by assembling the loop body first and
-the pre-roll after, with a shuffle of the loop-carried values at the loop's
-end. That is worth checking against its source before relying on it.
+Placements around a cycle depend on each other, so some reconciliation on it
+is unavoidable in general. What is open is how much the back edge costs:
 
-**Using the back edges.** A second backward pass over just the loop's blocks,
-with the header's used-in as the latch's live-out, would compute the
-loop-carried values straight into the registers the header wants, making the
-back edge's reconciliation empty. That costs one more pass over each loop's
-blocks; the marked back edges say which blocks those are. The choice between
-this and the baseline is open.
+- **Nothing wanted at the latch's end.** The latch's live-out is empty. The
+  values it leaves for the header (the loop-carried ones, such as the loop
+  variables) are placed without regard to where the header reads them, and the
+  back edge moves them there. That is a move each while they stay in registers.
+  One the latch's pass dropped, because it wasn't wanted and a later op needed
+  its register, costs a store and a load.
+- **The header's used-in at the latch's end, from a second pass.** Once the
+  first pass has computed the header's used-in, run the backward pass again
+  over just the loop's blocks (those on a path from the header to the latch),
+  with that used-in as the latch's live-out. The loop-carried values are then
+  computed where the header reads them. The second pass can change the
+  header's used-in itself, since its successors' used-in changed, and the back
+  edge then reconciles with the new one. That means fewer moves, and none only
+  when it doesn't change. The cost is one more pass over each loop's blocks,
+  which the marked back edges identify.
+
+As I remember LuaJIT's assembler, it puts this reconciliation on the same edge.
+It assembles the loop body backwards from the loop's end and emits a shuffle of
+the loop-carried values (its PHIs) there, with register hints so that a value's
+definition tends to land where the loop's start reads it. That is worth
+checking against its source.
 
 ## Worked by hand
 
@@ -202,4 +217,4 @@ This proposal doesn't add lookahead.
   the live-out (the loop continuation, for a for-loop's select)?
 - Whether a failure jump's target should contribute wants too, making failure
   paths cheaper at the fast path's expense.
-- The loop-header choice above.
+- Which back-edge treatment above, or something else.
