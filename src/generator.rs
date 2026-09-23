@@ -20,7 +20,7 @@ use crate::vm::LConstant;
 use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
-use crate::window::{windowed, Access, Gpr, Tokens, Window};
+use crate::window::{windowed, Access, Window};
 // The native code generator (`JitContext`) and its per-block `JitInfo` (dynasm
 // buffer + hotness tiering) are only needed with the `jit` feature. LBBV on its
 // own is a second interpreter tier and doesn't touch them.
@@ -202,9 +202,7 @@ pub enum YieldOp {
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
                            // is the expected type
     Exec(ResidualExec), // Emit a residual operation that will be executed
-    Storage(usize), // Resumed with Storage(Gpr), an opaque token for STACK[idx] as an
-                            // operand of the next ExecWindow. See Note [Register window].
-    ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op over Storage tokens
+    ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op. See Note [Register window].
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(BlockId), // Emit a jump to the given BlockId
@@ -252,7 +250,6 @@ pub enum ResumeArg {
     Type(CType),
     BlockId(BlockId),
     HashRef(HashRef, CType),
-    Storage(Gpr),
 }
 
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -268,15 +265,13 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
             let Constant::String(s) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
             *dest = LBoxed::interned(*s);
         });
-        let d = yield YieldOp::Storage(dest);
-        let ResumeArg::Storage(d) = d else { unreachable!() };
         match c {
             LType::Number => {
-                yield YieldOp::ExecWindow(Rc::new(LoadKNumber::new(bx, &[d])));
+                yield YieldOp::ExecWindow(Rc::new(LoadKNumber::new(bx, &[dest])));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
             },
             LType::String => {
-                yield YieldOp::ExecWindow(Rc::new(LoadKString::new(bx, &[d])));
+                yield YieldOp::ExecWindow(Rc::new(LoadKString::new(bx, &[dest])));
                 yield YieldOp::SetTypes(vec![(dest, LType::String)]);
             },
             _ => unreachable!(),
@@ -357,10 +352,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 debug!("gettable_href fetched {val1:?}");
                 *dest = *val1;
             });
-            let t = yield YieldOp::Storage(b);
-            let d = yield YieldOp::Storage(a);
-            let (ResumeArg::Storage(t), ResumeArg::Storage(d)) = (t, d) else { unreachable!() };
-            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[t, d])));
+            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[b, a])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
         } else {
             arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
@@ -455,13 +447,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: bool], |owner, state, base| (table, value) {
                         store(owner, state, table, value, href, expected, RETYPE);
                     });
-                    let t = yield YieldOp::Storage(a);
-                    let v = yield YieldOp::Storage(c);
-                    let (ResumeArg::Storage(t), ResumeArg::Storage(v)) = (t, v) else { unreachable!() };
                     arg = yield YieldOp::ExecWindow(if retype {
-                        Rc::new(SetTableHref::<true>::new(hb.0, expected, &[t, v]))
+                        Rc::new(SetTableHref::<true>::new(hb.0, expected, &[a, c]))
                     } else {
-                        Rc::new(SetTableHref::<false>::new(hb.0, expected, &[t, v]))
+                        Rc::new(SetTableHref::<false>::new(hb.0, expected, &[a, c]))
                     });
                 } else {
                     arg = yield YieldOp::Exec(ResidualExec::new("settable_href", Rc::new(move |owner, state| {
@@ -579,11 +568,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                 });
 
-                let l = yield YieldOp::Storage(lhs);
-                let r = yield YieldOp::Storage(rhs);
-                let d = yield YieldOp::Storage(dest);
-                let (ResumeArg::Storage(l), ResumeArg::Storage(r), ResumeArg::Storage(d)) = (l, r, d) else { unreachable!() };
-                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt, (&[l, r, d])));
+                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntInt, (&[lhs, rhs, dest])));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
@@ -880,10 +865,7 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
             windowed!(Move, [], [], |owner, state, base| (from, out to) {
                 *to = from;
             });
-            let s = yield YieldOp::Storage(src);
-            let d = yield YieldOp::Storage(dest);
-            let (ResumeArg::Storage(s), ResumeArg::Storage(d)) = (s, d) else { unreachable!() };
-            yield YieldOp::ExecWindow(Rc::new(Move::new(&[s, d])));
+            yield YieldOp::ExecWindow(Rc::new(Move::new(&[src, dest])));
             // TODO: track references? see PyLBBV
             debug!("move {} = {} {:?}", dest, src, t);
             yield YieldOp::SetCTypes(vec![(dest, t)]);
@@ -925,9 +907,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             debug!("upval {:?}", &upval);
             *dest = upval;
         });
-        let d = yield YieldOp::Storage(a);
-        let ResumeArg::Storage(d) = d else { unreachable!() };
-        arg = yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[d])));
+        arg = yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[a])));
         // TODO: We can resolve upvalues to types, but would need to make sure to
         // keep them synced with the type of the stack slot or SETUPVAL/calls.
         arg = yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
@@ -996,13 +976,7 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
                     *var = if comp { idx } else { prev };
                     state.select = if comp { 0 } else { 1 };
                 });
-                let i = yield YieldOp::Storage(a);
-                let l = yield YieldOp::Storage(a + 1);
-                let s = yield YieldOp::Storage(a + 2);
-                let p = yield YieldOp::Storage(a + 3);
-                let v = yield YieldOp::Storage(a + 3);
-                let (ResumeArg::Storage(i), ResumeArg::Storage(l), ResumeArg::Storage(s), ResumeArg::Storage(p), ResumeArg::Storage(v)) = (i, l, s, p, v) else { unreachable!() };
-                yield YieldOp::ExecWindow(Rc::new(ForLoop::new(&[i, l, s, p, v])));
+                yield YieldOp::ExecWindow(Rc::new(ForLoop::new(&[a, a + 1, a + 2, a + 3, a + 3])));
                 yield YieldOp::SetTypes(vec![(a + 3, LType::Number)]);
             },
             _ => {
@@ -1245,8 +1219,6 @@ pub struct Specializer<'src, 'intern> {
     pub versions: std::collections::HashMap<
         LProto<'src, 'intern>,
         std::collections::HashMap<(SubPc, Rc<Context>), BlockId>, InternedHasher>,
-    /// Mints the `Storage` tokens of window ops.
-    pub tokens: Tokens,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -1269,7 +1241,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             clos,
-            tokens: Tokens::default(),
         }
     }
 
@@ -1878,9 +1849,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
                 },
-                CoroutineState::Yielded(YieldOp::Storage(slot)) => {
-                    arg = ResumeArg::Storage(self.tokens.mint(slot));
-                },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
                 },
@@ -2298,9 +2266,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::LuaGuard { idx, ptr } => format!("lua_guard({}, {:p})", idx, *ptr),
                         Residual::Exec(ResidualExec { name, .. }) => format!("exec({})", name),
                         Residual::ExecWindow(w) => format!("window({}{})", w.name(),
-                            w.operands().iter().zip(w.accesses()).map(|(gpr, access)| match access {
-                                Access::Read => format!(", {}", gpr.slot()),
-                                Access::Write => format!(", out {}", gpr.slot()),
+                            w.operands().iter().zip(w.accesses()).map(|(slot, access)| match access {
+                                Access::Read => format!(", {slot}"),
+                                Access::Write => format!(", out {slot}"),
                             }).collect::<String>()),
                         Residual::Jump(target) => format!("jump({})", target.0),
                         Residual::Call { a, b, c } => format!("call({}, {}, {})", a, b, c),

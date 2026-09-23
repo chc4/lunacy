@@ -111,7 +111,7 @@ impl WindowAlloc {
     /// `skips` it can run at, and run it. `None` if there are none.
     pub fn op(&mut self, op: &dyn Window, skips: impl IntoIterator<Item = usize>) -> Option<SmallVec<[Emit; 16]>> {
         let accesses = op.accesses();
-        let slots: SmallVec<[usize; WINDOW]> = op.operands().iter().map(|gpr| gpr.slot()).collect();
+        let slots = op.operands();
         let plan = skips
             .into_iter()
             .filter(|&skip| skip + slots.len() <= self.width)
@@ -241,7 +241,7 @@ fn sequentialize(moves: &mut SmallVec<[(usize, Source); 8]>, emits: &mut SmallVe
 mod tests {
     use super::*;
     use crate::lboxed::LBoxed;
-    use crate::window::{windowed, Tokens};
+    use crate::window::windowed;
     use std::collections::HashMap;
 
     // Ops of each shape, their operands in window order as the emit sites
@@ -321,14 +321,14 @@ mod tests {
                 Emit::Op { skip } => {
                     let op = op.expect("an op");
                     let operands = op.operands().iter().zip(op.accesses()).enumerate();
-                    for (i, (gpr, _)) in operands.clone().filter(|(_, (_, a))| **a == Access::Read) {
-                        let current = Self::version(&self.current, gpr.slot());
-                        assert_eq!(self.regs[skip + i], Some((gpr.slot(), current)), "input {i} of {op:?}");
+                    for (i, (&slot, _)) in operands.clone().filter(|(_, (_, a))| **a == Access::Read) {
+                        let current = Self::version(&self.current, slot);
+                        assert_eq!(self.regs[skip + i], Some((slot, current)), "input {i} of {op:?}");
                     }
-                    for (i, (gpr, _)) in operands.filter(|(_, (_, a))| **a == Access::Write) {
-                        let version = Self::version(&self.current, gpr.slot()) + 1;
-                        self.current.insert(gpr.slot(), version);
-                        self.regs[skip + i] = Some((gpr.slot(), version));
+                    for (i, (&slot, _)) in operands.filter(|(_, (_, a))| **a == Access::Write) {
+                        let version = Self::version(&self.current, slot) + 1;
+                        self.current.insert(slot, version);
+                        self.regs[skip + i] = Some((slot, version));
                     }
                 }
             }
@@ -338,17 +338,16 @@ mod tests {
     /// Allocate and execute a run in a window of `width` registers, returning
     /// the machine for its counts.
     fn run(width: usize, ops: &[TestOp]) -> Machine {
-        let mut t = Tokens::default();
         let windows: Vec<Box<dyn Window>> = ops
             .iter()
             .map(|op| -> Box<dyn Window> {
                 match *op {
-                    TestOp::Bin(a, b, d) => Box::new(Bin::new(&[t.mint(a), t.mint(b), t.mint(d)])),
-                    TestOp::BinFirst(a, b, d) => Box::new(BinFirst::new(&[t.mint(d), t.mint(a), t.mint(b)])),
-                    TestOp::Get(a, d) => Box::new(Get::new(&[t.mint(a), t.mint(d)])),
-                    TestOp::Set(a, b) => Box::new(Set::new(&[t.mint(a), t.mint(b)])),
-                    TestOp::Out(d) => Box::new(Out::new(&[t.mint(d)])),
-                    TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[t.mint(i), t.mint(l), t.mint(s), t.mint(v), t.mint(v)])),
+                    TestOp::Bin(a, b, d) => Box::new(Bin::new(&[a, b, d])),
+                    TestOp::BinFirst(a, b, d) => Box::new(BinFirst::new(&[d, a, b])),
+                    TestOp::Get(a, d) => Box::new(Get::new(&[a, d])),
+                    TestOp::Set(a, b) => Box::new(Set::new(&[a, b])),
+                    TestOp::Out(d) => Box::new(Out::new(&[d])),
+                    TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[i, l, s, v, v])),
                 }
             })
             .collect();

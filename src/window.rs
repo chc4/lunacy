@@ -4,7 +4,7 @@
 //! [`windowed!`], exactly as it would a `define_exec!` closure. That produces:
 //!
 //! * a struct whose fields are the op's **captures** (its holes' values) plus the
-//!   [`Gpr`] tokens of its operands, and which implements [`Window`] — a trait
+//!   stack slots of its operands, and which implements [`Window`] — a trait
 //!   object the specializer stores in `Residual::ExecWindow`, so no processing
 //!   site enumerates ops (like `Exec`'s closure);
 //! * an `#[inline(always)]` body shared by both tiers (single source of truth);
@@ -59,10 +59,8 @@
 // must reach this frame's stack slots only through its operands: any of them
 // may have a newer value in a register than in its stack home.
 //
-// The specializer never chooses registers. For each operand, the emit site
-// yields a `Storage(slot)` and is resumed with an opaque `Gpr` token naming that
-// use of the slot; the op is built from the tokens, and its `ExecWindow` is the
-// only residual.
+// The specializer never chooses registers: the emit site builds the op from
+// its operands' stack slots, and its `ExecWindow` is the only residual.
 //
 // The JIT allocates registers (`crate::window_alloc`) at each `ExecWindow`,
 // knowing all of its operands from the op: it picks `SKIP` and resculpts the
@@ -171,34 +169,7 @@ impl<T: Copy + std::fmt::Debug + 'static> Capture for T {
     }
 }
 
-// ---- storage tokens -------------------------------------------------------
-
-/// An opaque token for one use of a stack slot by a window op, minted by
-/// [`Tokens::mint`]. See Note [Register window].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Gpr {
-    id: u32,
-    slot: u16,
-}
-
-impl Gpr {
-    /// The slot, relative to the frame's base.
-    pub fn slot(self) -> usize {
-        self.slot as usize
-    }
-}
-
-/// Mints [`Gpr`] tokens.
-#[derive(Debug, Default)]
-pub struct Tokens(u32);
-
-impl Tokens {
-    pub fn mint(&mut self, slot: usize) -> Gpr {
-        let id = self.0;
-        self.0 = self.0.checked_add(1).expect("storage tokens exhausted");
-        Gpr { id, slot: slot.try_into().expect("stack slot out of range for a storage token") }
-    }
-}
+// ---- operands -------------------------------------------------------------
 
 /// How an op uses one of its operands' slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,13 +180,13 @@ pub enum Access {
     Write,
 }
 
-/// Check a window op's operand tokens against its operands' accesses: no two
+/// Check a window op's operand slots against its operands' accesses: no two
 /// outputs write the same slot.
 #[doc(hidden)]
-pub fn check_operands(name: &str, operands: &[Gpr], accesses: &[Access]) {
-    let outputs = || operands.iter().zip(accesses).filter(|(_, a)| **a == Access::Write).map(|(g, _)| g);
+pub fn check_operands(name: &str, operands: &[usize], accesses: &[Access]) {
+    let outputs = || operands.iter().zip(accesses).filter(|(_, a)| **a == Access::Write).map(|(slot, _)| *slot);
     for (i, a) in outputs().enumerate() {
-        assert!(outputs().skip(i + 1).all(|b| b.slot != a.slot), "{name}: two outputs write slot {}", a.slot);
+        assert!(outputs().skip(i + 1).all(|b| b != a), "{name}: two outputs write slot {a}");
     }
 }
 
@@ -224,9 +195,9 @@ pub fn check_operands(name: &str, operands: &[Gpr], accesses: &[Access]) {
 /// A copy&patch window op, as stored in `Residual::ExecWindow`.
 pub trait Window: std::fmt::Debug {
     fn name(&self) -> &'static str;
-    /// The operands' tokens, in the order the op declares them: operand `i` is
-    /// window register `SKIP + i`.
-    fn operands(&self) -> &[Gpr];
+    /// The operands' stack slots, relative to the frame's base, in the order the
+    /// op declares them: operand `i` is window register `SKIP + i`.
+    fn operands(&self) -> &[usize];
     /// Whether each operand is read (an input) or written (an output).
     fn accesses(&self) -> &'static [Access];
     /// Hole values, in `__lunacy_holeN` order.
@@ -255,8 +226,8 @@ impl dyn Window {
     pub fn interp<'src, 'intern>(&self, owner: &mut Owner, state: &mut RunState<'src, 'intern>) {
         let operands = self.operands().iter().zip(self.accesses()).enumerate();
         let mut w = [LBoxed::NIL; WINDOW];
-        for (i, (gpr, _)) in operands.clone().filter(|(_, (_, a))| **a == Access::Read) {
-            w[i] = state.vals[state.base + gpr.slot()];
+        for (i, (slot, _)) in operands.clone().filter(|(_, (_, a))| **a == Access::Read) {
+            w[i] = state.vals[state.base + slot];
         }
         let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
         #[cfg(feature = "check_windows")]
@@ -264,8 +235,8 @@ impl dyn Window {
         unsafe { self.run(owner, state, base, &mut w, 0) };
         #[cfg(feature = "check_windows")]
         check::check(self, owner, state, base, before, &w);
-        for (i, (gpr, _)) in operands.filter(|(_, (_, a))| **a == Access::Write) {
-            state.vals[state.base + gpr.slot()] = w[i];
+        for (i, (slot, _)) in operands.filter(|(_, (_, a))| **a == Access::Write) {
+            state.vals[state.base + slot] = w[i];
         }
     }
 }
@@ -292,7 +263,7 @@ pub(crate) use bind_holes;
 /// windowed!(Name, [k: f64], [OP: Opcode], |owner, state, base| (out d, a, b) {
 ///     *d = /* ... uses a, b, k, OP, owner, state, base ... */;
 /// });
-/// let w: Rc<dyn Window> = Rc::new(Name::<{ Opcode::ADD }>::new(k, &[d, a, b])); // `Gpr` tokens
+/// let w: Rc<dyn Window> = Rc::new(Name::<{ Opcode::ADD }>::new(k, &[d, a, b])); // slots
 /// ```
 ///
 /// * `[captures]` — struct fields, and the stencil's holes (at most `MAX_HOLES`;
@@ -305,7 +276,7 @@ pub(crate) use bind_holes;
 ///   otherwise read or write this frame's stack slots (see Note [Register
 ///   window]).
 ///
-/// `new(captures.., operands)` takes the operands' [`Gpr`] tokens in the same
+/// `new(captures.., operands)` takes the operands' stack slots in the same
 /// order. See Note [Register window].
 macro_rules! windowed {
     (
@@ -337,7 +308,7 @@ macro_rules! windowed {
         #[derive(Debug, Clone)]
         pub struct $name<$(const $cp: $cpt),*> {
             $(pub $cap: $cty,)*
-            operands: ::smallvec::SmallVec<[$crate::window::Gpr; $crate::window::WINDOW]>,
+            operands: ::smallvec::SmallVec<[usize; $crate::window::WINDOW]>,
         }
 
         #[allow(unused_variables, unused_mut, unused_assignments, unused_unsafe, clippy::too_many_arguments)]
@@ -346,8 +317,8 @@ macro_rules! windowed {
             const ACCESSES: &'static [$crate::window::Access] = &[$($crate::window::Access::$acc),*];
             const FITS: () = assert!(Self::ARITY <= $crate::window::WINDOW, "more operands than window registers");
 
-            /// `operands`: the operands' tokens, in window order.
-            pub fn new($($cap: $cty,)* operands: &[$crate::window::Gpr]) -> Self {
+            /// `operands`: the operands' stack slots, in window order.
+            pub fn new($($cap: $cty,)* operands: &[usize]) -> Self {
                 let () = Self::FITS;
                 assert_eq!(operands.len(), Self::ARITY, "{}: wrong number of operands", stringify!($name));
                 $crate::window::check_operands(stringify!($name), operands, Self::ACCESSES);
@@ -437,7 +408,7 @@ macro_rules! windowed {
 
         impl<$(const $cp: $cpt),*> $crate::window::Window for $name<$($cp),*> {
             fn name(&self) -> &'static str { stringify!($name) }
-            fn operands(&self) -> &[$crate::window::Gpr] { &self.operands }
+            fn operands(&self) -> &[usize] { &self.operands }
             fn accesses(&self) -> &'static [$crate::window::Access] { Self::ACCESSES }
             fn captures(&self) -> $crate::window::Captures {
                 ::smallvec::smallvec![$($crate::window::Capture::to_bits(self.$cap)),*]
@@ -944,12 +915,11 @@ unsafe fn enter<'src, 'intern>(
     entry(owner, state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 }
 
-/// Operand tokens for an op that reads the whole window (at `SKIP` 0). Its
+/// Operand slots for an op that reads the whole window (at `SKIP` 0). Its
 /// stencil never touches the stack, so the slots are arbitrary.
 #[cfg(any(test, feature = "check_windows"))]
-fn whole_window() -> [Gpr; WINDOW] {
-    let mut tokens = Tokens::default();
-    core::array::from_fn(|i| tokens.mint(i))
+fn whole_window() -> [usize; WINDOW] {
+    core::array::from_fn(|i| i)
 }
 
 /// Differential check (feature `check_windows`): every window op the interpreter
@@ -1077,8 +1047,7 @@ mod tests {
     #[test]
     fn copy_and_patch_branches() {
         let image = Image::load().unwrap();
-        let mut tokens = Tokens::default();
-        let branch = TBranch::new(&[tokens.mint(0), tokens.mint(0)]);
+        let branch = TBranch::new(&[0, 0]);
         let flush = Flush::new(&whole_window());
         let exec = unsafe { assemble(&image, &[(&branch, 0), (&flush, 0)], &[0xc3]) }.unwrap();
         for (x, want) in [(-2.0, -5.0), (2.0, 102.0)] {
@@ -1093,8 +1062,7 @@ mod tests {
     #[test]
     fn copy_and_patch_relocates_calls() {
         let image = Image::load().unwrap();
-        let mut tokens = Tokens::default();
-        let call = TCall::new(&[tokens.mint(0), tokens.mint(0)]);
+        let call = TCall::new(&[0, 0]);
         let flush = Flush::new(&whole_window());
 
         let helper = out_of_line as *const () as usize;
@@ -1119,10 +1087,9 @@ mod tests {
     #[test]
     fn copy_and_patch_chain() {
         let image = Image::load().unwrap();
-        let mut t = Tokens::default();
-        let add = TAdd::new(&[t.mint(1), t.mint(2), t.mint(3)]);
-        let mul = TMul::new(&[t.mint(0), t.mint(1), t.mint(2)]);
-        let addk = TAddK::new(0.5, &[t.mint(2), t.mint(3)]);
+        let add = TAdd::new(&[1, 2, 3]);
+        let mul = TMul::new(&[0, 1, 2]);
+        let addk = TAddK::new(0.5, &[2, 3]);
         let flush = Flush::new(&whole_window());
         let ops: [(&dyn Window, usize); 4] = [(&add, 1), (&mul, 0), (&addk, 2), (&flush, 0)];
         let exec = unsafe { assemble(&image, &ops, &[0xc3]) }.unwrap();
@@ -1139,8 +1106,7 @@ mod tests {
     #[test]
     fn copy_and_patch_preserves_window() {
         let image = Image::load().unwrap();
-        let mut t = Tokens::default();
-        let add = TAdd::new(&[t.mint(0), t.mint(1), t.mint(2)]);
+        let add = TAdd::new(&[0, 1, 2]);
         let flush = Flush::new(&whole_window());
         let values: [f64; WINDOW] = core::array::from_fn(|i| 10.0 + i as f64);
         for skip in 0..=WINDOW - 3 {
@@ -1160,7 +1126,6 @@ mod tests {
             *c = b;
             *d = a;
         });
-        let mut t = Tokens::default();
-        TSwap::new(&[t.mint(10), t.mint(11), t.mint(10), t.mint(10)]);
+        TSwap::new(&[10, 11, 10, 10]);
     }
 }

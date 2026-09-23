@@ -131,10 +131,8 @@ The allocator needs to know which slots each op reads/writes; today `Exec` is an
 opaque closure so the JIT can't see its dataflow. Window ops make it visible
 (details in `Note [Register window]`, `src/window.rs`):
 
-- **`YieldOp::Storage(slot)` → `ResumeArg::Storage(Gpr)`:** the emit site gets
-  an **opaque token** per operand, minted by the specializer. LBBV does no
-  register allocation, and the tokens leave no residual of their own.
-- **`Residual::ExecWindow(Rc<dyn Window>)`**, built from those tokens: inputs are
+- **`Residual::ExecWindow(Rc<dyn Window>)`**, built from its operands' stack
+  slots and their accesses (LBBV does no register allocation): inputs are
   read-only and only outputs are written back (`windowed!(.., (a, b, out d))`),
   so a register caching a slot only ever holds that slot's value. An op always
   runs on a contiguous run of the window, `w[SKIP..SKIP + arity]`, its operands
@@ -217,11 +215,11 @@ green gate (default features ⇒ jit on).
   is a **generic**, op-agnostic mechanism used inline at the emit site, exactly
   like `define_exec!` — all of an op's code (static and dynamic) stays in its
   `emit_*`. It generates a struct of **captures** (hole values) + the operands'
-  `Gpr` tokens implementing the `Window` trait, an `#[inline(always)]` body
+  stack slots implementing the `Window` trait, an `#[inline(always)]` body
   shared by both tiers, and `__stencil::<SKIP>`, with operand `i` in window
   register `SKIP + i` (`stencil(skip)`). Inputs are bound as values and only
   outputs are written back. `src/window.rs` holds only
-  the mechanism (macro, `Window`, tokens, `Capture`, holes, copier); no op
+  the mechanism (macro, `Window`, `Capture`, holes, copier); no op
   templates.
 - Captures: any `Copy` type of at most 8 bytes (blanket `Capture` impl, raw bits).
   Holes are `extern_weak` statics (`__lunacy_holeN`), read through a const-generic
@@ -269,13 +267,13 @@ green gate (default features ⇒ jit on).
 
 **M1 — DONE: generic windowed ops in the generator (JIT splat still disabled).**
 `Residual::ExecWindow(Rc<dyn Window>)`, like `Exec`'s closure, keeps processing
-sites generic; its operands are `Storage` tokens (section 3). The
+sites generic; its operands are stack slots (section 3). The
 interpreter runs `<dyn Window>::interp`: load the inputs from their stack homes,
 run the body with captures from the struct, flush the outputs (it can't run the
 stencil itself: holes read 0 until patched). The first user is `emit_numeric`'s
 dynamic int-int arm: `windowed!(NumericIntInt, [], [OP: Opcode], .. (lhs, rhs, out dest))`
 inline (body = the VM's own `numeric_op`/`box_lvalue`), its operands three
-`Storage` tokens, instance picked with `dispatch_numeric_window!` for all six opcodes;
+stack slots, instance picked with `dispatch_numeric_window!` for all six opcodes;
 the constant-operand arms keep their `Exec` closures.
 
 Verification:
@@ -462,7 +460,7 @@ So we take the **streaming** part and not the exact stack discipline:
 
 `windowed!` declares one ordered operand list, each operand marked as an input
 or an output, e.g. `(out c, a, b)`. Operand `i` is window register `SKIP + i`.
-The emit site mints its operands' tokens in the same order. The allocator knows only
+The emit site passes its operands' stack slots in the same order. The allocator knows only
 each operand's index and whether it is read or written, so it handles any order
 an op names:
 
@@ -527,7 +525,7 @@ in section 5 (M2); at most two extra loads per run, no extra stores.
 ### Not done
 
 LuaJIT-style bottom-up assignment over the compiled region (a backward pass
-over the transitive closure of blocks before codegen, each token's register
+over the transitive closure of blocks before codegen, each operand's register
 stored compactly for the forward pass) would place values better across
 blocks, at the cost of a pass over the region and the storage for its results.
 Revisit with measurements.
