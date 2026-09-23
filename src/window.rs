@@ -26,9 +26,10 @@
 //! tier cannot run the stencil itself (its holes read 0 until patched), so it runs
 //! the same body with captures from the struct.
 //!
-//! Copying a stencil (`stencil_body`) decodes it (yaxpeax-x86). A well-formed
-//! stencil's last instruction is its `become`: a tail jump to the op's
-//! continuation, sliced off so the next stencil falls through. Every other
+//! Copying a stencil (`stencil_body`) decodes it (yaxpeax-x86). Every exit of a
+//! well-formed stencil is its `become`, a tail jump to the op's continuation,
+//! which the copy redirects to its end so the next stencil falls through (a
+//! final `become` is simply sliced off). Every other
 //! RIP-relative reference in the body is reported so it can be re-targeted
 //! wherever the body lands: hole loads (repointed at the op's capture values),
 //! other continuation references (at the copy's fall-through point), and
@@ -51,7 +52,9 @@
 // op always runs on a contiguous run of the window: operand `i` (inputs, then
 // outputs) is register `SKIP + i`, and `Window::stencil(skip)` is the instance
 // for that `SKIP`. An op's inputs are read-only and only its outputs are written,
-// so the registers outside its run, and its inputs, keep their values.
+// so the registers outside its run, and its inputs, keep their values. An op's
+// body must reach stack slots only through its operands: any slot may have a
+// newer value in a register than in its stack home.
 //
 // The specializer never chooses registers. Before an `ExecWindow`, the emit site
 // yields a `Storage(slot, access)` for each operand and is resumed with an opaque
@@ -307,7 +310,9 @@ pub(crate) use bind_holes;
 /// * `[const params]` — compile-time parameters baked into the stencil.
 /// * `|owner, state, base|` — names for the fixed params.
 /// * `(inputs) -> (outputs)` — the window operands: inputs are bound in the body
-///   as `LBoxed` values, outputs as `&mut LBoxed` to write the result to.
+///   as `LBoxed` values, outputs as `&mut LBoxed` to write the result to. The
+///   body must not otherwise read or write stack slots (see Note [Register
+///   window]).
 ///
 /// `new(captures.., operands)` takes the operands' [`Gpr`] tokens, inputs then
 /// outputs. See Note [Register window].
@@ -477,7 +482,7 @@ pub enum StencilError {
     Undecodable { op: &'static str, at: usize },
     /// A RIP displacement isn't where the instruction's layout puts it.
     Displacement { op: &'static str, at: usize },
-    /// The last instruction isn't the `become`: a jump to the continuation.
+    /// The stencil has no `become`: no jump to the continuation.
     NoBecome { op: &'static str },
     /// A jump leaves the stencil without being a `become` (e.g. a sibling tail
     /// call), so it would skip the rest of the chain.
@@ -501,7 +506,7 @@ impl std::fmt::Display for StencilError {
                 write!(f, "{op} stencil: RIP displacement not where expected at +{at:#x}")
             }
             Self::NoBecome { op } => {
-                write!(f, "{op} stencil does not end in `become` to its continuation")
+                write!(f, "{op} stencil has no `become` to its continuation")
             }
             Self::JumpsOut { op, at, target } => {
                 write!(f, "{op} stencil jumps out to {target:#x} at +{at:#x}")
@@ -643,13 +648,17 @@ const RELATIVE_BRANCHES: [yaxpeax_x86::long_mode::Opcode; 23] = {
 
 /// Copy `op`'s stencil with operand `i` in window register `skip + i`.
 ///
-/// A well-formed stencil ends in its `become`: its last instruction is a tail
-/// jump to the op's continuation, which is sliced off so the next stencil falls
-/// through. The rest is decoded to find every RIP-relative reference: loads of a
-/// hole's GOT slot are holes, the rest are relocations. Branches that stay within
-/// the body need no fixup (one to the sliced tail becomes a fall-through into the
-/// next stencil, as it should). A stencil that can't be copied this way is an
-/// error, not a panic, so the JIT can call the op's body instead.
+/// Every exit of a well-formed stencil is its `become`: a tail jump to the op's
+/// continuation, which the copy redirects to its end, where the next stencil
+/// falls through. When the `become` is the last instruction it is sliced off;
+/// otherwise the compiler laid cold code after it (e.g. a panic path, ending in
+/// a call that never returns), and the whole body is copied with a trap after it
+/// so that nothing can fall off its end. The body is decoded to find every
+/// RIP-relative reference: loads of a hole's GOT slot are holes, the rest are
+/// relocations. Branches that stay within the body need no fixup (one to the
+/// sliced tail becomes a fall-through into the next stencil, as it should). A
+/// stencil that can't be copied this way is an error, not a panic, so the JIT
+/// can leave the op to the interpreter.
 pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Result<Body, StencilError> {
     use yaxpeax_arch::LengthedInstruction;
     use yaxpeax_x86::long_mode::{InstDecoder, Instruction, Opcode, Operand, RegSpec};
@@ -735,17 +744,15 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
         })
     };
 
-    // The tail: the last instruction must jump to the continuation.
-    let last = insts.len() - 1;
-    if !jumps_to_next(last)? {
-        return Err(StencilError::NoBecome { op: name });
-    }
-    let body_len = insts[last].0;
+    // A final `become` is sliced off; otherwise the whole body is kept.
+    let sliced = jumps_to_next(insts.len() - 1)?;
+    let kept = if sliced { insts.len() - 1 } else { insts.len() };
+    let body_len = if sliced { insts[kept].0 } else { size };
 
     let mut holes = SmallVec::new();
     let mut relocs = Vec::new();
     let mut nexts = Vec::new();
-    for (i, (off, end, inst)) in insts[..last].iter().enumerate() {
+    for (i, (off, end, inst)) in insts[..kept].iter().enumerate() {
         let (off, end) = (*off, *end);
         // Relative branches: operand 0 is the displacement from `end`.
         let rel = match inst.operand(0) {
@@ -793,8 +800,19 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
             }
         }
     }
-    Ok(Body { code: code[..body_len].to_vec(), holes, relocs, nexts })
+    let mut code = code[..body_len].to_vec();
+    if !sliced {
+        if nexts.is_empty() {
+            return Err(StencilError::NoBecome { op: name });
+        }
+        code.extend_from_slice(&UD2);
+    }
+    Ok(Body { code, holes, relocs, nexts })
 }
+
+/// `ud2`, which traps: placed after a copied body that doesn't end in its
+/// `become`, which must never be reached.
+const UD2: [u8; 2] = [0x0f, 0x0b];
 
 /// A buffer of `len` bytes within ±2GiB of this binary, so rel32 references in
 /// copied stencils still reach their targets (the same placement the JIT's code
@@ -933,8 +951,9 @@ fn whole_window() -> [Gpr; WINDOW] {
 /// the results must match bit for bit. This drives the ops the specializer
 /// actually emits — declared at their emit sites, so no test can name them —
 /// through the real copier. An op the copier declines is skipped (logged once),
-/// just as the JIT would call its body instead. It re-executes the op, so it
-/// assumes the op's effects are confined to its window.
+/// just as the JIT leaves it to the interpreter. It re-executes the op, so an
+/// op's effects outside its window must be safe to repeat (a table set stores
+/// the same value again).
 #[cfg(feature = "check_windows")]
 mod check {
     use super::*;

@@ -432,12 +432,19 @@ mod tests {
     windowed!(Un, [], [], |owner, state, base| (a) -> (d) {
         *d = a;
     });
+    windowed!(Sink, [], [], |owner, state, base| (a, b) -> () {
+        core::hint::black_box((a, b));
+    });
 
-    /// An op of a test run: input slots and an output slot.
+    /// An op of a test run by shape: input slots, then output slots.
     #[derive(Debug, Clone, Copy)]
     enum TestOp {
+        /// Two inputs, one output (arithmetic).
         Bin(usize, usize, usize),
+        /// One input, one output (a table get).
         Un(usize, usize),
+        /// Two inputs, no output (a table set).
+        Set(usize, usize),
     }
 
     /// Executes allocator output on symbolic values (slot, version), checking
@@ -500,6 +507,7 @@ mod tests {
                 match *op {
                     TestOp::Bin(a, b, d) => Box::new(Bin::new(&[tokens.mint(a), tokens.mint(b), tokens.mint(d)])),
                     TestOp::Un(a, d) => Box::new(Un::new(&[tokens.mint(a), tokens.mint(d)])),
+                    TestOp::Set(t, v) => Box::new(Sink::new(&[tokens.mint(t), tokens.mint(v)])),
                 }
             })
             .collect();
@@ -529,7 +537,7 @@ mod tests {
         machine
     }
 
-    use TestOp::Bin as B;
+    use TestOp::{Bin as B, Set as S, Un as G};
 
     /// nbody `advance`, block 94: `dz = biz - dz; t23 = dx*dx; t24 = dy*dy;
     /// t23 += t24; t24 = dz*dz; t23 += t24` (slots: biz 10, dx 20, dy 21, dz 22).
@@ -548,15 +556,38 @@ mod tests {
         B(11, 24, 25),
     ];
 
-    /// The whole window reaches the floor on both runs: every slot loaded at
-    /// most once and stored once (4 loads and 3 stores, against 12 and 6 through
-    /// the stack; 9 and 5 against 16 and 8).
+    /// Every run of more than one window op in nbody's `advance`, table gets (G)
+    /// and sets (S) included (slots: dt 2, bi 7, bix..biz 8-10, bimass 11,
+    /// bivx..bivz 12-14, j 15/17, bj 19, dx..dz 20-22, dist2 23, mag 24, bm 25,
+    /// temporaries 26-27), with the (loads, stores, moves) worked by hand for
+    /// the whole window. Loads and stores are at the floor: a load per slot read
+    /// before it is written, a store per slot written.
+    const NBODY: [(&[TestOp], (u32, u32, u32)); 7] = [
+        // bi.vx, bi.vy, bi.vz = bivx, bivy, bivz: the table stays put.
+        (&[S(7, 12), S(7, 13), S(7, 14)], (4, 0, 0)),
+        // dx = bix - bj.x: the value got reads in place as the rhs.
+        (&[G(19, 20), B(8, 20, 20)], (2, 1, 0)),
+        // dz = biz - bj.z; dist2 = dx*dx + dy*dy + dz*dz: as DIST2, with dz got
+        // instead of loaded.
+        (&[G(19, 22), B(10, 22, 22), B(20, 20, 23), B(21, 21, 24), B(23, 24, 23), B(22, 22, 24), B(23, 24, 23)], (4, 3, 5)),
+        // bm = bj.mass * mag; bivx -= dx * bm; ...: as VELOCITY, bm got.
+        (&[G(19, 25), B(25, 24, 25), B(20, 25, 26), B(12, 26, 12), B(21, 25, 26), B(13, 26, 13), B(22, 25, 26), B(14, 26, 14), B(11, 24, 25)], (9, 5, 4)),
+        // bj.vx = bj.vx + dx * bm: bj.vx must move beside the product (whose op
+        // covers where the get left it), and bj beside the sum.
+        (&[G(19, 26), B(20, 25, 27), B(26, 27, 26), S(19, 26)], (3, 2, 2)),
+        // ... and the inner loop's `j += step`.
+        (&[G(19, 26), B(22, 25, 27), B(26, 27, 26), S(19, 26), B(15, 17, 15)], (5, 3, 2)),
+        // mag = dt / (mag * dist2): the product reads in place as the rhs.
+        (&[B(24, 23, 25), B(2, 25, 24)], (3, 2, 0)),
+    ];
+
+    /// With the whole window, the allocator matches the hand plans on nbody.
     #[test]
     fn nbody_full_window() {
-        let m = run(WINDOW, &DIST2);
-        assert_eq!((m.loads, m.stores, m.moves), (4, 3, 5), "{m:?}");
-        let m = run(WINDOW, &VELOCITY);
-        assert_eq!((m.loads, m.stores, m.moves), (9, 5, 4), "{m:?}");
+        for (ops, want) in NBODY {
+            let m = run(WINDOW, ops);
+            assert_eq!((m.loads, m.stores, m.moves), want, "{ops:?}: {m:?}");
+        }
     }
 
     /// Under pressure, in 4 registers (one spare beside a 3-register op), both
@@ -591,23 +622,39 @@ mod tests {
         out
     }
 
-    /// Every run of three ops, over up to five slots for binary ops alone and
-    /// four with unary ones mixed in, is allocated correctly (up to renaming
-    /// slots, which the allocator is indifferent to), in 4 registers so that the
-    /// runs evict.
+    /// Every run of three ops of every shape — over up to five slots for
+    /// arithmetic alone, four otherwise — is allocated correctly (up to
+    /// renaming slots, which the allocator is indifferent to), in 4 registers so
+    /// that the runs evict.
     #[test]
     fn exhaustive_small_runs() {
-        for shapes in 0..8u32 {
-            let arities: Vec<usize> = (0..3).map(|i| if shapes & (1 << i) == 0 { 3 } else { 2 }).collect();
-            let max = if shapes == 0 { 5 } else { 4 };
-            for pattern in slot_patterns(arities.iter().sum(), max) {
-                let mut slots = pattern.into_iter();
-                let mut next = || slots.next().unwrap();
-                let ops: Vec<TestOp> = arities
-                    .iter()
-                    .map(|&arity| if arity == 3 { B(next(), next(), next()) } else { TestOp::Un(next(), next()) })
-                    .collect();
-                run(4, &ops);
+        #[derive(Clone, Copy, PartialEq)]
+        enum Shape {
+            Bin,
+            Get,
+            Set,
+        }
+        let all = [Shape::Bin, Shape::Get, Shape::Set];
+        for x in all {
+            for y in all {
+                for z in all {
+                    let shapes = [x, y, z];
+                    let len = shapes.iter().map(|&s| if s == Shape::Bin { 3 } else { 2 }).sum();
+                    let max = if shapes.iter().all(|&s| s == Shape::Bin) { 5 } else { 4 };
+                    for pattern in slot_patterns(len, max) {
+                        let mut slots = pattern.into_iter();
+                        let mut next = || slots.next().unwrap();
+                        let ops: Vec<TestOp> = shapes
+                            .iter()
+                            .map(|shape| match shape {
+                                Shape::Bin => B(next(), next(), next()),
+                                Shape::Get => G(next(), next()),
+                                Shape::Set => S(next(), next()),
+                            })
+                            .collect();
+                        run(4, &ops);
+                    }
+                }
             }
         }
     }

@@ -239,10 +239,12 @@ green gate (default features ⇒ jit on).
   (`inline(never)`, and it `black_box`es the window — an empty internal callee
   lets LLVM delete the tail call and every computation feeding the window).
 - The copier (`stencil_body`) decodes the stencil with yaxpeax-x86. Well-formed =
-  the last instruction jumps to the continuation (`jmp rel32`, `jmp *[rip+got]`,
-  or `jmp *reg` loaded from the GOT slot — rustc uses `-Z plt=no`, and LLVM may
-  hoist that load above the epilogue); it is sliced so the next stencil falls
-  through. Every other RIP-relative reference is reported with its field, the
+  every exit jumps to the continuation (`jmp rel32`, `jmp *[rip+got]`, or
+  `jmp *reg` loaded from the GOT slot — rustc uses `-Z plt=no`, and LLVM may
+  hoist that load above the epilogue), redirected to the copy's end so the next
+  stencil falls through. A final `become` is sliced off; when cold code follows
+  it (a panic path, ending in a call that never returns — table ops have
+  several), the whole body is copied with a `ud2` after it. Every other RIP-relative reference is reported with its field, the
   end of its instruction (the true RIP base, even with a trailing immediate) and
   its absolute target:
   - `holes` — loads of a hole's GOT slot → repointed at the pool;
@@ -333,17 +335,46 @@ putting `t` right after `dist2` means running its producer at `SKIP+1`, whose
 span covers `dist2`. Plus an
 exhaustive correctness sweep at width 4 executing plans on a symbolic machine.
 
+**Table ops as window ops.** `emit_gettable`'s `gettable_href` is
+`GetTableHref: (table) -> (dest)` (captures: the witness index, and the constant
+key for the debug check) and `emit_settable`'s `settable_href`, when the value
+is in a register, `SetTableHref: (table, value) -> ()` (captures: the witness
+index and the value's expected `LType` for the debug check; const param: whether
+the store retypes the key and bumps the epoch); a constant value keeps an `Exec`
+closure, sharing the store with the window op. Their stencils call into the
+table code (23 relocations for a get) and all copy at every `SKIP`. They join
+runs, but runs still end at each `href_init` + `select`: a field not yet seen
+needs a runtime key lookup and a block split. The multi-op runs of nbody's
+`advance` with them, worked by hand for the 8-register window (loads/stores/
+moves; loads and stores at the floor):
+
+| run | now | with the table ops as `Exec`s |
+|---|---|---|
+| `bi.vx, bi.vy, bi.vz = bivx, bivy, bivz` (3 sets) | 4/0/0 | 6 loads |
+| `dx = bix - bj.x` | 2/1/0 | 3/2 |
+| `dz = biz - bj.z; dist2 = ...` | 4/3/5 | 5/4 |
+| `bm = bj.mass * mag; bivx -= dx * bm; ...` | 9/5/4 | 10/6 |
+| `bj.vx = bj.vx + dx * bm` | 3/2/2 | 5/3 |
+| ... plus `j += step` | 5/3/2 | 7/4 |
+| `mag = dt / (mag * dist2)` | 3/2/0 | 3/2 |
+
+In `bj.vx = bj.vx + dx * bm` both moves are forced by the window's shape: the
+got value must sit right before the product, whose op covers the register the
+get left it in, and `bj` must sit right before the sum. The allocator's tests
+pin every row, and the exhaustive sweep covers all three op shapes.
+
 Verification: `just test` (adds the golden suite with `immediate_jit`: in debug
 the copier rejects `NumericIntInt`'s jump table, exercising the fallback) and
 `just test-stencils` (adds it at opt-2, where window ops run as splatted
 stencils under the allocator). Golden `window_nbody.lua` runs `advance` hot.
 
 Open items:
-- A stencil whose `become` is followed by cold code (e.g. a panic path, which
-  `unreachable!()` in an op body produces) is rejected: the copier requires the
-  `become` to be the last instruction. Supporting it means copying the whole
-  body and jumping over the cold code to the fall-through point (plus a trap
-  after it).
+- A copied body with cold code after its `become` keeps the `become` as a
+  jump over the cold code (for a GOT-indirect `become`, a load from the pool and
+  an indirect jump). Laying the hot path out so the jump becomes a fall-through
+  would need the body's blocks reordered.
+- A window op's body reaching stack slots other than through its operands is a
+  documented rule (Note [Register window]), not a checked one.
 - Jump tables in stencils. (Fat-LTO release builds do keep each op's
   continuation a real tail target: `just run nbody` copies all 8
   `NumericIntInt` stencils it uses.)

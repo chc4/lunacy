@@ -323,15 +323,14 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
-            let t_htype = htype.clone();
-            arg = yield YieldOp::Exec(ResidualExec::new("gettable_href", Rc::new(move |owner, state| {
-                let witness = &state.hash_witnesses[state.witness_base + hc.0 as usize];
-                debug!("gettable_href with {:?} {:?}", &witness, t_htype);
-                let LValue::Table(tab) = state.vals[state.base + b].unbox() else { unreachable!() };
+            windowed!(GetTableHref, [href: u8, key: usize], [], |owner, state, base| (table) -> (dest) {
+                let witness = &state.hash_witnesses[state.witness_base + href as usize];
+                debug!("gettable_href with {:?}", &witness);
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 #[cfg(debug_assertions)]
                 let witness = witness.as_ref().unwrap();
                 #[cfg(not(debug_assertions))]
-                let witness = unsafe { witness.as_ref().unwrap_unchecked() };
+                let witness = witness.as_ref().unwrap_unchecked();
                 let (k, val1) = tab.ro(owner).hash.get_index(witness.index).unwrap();
 
                 // Sanity check
@@ -339,16 +338,20 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 #[cfg(debug_assertions)]
                 {
                     let val2 = tab.ro(owner).hash.get(&LCanon::new((&witness.key).into(), state.intern)).copied().unwrap();
-                    let full_key = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16);
+                    let full_key = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, key as u16);
                     debug!("{:?}", &tab.ro(owner));
                     let Ok(const_key) = full_key else { unreachable!() };
                     assert_eq!(*k, LCanon::new(LBoxed::from(const_key), state.intern));
                     assert_eq!(val1.bits(), val2.bits());
                 }
 
-                debug!("gettable_href fetched {a} = {val1:?}");
-                state.vals[state.base + a] = *val1;
-            })));
+                debug!("gettable_href fetched {val1:?}");
+                *dest = *val1;
+            });
+            let t = yield YieldOp::Storage(b, Access::Read);
+            let d = yield YieldOp::Storage(a, Access::Write);
+            let (ResumeArg::Storage(t), ResumeArg::Storage(d)) = (t, d) else { unreachable!() };
+            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[t, d])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
         } else {
             arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
@@ -418,28 +421,49 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     mismatched_type = Some(CType::Type(LType::Unknown));
                 }
 
-                let t_mismatched_type = mismatched_type.clone();
-                arg = yield YieldOp::Exec(ResidualExec::new("settable_href", Rc::new(move |owner, state| {
-                    let hidx = state.witness_base + hb.0 as usize;
+                // Store through the witness; retyping the key's value moves the
+                // table (and so the witness) to a new epoch.
+                fn store<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, href: u8, expected: LType, retype: bool) {
+                    let hidx = state.witness_base + href as usize;
                     let witness = &state.hash_witnesses[hidx];
-                    debug!("settable_href with {:?} {:?}", &witness, htype);
-                    let LValue::Table(tab) = state.vals[state.base + a].unbox() else { unreachable!() };
-                    let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                        Ok(c) => LBoxed::from(c),
-                        Err(lv) => *lv,
-                    };
+                    debug!("settable_href with {:?} {:?}", &witness, expected);
+                    let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     tab.barrier_back();
                     let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
-                    debug!("settable_href {:?} {}", &val1, htype);
+                    debug!("settable_href {:?} {:?}", &val1, expected);
                     #[cfg(debug_assertions)]
-                    assert!(val1.unbox().ctypeof_() == htype);
-                    *val1 = kc;
-                    if t_mismatched_type.is_some() {
+                    assert!(val1.unbox().typeof_() == expected);
+                    *val1 = value;
+                    if retype {
                         tab.rw(owner).epoch += 1;
                         // This is safe because we're statically updating the known type as well.
                         state.hash_witnesses[hidx].as_mut().unwrap().epoch = tab.rw(owner).epoch;
                     }
-                })));
+                }
+                let expected = htype.as_ltype();
+                let retype = mismatched_type.is_some();
+                if c & 0x100 == 0 {
+                    windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: bool], |owner, state, base| (table, value) -> () {
+                        store(owner, state, table, value, href, expected, RETYPE);
+                    });
+                    let t = yield YieldOp::Storage(a, Access::Read);
+                    let v = yield YieldOp::Storage(c, Access::Read);
+                    let (ResumeArg::Storage(t), ResumeArg::Storage(v)) = (t, v) else { unreachable!() };
+                    arg = yield YieldOp::ExecWindow(if retype {
+                        Rc::new(SetTableHref::<true>::new(hb.0, expected, &[t, v]))
+                    } else {
+                        Rc::new(SetTableHref::<false>::new(hb.0, expected, &[t, v]))
+                    });
+                } else {
+                    arg = yield YieldOp::Exec(ResidualExec::new("settable_href", Rc::new(move |owner, state| {
+                        let table = state.vals[state.base + a];
+                        let value: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                            Ok(c) => LBoxed::from(c),
+                            Err(lv) => *lv,
+                        };
+                        store(owner, state, table, value, hb.0, expected, retype);
+                    })));
+                }
                 if let Some(new_type) = mismatched_type {
                     // We statically know we will increment the epoch, so update the hashkey's
                     // known type. This also will set hazards.
@@ -539,8 +563,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
                 windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (lhs, rhs) -> (dest) {
-                    // Guarded numbers. Unchecked, since a panic path would follow
-                    // the stencil's `become`, which must be its last instruction.
+                    // Guarded numbers. Unchecked, so that no panic path follows the
+                    // stencil's `become` and the copy can slice it off.
                     let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
                     let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
                     *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
