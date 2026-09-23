@@ -227,7 +227,8 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit) {
             ; .arch x64
             ; mov Rq(reg(dst)), Rq(reg(src))
         ),
-        Emit::Op { .. } => unreachable!("an op is splatted"),
+        // An op is splatted by the caller.
+        Emit::Op { .. } => unreachable!(),
     }
 }
 
