@@ -1,6 +1,7 @@
 /target
 *.bin
 *.pdf
+*.dot
 Cargo.lock
 flake.lock
 .gdb_history

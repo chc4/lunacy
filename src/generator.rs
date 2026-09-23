@@ -2299,10 +2299,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
           )
         );
 
+        // The DOT source is written next to the rendered graph, to read as text.
+        let dot_path = std::path::Path::new(filepath).with_extension("dot");
+        std::fs::write(&dot_path, g.print(&mut PrinterContext::default()))
+            .unwrap_or_else(|e| panic!("writing {}: {e}", dot_path.display()));
         let graph_out = exec(g, &mut PrinterContext::default(), vec![
             CommandArg::Format(Format::Pdf),
             CommandArg::Output(filepath.to_string()),
-        ]).unwrap();
+        ]).unwrap_or_else(|e| panic!("rendering {filepath} with graphviz `dot`: {e}"));
         debug!("graphviz output: {}", graph_out);
     }
 }

@@ -44,6 +44,7 @@
             pkgs.lua5_1       # Lua 5.1 (unversioned `lua`/`luac`)
             luaVersioned      # `lua5.1` / `luac5.1` aliases for the Justfile
             pkgs.hyperfine    # used by the `just hyperfine*` recipes
+            pkgs.graphviz     # `dot`, which the `graph` feature renders block graphs with
           ];
 
           # mimalloc (and other -sys crates) need a C toolchain to build.
