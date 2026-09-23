@@ -513,7 +513,11 @@ pub struct Image {
 impl Image {
     pub fn load() -> Result<Self, StencilError> {
         let err = |e: &dyn std::fmt::Display| StencilError::Image(e.to_string());
-        let bytes = std::fs::read("/proc/self/exe").map_err(|e| err(&e))?;
+        // Mapped, not read: goblin parses in place, so only the pages of the
+        // headers and symbol tables are faulted in, not the debug info.
+        let file = std::fs::File::open("/proc/self/exe").map_err(|e| err(&e))?;
+        // SAFETY: nothing writes our own executable while it runs.
+        let bytes = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| err(&e))?;
         let elf = goblin::elf::Elf::parse(&bytes).map_err(|e| err(&e))?;
 
         let anchor = elf
