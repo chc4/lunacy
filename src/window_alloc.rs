@@ -29,6 +29,30 @@ use crate::window::{Access, Window, WINDOW};
 // inline type guard: it tests the register caching its slot, and only its
 // failure path (and a gas exit) stores the dirty registers, leaving the window
 // live on the success path ([`WindowAlloc::stores`]).
+//
+// Jumps carry the window across block edges too. Each block is entered with
+// the window it was compiled for: a block first reached by a jump is compiled to
+// expect the jumping block's window, and any other jump to it transfers the
+// window to that one ([`WindowAlloc::transfer`]): dirty values the target
+// doesn't carry dirty are stored, then its registers are filled as one parallel
+// move (see Note [Parallel moves]). A block entered from the interpreter
+// expects an empty window, or else an entry stub loads its window from the
+// stack.
+
+// Note [Parallel moves]
+// ~~~~~~~~~~~~~~~~~~~~~
+// A parallel move fills distinct destination registers all at once, from
+// registers or stack homes. Destinations being distinct, each component of its
+// location transfer graph is a "windmill": at most one cycle (the axle), with
+// trees (the blades) hanging off it (Rideau, Serpette & Leroy, "Tilting at
+// windmills with Coq"; https://compiler.club/parallel-moves/). It is
+// sequentialized by peeling blades: a move whose destination no remaining move
+// reads is emitted and removed, which may free another. When every remaining
+// destination is still read only axles are left: one register of a cycle is
+// saved to `SCRATCH` and its readers redirected there, turning the cycle into a
+// blade. Loads read no register, so they are never on an axle. `SCRATCH` holds
+// one value at a time: peeling doesn't stall again until a cycle broken through
+// it has peeled completely.
 
 /// Location of a value for [`Emit`]: window register `0..WINDOW`, or `SCRATCH`.
 pub const SCRATCH: usize = WINDOW;
@@ -59,9 +83,10 @@ impl Emit {
     }
 }
 
-/// The window's cache between window residuals.
-#[derive(Debug, Clone, Default)]
-struct Cache {
+/// Which slot each window register caches, and which of them are dirty: the
+/// window between residuals, and a block's window on entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cache {
     /// The slot whose current value each register holds.
     regs: [Option<usize>; WINDOW],
     /// Cached slots whose stack home is stale.
@@ -103,6 +128,42 @@ impl WindowAlloc {
     fn with_width(width: usize) -> Self {
         assert!(width <= WINDOW);
         WindowAlloc { width, cache: Cache::default() }
+    }
+
+    /// Start a block entered with its window holding `cache`.
+    pub fn entering(cache: Cache) -> Self {
+        WindowAlloc { cache, ..Self::default() }
+    }
+
+    /// What the window holds now.
+    pub fn cache(&self) -> &Cache {
+        &self.cache
+    }
+
+    /// Leave the window's current contents for a block expecting `to`: store
+    /// the dirty values `to` doesn't carry dirty, then fill its registers (see
+    /// Note [Window allocation]). The window itself is unchanged, for the paths
+    /// that don't take this edge.
+    pub fn transfer(&self, to: &Cache) -> SmallVec<[Emit; 16]> {
+        let now = &self.cache;
+        let mut emits: SmallVec<[Emit; 16]> = now
+            .dirty
+            .iter()
+            .filter(|slot| !to.dirty.contains(slot))
+            .map(|&slot| Emit::Store { slot, reg: now.position(slot).expect("dirty slot in a register") })
+            .collect();
+        let mut moves: SmallVec<[(usize, Source); 8]> = to
+            .regs
+            .iter()
+            .enumerate()
+            .filter_map(|(reg, &slot)| {
+                let slot = slot?;
+                let src = if now.regs[reg] == Some(slot) { Some(reg) } else { now.position(slot) };
+                Some((reg, src.map_or(Source::Memory(slot), Source::Reg)))
+            })
+            .collect();
+        parallel_move(&mut moves, &mut emits);
+        emits
     }
 
     /// Whether no register holds a value.
@@ -185,7 +246,7 @@ impl WindowAlloc {
                 None => moves.push((reg, now.position(slot).map_or(Source::Memory(slot), Source::Reg))),
             }
         }
-        sequentialize(&mut moves, &mut emits);
+        parallel_move(&mut moves, &mut emits);
         emits.extend(copies.into_iter().map(|(dst, src)| Emit::Move { dst, src }));
         emits.push(Emit::Op { skip });
 
@@ -225,9 +286,9 @@ enum Source {
     Memory(usize),
 }
 
-/// Emit the parallel assignment `moves` (distinct destinations) as a sequence,
-/// breaking cycles through `SCRATCH`.
-fn sequentialize(moves: &mut SmallVec<[(usize, Source); 8]>, emits: &mut SmallVec<[Emit; 16]>) {
+/// Emit the parallel move `moves` (distinct destinations) as a sequence of
+/// moves and loads. See Note [Parallel moves].
+fn parallel_move(moves: &mut SmallVec<[(usize, Source); 8]>, emits: &mut SmallVec<[Emit; 16]>) {
     moves.retain(|(dst, src)| *src != Source::Reg(*dst));
     while !moves.is_empty() {
         let read = |reg: usize, moves: &[(usize, Source)]| moves.iter().any(|(_, src)| *src == Source::Reg(reg));
@@ -240,7 +301,7 @@ fn sequentialize(moves: &mut SmallVec<[(usize, Source); 8]>, emits: &mut SmallVe
                 });
             }
             None => {
-                // Every destination is still read: a cycle. Park one in SCRATCH.
+                // Every destination is still read: an axle. Save one in SCRATCH.
                 let (dst, _) = moves[0];
                 emits.push(Emit::Move { dst: SCRATCH, src: dst });
                 for (_, src) in moves.iter_mut() {
@@ -523,13 +584,64 @@ mod tests {
         }
     }
 
+    /// Every window over three registers and three slots (each register caching
+    /// a slot or nothing, each cached slot dirty or not) transfers to every
+    /// other: afterwards the target's registers hold their slots' current
+    /// values, and every slot it doesn't carry dirty is current on the stack. A
+    /// window transfers to itself with no code.
+    #[test]
+    fn transfer_exhaustive() {
+        const REGS: usize = 3;
+        const SLOTS: usize = 3;
+        let mut caches = Vec::new();
+        for code in 0..(SLOTS + 1).pow(REGS as u32) {
+            let mut regs = [None; WINDOW];
+            let mut digits = code;
+            for reg in regs.iter_mut().take(REGS) {
+                *reg = (digits % (SLOTS + 1)).checked_sub(1);
+                digits /= SLOTS + 1;
+            }
+            let cached: Vec<usize> = (0..SLOTS).filter(|slot| regs.contains(&Some(*slot))).collect();
+            for mask in 0..1u32 << cached.len() {
+                let dirty = cached.iter().enumerate().filter(|(i, _)| mask & 1 << i != 0).map(|(_, &slot)| slot).collect();
+                caches.push(Cache { regs, dirty });
+            }
+        }
+        for from in &caches {
+            for to in &caches {
+                let mut machine = Machine::default();
+                for &slot in &from.dirty {
+                    machine.current.insert(slot, 1);
+                }
+                for (reg, slot) in from.regs.iter().enumerate() {
+                    machine.regs[reg] = slot.map(|slot| (slot, Machine::version(&machine.current, slot)));
+                }
+                let emits = WindowAlloc::entering(from.clone()).transfer(to);
+                assert!(from != to || emits.is_empty(), "{from:?} to itself: {emits:?}");
+                for emit in emits {
+                    machine.exec(emit, None);
+                }
+                for (reg, slot) in to.regs.iter().enumerate() {
+                    if let Some(slot) = *slot {
+                        let current = Machine::version(&machine.current, slot);
+                        assert_eq!(machine.regs[reg], Some((slot, current)), "{from:?} to {to:?}: register {reg}");
+                    }
+                }
+                for slot in (0..SLOTS).filter(|slot| !to.dirty.contains(slot)) {
+                    let current = Machine::version(&machine.current, slot);
+                    assert_eq!(Machine::version(&machine.memory, slot), current, "{from:?} to {to:?}: slot {slot}");
+                }
+            }
+        }
+    }
+
     /// Cycles between registers are broken through `SCRATCH`.
     #[test]
-    fn sequentialize_cycle() {
+    fn parallel_move_cycle() {
         let mut moves: SmallVec<[(usize, Source); 8]> =
             SmallVec::from_slice(&[(0, Source::Reg(1)), (1, Source::Reg(0)), (2, Source::Memory(7))]);
         let mut emits = SmallVec::new();
-        sequentialize(&mut moves, &mut emits);
+        parallel_move(&mut moves, &mut emits);
         assert_eq!(emits.iter().filter(|e| matches!(e, Emit::Move { dst: SCRATCH, .. })).count(), 1);
         let mut regs: [usize; WINDOW + 1] = core::array::from_fn(|r| 10 + r);
         for emit in emits {

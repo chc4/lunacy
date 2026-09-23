@@ -300,7 +300,7 @@ Verification:
 **M2 — DONE: JIT register allocation + stencil splat.** `src/window_alloc.rs`
 allocates each run of window residuals (section 6, `Note [Window allocation]`);
 `jit_block` lowers its plan (loads/stores against r14, moves between the window
-registers with r10 as scratch) and splats each op's stencil body between
+registers with rax as scratch) and splats each op's stencil body between
 `sub rsp, 8`/`add rsp, 8` (block code keeps rsp 16-aligned; stencils expect the
 alignment just after a call). Holes and indirect continuation references become
 dynasm relocations to 8-byte pool entries emitted after the region's epilogue
@@ -309,10 +309,11 @@ code is appended after it; equal hole values share one entry);
 direct ones a relocation to a label at the copy's end; other RIP-relative
 references `value_relocation`s to their absolute target (the buffer's base is
 known). An inline type guard (every `LType` but `Unknown`) keeps the window:
-it tests the register caching its slot, or else loads the slot into the move
-scratch r10 (rax, never a window register, is the mask scratch), jumps to its success edge with the window live,
+it tests the register caching its slot, or else loads the slot into r10 (rax,
+never a window register, is the mask scratch), jumps to its success edge with the window live,
 and stores the dirty registers on its fall-through failure path into its thunk;
-the gas exit stores them too. Any other residual flushes the window after its
+the gas exit stores them too. A `Jump` or `Select` keeps the window too, and
+transfers it to the target block's (below). Any other residual flushes the window after its
 label, since a guard's success edge may jump there with the window live
 (`Unknown` guards call `check_guard`, so they flush). Window residuals
 following another get no label, so a jump into a run fails to assemble; with
@@ -527,15 +528,39 @@ At an `ExecWindow` with operands `o_0..o_{n-1}` (from the op itself):
 3. **Update**: each output is cached, dirty, in its register, and other copies of
    its slot's older value are dropped.
 
-At a flush point (any residual other than an `ExecWindow` or an inline type
-guard), store every dirty register. Calls clobber every register, so the cache
-is emptied too. An inline guard's failure path stores the dirty registers
-without emptying the cache, which its success path keeps.
+At a flush point (any residual other than an `ExecWindow`, an inline type
+guard or a jump), store every dirty register. Calls clobber every register, so
+the cache is emptied too. An inline guard's failure path stores the dirty
+registers without emptying the cache, which its success path keeps.
+
+**Block edges.** Each block is compiled to be entered with a window, recorded
+with its code (`JitBlock`, or `Pending` until it is compiled):
+
+- The block `jit_compile` starts at is entered with an empty window.
+- A block first reached by a jump (or `Select` edge) is entered with the
+  jumping block's window at the jump: the edge needs no code, and when the
+  target is compiled next the jump is elided as before.
+- Any other jump to a block, compiled or pending (a second predecessor, a
+  backedge, a `jmp extern` into an earlier region), transfers the window to
+  the target's: stores of the dirty values the target doesn't carry dirty,
+  then one parallel move filling its registers from registers or stack homes
+  (`WindowAlloc::transfer`), sequentialized by windmill peeling through rax
+  (`Note [Parallel moves]`).
+- `jit_compile` of a block already compiled (the interpreter entering it)
+  loads the block's window from the stack before jumping to it.
+
+A loop header compiled first is entered with an empty window, so its backedge
+flushes; one reached forward first keeps the preheader's window, which its
+backedge restores.
 
 **What it gives up**, worked by hand on nbody's steady-state runs: the table
 in section 5 (M2); at most two extra loads per run, no extra stores.
 
 ### Not done
+
+A block's entry window is whatever its first predecessor left, not what the
+block reads: a register it never uses is still restored on every other edge
+into it (a backedge reloading a value the loop never touches).
 
 LuaJIT-style bottom-up assignment over the compiled region (a backward pass
 over the transitive closure of blocks before codegen, each operand's register

@@ -10,7 +10,7 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::generator::{Block, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
-use crate::window_alloc::{Emit, WindowAlloc, SCRATCH};
+use crate::window_alloc::{Cache, Emit, WindowAlloc};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use smallvec::SmallVec;
@@ -162,11 +162,11 @@ type Assembler = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>;
 
 /// The window registers `w0..w7` in the order the stencil ABI passes them (the
 /// `rust-preserve-none` arguments after owner, state and base in r12, r13, r14),
-/// then `SCRATCH`: r10, which is not an argument register and only holds a value
-/// within one sequence of moves.
+/// then `SCRATCH`: rax, which every stencil clobbers (LLVM loads its `become`
+/// target into it), so it only holds a value within one sequence of moves.
 const WINDOW_REGS: [u8; WINDOW + 1] = [
     15, /* r15 */ 7, /* rdi */ 6, /* rsi */ 2, /* rdx */ 1, /* rcx */
-    8, /* r8 */ 9, /* r9 */ 11, /* r11 */ 10, /* r10 */
+    8, /* r8 */ 9, /* r9 */ 11, /* r11 */ 0, /* rax */
 ];
 
 /// An 8-byte entry of the pool emitted after a compiled region's code.
@@ -291,8 +291,8 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
 const JIT_SIZE: usize = 0x1000 * 16;
 pub struct JitContext {
     pub memory: std::cell::Cell<dynasmrt::mmap::ExecutableBuffer>,
-    pub blocks: HashMap<BlockId, JitPtr, FxBuildHasher>,
-    pub pending: BTreeMap<BlockId, DynamicLabel>,
+    pub blocks: HashMap<BlockId, JitBlock, FxBuildHasher>,
+    pub pending: BTreeMap<BlockId, Pending>,
     pub stencils: Stencils,
     pub used: usize,
     pub perf_map: Option<std::cell::RefCell<std::fs::File>>,
@@ -300,6 +300,20 @@ pub struct JitContext {
 
 #[derive(Copy, Clone)]
 struct JitPtr(*const u8);
+
+/// A compiled block: its code, entered with the window holding `window` (see
+/// Note [Window allocation]).
+pub struct JitBlock {
+    ptr: JitPtr,
+    window: Cache,
+}
+
+/// A block to compile in the current region: jumps to it go to `label`, with
+/// the window holding `window`.
+pub struct Pending {
+    label: DynamicLabel,
+    window: Cache,
+}
 
 impl JitContext {
     pub fn new() -> Self {
@@ -416,14 +430,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // We may have already JIT this block, if it was jumped to by another block
         // first. In that case we just have to jump to it.
         let mut successor = None;
-        if let Some(block_ptr) = self.jctx.blocks.get(&id) {
+        if let Some(block) = self.jctx.blocks.get(&id) {
+            // Load the window the block is entered with.
+            for emit in WindowAlloc::default().transfer(&block.window) {
+                emit_window_move(&mut ops, emit);
+            }
             dynasm!(ops
-            ; jmp extern block_ptr.0 as usize
+            ; jmp extern block.ptr.0 as usize
             );
         } else {
             // We need to skip over the uncommitted prologue
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
-            self.jctx.blocks.insert(id, new_block);
+            self.jctx.blocks.insert(id, JitBlock { ptr: new_block, window: Cache::default() });
             let start_off = ops.offset().0;
             let (_block, entry_succ) = self.jit_block(id, &mut ops, &mut pool, owner);
             successor = entry_succ;
@@ -440,14 +458,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // Try to use the successor label first, if it exists
             // Else pop the next pending
             // If there are none remaining, we're done.
-            let successor_pair = successor.and_then(|succ| self.jctx.pending.remove(&succ).map(|label| (succ, label)));
-            let Some((pending_block, pending_label)) = successor_pair.or_else(|| self.jctx.pending.pop_first()) else { break };
-            debug!("pending block {:?} {:?}", pending_block.0, pending_label);
+            let successor_pair = successor.and_then(|succ| self.jctx.pending.remove(&succ).map(|pending| (succ, pending)));
+            let Some((pending_block, pending)) = successor_pair.or_else(|| self.jctx.pending.pop_first()) else { break };
+            debug!("pending block {:?} {:?}", pending_block.0, pending.label);
             let pending_ptr = self.jctx.end();
             let pending_start = ops.offset();
-            self.jctx.blocks.insert(pending_block, pending_ptr);
+            self.jctx.blocks.insert(pending_block, JitBlock { ptr: pending_ptr, window: pending.window });
             dynasm!(ops
-                ; =>pending_label
+                ; =>pending.label
             );
             let (_block, next_succ) = self.jit_block(pending_block, &mut ops, &mut pool, owner);
             successor = next_succ;
@@ -519,23 +537,34 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let x = self.jctx.memory.get_mut().as_ptr();
         let block = &self.blocks[id.0];
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
+        let mut alloc = WindowAlloc::entering(self.jctx.blocks[&id].window.clone());
 
-        let mut emit_jump = |ops: &mut Assembler, target: &BlockId, skip: bool| {
-            if let Some(target_ptr) = self.jctx.blocks.get(target) {
+        // Jump to `target`, or fall through to it if `skip`, transferring the
+        // window to the one it is entered with: a block not yet compiled or
+        // pending is entered with the current window, so it needs no code.
+        let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool| {
+            if let Some(target_block) = self.jctx.blocks.get(target) {
                 // We already JIT compiled the block, and can jump to it directly.
+                for emit in alloc.transfer(&target_block.window) {
+                    emit_window_move(ops, emit);
+                }
                 if !skip {
                     dynasm!(ops
-                        ; jmp extern target_ptr.0 as usize
+                        ; jmp extern target_block.ptr.0 as usize
                     );
                 }
             } else {
                 // The block could already be pending from another block in this assembler
                 // set. Use it if it already exists, otherwise create a new label for our
                 // relocation.
-                let pending_label = self.jctx.pending.entry(*target).or_insert_with(|| ops.new_dynamic_label());
+                let pending = self.jctx.pending.entry(*target)
+                    .or_insert_with(|| Pending { label: ops.new_dynamic_label(), window: alloc.cache().clone() });
+                for emit in alloc.transfer(&pending.window) {
+                    emit_window_move(ops, emit);
+                }
                 if !skip {
                     dynasm!(ops
-                        ; jmp =>*pending_label
+                        ; jmp =>pending.label
                     );
                 }
             }
@@ -584,22 +613,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             );
         };
 
-        // The window carries values across window residuals and the inline type
-        // guards between them (see Note [Register window]); any other residual
-        // flushes it, after its label, since a guard's success edge may jump there
-        // with the window live. A guard's failure edge is its thunk, reached with
-        // the stack already up to date. Every edge into a label carries the same
-        // window: a window residual following another gets no label, so a jump to
-        // one fails to assemble.
+        // The window carries values across window residuals, the inline type
+        // guards between them, and jumps to other blocks (see Note [Window
+        // allocation]); any other residual flushes it, after its label, since a
+        // guard's success edge may jump there with the window live. A guard's
+        // failure edge is its thunk, reached with the stack already up to date.
+        // Every edge into a label carries the same window: a window residual
+        // following another gets no label, so a jump to one fails to assemble.
         let window = |r: &Residual| matches!(r, Residual::ExecWindow(_));
         let inline_guard = |r: &Residual| {
             matches!(r, Residual::Guard { expected: LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String, .. })
         };
-        let mut alloc = WindowAlloc::default();
+        let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_));
         for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
             let prev = off.checked_sub(1).map(|p| &block.instructions[p]);
-            let keeps_window = window(res) || inline_guard(res) || prev.is_some_and(|p| inline_guard(p));
+            let keeps_window = window(res) || inline_guard(res) || jump(res) || prev.is_some_and(|p| inline_guard(p));
             if window(res) && prev.is_some_and(|p| window(p)) {
                 // Inside a run of window residuals, charged for with its first.
             } else {
@@ -630,8 +659,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     //     We must reject non-cells first so we never dereference a double
                     //     or an immediate.
                     //
-                    // `v` holds the value: its window register, or else the move
-                    // scratch r10. rax, never a window register, is scratch for the masks.
+                    // `v` holds the value: its window register, or else r10. rax,
+                    // never a window register, is scratch for the masks.
                     let m = 0; // rax
                     let v = match alloc.register_of(*idx) {
                         Some(reg) => WINDOW_REGS[reg],
@@ -640,7 +669,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; .arch x64
                                 ; mov r10, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
                             );
-                            WINDOW_REGS[SCRATCH]
+                            10 // r10
                         }
                     };
                     match expected {
@@ -889,9 +918,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // we can elide a jump and instead fallthrough. We will use the target as
                     // `successor`, and so the JIT worklist will compile it immediately after this
                     // code.
-                    emit_jump(ops, target,
+                    emit_jump(ops, &alloc, target,
                         off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none());
                     successor = Some(*target);
+                    // Nothing falls through with this window.
+                    alloc = WindowAlloc::default();
                 },
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
@@ -908,12 +939,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; mov rax, QWORD r13 => RunState.select
                     );
+                    // A taken target's transfer may use rax (`SCRATCH`): the
+                    // comparisons only continue on the paths not taken.
                     for (i, target) in targets.iter().enumerate() {
                         dynasm!(ops
                             ; cmp rax, i as i32
                             ; jnz >next_target
                         );
-                        emit_jump(ops, &target.1, false);
+                        emit_jump(ops, &alloc, &target.1, false);
                         dynasm!(ops
                             ; next_target:
                         );
@@ -922,6 +955,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; ud2
                     );
+                    alloc = WindowAlloc::default();
                 },
                 Residual::GC => {
                     dynasm!(ops
