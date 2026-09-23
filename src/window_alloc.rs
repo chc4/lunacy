@@ -27,13 +27,17 @@ use crate::window::{Access, Window, WINDOW};
 //   inline guard is a read of its slot: the placement before it keeps the slot
 //   where it is, or puts it in the first free register.
 //
-// * Forward, generating code. Each window op runs at its planned `SKIP`
-//   ([`WindowAlloc::op`]): its inputs are moved or loaded into its run as one
-//   parallel move (see Note [Parallel moves]), after storing the dirty values
-//   the run overwrites that survive nowhere else and that the op doesn't
-//   rewrite. The rest of the window keeps its values. Only each op's `SKIP` and
-//   each block's entry window are kept from the backward pass ([`Packed`]); the
-//   placements between ops are rebuilt forward.
+// * Forward, generating code, doing exactly what the backward pass decided.
+//   Before each window op, the window is reconciled with the placement planned
+//   before it ([`WindowAlloc::reconcile`]): the dirty values it overwrites that
+//   survive nowhere else and that the op doesn't rewrite are stored, then its
+//   wanted registers are filled as one parallel move (see Note [Parallel
+//   moves]). The op then runs at its planned `SKIP` ([`WindowAlloc::op`]).
+//   Registers a placement doesn't care about keep their values. Each op's
+//   `SKIP` and placement, and each block's entry window, are kept from the
+//   backward pass, packed ([`Packed`]). Only `SKIP`s would not do: the forward
+//   pass would drop or store what the plan moves aside, and every edge would
+//   pay to reconcile the difference.
 //
 // Any other residual ends a run of window ops and flushes every dirty
 // register, except an inline type guard: it tests the register caching its
@@ -341,6 +345,45 @@ impl WindowAlloc {
         (cost, before)
     }
 
+    /// Make the window hold `want` in each register it names, before `op`,
+    /// leaving the others as they are: store the dirty values overwritten that
+    /// survive nowhere else and that `op` doesn't rewrite, then fill the named
+    /// registers as one parallel move (a slot loaded into several registers is
+    /// loaded once and copied). See Note [Window allocation].
+    pub fn reconcile(&mut self, want: &Placement, op: &dyn Window) -> SmallVec<[Emit; 16]> {
+        let rewritten = |slot: usize| op.operands().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a == Access::Write);
+        let now = &self.cache;
+        let mut after = now.regs;
+        for (reg, slot) in want.iter().enumerate() {
+            if slot.is_some() {
+                after[reg] = *slot;
+            }
+        }
+        let mut emits: SmallVec<[Emit; 16]> = now
+            .dirty
+            .iter()
+            .filter(|slot| !after.contains(&Some(**slot)) && !rewritten(**slot))
+            .map(|&slot| Emit::Store { slot, reg: now.position(slot).expect("dirty slot in a register") })
+            .collect();
+        let mut moves: SmallVec<[(usize, Source); 8]> = SmallVec::new();
+        let mut copies: SmallVec<[(usize, usize); WINDOW]> = SmallVec::new();
+        for (reg, &slot) in want.iter().enumerate() {
+            let Some(slot) = slot.filter(|&slot| now.regs[reg] != Some(slot)) else { continue };
+            match now.position(slot) {
+                Some(src) => moves.push((reg, Source::Reg(src))),
+                None => match moves.iter().find(|(_, src)| *src == Source::Memory(slot)) {
+                    Some(&(first, _)) => copies.push((reg, first)),
+                    None => moves.push((reg, Source::Memory(slot))),
+                },
+            }
+        }
+        parallel_move(&mut moves, &mut emits);
+        emits.extend(copies.into_iter().map(|(dst, src)| Emit::Move { dst, src }));
+        let dirty = now.dirty.iter().filter(|slot| after.contains(&Some(**slot))).copied().collect();
+        self.cache = Cache { regs: after, dirty };
+        emits
+    }
+
     /// A register caching `slot`'s current value, if any.
     pub fn register_of(&self, slot: usize) -> Option<usize> {
         self.cache.position(slot)
@@ -596,20 +639,23 @@ mod tests {
         finish(alloc, machine, ops)
     }
 
-    /// Place a run bottom-up, with nothing wanted after it, then execute it at
-    /// those `SKIP`s in a window of `width` registers.
+    /// Place a run bottom-up, with nothing wanted after it, then execute it as
+    /// placed in a window of `width` registers.
     fn run_backward(width: usize, ops: &[TestOp]) {
         let windows = windows(ops);
         let mut alloc = WindowAlloc::with_width(width);
         let mut after: Placement = [None; WINDOW];
-        let mut skips = Vec::new();
+        let mut placed = Vec::new();
         for w in windows.iter().rev() {
             let (skip, before) = alloc.place(&**w, 0..WINDOW, &after).unwrap();
-            skips.push(skip);
+            placed.push((skip, before));
             after = before;
         }
         let mut machine = Machine::default();
-        for (w, skip) in windows.iter().zip(skips.into_iter().rev()) {
+        for (w, (skip, want)) in windows.iter().zip(placed.into_iter().rev()) {
+            for emit in alloc.reconcile(&want, &**w) {
+                machine.exec(emit, None);
+            }
             for emit in alloc.op(&**w, [skip]).unwrap() {
                 machine.exec(emit, Some(&**w));
             }

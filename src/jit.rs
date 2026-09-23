@@ -342,13 +342,10 @@ pub struct BlockPlan {
     /// The registers of its entry window: the slots it and its successors read
     /// before writing, where they read them.
     entry: Packed,
-    /// Per residual, the `SKIP` of a window op with a stencil, else `NOT_PLACED`.
-    placed: Vec<u8>,
+    /// Per residual, for a window op with a stencil, its `SKIP` and the placement
+    /// planned before it.
+    placed: Vec<Option<(u8, Packed)>>,
 }
-
-/// A residual the backward pass didn't place: not a window op, or one with no
-/// stencil.
-const NOT_PLACED: u8 = u8::MAX;
 
 type Plans = HashMap<BlockId, BlockPlan, FxBuildHasher>;
 
@@ -707,7 +704,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0))
         });
         let alloc = WindowAlloc::default();
-        let mut placed = vec![NOT_PLACED; block.instructions.len()];
+        let mut placed = vec![None; block.instructions.len()];
         let mut want: Placement = [None; WINDOW];
         for (off, res) in block.instructions.iter().enumerate().rev() {
             let targets = jump_targets(res);
@@ -729,7 +726,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             match res {
                 Residual::ExecWindow(w) if !skips[off].is_empty() => {
                     let (skip, before) = alloc.place(&**w, skips[off].iter().copied(), &want).expect("a usable SKIP");
-                    placed[off] = skip as u8;
+                    placed[off] = Some((skip as u8, Packed::pack(&before)));
                     want = before;
                 }
                 // An inline guard tests its slot where the window has it: keep it
@@ -1190,9 +1187,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::ExecWindow(w) => {
                     let stencils = &mut self.jctx.stencils;
-                    match Some(plans[&id].placed[off]).filter(|&skip| skip != NOT_PLACED) {
-                        Some(skip) => {
-                            let emits = alloc.op(&**w, [skip as usize]).expect("a placed op runs at its SKIP");
+                    match plans[&id].placed[off] {
+                        Some((skip, want)) => {
+                            let mut emits = alloc.reconcile(&want.unpack(), &**w);
+                            emits.extend(alloc.op(&**w, [skip as usize]).expect("a placed op runs at its SKIP"));
                             window_dump!(self.jctx, "      {}", emits_line(&emits));
                             for emit in emits {
                                 match emit {
