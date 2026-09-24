@@ -49,9 +49,19 @@ window-runs benchmark times='20':
 # The JIT's window allocation for a benchmark, in window_dump.txt: each compiled
 # block's entry window, then per residual its loads, stores and moves, what each
 # jump transfers, and the window after it.
-window-dump benchmark times='20':
+# With `ref`, revision `ref`'s (in target/compare/<ref>, as for `hyperfine-vs`)
+# on this checkout's benchmark, in target/compare/<ref>/window_dump.txt.
+window-dump benchmark times='20' ref='':
+    #!/usr/bin/env bash
+    set -euo pipefail
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    cargo run --release --features window_dump --bin bench -- {{benchmark}}.bin {{times}}
+    if [ -z "{{ref}}" ]; then
+        cargo run --release --features window_dump --bin bench -- {{benchmark}}.bin {{times}}
+    else
+        just _compare-worktree {{ref}}
+        bin=$(realpath {{benchmark}}.bin)
+        (cd target/compare/{{ref}} && cargo run --release --features window_dump --bin bench -- $bin {{times}})
+    fi
 
 # Save a benchmark's window dump as bench/window_dumps/<benchmark>.<name>.txt, a
 # reference to compare window allocators against with `just window-dump-stats`.
@@ -151,11 +161,24 @@ gdb-benchmark benchmark:
     cargo build --release --bin bench
     gdb --args ./target/release/bench {{benchmark}}.bin
 
-flamegraph benchmark times='10':
+# Profile a benchmark: perf.data and flamegraph.svg here, or with `ref`, revision
+# `ref`'s build (in target/compare/<ref>, as for `hyperfine-vs`) on this
+# checkout's benchmark, its perf.data there and flamegraph-<ref>.svg here.
+flamegraph benchmark times='10' ref='':
+    #!/usr/bin/env bash
+    set -euo pipefail
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
-    -rm /tmp/perf-*.map
-    cargo flamegraph --features "perf" --bin bench -- {{benchmark}}.bin {{times}}
-    -firefox -new-tab flamegraph.svg
+    rm -f /tmp/perf-*.map
+    if [ -z "{{ref}}" ]; then
+        cargo flamegraph --features "perf" --bin bench -- {{benchmark}}.bin {{times}}
+        firefox -new-tab flamegraph.svg || true
+    else
+        dir=target/compare/{{ref}}
+        just _compare-worktree {{ref}}
+        bin=$(realpath {{benchmark}}.bin)
+        svg=$(realpath .)/flamegraph-{{ref}}.svg
+        (cd $dir && cargo flamegraph --features "perf" --bin bench -o $svg -- $bin {{times}})
+    fi
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
@@ -181,9 +204,7 @@ stencil-asm op ref='':
     dir=.
     if [ -n "{{ref}}" ]; then
         dir=target/compare/{{ref}}
-        test -d $dir || git worktree add --detach $dir {{ref}}
-        git -C $dir checkout --detach {{ref}}
-        for module in dynasm-rs memmap2-rs; do test -L $dir/$module || { rmdir $dir/$module && ln -s "$(realpath $module)" $dir/$module; }; done
+        just _compare-worktree {{ref}}
     fi
     (cd $dir && cargo build --profile unsafe --no-default-features --features unsafe --bin bench -Z build-std="core,std,panic_abort")
     read start size < <(objdump -t -C $dir/target/unsafe/bench | awk '/{{op}}>::__stencil::<0>$/ {print $1, $5}')
@@ -231,15 +252,23 @@ alloc-stats benchmark times='10' policies='streaming unidirectional':
     cargo build --release --features alloc_stats --bin bench
     for policy in {{policies}}; do LUNACY_TRACES=$policy ./target/release/bench {{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-$policy.txt; echo "target/alloc-stats-{{benchmark}}-$policy.txt"; done
 
+# Revision `ref` checked out in a detached worktree, target/compare/<ref>, kept
+# for reruns, its submodules linked to this checkout's.
+_compare-worktree ref:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=target/compare/{{ref}}
+    test -d $dir || git worktree add --detach $dir {{ref}}
+    git -C $dir checkout --detach {{ref}}
+    for module in dynasm-rs memmap2-rs; do test -L $dir/$module || { rmdir $dir/$module && ln -s "$(realpath $module)" $dir/$module; }; done
+
 # Compare this checkout's release build against revision `ref`'s on one
 # benchmark: `ref` is built in a detached worktree under target/compare/ (kept
 # for reruns, its submodules linked to this checkout's).
 hyperfine-vs ref benchmark times='10':
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin bench
-    test -d target/compare/{{ref}} || git worktree add --detach target/compare/{{ref}} {{ref}}
-    git -C target/compare/{{ref}} checkout --detach {{ref}}
-    for module in dynasm-rs memmap2-rs; do test -L target/compare/{{ref}}/$module || { rmdir target/compare/{{ref}}/$module && ln -s "$(realpath $module)" target/compare/{{ref}}/$module; }; done
+    just _compare-worktree {{ref}}
     cd target/compare/{{ref}} && cargo build --release --bin bench
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-vs-{{ref}}.md \
         "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \

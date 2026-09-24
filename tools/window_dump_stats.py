@@ -11,7 +11,8 @@ code weighted by how often it ran, by log2(1 + log2(1 + n)): zero for code
 that never ran, and growing slowly enough that the hottest edge doesn't
 swamp the rest. With `--blocks`, it lists each hot block's counts in
 every dump side by side instead (every block's, with `--all`), where they
-differ.
+differ. With `--kinds`, it totals the code by what emitted it (region entries,
+jumps into compiled blocks, other jumps, exits, ops) in each dump.
 """
 import argparse
 import math
@@ -51,6 +52,23 @@ def counted(path):
         if m:
             lines.append((block, int(m.group(1)), line[:m.start()]))
     return [(block, code, runs.get(id, 0), [n * weight(runs.get(id, 0)) for n in emits(code)]) for block, id, code in lines]
+
+
+def kind(code):
+    """What emitted a counted line of allocator code."""
+    code = code.strip()
+    if code.startswith('region entry'):
+        return 'region entry'
+    if 'compiled' in code:
+        return 'into compiled'
+    if code.startswith('to block'):
+        return 'jump'
+    if code.startswith('exit'):
+        return 'exit'
+    return 'op'
+
+
+KINDS = ['region entry', 'into compiled', 'jump', 'exit', 'op']
 
 
 def executed(path):
@@ -106,9 +124,21 @@ def main():
     parser.add_argument('--all', action='store_true', help='with --blocks, every block, not just the hot ones')
     parser.add_argument('--top', type=int, help='the counted lines executing the most loads, stores and moves')
     parser.add_argument('--raw', action='store_true', help='weight code by how often it ran, not log log of it')
+    parser.add_argument('--kinds', action='store_true', help='the code totalled by what emitted it, in each dump')
     args = parser.parse_args()
     global RAW
     RAW = args.raw
+    if args.kinds:
+        print('%-16s' % 'kind' + ''.join('%34s' % path for path in args.dumps))
+        per = []
+        for path in args.dumps:
+            totals = {k: [0, 0, 0] for k in KINDS}
+            for _, code, _, counts in counted(path):
+                totals[kind(code)] = [a + b for a, b in zip(totals[kind(code)], counts)]
+            per.append(totals)
+        for k in KINDS:
+            print('%-16s' % k + ''.join('%34s' % ('%.0f %.0f %.0f' % tuple(t[k])) for t in per))
+        return 0
     if args.top:
         for path in args.dumps:
             print('==', path)
