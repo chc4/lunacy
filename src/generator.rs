@@ -903,6 +903,9 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
             state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::new(s)));
         })));
         arg = yield YieldOp::SetTypes(vec![(a, LType::String)]);
+        // It allocates, so it is a safepoint, as NEWTABLE is: a loop that only
+        // builds strings would otherwise never collect.
+        yield YieldOp::CollectGarbage;
         arg
     }
 }
