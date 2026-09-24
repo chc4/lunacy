@@ -65,6 +65,9 @@ pub struct Block {
     /// The bytecode PC the block starts at, or the PC of the instruction a
     /// block starting inside one belongs to.
     pub pc: Pc,
+    /// Whether the block may have allocated since its last GC safepoint, which
+    /// it then gets at its end. See Note [Block safepoints].
+    allocates: bool,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
     /// Times the interpreter entered the block, shown by `dump`.
@@ -72,11 +75,23 @@ pub struct Block {
     pub entered: u64,
 }
 
+// Note [Block safepoints]
+// ~~~~~~~~~~~~~~~~~~~~~~~
+// The collector steps only at safepoints (`Residual::GC`), so any code that
+// allocates must reach one, or a loop allocating only there never collects.
+// Emitters say an operation allocates with `YieldOp::CollectGarbage`, and a
+// call that may reach a native may allocate too (a call to a Lua function
+// doesn't: its own blocks have safepoints); either marks its block, which gets one
+// safepoint just before the residual ending it (a jump, a select, a thunk, a
+// return). One per block, not per allocation: each safepoint flushes the JIT's
+// register window, and a block's allocations are few enough to wait for its end.
+
 impl Block {
     fn new(pc: Pc) -> Self {
         Self {
             instructions: vec![],
             pc,
+            allocates: false,
             #[cfg(feature = "jit")]
             jit_info: JitInfo::new(),
             #[cfg(feature = "graph")]
@@ -903,8 +918,7 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
             state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::new(s)));
         })));
         arg = yield YieldOp::SetTypes(vec![(a, LType::String)]);
-        // It allocates, so it is a safepoint, as NEWTABLE is: a loop that only
-        // builds strings would otherwise never collect.
+        // It allocates. See Note [Block safepoints].
         yield YieldOp::CollectGarbage;
         arg
     }
@@ -1449,6 +1463,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
+                    self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b)); None
                 },
                 x => {
@@ -1466,6 +1481,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else {
                 return ctx;
             }
+        }
+    }
+
+    /// Before the residual ending a block: its GC safepoint, if it may have
+    /// allocated since its last. See Note [Block safepoints].
+    fn end_block(&mut self, block_id: BlockId) {
+        let block = &mut self.blocks[block_id.0];
+        if std::mem::take(&mut block.allocates) {
+            block.instructions.push(Residual::GC);
         }
     }
 
@@ -1808,6 +1832,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         let holds_block = self.subblock(owner, pc.next_true(), holds_ctx.clone(), coro.clone(), arg);
                                         self.make_epoch_check(owner, block_id, coro.clone(), idx, cached.clone(), pc, ctx.clone(), holds_block);
 
+                                        self.end_block(block_id);
                                         self.blocks[block_id.0].instructions.push(Residual::Jump(holds_block));
                                         return None;
                                     }
@@ -1847,6 +1872,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         let witness = Residual::Thunk(self.make_href_thunk(block_id, thunk_coro, idx, href.clone(), pc, thunk_ctx, true));
+                        self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(witness);
                         return None;
                     } else {
@@ -1907,6 +1933,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_ctx = ctx.clone();
                         debug!("emitting discovery thunk");
                         let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, expected, pc, thunk_ctx, true));
+                        self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
                     }
@@ -1918,9 +1945,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
-                    self.blocks[block_id.0].instructions.push(Residual::GC);
+                    self.blocks[block_id.0].allocates = true;
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {
+                    self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Select(targets));
                     return None;
                 },
@@ -1943,6 +1971,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 self.blocks[block_id.0].instructions.push(Residual::NativeCall {
                                     nf: nf.native(), a: a as u16, b: b as u16, c: c as u16
                                 });
+                                // A native may allocate (a table, a string).
+                                self.blocks[block_id.0].allocates = true;
                             } else if let CType::LuaFunction(lclos) = &ctx.types[a] {
                                 // TODO: we should probably track the number of incoming edges, and
                                 // subtract that count from the initial hotness of the entry block.
@@ -1955,6 +1985,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 self.blocks[block_id.0].instructions.push(Residual::Call {
                                     a: a as u16, b: b as u16, c: c as u16
                                 });
+                                // It may call a native, which may allocate.
+                                self.blocks[block_id.0].allocates = true;
                             }
                             let ctx = if c == 1 {
                                 // No values are saved
@@ -2026,6 +2058,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::Jump(dest_block)) => {
+                    self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Jump(dest_block));
                     // If it was a jump, stop pumping the coroutine
                     return None;
