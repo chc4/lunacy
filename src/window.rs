@@ -479,6 +479,8 @@ pub(crate) use windowed;
 /// splatting it — or why copying failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StencilError {
+    /// This build copies no stencils (debug assertions, or `immediate_jit`).
+    Disabled,
     /// Reading or parsing this executable's own ELF image failed.
     Image(String),
     /// The stencil isn't a function in the symbol table.
@@ -504,6 +506,7 @@ pub enum StencilError {
 impl std::fmt::Display for StencilError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Disabled => write!(f, "this build copies no stencils"),
             Self::Image(e) => write!(f, "can't read this executable's ELF image: {e}"),
             Self::NotInSymtab { op } => write!(f, "{op} stencil isn't in the symbol table"),
             Self::Undecodable { op, at } => write!(f, "{op} stencil doesn't decode at +{at:#x}"),

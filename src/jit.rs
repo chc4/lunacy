@@ -303,6 +303,13 @@ impl Pool {
     }
 }
 
+/// Whether window ops are copied as stencils at all. Not in a build with debug
+/// assertions, whose stencils are unoptimized and too big to copy, nor with
+/// `immediate_jit`, which compiles every block, more code than the JIT buffer
+/// holds: every window op then runs through its interpreter path, as one the
+/// copier rejects does.
+const COPIES: bool = !cfg!(debug_assertions) && !cfg!(feature = "immediate_jit");
+
 /// Window-op stencils copied out of this executable, by stencil address.
 #[derive(Default)]
 pub struct Stencils {
@@ -312,6 +319,9 @@ pub struct Stencils {
 
 impl Stencils {
     fn body(&mut self, op: &dyn Window, skip: usize) -> Result<Rc<Body>, StencilError> {
+        if !COPIES {
+            return Err(StencilError::Disabled);
+        }
         let image = self.image.get_or_insert_with(Image::load).as_ref().map_err(Clone::clone)?;
         self.bodies
             .entry(op.stencil(skip))
@@ -390,7 +400,7 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
     dynasm!(ops ; .arch x64 ; =>fall ; add rsp, 8);
 }
 
-const JIT_SIZE: usize = 0x1000 * 4096;
+const JIT_SIZE: usize = 0x1000 * 16;
 pub struct JitContext {
     pub memory: std::cell::Cell<dynasmrt::mmap::ExecutableBuffer>,
     pub blocks: HashMap<BlockId, JitBlock, FxBuildHasher>,
@@ -473,13 +483,9 @@ fn inline_guard(res: &Residual) -> bool {
     matches!(res, Residual::Guard { expected: LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String, .. })
 }
 
-/// The `SKIP`s a window op's stencil can be copied at. None in a build with debug
-/// assertions: its stencils are unoptimized, and too big to copy, so the op runs
-/// through its interpreter path instead, as an op the copier rejects does.
+/// The `SKIP`s a window op's stencil can be copied at: none where stencils
+/// aren't copied (`COPIES`), and the op runs through its interpreter path.
 fn usable_skips(stencils: &mut Stencils, w: &dyn Window) -> SmallVec<[usize; WINDOW]> {
-    if cfg!(debug_assertions) {
-        return SmallVec::new();
-    }
     (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(w, skip).is_ok()).collect()
 }
 

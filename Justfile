@@ -13,9 +13,8 @@ test:
     cargo test --features "gc_sanitize"
     # Interpreter GC stress test
     cargo test --features "gc_stress gc_sanitize"
-    # Golden suite with every block JIT compiled on first run (a debug build, so
-    # window ops run through their interpreter path; `just test-stencils` runs
-    # them as copied stencils)
+    # Golden suite with every block JIT compiled on first run (window ops run
+    # through their interpreter path: `immediate_jit` copies no stencils)
     cargo test --features "immediate_jit gc_sanitize" --test golden_tests
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     cargo test --test gc_reset_frees
@@ -25,8 +24,9 @@ test:
 # tests also run in `just test` (debug); this runs them against optimized
 # stencils, then the golden suite with `check_windows`: every window op the
 # interpreter executes is also copy&patched and run natively, and the results
-# must match. Then the golden suite with every block JIT compiled, so window ops
-# run as copied stencils under the JIT's register allocation. (At opt-level 0,
+# must match. Then the golden suite with every block JIT compiled, optimized
+# (`immediate_jit` copies no stencils, so window ops run through their
+# interpreter path under the JIT's register allocation). (At opt-level 0,
 # `NumericIntInt` keeps a jump table from the unfolded `match OP`, which the
 # copier rejects: the check skips it and the JIT calls into the interpreter.)
 STENCIL_OPT := "--profile stencils"
