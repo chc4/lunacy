@@ -39,9 +39,27 @@ end
 print(loops())
 loops.__jit = 1
 print(loops())
+-- Array part bounds guards (see Note [Dynamic guards]) whose first key is past
+-- the array part, so the in-array side is compiled second; constant keys on
+-- both sides; and appends, each one past the array part.
+local function at(t, k) return t[k] end
+local function put(t, k, v) t[k] = v end
+local function bounds()
+  local t = {1, 2, 3}
+  put(t, 0, "zero"); put(t, 2, "two")
+  t[4] = "four"; t[3] = "three"
+  local a = {}
+  for i = 1, 5 do a[i] = i * 10 end
+  return at(t, 9), at(t, 2), at(t, 0), t[3], t[4], t[7], t[1], #t, a[5], #a
+end
+print(bounds())
+at.__jit = 1; put.__jit = 1; bounds.__jit = 1
+print(bounds())
 -- EXPECT: 10	half	string	zero	minus two	40	nil	4
 -- EXPECT: 10	half	string	zero	minus two	40	nil	4
 -- EXPECT: 385	past	above	product	10
 -- EXPECT: 385	past	above	product	10
 -- EXPECT: 1	1.5	3	nil	-2147483647	-2147483650	3
 -- EXPECT: 1	1.5	3	nil	-2147483647	-2147483650	3
+-- EXPECT: nil	two	zero	three	four	nil	1	4	50	5
+-- EXPECT: nil	two	zero	three	four	nil	1	4	50	5

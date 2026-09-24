@@ -243,6 +243,8 @@ pub enum YieldOp {
     GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer.
                               // See Note [Integers]
     TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
+    GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
+                                  // See Note [Dynamic guards]
     Exec(ResidualExec), // Emit a residual operation that will be executed
     ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op. See Note [Register window].
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
@@ -432,21 +434,30 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
         } else {
             let integer = match yield YieldOp::GuardRk(c, LType::Number) {
-                ResumeArg::Matched => yield YieldOp::GuardCType(c, CType::Integer),
+                ResumeArg::Matched | ResumeArg::MatchedConst(_) => yield YieldOp::GuardCType(c, CType::Integer),
                 _ => ResumeArg::Failed,
             };
-            if let ResumeArg::Matched = integer {
-                // An integer key in a register: the array part, if it is in it.
+            // An integer key in the array part, in a register or a constant: the
+            // array slot. See Note [Dynamic guards].
+            let in_array = match integer {
+                ResumeArg::MatchedConst(k) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k as u32, &[b]))),
+                ResumeArg::Matched => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[b, c]))),
+                _ => ResumeArg::Failed,
+            };
+            if let (ResumeArg::MatchedConst(k), ResumeArg::Matched) = (&integer, &in_array) {
+                windowed!(GetTableArray, [k: u32], [], |owner, state, base| (table, out dest) {
+                    let Constant::Number(n) = (&(*state.clos.ro(owner).prototype).constants.items).get_unchecked(k as usize) else {
+                        core::hint::unreachable_unchecked()
+                    };
+                    let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
+                    *dest = *tab.ro(owner).array.get_unchecked(integer_slot(n.0));
+                });
+                arg = yield YieldOp::ExecWindow(Rc::new(GetTableArray::new(*k as u32, &[b, a])));
+            } else if let (ResumeArg::Matched, ResumeArg::Matched) = (&integer, &in_array) {
                 windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
                     let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
                     let Some(n) = key.as_number() else { core::hint::unreachable_unchecked() };
-                    // Keys below 1 wrap past any array part.
-                    let slot = (n.to_int_unchecked::<i32>() as i64 - 1) as usize;
-                    *dest = if slot < tab.ro(owner).array.len() {
-                        *tab.ro(owner).array.get_unchecked(slot)
-                    } else {
-                        tab.get(owner, &key, state.intern).unwrap_or(LBoxed::NIL)
-                    };
+                    *dest = *tab.ro(owner).array.get_unchecked(integer_slot(n));
                 });
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableInteger::new(&[b, c, a])));
             } else {
@@ -484,40 +495,34 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             ResumeArg::Matched | ResumeArg::MatchedConst(_) => yield YieldOp::GuardCType(b, CType::Integer),
             _ => ResumeArg::Failed,
         };
-        // An integer key, with the value in a register, stores straight into the
-        // array part if it is in it, else through `set`, which may grow it. Keys
-        // below 1 wrap past any array part.
-        if let (ResumeArg::MatchedConst(k), 0) = (&integer, c & 0x100) {
+        // An integer key in the array part, with the value in a register, stores
+        // into its slot. See Note [Dynamic guards].
+        let in_array = match (&integer, c & 0x100) {
+            (ResumeArg::MatchedConst(k), 0) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(*k as u32, &[a]))),
+            (ResumeArg::Matched, 0) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[a, b]))),
+            _ => ResumeArg::Failed,
+        };
+        if let (ResumeArg::MatchedConst(k), ResumeArg::Matched) = (&integer, &in_array) {
             windowed!(SetTableArray, [k: u32], [], |owner, state, base| (table, value) {
-                // The specializer checked `k` is an integer constant.
                 let Constant::Number(n) = (&(*state.clos.ro(owner).prototype).constants.items).get_unchecked(k as usize) else {
                     core::hint::unreachable_unchecked()
                 };
                 let LValue::Table(mut tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-                let slot = (n.0.to_int_unchecked::<i32>() as i64 - 1) as usize;
                 tab.barrier_back();
-                if slot < tab.ro(owner).array.len() {
-                    *tab.rw(owner).array.get_unchecked_mut(slot) = value;
-                } else {
-                    tab.set(owner, LBoxed::from_number(n.0), value, state.intern);
-                }
+                *tab.rw(owner).array.get_unchecked_mut(integer_slot(n.0)) = value;
             });
             arg = yield YieldOp::ExecWindow(Rc::new(SetTableArray::new(*k as u32, &[a, c])));
-        } else if let (ResumeArg::Matched, 0) = (&integer, c & 0x100) {
+        } else if let (ResumeArg::Matched, ResumeArg::Matched) = (&integer, &in_array) {
             windowed!(SetTableInteger, [], [], |owner, state, base| (table, key, value) {
                 let LValue::Table(mut tab) = table.unbox() else { core::hint::unreachable_unchecked() };
                 let Some(n) = key.as_number() else { core::hint::unreachable_unchecked() };
-                let slot = (n.to_int_unchecked::<i32>() as i64 - 1) as usize;
                 tab.barrier_back();
-                if slot < tab.ro(owner).array.len() {
-                    *tab.rw(owner).array.get_unchecked_mut(slot) = value;
-                } else {
-                    tab.set(owner, key, value, state.intern);
-                }
+                *tab.rw(owner).array.get_unchecked_mut(integer_slot(n)) = value;
             });
             arg = yield YieldOp::ExecWindow(Rc::new(SetTableInteger::new(&[a, b, c])));
         } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
-            // Any other number key, or a constant value: through `set`.
+            // Any other number key, one past the array part, or a constant value:
+            // through `set`.
             arg = yield YieldOp::Exec(ResidualExec::new("settable_array", Rc::new(move |owner, state| {
                 let kb: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                     Ok(b) => LValue::from(b),
@@ -1167,8 +1172,8 @@ pub enum Residual {
     ExecWindow(Rc<dyn Window>),
     /// A guard whose test is a window op: it sets `state.select` to 0 to pass,
     /// taking the success edge (the residual after the next), or 1 to fail,
-    /// falling through to the failure edge, as `Guard` does. Its test needn't be
-    /// an LType's; see Note [Integers].
+    /// falling through to the failure edge, as `Guard` does. See Note [Dynamic
+    /// guards].
     GuardDynamic(Rc<dyn Window>),
     Call { a: u16, b: u16, c: u16 },
     Select(Vec<(&'static str, BlockId)>),
@@ -1300,6 +1305,50 @@ pub fn is_integer(n: f64) -> bool {
 crate::window::windowed!(CheckInteger, [], [INTEGER: bool], |owner, state, base| (value) {
     let pass = value.as_number().is_some_and(|n| is_integer(n) == INTEGER);
     state.select = (!pass) as usize;
+});
+
+// Note [Dynamic guards]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// A `GuardDynamic` residual's test is a window op that reads its operands and
+// sets `state.select`, 0 to pass and 1 to fail, and does nothing else. Its two
+// edges continue the generator at different `SubPc`s, resumed with `Matched` or
+// `Failed`, so their versions are told apart by the outcome and needn't differ
+// in context: a test can speculate on what no ctype names, like whether a key is
+// in a table's array part (`InArray`), for the instruction's next op alone.
+// Nothing records it, so nothing invalidates it: the guard tests it each run.
+//
+// A generator yields `GuardDynamic(test)`, ending its block in a thunk. Forcing
+// it runs the test on the values at hand, then lays out
+//
+//   passed: guard(test), thunk(fail side), jump(pass side)
+//   failed: guard(test), jump(fail side), thunk(pass side)
+//
+// compiling the side the values took, and the other when first taken, as a jump
+// in place of its thunk.
+//
+// `CheckInteger` guards with the same residual, but through `GuardCType`: what it
+// finds is a ctype, which each side's context records. See Note [Integers].
+
+/// The array part slot of a `CType::Integer` key. Keys below 1 wrap past any
+/// array part.
+#[inline(always)]
+unsafe fn integer_slot(n: f64) -> usize {
+    (unsafe { n.to_int_unchecked::<i32>() } as i64 - 1) as usize
+}
+
+// `GuardDynamic` tests: whether a `CType::Integer` key, in a register or the
+// constant `k`, is in a table's array part. See Note [Dynamic guards].
+crate::window::windowed!(InArray, [], [], |owner, state, base| (table, key) {
+    let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
+    let Some(n) = key.as_number() else { core::hint::unreachable_unchecked() };
+    state.select = (integer_slot(n) >= tab.ro(owner).array.len()) as usize;
+});
+crate::window::windowed!(InArrayK, [k: u32], [], |owner, state, base| (table) {
+    let Constant::Number(n) = (&(*state.clos.ro(owner).prototype).constants.items).get_unchecked(k as usize) else {
+        core::hint::unreachable_unchecked()
+    };
+    let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
+    state.select = (integer_slot(n.0) >= tab.ro(owner).array.len()) as usize;
 });
 
 /// The type of a constant.
@@ -1750,6 +1799,35 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("yield one resulted in {arg:?}");
             return arg;
         }
+    }
+
+    /// The thunk a `GuardDynamic` yield ends its block in. See Note [Dynamic guards].
+    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            test.interp(owner, state);
+            let passed = state.select == 0;
+            vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test.clone());
+            let (fail, pass) = if passed {
+                let pass = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Matched);
+                let fail = vm.make_side_thunk(block_id, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
+                (Residual::Thunk(fail), Residual::Jump(pass))
+            } else {
+                let fail = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
+                let pass = vm.make_side_thunk(block_id, thunk_coro.clone(), pc.next_true(), thunk_ctx.clone(), ResumeArg::Matched);
+                (Residual::Jump(fail), Residual::Thunk(pass))
+            };
+            vm.blocks[block_id.0].instructions.push(fail);
+            vm.blocks[block_id.0].instructions.push(pass);
+        })))
+    }
+
+    /// A `GuardDynamic`'s side not yet taken, compiled and jumped to in its
+    /// place when first taken. See Note [Dynamic guards].
+    fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
+            vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Jump(side);
+        })))
     }
 
     /// `make_discovery_thunk`, for `GuardCType(idx, Integer)`. See Note [Integers].
@@ -2216,6 +2294,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             return None;
                         },
                     }
+                },
+                CoroutineState::Yielded(YieldOp::GuardDynamic(test)) => {
+                    assert!(test.accesses().iter().all(|access| *access == Access::Read), "{}: a guard's test has no outputs", test.name());
+                    let thunk = Residual::Thunk(self.make_dynamic_thunk(block_id, coro.clone(), test, pc, ctx.clone()));
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(thunk);
+                    return None;
                 },
                 CoroutineState::Yielded(guard @ YieldOp::Guard(idx, expected)) => {
                     debug!("guard {:?} == {:?}", ctx.types[idx], expected);
