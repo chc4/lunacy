@@ -288,7 +288,7 @@ impl WindowAlloc {
     /// registers as one parallel move (a slot loaded into several registers is
     /// loaded once and copied). See Note [Window allocation].
     pub fn reconcile(&mut self, want: &Placement, op: &dyn Window) -> SmallVec<[Emit; 16]> {
-        let rewritten = |slot: usize| op.operands().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a == Access::Write);
+        let rewritten = |slot: usize| op.operands().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a.writes());
         let now = &self.cache;
         let mut after = now.regs;
         for (reg, slot) in want.iter().enumerate() {
@@ -348,7 +348,6 @@ impl WindowAlloc {
     fn plan(&self, slots: &[usize], accesses: &[Access], skip: usize) -> Plan {
         let now = &self.cache;
         let span = skip..skip + slots.len();
-        let operand = |slot: usize, access: Access| slots.iter().zip(accesses).any(|(&s, &a)| s == slot && a == access);
         let mut emits = SmallVec::new();
 
         // Values the span overwrites; a dirty one that survives nowhere else is
@@ -356,12 +355,12 @@ impl WindowAlloc {
         let mut overwritten = 0;
         for (i, reg) in span.clone().enumerate() {
             let Some(slot) = now.regs[reg] else { continue };
-            if accesses[i] == Access::Read && slots[i] == slot {
+            if accesses[i].reads() && slots[i] == slot {
                 continue;
             }
             overwritten += 1;
             let elsewhere = (0..self.width).any(|r| !span.contains(&r) && now.regs[r] == Some(slot));
-            let survives = elsewhere || operand(slot, Access::Read) || operand(slot, Access::Write);
+            let survives = elsewhere || slots.contains(&slot);
             let stored = emits.iter().any(|e| matches!(e, Emit::Store { slot: s, .. } if *s == slot));
             if now.dirty.contains(&slot) && !survives && !stored {
                 emits.push(Emit::Store { slot, reg });
@@ -377,7 +376,7 @@ impl WindowAlloc {
             if access == Access::Write || now.regs[reg] == Some(slot) {
                 continue;
             }
-            match (0..i).find(|&j| accesses[j] == Access::Read && slots[j] == slot) {
+            match (0..i).find(|&j| accesses[j].reads() && slots[j] == slot) {
                 Some(first) => copies.push((reg, skip + first)),
                 None => moves.push((reg, now.position(slot).map_or(Source::Memory(slot), Source::Reg))),
             }
@@ -393,7 +392,7 @@ impl WindowAlloc {
             after.regs[skip + i] = (access == Access::Read).then_some(slot);
         }
         for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
-            if access == Access::Write {
+            if access.writes() {
                 for reg in after.regs.iter_mut().filter(|r| **r == Some(slot)) {
                     *reg = None;
                 }
@@ -563,12 +562,12 @@ impl Run<'_> {
 
     /// The register the op writes `slot` to, if it writes it.
     fn writes(&self, slot: usize) -> Option<usize> {
-        self.operands().find(|&(_, s, a)| s == slot && a == Access::Write).map(|(reg, ..)| reg)
+        self.operands().find(|&(_, s, a)| s == slot && a.writes()).map(|(reg, ..)| reg)
     }
 
     /// Whether the op reads `slot` in `reg`.
     fn reads_at(&self, slot: usize, reg: usize) -> bool {
-        self.contains(reg) && self.slots[reg - self.skip] == slot && self.accesses[reg - self.skip] == Access::Read
+        self.contains(reg) && self.slots[reg - self.skip] == slot && self.accesses[reg - self.skip].reads()
     }
 
     fn operands(&self) -> impl Iterator<Item = (usize, usize, Access)> + '_ {
@@ -634,14 +633,15 @@ impl Planner {
         for (reg, slot, access) in run.operands() {
             for id in self.pending(slot) {
                 let q = &self.requests[id];
-                match (access, q.wants) {
-                    (Access::Write, Some(r)) if !run.contains(r) => cost += weight(id) * PLAN_MOVE,
+                // A later use of a slot the op writes wants its new value.
+                match (access.writes(), q.wants) {
+                    (true, Some(r)) if !run.contains(r) => cost += weight(id) * PLAN_MOVE,
                     // Kept in its register until the use, a move there; else
                     // the new value is stored, on the hot path, and reloaded.
-                    (Access::Write, None) => {
+                    (true, None) => {
                         cost += if self.free(reg, q.at, run) { weight(id) * PLAN_MOVE } else { PLAN_STORE + weight(id) * PLAN_LOAD }
                     }
-                    (Access::Read, Some(r)) if !run.contains(r) && r != reg => cost += weight(id) * PLAN_MOVE,
+                    (false, Some(r)) if !run.contains(r) && r != reg => cost += weight(id) * PLAN_MOVE,
                     _ => {}
                 }
             }
@@ -664,7 +664,7 @@ impl Planner {
         }
         // Outputs, then inputs, are their slots' sources. Requests for any
         // register need a free one, so go before those holding theirs.
-        let outputs = run.operands().filter(|&(.., a)| a == Access::Write);
+        let outputs = run.operands().filter(|&(.., a)| a.writes());
         let inputs = run.operands().filter(|&(.., a)| a == Access::Read);
         for (reg, slot, _) in outputs.chain(inputs) {
             for id in self.pending(slot) {
@@ -688,7 +688,7 @@ impl Planner {
             self.occupied[reg] = self.occupied[reg].min(step);
         }
         for (reg, slot, access) in run.operands() {
-            if access == Access::Read {
+            if access.reads() {
                 self.request(slot, step, true, Some(reg));
             }
         }
@@ -752,15 +752,15 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
         match s {
             Step::Op(op, usable) => {
                 let operands = op.operands().iter().zip(op.accesses()).enumerate();
-                for (_, (&slot, _)) in operands.clone().filter(|(_, (_, a))| **a == Access::Read) {
+                for (_, (&slot, _)) in operands.clone().filter(|(_, (_, a))| a.reads()) {
                     inputs.push(writer.iter().find(|w| w.0 == slot).map_or(u16::MAX, |w| w.1));
                 }
-                let reads = |skip: usize| (skip..).zip(op.accesses()).filter(|(_, a)| **a == Access::Read).map(|(reg, _)| reg);
+                let reads = |skip: usize| (skip..).zip(op.accesses()).filter(|(_, a)| a.reads()).map(|(reg, _)| reg);
                 let misses = |skip: usize| reads(skip).zip(&inputs).filter(|&(reg, mask)| mask & 1 << reg == 0).count();
                 let fits = usable.iter().copied().filter(|&skip| skip + op.operands().len() <= width);
                 let fewest = fits.clone().map(misses).min().unwrap_or(0);
                 let good = fits.filter(|&skip| misses(skip) == fewest).fold(0u16, |mask, skip| mask | 1 << skip);
-                for (index, (&slot, _)) in operands.filter(|(_, (_, a))| **a == Access::Write) {
+                for (index, (&slot, _)) in operands.filter(|(_, (_, a))| a.writes()) {
                     written.insert(slot);
                     writer.retain(|w| w.0 != slot);
                     writer.push((slot, good << index));
@@ -790,7 +790,7 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
                     .map(|skip| {
                         let (mut cost, nearest) = planner.cost(&Run { slots, accesses, skip }, &dirty[step]);
                         // An input its producer can't write in place is a move.
-                        let inputs = (skip..).zip(accesses).filter(|(_, a)| **a == Access::Read).map(|(reg, _)| reg);
+                        let inputs = (skip..).zip(accesses).filter(|(_, a)| a.reads()).map(|(reg, _)| reg);
                         for (reg, mask) in inputs.zip(&in_place[step]) {
                             cost += u32::from(mask & 1 << reg == 0) * PLAN_MOVE;
                         }
@@ -871,7 +871,7 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
         if let Step::Op(op, _) = s {
             let run = Run { slots: op.operands(), accesses: op.accesses(), skip: skips[step] };
             for (reg, slot, access) in run.operands() {
-                if access == Access::Read {
+                if access.reads() {
                     want(&mut windows, step, reg, slot);
                 }
             }
@@ -1011,11 +1011,11 @@ mod tests {
                 Emit::Op { skip } => {
                     let op = op.expect("an op");
                     let operands = op.operands().iter().zip(op.accesses()).enumerate();
-                    for (i, (&slot, _)) in operands.clone().filter(|(_, (_, a))| **a == Access::Read) {
+                    for (i, (&slot, _)) in operands.clone().filter(|(_, (_, a))| a.reads()) {
                         let current = Self::version(&self.current, slot);
                         assert_eq!(self.regs[skip + i], Some((slot, current)), "input {i} of {op:?}");
                     }
-                    for (i, (&slot, _)) in operands.filter(|(_, (_, a))| **a == Access::Write) {
+                    for (i, (&slot, _)) in operands.filter(|(_, (_, a))| a.writes()) {
                         let version = Self::version(&self.current, slot) + 1;
                         self.current.insert(slot, version);
                         self.regs[skip + i] = Some((slot, version));

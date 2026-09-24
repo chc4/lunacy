@@ -12,7 +12,10 @@ that never ran, and growing slowly enough that the hottest edge doesn't
 swamp the rest. With `--blocks`, it lists each hot block's counts in
 every dump side by side instead (every block's, with `--all`), where they
 differ. With `--kinds`, it totals the code by what emitted it (region entries,
-jumps into compiled blocks, other jumps, exits, ops) in each dump.
+jumps into compiled blocks, other jumps, exits, ops) in each dump. With `--ops`,
+it lists how often each window op ran (a residual `window(Op, ...)` or
+`guard_dynamic(Op, ...)`, counted by its `op at` line) in each dump side by
+side, most changed first.
 """
 import argparse
 import math
@@ -24,6 +27,7 @@ STUB = re.compile(r'^(?:block \d+ compiled already, entered with \{[^}]*\}|regio
 EMIT = re.compile(r'(\w+|\[\d+\]) <- (\w+|\[\d+\])')
 COUNTED = re.compile(r' #(\d+)$')
 COUNT = re.compile(r'^count #(\d+) (\d+)$')
+RESIDUAL = re.compile(r'^    \d+ (window|guard_dynamic)\((\w+)')
 
 
 RAW = False
@@ -69,6 +73,32 @@ def kind(code):
 
 
 KINDS = ['region entry', 'into compiled', 'jump', 'exit', 'op']
+
+
+def ops(path):
+    """{window op: times run} over the dump at `path`."""
+    runs, seen = {}, []
+    op = None
+    for line in open(path):
+        line = line.rstrip('\n')
+        m = COUNT.match(line)
+        if m:
+            runs[int(m.group(1))] = int(m.group(2))
+            continue
+        m = RESIDUAL.match(line)
+        if m:
+            op = m.group(2)
+            continue
+        if line.startswith('    ') and not line.startswith('      '):
+            op = None
+        m = COUNTED.search(line)
+        if m and op is not None and 'op at' in line:
+            seen.append((op, int(m.group(1))))
+            op = None
+    totals = {}
+    for op, id in seen:
+        totals[op] = totals.get(op, 0) + runs.get(id, 0)
+    return totals
 
 
 def executed(path):
@@ -125,9 +155,18 @@ def main():
     parser.add_argument('--top', type=int, help='the counted lines executing the most loads, stores and moves')
     parser.add_argument('--raw', action='store_true', help='weight code by how often it ran, not log log of it')
     parser.add_argument('--kinds', action='store_true', help='the code totalled by what emitted it, in each dump')
+    parser.add_argument('--ops', action='store_true', help='how often each window op ran, in each dump')
     args = parser.parse_args()
     global RAW
     RAW = args.raw
+    if args.ops:
+        per = [ops(path) for path in args.dumps]
+        names = sorted({op for t in per for op in t}, key=lambda op: -(max(t.get(op, 0) for t in per) - min(t.get(op, 0) for t in per)))
+        print('%-24s' % 'op' + ''.join('%20s' % path.split('/')[-2 if path.endswith('window_dump.txt') and '/' in path else -1] for path in args.dumps))
+        for op in names:
+            print('%-24s' % op + ''.join('%20d' % t.get(op, 0) for t in per))
+        print('%-24s' % 'total' + ''.join('%20d' % sum(t.values()) for t in per))
+        return 0
     if args.kinds:
         print('%-16s' % 'kind' + ''.join('%34s' % path for path in args.dumps))
         per = []

@@ -186,25 +186,25 @@ macro_rules! dispatch_compare_window {
 }
 
 /// In a generator, the types of an op's two operands, as `TypeofRk` gives
-/// them, for an op computing on integers: with one an integer, whether an
-/// unknown other is one is found out. See Note [Integers].
+/// them, for an op computing on integers: with one an integer, whether the
+/// other is one is found out. See Note [Integers].
 ///
-/// The other register is guarded even when its type is known, statically
-/// (`DiscoverInteger` tests no known number), so that a way into the op
-/// already holding both integers takes the same guard as one finding out: the
-/// subblocks after the guard are shared by its outcome and the context, which
-/// are then the same, so the op must be at the same point in each.
+/// The other register is guarded even when it is known to be an integer,
+/// statically, so that a way into the op already holding both integers takes
+/// the same guard as one finding out: the subblocks after the guard are shared
+/// by its outcome and the context, which are then the same, so the op must be
+/// at the same point in each.
 macro_rules! discover_integers {
     ($lhs:expr, $rhs:expr) => {{
         let integer = ResumeArg::Type(CType::Integer);
         let mut lt = yield YieldOp::TypeofRk($lhs);
         let mut rt = yield YieldOp::TypeofRk($rhs);
         if lt == integer && ($rhs & 0x100) == 0 {
-            if (yield YieldOp::DiscoverInteger($rhs)) == ResumeArg::Matched {
+            if (yield YieldOp::GuardCType($rhs, CType::Integer)) == ResumeArg::Matched {
                 rt = integer.clone();
             }
         } else if rt == integer && ($lhs & 0x100) == 0 {
-            if (yield YieldOp::DiscoverInteger($lhs)) == ResumeArg::Matched {
+            if (yield YieldOp::GuardCType($lhs, CType::Integer)) == ResumeArg::Matched {
                 lt = integer.clone();
             }
         }
@@ -254,6 +254,7 @@ fn window_label(w: &dyn Window) -> String {
     let operands = w.operands().iter().zip(w.accesses()).map(|(slot, access)| match access {
         Access::Read => format!(", {slot}"),
         Access::Write => format!(", out {slot}"),
+        Access::Update => format!(", inout {slot}"),
     });
     format!("{}{}", w.name(), operands.collect::<String>())
 }
@@ -286,8 +287,6 @@ pub enum YieldOp {
                            // is the expected type
     GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer.
                               // See Note [Integers]
-    DiscoverInteger(usize), // GuardCType(idx, Integer), but a number known not to be one
-                            // fails statically. See Note [Integers]
     TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
     IntegerK(usize), // Resumed with the value of CONSTANT[idx], a `CType::Integer`
     Demote(std::ops::Range<usize>), // Lower the integers in STACK[range] to doubles, for code
@@ -1562,7 +1561,8 @@ impl std::fmt::Display for CType {
 // store to a table or a global, a table op's generic path), for a call's
 // arguments and a return's values, and before a jump into a version typing the
 // slot less precisely (Note [Version compatibility]), in a block of its own on
-// that edge. Its context must still be one the version accepts, so a generator
+// that edge. A jump forgetting the types of registers holding no local keeps an
+// integer's (`forgotten`), as forgetting it would lower it every time. Its context must still be one the version accepts, so a generator
 // lowers nothing once it has its jump targets. `Typeof` answers `Integer`, so
 // MOVE copies an integer as one.
 //
@@ -1570,12 +1570,19 @@ impl std::fmt::Display for CType {
 // SUB, MUL and MOD of two `Integer` operands give one, guarded by a
 // `GuardDynamic` test that the exact result fits the encoding, which a failing
 // one computes as doubles instead. Compares of two compare them as integers.
-// With one operand known an integer, these find out whether the other is with
-// `DiscoverInteger`: a `GuardCType` but for failing statically on a number the
-// context knows isn't `Integer`, so that arithmetic on doubles tests nothing. The number ops, compares and FORLOOP read
-// an integer operand as a double without lowering it, and FORPREP finds out
-// whether its operands are integers, so an integer loop's index and variable
-// stay ones.
+// With one operand an integer, these find out whether the other is one too
+// with a `GuardCType`, which leaves it `Integer` for the ops after. The double
+// ops, compares and FORLOOP read an integer operand as a double, and FORPREP
+// finds out whether its operands are integers, so an integer loop's index and
+// variable stay ones.
+
+/// Whether a jump forgets a type of a register holding no local in scope at
+/// its target, which may still be an expression's temporary (`a and b or c`).
+/// Not an `Integer`: forgetting one would lower it, a conversion on every jump
+/// with it, where forgetting any other type costs nothing.
+fn forgotten(ctype: &CType) -> bool {
+    !matches!(ctype, CType::Type(LType::Unknown) | CType::Integer)
+}
 
 /// Whether `n` is a `CType::Integer`. See Note [Integers].
 #[inline(always)]
@@ -1592,12 +1599,12 @@ crate::window::windowed!(CheckInteger, [], [INTEGER: bool], |owner, state, base|
 
 // Convert a number between its encodings, in place: a double that is a
 // `CType::Integer` to one, and back. See Note [Integers].
-crate::window::windowed!(ToInteger, [], [], |owner, state, base| (value, out dest) {
+crate::window::windowed!(ToInteger, [], [], |owner, state, base| (inout value) {
     let Some(n) = value.as_number() else { core::hint::unreachable_unchecked() };
-    *dest = LBoxed::from_int(n.to_int_unchecked::<i32>());
+    *value = LBoxed::from_int(n.to_int_unchecked::<i32>());
 });
-crate::window::windowed!(ToNumber, [], [], |owner, state, base| (value, out dest) {
-    *dest = LBoxed::from_number(value.as_int() as f64);
+crate::window::windowed!(ToNumber, [], [], |owner, state, base| (inout value) {
+    *value = LBoxed::from_number(value.as_int() as f64);
 });
 
 // Note [Dynamic guards]
@@ -2074,7 +2081,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn demote(&mut self, block_id: BlockId, ctx: &mut Rc<Context>, slots: std::ops::Range<usize>) {
         for idx in slots.start..slots.end.min(ctx.types.len()) {
             if ctx.types[idx] == CType::Integer {
-                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(ToNumber::new(&[idx, idx]))));
+                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(ToNumber::new(&[idx]))));
                 Rc::make_mut(ctx).types[idx] = CType::Type(LType::Number);
             }
         }
@@ -2086,24 +2093,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn edge(&mut self, owner: &mut Owner, ctx: &Context, target: BlockId) -> BlockId {
         let Some(entered) = self.blocks[target.0].context.clone() else { return target };
         let pc = self.blocks[target.0].pc;
-        // Every integer the version doesn't keep, including those in the
-        // registers `GetBlock` forgets, which an expression's temporaries may
-        // still be in.
+        // Every integer the version doesn't keep: one that joined with another
+        // type into a less precise one.
         let lower: Vec<usize> = (0..ctx.types.len())
             .filter(|&idx| ctx.types[idx] == CType::Integer && entered.slot(idx) != CType::Integer)
             .collect();
         let live = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
         let mut jumping = ctx.clone();
-        jumping.set_types(owner, lower.iter().map(|&idx| (idx, CType::Type(LType::Number)))
-            .chain((live..ctx.types.len()).map(|idx| (idx, CType::Type(LType::Unknown))))
-            .collect());
+        jumping.set_types(owner, lower.iter().map(|&idx| (idx, CType::Type(LType::Number))).collect());
+        let dead = (live..jumping.types.len()).filter(|&idx| forgotten(&jumping.types[idx])).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
+        jumping.set_types(owner, dead);
         assert!(entered.accepts(&jumping), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
         if lower.is_empty() {
             return target;
         }
         let lowering = self.new_block(pc);
         for idx in lower {
-            self.blocks[lowering.0].instructions.push(Residual::ExecWindow(Rc::new(ToNumber::new(&[idx, idx]))));
+            self.blocks[lowering.0].instructions.push(Residual::ExecWindow(Rc::new(ToNumber::new(&[idx]))));
         }
         self.blocks[lowering.0].instructions.push(Residual::Jump(target));
         lowering
@@ -2230,7 +2236,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // ways holding it as one already share.
             if integer {
                 let converting = vm.new_block(pc.0);
-                vm.blocks[converting.0].instructions.push(Residual::ExecWindow(Rc::new(ToInteger::new(&[idx, idx]))));
+                vm.blocks[converting.0].instructions.push(Residual::ExecWindow(Rc::new(ToInteger::new(&[idx]))));
                 vm.blocks[converting.0].instructions.push(Residual::Jump(guard_block));
                 guard_block = converting;
             }
@@ -2648,15 +2654,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         continue 'machine;
                     }
                 },
-                op @ CoroutineState::Yielded(YieldOp::GuardCType(_, _) | YieldOp::DiscoverInteger(_)) => {
-                    let (rk, discover) = match op {
-                        CoroutineState::Yielded(YieldOp::GuardCType(rk, expected)) => {
-                            assert_eq!(expected, CType::Integer, "GuardCType tests only for Integer");
-                            (rk, false)
-                        },
-                        CoroutineState::Yielded(YieldOp::DiscoverInteger(rk)) => (rk, true),
-                        _ => unreachable!(),
-                    };
+                CoroutineState::Yielded(YieldOp::GuardCType(rk, ref expected)) => {
+                    assert_eq!(*expected, CType::Integer, "GuardCType tests only for Integer");
                     let pass = if (rk & 0x100) != 0 {
                         let k = rk & 0xff;
                         let proto = self.clos.ro(owner).prototype;
@@ -2665,7 +2664,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         match &ctx.types[rk] {
                             CType::Integer => Some(ResumeArg::Matched),
-                            CType::Type(LType::Number) if discover => Some(ResumeArg::Failed),
                             ctype if !matches!(ctype.as_ltype(), LType::Number | LType::Unknown) => Some(ResumeArg::Failed),
                             // A number, or unknown: tested at runtime. See Note [Integers].
                             _ => None,
@@ -2822,17 +2820,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
                     // The jump forgets the types of every register not holding a local in
-                    // scope at its target: a register a local leaves is written before
-                    // it is read again, and an expression's temporaries (`a and b or
-                    // c`) are only read as any value. Forgetting their types lets paths
-                    // that differ only in them share the target's version; `edge`
-                    // lowers an integer it forgets. See Note [Integers]. The context of the block itself is unchanged, as it may
-                    // jump elsewhere too.
+                    // scope at its target (`forgotten`), which lets paths that differ
+                    // only in them share the target's version.
                     let mut ctx = ctx.clone();
                     let in_scope = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(dest_pc);
                     if let Some(in_scope) = in_scope {
                         let dead: Vec<(usize, CType)> = (in_scope..ctx.types.len())
-                            .filter(|&idx| ctx.types[idx] != CType::Type(LType::Unknown))
+                            .filter(|&idx| forgotten(&ctx.types[idx]))
                             .map(|idx| (idx, CType::Type(LType::Unknown)))
                             .collect();
                         if !dead.is_empty() {

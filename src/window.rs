@@ -181,15 +181,34 @@ pub enum Access {
     Read,
     /// The op only writes the slot.
     Write,
+    /// The op reads the slot's value and writes its new one in place, in the
+    /// same register.
+    Update,
+}
+
+impl Access {
+    /// Whether the op reads the slot's value.
+    pub fn reads(self) -> bool {
+        matches!(self, Access::Read | Access::Update)
+    }
+
+    /// Whether the op writes the slot.
+    pub fn writes(self) -> bool {
+        matches!(self, Access::Write | Access::Update)
+    }
 }
 
 /// Check a window op's operand slots against its operands' accesses: no two
-/// outputs write the same slot.
+/// outputs write the same slot, and a slot updated in place is no other
+/// operand.
 #[doc(hidden)]
 pub fn check_operands(name: &str, operands: &[usize], accesses: &[Access]) {
-    let outputs = || operands.iter().zip(accesses).filter(|(_, a)| **a == Access::Write).map(|(slot, _)| *slot);
+    let outputs = || operands.iter().zip(accesses).filter(|(_, a)| a.writes()).map(|(slot, _)| *slot);
     for (i, a) in outputs().enumerate() {
         assert!(outputs().skip(i + 1).all(|b| b != a), "{name}: two outputs write slot {a}");
+    }
+    for (slot, _) in operands.iter().zip(accesses).filter(|(_, a)| **a == Access::Update) {
+        assert_eq!(operands.iter().filter(|s| *s == slot).count(), 1, "{name}: slot {slot} updated in place is another operand too");
     }
 }
 
@@ -242,14 +261,14 @@ impl dyn Window {
     fn interp_checked<'src, 'intern>(&self, owner: &mut Owner, state: &mut RunState<'src, 'intern>) {
         let operands = self.operands().iter().zip(self.accesses()).enumerate();
         let mut w = [LBoxed::NIL; WINDOW];
-        for (i, (slot, _)) in operands.clone().filter(|(_, (_, a))| **a == Access::Read) {
+        for (i, (slot, _)) in operands.clone().filter(|(_, (_, a))| a.reads()) {
             w[i] = state.vals[state.base + slot];
         }
         let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
         let before = w;
         unsafe { self.run(owner, state, base, &mut w, 0) };
         check::check(self, owner, state, base, before, &w);
-        for (i, (slot, _)) in operands.filter(|(_, (_, a))| **a == Access::Write) {
+        for (i, (slot, _)) in operands.filter(|(_, (_, a))| a.writes()) {
             state.vals[state.base + slot] = w[i];
         }
     }
@@ -308,6 +327,9 @@ macro_rules! windowed {
     };
     // Sort the operands into inputs and outputs, each with its window offset,
     // and their accesses in window order.
+    (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) inout $op:ident $(, $($rest:tt)*)?) => {
+        $crate::window::windowed!(@sort $decl [$($in)*] [$($out)* ($op, $i)] [$($acc)* Update] ($i + 1) $($($rest)*)?);
+    };
     (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) out $op:ident $(, $($rest:tt)*)?) => {
         $crate::window::windowed!(@sort $decl [$($in)*] [$($out)* ($op, $i)] [$($acc)* Write] ($i + 1) $($($rest)*)?);
     };
@@ -464,7 +486,7 @@ macro_rules! windowed {
                 let at = state.base;
                 let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(at).as_ptr() };
                 $( let $in = state.vals[at + self.operands[$ii]]; )*
-                $( let mut $out = $crate::lboxed::LBoxed::NIL; )*
+                $( let mut $out = state.vals[at + self.operands[$oi]]; )*
                 unsafe { Self::__run($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
                 $( state.vals[at + self.operands[$oi]] = $out; )*
             }

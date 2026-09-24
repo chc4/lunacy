@@ -875,8 +875,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         match res {
                             Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[off].is_empty() => {
                                 let operands = w.operands().iter().zip(w.accesses());
-                                events.extend(operands.clone().filter(|(_, a)| **a == Access::Read).map(|(&slot, _)| Event::Read(slot)));
-                                events.extend(operands.filter(|(_, a)| **a == Access::Write).map(|(&slot, _)| Event::Write(slot)));
+                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot)));
+                                events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot)));
                             }
                             Residual::Guard { idx, .. } if inline_guard(res) => events.push(Event::Read(*idx)),
                             Residual::Jump(_) | Residual::Select(_) => {
