@@ -148,7 +148,8 @@ Without critical edges, every edge between two blocks of a trace joins
 consecutive blocks, or is a back edge ending the trace. With them, a trace can
 also have a forward edge skipping blocks (from `T[i]` to a join `T[j]`, `j > i +
 1`), a back edge leaving from its middle (a latch whose select exits the loop,
-with the exit appended after it), or a block jumping to itself.
+with the exit appended after it, when the exit is as frequent as the loop), or
+a block jumping to itself.
 
 None of these need the policy to avoid them. The backward pass only relies on
 the definition: along each edge between consecutive blocks of a trace, the
@@ -167,20 +168,31 @@ the edges between its consecutive blocks all go forward, reducible or not.
   successor allocated already (every one but a loop's closing edge's target).
 - **Unidirectional** (the thesis's choice). Start a trace at a block whose
   predecessors in the region are all in traces already (at first, the
-  region's entry), preferring the most frequent, and append the most frequent
-  successor not yet in a trace until there is none. Traces are allocated in the
-  order found. The thesis proves there is always such a block to start from
+  region's entry, or when the entry lies inside a loop, the header of the
+  outermost loop around it: the block of that cycle at the lowest bytecode
+  position), preferring the most frequent, and append the most frequent
+  successor while it is not yet in a trace and not across a back edge. Traces
+  are allocated in the order found. The thesis proves there is always such a block to start from
   only for CFGs without critical edges; when there is none, start from the most
   frequent block not yet in a trace.
 - **Bidirectional.** Start a trace at the most frequent block not yet in one,
-  grow it upwards through its most frequent predecessor not in a trace (never
-  across a back edge), then downwards as the unidirectional builder does.
-  Traces are allocated in the order found.
+  grow it upwards through its most frequent predecessor (never across a back
+  edge) while it is not in a trace, then downwards as the unidirectional
+  builder does. Traces are allocated in the order found.
 
-The frequency-driven policies need a block's most frequent successor, by the
-hotness countdown. It stops at zero, so successors that tie have both reached
+Both compare every neighbour, not only those not yet in a trace, and end the
+trace when the most frequent one can't extend it. The thesis's rule, the most
+frequent neighbour not yet in a trace, relies on its critical edges being
+split: a loop end that also exits reaches the header through a block of its
+own, compared with the exit, and the trace ends there when the loop is the more
+frequent. Without the split the header, already in a trace, would drop out of
+the comparison and the trace would carry on into the exit however cold, with
+the loop end's window planned for the exit instead of the loop.
+
+The frequency-driven policies need a block's most frequent neighbour, by the
+hotness countdown. It stops at zero, so neighbours that tie have both reached
 the compile threshold and are both hot, and which one comes first matters
-little: the lowest block id.
+little: one that can extend the trace, then the lowest block id.
 
 ## What it replaces
 

@@ -295,11 +295,12 @@ pub enum Policy {
     SingleBlock,
     /// Start at a block whose predecessors are all in traces (at first the
     /// root; the most frequent otherwise), and append the most frequent
-    /// successor not in a trace until there is none.
+    /// successor while it isn't in a trace or across a retreating edge. See
+    /// Note [Most frequent edge].
     Unidirectional,
     /// Start at the most frequent block not in a trace, prepend its most
-    /// frequent predecessor not in a trace until there is none, then append as
-    /// `Unidirectional`.
+    /// frequent predecessor (not across a retreating edge) while it isn't in a
+    /// trace, then append as `Unidirectional`.
     Bidirectional,
 }
 
@@ -316,6 +317,21 @@ impl Policy {
         }
     }
 }
+
+// Note [Most frequent edge]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~
+// The thesis grows a trace by the most frequent neighbour not yet in a trace,
+// over CFGs with critical edges split. There, a loop end with an exit reaches
+// the loop's header through a block of its own, which is compared with the
+// exit, and the trace ends at it if the loop is the more frequent: the loop end
+// ends the trace. The region's critical edges aren't split (each edge is
+// resolved at its own jump), so comparing only neighbours not in a trace would
+// drop the loop's edge, whose target is placed already, and carry the trace on
+// into the exit however cold, planning the loop end's window for the exit.
+// So every neighbour is compared, and the trace ends when the most frequent
+// one can't extend it: already in a trace, or across a retreating edge. Among
+// equally frequent neighbours, one that can extend the trace comes first, then
+// the lowest id.
 
 impl Region {
     /// The region's traces, in the order they are allocated.
@@ -343,8 +359,9 @@ impl Region {
                 while let Some(p) = self.preds[head]
                     .iter()
                     .copied()
-                    .filter(|&p| !placed[p] && !self.is_retreating(p, head))
-                    .min_by_key(|&p| hotter(p))
+                    .filter(|&p| !self.is_retreating(p, head))
+                    .min_by_key(|&p| (self.blocks[p].hotness, placed[p], self.blocks[p].id))
+                    .filter(|&p| !placed[p])
                 {
                     placed[p] = true;
                     trace.push_front(p);
@@ -352,8 +369,12 @@ impl Region {
                 }
             }
             let mut last = start;
-            while let Some(s) =
-                self.succs[last].iter().copied().filter(|&s| !placed[s] && !self.is_retreating(last, s)).min_by_key(|&s| hotter(s))
+            let extends = |placed: &[bool], last: usize, s: usize| !placed[s] && !self.is_retreating(last, s);
+            while let Some(s) = self.succs[last]
+                .iter()
+                .copied()
+                .min_by_key(|&s| (self.blocks[s].hotness, !extends(&placed, last, s), self.blocks[s].id))
+                .filter(|&s| extends(&placed, last, s))
             {
                 placed[s] = true;
                 trace.push_back(s);
@@ -411,9 +432,12 @@ mod tests {
     const POLICIES: [Policy; 3] = [Policy::SingleBlock, Policy::Unidirectional, Policy::Bidirectional];
 
     /// The invariants every policy upholds: the traces partition the region,
-    /// consecutive blocks of a trace are joined by a forward edge, and the
-    /// greedy policies can't extend any trace further. And the region's root
-    /// is the block at the lowest PC (then id) of those reaching the entry.
+    /// and consecutive blocks of a trace are joined by a forward edge. The
+    /// frequency-driven policies join each block to its most frequent successor
+    /// (or, growing upwards, predecessor), and end a trace only where a more
+    /// frequent neighbour than any that could extend it can't (Note [Most
+    /// frequent edge]). And the region's root is the block at the lowest PC
+    /// (then id) of those reaching the entry.
     fn check(region: &Region, policy: Policy) -> Vec<Vec<usize>> {
         let traces = region.traces(policy);
         let n = region.blocks.len();
@@ -442,27 +466,43 @@ mod tests {
                 assert_eq!(traces.iter().map(|trace| trace[0]).collect::<Vec<_>>(), region.postorder());
             }
             Policy::Unidirectional | Policy::Bidirectional => {
+                let hotness = |b: usize| region.blocks[b].hotness;
                 for (t, trace) in traces.iter().enumerate() {
-                    let last = *trace.last().unwrap();
-                    for &s in region.succs(last) {
+                    for pair in trace.windows(2) {
+                        let (a, b) = (pair[0], pair[1]);
+                        let hottest_succ = region.succs(a).iter().all(|&s| hotness(b) <= hotness(s));
+                        let hottest_pred =
+                            region.preds[b].iter().all(|&p| region.is_retreating(p, b) || hotness(a) <= hotness(p));
                         assert!(
-                            region.is_retreating(last, s) || trace_of[s] <= t,
+                            hottest_succ || (policy == Policy::Bidirectional && hottest_pred),
+                            "{policy:?}: {pair:?} doesn't follow the most frequent edge: {traces:?}"
+                        );
+                    }
+                    // A neighbour that could have extended the trace when it
+                    // ended is colder than one that couldn't.
+                    let last = *trace.last().unwrap();
+                    let (open, closed): (Vec<usize>, Vec<usize>) =
+                        region.succs(last).iter().partition(|&&s| !region.is_retreating(last, s) && trace_of[s] > t);
+                    for s in open {
+                        assert!(
+                            closed.iter().any(|&c| hotness(c) < hotness(s)),
                             "{policy:?}: trace {t} could go on to {s}: {traces:?}"
                         );
                     }
-                }
-                if policy == Policy::Unidirectional {
-                    assert_eq!(traces[0][0], root, "the first trace starts at the root");
-                } else {
-                    for (t, trace) in traces.iter().enumerate() {
+                    if policy == Policy::Bidirectional {
                         let head = trace[0];
-                        for &p in &region.preds[head] {
+                        let preds = region.preds[head].iter().copied().filter(|&p| !region.is_retreating(p, head));
+                        let (open, closed): (Vec<usize>, Vec<usize>) = preds.partition(|&p| trace_of[p] > t);
+                        for p in open {
                             assert!(
-                                region.is_retreating(p, head) || trace_of[p] <= t,
+                                closed.iter().any(|&c| hotness(c) < hotness(p)),
                                 "{policy:?}: trace {t} could start at {p}: {traces:?}"
                             );
                         }
                     }
+                }
+                if policy == Policy::Unidirectional {
+                    assert_eq!(traces[0][0], root, "the first trace starts at the root");
                 }
             }
         }
@@ -599,8 +639,10 @@ mod tests {
         for policy in POLICIES {
             check(&r, policy);
         }
-        // The inner loop's header follows the outer loop's body into it.
-        assert_eq!(check(&r, Policy::Unidirectional), vec![vec![7, 8, 9, 0, 1, 2, 5, 6], vec![3, 4]]);
+        // The inner loop's header follows the outer loop's body into it, and
+        // the trace ends at the inner loop's end 2, which goes back to 0 more
+        // often than on to the outer loop's end 5.
+        assert_eq!(check(&r, Policy::Unidirectional), vec![vec![7, 8, 9, 0, 1, 2], vec![3, 4], vec![5], vec![6]]);
         check_liveness(&r);
     }
 
@@ -618,6 +660,32 @@ mod tests {
         let live = r.liveness();
         // The inner loop carries 8 and passes the outer loop's 7 through.
         assert!(live[3].contains(8) && live[3].contains(7));
+    }
+
+    #[test]
+    fn a_loop_end_ends_its_trace_before_a_colder_exit() {
+        // 0 enters the loop 1 -> 2 -> 1, whose end 2 also exits to the cold 3:
+        // 2's most frequent edge is the loop's, so its trace ends at 2.
+        let r = region(&[&[E(1)], &[R(1), E(2)], &[W(1), E(1), E(3)], &[R(1)]], &[(3, 50)]);
+        assert_eq!(check(&r, Policy::Unidirectional), vec![vec![0, 1, 2], vec![3]]);
+        assert_eq!(check(&r, Policy::Bidirectional), vec![vec![0, 1, 2], vec![3]]);
+        check_liveness(&r);
+        // An exit as frequent as the loop carries the trace on.
+        let r = region(&[&[E(1)], &[R(1), E(2)], &[W(1), E(1), E(3)], &[R(1)]], &[]);
+        assert_eq!(check(&r, Policy::Unidirectional), vec![vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn upwards_growth_stops_at_a_more_frequent_predecessor_in_a_trace() {
+        // 0 branches to the hot 1 and the cold 2; 1 -> 3, and 3 and 2 both go
+        // to 4, 3 also to the hotter 5. The first trace is 0, 1, 3, 5; 4's
+        // can't grow upwards into 2, as its more frequent predecessor 3 is in a
+        // trace already.
+        let r = region(
+            &[&[E(1), E(2)], &[E(3)], &[E(3), E(4)], &[E(4), E(5)], &[], &[]],
+            &[(0, 5), (2, 20), (3, 5), (4, 10), (5, 1)],
+        );
+        assert_eq!(check(&r, Policy::Bidirectional), vec![vec![0, 1, 3, 5], vec![4], vec![2]]);
     }
 
     #[test]
