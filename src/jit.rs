@@ -1250,7 +1250,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         dynasm!(ops ; .arch x64 ; mov rsi, (b - 1));
                     }
-                    if c == 0 {
+                    // Every result goes in the slots the function and its
+                    // arguments took: `b` of them, or up to the top.
+                    if c == 0 && b == 0 {
                         dynasm!(ops
                             ; .arch x64
                             ; mov rax, QWORD r13 => RunState.top
@@ -1258,6 +1260,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; sub rax, a
                             ; mov rcx, rax
                         );
+                    } else if c == 0 {
+                        dynasm!(ops ; .arch x64 ; mov rcx, b);
                     } else if c == 1 {
                         dynasm!(ops ; .arch x64 ; xor ecx, ecx);
                     } else {
@@ -1269,6 +1273,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; lea rdx, [r14 + (a * 8)]       // returns ptr = &vals[base + a]
                         ; call extern (*nf as usize)     // direct, statically-known target
                     );
+                    // Taking every result, the caller reads up to the top: the
+                    // native returns how many it wrote, within the slots it got.
+                    if c == 0 {
+                        if b == 0 {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rcx, QWORD r13 => RunState.top
+                                ; sub rcx, QWORD r13 => RunState.base
+                                ; sub rcx, a
+                            );
+                        } else {
+                            dynasm!(ops ; .arch x64 ; mov rcx, b);
+                        }
+                        dynasm!(ops
+                            ; .arch x64
+                            ; cmp rax, rcx
+                            ; cmova rax, rcx
+                            ; add rax, QWORD r13 => RunState.base
+                            ; add rax, a
+                            ; mov QWORD r13 => RunState.top, rax
+                        );
+                    }
                 },
                 Residual::Jump(target) => {
                     // If the block ends in a jump, and the block hasn't already been emitted, then

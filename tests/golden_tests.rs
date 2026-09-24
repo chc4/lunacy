@@ -110,6 +110,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
                 ).collect::<Vec<_>>();
                 let output = s.into_iter().intersperse("\t".to_string()).collect::<String>();
                 CAPTURED.with(|c| c.rw(owner).push(output));
+                0
             })));
             _g.set(owner, print_key, custom_print, s.intern());
 

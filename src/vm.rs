@@ -901,7 +901,10 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
     }
 }
 
-pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner);
+/// A native function: from its arguments, it writes its results into the slots
+/// for them (which overlap the arguments; see Note [Library natives] in
+/// `library`), and returns how many it wrote.
+pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner) -> usize;
 #[derive(Clone, Copy)]
 pub struct NClosure {
     // A `'static`, non-GC cell (leaked at `new`) whose pointer is the native's
@@ -1190,15 +1193,14 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     // Natives take `LBoxed` slice views over the arg/return stack regions, so the
     // boxed stack is aliased in place with no unbox/rebox copy.
     pub fn call_native(&mut self, nf: NativeFunc, a: u16, b: u16, c: u16, owner: &mut Owner) {
-        let args = if b == 0 {
-            &self.vals[self.base + a as usize+1..self.top]
-        } else {
-            &self.vals[self.base + a as usize+1..=(self.base + a as usize + b as usize - 1)]
-        };
+        // The function's slot and its arguments: up to the top when they are
+        // all a previous call's results (`B` = 0), else `B - 1` of them.
+        let end = if b == 0 { self.top } else { self.base + a as usize + b as usize };
+        let args = &self.vals[self.base + a as usize + 1..end];
         debug!("{:?}", args);
         let returns = if c == 0 {
-            // save all returned
-            &self.vals[self.base + a as usize..self.top]
+            // Every result, in the slots the function and its arguments took.
+            &self.vals[self.base + a as usize..end]
         }
         else if c == 1 {
             // nothing saved
@@ -1208,14 +1210,20 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         } else {
             unimplemented!()
         };
+        let wanted = returns.len();
+        let mut count = 0;
         LCellOwner::scope(|mut seq| {
             // Safety: LCellOwner guarantees that the native function can only ever
             // have mutable access to one slice at a time. The transmute wraps the
             // aliased stack slices in-place as `LCell`s (repr(transparent) over UnsafeCell).
             let args = unsafe { core::mem::transmute(seq.cell(args)) };
             let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
-            let ret = (nf)(seq, args, returns, owner);
+            count = (nf)(seq, args, returns, owner);
         });
+        // Taking every result, the caller reads up to the top.
+        if c == 0 {
+            self.top = self.base + a as usize + count.min(wanted);
+        }
     }
 
     // `extern "C"` so the JIT can call it directly. The callee closure is read
@@ -1364,6 +1372,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         _ => unimplemented!(),
                     };
                     returns.rw(&mut seq).into_iter().zip([r]).for_each(|(slot, o)| *slot = o);
+                    1
                 }))
             };
         }
@@ -1373,6 +1382,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         math_tab.insert_lvalue(InternString::intern(intern, "abs"), math1!(f64::abs));
         math_tab.insert_lvalue(InternString::intern(intern, "huge"), LValue::NClosure(NClosure::new(|mut seq, args, returns, _owner|{
             returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::from_number(f64::INFINITY));
+            1
         })));
         math_tab.insert_lvalue(InternString::intern(intern, "pi"), LValue::Number(Number(std::f64::consts::PI)));
         math_tab.insert_lvalue(InternString::intern(intern, "sin"), math1!(f64::sin));
@@ -1399,7 +1409,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     ).collect::<Vec<_>>();
                     //println!("> {}", String::from_utf8_lossy(s.iter().into()));
                     println!("{}", s.iter().intersperse(&"\t".to_string()).cloned().collect::<String>());
-                    // No returns
+                    0
                 }))),
                 (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::new(|seq, args, _returns, _owner| {
                     if let [b, ..] = args.ro(&seq) {
@@ -1407,7 +1417,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             panic!("lua assert failed");
                         }
                     }
-                    // No returns
+                    0
                 }))),
                 // Lua's `collectgarbage(opt [, arg])`: drive the collector explicitly.
                 (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
@@ -1431,10 +1441,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         _ => LValue::Nil,
                     };
                     returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::box_lvalue(result));
+                    1
                 }))),
                 math,
                 os,
-                ].drain(..).map(|(k, v)| (LCanon(LBoxed::box_lvalue(k)), LBoxed::box_lvalue(v)))
+                ].into_iter().chain(crate::library::globals(intern)).map(|(k, v)| (LCanon(LBoxed::box_lvalue(k)), LBoxed::box_lvalue(v)))
             ),
             epoch: 0,
         });

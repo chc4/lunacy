@@ -29,6 +29,7 @@ pub mod trace;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod gc;
+pub mod library;
 
 pub use vm::Vm;
 /// Marker branding the per-thread cell owner. `Owner` is unique per thread — a second
