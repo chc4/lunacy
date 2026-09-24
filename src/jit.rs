@@ -831,7 +831,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             steps.push(Step::Exit { window: window_of(target).expect("a continuation with a window"), own: true });
                         }
                     }
-                    Residual::Thunk(_) => {}
+                    Residual::Thunk(_) => steps.push(Step::Thunk),
                     _ => steps.push(Step::Flush),
                 }
             }

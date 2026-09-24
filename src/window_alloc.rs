@@ -455,9 +455,17 @@ impl WindowAlloc {
 // requests from the loop's body end at its header, rather than reaching up to
 // sources above the loop, where the code before it would drop them and the
 // loop would reload them every iteration. (A trace with a loop is planned
-// twice, the latch continuing into the header's window from the first pass.) Exits to blocks
-// outside the trace are the thesis's pseudo-uses, weighted 0. The windows
-// wanted before each step are read off the kept intervals afterwards.
+// twice, the latch continuing into the header's window from the first pass.)
+//
+// Exits to blocks outside the trace are the thesis's pseudo-uses, and so is a
+// thunk's exit to the interpreter, which reads the stack, of every slot dirty
+// there. They are the cold edges: moving a value into place for one, or
+// loading it there, costs nothing. But a dirty value that loses its register
+// before the exit is stored on the way, on the hot path, and that store is
+// costed, whichever exit needs the value: an op writing over the register it
+// sits in otherwise evicts it for free, and codegen stores it anyway. Capping
+// drops them before the trace's own requests. The windows wanted before each
+// step are read off the kept intervals afterwards.
 
 /// A step of a trace, for [`plan_trace`]: its blocks' residuals, as planning
 /// sees them.
@@ -477,6 +485,9 @@ pub enum Step<'a> {
     /// An edge leaving the trace into a block with no window yet, which these
     /// slots are live into: pseudo-uses that may stay in memory.
     ExitLive(SmallVec<[usize; 16]>),
+    /// A thunk: an exit to the interpreter, which reads the stack, so the
+    /// slots dirty there are pseudo-uses.
+    Thunk,
 }
 
 /// A planned trace: per step, the placement wanted before it (an op's, or a
@@ -597,8 +608,12 @@ impl Planner {
     /// trace since the last flush.
     fn cost(&self, run: &Run, dirty: &Slots) -> (u32, usize) {
         let weight = |id: usize| u32::from(self.requests[id].own);
-        // A demoted value is reloaded at its use, and stored first if dirty.
-        let dropped = |slot: usize| PLAN_LOAD + if dirty.contains(slot) { PLAN_STORE } else { 0 };
+        // A demoted value is reloaded at its use (a pseudo-use's, on its cold
+        // edge, is free), and stored first if dirty, on the hot path.
+        let dropped = |id: usize| {
+            let q = &self.requests[id];
+            weight(id) * PLAN_LOAD + if dirty.contains(q.slot) { PLAN_STORE } else { 0 }
+        };
         let mut cost = 0;
         let mut nearest = usize::MAX;
         for reg in run.skip..run.skip + run.slots.len() {
@@ -609,7 +624,7 @@ impl Planner {
                 Some(_) => {}
                 None if run.reads_at(q.slot, reg) => {}
                 None => {
-                    cost += weight(id) * dropped(q.slot);
+                    cost += dropped(id);
                     if q.own {
                         nearest = nearest.min(q.at);
                     }
@@ -622,9 +637,9 @@ impl Planner {
                 match (access, q.wants) {
                     (Access::Write, Some(r)) if !run.contains(r) => cost += weight(id) * PLAN_MOVE,
                     // Kept in its register until the use, a move there; else
-                    // the new value is stored and reloaded.
+                    // the new value is stored, on the hot path, and reloaded.
                     (Access::Write, None) => {
-                        cost += weight(id) * if self.free(reg, q.at, run) { PLAN_MOVE } else { PLAN_STORE + PLAN_LOAD }
+                        cost += if self.free(reg, q.at, run) { weight(id) * PLAN_MOVE } else { PLAN_STORE + weight(id) * PLAN_LOAD }
                     }
                     (Access::Read, Some(r)) if !run.contains(r) && r != reg => cost += weight(id) * PLAN_MOVE,
                     _ => {}
@@ -683,7 +698,12 @@ impl Planner {
     /// window can hold.
     fn cap(&mut self) {
         while self.holds.iter().flatten().count() + self.any.len() > self.width {
-            let (i, &id) = self.any.iter().enumerate().max_by_key(|&(_, &id)| self.requests[id].at).expect("a request for any register");
+            let (i, &id) = self
+                .any
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &id)| (!self.requests[id].own, self.requests[id].at))
+                .expect("a request for any register");
             self.any.remove(i);
             self.requests[id].fate = Fate::Home;
         }
@@ -807,6 +827,13 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
             }
             Step::ExitLive(slots) => {
                 for &slot in slots {
+                    if planner.pending(slot).is_empty() {
+                        planner.request(slot, step, false, None);
+                    }
+                }
+            }
+            Step::Thunk => {
+                for slot in dirty[step].iter() {
                     if planner.pending(slot).is_empty() {
                         planner.request(slot, step, false, None);
                     }
@@ -1164,6 +1191,7 @@ mod tests {
                     0 => kinds.push(1),
                     1 => kinds.push(2),
                     2 => kinds.push(3),
+                    3 if header => kinds.push(6),
                     3 => kinds.push(4),
                     k => {
                         ops.push(match k {
@@ -1185,6 +1213,7 @@ mod tests {
                     0 => Step::Op(&**next_op.next().unwrap(), (0..WINDOW).collect()),
                     1 => Step::Start,
                     5 => Step::Header,
+                    6 => Step::Thunk,
                     2 => Step::Flush,
                     3 => {
                         let mut window = [None; WINDOW];
@@ -1240,6 +1269,15 @@ mod tests {
                         }
                     }
                     Step::ExitLive(_) => {}
+                    Step::Thunk => {
+                        let mut taken = Machine { memory: machine.memory.clone(), current: machine.current.clone(), regs: machine.regs };
+                        for emit in alloc.stores() {
+                            taken.exec(emit, None);
+                        }
+                        for (&slot, &version) in &taken.current {
+                            assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the thunk at step {step} of {ops:?}");
+                        }
+                    }
                 }
             }
             finish(alloc, machine, &ops);
