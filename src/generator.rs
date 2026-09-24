@@ -836,16 +836,18 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             (ResumeArg::MatchedConst(rb), ResumeArg::MatchedConst(rc)) => {
                 unimplemented!()
             },
-            (larg, rarg) => match (&lnil, &rnil) {
-                (ResumeArg::Matched | ResumeArg::MatchedConst(_), ResumeArg::Matched | ResumeArg::MatchedConst(_)) => {
-                    // nil == nil = true
-                    yield YieldOp::Jump(fallthrough);
-                },
-                (ResumeArg::Matched | ResumeArg::MatchedConst(_), _) | (_, ResumeArg::Matched | ResumeArg::MatchedConst(_)) => {
-                    // nil == !nil = false
-                    yield YieldOp::Jump(taken);
+            (larg, rarg) => {
+                if opcode != Opcode::EQ {
+                    unimplemented!("ordering a nil (an error, or a metamethod)");
                 }
-                _ => { unimplemented!() },
+                let equal = match (&lnil, &rnil) {
+                    (ResumeArg::Matched | ResumeArg::MatchedConst(_), ResumeArg::Matched | ResumeArg::MatchedConst(_)) => true,
+                    (ResumeArg::Matched | ResumeArg::MatchedConst(_), _) | (_, ResumeArg::Matched | ResumeArg::MatchedConst(_)) => false,
+                    _ => unimplemented!(),
+                };
+                // Statically decided: take the jump when the condition isn't `a`,
+                // as `select` does.
+                yield YieldOp::Jump(if (equal as u8) != a { taken } else { fallthrough });
             }
         }
         arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
