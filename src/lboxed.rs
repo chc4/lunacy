@@ -178,6 +178,18 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         self.is_int().then_some(self.0 as u32 as i32)
     }
 
+    /// A number known to be in the integer encoding. See Note [Integer encoding].
+    #[inline(always)]
+    pub unsafe fn as_int_unchecked(&self) -> i32 {
+        self.0 as u32 as i32
+    }
+
+    /// A number known to be in the double encoding. See Note [Integer encoding].
+    #[inline(always)]
+    pub unsafe fn as_double_unchecked(&self) -> f64 {
+        f64::from_bits(self.0.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET))
+    }
+
     /// Decode a number, in either encoding, or `None` if this value isn't a number.
     #[inline(always)]
     pub fn as_number(&self) -> Option<f64> {
