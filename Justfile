@@ -184,7 +184,7 @@ hyperfine-traces benchmark times='10' policies='streaming,single,unidirectional,
 # `hyperfine-traces` over the benchmarks lunacy runs, each run enough times for
 # a stable mean. life runs twice: the difference between its 1000 and 5000 runs
 # is the steady-state cost of the code, the rest the upfront cost (compiling).
-hyperfines-traces policies='streaming,unidirectional': (hyperfine-traces "life" "1000" policies) (hyperfine-traces "life" "5000" policies) (hyperfine-traces "nbody" "10" policies) (hyperfine-traces "queens" "3000" policies)
+hyperfines-traces policies='streaming,unidirectional': (hyperfine-traces "life" "1000" policies) (hyperfine-traces "life" "5000" policies) (hyperfine-traces "nbody" "10" policies) (hyperfine-traces "queens" "3000" policies) (hyperfine-traces "fannkuch_redux" "150" policies)
 
 # mimalloc's statistics for a benchmark under each trace policy, before and
 # after the heap's final reset (feature `alloc_stats`), each policy's in
