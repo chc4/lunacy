@@ -66,14 +66,16 @@ pub enum Event {
 }
 
 /// A block of a region: its events, its hotness (the countdown to
-/// compilation, lower is hotter) and id, which order blocks by frequency, and
-/// the bytecode PC it starts at (see Note [Region root]).
+/// compilation, lower is hotter) and id, which order blocks by frequency, the
+/// bytecode PC it starts at (see Note [Region root]), and whether the
+/// interpreter has entered it (see Note [Most frequent edge]).
 #[derive(Debug, Clone)]
 pub struct Block {
     pub events: Vec<Event>,
     pub hotness: usize,
     pub id: usize,
     pub pc: usize,
+    pub ran: bool,
 }
 
 /// A set of stack slots. A Lua frame has at most 250.
@@ -332,6 +334,12 @@ impl Policy {
 // one can't extend it: already in a trace, or across a retreating edge. Among
 // equally frequent neighbours, one that can extend the trace comes first, then
 // the lowest id.
+//
+// A block the interpreter never entered is a trace of its own. The region
+// compiles it only so that the code reaching it has somewhere to bail out: it
+// was specialized ahead of running, so a discovery thunk in it is unforced.
+// Taken into a trace, it would have the trace planned through code that
+// hasn't run, and its thunk is a hot exit if it turns out to be the way on.
 
 impl Region {
     /// The region's traces, in the order they are allocated.
@@ -355,13 +363,14 @@ impl Region {
             placed[start] = true;
             let mut trace = std::collections::VecDeque::from([start]);
             if policy == Policy::Bidirectional {
+                let prepends = |placed: &[bool], head: usize, p: usize| !placed[p] && self.blocks[p].ran && self.blocks[head].ran;
                 let mut head = start;
                 while let Some(p) = self.preds[head]
                     .iter()
                     .copied()
                     .filter(|&p| !self.is_retreating(p, head))
-                    .min_by_key(|&p| (self.blocks[p].hotness, placed[p], self.blocks[p].id))
-                    .filter(|&p| !placed[p])
+                    .min_by_key(|&p| (self.blocks[p].hotness, !prepends(&placed, head, p), self.blocks[p].id))
+                    .filter(|&p| prepends(&placed, head, p))
                 {
                     placed[p] = true;
                     trace.push_front(p);
@@ -369,7 +378,9 @@ impl Region {
                 }
             }
             let mut last = start;
-            let extends = |placed: &[bool], last: usize, s: usize| !placed[s] && !self.is_retreating(last, s);
+            let extends = |placed: &[bool], last: usize, s: usize| {
+                !placed[s] && !self.is_retreating(last, s) && self.blocks[last].ran && self.blocks[s].ran
+            };
             while let Some(s) = self.succs[last]
                 .iter()
                 .copied()
@@ -404,7 +415,7 @@ mod tests {
                 .enumerate()
                 .map(|(b, events)| {
                     let hotness = hot.iter().find(|(x, _)| *x == b).map_or(0, |&(_, h)| h);
-                    Block { events: events.to_vec(), hotness, id: ids[b], pc: pcs[b] }
+                    Block { events: events.to_vec(), hotness, id: ids[b], pc: pcs[b], ran: true }
                 })
                 .collect(),
         )
@@ -467,7 +478,9 @@ mod tests {
             }
             Policy::Unidirectional | Policy::Bidirectional => {
                 let hotness = |b: usize| region.blocks[b].hotness;
+                let ran = |b: usize| region.blocks[b].ran;
                 for (t, trace) in traces.iter().enumerate() {
+                    assert!(trace.len() == 1 || trace.iter().all(|&b| ran(b)), "{policy:?}: a block that never ran in a longer trace: {traces:?}");
                     for pair in trace.windows(2) {
                         let (a, b) = (pair[0], pair[1]);
                         let hottest_succ = region.succs(a).iter().all(|&s| hotness(b) <= hotness(s));
@@ -482,7 +495,7 @@ mod tests {
                     // ended is colder than one that couldn't.
                     let last = *trace.last().unwrap();
                     let (open, closed): (Vec<usize>, Vec<usize>) =
-                        region.succs(last).iter().partition(|&&s| !region.is_retreating(last, s) && trace_of[s] > t);
+                        region.succs(last).iter().partition(|&&s| !region.is_retreating(last, s) && trace_of[s] > t && ran(last) && ran(s));
                     for s in open {
                         assert!(
                             closed.iter().any(|&c| hotness(c) < hotness(s)),
@@ -492,7 +505,7 @@ mod tests {
                     if policy == Policy::Bidirectional {
                         let head = trace[0];
                         let preds = region.preds[head].iter().copied().filter(|&p| !region.is_retreating(p, head));
-                        let (open, closed): (Vec<usize>, Vec<usize>) = preds.partition(|&p| trace_of[p] > t);
+                        let (open, closed): (Vec<usize>, Vec<usize>) = preds.partition(|&p| trace_of[p] > t && ran(p) && ran(head));
                         for p in open {
                             assert!(
                                 closed.iter().any(|&c| hotness(c) < hotness(p)),
@@ -757,7 +770,7 @@ mod tests {
                     for _ in 0..rng.below(3) {
                         events.push(Event::Edge(rng.below(n)));
                     }
-                    Block { events, hotness: rng.below(3) * 20, id: b, pc: rng.below(n) }
+                    Block { events, hotness: rng.below(3) * 20, id: b, pc: rng.below(n), ran: rng.below(4) != 0 }
                 })
                 .collect();
             // The spanning tree: every block's parent jumps to it somewhere.

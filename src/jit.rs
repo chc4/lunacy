@@ -63,6 +63,25 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
     }
 }
 
+// Note [Thunk patching]
+// ~~~~~~~~~~~~~~~~~~~~~
+// A thunk compiled into JIT code exits to the interpreter, which forces it,
+// but forcing rewrites residuals, not JIT code: a thunk forced after its block
+// was compiled would exit there every time, and a side exit taken often would
+// run through the interpreter on every pass.
+//
+// So a thunk's JIT code, after storing the window's dirty registers, has five
+// bytes of nops (`NOP5`) before its exit: room for a `jmp rel32`. Forcing a
+// thunk in a block with JIT code leaves a jump where it was, whatever guard it
+// adds starting a new block, and every thunk made a jump goes through
+// `jump_thunk`, which records its site against the target. Once the target
+// has JIT code, the nops become a jump to a stub loading the target's entry
+// window from the stack, where the stores left every value, and jumping into
+// it: the path stays in JIT code from then on.
+
+/// A five-byte nop: the room a thunk site leaves for a `jmp rel32`.
+const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
+
 /// The address the JIT passes as an `&mut Owner` argument: the token is
 /// zero-sized, so any non-null aligned address is one. See `crate::forge_owner`.
 const FORGED_OWNER: i64 = core::mem::align_of::<Owner>() as i64;
@@ -349,6 +368,15 @@ pub struct JitContext {
     /// How often each counted piece of allocator code ran (`window_count!`).
     #[cfg(feature = "window_dump")]
     window_counts: std::cell::RefCell<Vec<Box<std::sync::atomic::AtomicU64>>>,
+    /// Where each thunk compiled into JIT code has its nops, by block and
+    /// offset. See Note [Thunk patching].
+    thunk_sites: HashMap<(BlockId, usize), usize, FxBuildHasher>,
+    /// The thunk sites of the region being compiled, by offset in it.
+    region_sites: Vec<(BlockId, usize, usize)>,
+    /// Thunk sites to patch once their target block has JIT code.
+    waiting: HashMap<BlockId, Vec<usize>, FxBuildHasher>,
+    /// The stub entering each block from a patched thunk site.
+    thunk_stubs: HashMap<BlockId, usize, FxBuildHasher>,
     /// How regions are partitioned into traces (`LUNACY_TRACES`), or `None` to
     /// allocate streaming instead: no plan, each op placing itself in the window
     /// it finds and each block entered with the window of the first jump to it,
@@ -450,6 +478,10 @@ impl JitContext {
             memory: Cell::new(memory.make_exec().unwrap()),
             blocks: HashMap::default(),
             pending: BTreeMap::new(),
+            thunk_sites: HashMap::default(),
+            region_sites: Vec::new(),
+            waiting: HashMap::default(),
+            thunk_stubs: HashMap::default(),
             stencils: Stencils::default(),
             used: 0,
             perf_map,
@@ -522,6 +554,15 @@ impl JitContext {
         unsafe { core::slice::from_raw_parts_mut(ptr, contents.len()).copy_from_slice(contents) };
         self.memory.set(mutable.make_exec().unwrap());
         Some(ptr)
+    }
+
+    /// Overwrite committed code at `at` with `bytes`.
+    fn patch(&mut self, at: usize, bytes: &[u8]) {
+        let mut mutable = self.memory.take().make_mut().unwrap();
+        let start = mutable.as_mut_ptr() as usize;
+        assert!(at >= start && at + bytes.len() <= start + self.used, "patching outside committed code");
+        unsafe { core::slice::from_raw_parts_mut(at as *mut u8, bytes.len()).copy_from_slice(bytes) };
+        self.memory.set(mutable.make_exec().unwrap());
     }
 }
 
@@ -643,6 +684,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let buf = ops.finalize().unwrap();
         let Some(slab) = self.jctx.commit(base, buf.as_slice()) else { panic!() };
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
+        for (block, off, at) in std::mem::take(&mut self.jctx.region_sites) {
+            self.jctx.thunk_sites.insert((block, off), slab as usize + at);
+        }
+        // Thunk sites waiting for a block compiled here jump to it now.
+        let ready: Vec<BlockId> = self.jctx.waiting.keys().filter(|target| self.jctx.blocks.contains_key(target)).copied().collect();
+        for target in ready {
+            for site in self.jctx.waiting.remove(&target).unwrap() {
+                self.patch_thunk(site, target);
+            }
+        }
 
         let (source, line) = {
             let proto = self.clos.ro(owner).prototype;
@@ -664,6 +715,53 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
 
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
+    }
+
+    /// The thunk at `off` in `block` is now a jump to `target`: patch its JIT
+    /// code, if any, now or once `target` has some. See Note [Thunk patching].
+    pub fn link_thunk(&mut self, block: BlockId, off: usize, target: BlockId) {
+        let Some(site) = self.jctx.thunk_sites.remove(&(block, off)) else { return };
+        if self.jctx.blocks.contains_key(&target) {
+            self.patch_thunk(site, target);
+        } else {
+            self.jctx.waiting.entry(target).or_default().push(site);
+        }
+    }
+
+    /// Make the thunk site `site` jump into `target`'s JIT code.
+    fn patch_thunk(&mut self, site: usize, target: BlockId) {
+        let stub = self.thunk_stub(target);
+        let rel = i32::try_from(stub as isize - (site as isize + NOP5.len() as isize)).expect("a thunk stub within rel32 of its site");
+        let mut jmp = [0xe9, 0, 0, 0, 0];
+        jmp[1..].copy_from_slice(&rel.to_le_bytes());
+        self.jctx.patch(site, &jmp);
+    }
+
+    /// The stub a patched thunk site jumps to: load `target`'s entry window
+    /// from the stack, then jump into its code.
+    fn thunk_stub(&mut self, target: BlockId) -> usize {
+        if let Some(&stub) = self.jctx.thunk_stubs.get(&target) {
+            return stub;
+        }
+        let block = &self.jctx.blocks[&target];
+        let (ptr, window) = (block.ptr, block.window.clone());
+        let base = self.jctx.end();
+        let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
+        let loads = WindowAlloc::default().transfer(&window);
+        let counted = window_count!(self.jctx, &mut ops, loads);
+        window_dump!(self.jctx, "thunk stub into block {} loads {}{counted}", target.0, emits_line(&loads));
+        for emit in loads {
+            emit_window_move(&mut ops, emit);
+        }
+        dynasm!(ops
+            ; .arch x64
+            ; jmp extern ptr.0 as usize
+        );
+        let buf = ops.finalize().unwrap();
+        self.jctx.reserve(buf.len());
+        let stub = self.jctx.commit(base, &buf).expect("a committed thunk stub") as usize;
+        self.jctx.thunk_stubs.insert(target, stub);
+        stub
     }
 
     /// Plan the window allocation of the region compiled from `entry`: the blocks
@@ -730,7 +828,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             _ => events.push(Event::Flush),
                         }
                     }
-                    TraceBlock { events, hotness: self.blocks[block.0].jit_info.hotness.get(), id: block.0, pc: self.blocks[block.0].pc }
+                    TraceBlock {
+                        events,
+                        hotness: self.blocks[block.0].jit_info.hotness.get(),
+                        id: block.0,
+                        pc: self.blocks[block.0].pc,
+                        // A block whose countdown hasn't moved never ran. Every
+                        // block starts hot with `immediate_jit`, so none counts.
+                        ran: cfg!(feature = "immediate_jit") || self.blocks[block.0].jit_info.hotness.get() < INITIAL_HOTNESS,
+                    }
                 })
                 .collect(),
         );
@@ -1411,6 +1517,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     for emit in stores {
                         emit_window_move(ops, emit);
                     }
+                    // Room for a `jmp rel32` past the exit, once the thunk is a
+                    // jump. See Note [Thunk patching].
+                    self.jctx.region_sites.push((id, off, ops.offset().0));
+                    ops.extend(&NOP5);
                     dynasm!(ops
                         ; mov WORD r12 => RunState.current_off, (off as i16)
                         ; mov rax, QWORD (((-4i32 as u64) << 32 | (id.0 as u64)) as i64)

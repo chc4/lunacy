@@ -1803,23 +1803,50 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
+    /// Replace the thunk at `off` in `block` with a jump to `target`, and its
+    /// JIT code too, if any, once `target` has some. See Note [Thunk patching].
+    pub fn jump_thunk(&mut self, block: BlockId, off: usize, target: BlockId) {
+        self.blocks[block.0].instructions[off] = Residual::Jump(target);
+        #[cfg(feature = "jit")]
+        self.link_thunk(block, off, target);
+    }
+
+    /// Whether `block` has JIT code, so a thunk in it must be forced into a
+    /// jump. See Note [Thunk patching].
+    fn compiled(&self, block: BlockId) -> bool {
+        #[cfg(feature = "jit")]
+        return self.jctx.blocks.contains_key(&block);
+        #[cfg(not(feature = "jit"))]
+        return false;
+    }
+
     /// The thunk a `GuardDynamic` yield ends its block in. See Note [Dynamic guards].
     fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             test.interp(owner, state);
             let passed = state.select == 0;
-            vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test.clone());
+            // In place, unless the thunk's JIT code can only be patched to a jump.
+            // See Note [Thunk patching].
+            let block = if vm.compiled(block_id) {
+                let guard_block = vm.new_block(pc.0);
+                vm.jump_thunk(block_id, thunk_pc, guard_block);
+                vm.blocks[guard_block.0].instructions.push(Residual::GuardDynamic(test.clone()));
+                guard_block
+            } else {
+                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test.clone());
+                block_id
+            };
             let (fail, pass) = if passed {
                 let pass = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Matched);
-                let fail = vm.make_side_thunk(block_id, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
+                let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
                 (Residual::Thunk(fail), Residual::Jump(pass))
             } else {
                 let fail = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
-                let pass = vm.make_side_thunk(block_id, thunk_coro.clone(), pc.next_true(), thunk_ctx.clone(), ResumeArg::Matched);
+                let pass = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_true(), thunk_ctx.clone(), ResumeArg::Matched);
                 (Residual::Jump(fail), Residual::Thunk(pass))
             };
-            vm.blocks[block_id.0].instructions.push(fail);
-            vm.blocks[block_id.0].instructions.push(pass);
+            vm.blocks[block.0].instructions.push(fail);
+            vm.blocks[block.0].instructions.push(pass);
         })))
     }
 
@@ -1828,7 +1855,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
-            vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Jump(side);
+            vm.jump_thunk(block_id, thunk_pc, side);
         })))
     }
 
@@ -1853,10 +1880,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     (Residual::Guard { idx, expected: runtime_type }, pc.next_false(), ResumeArg::Failed)
                 },
             };
-            if !appends {
+            // In place, unless the thunk's JIT code can only be patched to a
+            // jump. See Note [Thunk patching].
+            if !appends || vm.compiled(block_id) {
                 let old_block = block_id;
                 block_id = vm.new_block(pc.0);
-                vm.blocks[old_block.0].instructions[thunk_pc] = Residual::Jump(block_id);
+                vm.jump_thunk(old_block, thunk_pc, block_id);
                 vm.blocks[block_id.0].instructions.push(guard);
             } else {
                 vm.blocks[block_id.0].instructions[thunk_pc] = guard;
@@ -1891,10 +1920,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("forcing thunk with {:?} == {:?}", runtime_type, expected);
             let arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
             // TODO: search for if we already have a compatible block
-            if !appends {
+            // In place, unless the thunk's JIT code can only be patched to a
+            // jump. See Note [Thunk patching].
+            if !appends || vm.compiled(block_id) {
                 let old_block = block_id;
                 block_id = vm.new_block(pc.0);
-                vm.blocks[old_block.0].instructions[thunk_pc] = Residual::Jump(block_id);
+                vm.jump_thunk(old_block, thunk_pc, block_id);
                 vm.blocks[block_id.0].instructions.push(Residual::Guard { idx, expected: runtime_type });
             } else {
                 vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Guard { idx, expected: runtime_type };
@@ -1953,7 +1984,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), thunk_coro, ResumeArg::Failed, block_id) {
                     vm.compile(owner, succ_next, succ_ty, fail_block);
                 }
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Jump(fail_block);
+                vm.jump_thunk(block_id, thunk_pc, fail_block);
                 return;
             };
             debug!("href forced by {tab:?} -> {val:?}");
@@ -2019,10 +2050,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     index,
                 });
             })));
-            if(!appends) {
+            // In place, unless the thunk's JIT code can only be patched to a
+            // jump. See Note [Thunk patching].
+            if !appends || vm.compiled(block_id) {
                 let old_block = block_id;
                 block_id = vm.new_block(pc.0);
-                vm.blocks[old_block.0].instructions[thunk_pc] = Residual::Jump(block_id);
+                vm.jump_thunk(old_block, thunk_pc, block_id);
                 vm.blocks[block_id.0].instructions.push(href_init);
             } else {
                 vm.blocks[block_id.0].instructions[thunk_pc] = href_init;
@@ -2039,7 +2072,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), missing_coro.clone(), ResumeArg::Failed, fail_block) {
                     vm.compile(owner, succ_next, succ_ty, fail_block);
                 }
-                vm.blocks[missing_key.0].instructions[thunk_pc] = Residual::Jump(fail_block);
+                vm.jump_thunk(missing_key, thunk_pc, fail_block);
             })))));
 
             let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, CType::Type(discovered_type)));
@@ -2067,7 +2100,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // Do another check for the key type, where if it still holds we can update the
             // witness epoch and jump back to the success block.
             let check_block = vm.new_block(pc.0);
-            vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Jump(check_block);
+            vm.jump_thunk(block_id, thunk_pc, check_block);
             let expected = &thunk_ctx.hkeys[href.0 as usize].known_type;
             // Because we will need to JIT the guards, we split "simple" hashguards from other, more
             // specialized ones such as for function targets.
