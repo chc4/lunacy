@@ -327,6 +327,12 @@ impl<T, Idx: std::slice::SliceIndex<[T]>> IndexMut<Idx> for UnsafeVec<T> {
     }
 }
 
+impl<T: Mark> Mark for UnsafeVec<T> {
+    fn mark(&self, owner: &Owner) {
+        self.vec.mark(owner)
+    }
+}
+
 #[cfg(feature = "skip_vec")]
 pub type FVec<T> = UnsafeVec<T>;
 #[cfg(not(feature = "skip_vec"))]
