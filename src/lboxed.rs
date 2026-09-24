@@ -82,6 +82,22 @@ impl<'src> IStr<'src> {
     }
 }
 
+// Note [Integer encoding]
+// ~~~~~~~~~~~~~~~~~~~~~~~
+// A number has two encodings, as in JavaScriptCore's NuN boxing (JSCJSValue.h):
+// a double, offset by `DOUBLE_ENCODE_OFFSET` into `0002:...` to `FFFC:...` (a
+// NaN canonicalized first, so none reaches higher), or an i32, `NUMBER_TAG` or'd
+// with its bits, `FFFE:0000:IIII:IIII`.
+//
+// Only LBBV code produces the integer encoding, and only in a stack slot its
+// context types `CType::Integer` (Note [Integers] in `generator`): everything
+// else, from tables and upvalues to natives and the interpreter, only ever
+// sees doubles. So the generic decoders (`as_number`, `unbox`) read doubles
+// alone, and assert that in debug builds; code that knows a slot is an integer
+// reads it with `as_int`. A slot whose context no longer tracks it (a dead
+// register) may keep an integer it never reads again, which the collector
+// skips.
+
 impl<'src, 'intern> LBoxed<'src, 'intern> {
     pub const NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;
     pub const DOUBLE_ENCODE_OFFSET: u64 = 0x0002_0000_0000_0000; // 2^49
@@ -130,6 +146,12 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         Self::from_raw(bits.wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
     }
 
+    /// Box an integer. See Note [Integer encoding].
+    #[inline(always)]
+    pub fn from_int(i: i32) -> Self {
+        Self::from_raw(Self::NUMBER_TAG | i as u32 as u64)
+    }
+
     #[inline(always)]
     pub fn from_bool(b: bool) -> Self {
         Self::from_raw(if b { Self::VALUE_TRUE } else { Self::VALUE_FALSE })
@@ -146,9 +168,26 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         (self.0 & Self::NUMBER_TAG) != 0
     }
 
-    /// Decode a number, or `None` if this value isn't a number.
+    /// Whether this value is a number in the integer encoding. See Note
+    /// [Integer encoding].
+    #[inline(always)]
+    pub fn is_int(&self) -> bool {
+        (self.0 & Self::NUMBER_TAG) == Self::NUMBER_TAG
+    }
+
+    /// Decode a number in the integer encoding, which the caller knows this is.
+    /// See Note [Integer encoding].
+    #[inline(always)]
+    pub unsafe fn as_int(&self) -> i32 {
+        debug_assert!(self.is_int(), "{:#x} isn't an integer", self.0);
+        self.0 as u32 as i32
+    }
+
+    /// Decode a number, or `None` if this value isn't a number. Never an
+    /// integer: see Note [Integer encoding].
     #[inline(always)]
     pub fn as_number(&self) -> Option<f64> {
+        debug_assert!(!self.is_int(), "integer {} outside LBBV", self.0 as u32 as i32);
         if self.is_number() {
             Some(f64::from_bits(self.0.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET)))
         } else {
@@ -205,6 +244,7 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     #[inline(always)]
     pub fn unbox(&self) -> LValue<'src, 'intern> {
         let bits = self.0;
+        debug_assert!(!self.is_int(), "integer {} outside LBBV", bits as u32 as i32);
         if bits & Self::NUMBER_TAG != 0 {
             return LValue::Number(Number(f64::from_bits(bits.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET))));
         }
@@ -245,6 +285,9 @@ impl Default for LBoxed<'_, '_> {
 // need `Eq`/`Hash` use the canonical `LCanon` wrapper in `vm` instead.
 impl Debug for LBoxed<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        if self.is_int() {
+            return write!(f, "Integer({})", self.0 as u32 as i32);
+        }
         write!(f, "{:?}", self.unbox())
     }
 }

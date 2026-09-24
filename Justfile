@@ -27,7 +27,7 @@ test:
 # must match. Then the golden suite with every block JIT compiled, optimized
 # (`immediate_jit` copies no stencils, so window ops run through their
 # interpreter path under the JIT's register allocation). (At opt-level 0,
-# `NumericIntInt` keeps a jump table from the unfolded `match OP`, which the
+# `NumericRR` keeps a jump table from the unfolded `match OP`, which the
 # copier rejects: the check skips it and the JIT calls into the interpreter.)
 STENCIL_OPT := "--profile stencils"
 [env("RUST_BACKTRACE","1")]

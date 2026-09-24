@@ -68,6 +68,9 @@ pub struct Block {
     /// Whether the block may have allocated since its last GC safepoint, which
     /// it then gets at its end. See Note [Block safepoints].
     allocates: bool,
+    /// A version of a pc's context, which jumps to it enter. See Note [Version
+    /// compatibility].
+    context: Option<Rc<Context>>,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
     /// Times the interpreter entered the block, shown by `dump`.
@@ -92,6 +95,7 @@ impl Block {
             instructions: vec![],
             pc,
             allocates: false,
+            context: None,
             #[cfg(feature = "jit")]
             jit_info: JitInfo::new(),
             #[cfg(feature = "graph")]
@@ -141,31 +145,71 @@ macro_rules! define_exec {
     };
 }
 
-/// The arithmetic opcode's `[OP: Opcode]` instance of a `windowed!` op,
-/// constructed with `new($args)`.
+/// The arithmetic opcode's `[OP: Opcode, $params]` instance of a `windowed!`
+/// op, constructed with `new($args)`.
 macro_rules! dispatch_numeric_window {
+    ($opcode:expr, $name:ident, [$($p:expr),*], ($($arg:expr),*)) => {
+        match $opcode {
+            Opcode::ADD => Rc::new($name::<{Opcode::ADD} $(, {$p})*>::new($($arg),*)) as Rc<dyn Window>,
+            Opcode::SUB => Rc::new($name::<{Opcode::SUB} $(, {$p})*>::new($($arg),*)),
+            Opcode::MUL => Rc::new($name::<{Opcode::MUL} $(, {$p})*>::new($($arg),*)),
+            Opcode::DIV => Rc::new($name::<{Opcode::DIV} $(, {$p})*>::new($($arg),*)),
+            Opcode::MOD => Rc::new($name::<{Opcode::MOD} $(, {$p})*>::new($($arg),*)),
+            Opcode::POW => Rc::new($name::<{Opcode::POW} $(, {$p})*>::new($($arg),*)),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// `dispatch_numeric_window`, for the integer ops. See Note [Integers].
+macro_rules! dispatch_integer_window {
     ($opcode:expr, $name:ident, ($($arg:expr),*)) => {
         match $opcode {
             Opcode::ADD => Rc::new($name::<{Opcode::ADD}>::new($($arg),*)) as Rc<dyn Window>,
             Opcode::SUB => Rc::new($name::<{Opcode::SUB}>::new($($arg),*)),
             Opcode::MUL => Rc::new($name::<{Opcode::MUL}>::new($($arg),*)),
-            Opcode::DIV => Rc::new($name::<{Opcode::DIV}>::new($($arg),*)),
             Opcode::MOD => Rc::new($name::<{Opcode::MOD}>::new($($arg),*)),
-            Opcode::POW => Rc::new($name::<{Opcode::POW}>::new($($arg),*)),
             _ => unreachable!(),
         }
     };
 }
 
 macro_rules! dispatch_compare_window {
-    ($opcode:expr, $name:ident, ($($arg:expr),*)) => {
+    ($opcode:expr, $name:ident, [$($p:expr),*], ($($arg:expr),*)) => {
         match $opcode {
-            Opcode::EQ => Rc::new($name::<{Opcode::EQ}>::new($($arg),*)) as Rc<dyn Window>,
-            Opcode::LT => Rc::new($name::<{Opcode::LT}>::new($($arg),*)),
-            Opcode::LE => Rc::new($name::<{Opcode::LE}>::new($($arg),*)),
+            Opcode::EQ => Rc::new($name::<{Opcode::EQ} $(, {$p})*>::new($($arg),*)) as Rc<dyn Window>,
+            Opcode::LT => Rc::new($name::<{Opcode::LT} $(, {$p})*>::new($($arg),*)),
+            Opcode::LE => Rc::new($name::<{Opcode::LE} $(, {$p})*>::new($($arg),*)),
             _ => unreachable!(),
         }
     };
+}
+
+/// In a generator, the types of an op's two operands, as `TypeofRk` gives
+/// them, for an op computing on integers: with one an integer, whether an
+/// unknown other is one is found out. See Note [Integers].
+///
+/// The other register is guarded even when its type is known, statically
+/// (`DiscoverInteger` tests no known number), so that a way into the op
+/// already holding both integers takes the same guard as one finding out: the
+/// subblocks after the guard are shared by its outcome and the context, which
+/// are then the same, so the op must be at the same point in each.
+macro_rules! discover_integers {
+    ($lhs:expr, $rhs:expr) => {{
+        let integer = ResumeArg::Type(CType::Integer);
+        let mut lt = yield YieldOp::TypeofRk($lhs);
+        let mut rt = yield YieldOp::TypeofRk($rhs);
+        if lt == integer && ($rhs & 0x100) == 0 {
+            if (yield YieldOp::DiscoverInteger($rhs)) == ResumeArg::Matched {
+                rt = integer.clone();
+            }
+        } else if rt == integer && ($lhs & 0x100) == 0 {
+            if (yield YieldOp::DiscoverInteger($lhs)) == ResumeArg::Matched {
+                lt = integer.clone();
+            }
+        }
+        (lt, rt)
+    }};
 }
 
 
@@ -242,7 +286,12 @@ pub enum YieldOp {
                            // is the expected type
     GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer.
                               // See Note [Integers]
+    DiscoverInteger(usize), // GuardCType(idx, Integer), but a number known not to be one
+                            // fails statically. See Note [Integers]
     TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
+    IntegerK(usize), // Resumed with the value of CONSTANT[idx], a `CType::Integer`
+    Demote(std::ops::Range<usize>), // Lower the integers in STACK[range] to doubles, for code
+                                    // reading them as any value. See Note [Integers]
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
     Exec(ResidualExec), // Emit a residual operation that will be executed
@@ -294,6 +343,7 @@ pub enum ResumeArg {
     Type(CType),
     BlockId(BlockId),
     HashRef(HashRef, CType),
+    Integer(i32),
 }
 
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -305,14 +355,22 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
             let Constant::Number(n) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
             *dest = LBoxed::from_number(n.0);
         });
+        windowed!(LoadKInteger, [value: i32], [], |owner, state, base| (out dest) {
+            *dest = LBoxed::from_int(value);
+        });
         windowed!(LoadKString, [index: u32], [], |owner, state, base| (out dest) {
             let Constant::String(s) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
             *dest = LBoxed::interned(*s);
         });
         match c {
             LType::Number => {
-                yield YieldOp::ExecWindow(Rc::new(LoadKNumber::new(bx, &[dest])));
                 let ResumeArg::Type(t) = (yield YieldOp::TypeofK(bx as usize)) else { unreachable!() };
+                if t == CType::Integer {
+                    let ResumeArg::Integer(value) = (yield YieldOp::IntegerK(bx as usize)) else { unreachable!() };
+                    yield YieldOp::ExecWindow(Rc::new(LoadKInteger::new(value, &[dest])));
+                } else {
+                    yield YieldOp::ExecWindow(Rc::new(LoadKNumber::new(bx, &[dest])));
+                }
                 yield YieldOp::SetCTypes(vec![(dest, t)]);
             },
             LType::String => {
@@ -383,6 +441,7 @@ pub fn emit_setglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>
     move |mut arg: ResumeArg| {
         // TODO: env shape specialization
         debug!("setglobal {} = {:?}", dest, &kst);
+        yield YieldOp::Demote(dest..dest + 1);
         yield YieldOp::Exec(ResidualExec::new("setglobal", Rc::new(move |owner, state| {
             state._G.set(owner, (&kst).into(), state.vals[state.base + dest as usize], state.intern);
         })));
@@ -433,35 +492,36 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[b, a])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
         } else {
-            let integer = match yield YieldOp::GuardRk(c, LType::Number) {
-                ResumeArg::Matched | ResumeArg::MatchedConst(_) => yield YieldOp::GuardCType(c, CType::Integer),
-                _ => ResumeArg::Failed,
+            // An integer key in the array part, in a register or a constant (its
+            // value, `k`): the array slot. See Note [Dynamic guards].
+            let integer = match yield YieldOp::GuardCType(c, CType::Integer) {
+                ResumeArg::MatchedConst(k) => {
+                    let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };
+                    Some(Some(k))
+                },
+                ResumeArg::Matched => Some(None),
+                _ => None,
             };
-            // An integer key in the array part, in a register or a constant: the
-            // array slot. See Note [Dynamic guards].
             let in_array = match integer {
-                ResumeArg::MatchedConst(k) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k as u32, &[b]))),
-                ResumeArg::Matched => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[b, c]))),
-                _ => ResumeArg::Failed,
+                Some(Some(k)) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[b]))),
+                Some(None) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[b, c]))),
+                None => ResumeArg::Failed,
             };
-            if let (ResumeArg::MatchedConst(k), ResumeArg::Matched) = (&integer, &in_array) {
-                windowed!(GetTableArray, [k: u32], [], |owner, state, base| (table, out dest) {
-                    let Constant::Number(n) = (&(*state.clos.ro(owner).prototype).constants.items).get_unchecked(k as usize) else {
-                        core::hint::unreachable_unchecked()
-                    };
+            if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
+                windowed!(GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
                     let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-                    *dest = *tab.ro(owner).array.get_unchecked(integer_slot(n.0));
+                    *dest = *tab.ro(owner).array.get_unchecked(integer_slot(k));
                 });
-                arg = yield YieldOp::ExecWindow(Rc::new(GetTableArray::new(*k as u32, &[b, a])));
-            } else if let (ResumeArg::Matched, ResumeArg::Matched) = (&integer, &in_array) {
+                arg = yield YieldOp::ExecWindow(Rc::new(GetTableArray::new(k, &[b, a])));
+            } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
                 windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
                     let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-                    let Some(n) = key.as_number() else { core::hint::unreachable_unchecked() };
-                    *dest = *tab.ro(owner).array.get_unchecked(integer_slot(n));
+                    *dest = *tab.ro(owner).array.get_unchecked(integer_slot(key.as_int()));
                 });
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableInteger::new(&[b, c, a])));
             } else {
                 // Any other key: through `gettable`.
+                yield YieldOp::Demote(c..c + 1);
                 arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
                     let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
                         Ok(c) => Cow::Owned(LValue::from(c)),
@@ -490,37 +550,51 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             return arg;
         }
         // TODO: table shape specialization
-        arg = yield YieldOp::GuardRk(b, LType::Number);
-        let integer = match arg {
-            ResumeArg::Matched | ResumeArg::MatchedConst(_) => yield YieldOp::GuardCType(b, CType::Integer),
+        // An integer key in the array part, in a register or a constant (its
+        // value, `k`), with the value in a register, stores into its slot. See
+        // Note [Dynamic guards].
+        let integer = match yield YieldOp::GuardCType(b, CType::Integer) {
+            ResumeArg::MatchedConst(k) => {
+                let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };
+                Some(Some(k))
+            },
+            ResumeArg::Matched => Some(None),
+            _ => None,
+        };
+        let in_array = match (integer, c & 0x100) {
+            (Some(Some(k)), 0) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[a]))),
+            (Some(None), 0) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[a, b]))),
             _ => ResumeArg::Failed,
         };
-        // An integer key in the array part, with the value in a register, stores
-        // into its slot. See Note [Dynamic guards].
-        let in_array = match (&integer, c & 0x100) {
-            (ResumeArg::MatchedConst(k), 0) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(*k as u32, &[a]))),
-            (ResumeArg::Matched, 0) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[a, b]))),
-            _ => ResumeArg::Failed,
-        };
-        if let (ResumeArg::MatchedConst(k), ResumeArg::Matched) = (&integer, &in_array) {
-            windowed!(SetTableArray, [k: u32], [], |owner, state, base| (table, value) {
-                let Constant::Number(n) = (&(*state.clos.ro(owner).prototype).constants.items).get_unchecked(k as usize) else {
-                    core::hint::unreachable_unchecked()
-                };
+        // A table holds a double. See Note [Integers].
+        let int_value = in_array == ResumeArg::Matched && (yield YieldOp::TypeofRk(c)) == ResumeArg::Type(CType::Integer);
+        if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
+            windowed!(SetTableArray, [k: i32], [INT: bool], |owner, state, base| (table, value) {
                 let LValue::Table(mut tab) = table.unbox() else { core::hint::unreachable_unchecked() };
                 tab.barrier_back();
-                *tab.rw(owner).array.get_unchecked_mut(integer_slot(n.0)) = value;
+                *tab.rw(owner).array.get_unchecked_mut(integer_slot(k)) = double::<INT>(value);
             });
-            arg = yield YieldOp::ExecWindow(Rc::new(SetTableArray::new(*k as u32, &[a, c])));
-        } else if let (ResumeArg::Matched, ResumeArg::Matched) = (&integer, &in_array) {
-            windowed!(SetTableInteger, [], [], |owner, state, base| (table, key, value) {
+            arg = yield YieldOp::ExecWindow(if int_value {
+                Rc::new(SetTableArray::<true>::new(k, &[a, c]))
+            } else {
+                Rc::new(SetTableArray::<false>::new(k, &[a, c]))
+            });
+        } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
+            windowed!(SetTableInteger, [], [INT: bool], |owner, state, base| (table, key, value) {
                 let LValue::Table(mut tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-                let Some(n) = key.as_number() else { core::hint::unreachable_unchecked() };
                 tab.barrier_back();
-                *tab.rw(owner).array.get_unchecked_mut(integer_slot(n)) = value;
+                *tab.rw(owner).array.get_unchecked_mut(integer_slot(key.as_int())) = double::<INT>(value);
             });
-            arg = yield YieldOp::ExecWindow(Rc::new(SetTableInteger::new(&[a, b, c])));
-        } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
+            arg = yield YieldOp::ExecWindow(if int_value {
+                Rc::new(SetTableInteger::<true>::new(&[a, b, c]))
+            } else {
+                Rc::new(SetTableInteger::<false>::new(&[a, b, c]))
+            });
+        } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = {
+            yield YieldOp::Demote(b..b + 1);
+            yield YieldOp::Demote(c..c + 1);
+            yield YieldOp::GuardRk(b, LType::Number)
+        } {
             // Any other number key, one past the array part, or a constant value:
             // through `set`.
             arg = yield YieldOp::Exec(ResidualExec::new("settable_array", Rc::new(move |owner, state| {
@@ -544,6 +618,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 arg = yield YieldOp::TypeofRk(c);
                 let mut mismatched_type = None;
                 if let ResumeArg::Type(t) = arg {
+                    // A table holds an integer constant as a double. See Note [Integers].
+                    let t = if t == CType::Integer { CType::Type(LType::Number) } else { t };
                     if t != htype {
                         mismatched_type = Some(t);
                     } else {
@@ -652,6 +728,7 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
         // We don't need to guard on LType::Table, because this instruction is only ever used for
         // table initialization, which means it is definitely a table and doesn't e.g. have a
         // metatable we have to chain to.
+        yield YieldOp::Demote(a + 1..if b == 0 { usize::MAX } else { a + 1 + b });
         arg = yield YieldOp::Exec(ResidualExec::new("setlist", Rc::new(move |owner, state| {
             match state.vals[state.base + a as usize].unbox() {
                 LValue::Table(tab) => {
@@ -673,9 +750,151 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
     }
 }
 
+/// A numeric operand as a double, decoded from the integer encoding if `INT`.
+/// See Note [Integers].
+#[inline(always)]
+unsafe fn number<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>) -> f64 {
+    if INT {
+        (unsafe { v.as_int() }) as f64
+    } else {
+        let Some(n) = v.as_number() else { unsafe { core::hint::unreachable_unchecked() } };
+        n
+    }
+}
+
+/// A value as a double, for a table to hold: re-encoded if `INT`. See Note
+/// [Integers].
+#[inline(always)]
+unsafe fn double<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>) -> LBoxed<'src, 'intern> {
+    if INT { LBoxed::from_number((unsafe { v.as_int() }) as f64) } else { v }
+}
+
+/// The integer op `OP`'s result, if it fits the integer encoding: it must be in
+/// range, and neither -0 nor NaN. See Note [Integers].
+#[inline(always)]
+fn integer_op<const OP: Opcode>(l: i32, r: i32) -> Option<i32> {
+    match OP {
+        Opcode::ADD => l.checked_add(r),
+        Opcode::SUB => l.checked_sub(r),
+        // Zero times a negative number is -0.
+        Opcode::MUL => l.checked_mul(r).filter(|&p| p != 0 || (l | r) >= 0),
+        // Floored, as `lua_mod`. By zero, it is NaN.
+        Opcode::MOD => (r != 0).then(|| {
+            let m = l.wrapping_rem(r);
+            if m != 0 && (m ^ r) < 0 { m + r } else { m }
+        }),
+        _ => unsafe { core::hint::unreachable_unchecked() },
+    }
+}
+
+// The integer ops on registers and constants (`k`, their value), and their
+// `GuardDynamic` tests that the result fits. See Note [Integers].
+crate::window::windowed!(FitsRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs) {
+    state.select = integer_op::<OP>(lhs.as_int(), rhs.as_int()).is_none() as usize;
+});
+crate::window::windowed!(FitsKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs) {
+    state.select = integer_op::<OP>(k, rhs.as_int()).is_none() as usize;
+});
+crate::window::windowed!(FitsRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs) {
+    state.select = integer_op::<OP>(lhs.as_int(), k).is_none() as usize;
+});
+crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
+    *dest = LBoxed::from_int(integer_op::<OP>(lhs.as_int(), rhs.as_int()).unwrap_unchecked());
+});
+crate::window::windowed!(IntegerKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
+    *dest = LBoxed::from_int(integer_op::<OP>(k, rhs.as_int()).unwrap_unchecked());
+});
+crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
+    *dest = LBoxed::from_int(integer_op::<OP>(lhs.as_int(), k).unwrap_unchecked());
+});
+
+// The double ops on registers, `LI`/`RI` if in the integer encoding, and
+// constants (index `k`), read from the prototype. Unchecked, so that no panic
+// path follows the stencil's `become` and the copy can slice it off.
+crate::window::windowed!(NumericRR, [], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs, out dest) {
+    let (l, r) = (number::<LI>(lhs), number::<RI>(rhs));
+    *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
+});
+crate::window::windowed!(NumericKK, [kl: u32, kr: u32], [OP: Opcode], |owner, state, base| (out dest) {
+    let constants = &(&(*state.clos.ro(owner).prototype).constants.items);
+    let Constant::Number(l) = &constants[kl as usize] else { core::hint::unreachable_unchecked() };
+    let Constant::Number(r) = &constants[kr as usize] else { core::hint::unreachable_unchecked() };
+    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(*r)).unwrap());
+});
+crate::window::windowed!(NumericKR, [k: u32], [OP: Opcode, RI: bool], |owner, state, base| (rhs, out dest) {
+    let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+        core::hint::unreachable_unchecked()
+    };
+    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(number::<RI>(rhs)))).unwrap());
+});
+crate::window::windowed!(NumericRK, [k: u32], [OP: Opcode, LI: bool], |owner, state, base| (lhs, out dest) {
+    let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+        core::hint::unreachable_unchecked()
+    };
+    *dest = LBoxed::box_lvalue(LValue::Number(Number(number::<LI>(lhs))).numeric_op(OP, &LValue::Number(*r)).unwrap());
+});
+
+/// `NumericRR` for `opcode`, reading integer registers as `li`/`ri` say.
+fn numeric_rr(opcode: Opcode, li: bool, ri: bool, operands: &[usize]) -> Rc<dyn Window> {
+    match (li, ri) {
+        (false, false) => dispatch_numeric_window!(opcode, NumericRR, [false, false], (operands)),
+        (false, true) => dispatch_numeric_window!(opcode, NumericRR, [false, true], (operands)),
+        (true, false) => dispatch_numeric_window!(opcode, NumericRR, [true, false], (operands)),
+        (true, true) => dispatch_numeric_window!(opcode, NumericRR, [true, true], (operands)),
+    }
+}
+
+/// `NumericKR` for `opcode`, reading an integer register if `ri`.
+fn numeric_kr(opcode: Opcode, ri: bool, k: u32, operands: &[usize]) -> Rc<dyn Window> {
+    match ri {
+        false => dispatch_numeric_window!(opcode, NumericKR, [false], (k, operands)),
+        true => dispatch_numeric_window!(opcode, NumericKR, [true], (k, operands)),
+    }
+}
+
+/// `NumericRK` for `opcode`, reading an integer register if `li`.
+fn numeric_rk(opcode: Opcode, li: bool, k: u32, operands: &[usize]) -> Rc<dyn Window> {
+    match li {
+        false => dispatch_numeric_window!(opcode, NumericRK, [false], (k, operands)),
+        true => dispatch_numeric_window!(opcode, NumericRK, [true], (k, operands)),
+    }
+}
+
 pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
+        let integer = ResumeArg::Type(CType::Integer);
+        // --- Int Path --- See Note [Integers]. First, as finding out whether an
+        // unknown operand is an integer finds out its type too.
+        if matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::MOD) {
+            let (lt, rt) = discover_integers!(lhs, rhs);
+            let (lk, rk) = ((lhs & 0x100) != 0, (rhs & 0x100) != 0);
+            // A constant operand is its value, as `k`. luac folds two.
+            let op = if lt != integer || rt != integer || (lk && rk) {
+                None
+            } else if lk {
+                let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(lhs & 0xff)) else { unreachable!() };
+                Some((Some(dispatch_integer_window!(opcode, FitsKR, (k, &[rhs]))), dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest]))))
+            } else if rk {
+                let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rhs & 0xff)) else { unreachable!() };
+                // Only MOD by a zero can fail with a constant divisor.
+                let test = (opcode != Opcode::MOD || k == 0).then(|| dispatch_integer_window!(opcode, FitsRK, (k, &[lhs])));
+                Some((test, dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest]))))
+            } else {
+                Some((Some(dispatch_integer_window!(opcode, FitsRR, (&[lhs, rhs]))), dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest]))))
+            };
+            if let Some((test, op)) = op {
+                let fits = match test {
+                    Some(test) => yield YieldOp::GuardDynamic(test),
+                    None => ResumeArg::Matched,
+                };
+                if fits == ResumeArg::Matched {
+                    yield YieldOp::ExecWindow(op);
+                    yield YieldOp::SetCTypes(vec![(dest, CType::Integer)]);
+                    return arg;
+                }
+            }
+        }
         arg = yield YieldOp::GuardRk(lhs, LType::Table);
         if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
             arg = yield YieldOp::GuardRk(rhs, LType::Table);
@@ -687,62 +906,24 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 return arg;
             }
         }
-        // --- Int Path ---
-        let larg = yield YieldOp::GuardRk(lhs, LType::Number);
-        let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
+        // --- Number Path ---
+        // An integer register is decoded, not lowered. See Note [Integers].
+        let lint = (lhs & 0x100) == 0 && (yield YieldOp::TypeofRk(lhs)) == integer;
+        let rint = (rhs & 0x100) == 0 && (yield YieldOp::TypeofRk(rhs)) == integer;
+        let larg = if lint { ResumeArg::Matched } else { yield YieldOp::GuardRk(lhs, LType::Number) };
+        let rarg = if rint { ResumeArg::Matched } else { yield YieldOp::GuardRk(rhs, LType::Number) };
         let window = match (larg, rarg) {
-            (ResumeArg::Matched, ResumeArg::Matched) => {
-                windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
-                    // Guarded numbers. Unchecked, so that no panic path follows the
-                    // stencil's `become` and the copy can slice it off.
-                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
-                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
-                    *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
-                });
-                Some(dispatch_numeric_window!(opcode, NumericIntInt, (&[lhs, rhs, dest])))
-            },
-            // A constant operand is read from the prototype, as `k`.
+            (ResumeArg::Matched, ResumeArg::Matched) => Some(numeric_rr(opcode, lint, rint, &[lhs, rhs, dest])),
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
-                windowed!(NumericCintCint, [kl: u32, kr: u32], [OP: Opcode], |owner, state, base| (out dest) {
-                    let constants = &(&(*state.clos.ro(owner).prototype).constants.items);
-                    let Constant::Number(l) = &constants[kl as usize] else { core::hint::unreachable_unchecked() };
-                    let Constant::Number(r) = &constants[kr as usize] else { core::hint::unreachable_unchecked() };
-                    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(*r)).unwrap());
-                });
-                Some(dispatch_numeric_window!(opcode, NumericCintCint, (lhsc as u32, rhsc as u32, &[dest])))
+                Some(dispatch_numeric_window!(opcode, NumericKK, [], (lhsc as u32, rhsc as u32, &[dest])))
             },
-            (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
-                windowed!(NumericCintInt, [k: u32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
-                    let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-                        core::hint::unreachable_unchecked()
-                    };
-                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
-                    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
-                });
-                Some(dispatch_numeric_window!(opcode, NumericCintInt, (lhsc as u32, &[rhs, dest])))
-            },
-            (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
-                windowed!(NumericIntCint, [k: u32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
-                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
-                    let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-                        core::hint::unreachable_unchecked()
-                    };
-                    *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(*r)).unwrap());
-                });
-                Some(dispatch_numeric_window!(opcode, NumericIntCint, (rhsc as u32, &[lhs, dest])))
-            },
+            (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => Some(numeric_kr(opcode, rint, lhsc as u32, &[rhs, dest])),
+            (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => Some(numeric_rk(opcode, lint, rhsc as u32, &[lhs, dest])),
             _ => None,
         };
         if let Some(window) = window {
-            // Integer operands give an integer, unless it overflows. See Note [Integers].
-            let integers = matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL)
-                && (yield YieldOp::TypeofRk(lhs)) == ResumeArg::Type(CType::Integer)
-                && (yield YieldOp::TypeofRk(rhs)) == ResumeArg::Type(CType::Integer);
             yield YieldOp::ExecWindow(window);
             yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
-            if integers {
-                yield YieldOp::GuardCType(dest, CType::Integer);
-            }
             return arg;
         }
 
@@ -776,11 +957,87 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
     }
 }
 
+/// Set `select` for a compare's select: 0 to take the jump, when the condition
+/// isn't `a`. `OP` is a const param, so each stencil compares one way.
+/// Unchecked, so that no panic path follows the stencil's `become`.
+#[inline(always)]
+unsafe fn select<const OP: Opcode, T: PartialOrd>(state: &mut RunState, a: u8, l: T, r: T) {
+    let cond = match OP {
+        Opcode::EQ => l == r,
+        Opcode::LT => l < r,
+        Opcode::LE => l <= r,
+        _ => unsafe { core::hint::unreachable_unchecked() },
+    };
+    state.select = if (cond as u8) != a { 0 } else { 1 };
+}
+
+// Compares of integers, a constant one as `k`, its value. See Note [Integers].
+crate::window::windowed!(CompareIntRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
+    select::<OP, i32>(state, a, lhs.as_int(), rhs.as_int());
+});
+crate::window::windowed!(CompareIntKR, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (rhs) {
+    select::<OP, i32>(state, a, k, rhs.as_int());
+});
+crate::window::windowed!(CompareIntRK, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (lhs) {
+    select::<OP, i32>(state, a, lhs.as_int(), k);
+});
+
+// Compares of numbers: registers, `LI`/`RI` if in the integer encoding, and a
+// constant, `k` its index, read from the prototype.
+crate::window::windowed!(CompareRR, [a: u8], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs) {
+    select::<OP, f64>(state, a, number::<LI>(lhs), number::<RI>(rhs));
+});
+crate::window::windowed!(CompareKR, [a: u8, k: u32], [OP: Opcode, RI: bool], |owner, state, base| (rhs) {
+    let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+        core::hint::unreachable_unchecked()
+    };
+    select::<OP, f64>(state, a, l.0, number::<RI>(rhs));
+});
+crate::window::windowed!(CompareRK, [a: u8, k: u32], [OP: Opcode, LI: bool], |owner, state, base| (lhs) {
+    let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+        core::hint::unreachable_unchecked()
+    };
+    select::<OP, f64>(state, a, number::<LI>(lhs), r.0);
+});
+
+/// `CompareRR` for `opcode`, reading integer registers as `li`/`ri` say.
+fn compare_rr(opcode: Opcode, li: bool, ri: bool, a: u8, operands: &[usize]) -> Rc<dyn Window> {
+    match (li, ri) {
+        (false, false) => dispatch_compare_window!(opcode, CompareRR, [false, false], (a, operands)),
+        (false, true) => dispatch_compare_window!(opcode, CompareRR, [false, true], (a, operands)),
+        (true, false) => dispatch_compare_window!(opcode, CompareRR, [true, false], (a, operands)),
+        (true, true) => dispatch_compare_window!(opcode, CompareRR, [true, true], (a, operands)),
+    }
+}
+
+/// `CompareKR` for `opcode`, reading an integer register if `ri`.
+fn compare_kr(opcode: Opcode, ri: bool, a: u8, k: u32, operands: &[usize]) -> Rc<dyn Window> {
+    match ri {
+        false => dispatch_compare_window!(opcode, CompareKR, [false], (a, k, operands)),
+        true => dispatch_compare_window!(opcode, CompareKR, [true], (a, k, operands)),
+    }
+}
+
+/// `CompareRK` for `opcode`, reading an integer register if `li`.
+fn compare_rk(opcode: Opcode, li: bool, a: u8, k: u32, operands: &[usize]) -> Rc<dyn Window> {
+    match li {
+        false => dispatch_compare_window!(opcode, CompareRK, [false], (a, k, operands)),
+        true => dispatch_compare_window!(opcode, CompareRK, [true], (a, k, operands)),
+    }
+}
+
 pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        let larg = yield YieldOp::GuardRk(b, LType::Number);
-        let rarg = yield YieldOp::GuardRk(c, LType::Number);
+        // Integers compare as integers, and an integer register is decoded, not
+        // lowered. See Note [Integers].
+        let integer = ResumeArg::Type(CType::Integer);
+        let (lt, rt) = discover_integers!(b, c);
+        let integers = lt == integer && rt == integer;
+        let lint = (b & 0x100) == 0 && lt == integer;
+        let rint = (c & 0x100) == 0 && rt == integer;
+        let larg = if lint { ResumeArg::Matched } else { yield YieldOp::GuardRk(b, LType::Number) };
+        let rarg = if rint { ResumeArg::Matched } else { yield YieldOp::GuardRk(c, LType::Number) };
 
         let lnil = yield YieldOp::GuardRk(b, LType::Nil);
         let rnil = yield YieldOp::GuardRk(c, LType::Nil);
@@ -790,48 +1047,26 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
         arg = yield YieldOp::GetBlock((pc as isize + 1 as isize) as usize);
         let ResumeArg::BlockId(taken) = arg else { unreachable!() };
 
-        // Compare guarded numbers, a constant one read from the prototype, and set
-        // `select` for the select below: 0 to take the jump, when the condition
-        // isn't `a`. `OP` is a const param, so each stencil compares one way.
-        // Unchecked, so that no panic path follows the stencil's `become`.
-        #[inline(always)]
-        unsafe fn select<const OP: Opcode>(state: &mut RunState, a: u8, l: f64, r: f64) {
-            let cond = match OP {
-                Opcode::EQ => l == r,
-                Opcode::LT => l < r,
-                Opcode::LE => l <= r,
-                _ => unsafe { core::hint::unreachable_unchecked() },
-            };
-            state.select = if (cond as u8) != a { 0 } else { 1 };
-        }
         match (larg, rarg) {
+            (ResumeArg::Matched, ResumeArg::Matched) if integers => {
+                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRR, [], (a, &[b, c])));
+            },
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                windowed!(CompareIntInt, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
-                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
-                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
-                    select::<OP>(state, a, l, r);
-                });
-                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntInt, (a, &[b, c])));
+                arg = yield YieldOp::ExecWindow(compare_rr(opcode, lint, rint, a, &[b, c]));
+            },
+            (ResumeArg::MatchedConst(rb), ResumeArg::Matched) if integers => {
+                let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rb)) else { unreachable!() };
+                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntKR, [], (a, k, &[c])));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) => {
-                windowed!(CompareCIntInt, [a: u8, k: u32], [OP: Opcode], |owner, state, base| (rhs) {
-                    let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-                        core::hint::unreachable_unchecked()
-                    };
-                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
-                    select::<OP>(state, a, l.0, r);
-                });
-                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareCIntInt, (a, rb as u32, &[c])));
+                arg = yield YieldOp::ExecWindow(compare_kr(opcode, rint, a, rb as u32, &[c]));
+            },
+            (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) if integers => {
+                let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rc)) else { unreachable!() };
+                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRK, [], (a, k, &[b])));
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
-                windowed!(CompareIntCInt, [a: u8, k: u32], [OP: Opcode], |owner, state, base| (lhs) {
-                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
-                    let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-                        core::hint::unreachable_unchecked()
-                    };
-                    select::<OP>(state, a, l, r.0);
-                });
-                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntCInt, (a, rc as u32, &[b])));
+                arg = yield YieldOp::ExecWindow(compare_rk(opcode, lint, a, rc as u32, &[b]));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::MatchedConst(rc)) => {
                 unimplemented!()
@@ -1051,6 +1286,11 @@ pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
     #[coroutine]
     move |mut arg: ResumeArg| {
         debug!("forprep {a} {sbx} {pc}");
+        // An integer loop's index, limit and step are integers: find out which
+        // are. See Note [Integers].
+        for slot in a..a + 3 {
+            yield YieldOp::GuardCType(slot, CType::Integer);
+        }
         let mut sub = emit_numeric(Opcode::SUB, a, a, a + 2);
         drain!(sub, arg);
         arg = yield YieldOp::GetBlock(((pc as isize) + sbx as isize) as usize);
@@ -1060,39 +1300,61 @@ pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
     }
 }
 
+// FORLOOP's test, reading its index, limit and step in the integer encoding as
+// `II`, `LI` and `SI` say (see Note [Integers]), and comparing them as integers
+// if all are.
+//
+// Lua sets the loop variable only when the loop continues, but it is local to
+// the loop's body: after the loop exits nothing reads it before writing it,
+// and a closure capturing it has it closed (`CLOSE`) at the end of each
+// iteration, before this runs. So it is set on exit too, and the op needn't
+// read its old value.
+crate::window::windowed!(ForLoop, [], [II: bool, LI: bool, SI: bool], |owner, state, base| (idx, limit, step, out var) {
+    let comp = if II && LI && SI {
+        let (nidx, nlimit, nstep) = (idx.as_int(), limit.as_int(), step.as_int());
+        if nstep < 0 { nlimit <= nidx } else { nidx <= nlimit }
+    } else {
+        let (nidx, nlimit, nstep) = (number::<II>(idx), number::<LI>(limit), number::<SI>(step));
+        if nstep < 0.0 { nlimit <= nidx } else { nidx <= nlimit }
+    };
+    *var = idx;
+    state.select = if comp { 0 } else { 1 };
+});
+
+/// `ForLoop`, reading integers as `ii`, `li` and `si` say.
+fn for_loop(ii: bool, li: bool, si: bool, operands: &[usize]) -> Rc<dyn Window> {
+    match (ii, li, si) {
+        (false, false, false) => Rc::new(ForLoop::<false, false, false>::new(operands)),
+        (false, false, true) => Rc::new(ForLoop::<false, false, true>::new(operands)),
+        (false, true, false) => Rc::new(ForLoop::<false, true, false>::new(operands)),
+        (false, true, true) => Rc::new(ForLoop::<false, true, true>::new(operands)),
+        (true, false, false) => Rc::new(ForLoop::<true, false, false>::new(operands)),
+        (true, false, true) => Rc::new(ForLoop::<true, false, true>::new(operands)),
+        (true, true, false) => Rc::new(ForLoop::<true, true, false>::new(operands)),
+        (true, true, true) => Rc::new(ForLoop::<true, true, true>::new(operands)),
+    }
+}
+
 pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         debug!("forloop {a} {sbx} {pc}");
         debug!("{} {}", a, sbx);
-        let mut sub = emit_numeric(Opcode::ADD, a, a, a + 2);
-        drain!(sub, arg);
+        let mut add = emit_numeric(Opcode::ADD, a, a, a + 2);
+        drain!(add, arg);
 
-        let idx_number = yield YieldOp::Guard(a, LType::Number);
-        let limit_number = yield YieldOp::Guard(a + 1, LType::Number);
-        let step_number = yield YieldOp::Guard(a + 2, LType::Number);
+        // Integers are decoded, not lowered. See Note [Integers].
+        let integer = ResumeArg::Type(CType::Integer);
+        let ii = (yield YieldOp::Typeof(a)) == integer;
+        let li = (yield YieldOp::Typeof(a + 1)) == integer;
+        let si = (yield YieldOp::Typeof(a + 2)) == integer;
+        let idx_number = if ii { ResumeArg::Matched } else { yield YieldOp::Guard(a, LType::Number) };
+        let limit_number = if li { ResumeArg::Matched } else { yield YieldOp::Guard(a + 1, LType::Number) };
+        let step_number = if si { ResumeArg::Matched } else { yield YieldOp::Guard(a + 2, LType::Number) };
 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
-                // Lua sets the loop variable only when the loop continues, but it is
-                // local to the loop's body: after the loop exits nothing reads it
-                // before writing it, and a closure capturing it has it closed
-                // (`CLOSE`) at the end of each iteration, before this runs. So it
-                // is set on exit too, and the op needn't read its old value.
-                windowed!(ForLoop, [], [], |owner, state, base| (idx, limit, step, out var) {
-                    let Some(nidx) = idx.as_number() else { unreachable!() };
-                    let Some(nlimit) = limit.as_number() else { unreachable!() };
-                    let Some(nstep) = step.as_number() else { unreachable!() };
-                    debug!("{:?} {:?} {:?}", nidx, nlimit, nstep);
-                    let comp = if nstep < 0.0 {
-                        nlimit <= nidx
-                    } else {
-                        nidx <= nlimit
-                    };
-                    *var = idx;
-                    state.select = if comp { 0 } else { 1 };
-                });
-                yield YieldOp::ExecWindow(Rc::new(ForLoop::new(&[a, a + 1, a + 2, a + 3])));
+                yield YieldOp::ExecWindow(for_loop(ii, li, si, &[a, a + 1, a + 2, a + 3]));
                 let ResumeArg::Type(t) = (yield YieldOp::Typeof(a)) else { unreachable!() };
                 yield YieldOp::SetCTypes(vec![(a + 3, t)]);
             },
@@ -1272,41 +1534,70 @@ impl std::fmt::Display for CType {
 
 // Note [Integers]
 // ~~~~~~~~~~~~~~~
-// Numbers are doubles. `CType::Integer` is a number that is a whole number in
-// the i32 range: exact as a double, and an array slot after one truncation. No
-// `LType` tells one apart, so it is discovered where a consumer wants one (a
-// table key): `GuardCType(slot, Integer)` answers statically when the context
-// knows (the slot is `Integer`, or not a number), and otherwise ends the block
-// in a discovery thunk, like `Guard`'s. Forcing it tests the value it finds:
+// `CType::Integer` is a number that is a whole number in the i32 range, but
+// not -0, held in the integer encoding (Note [Integer encoding] in `lboxed`): a
+// stack slot is in the integer encoding exactly when its context types it
+// `Integer`. Every other number is a double, and nothing outside LBBV code
+// sees an integer: no closure captures a slot of a frame LBBV runs, as it has
+// no CLOSURE.
+//
+// They are found by demand: an op that wants an integer (a table key,
+// FORPREP's operands) yields `GuardCType(slot, Integer)`, which answers
+// statically when the context knows (the slot is `Integer`, or not a number)
+// and otherwise ends the block in a discovery thunk, like `Guard`'s. Forcing
+// it tests the value it finds:
 //
 //   * an integer: a `GuardDynamic(CheckInteger<true>)`, continuing on the
-//     success path with the slot `Integer`;
+//     success path with the slot `Integer`, through a block converting it
+//     (`ToInteger`);
 //   * another number: a `GuardDynamic(CheckInteger<false>)`, continuing on the
 //     failure path with the slot a number;
 //   * anything else: a `Guard` on its type, continuing on the failure path.
 //
-// Its fail thunk does the same for the next value that fails the guard. The
-// check is a window op, so the JIT keeps the window across it, as across an
-// inline `Guard`.
+// Its fail thunk does the same for the next value that fails the guard.
 //
-// A constant's type is `Integer` if it is one, so LOADK's and constant
-// operands are. Arithmetic propagates it with no guard on its operands: ADD,
-// SUB and MUL of two `Integer`s guard their result `Integer`, the overflow
-// check (their exact result is a double's up to 2^53, where rounding starts,
-// far out of the range), and otherwise give a number. FORLOOP's variable has
-// its index's type.
+// An integer is lowered back to a double (`ToNumber`, typing its slot a
+// number) wherever code would read it as any number or value: at a
+// `Guard(slot, Number)`, and a `Demote` by an op handing it to generic code (a
+// store to a table or a global, a table op's generic path), for a call's
+// arguments and a return's values, and before a jump into a version typing the
+// slot less precisely (Note [Version compatibility]), in a block of its own on
+// that edge. Its context must still be one the version accepts, so a generator
+// lowers nothing once it has its jump targets. `Typeof` answers `Integer`, so
+// MOVE copies an integer as one.
+//
+// Integer ops read and give integers. A whole i32 constant loads as one. ADD,
+// SUB, MUL and MOD of two `Integer` operands give one, guarded by a
+// `GuardDynamic` test that the exact result fits the encoding, which a failing
+// one computes as doubles instead. Compares of two compare them as integers.
+// With one operand known an integer, these find out whether the other is with
+// `DiscoverInteger`: a `GuardCType` but for failing statically on a number the
+// context knows isn't `Integer`, so that arithmetic on doubles tests nothing. The number ops, compares and FORLOOP read
+// an integer operand as a double without lowering it, and FORPREP finds out
+// whether its operands are integers, so an integer loop's index and variable
+// stay ones.
 
 /// Whether `n` is a `CType::Integer`. See Note [Integers].
 #[inline(always)]
 pub fn is_integer(n: f64) -> bool {
-    n == (n as i32) as f64
+    ((n as i32) as f64).to_bits() == n.to_bits()
 }
 
 // A `GuardDynamic` test: whether the value is a number that is (`INTEGER`) or
-// isn't a `CType::Integer`. See Note [Integers].
+// isn't a `CType::Integer`, in either case a double. See Note [Integers].
 crate::window::windowed!(CheckInteger, [], [INTEGER: bool], |owner, state, base| (value) {
     let pass = value.as_number().is_some_and(|n| is_integer(n) == INTEGER);
     state.select = (!pass) as usize;
+});
+
+// Convert a number between its encodings, in place: a double that is a
+// `CType::Integer` to one, and back. See Note [Integers].
+crate::window::windowed!(ToInteger, [], [], |owner, state, base| (value, out dest) {
+    let Some(n) = value.as_number() else { core::hint::unreachable_unchecked() };
+    *dest = LBoxed::from_int(n.to_int_unchecked::<i32>());
+});
+crate::window::windowed!(ToNumber, [], [], |owner, state, base| (value, out dest) {
+    *dest = LBoxed::from_number(value.as_int() as f64);
 });
 
 // Note [Dynamic guards]
@@ -1336,23 +1627,19 @@ crate::window::windowed!(CheckInteger, [], [INTEGER: bool], |owner, state, base|
 /// The array part slot of a `CType::Integer` key. Keys below 1 wrap past any
 /// array part.
 #[inline(always)]
-unsafe fn integer_slot(n: f64) -> usize {
-    (unsafe { n.to_int_unchecked::<i32>() } as i64 - 1) as usize
+fn integer_slot(i: i32) -> usize {
+    (i as i64 - 1) as usize
 }
 
 // `GuardDynamic` tests: whether a `CType::Integer` key, in a register or the
 // constant `k`, is in a table's array part. See Note [Dynamic guards].
 crate::window::windowed!(InArray, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-    let Some(n) = key.as_number() else { core::hint::unreachable_unchecked() };
-    state.select = (integer_slot(n) >= tab.ro(owner).array.len()) as usize;
+    state.select = (integer_slot(key.as_int()) >= tab.ro(owner).array.len()) as usize;
 });
-crate::window::windowed!(InArrayK, [k: u32], [], |owner, state, base| (table) {
-    let Constant::Number(n) = (&(*state.clos.ro(owner).prototype).constants.items).get_unchecked(k as usize) else {
-        core::hint::unreachable_unchecked()
-    };
+crate::window::windowed!(InArrayK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-    state.select = (integer_slot(n.0) >= tab.ro(owner).array.len()) as usize;
+    state.select = (integer_slot(k) >= tab.ro(owner).array.len()) as usize;
 });
 
 /// The type of a constant.
@@ -1375,7 +1662,8 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
 //   Unknown  >  each LType  >  Number > Integer, Closure > a known function
 //
 // (a shape accepts only itself), with the same hkeys, whose indexes the
-// block's hash witnesses are at. A bytecode pc's first `MAX_VERSIONS`
+// block's hash witnesses are at. An `Integer` a version types less precisely
+// is lowered on the way in (Note [Integers]). A bytecode pc's first `MAX_VERSIONS`
 // contexts each get a version. A jump past that enters the accepting version
 // that tells the most (loses the least lattice height), and failing any, a
 // version for the join of its context and every existing one's, which the
@@ -1578,6 +1866,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut pc = entry;
 
         let block_id = self.new_block(entry);
+        self.blocks[block_id.0].context = Some(ctx.clone());
         let subpc: SubPc = SubPc::new(entry);
         self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().insert((subpc, ctx.clone()), block_id);
         self.compile(owner, entry, ctx, block_id);
@@ -1757,6 +2046,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
+                    let end = if b == 0 { usize::MAX } else { a as usize + b as usize - 1 };
+                    self.demote(block_id, &mut ctx, a as usize..end);
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b)); None
                 },
@@ -1776,6 +2067,46 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 return ctx;
             }
         }
+    }
+
+    /// Lower the integers in `slots` to doubles, for code reading them as any
+    /// value. See Note [Integers].
+    fn demote(&mut self, block_id: BlockId, ctx: &mut Rc<Context>, slots: std::ops::Range<usize>) {
+        for idx in slots.start..slots.end.min(ctx.types.len()) {
+            if ctx.types[idx] == CType::Integer {
+                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(ToNumber::new(&[idx, idx]))));
+                Rc::make_mut(ctx).types[idx] = CType::Type(LType::Number);
+            }
+        }
+    }
+
+    /// Where a jump in `ctx` to `target` goes: to a version of a pc, through a
+    /// block lowering the integers it types less precisely first. See Note
+    /// [Integers].
+    fn edge(&mut self, owner: &mut Owner, ctx: &Context, target: BlockId) -> BlockId {
+        let Some(entered) = self.blocks[target.0].context.clone() else { return target };
+        let pc = self.blocks[target.0].pc;
+        // Every integer the version doesn't keep, including those in the
+        // registers `GetBlock` forgets, which an expression's temporaries may
+        // still be in.
+        let lower: Vec<usize> = (0..ctx.types.len())
+            .filter(|&idx| ctx.types[idx] == CType::Integer && entered.slot(idx) != CType::Integer)
+            .collect();
+        let live = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
+        let mut jumping = ctx.clone();
+        jumping.set_types(owner, lower.iter().map(|&idx| (idx, CType::Type(LType::Number)))
+            .chain((live..ctx.types.len()).map(|idx| (idx, CType::Type(LType::Unknown))))
+            .collect());
+        assert!(entered.accepts(&jumping), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
+        if lower.is_empty() {
+            return target;
+        }
+        let lowering = self.new_block(pc);
+        for idx in lower {
+            self.blocks[lowering.0].instructions.push(Residual::ExecWindow(Rc::new(ToNumber::new(&[idx, idx]))));
+        }
+        self.blocks[lowering.0].instructions.push(Residual::Jump(target));
+        lowering
     }
 
     /// Before the residual ending a block: its GC safepoint, if it may have
@@ -1867,19 +2198,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let value = state.vals[state.base + idx].unbox();
             let mut forced_ctx = thunk_ctx.clone();
             let forced_mut = Rc::make_mut(&mut forced_ctx);
-            let (guard, next, arg) = match value {
+            let (guard, next, arg, integer) = match value {
                 LValue::Number(n) if is_integer(n.0) => {
                     forced_mut.types[idx] = CType::Integer;
-                    (Residual::GuardDynamic(Rc::new(CheckInteger::<true>::new(&[idx]))), pc.next_true(), ResumeArg::Matched)
+                    (Residual::GuardDynamic(Rc::new(CheckInteger::<true>::new(&[idx]))), pc.next_true(), ResumeArg::Matched, true)
                 },
                 LValue::Number(_) => {
                     forced_mut.types[idx] = CType::Type(LType::Number);
-                    (Residual::GuardDynamic(Rc::new(CheckInteger::<false>::new(&[idx]))), pc.next_false(), ResumeArg::Failed)
+                    (Residual::GuardDynamic(Rc::new(CheckInteger::<false>::new(&[idx]))), pc.next_false(), ResumeArg::Failed, false)
                 },
                 value => {
                     let runtime_type = value.typeof_();
                     forced_mut.types[idx] = CType::Type(runtime_type);
-                    (Residual::Guard { idx, expected: runtime_type }, pc.next_false(), ResumeArg::Failed)
+                    (Residual::Guard { idx, expected: runtime_type }, pc.next_false(), ResumeArg::Failed, false)
                 },
             };
             // In place, unless the thunk's JIT code can only be patched to a
@@ -1894,7 +2225,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let fail_thunk = vm.make_integer_thunk(block_id, thunk_coro.clone(), idx, pc, thunk_ctx.clone(), false);
             vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
-            let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro.clone(), arg);
+            let mut guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro.clone(), arg);
+            // An integer is converted on the edge into the subblock, which the
+            // ways holding it as one already share.
+            if integer {
+                let converting = vm.new_block(pc.0);
+                vm.blocks[converting.0].instructions.push(Residual::ExecWindow(Rc::new(ToInteger::new(&[idx, idx]))));
+                vm.blocks[converting.0].instructions.push(Residual::Jump(guard_block));
+                guard_block = converting;
+            }
             vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
         })))
     }
@@ -2141,6 +2480,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let proto = self.clos.ro(owner).prototype;
                     arg = ResumeArg::Type(constant_ctype(unsafe { &(&(*proto).constants.items)[k] }));
                 },
+                CoroutineState::Yielded(YieldOp::IntegerK(k)) => {
+                    let proto = self.clos.ro(owner).prototype;
+                    let crate::chunk::Constant::Number(n) = (unsafe { &(&(*proto).constants.items)[k] }) else { unreachable!() };
+                    assert!(is_integer(n.0), "{} isn't an integer", n.0);
+                    arg = ResumeArg::Integer(n.0 as i32);
+                },
+                CoroutineState::Yielded(YieldOp::Demote(slots)) => {
+                    self.demote(block_id, &mut ctx, slots);
+                },
                 op @ CoroutineState::Yielded(YieldOp::Typeof(idx) | YieldOp::TypeofRk(idx)) => {
                     if let CoroutineState::Yielded(YieldOp::TypeofRk(key)) = op {
                         let proto = self.clos.ro(owner).prototype;
@@ -2300,8 +2648,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         continue 'machine;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::GuardCType(rk, ref expected)) => {
-                    assert_eq!(*expected, CType::Integer, "GuardCType tests only for Integer");
+                op @ CoroutineState::Yielded(YieldOp::GuardCType(_, _) | YieldOp::DiscoverInteger(_)) => {
+                    let (rk, discover) = match op {
+                        CoroutineState::Yielded(YieldOp::GuardCType(rk, expected)) => {
+                            assert_eq!(expected, CType::Integer, "GuardCType tests only for Integer");
+                            (rk, false)
+                        },
+                        CoroutineState::Yielded(YieldOp::DiscoverInteger(rk)) => (rk, true),
+                        _ => unreachable!(),
+                    };
                     let pass = if (rk & 0x100) != 0 {
                         let k = rk & 0xff;
                         let proto = self.clos.ro(owner).prototype;
@@ -2310,6 +2665,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         match &ctx.types[rk] {
                             CType::Integer => Some(ResumeArg::Matched),
+                            CType::Type(LType::Number) if discover => Some(ResumeArg::Failed),
                             ctype if !matches!(ctype.as_ltype(), LType::Number | LType::Unknown) => Some(ResumeArg::Failed),
                             // A number, or unknown: tested at runtime. See Note [Integers].
                             _ => None,
@@ -2351,7 +2707,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let ltype = ctype.as_ltype();
 
                     if ltype == expected {
-                        // Statically true: pump the success path
+                        // Statically true: pump the success path, with an
+                        // integer read as a number lowered to a double. See
+                        // Note [Integers].
+                        if ctx.types[idx] == CType::Integer {
+                            self.demote(block_id, &mut ctx, idx..idx + 1);
+                        }
                         pc = pc.next_true();
                         arg = ResumeArg::Matched;
                     }
@@ -2381,6 +2742,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].allocates = true;
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {
+                    let targets = targets.into_iter().map(|(name, target)| (name, self.edge(owner, &ctx, target))).collect();
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Select(targets));
                     return None;
@@ -2400,6 +2762,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
+                            // The callee reads its arguments as any value. See
+                            // Note [Integers].
+                            self.demote(block_id, &mut ctx, a + 1..if b == 0 { usize::MAX } else { a + b });
                             // A native run as a window op, with its arguments of the type it
                             // assumes, gives its result's type. See Note [Native windows].
                             let mut result = None;
@@ -2432,30 +2797,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // It may call a native, which may allocate.
                                 self.blocks[block_id.0].allocates = true;
                             }
-                            let ctx = if c == 1 {
-                                // No values are saved
-                                // All our types are intact
-                                ctx
-                            } else if c >= 2 {
-                                // (C-1) values are saved
-                                // Returned values become unknown
-                                // TODO: compile a type specialized thunk instead? is that better?
-                                for i in 0..(c - 1) {
-                                    //ctx.set_types(owner, vec![(a + i, CType::Type(LType::Unknown))]);
-                                    Rc::make_mut(&mut ctx).types[a + i] = CType::Type(LType::Unknown);
-                                }
-                                ctx
-                            } else {
-                                // Multiple return results are saved
-                                // All types until end of stack are unknown
-                                for i in a..ctx.types.len() {
-                                    //ctx.set_types(owner, vec![(i, CType::Type(LType::Unknown))]);
-                                    Rc::make_mut(&mut ctx).types[i] = CType::Type(LType::Unknown);
-                                }
-                                ctx
-                            };
-                            //ctx.types = vec![LType::Unknown; ctx.types.len()];
-                            let mut ctx = ctx;
+                            // The results, and the callee's frame above them, overwrote
+                            // every register from `a` on: their types are unknown.
+                            // TODO: compile a type specialized thunk instead? is that better?
+                            let clobbered: Vec<(usize, CType)> = (a..ctx.types.len())
+                                .map(|idx| (idx, CType::Type(LType::Unknown)))
+                                .collect();
+                            Rc::make_mut(&mut ctx).set_types(owner, clobbered);
                             if let Some(result) = result {
                                 Rc::make_mut(&mut ctx).types[a] = CType::Type(result);
                             }
@@ -2473,11 +2821,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Rc::make_mut(&mut ctx).set_types(owner, ty_effects)
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
-                    // The jump kills what has no later use along it: every register not
-                    // holding a local in scope at its target (a register a local leaves
-                    // is written before it is read again). Forgetting their types lets
-                    // paths that differ only in dead registers share the target's
-                    // version. The context of the block itself is unchanged, as it may
+                    // The jump forgets the types of every register not holding a local in
+                    // scope at its target: a register a local leaves is written before
+                    // it is read again, and an expression's temporaries (`a and b or
+                    // c`) are only read as any value. Forgetting their types lets paths
+                    // that differ only in them share the target's version; `edge`
+                    // lowers an integer it forgets. See Note [Integers]. The context of the block itself is unchanged, as it may
                     // jump elsewhere too.
                     let mut ctx = ctx.clone();
                     let in_scope = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(dest_pc);
@@ -2496,6 +2845,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::BlockId(self.version(owner, dest_pc, ctx));
                 },
                 CoroutineState::Yielded(YieldOp::Jump(dest_block)) => {
+                    let dest_block = self.edge(owner, &ctx, dest_block);
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Jump(dest_block));
                     // If it was a jump, stop pumping the coroutine

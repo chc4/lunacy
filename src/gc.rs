@@ -31,7 +31,11 @@ impl<'src, 'intern> Mark for LValue<'src, 'intern> {
 
 impl<'src, 'intern> Mark for LBoxed<'src, 'intern> {
     // Trace through the decoded value; `LValue::mark` no-ops the non-cell arms.
+    // A dead register may hold an integer. See Note [Integer encoding].
     fn mark(&self, owner: &Owner) {
+        if self.is_int() {
+            return;
+        }
         self.unbox().mark(owner);
     }
 }

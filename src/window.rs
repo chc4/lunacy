@@ -42,7 +42,7 @@
 //! without being a `become` would skip the rest of the chain, so it is rejected
 //! with a [`StencilError`]: a sibling tail call, or an indirect jump such as a
 //! jump table (whose entries lead back into the original function). An opt-level
-//! 0 build of `NumericIntInt` hits the latter (`match OP` isn't folded);
+//! 0 build of `NumericRR` hits the latter (`match OP` isn't folded);
 //! optimized builds don't. The interpreter tier runs any window op regardless,
 //! and the JIT calls the body of an op the copier rejects.
 
@@ -1111,7 +1111,7 @@ mod tests {
         let body = unsafe { stencil_body(&image, &call, 0) }.unwrap();
         assert!(
             body.relocations().iter().any(|r| r.target == helper
-                || unsafe { *(r.target as *const usize) } == helper),
+                || unsafe { (r.target as *const usize).read_unaligned() } == helper),
             "call to the helper not among {:x?}",
             body.relocations()
         );
