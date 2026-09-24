@@ -186,25 +186,25 @@ macro_rules! dispatch_compare_window {
 }
 
 /// In a generator, the types of an op's two operands, as `TypeofRk` gives
-/// them, for an op computing on integers: with one an integer, whether the
-/// other is one is found out. See Note [Integers].
+/// them, for an op computing on integers: with one an integer, whether an
+/// unknown other is one is found out (`DiscoverInteger`). See Note [Integers].
 ///
-/// The other register is guarded even when it is known to be an integer,
-/// statically, so that a way into the op already holding both integers takes
-/// the same guard as one finding out: the subblocks after the guard are shared
-/// by its outcome and the context, which are then the same, so the op must be
-/// at the same point in each.
+/// The other register is guarded even when its type is known, statically, so
+/// that a way into the op already holding both integers takes the same guard
+/// as one finding out: the subblocks after the guard are shared by its outcome
+/// and the context, which are then the same, so the op must be at the same
+/// point in each.
 macro_rules! discover_integers {
     ($lhs:expr, $rhs:expr) => {{
         let integer = ResumeArg::Type(CType::Integer);
         let mut lt = yield YieldOp::TypeofRk($lhs);
         let mut rt = yield YieldOp::TypeofRk($rhs);
         if lt == integer && ($rhs & 0x100) == 0 {
-            if (yield YieldOp::GuardCType($rhs, CType::Integer)) == ResumeArg::Matched {
+            if (yield YieldOp::DiscoverInteger($rhs)) == ResumeArg::Matched {
                 rt = integer.clone();
             }
         } else if rt == integer && ($lhs & 0x100) == 0 {
-            if (yield YieldOp::GuardCType($lhs, CType::Integer)) == ResumeArg::Matched {
+            if (yield YieldOp::DiscoverInteger($lhs)) == ResumeArg::Matched {
                 lt = integer.clone();
             }
         }
@@ -287,6 +287,9 @@ pub enum YieldOp {
                            // is the expected type
     GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer.
                               // See Note [Integers]
+    DiscoverInteger(usize), // Which of the number sublattice STACK[idx] is in: Integer, or a
+                            // number, statically, or as GuardCType(idx, Integer) finds out if
+                            // unknown. See Note [Integers]
     TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
     IntegerK(usize), // Resumed with the value of CONSTANT[idx], a `CType::Integer`
     Demote(std::ops::Range<usize>), // Lower the integers in STACK[range] to doubles, for code
@@ -1570,11 +1573,14 @@ impl std::fmt::Display for CType {
 // SUB, MUL and MOD of two `Integer` operands give one, guarded by a
 // `GuardDynamic` test that the exact result fits the encoding, which a failing
 // one computes as doubles instead. Compares of two compare them as integers.
-// With one operand an integer, these find out whether the other is one too
-// with a `GuardCType`, which leaves it `Integer` for the ops after. The double
-// ops, compares and FORLOOP read an integer operand as a double, and FORPREP
-// finds out whether its operands are integers, so an integer loop's index and
-// variable stay ones.
+// With one operand an integer, these ask which part of the number sublattice
+// the other is in (`DiscoverInteger`), like a `Typeof` restricted to numbers:
+// an `Integer` or a number the context knows answers statically, taking the
+// integer or the double op, and an unknown one is found out as by a
+// `GuardCType`. A known number isn't tested, so arithmetic on doubles tests
+// nothing. The double ops, compares and FORLOOP read an integer operand as a
+// double, and FORPREP finds out whether its operands are integers, so an
+// integer loop's index and variable stay ones.
 
 /// Whether a jump forgets a type of a register holding no local in scope at
 /// its target, which may still be an expression's temporary (`a and b or c`).
@@ -2654,8 +2660,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         continue 'machine;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::GuardCType(rk, ref expected)) => {
-                    assert_eq!(*expected, CType::Integer, "GuardCType tests only for Integer");
+                op @ CoroutineState::Yielded(YieldOp::GuardCType(_, _) | YieldOp::DiscoverInteger(_)) => {
+                    let (rk, discover) = match op {
+                        CoroutineState::Yielded(YieldOp::GuardCType(rk, expected)) => {
+                            assert_eq!(expected, CType::Integer, "GuardCType tests only for Integer");
+                            (rk, false)
+                        },
+                        CoroutineState::Yielded(YieldOp::DiscoverInteger(rk)) => (rk, true),
+                        _ => unreachable!(),
+                    };
                     let pass = if (rk & 0x100) != 0 {
                         let k = rk & 0xff;
                         let proto = self.clos.ro(owner).prototype;
@@ -2664,6 +2677,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         match &ctx.types[rk] {
                             CType::Integer => Some(ResumeArg::Matched),
+                            CType::Type(LType::Number) if discover => Some(ResumeArg::Failed),
                             ctype if !matches!(ctype.as_ltype(), LType::Number | LType::Unknown) => Some(ResumeArg::Failed),
                             // A number, or unknown: tested at runtime. See Note [Integers].
                             _ => None,
