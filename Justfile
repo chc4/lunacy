@@ -121,6 +121,22 @@ graph name:
 graph-release name:
     luac5.1 -o {{name}}.bin {{name}}.lua
     cargo run --release --features graph --bin lunacy -- {{name}}.bin
+# A benchmark's residual graphs with and without dynamic guards (feature
+# `no_dynamic_guards`, Note [Dynamic guards]), in
+# target/graphs/<benchmark>/{guards,no_guards}, and their blocks compared.
+graph-guards benchmark times='10':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    for variant in guards no_guards; do
+        features=graph
+        if [ $variant = no_guards ]; then features="graph no_dynamic_guards"; fi
+        cargo build --release --features "$features" --bin bench --target-dir target/graph-$variant
+        dir=target/graphs/{{benchmark}}/$variant
+        rm -rf $dir && mkdir -p $dir
+        (cd $dir && ../../../graph-$variant/release/bench ../../../../{{benchmark}}.bin {{times}} > /dev/null)
+    done
+    tools/graph_blocks.py target/graphs/{{benchmark}}/guards target/graphs/{{benchmark}}/no_guards
 gdb name:
     luac5.1 -o {{name}}.bin {{name}}.lua
     cargo build --release --bin lunacy
@@ -228,6 +244,15 @@ hyperfine-vs ref benchmark times='10':
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-vs-{{ref}}.md \
         "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \
         "./target/release/bench {{benchmark}}.bin {{times}}"
+# Compare this checkout's release build with and without cargo feature
+# `feature` on one benchmark: the feature's build is in target/features/<feature>.
+hyperfine-feature feature benchmark times='10':
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    cargo build --release --bin bench
+    cargo build --release --features {{feature}} --bin bench --target-dir target/features/{{feature}}
+    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
+        -n default "./target/release/bench {{benchmark}}.bin {{times}}" \
+        -n {{feature}} "target/features/{{feature}}/release/bench {{benchmark}}.bin {{times}}"
 hyperfine-jit benchmark:
     luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
     cargo build --release --bin bench

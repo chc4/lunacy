@@ -1324,7 +1324,9 @@ crate::window::windowed!(CheckInteger, [], [INTEGER: bool], |owner, state, base|
 //   failed: guard(test), jump(fail side), thunk(pass side)
 //
 // compiling the side the values took, and the other when first taken, as a jump
-// in place of its thunk.
+// in place of its thunk. With feature `no_dynamic_guards`, every such yield
+// fails statically instead, to measure the blocks the guards cost (`just
+// graph-guards`).
 //
 // `CheckInteger` guards with the same residual, but through `GuardCType`: what it
 // finds is a ctype, which each side's context records. See Note [Integers].
@@ -2297,10 +2299,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::GuardDynamic(test)) => {
                     assert!(test.accesses().iter().all(|access| *access == Access::Read), "{}: a guard's test has no outputs", test.name());
-                    let thunk = Residual::Thunk(self.make_dynamic_thunk(block_id, coro.clone(), test, pc, ctx.clone()));
-                    self.end_block(block_id);
-                    self.blocks[block_id.0].instructions.push(thunk);
-                    return None;
+                    if cfg!(feature = "no_dynamic_guards") {
+                        pc = pc.next_false();
+                        arg = ResumeArg::Failed;
+                    } else {
+                        let thunk = Residual::Thunk(self.make_dynamic_thunk(block_id, coro.clone(), test, pc, ctx.clone()));
+                        self.end_block(block_id);
+                        self.blocks[block_id.0].instructions.push(thunk);
+                        return None;
+                    }
                 },
                 CoroutineState::Yielded(guard @ YieldOp::Guard(idx, expected)) => {
                     debug!("guard {:?} == {:?}", ctx.types[idx], expected);

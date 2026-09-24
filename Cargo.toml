@@ -26,6 +26,7 @@ magic = [] # Magic JIT intrinsics
 perf = [] # Create perf JIT map file
 alloc_stats = ["mimalloc/extended", "dep:libmimalloc-sys"] # bench prints mimalloc's statistics
 window_dump = ["jit"] # Dump the JIT's window allocation to window_dump.txt
+no_dynamic_guards = [] # GuardDynamic yields fail statically (Note [Dynamic guards])
 gc_sanitize = []
 gc_stress = []
 gc_test = []
