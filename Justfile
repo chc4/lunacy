@@ -55,6 +55,14 @@ window-dump-save benchmark name times='20':
     mkdir -p bench/window_dumps
     cp window_dump.txt bench/window_dumps/{{benchmark}}.{{name}}.txt
 
+# A lua_tests program's window allocation under streaming allocation and each
+# trace-building policy, as bench/window_dumps/<name>.<policy>.txt.
+window-dump-policies name:
+    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
+    cargo build --release --features window_dump --bin lunacy
+    mkdir -p bench/window_dumps
+    for policy in streaming single unidirectional bidirectional; do LUNACY_TRACES=$policy ./target/release/lunacy {{name}}.bin > /dev/null && cp window_dump.txt bench/window_dumps/{{name}}.$policy.txt; done
+
 # The loads, stores and moves in window dumps, over all blocks and hot ones.
 window-dump-stats *dumps='bench/window_dumps/*.txt':
     python3 tools/window_dump_stats.py {{dumps}}

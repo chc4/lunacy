@@ -1,0 +1,89 @@
+== region entered at block 0
+region entry block 0 loads 
+block 0 hotness 0 entered with {}
+    0 guard(0, number)
+      tests r10 <- [0] #0
+      window {}
+    1 thunk
+      exit after 
+      window {}
+    2 jump(1)
+      to block 1 (entered with {}): 
+      window {}
+block 1 hotness 0 entered with {}
+    0 guard(1, number)
+      tests r10 <- [1] #1
+      window {}
+    1 thunk
+      exit after 
+      window {}
+    2 jump(2)
+      to block 2 (entered with {}): 
+      window {}
+block 2 hotness 0 entered with {}
+    0 window(NumericIntInt, 0, 1, out 4)
+      w0 <- [0]; w1 <- [1]; op at w0 #2
+      window {w0=[0] w1=[1] w2=[4]*}
+    1 guard(2, number)
+      tests r10 <- [2] #3
+      window {w0=[0] w1=[1] w2=[4]*}
+    2 thunk
+      exit after [4] <- w2 #4
+      window {w0=[0] w1=[1] w2=[4]*}
+    3 jump(3)
+      to block 3 (entered with {w0=[0] w1=[1] w2=[4]*}): 
+      window {w0=[0] w1=[1] w2=[4]*}
+block 3 hotness 0 entered with {w0=[0] w1=[1] w2=[4]*}
+    0 window(NumericIntInt, 4, 2, out 4)
+      w3 <- [2]; op at w2 #5
+      window {w0=[0] w1=[1] w3=[2] w4=[4]*}
+    1 guard(3, number)
+      tests r10 <- [3] #6
+      window {w0=[0] w1=[1] w3=[2] w4=[4]*}
+    2 thunk
+      exit after [4] <- w4 #7
+      window {w0=[0] w1=[1] w3=[2] w4=[4]*}
+    3 jump(4)
+      to block 4 (entered with {w0=[0] w1=[1] w3=[2] w4=[4]*}): 
+      window {w0=[0] w1=[1] w3=[2] w4=[4]*}
+block 4 hotness 0 entered with {w0=[0] w1=[1] w3=[2] w4=[4]*}
+    0 window(NumericIntInt, 4, 3, out 5)
+      w5 <- [3]; op at w4 #8
+      window {w0=[0] w1=[1] w3=[2] w4=[4]* w5=[3] w6=[5]*}
+    1 window(NumericIntInt, 5, 0, out 5)
+      w1 <- w0; w0 <- w6; op at w0 #9
+      window {w1=[0] w2=[5]* w3=[2] w4=[4]* w5=[3]}
+    2 window(NumericIntInt, 4, 5, out 6)
+      w5 <- w2; op at w4 #10
+      window {w1=[0] w2=[5]* w3=[2] w4=[4]* w5=[5]* w6=[6]*}
+    3 window(NumericIntInt, 1, 3, out 7)
+      w0 <- [1]; w1 <- [3]; op at w0 #11
+      window {w0=[1] w1=[3] w2=[7]* w3=[2] w4=[4]* w5=[5]* w6=[6]*}
+    4 window(NumericIntInt, 6, 7, out 6)
+      w1 <- w6; op at w1 #12
+      window {w0=[1] w2=[7]* w3=[6]* w4=[4]* w5=[5]*}
+    5 window(NumericIntInt, 4, 5, out 7)
+      op at w4 #13
+      window {w0=[1] w3=[6]* w4=[4]* w5=[5]* w6=[7]*}
+    6 window(NumericIntInt, 7, 6, out 7)
+      w0 <- w6; w1 <- w3; op at w0 #14
+      window {w1=[6]* w2=[7]* w3=[6]* w4=[4]* w5=[5]*}
+    7 ret
+      flush: [4] <- w4; [5] <- w5; [6] <- w1; [7] <- w2 #15
+      window {}
+count #0 2
+count #1 2
+count #2 2
+count #3 2
+count #4 0
+count #5 2
+count #6 2
+count #7 0
+count #8 2
+count #9 2
+count #10 2
+count #11 2
+count #12 2
+count #13 2
+count #14 2
+count #15 2
