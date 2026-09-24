@@ -63,6 +63,13 @@ window-dump-policies name:
     mkdir -p bench/window_dumps
     for policy in streaming single unidirectional bidirectional; do LUNACY_TRACES=$policy ./target/release/lunacy {{name}}.bin > /dev/null && cp window_dump.txt bench/window_dumps/{{name}}.$policy.txt; done
 
+# Executed loads, stores and moves of each benchmark, run `times` times, under
+# streaming allocation and unidirectional traces, from their window dumps; a
+# benchmark that fails (lunacy lacks some of Lua) says why.
+window-dump-compare times +benchmarks:
+    cargo build --release --features window_dump --bin bench
+    for b in {{benchmarks}}; do luac5.1 -o $b.bin lua_benchmarking/benchmarks/$b/bench.lua || continue; for policy in streaming unidirectional; do if LUNACY_TRACES=$policy timeout 600 ./target/release/bench $b.bin {{times}} > /dev/null 2> target/window-dump-compare.err; then python3 tools/window_dump_stats.py --raw window_dump.txt | tail -1 | sed "s|^window_dump.txt|$b $policy|"; else echo "$b $policy: failed: $(grep -A1 -m1 panicked target/window-dump-compare.err | tail -1)"; fi; done; done
+
 # The loads, stores and moves in window dumps, over all blocks and hot ones.
 window-dump-stats *dumps='bench/window_dumps/*.txt':
     python3 tools/window_dump_stats.py {{dumps}}
