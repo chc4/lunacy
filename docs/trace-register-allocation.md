@@ -1,9 +1,10 @@
 # Trace register allocation for the window (proposal)
 
 A proposal to base the window allocator on trace register allocation (Josef
-Eisl, *Trace Register Allocation*, JKU Linz 2018; built for Graal), replacing
-the per-block backward planning, whose rules for what a displaced value costs
-and what a block's entry window holds have no model behind them.
+Eisl, *Trace Register Allocation*, JKU Linz 2018; built for Graal): its trace
+building, global liveness and resolution between traces, with allocation
+within a trace destination-driven, as the window's positional operands need,
+in place of the thesis's register-to-variable allocators.
 
 ## The model
 
@@ -33,7 +34,7 @@ evaluates two and names a third.
   variable's live range within it is one interval, and one linear pass over
   the trace allocates it.
 - **Allocation, one trace at a time**, in the policy's order, most important
-  first. The bottom-up
+  first. The thesis's bottom-up
   strategy is one backward pass over a trace with a map from registers to
   variables and from variables to locations: per instruction, its outputs first
   (their registers become free), then its inputs (where they already are, else
@@ -41,7 +42,9 @@ evaluates two and names a third.
   evicted, with a reload after the instruction). It starts from the entry
   locations of an already allocated successor. It deliberately doesn't try
   harder (furthest-first eviction, delayed spill stores, round-robin registers
-  were all tried and dropped for compile time).
+  were all tried and dropped for compile time). Its premise, that a value in
+  any register is a free operand, doesn't hold for the window (see Allocating a
+  trace).
 - **Resolution.** Each trace records where its boundary values are; every edge
   between traces gets the parallel moves between the two, and a loop's back
   edge, which is always the end of a trace, is resolved the same way.
@@ -79,50 +82,117 @@ wants in a register) as live into every block of the region. Fixing up only
 the cycle's blocks would be unsound: blocks the pass visited before the fix
 computed their sets from the cycle's.
 
-**Allocating a trace.** One backward pass with the wanted window (which slot
-each register should hold) as the register-to-variable map; a slot not in it
-is in its stack home. At a window op:
+**Allocating a trace.** The window is positional: an op at `SKIP` s with arity
+k reads `w[s..s+k]` in declared order and writes its output directly above its
+inputs, so where an op runs decides which registers it touches, and a value is
+useful in a register only if it is where the op reading it needs it. A load
+straight into that position costs one instruction, as a move does, so keeping
+a value in a register saves something only if it is in place at its next use,
+and costs a move every time an op's run lands on it in between. Allocation is
+then mostly choosing each op's `SKIP` so values produced and read nearby line
+up, and choosing which values stay in registers between their uses at all.
 
-1. its outputs are removed from the window (their old values are dead before
-   it, unless also inputs);
-2. it is placed at the usable `SKIP` that displaces the fewest wanted values
-   from its run and lands the most outputs where they are wanted, ties to the
-   lowest: the window's constraint that an op's operands are a contiguous run
-   replaces choosing a register per operand;
-3. a displaced value waits in the first free register outside the run, or is
-   evicted, reloaded from its stack home after the op;
-4. its inputs are at `SKIP + i`.
+It is destination-driven (Dybvig, Hieb and Butler, "Destination-driven code
+generation", 1990): one backward pass over the trace, as one straight line (its
+blocks in order, their exits as points on it), where each use of a value says
+where it wants the value, and the code above it (its producer, or an earlier
+use) satisfies that if it can. The pass keeps **requests**, one per pending use:
 
-An inline guard is a use of its slot: it keeps the slot where it is, or takes
-the first free register. A flush point empties the window.
+- **At(r).** The use reads the slot in register `r`: an operand of an op placed
+  already, at `SKIP + i`. Kept, the value is in `r` from its source to the use,
+  and `r` is reserved for it in between.
+- **Any.** The use wants the value in some register, moved into place at the
+  use: one move, from wherever it is.
+- **Home.** Dropped: the use loads it from its stack home, one load (and a store,
+  if the value was written in the trace since the last flush, as the dropped
+  register held its only up-to-date copy).
 
-**Liveness in the pass.** The global live sets enter the pass as the thesis's
-pseudo-uses and pseudo-definitions:
+A request's **source** is the point above its use where the value is known to
+be in a register: the op that writes it (its output register), an earlier op
+that reads it (that op's input register, which it leaves unchanged), or the top
+of the trace. A request never outlives its source: above a write of its slot,
+the slot names another value.
 
-- *Pseudo-uses at edges leaving the trace.* At the trace's final jump, if its
-  target has a recorded start window (a trace allocated already), the window
-  becomes that. At any other edge leaving the trace, whose target has no window
-  yet (a side exit to a trace not allocated yet, the final jump to one, or a
-  back edge to the trace's own head), each slot live into the target is used
-  there as a use that may stay in its stack home: it keeps its register if the
-  window has one for it, takes a free register if there is one, and otherwise
-  is left in memory. At a back edge that keeps the loop-carried values in
-  registers across the latch, so the back edge moves them into the head's
-  window instead of the latch storing them and the head reloading them. Side
-  exits get them too: a side exit is a jump to another block, not necessarily
-  the cold path (a polymorphic guard's failure block runs as often as the
-  success path), and the live sets are computed anyway. A pseudo-use never
-  evicts a value the trace wants, only takes a free register, but once in the
-  window it is wanted like any other value by the ops above the exit. A thunk
-  exits to the interpreter, which reads every slot from the stack, so it has no
-  pseudo-uses.
-- *Pseudo-definitions at the start of each block.* The window at a block's
-  start, recorded as its entry window, holds only values live into the block:
-  going backwards, each op writing a slot removed it from the window, so what
-  is left is the incoming value, defined at the block's top. Slots aren't SSA,
-  but the walk resolves which value a slot names at each point, so the
-  pseudo-definition needs no more. A slot live in but not in the window
-  arrives in its stack home.
+At a window op, walking backwards:
+
+1. **Its `SKIP`.** Each usable `SKIP` is costed against the pending requests:
+   - an At(r) of another slot in its run, which the op overwrites: the request
+     is **demoted** to Any, never moved aside and back (a pending request inside
+     the run which the op reads in place, or writes there, is kept): cost 1, or 2
+     if the value is dirty;
+   - an At(r) of its output outside the run: a move after the op, cost 1;
+   - an Any of its output: kept in the output's register if that register is
+     free until the use (cost 1, the move at the use), else dropped (cost 2: the
+     store the dirty value then needs, and the load);
+   - an At(r) of an input in another register: a copy, cost 1.
+
+   The cheapest `SKIP` wins, ties to the one demoting requests whose next uses
+   are furthest (Belady), then to the highest `SKIP`: a use placed high leaves
+   its definers room below it, where their outputs land on its inputs. An input
+   already wanted in place by a later use costs nothing, so a repeated op shape
+   settles at the same `SKIP` in every instance, and a value both use (a loop
+   invariant, a table the same row is read from) stays put between them.
+2. **Its outputs are sources.** Each pending request of an output slot ends
+   here: an At(r) is kept (moved into `r` after the op, if the output lands
+   elsewhere); an Any is kept in the output's register if it is free until the
+   use, else becomes Home.
+3. **Its inputs are sources** of every other pending request of their slot: an
+   At(r) is kept (copied into `r` if the input is elsewhere); an Any is kept in
+   the input's register if it is free until the use, else becomes Home.
+4. **Its inputs make new requests**, At(`SKIP + i`), for the code above.
+
+**Any values.** On a straight line a value kept between its source and its use
+is one interval. Whether a register is free across it is known at the source:
+every op's run and every kept value between were placed on the way up. Each
+register records the earliest point at or below the walk where something
+occupies it (a run, or a kept value); since the walk only moves up, the
+register is free for an interval from the current point to a use exactly when
+that point is at or past the use, and no pending At holds the register. A
+register given to an Any value is then occupied from its source.
+
+**Other residuals.** An inline guard makes no request: it tests its slot's
+register if the window has one, else loads the slot into a register outside the
+window. A thunk needs nothing. A flush point ends every pending request: they
+become Home, loaded after it. At the top of the trace, pending At requests are
+the head's entry window, and pending Any requests become Home: loading a value
+at the top to move it later costs more than loading it at its use.
+
+**Block boundaries and exits.** The pass runs through the trace's blocks without
+stopping; a block's entry window is the requests kept across its start. At an
+edge leaving the trace (a side exit, a select target, the final jump), the
+thesis's pseudo-uses become requests, weighted 0 so they never outweigh the
+trace's own:
+
+- to a block with an entry window already, its registers as At requests, where
+  no request holds that register;
+- to a block with no window yet, the slots live into it as Any requests (kept
+  only in registers free until the edge: "may stay in memory").
+
+The trace's own continuation from its last block, into its hottest target with
+an entry window, is weighted as the trace's own requests.
+
+**Loops.** A trace containing a loop's header and latch plans its back edge
+blind: the latch is planned before the header, whose entry window isn't known
+yet. Streaming allocation gets this for free: the header adopts the window the
+loop is entered with, typically the end of LBBV's peeled first iteration, which
+ran the same code, so the back edge transfers almost nothing. A trace with an
+edge back into itself is planned twice: the second pass continues the latch
+into the header's entry window from the first. The first pass plays the peeled
+iteration's part; a third would barely change the header's window.
+
+**The plan.** The pass decides each request's fate (kept in a register from its
+source to its use, or Home) and each op's `SKIP`; the window wanted before each
+op, and each block's entry window, is then read off the kept intervals in one
+sweep over the trace. Every register a window names holds a value it keeps
+until its use; registers it doesn't name are free for the code generator to
+reuse. Code generation is unchanged: reconcile to the window, run the op at its
+`SKIP`, and transfer at every jump.
+
+**Cost.** Each op looks only at the pending requests (at most one At per
+register, and Any requests capped at the window's width, the furthest used
+first dropped to Home) and at most `WINDOW` `SKIP`s, so a trace is planned in
+time linear in its length; a loop's trace twice. The sweep writes each window
+entry once.
 
 **What is kept.** Per window op its `SKIP`, and per block the window at its
 start, which every edge entering it other than from its predecessor in the
@@ -197,7 +267,9 @@ little: one that can extend the trace, then the lowest block id.
 ## What it replaces
 
 The region's depth-first postorder and per-block plans, the choice of a
-block's live-out from its hottest planned successor, and the rules estimating
-a displaced value's cost from how the ops above it use its slot. Within a
-trace, what is wanted after a point is exactly what the pass has seen used
-further down, so the displacement cost needs no look upward.
+block's live-out from its hottest planned successor, and the per-op placement
+that kept every value a later op wanted pinned in that register: under the
+window's register pressure, every op's run landed on pinned values, which were
+moved aside before it and back after it (two moves, where dropping the value
+and loading it at its use is one), and each op's `SKIP` drifted with whatever
+the code after it left free.
