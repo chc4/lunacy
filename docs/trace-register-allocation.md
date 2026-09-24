@@ -190,6 +190,19 @@ edge back into itself is planned twice: the second pass continues the latch
 into the header's entry window from the first. The first pass plays the peeled
 iteration's part; a third would barely change the header's window.
 
+That window must hold what the loop needs, so requests from the loop's body
+end at the header's start, as at the top of a trace: those for a register are
+its entry window, the others are dropped, and the code above the header is
+asked for that window, as for a jump into it. Left to reach up to their
+sources above the loop, they would be dropped there by the code before the
+loop, under its own register pressure, and the loop would reload its
+invariants every iteration. Not yet handled: a value the header keeps in a
+register that the loop's own ops always cover (any five-operand op covers
+`w3` and `w4`) is still dropped and reloaded on every back edge, and a
+header's entry window takes its dirty slots from the first jump compiled into
+it, so an accumulator arriving clean from before the loop is stored on every
+back edge.
+
 **The plan.** The pass decides each request's fate (kept in a register from its
 source to its use, or Home) and each op's `SKIP`; the window wanted before each
 op, and each block's entry window, is then read off the kept intervals in one
