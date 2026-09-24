@@ -80,6 +80,11 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
 // compiled jump would do from the thunk's window to the target's entry window
 // (a value both keep in a register is neither stored nor loaded), then a jump
 // into the target: the path stays in JIT code from then on.
+//
+// A target compiled with a thunk waiting to be linked into it, the thunk whose
+// path got it hot, takes that thunk's window as its entry window, dirty slots
+// and all, and its region is planned into it: the link then stores and moves
+// nothing.
 
 /// A five-byte nop: the room a thunk site leaves for a `jmp rel32`.
 const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
@@ -612,12 +617,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         } else {
             // Load the window the block is entered with, clean from the stack
             // (empty, streaming).
+            // A thunk waiting to be linked into the block is the one whose path
+            // got it hot: it's entered with that thunk's window. See Note [Thunk
+            // patching].
+            let linked = self.jctx.waiting.get(&id).and_then(|sites| sites.last()).map(|site| site.window.clone());
             let window = match self.jctx.trace_policy {
                 Some(policy) => {
-                    plans = self.plan_region(id, policy);
-                    Cache::entry(plans[&id].entry.unpack(), &Cache::default(), &plans[&id].dirty)
+                    plans = self.plan_region(id, policy, linked.as_ref());
+                    Cache::entry(plans[&id].entry.unpack(), linked.as_ref().unwrap_or(&Cache::default()), &plans[&id].dirty)
                 }
-                None => Cache::default(),
+                None => linked.clone().unwrap_or_default(),
             };
             let loads = WindowAlloc::default().transfer(&window);
             let counted = window_count!(self.jctx, &mut ops, loads);
@@ -772,7 +781,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// reachable from it not compiled yet, partitioned into traces by the JIT's
     /// policy, each trace placed by one backward pass. See Note [Trace register
     /// allocation].
-    fn plan_region(&mut self, entry: BlockId, policy: Policy) -> Plans {
+    /// With `entered`, the entry block is entered with that window.
+    fn plan_region(&mut self, entry: BlockId, policy: Policy, entered: Option<&Cache>) -> Plans {
         let mut ids = vec![entry];
         let mut index: HashMap<BlockId, usize, FxBuildHasher> = HashMap::default();
         index.insert(entry, 0);
@@ -850,6 +860,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for (b, live) in live_in.iter().enumerate() {
             window_dump!(self.jctx, "live into block {}: {:?}", ids[b].0, live.iter().collect::<Vec<_>>());
         }
+        let fixed: HashMap<BlockId, Placement, FxBuildHasher> = entered.map(|window| (entry, *window.regs())).into_iter().collect();
         let mut plans = Plans::default();
         for trace in &traces {
             // A trace with an edge back into itself plans that edge blind:
@@ -861,10 +872,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 })
             });
             let none = HashMap::default();
-            let mut planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &none, !loops);
+            let mut planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &fixed, &none, !loops);
             if loops {
                 let seed: HashMap<BlockId, Placement, FxBuildHasher> = planned.iter().map(|(id, plan)| (*id, plan.entry.unpack())).collect();
-                planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &seed, true);
+                planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &fixed, &seed, true);
                 for (id, plan) in &planned {
                     if seed[id] != plan.entry.unpack() {
                         let window = |regs| Cache::entry(regs, &Cache::default(), &Slots::default());
@@ -873,6 +884,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
             plans.extend(planned);
+        }
+        if let (Some(window), Some(plan)) = (entered, plans.get_mut(&entry)) {
+            plan.entry = Packed::pack(window.regs());
         }
         plans
     }
@@ -892,10 +906,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         index: &HashMap<BlockId, usize, FxBuildHasher>,
         live_in: &[Slots],
         plans: &Plans,
+        fixed: &HashMap<BlockId, Placement, FxBuildHasher>,
         seed: &HashMap<BlockId, Placement, FxBuildHasher>,
         dump: bool,
     ) -> Vec<(BlockId, BlockPlan)> {
         let window_of = |target: BlockId| match self.jctx.blocks.get(&target) {
+            _ if fixed.contains_key(&target) => fixed.get(&target).copied(),
             Some(done) => Some(*done.window.regs()),
             None => plans.get(&target).map(|plan| plan.entry.unpack()).or_else(|| seed.get(&target).copied()),
         };
