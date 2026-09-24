@@ -713,7 +713,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             _ => events.push(Event::Flush),
                         }
                     }
-                    TraceBlock { events, hotness: self.blocks[block.0].jit_info.hotness.get(), id: block.0 }
+                    TraceBlock { events, hotness: self.blocks[block.0].jit_info.hotness.get(), id: block.0, pc: self.blocks[block.0].pc }
                 })
                 .collect(),
         );
@@ -816,7 +816,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let block = &self.blocks[id.0];
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
         let mut alloc = WindowAlloc::entering(self.jctx.blocks[&id].window.clone());
-        window_dump!(self.jctx, "block {} hotness {} entered with {}", id.0, block.jit_info.hotness.get(), alloc.cache());
+        window_dump!(self.jctx, "block {} hotness {} pc {} entered with {}", id.0, block.jit_info.hotness.get(), block.pc, alloc.cache());
 
         // Jump to `target`, or fall through to it if `skip`, transferring the
         // window to the one it is entered with: its planned entry window, dirty where the

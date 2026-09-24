@@ -61,6 +61,9 @@ impl<'src, 'intern> LValue<'src, 'intern> {
 #[derive(Debug)]
 pub struct Block {
     pub instructions: Vec<Residual>,
+    /// The bytecode PC the block starts at, or the PC of the instruction a
+    /// block starting inside one belongs to.
+    pub pc: Pc,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
     /// Times the interpreter entered the block, shown by `dump`.
@@ -69,9 +72,10 @@ pub struct Block {
 }
 
 impl Block {
-    fn new() -> Self {
+    fn new(pc: Pc) -> Self {
         Self {
             instructions: vec![],
+            pc,
             #[cfg(feature = "jit")]
             jit_info: JitInfo::new(),
             #[cfg(feature = "graph")]
@@ -1282,7 +1286,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn block(&mut self, owner: &mut Owner, entry: Pc, ctx: Rc<Context>) -> BlockId {
         let mut pc = entry;
 
-        let block_id = self.new_block();
+        let block_id = self.new_block(entry);
         let subpc: SubPc = SubPc::new(entry);
         let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((pc, ty), block)| pc.0 == entry).collect();
         if count.len() >= 5 {
@@ -1302,7 +1306,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             panic!("too many versions: {:#?}", count);
         }
         // Finish the remainder of the coroutine
-        let new_block = self.new_block();
+        let new_block = self.new_block(pc.0);
         self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().insert((pc, ctx.clone()), new_block);
         if let Some((succ_next, succ_ty, succ_ret)) = self.compile_one(owner, pc, ctx, coro, arg, new_block) {
             // And continue compiling the block
@@ -1439,8 +1443,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    pub fn new_block(&mut self) -> BlockId {
-        self.blocks.push(Block::new());
+    /// A new, empty block starting at `pc` (see `Block::pc`).
+    pub fn new_block(&mut self, pc: Pc) -> BlockId {
+        self.blocks.push(Block::new(pc));
         BlockId(self.blocks.len() - 1)
     }
 
@@ -1481,7 +1486,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // TODO: search for if we already have a compatible block
             if !appends {
                 let old_block = block_id;
-                block_id = vm.new_block();
+                block_id = vm.new_block(pc.0);
                 vm.blocks[old_block.0].instructions[thunk_pc] = Residual::Jump(block_id);
                 vm.blocks[block_id.0].instructions.push(Residual::Guard { idx, expected: runtime_type });
             } else {
@@ -1537,7 +1542,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
             let Some((index, key, val)) = tab.ro(owner).hash.get_full(&LCanon::new((&hkey.key).into(), state.intern)) else {
                 // The table doesn't have this key, which means we should actually just bailout
-                let fail_block = vm.new_block();
+                let fail_block = vm.new_block(pc.0);
                 if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), thunk_coro, ResumeArg::Failed, block_id) {
                     vm.compile(owner, succ_next, succ_ty, fail_block);
                 }
@@ -1609,21 +1614,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             })));
             if(!appends) {
                 let old_block = block_id;
-                block_id = vm.new_block();
+                block_id = vm.new_block(pc.0);
                 vm.blocks[old_block.0].instructions[thunk_pc] = Residual::Jump(block_id);
                 vm.blocks[block_id.0].instructions.push(href_init);
             } else {
                 vm.blocks[block_id.0].instructions[thunk_pc] = href_init;
             }
-            let has_key = vm.new_block();
-            let missing_key = vm.new_block();
+            let has_key = vm.new_block(pc.0);
+            let missing_key = vm.new_block(pc.0);
             vm.blocks[block_id.0].instructions.push(Residual::Select(
                 vec![("has_key", has_key), ("missing_key", missing_key)]));
             let missing_coro = thunk_coro.clone();
             vm.blocks[missing_key.0].instructions.push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
                 debug!("missing key thunk");
                 // Same as the outer thunk missing the key
-                let fail_block = vm.new_block();
+                let fail_block = vm.new_block(pc.0);
                 if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), missing_coro.clone(), ResumeArg::Failed, fail_block) {
                     vm.compile(owner, succ_next, succ_ty, fail_block);
                 }
@@ -1654,7 +1659,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // The epoch is different, but the actual key type might still be the same.
             // Do another check for the key type, where if it still holds we can update the
             // witness epoch and jump back to the success block.
-            let check_block = vm.new_block();
+            let check_block = vm.new_block(pc.0);
             vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Jump(check_block);
             let expected = &thunk_ctx.hkeys[href.0 as usize].known_type;
             // Because we will need to JIT the guards, we split "simple" hashguards from other, more
@@ -1966,7 +1971,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         debug!("jump exist {dest_pc} -> {exists:?}");
                         arg = ResumeArg::BlockId(*exists);
                     } else {
-                        let fresh = self.new_block();
+                        let fresh = self.new_block(dest_pc);
                         debug!("jump fresh {dest_pc} -> {:?}", fresh);
                         self.versions.get_mut(&self.clos.rw(owner).prototype).unwrap().insert((SubPc::new(dest_pc), ctx.clone()), fresh);
                         // TODO: do we just return ((dest, ctx, arg)) here and have self.compile

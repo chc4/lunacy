@@ -1,7 +1,12 @@
 == region entered at block 0
 traces 0 1 2 3 4
+live into block 0: [0, 1, 2, 3]
+live into block 1: [0, 1, 2, 3]
+live into block 2: [0, 1, 2, 3]
+live into block 3: [0, 1, 2, 3, 4]
+live into block 4: [0, 1, 3, 4]
 region entry block 0 loads w0 <- [1]; w2 <- [2]; w4 <- [3]; w5 <- [0]; w6 <- w0 #0
-block 0 hotness 0 entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
+block 0 hotness 0 pc 0 entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
     0 guard(0, number)
       tests w5
       window {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
@@ -11,7 +16,7 @@ block 0 hotness 0 entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
     2 jump(1)
       to block 1 (entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}): 
       window {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
-block 1 hotness 0 entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
+block 1 hotness 0 pc 0 entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
     0 guard(1, number)
       tests w0
       window {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
@@ -21,7 +26,7 @@ block 1 hotness 0 entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
     2 jump(2)
       to block 2 (entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}): 
       window {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
-block 2 hotness 0 entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
+block 2 hotness 0 pc 0 entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
     0 window(NumericIntInt, 0, 1, out 4)
       op at w5 #1
       window {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1] w7=[4]*}
@@ -34,7 +39,7 @@ block 2 hotness 0 entered with {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1]}
     3 jump(3)
       to block 3 (entered with {w0=[1] w1=[4]* w2=[2] w4=[3] w6=[0]}): w1 <- w7; w6 <- w5 #3
       window {w0=[1] w2=[2] w4=[3] w5=[0] w6=[1] w7=[4]*}
-block 3 hotness 0 entered with {w0=[1] w1=[4]* w2=[2] w4=[3] w6=[0]}
+block 3 hotness 0 pc 1 entered with {w0=[1] w1=[4]* w2=[2] w4=[3] w6=[0]}
     0 window(NumericIntInt, 4, 2, out 4)
       op at w1 #4
       window {w0=[1] w2=[2] w3=[4]* w4=[3] w6=[0]}
@@ -47,7 +52,7 @@ block 3 hotness 0 entered with {w0=[1] w1=[4]* w2=[2] w4=[3] w6=[0]}
     3 jump(4)
       to block 4 (entered with {w0=[1] w1=[3] w3=[4]* w4=[3] w6=[0]}): w1 <- w4 #6
       window {w0=[1] w2=[2] w3=[4]* w4=[3] w6=[0]}
-block 4 hotness 0 entered with {w0=[1] w1=[3] w3=[4]* w4=[3] w6=[0]}
+block 4 hotness 0 pc 2 entered with {w0=[1] w1=[3] w3=[4]* w4=[3] w6=[0]}
     0 window(NumericIntInt, 4, 3, out 5)
       op at w3 #7
       window {w0=[1] w1=[3] w3=[4]* w4=[3] w5=[5]* w6=[0]}

@@ -18,7 +18,7 @@ import math
 import re
 import sys
 
-BLOCK = re.compile(r'^block (\d+) hotness (\d+) entered with ')
+BLOCK = re.compile(r'^block (\d+) hotness (\d+)(?: pc \d+)? entered with ')
 STUB = re.compile(r'^(?:block \d+ compiled already, entered with \{[^}]*\}|region entry block \d+ loads)[:]? ?(.*)$')
 EMIT = re.compile(r'(\w+|\[\d+\]) <- (\w+|\[\d+\])')
 COUNTED = re.compile(r' #(\d+)$')

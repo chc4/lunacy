@@ -9,7 +9,8 @@ use smallvec::SmallVec;
 // Allocation", 2018; docs/trace-register-allocation.md). A compiled region's
 // blocks are partitioned into traces: sequences of blocks where each is a
 // successor of the one before it, joined by forward edges (not retreating edges
-// of the region's depth-first walk). Building the partition is a policy
+// of the region's depth-first walk from its root; see Note [Region root]).
+// Building the partition is a policy
 // (`Policy`); allocation is correct for any partition. Each trace is then
 // allocated by one backward pass, with the slot liveness computed here, and
 // every edge other than one between consecutive blocks of a trace is resolved
@@ -27,6 +28,27 @@ use smallvec::SmallVec;
 // dominate its source is irreducible; every block of it gets every slot the
 // region reads, or that a block outside it wants in a register.
 
+// Note [Region root]
+// ~~~~~~~~~~~~~~~~~~
+// Trace register allocation assumes a control-flow graph whose start block has
+// no predecessors, so every loop is entered from outside it at its header, the
+// target of its back edges, and a trace goes through a loop from its entry to
+// its end. A region is compiled from the block whose hotness ran out, which
+// may lie inside a loop: its entry can have predecessors in the region, and
+// the loop's own entry, upstream of the entry, isn't in the region at all.
+// Walking the region from its entry would make the edge into the entry the
+// loop's back edge, cutting the loop wherever compilation was triggered.
+//
+// So the region is walked from its root instead: of the blocks on a cycle
+// through the entry (those that reach it, since every block is reachable from
+// the entry), the one at the lowest bytecode PC, the lowest id among versions of
+// that PC. Lua bytecode lays a loop out as a contiguous range of PCs holding the
+// loops nested in it, with its backward jump landing on the range's first
+// instruction, so this is the header of the outermost loop around the entry.
+// Block ids don't serve: they follow the order in which blocks were specialized,
+// and the versions a loop settles into can first be reached anywhere inside it.
+// When the entry is on no cycle it is the root.
+
 /// What a block does with stack slots and control flow, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -43,13 +65,15 @@ pub enum Event {
     Exit(Slots),
 }
 
-/// A block of a region: its events, and its hotness (the countdown to
-/// compilation, lower is hotter) and id, which order blocks by frequency.
+/// A block of a region: its events, its hotness (the countdown to
+/// compilation, lower is hotter) and id, which order blocks by frequency, and
+/// the bytecode PC it starts at (see Note [Region root]).
 #[derive(Debug, Clone)]
 pub struct Block {
     pub events: Vec<Event>,
     pub hotness: usize,
     pub id: usize,
+    pub pc: usize,
 }
 
 /// A set of stack slots. A Lua frame has at most 250.
@@ -91,7 +115,9 @@ pub struct Region {
     pub blocks: Vec<Block>,
     succs: Vec<SmallVec<[usize; 2]>>,
     preds: Vec<SmallVec<[usize; 2]>>,
-    /// Blocks in postorder of the depth-first walk from the entry.
+    /// Where the depth-first walk starts. See Note [Region root].
+    root: usize,
+    /// Blocks in postorder of the depth-first walk from the root.
     postorder: Vec<usize>,
     /// The retreating edges of that walk: to a block still on its stack.
     retreating: Vec<(usize, usize)>,
@@ -118,12 +144,24 @@ impl Region {
                 preds[target].push(b);
             }
         }
+        let mut reaches_entry = vec![false; n];
+        reaches_entry[0] = true;
+        let mut work = vec![0];
+        while let Some(b) = work.pop() {
+            for &p in &preds[b] {
+                if !reaches_entry[p] {
+                    reaches_entry[p] = true;
+                    work.push(p);
+                }
+            }
+        }
+        let root = (0..n).filter(|&b| reaches_entry[b]).min_by_key(|&b| (blocks[b].pc, blocks[b].id)).unwrap();
         // Depth-first walk: 0 unvisited, 1 on the stack, 2 finished.
         let mut state = vec![0u8; n];
         let mut postorder = Vec::with_capacity(n);
         let mut retreating = Vec::new();
-        let mut stack = vec![(0, 0)];
-        state[0] = 1;
+        let mut stack = vec![(root, 0)];
+        state[root] = 1;
         while let Some((b, next)) = stack.last_mut() {
             let b = *b;
             match succs[b].get(*next).copied() {
@@ -146,7 +184,7 @@ impl Region {
             }
         }
         assert_eq!(postorder.len(), n, "every block reachable from the entry");
-        Region { blocks, succs, preds, postorder, retreating }
+        Region { blocks, succs, preds, root, postorder, retreating }
     }
 
     pub fn succs(&self, b: usize) -> &[usize] {
@@ -157,19 +195,23 @@ impl Region {
         &self.postorder
     }
 
+    pub fn root(&self) -> usize {
+        self.root
+    }
+
     pub fn is_retreating(&self, from: usize, to: usize) -> bool {
         self.retreating.contains(&(from, to))
     }
 
-    /// Whether every path from the entry to `b` passes through `d`.
+    /// Whether every path from the root to `b` passes through `d`.
     fn dominates(&self, d: usize, b: usize) -> bool {
-        if d == 0 || d == b {
+        if d == self.root || d == b {
             return true;
         }
         let mut seen = vec![false; self.blocks.len()];
         seen[d] = true;
-        seen[0] = true;
-        let mut work = vec![0];
+        seen[self.root] = true;
+        let mut work = vec![self.root];
         while let Some(x) = work.pop() {
             if x == b {
                 return false;
@@ -252,7 +294,7 @@ pub enum Policy {
     /// Every block its own trace, allocated in postorder.
     SingleBlock,
     /// Start at a block whose predecessors are all in traces (at first the
-    /// entry; the most frequent otherwise), and append the most frequent
+    /// root; the most frequent otherwise), and append the most frequent
     /// successor not in a trace until there is none.
     Unidirectional,
     /// Start at the most frequent block not in a trace, prepend its most
@@ -287,7 +329,7 @@ impl Region {
         }
         while let Some(fallback) = (0..n).filter(|&b| !placed[b]).min_by_key(|&b| hotter(b)) {
             let start = match policy {
-                Policy::Unidirectional if traces.is_empty() => 0,
+                Policy::Unidirectional if traces.is_empty() => self.root,
                 Policy::Unidirectional => (0..n)
                     .filter(|&b| !placed[b] && self.preds[b].iter().all(|&p| placed[p]))
                     .min_by_key(|&b| hotter(b))
@@ -327,19 +369,41 @@ impl Region {
 mod tests {
     use super::*;
 
-    /// A block reading, writing and jumping as `events` say, with hotness 0 and
-    /// its index as its id unless `hot` says otherwise.
+    /// A block reading, writing and jumping as `events` say, with hotness 0
+    /// unless `hot` says otherwise, and its index as its id and PC.
     fn region(blocks: &[&[Event]], hot: &[(usize, usize)]) -> Region {
+        region_at(blocks, hot, &(0..blocks.len()).collect::<Vec<_>>(), &(0..blocks.len()).collect::<Vec<_>>())
+    }
+
+    /// As `region`, with each block's id and PC.
+    fn region_at(blocks: &[&[Event]], hot: &[(usize, usize)], ids: &[usize], pcs: &[usize]) -> Region {
         Region::new(
             blocks
                 .iter()
                 .enumerate()
                 .map(|(b, events)| {
                     let hotness = hot.iter().find(|(x, _)| *x == b).map_or(0, |&(_, h)| h);
-                    Block { events: events.to_vec(), hotness, id: b }
+                    Block { events: events.to_vec(), hotness, id: ids[b], pc: pcs[b] }
                 })
                 .collect(),
         )
+    }
+
+    /// Whether `to` is reachable from `from`.
+    fn reaches(region: &Region, from: usize, to: usize) -> bool {
+        let mut seen = vec![false; region.blocks.len()];
+        let mut work = vec![from];
+        while let Some(b) = work.pop() {
+            if b == to {
+                return true;
+            }
+            for &s in region.succs(b) {
+                if !std::mem::replace(&mut seen[s], true) {
+                    work.push(s);
+                }
+            }
+        }
+        false
     }
 
     use Event::{Edge as E, Flush as F, Read as R, Write as W};
@@ -348,10 +412,17 @@ mod tests {
 
     /// The invariants every policy upholds: the traces partition the region,
     /// consecutive blocks of a trace are joined by a forward edge, and the
-    /// greedy policies can't extend any trace further.
+    /// greedy policies can't extend any trace further. And the region's root
+    /// is the block at the lowest PC (then id) of those reaching the entry.
     fn check(region: &Region, policy: Policy) -> Vec<Vec<usize>> {
         let traces = region.traces(policy);
         let n = region.blocks.len();
+        let key = |b: usize| (region.blocks[b].pc, region.blocks[b].id);
+        let root = region.root();
+        assert!(reaches(region, root, 0), "the root {root} is on a cycle through the entry");
+        for b in (0..n).filter(|&b| reaches(region, b, 0)) {
+            assert!(key(root) <= key(b), "block {b} reaches the entry at a lower PC than the root {root}");
+        }
         let mut trace_of = vec![usize::MAX; n];
         for (t, trace) in traces.iter().enumerate() {
             assert!(!trace.is_empty(), "{policy:?}: an empty trace");
@@ -381,7 +452,7 @@ mod tests {
                     }
                 }
                 if policy == Policy::Unidirectional {
-                    assert_eq!(traces[0][0], 0, "the first trace starts at the entry");
+                    assert_eq!(traces[0][0], root, "the first trace starts at the root");
                 } else {
                     for (t, trace) in traces.iter().enumerate() {
                         let head = trace[0];
@@ -482,13 +553,54 @@ mod tests {
 
     #[test]
     fn region_entered_inside_its_loop() {
-        // The region's entry is the middle of the loop 0 -> 1 -> 2 -> 0, the
-        // block whose hotness triggered compilation, and the loop exits at 1.
-        let r = region(&[&[R(3), E(1)], &[E(2), E(3)], &[W(3), E(0)], &[]], &[(3, 50)]);
+        // The region's entry 0, the block whose hotness triggered compilation,
+        // is the end of the loop 1 -> 2 -> 0 -> 1, whose header 1 is at the
+        // lowest PC and exits to 3. The loop is walked from its header.
+        let r = region_at(&[&[R(3), E(1)], &[E(2), E(3)], &[W(3), E(0)], &[]], &[(3, 50)], &[0, 1, 2, 3], &[6, 2, 4, 8]);
+        assert_eq!(r.root(), 1);
+        assert!(r.is_retreating(0, 1));
         for policy in POLICIES {
             check(&r, policy);
         }
-        assert_eq!(check(&r, Policy::Unidirectional)[0], vec![0, 1, 2]);
+        assert_eq!(check(&r, Policy::Unidirectional), vec![vec![1, 2, 0], vec![3]]);
+        check_liveness(&r);
+    }
+
+    #[test]
+    fn nested_loop_entered_inside_its_inner_loop() {
+        // The region of lua_tests/window_nested_loop.lua, compiled from its
+        // inner loop's first block 0. The outer loop runs 7 -> 8 -> 9 (its body,
+        // entering the inner loop) and 5 (its end, back to 7 or out to 6); the
+        // inner loop is 0, branching to 1 -> 2 or 3 -> 4, which both end it (back
+        // to 0 or on to 5). The lowest id is the inner loop's block 2, first
+        // reached from outside the region; the lowest PC is the outer loop's
+        // header 7, and the walk from it nests the inner loop in the outer.
+        let r = region_at(
+            &[
+                &[R(12), E(1), E(3)],
+                &[W(3), E(2)],
+                &[W(9), E(0), E(5)],
+                &[E(4)],
+                &[W(3), E(0), E(5)],
+                &[W(3), E(7), E(6)],
+                &[],
+                &[W(8), E(8)],
+                &[E(9)],
+                &[W(12), E(0), E(5)],
+            ],
+            &[(1, 30), (2, 29), (3, 34), (4, 34), (5, 57), (6, 64), (7, 57), (8, 57), (9, 57)],
+            &[27, 30, 22, 28, 29, 23, 24, 25, 26, 31],
+            &[10, 12, 16, 14, 16, 17, 20, 5, 8, 16],
+        );
+        assert_eq!(r.root(), 7);
+        let mut retreating = r.retreating.clone();
+        retreating.sort();
+        assert_eq!(retreating, vec![(2, 0), (4, 0), (5, 7)]);
+        for policy in POLICIES {
+            check(&r, policy);
+        }
+        // The inner loop's header follows the outer loop's body into it.
+        assert_eq!(check(&r, Policy::Unidirectional), vec![vec![7, 8, 9, 0, 1, 2, 5, 6], vec![3, 4]]);
         check_liveness(&r);
     }
 
@@ -555,7 +667,7 @@ mod tests {
     /// Random regions of up to 9 blocks and 6 slots: every block reachable
     /// through a spanning chain, plus random edges (back edges, self-loops,
     /// critical edges and irreducible cycles among them), random reads,
-    /// writes and flushes, and random hotness. Every policy's traces uphold
+    /// writes and flushes, and random hotness and PCs. Every policy's traces uphold
     /// the invariants, and liveness covers the exact one.
     #[test]
     fn random_regions() {
@@ -577,7 +689,7 @@ mod tests {
                     for _ in 0..rng.below(3) {
                         events.push(Event::Edge(rng.below(n)));
                     }
-                    Block { events, hotness: rng.below(3) * 20, id: b }
+                    Block { events, hotness: rng.below(3) * 20, id: b, pc: rng.below(n) }
                 })
                 .collect();
             // The spanning tree: every block's parent jumps to it somewhere.
