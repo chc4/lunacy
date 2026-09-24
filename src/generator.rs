@@ -151,12 +151,12 @@ macro_rules! dispatch_numeric_window {
     };
 }
 
-macro_rules! dispatch_compare {
-    ($opcode:expr, $label:expr, $name:ident, {$($cap:ident: $val:expr),*}) => {
+macro_rules! dispatch_compare_window {
+    ($opcode:expr, $name:ident, ($($arg:expr),*)) => {
         match $opcode {
-            Opcode::EQ => ResidualExec::new(concat!($label, "_EQ"), Rc::new($name::<{Opcode::EQ}> { $($cap: $val),* })),
-            Opcode::LT => ResidualExec::new(concat!($label, "_LT"), Rc::new($name::<{Opcode::LT}> { $($cap: $val),* })),
-            Opcode::LE => ResidualExec::new(concat!($label, "_LE"), Rc::new($name::<{Opcode::LE}> { $($cap: $val),* })),
+            Opcode::EQ => Rc::new($name::<{Opcode::EQ}>::new($($arg),*)) as Rc<dyn Window>,
+            Opcode::LT => Rc::new($name::<{Opcode::LT}>::new($($arg),*)),
+            Opcode::LE => Rc::new($name::<{Opcode::LE}>::new($($arg),*)),
             _ => unreachable!(),
         }
     };
@@ -708,56 +708,48 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
         arg = yield YieldOp::GetBlock((pc as isize + 1 as isize) as usize);
         let ResumeArg::BlockId(taken) = arg else { unreachable!() };
 
+        // Compare guarded numbers, a constant one read from the prototype, and set
+        // `select` for the select below: 0 to take the jump, when the condition
+        // isn't `a`. `OP` is a const param, so each stencil compares one way.
+        // Unchecked, so that no panic path follows the stencil's `become`.
+        #[inline(always)]
+        unsafe fn select<const OP: Opcode>(state: &mut RunState, a: u8, l: f64, r: f64) {
+            let cond = match OP {
+                Opcode::EQ => l == r,
+                Opcode::LT => l < r,
+                Opcode::LE => l <= r,
+                _ => unsafe { core::hint::unreachable_unchecked() },
+            };
+            state.select = if (cond as u8) != a { 0 } else { 1 };
+        }
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => {
-                define_exec!(CompareIntInt, [a: u8, b: usize, c: usize], [OP: Opcode],
-                |owner, state, dest, lhs, rhs| {
-                    let Some(dyn_b) = state.vals[state.base + b].as_number() else { unreachable!() };
-                    let Some(dyn_c) = state.vals[state.base + c].as_number() else { unreachable!() };
-                    let cond = LValue::Number(Number(dyn_b)).compare(OP, LValue::Number(Number(dyn_c)), owner).unwrap();
-                    if (cond as u8) != *a {
-                        //debug!("taking comparison jump -> {:?}", taken);
-                        state.select = 0;
-                    } else {
-                        //debug!("falling through comparison jump -> {:?}", fallthrough);
-                        state.select = 1;
-                    }
+                windowed!(CompareIntInt, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
+                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
+                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
+                    select::<OP>(state, a, l, r);
                 });
-                arg = yield YieldOp::Exec(dispatch_compare!(opcode, "comp_int_int", CompareIntInt, {a: a, b: b, c: c}));
+                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntInt, (a, &[b, c])));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) => {
-                define_exec!(CompareCIntInt, [a: u8, rb: usize, c: usize], [OP: Opcode],
-                |owner, state, dest, lhs, rhs| {
-                    let const_b = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[*rb as usize] };
-                    let Constant::Number(Number(_)) = const_b else { unreachable!() };
-                    let Some(dyn_c) = state.vals[state.base + c].as_number() else { unreachable!() };
-                    let cond = LValue::from(const_b).compare(OP, LValue::Number(Number(dyn_c)), owner).unwrap();
-                    if (cond as u8) != *a {
-                        //debug!("taking comparison jump -> {:?}", taken);
-                        state.select = 0;
-                    } else {
-                        //debug!("falling through comparison jump -> {:?}", fallthrough);
-                        state.select = 1;
-                    }
+                windowed!(CompareCIntInt, [a: u8, k: u32], [OP: Opcode], |owner, state, base| (rhs) {
+                    let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+                        core::hint::unreachable_unchecked()
+                    };
+                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
+                    select::<OP>(state, a, l.0, r);
                 });
-                arg = yield YieldOp::Exec(dispatch_compare!(opcode, "comp_cint_int", CompareCIntInt, {a: a, rb: rb, c: c}));
+                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareCIntInt, (a, rb as u32, &[c])));
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
-                define_exec!(CompareIntCInt, [a: u8, b: usize, rc: usize], [OP: Opcode],
-                |owner, state, dest, lhs, rhs| {
-                    let Some(dyn_b) = state.vals[state.base + b].as_number() else { unreachable!() };
-                    let const_c = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[*rc as usize] };
-                    let Constant::Number(Number(_)) = const_c else { unreachable!() };
-                    let cond = LValue::Number(Number(dyn_b)).compare(OP, const_c.into(), owner).unwrap();
-                    if (cond as u8) != *a {
-                        //debug!("taking comparison jump -> {:?}", taken);
-                        state.select = 0;
-                    } else {
-                        //debug!("falling through comparison jump -> {:?}", fallthrough);
-                        state.select = 1;
-                    }
+                windowed!(CompareIntCInt, [a: u8, k: u32], [OP: Opcode], |owner, state, base| (lhs) {
+                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
+                    let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+                        core::hint::unreachable_unchecked()
+                    };
+                    select::<OP>(state, a, l, r.0);
                 });
-                arg = yield YieldOp::Exec(dispatch_compare!(opcode, "comp_int_cint", CompareIntCInt, {a: a, b: b, rc: rc}));
+                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntCInt, (a, rc as u32, &[b])));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::MatchedConst(rc)) => {
                 unimplemented!()
