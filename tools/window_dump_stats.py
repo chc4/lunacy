@@ -102,7 +102,7 @@ def blocks(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('dumps', nargs='+', help='window_dump.txt files')
-    parser.add_argument('--blocks', action='store_true', help="each hot block's counts, side by side")
+    parser.add_argument('--blocks', action='store_true', help="each hot block's counts, side by side; with --raw, each block's executed counts")
     parser.add_argument('--all', action='store_true', help='with --blocks, every block, not just the hot ones')
     parser.add_argument('--top', type=int, help='the counted lines executing the most loads, stores and moves')
     parser.add_argument('--raw', action='store_true', help='weight code by how often it ran, not log log of it')
@@ -117,6 +117,19 @@ def main():
                 print('%7.1f %7.1f %7.1f  block %s x%d: %s' % (*counts, block, runs, code.strip()))
         return 0
     found = [blocks(path) for path in args.dumps]
+    if args.blocks and RAW:
+        # Executed counts per block, every block that ran, most first.
+        ran = []
+        for path in args.dumps:
+            per = {}
+            for block, _, _, counts in counted(path):
+                per[block] = [a + b for a, b in zip(per.get(block, [0, 0, 0]), counts)]
+            ran.append(per)
+        ids = sorted({b for per in ran for b, counts in per.items() if sum(counts)}, key=lambda b: -max(sum(per.get(b, [0, 0, 0])) for per in ran))
+        print('%-8s' % 'block' + ''.join('%28s' % path.split('/')[-1] for path in args.dumps))
+        for b in ids:
+            print('%-8s' % ('entry' if b is None else b) + ''.join('%28s' % ('%.0f %.0f %.0f' % tuple(per[b]) if b in per else '-') for per in ran))
+        return 0
     if args.blocks:
         ids = sorted({b for dump in found for b, (hot, _) in dump.items() if hot or args.all})
         print('%-8s' % 'block' + ''.join('%24s' % path.split('/')[-1] for path in args.dumps))
