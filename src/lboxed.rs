@@ -82,6 +82,19 @@ impl<'src> IStr<'src> {
     }
 }
 
+// Note [Integer encoding]
+// ~~~~~~~~~~~~~~~~~~~~~~~
+// A number has two encodings, as in JavaScriptCore's NuN boxing (JSCJSValue.h):
+// a double, offset by `DOUBLE_ENCODE_OFFSET` into `0002:...` to `FFFC:...` (a
+// NaN canonicalized first, so none reaches higher), or an i32, `NUMBER_TAG` or'd
+// with its bits, `FFFE:0000:IIII:IIII`. Both have `NUMBER_TAG` bits set, so both
+// are numbers to every number test. Code that knows a value is an integer reads
+// its low 32 bits and boxes a result with one `or`; everything else reads either
+// encoding as the same `f64` (`as_number`, and `unbox`, whose `LValue::Number`
+// never says which it was). A number's encoding isn't canonical: an integer and
+// the equal double are the same value, which `LCanon` accounts for (Note
+// [Canonical values] in `vm`).
+
 impl<'src, 'intern> LBoxed<'src, 'intern> {
     pub const NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;
     pub const DOUBLE_ENCODE_OFFSET: u64 = 0x0002_0000_0000_0000; // 2^49
@@ -130,6 +143,12 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         Self::from_raw(bits.wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
     }
 
+    /// Box an integer. See Note [Integer encoding].
+    #[inline(always)]
+    pub fn from_int(i: i32) -> Self {
+        Self::from_raw(Self::NUMBER_TAG | i as u32 as u64)
+    }
+
     #[inline(always)]
     pub fn from_bool(b: bool) -> Self {
         Self::from_raw(if b { Self::VALUE_TRUE } else { Self::VALUE_FALSE })
@@ -146,10 +165,25 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         (self.0 & Self::NUMBER_TAG) != 0
     }
 
-    /// Decode a number, or `None` if this value isn't a number.
+    /// Whether this value is a number in the integer encoding. See Note
+    /// [Integer encoding].
+    #[inline(always)]
+    pub fn is_int(&self) -> bool {
+        (self.0 & Self::NUMBER_TAG) == Self::NUMBER_TAG
+    }
+
+    /// Decode a number in the integer encoding, or `None` if this value isn't one.
+    #[inline(always)]
+    pub fn as_int(&self) -> Option<i32> {
+        self.is_int().then_some(self.0 as u32 as i32)
+    }
+
+    /// Decode a number, in either encoding, or `None` if this value isn't a number.
     #[inline(always)]
     pub fn as_number(&self) -> Option<f64> {
-        if self.is_number() {
+        if self.is_int() {
+            Some(self.0 as u32 as i32 as f64)
+        } else if self.is_number() {
             Some(f64::from_bits(self.0.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET)))
         } else {
             None
@@ -205,8 +239,8 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     #[inline(always)]
     pub fn unbox(&self) -> LValue<'src, 'intern> {
         let bits = self.0;
-        if bits & Self::NUMBER_TAG != 0 {
-            return LValue::Number(Number(f64::from_bits(bits.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET))));
+        if let Some(n) = self.as_number() {
+            return LValue::Number(Number(n));
         }
         if bits & Self::NOT_CELL_MASK != 0 {
             return match bits {
@@ -259,6 +293,45 @@ impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LBoxed<'src, 'intern> {
             Constant::Bool(b) => Self::from_bool(*b),
             Constant::Number(n) => Self::from_number(n.0),
             Constant::String(s) => Self::interned(*s),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both encodings of a number read back as the same value, and only the
+    /// integer encoding reads as an integer. See Note [Integer encoding].
+    #[test]
+    fn integer_encoding() {
+        for i in [0, 1, -1, 3, i32::MAX, i32::MIN, 1 << 20, -(1 << 30)] {
+            let (int, double) = (LBoxed::from_int(i), LBoxed::from_number(i as f64));
+            assert_ne!(int.bits(), double.bits());
+            assert!(int.is_number() && int.is_int() && !double.is_int(), "{i}");
+            assert_eq!(int.as_int(), Some(i));
+            assert_eq!(double.as_int(), None);
+            assert_eq!(int.as_number(), Some(i as f64));
+            assert_eq!(double.as_number(), Some(i as f64));
+            assert!(matches!(int.unbox(), LValue::Number(Number(n)) if n == i as f64), "{i}");
+        }
+        for n in [0.5, -0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, f64::MAX, -f64::MAX] {
+            assert!(!LBoxed::from_number(n).is_int(), "{n}");
+        }
+        assert!(!LBoxed::NIL.is_int() && !LBoxed::from_bool(true).is_int());
+    }
+
+    /// An integer and the equal double are one table key.
+    #[test]
+    fn integer_keys() {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let arena = internment::Arena::new();
+        let hash = |c: &crate::vm::LCanon| BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(c);
+        for i in [0, 3, -7, i32::MAX, i32::MIN] {
+            let int = crate::vm::LCanon::new(LBoxed::from_int(i), &arena);
+            let double = crate::vm::LCanon::new(LBoxed::from_number(i as f64), &arena);
+            assert!(int == double, "{i}");
+            assert_eq!(hash(&int), hash(&double), "{i}");
         }
     }
 }

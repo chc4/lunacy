@@ -623,9 +623,10 @@ impl crate::gc::CellKind for FVec<u8> {
 // `LCanon` is an `LBoxed` in canonical form: equal values have identical bits, so it
 // implements `Hash`/`Eq` by value — comparing the raw bits, pointers included — with no
 // `owner`. `LCanon::new` does the canonicalizing: an owned string is interned, which the
-// arena dedups to the one pointer shared by every string with those bytes. Everything
+// arena dedups to the one pointer shared by every string with those bytes, and an
+// integer becomes the equal double (Note [Integer encoding] in `lboxed`). Everything
 // else is already canonical: interned strings are that unique pointer, tables/closures
-// compare by identity, and numbers/bool/nil are their own bits.
+// compare by identity, and doubles/bool/nil are their own bits.
 //
 // Hashing agrees with that equality: an interned string hashes by its precomputed content
 // hash (so strings spread by content, not by arena address), everything else by its bits.
@@ -641,6 +642,9 @@ impl<'src, 'intern> LCanon<'src, 'intern> {
     /// header-tag check (cf. `as_table`).
     #[inline(always)]
     pub fn new(v: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> Self {
+        if let Some(i) = v.as_int() {
+            return LCanon(LBoxed::from_number(i as f64));
+        }
         match v.unbox() {
             LValue::OwnedString(g) => LCanon(LBoxed::interned(intern_bytes(intern, g.as_slice()))),
             _ => LCanon(v),
