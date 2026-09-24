@@ -125,22 +125,8 @@ macro_rules! define_exec {
     };
 }
 
-macro_rules! dispatch_numeric {
-    ($opcode:expr, $label:expr, $name:ident, {$($cap:ident: $val:expr),*}) => {
-        match $opcode {
-            Opcode::ADD => ResidualExec::new(concat!($label, "_ADD"), Rc::new($name::<{Opcode::ADD}> { $($cap: $val),* })),
-            Opcode::SUB => ResidualExec::new(concat!($label, "_SUB"), Rc::new($name::<{Opcode::SUB}> { $($cap: $val),* })),
-            Opcode::MUL => ResidualExec::new(concat!($label, "_MUL"), Rc::new($name::<{Opcode::MUL}> { $($cap: $val),* })),
-            Opcode::DIV => ResidualExec::new(concat!($label, "_DIV"), Rc::new($name::<{Opcode::DIV}> { $($cap: $val),* })),
-            Opcode::MOD => ResidualExec::new(concat!($label, "_MOD"), Rc::new($name::<{Opcode::MOD}> { $($cap: $val),* })),
-            Opcode::POW => ResidualExec::new(concat!($label, "_POW"), Rc::new($name::<{Opcode::POW}> { $($cap: $val),* })),
-            _ => unreachable!(),
-        }
-    };
-}
-
-/// `dispatch_numeric!` for window ops: the `[OP: Opcode]` instance of a
-/// `windowed!` op, constructed with `new($args)`.
+/// The arithmetic opcode's `[OP: Opcode]` instance of a `windowed!` op,
+/// constructed with `new($args)`.
 macro_rules! dispatch_numeric_window {
     ($opcode:expr, $name:ident, ($($arg:expr),*)) => {
         match $opcode {
@@ -618,50 +604,42 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
+            // A constant operand is read from the prototype, as `k`.
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
-                define_exec!(NumericCintCint, [dest: usize, lhsc: usize, rhsc: usize], [OP: Opcode],
-                |owner, state, dest, lhsc, rhsc| {
-                    let klhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc]) };
-                    let krhs: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc]) };
-                    let LConstant::Number(kb) = klhs else { unreachable!() };
-                    let LConstant::Number(kc) = krhs else { unreachable!() };
-                    let res = LValue::Number(*kb).numeric_op(OP, &LValue::Number(*kc)).unwrap();
-                    debug!("res {:?}", &res);
-                    state.vals[state.base + dest] = LBoxed::box_lvalue(res);
+                windowed!(NumericCintCint, [kl: u32, kr: u32], [OP: Opcode], |owner, state, base| (out dest) {
+                    let constants = &(&(*state.clos.ro(owner).prototype).constants.items);
+                    let Constant::Number(l) = &constants[kl as usize] else { core::hint::unreachable_unchecked() };
+                    let Constant::Number(r) = &constants[kr as usize] else { core::hint::unreachable_unchecked() };
+                    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(*r)).unwrap());
                 });
 
-                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_cint_cint", NumericCintCint, {dest: dest, lhsc: lhsc as usize, rhsc: rhsc as usize}));
+                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericCintCint, (lhsc as u32, rhsc as u32, &[dest])));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
             (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
-                define_exec!(NumericCintInt, [dest: usize, lhsc: usize, rhs: usize], [OP: Opcode],
-                |owner, state, dest, lhsc, rhs| {
-                    let kb: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[lhsc]) };
-                    let LConstant::Number(kb) = kb else { unreachable!() };
-                    let Some(dyn_c) = state.vals[state.base + rhs].as_number() else { unreachable!() };
-                    let res = LValue::Number(Number(kb.0)).numeric_op(OP, &LValue::Number(Number(dyn_c))).unwrap();
-                    debug!("res {:?}", &res);
-                    state.vals[state.base + dest] = LBoxed::box_lvalue(res);
+                windowed!(NumericCintInt, [k: u32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
+                    let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+                        core::hint::unreachable_unchecked()
+                    };
+                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
+                    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                 });
 
-                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_cint_int", NumericCintInt, {dest: dest, lhsc: lhsc as usize, rhs: rhs}));
+                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericCintInt, (lhsc as u32, &[rhs, dest])));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
-                define_exec!(NumericIntCint, [dest: usize, lhs: usize, rhsc: usize], [OP: Opcode],
-                |owner, state, dest, lhs, rhsc| {
-                    let Some(dyn_b) = state.vals[state.base + lhs].as_number() else { unreachable!() };
-                    let kc: &LConstant = unsafe { &((&(*state.clos.ro(owner).prototype).constants.items)[rhsc]) };
-                    let LConstant::Number(kc) = kc else { unreachable!() };
-                    let res = LValue::Number(Number(dyn_b)).numeric_op(OP, &LValue::Number(Number(kc.0))).unwrap();
-                    debug!("res {:?}", &res);
-                    state.vals[state.base + dest] = LBoxed::box_lvalue(res);
+                windowed!(NumericIntCint, [k: u32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
+                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
+                    let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+                        core::hint::unreachable_unchecked()
+                    };
+                    *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(*r)).unwrap());
                 });
 
-
-                yield YieldOp::Exec(dispatch_numeric!(opcode, "numeric_int_cint", NumericIntCint, {dest: dest, lhs: lhs, rhsc: rhsc as usize}));
+                yield YieldOp::ExecWindow(dispatch_numeric_window!(opcode, NumericIntCint, (rhsc as u32, &[lhs, dest])));
                 yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
                 return arg;
             },
