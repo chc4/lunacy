@@ -782,8 +782,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     .filter(|&target| window_of(target).is_some())
                     .min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0)),
             };
+            // A loop's header: a block of the trace at or after it jumps back to it.
+            let header = trace[pos..].iter().any(|&l| self.blocks[ids[l].0].instructions.iter().flat_map(jump_targets).any(|t| t == ids[b]));
             starts.push(steps.len());
-            steps.push(Step::Start);
+            steps.push(if header { Step::Header } else { Step::Start });
             let mut of = vec![None; block.instructions.len()];
             for (off, res) in block.instructions.iter().enumerate() {
                 match res {

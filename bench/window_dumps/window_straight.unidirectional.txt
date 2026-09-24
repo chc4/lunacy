@@ -16,7 +16,7 @@ block 0 hotness 0 pc 0 entered with {w0=[0] w1=[1] w3=[2] w5=[3]}
     2 jump(1)
       to block 1 (entered with {w0=[0] w1=[1] w3=[2] w5=[3]}): 
       window {w0=[0] w1=[1] w3=[2] w5=[3]}
-block 1 hotness 0 pc 0 entered with {w0=[0] w1=[1] w3=[2] w5=[3]}
+block 1 hotness 62 pc 0 entered with {w0=[0] w1=[1] w3=[2] w5=[3]}
     0 guard(1, number)
       tests w1
       window {w0=[0] w1=[1] w3=[2] w5=[3]}
@@ -26,7 +26,7 @@ block 1 hotness 0 pc 0 entered with {w0=[0] w1=[1] w3=[2] w5=[3]}
     2 jump(2)
       to block 2 (entered with {w0=[0] w1=[1] w3=[2] w5=[3]}): 
       window {w0=[0] w1=[1] w3=[2] w5=[3]}
-block 2 hotness 0 pc 0 entered with {w0=[0] w1=[1] w3=[2] w5=[3]}
+block 2 hotness 63 pc 0 entered with {w0=[0] w1=[1] w3=[2] w5=[3]}
     0 window(NumericIntInt, 0, 1, out 4)
       op at w0 #1
       window {w0=[0] w1=[1] w2=[4]* w3=[2] w5=[3]}
@@ -39,7 +39,7 @@ block 2 hotness 0 pc 0 entered with {w0=[0] w1=[1] w3=[2] w5=[3]}
     3 jump(3)
       to block 3 (entered with {w0=[0] w2=[4]* w3=[2] w5=[3]}): 
       window {w0=[0] w1=[1] w2=[4]* w3=[2] w5=[3]}
-block 3 hotness 0 pc 1 entered with {w0=[0] w2=[4]* w3=[2] w5=[3]}
+block 3 hotness 63 pc 1 entered with {w0=[0] w2=[4]* w3=[2] w5=[3]}
     0 window(NumericIntInt, 4, 2, out 4)
       op at w2 #3
       window {w0=[0] w3=[2] w4=[4]* w5=[3]}
@@ -52,7 +52,7 @@ block 3 hotness 0 pc 1 entered with {w0=[0] w2=[4]* w3=[2] w5=[3]}
     3 jump(4)
       to block 4 (entered with {w0=[0] w4=[4]* w5=[3]}): 
       window {w0=[0] w3=[2] w4=[4]* w5=[3]}
-block 4 hotness 0 pc 2 entered with {w0=[0] w4=[4]* w5=[3]}
+block 4 hotness 63 pc 2 entered with {w0=[0] w4=[4]* w5=[3]}
     0 window(NumericIntInt, 4, 3, out 5)
       op at w4 #5
       window {w0=[0] w4=[4]* w5=[3] w6=[5]*}

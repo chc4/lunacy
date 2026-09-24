@@ -1658,11 +1658,16 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         #[cfg(feature = "jit")]
                         if let (LValue::LClosure(lc), LValue::InternedString(key)) = (target.unbox(), kb.unbox()) {
                             match key.as_bytes() {
+                                // Its entry blocks compile when next entered, with the
+                                // blocks reachable from them; those keep their hotness,
+                                // for building traces.
                                 x if x == const { "__jit".as_bytes() } => {
                                     if let Entry::Occupied(mut entry) = spec.versions.entry(lc.rw(owner).prototype) {
-                                        for block in entry.get_mut().values() {
-                                            warn!("Forcing JIT for block {}", block.0);
-                                            spec.blocks[block.0].jit_info.hotness.set(0);
+                                        for ((pc, _), block) in entry.get_mut().iter() {
+                                            if *pc == crate::generator::SubPc::new(0) {
+                                                warn!("Forcing JIT for block {}", block.0);
+                                                spec.blocks[block.0].jit_info.hotness.set(0);
+                                            }
                                         }
                                     }
                                 },

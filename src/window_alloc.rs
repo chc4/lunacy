@@ -439,7 +439,12 @@ impl WindowAlloc {
 // earliest step occupying it, and checking is constant time. Requests wanting
 // any register are capped at the window's width, dropping the furthest used.
 // Flush points drop every request; at the top of the trace, requests for a
-// register are its entry window and the others are dropped. Exits to blocks
+// register are its entry window and the others are dropped. So they are at a
+// loop header's start, where the code above is then asked for that window:
+// requests from the loop's body end at its header, rather than reaching up to
+// sources above the loop, where the code before it would drop them and the
+// loop would reload them every iteration. (A trace with a loop is planned
+// twice, the latch continuing into the header's window from the first pass.) Exits to blocks
 // outside the trace are the thesis's pseudo-uses, weighted 0. The windows
 // wanted before each step are read off the kept intervals afterwards.
 
@@ -448,6 +453,9 @@ impl WindowAlloc {
 pub enum Step<'a> {
     /// A block's start: the window planned here is its entry window.
     Start,
+    /// The start of a loop's header, the target of a back edge in the trace.
+    /// See Note [Trace allocation].
+    Header,
     /// A window op, and the `SKIP`s it can run at.
     Op(&'a dyn Window, SmallVec<[usize; WINDOW]>),
     /// A residual that flushes the window.
@@ -645,6 +653,22 @@ impl Planner {
         }
     }
 
+    /// At a loop header's start `step`: the requests for a register are its
+    /// entry window, which the code above is asked for in turn, as it would
+    /// be for a jump into it; the others are dropped.
+    fn anchor(&mut self, step: usize) {
+        for reg in 0..WINDOW {
+            if let Some(id) = self.holds[reg].take() {
+                self.keep(id, reg, step.checked_sub(1));
+                let Request { slot, own, .. } = self.requests[id];
+                self.request(slot, step, own, Some(reg));
+            }
+        }
+        for id in self.any.drain(..) {
+            self.requests[id].fate = Fate::Home;
+        }
+    }
+
     fn drop_pending(&mut self) {
         for id in self.holds.iter_mut().filter_map(Option::take).chain(self.any.drain(..)) {
             self.requests[id].fate = Fate::Home;
@@ -699,6 +723,7 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
     for (step, s) in steps.iter().enumerate().rev() {
         match s {
             Step::Start => {}
+            Step::Header => planner.anchor(step),
             Step::Op(op, usable) => {
                 let (slots, accesses) = (op.operands(), op.accesses());
                 let skip = usable
@@ -1051,12 +1076,12 @@ mod tests {
         }
     }
 
-    /// Random traces of ops over up to six slots, with block starts, flushes and
-    /// exits, in windows of 5 to 8 registers, run as the JIT runs a planned
-    /// trace: each op reconciled to its planned window, each block entered
-    /// through a transfer into its entry window, each exit's transfer into its
-    /// target's window checked. Every op reads current values, every exit
-    /// delivers its window, and the stack ends current.
+    /// Random traces of ops over up to six slots, with block and loop starts,
+    /// flushes and exits, in windows of 5 to 8 registers, run as the JIT runs
+    /// a planned trace: each op reconciled to its planned window, each block
+    /// entered through a transfer into its entry window, each exit's transfer
+    /// into its target's window checked. Every op reads current values, every
+    /// exit delivers its window, and the stack ends current.
     #[test]
     fn random_traces() {
         let mut rng = Rng(0x2545f4914f6cdd1d);
@@ -1066,8 +1091,10 @@ mod tests {
             let mut kinds = Vec::new();
             for _ in 0..1 + rng.below(24) {
                 let k = rng.below(12);
+                let header = rng.below(2) == 0;
                 let mut slot = || rng.below(6);
                 match k {
+                    0 if header => kinds.push(5),
                     0 => kinds.push(1),
                     1 => kinds.push(2),
                     2 => kinds.push(3),
@@ -1091,6 +1118,7 @@ mod tests {
                 .chain(kinds.iter().map(|kind| match kind {
                     0 => Step::Op(&**next_op.next().unwrap(), (0..WINDOW).collect()),
                     1 => Step::Start,
+                    5 => Step::Header,
                     2 => Step::Flush,
                     3 => {
                         let mut window = [None; WINDOW];
@@ -1113,7 +1141,7 @@ mod tests {
             let mut machine = Machine::default();
             for (step, s) in steps.iter().enumerate() {
                 match s {
-                    Step::Start => {
+                    Step::Start | Step::Header => {
                         let entry = Cache::entry(plan.windows[step], alloc.cache());
                         for emit in alloc.transfer(&entry) {
                             machine.exec(emit, None);

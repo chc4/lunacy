@@ -19,7 +19,7 @@ block 0 hotness 0 pc 0 entered with {}
     5 jump(1)
       to block 1 (entered with {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=[4]*}): 
       window {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=[4]*}
-block 1 hotness 0 pc 13 entered with {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=[4]*}
+block 1 hotness 63 pc 13 entered with {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=[4]*}
     0 window(NumericIntInt, 4, 6, out 4)
       w5 <- w7; op at w5 #5
       window {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=[4]*}
@@ -32,7 +32,7 @@ block 1 hotness 0 pc 13 entered with {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=
     3 jump(2)
       to block 2 (entered with {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=[4]*}): 
       window {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=[4]*}
-block 2 hotness 0 pc 13 entered with {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=[4]*}
+block 2 hotness 63 pc 13 entered with {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=[4]*}
     0 window(ForLoop, 4, 5, 6, 7, out 7)
       w2 <- w7; w5 <- [7]; op at w2 #7
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
@@ -40,11 +40,11 @@ block 2 hotness 0 pc 13 entered with {w0=[3]* w2=[0] w3=[5]* w4=[6]* w6=[6]* w7=
       to block 4 (entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}): 
       to block 3 (entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}): 
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
-block 3 hotness 0 pc 14 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
+block 3 hotness 64 pc 14 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
     0 ret
       flush: [3] <- w0; [4] <- w2; [5] <- w3; [6] <- w4; [7] <- w6 #8
       window {}
-block 4 hotness 0 pc 5 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
+block 4 hotness 62 pc 5 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
     0 guard(7, number)
       tests w6
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
@@ -54,7 +54,7 @@ block 4 hotness 0 pc 5 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=
     2 jump(5)
       to block 5 (entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}): 
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
-block 5 hotness 0 pc 5 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
+block 5 hotness 62 pc 5 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
     0 guard(1, number)
       tests r10 <- [1] #10
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
@@ -64,7 +64,7 @@ block 5 hotness 0 pc 5 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=
     2 jump(6)
       to block 6 (entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}): 
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
-block 6 hotness 0 pc 5 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
+block 6 hotness 63 pc 5 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=[4]*}
     0 window(NumericIntInt, 7, 1, out 8)
       w5 <- w6; w6 <- [1]; op at w5 #12
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w5=[7]* w6=[1] w7=[8]*}
@@ -77,7 +77,7 @@ block 6 hotness 0 pc 5 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[7]* w7=
     3 jump(7)
       to block 7 (entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w5=[7]* w6=[1] w7=[8]*}): 
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w5=[7]* w6=[1] w7=[8]*}
-block 7 hotness 0 pc 6 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w5=[7]* w6=[1] w7=[8]*}
+block 7 hotness 63 pc 6 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w5=[7]* w6=[1] w7=[8]*}
     0 window(NumericIntInt, 8, 2, out 8)
       [7] <- w5; w5 <- w7; w6 <- [2]; op at w5 #15
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}
@@ -88,11 +88,11 @@ block 7 hotness 0 pc 6 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w5=[7]* w6=
       to block 15 (entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}): 
       to block 8 (entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}): 
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}
-block 8 hotness 0 pc 8 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}
+block 8 hotness 63 pc 8 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}
     0 jump(9)
       to block 9 (entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}): 
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}
-block 9 hotness 0 pc 10 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}
+block 9 hotness 63 pc 10 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}
     0 window(NumericIntInt, 8, 1, out 9)
       w5 <- w7; w6 <- [1]; op at w5 #17
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w5=[8]* w6=[1] w7=[9]*}
@@ -112,11 +112,11 @@ block 9 hotness 0 pc 10 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=
       to block 11 (entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}): 
       to block 10 (entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}): 
       window {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}
-block 10 hotness 0 pc 14 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}
+block 10 hotness 63 pc 14 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}
     0 ret
       flush: [3] <- w2; [5] <- w4; [6] <- w5; [9] <- w0; [4] <- w3; [7] <- w7 #22
       window {}
-block 11 hotness 0 pc 5 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}
+block 11 hotness 45 pc 5 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}
     0 window(NumericIntInt, 7, 1, out 8)
       [6] <- w5; w5 <- w7; w6 <- [1]; op at w5 #23
       window {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[7]* w6=[1] w7=[8]*}
@@ -130,11 +130,11 @@ block 11 hotness 0 pc 5 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=
       to block 14 (entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}): 
       to block 12 (entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}): 
       window {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}
-block 12 hotness 0 pc 8 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}
+block 12 hotness 63 pc 8 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}
     0 jump(13)
       to block 13 (entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}): 
       window {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}
-block 13 hotness 0 pc 10 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}
+block 13 hotness 63 pc 10 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}
     0 window(NumericIntInt, 8, 1, out 9)
       w5 <- w7; w6 <- [1]; op at w5 #26
       window {w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[8]* w6=[1] w7=[9]*}
@@ -154,7 +154,7 @@ block 13 hotness 0 pc 10 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6
       to block 11 (compiled, entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}): 
       to block 10 (compiled, entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}): 
       window {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6] w7=[7]*}
-block 14 hotness 0 pc 9 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}
+block 14 hotness 46 pc 9 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[2] w7=[8]*}
     0 window(NumericIntCint, 8, out 8)
       w5 <- w7; op at w5 #31
       window {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=[8]*}
@@ -177,7 +177,7 @@ block 14 hotness 0 pc 9 entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w6=
       to block 11 (compiled, entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}): 
       to block 10 (compiled, entered with {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6]* w7=[7]*}): 
       window {w0=[9]* w1=[2] w2=[3]* w3=[4]* w4=[5]* w5=[6] w7=[7]*}
-block 15 hotness 0 pc 9 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}
+block 15 hotness 64 pc 9 entered with {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[2] w7=[8]*}
     0 window(NumericIntCint, 8, out 8)
       w5 <- w7; op at w5 #37
       window {w0=[3]* w2=[4]* w3=[5]* w4=[6]* w6=[8]*}
