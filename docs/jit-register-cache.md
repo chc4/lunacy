@@ -19,7 +19,8 @@ in GPRs across JIT code instead of round-tripping every operand through
   `(&mut Owner, &mut RunState)`. The interpreter calls it; the JIT emits a
   **static call** to the closure's body.
 - **Everything reads/writes `state.vals[state.base + slot]` (memory).** The JIT
-  pins `r12=owner, r13=state, r14=&vals[base]`. Guards do inline NuN-box tag
+  pins `r12=state, r13=&vals[base]`; the `Owner` token is zero-sized, so it is
+  forged where a callee wants one rather than passed. Guards do inline NuN-box tag
   tests against a slot's stack home, but `Exec` bodies still load/compute/store
   operands through the stack, plus a `call` per op. **That memory traffic + the
   call are what the register cache removes.**
@@ -138,7 +139,7 @@ compiled closure body — no duplicated op semantics in the JIT) while inlining
 with register operands and no call. Costs to go in eyes-open: LLVM doesn't pin
 stencil register usage/layout, so operands must be expressed as **relocations**
 (extern-symbol holes) to patch, not "byte N"; reserve a fixed register partition
-(pinned `owner`/`state`/`base` vs. value-cache regs); `become` /
+(pinned `state`/`base` vs. value-cache regs); `become` /
 `explicit_tail_calls` is nightly.
 
 ---

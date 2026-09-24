@@ -1179,7 +1179,7 @@ mod tests {
     fn random_traces() {
         let mut rng = Rng(0x2545f4914f6cdd1d);
         for _ in 0..3000 {
-            let width = 5 + rng.below(4);
+            let width = 5 + rng.below(5);
             let mut ops = Vec::new();
             let mut kinds = Vec::new();
             for _ in 0..1 + rng.below(24) {

@@ -10,7 +10,7 @@
 //! * an `#[inline(always)]` body shared by both tiers (single source of truth);
 //! * a `rust-preserve-none` stencil `__stencil::<SKIP>`: the fixed params
 //!   `(state, base)` (the ABI the JIT pins in r12/r13) followed by the
-//!   register window as **scalar** `LBoxed` params `w0..w7` (r14, r15, rdi, rsi, rdx, rcx, r8, r9; see
+//!   register window as **scalar** `LBoxed` params `w0..w8` (r14, r15, rdi, rsi, rdx, rcx, r8, r9, r11; see
 //!   `WINDOW`). The body's `owner` is forged (`crate::forge_owner`): the
 //!   token is zero-sized, so passing it would only spend a register.
 //!   Scalars, not `[LBoxed; N]`, because Rust passes arrays by pointer whatever
@@ -49,7 +49,7 @@
 // Note [Register window]
 // ~~~~~~~~~~~~~~~~~~~~~~
 // A window op's operands are whole `LBoxed` values held in the register window:
-// `WINDOW` registers, passed between stencils as the scalar params `w0..w7`. An
+// `WINDOW` registers, passed between stencils as the scalar params `w0..w8`. An
 // op always runs on a contiguous run of the window: operand `i`, in the order
 // the op declares its operands, is register `SKIP + i`, and
 // `Window::stencil(skip)` is the instance for that `SKIP`. The order is the op's
@@ -87,12 +87,12 @@ use crate::lboxed::LBoxed;
 use crate::vm::RunState;
 use crate::Owner;
 
-/// Number of register-window slots (w0..w7 = r14, r15, rdi, rsi, rdx, rcx, r8, r9).
+/// Number of register-window slots (w0..w8 = r14, r15, rdi, rsi, rdx, rcx, r8, r9, r11).
 /// `rust-preserve-none` passes 12 integer arguments in registers, 2 of them the
-/// fixed params; the 11th (r11) is unused, and the 12th (rax) can't be a window register: a stencil's
+/// fixed params, but the 12th (rax) can't be a window register: a stencil's
 /// `become` may be an indirect jump through the GOT, whose target LLVM loads
 /// into rax even when rax carries an argument, and that load stays in the copy.
-pub const WINDOW: usize = 8;
+pub const WINDOW: usize = 9;
 /// Number of hole statics available to captures.
 pub const MAX_HOLES: usize = 2;
 // `Captures` and `Regs` use literal lengths: with `generic_const_exprs` on, a named
@@ -100,8 +100,8 @@ pub const MAX_HOLES: usize = 2;
 /// A window op's hole values.
 pub type Captures = SmallVec<[u64; 2]>;
 /// The register window's values.
-pub type Regs<'src, 'intern> = [LBoxed<'src, 'intern>; 8];
-const _: () = assert!(MAX_HOLES == 2 && WINDOW == 8);
+pub type Regs<'src, 'intern> = [LBoxed<'src, 'intern>; 9];
+const _: () = assert!(MAX_HOLES == 2 && WINDOW == 9);
 
 // ---- holes / continuation / anchor ---------------------------------------
 
@@ -381,16 +381,17 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                w8: $crate::lboxed::LBoxed<'src, 'intern>,
             ) {
                 if SKIP + Self::ARITY > $crate::window::WINDOW {
                     // Never used: `stencil(skip)` rejects such `skip`.
                     unsafe { core::hint::unreachable_unchecked() }
                 }
-                let mut w = [w0, w1, w2, w3, w4, w5, w6, w7];
+                let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
                 unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
-                become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
+                become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
             }
 
             /// This op's `become` target; the `jmp` to it is sliced off when
@@ -414,8 +415,9 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                w8: $crate::lboxed::LBoxed<'src, 'intern>,
             ) {
-                core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7));
+                core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8));
             }
         }
 
@@ -438,6 +440,7 @@ macro_rules! windowed {
                     5 => Self::__stencil::<5> as *const () as usize,
                     6 => Self::__stencil::<6> as *const () as usize,
                     7 => Self::__stencil::<7> as *const () as usize,
+                    8 => Self::__stencil::<8> as *const () as usize,
                     _ => unreachable!(),
                 }
             }
@@ -938,8 +941,9 @@ unsafe fn enter<'src, 'intern>(
         *mut L<'src, 'intern>,
         L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>,
         L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>,
+        L<'src, 'intern>,
     ) = unsafe { core::mem::transmute(exec.ptr(dynasmrt::AssemblyOffset(0))) };
-    entry(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    entry(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8]);
 }
 
 /// Operand slots for an op that reads the whole window (at `SKIP` 0). Its
@@ -964,9 +968,9 @@ mod check {
 
     // Writes the window to the address in its capture (a hole), so observing the
     // result doesn't depend on `base`, which the op under test may use.
-    windowed!(CheckFlush, [out: u64], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7) {
+    windowed!(CheckFlush, [out: u64], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7, w8) {
         let out = out as *mut [u64; WINDOW];
-        *out = [w0, w1, w2, w3, w4, w5, w6, w7].map(|w| w.bits());
+        *out = [w0, w1, w2, w3, w4, w5, w6, w7, w8].map(|w| w.bits());
     });
 
     struct Checker {
@@ -1033,8 +1037,8 @@ mod tests {
         *d = LBoxed::from_number(a.as_number().unwrap_unchecked() + k);
     });
     // Flush the whole window to `base[0..WINDOW]`, to observe the result.
-    windowed!(Flush, [], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7) {
-        *(base as *mut [LBoxed; WINDOW]) = [w0, w1, w2, w3, w4, w5, w6, w7];
+    windowed!(Flush, [], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7, w8) {
+        *(base as *mut [LBoxed; WINDOW]) = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
     });
 
     // A stencil that calls out of line (as table get/set through `IndexMap`

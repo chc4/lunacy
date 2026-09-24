@@ -209,13 +209,13 @@ fn window_count(counts: &std::cell::RefCell<Vec<Box<std::sync::atomic::AtomicU64
     counts.len() - 1
 }
 
-/// The window registers `w0..w7` in the order the stencil ABI passes them (the
+/// The window registers `w0..w8` in the order the stencil ABI passes them (the
 /// `rust-preserve-none` arguments after state and base in r12, r13),
 /// then `SCRATCH`: rax, which every stencil clobbers (LLVM loads its `become`
 /// target into it), so it only holds a value within one sequence of moves.
 const WINDOW_REGS: [u8; WINDOW + 1] = [
     14, /* r14 */ 15, /* r15 */ 7, /* rdi */ 6, /* rsi */ 2, /* rdx */ 1, /* rcx */
-    8, /* r8 */ 9, /* r9 */ 0, /* rax */
+    8, /* r8 */ 9, /* r9 */ 11, /* r11 */ 0, /* rax */
 ];
 
 /// An 8-byte entry of the pool emitted after a compiled region's code.
