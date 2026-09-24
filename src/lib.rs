@@ -37,6 +37,21 @@ pub use vm::Vm;
 pub struct TlcOwner;
 /// The cell owner handle, threaded through every read or write of a GC-managed [`TLCell`].
 pub type Owner = qcell::TLCellOwner<TlcOwner>;
+
+const _: () = assert!(core::mem::size_of::<Owner>() == 0, "Owner is a zero-sized token");
+
+/// An `Owner` token for code the thread's one real owner is lent to but not
+/// passed: the JIT's calling convention and its stencils leave the
+/// zero-sized token out, and forge it where a callee wants one.
+///
+/// # Safety
+/// The thread's real `Owner` must be lent to the caller for as long as the
+/// forged one is used, as it is to JIT code for the duration of the call
+/// into it.
+#[inline(always)]
+pub unsafe fn forge_owner<'a>() -> &'a mut Owner {
+    unsafe { core::ptr::NonNull::dangling().as_mut() }
+}
 pub use qcell::TLCell;
 
 pub use log::debug;

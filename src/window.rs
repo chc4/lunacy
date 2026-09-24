@@ -9,9 +9,10 @@
 //!   site enumerates ops (like `Exec`'s closure);
 //! * an `#[inline(always)]` body shared by both tiers (single source of truth);
 //! * a `rust-preserve-none` stencil `__stencil::<SKIP>`: the fixed params
-//!   `(owner, state, base)` (the ABI the JIT pins in r12/r13/r14) followed by the
-//!   register window as **scalar** `LBoxed` params `w0..w7` (r15, rdi, rsi, rdx, rcx, r8, r9, r11; see
-//!   `WINDOW`).
+//!   `(state, base)` (the ABI the JIT pins in r12/r13) followed by the
+//!   register window as **scalar** `LBoxed` params `w0..w7` (r14, r15, rdi, rsi, rdx, rcx, r8, r9; see
+//!   `WINDOW`). The body's `owner` is forged (`crate::forge_owner`): the
+//!   token is zero-sized, so passing it would only spend a register.
 //!   Scalars, not `[LBoxed; N]`, because Rust passes arrays by pointer whatever
 //!   the ABI, which would put the window in memory. Operand `i`, in the order
 //!   the op declares them, is `w[SKIP + i]` (see Note [Register window]).
@@ -86,9 +87,9 @@ use crate::lboxed::LBoxed;
 use crate::vm::RunState;
 use crate::Owner;
 
-/// Number of register-window slots (w0..w7 = r15, rdi, rsi, rdx, rcx, r8, r9, r11).
-/// `rust-preserve-none` passes 12 integer arguments in registers, 3 of them the
-/// fixed params, but the 12th (rax) can't be a window register: a stencil's
+/// Number of register-window slots (w0..w7 = r14, r15, rdi, rsi, rdx, rcx, r8, r9).
+/// `rust-preserve-none` passes 12 integer arguments in registers, 2 of them the
+/// fixed params; the 11th (r11) is unused, and the 12th (rax) can't be a window register: a stencil's
 /// `become` may be an indirect jump through the GOT, whose target LLVM loads
 /// into rax even when rax carries an argument, and that load stays in the copy.
 pub const WINDOW: usize = 8;
@@ -369,8 +370,7 @@ macro_rules! windowed {
             }
 
             /// The stencil running at `SKIP`.
-            pub extern "rust-preserve-none" fn __stencil<'a, 'b, 'src, 'intern, const SKIP: usize>(
-                owner: &'a mut $crate::Owner,
+            pub extern "rust-preserve-none" fn __stencil<'b, 'src, 'intern, const SKIP: usize>(
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 w0: $crate::lboxed::LBoxed<'src, 'intern>,
@@ -388,8 +388,9 @@ macro_rules! windowed {
                 }
                 let mut w = [w0, w1, w2, w3, w4, w5, w6, w7];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
-                unsafe { Self::__window($($cap,)* &mut *owner, &mut *state, base, &mut w, SKIP) };
-                become Self::__next(owner, state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
+                // The JIT lends this code the thread's owner. See `crate::forge_owner`.
+                unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
             }
 
             /// This op's `become` target; the `jmp` to it is sliced off when
@@ -402,8 +403,7 @@ macro_rules! windowed {
             /// window: LLVM deletes a tail call to an empty internal callee, and
             /// with it every computation feeding the window.
             #[inline(never)]
-            extern "rust-preserve-none" fn __next<'a, 'b, 'src, 'intern>(
-                owner: &'a mut $crate::Owner,
+            extern "rust-preserve-none" fn __next<'b, 'src, 'intern>(
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 w0: $crate::lboxed::LBoxed<'src, 'intern>,
@@ -415,7 +415,7 @@ macro_rules! windowed {
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
             ) {
-                core::hint::black_box((owner as *mut $crate::Owner, state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7));
+                core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7));
             }
         }
 
@@ -928,20 +928,18 @@ pub unsafe fn assemble(
 #[cfg(any(test, feature = "check_windows"))]
 unsafe fn enter<'src, 'intern>(
     exec: &ExecutableBuffer,
-    owner: *mut Owner,
     state: *mut RunState<'src, 'intern>,
     base: *mut LBoxed<'src, 'intern>,
     w: Regs<'src, 'intern>,
 ) {
     type L<'s, 'i> = LBoxed<'s, 'i>;
     let entry: extern "rust-preserve-none" fn(
-        *mut Owner,
         *mut RunState<'src, 'intern>,
         *mut L<'src, 'intern>,
         L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>,
         L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>,
     ) = unsafe { core::mem::transmute(exec.ptr(dynasmrt::AssemblyOffset(0))) };
-    entry(owner, state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    entry(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 }
 
 /// Operand slots for an op that reads the whole window (at `SKIP` 0). Its
@@ -1012,7 +1010,7 @@ mod check {
                 }
             });
             let Some(exec) = program else { return };
-            unsafe { enter(exec, owner, state, base, before) };
+            unsafe { enter(exec, state, base, before) };
             let native = unsafe { *c.out };
             let interp: [u64; WINDOW] = core::array::from_fn(|i| after[i].bits());
             assert_eq!(native, interp, "{}: copy&patched stencil disagrees with the interpreter", op.name());
@@ -1068,7 +1066,7 @@ mod tests {
         for (w, &v) in w.iter_mut().zip(values) {
             *w = LBoxed::from_number(v);
         }
-        unsafe { enter(exec, core::ptr::null_mut(), core::ptr::null_mut(), out.as_mut_ptr(), w) };
+        unsafe { enter(exec, core::ptr::null_mut(), out.as_mut_ptr(), w) };
     }
 
     /// Both arms of a branchy stencil fall through to the next stencil, however

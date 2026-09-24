@@ -47,7 +47,7 @@ impl JitInfo {
     }
 }
 
-pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&mut Owner, &'a mut RunState<'src, 'intern>, *const LBoxed<'src, 'intern>) -> u64;
+pub type JitExec = for<'a, 'src, 'intern> extern "rust-preserve-none" fn(&'a mut RunState<'src, 'intern>, *const LBoxed<'src, 'intern>) -> u64;
 
 pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)) -> (*const (), usize, usize) {
     let (addr, meta) = (f as *const dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)).to_raw_parts();
@@ -62,6 +62,10 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
         return (addr, vtable.vtable as &_ as *const _ as usize, call);
     }
 }
+
+/// The address the JIT passes as an `&mut Owner` argument: the token is
+/// zero-sized, so any non-null aligned address is one. See `crate::forge_owner`.
+const FORGED_OWNER: i64 = core::mem::align_of::<Owner>() as i64;
 
 pub struct JitHelper;
 impl JitHelper {
@@ -106,10 +110,10 @@ impl JitHelper {
 
     /// Run a window op whose stencil the copier rejected, through its
     /// interpreter path: operands from their stack homes, outputs flushed.
-    pub unsafe extern "C" fn window_interp(owner: *mut (), state: *mut (), op: *const (), vtable: *const ()) {
+    pub unsafe extern "C" fn window_interp(state: *mut (), op: *const (), vtable: *const ()) {
         unsafe {
             let op: *const dyn Window = core::ptr::from_raw_parts(op, core::mem::transmute(vtable));
-            let owner = &mut *(owner as *mut Owner);
+            let owner = crate::forge_owner();
             let state = &mut *(state as *mut RunState<'static, 'static>);
             (*op).interp(owner, state);
         }
@@ -118,9 +122,9 @@ impl JitHelper {
     /// Incremental GC safepoint from JIT'd code. The roots (state + specializer)
     /// were published before entering the JIT and the value stack is mutated in
     /// place, so `step_published` traces the live state. See Note [GC roots].
-    pub unsafe extern "C" fn gc_safepoint(owner: *mut ()) {
+    pub unsafe extern "C" fn gc_safepoint() {
         unsafe {
-            let owner = &*(owner as *const Owner);
+            let owner = crate::forge_owner();
             GcCtx::assume_rooted().step_published(owner);
         }
     }
@@ -206,12 +210,12 @@ fn window_count(counts: &std::cell::RefCell<Vec<Box<std::sync::atomic::AtomicU64
 }
 
 /// The window registers `w0..w7` in the order the stencil ABI passes them (the
-/// `rust-preserve-none` arguments after owner, state and base in r12, r13, r14),
+/// `rust-preserve-none` arguments after state and base in r12, r13),
 /// then `SCRATCH`: rax, which every stencil clobbers (LLVM loads its `become`
 /// target into it), so it only holds a value within one sequence of moves.
 const WINDOW_REGS: [u8; WINDOW + 1] = [
-    15, /* r15 */ 7, /* rdi */ 6, /* rsi */ 2, /* rdx */ 1, /* rcx */
-    8, /* r8 */ 9, /* r9 */ 11, /* r11 */ 0, /* rax */
+    14, /* r14 */ 15, /* r15 */ 7, /* rdi */ 6, /* rsi */ 2, /* rdx */ 1, /* rcx */
+    8, /* r8 */ 9, /* r9 */ 0, /* rax */
 ];
 
 /// An 8-byte entry of the pool emitted after a compiled region's code.
@@ -273,11 +277,11 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit) {
     match emit {
         Emit::Load { reg: r, slot } => dynasm!(ops
             ; .arch x64
-            ; mov Rq(reg(r)), QWORD [r14 + (slot * 8) as i32]
+            ; mov Rq(reg(r)), QWORD [r13 + (slot * 8) as i32]
         ),
         Emit::Store { slot, reg: r } => dynasm!(ops
             ; .arch x64
-            ; mov QWORD [r14 + (slot * 8) as i32], Rq(reg(r))
+            ; mov QWORD [r13 + (slot * 8) as i32], Rq(reg(r))
         ),
         Emit::Move { dst, src } => dynasm!(ops
             ; .arch x64
@@ -530,14 +534,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let entry = ops.offset();
 
         // SystemV ABI is RDI, RSI, RDX, RCX, R8, R9
-        // JitExec (rust-preserve-none): R12=owner, R13=state, R14=base_ptr, R15=base_ptr
+        // JitExec (rust-preserve-none): R12=state, R13=base_ptr
 
         dynasm!(ops
             ; .arch x64
             ; push rbp
             ; mov rbp, rsp
             ; push rbx
-            ; push r14 // save initial base_ptr
+            ; push r13 // save initial base_ptr
         );
         // TODO: Pin state.vals.as_ptr() to a register, which will let us remove a lot of the
         // JitHelper function calls.
@@ -613,7 +617,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         dynasm!(ops
             ; .arch x64
             ; ->exit_jit:
-            ; pop r14
+            ; pop r13
             ; pop rbx
             ; pop rbp
             ; ret
@@ -931,9 +935,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // this same function again immediately in a loop.
                 dynasm!(ops
                     ; .arch x64
-                    ; mov WORD r13 => RunState.current_off, (off as i16)
+                    ; mov WORD r12 => RunState.current_off, (off as i16)
                     ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
-                    ; mov BYTE r13 => RunState.trap, 1
+                    ; mov BYTE r12 => RunState.trap, 1
                     ; jmp ->exit_jit
                 );
             } else {
@@ -941,7 +945,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 dynasm!(ops
                     ; .arch x64
                     ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
-                    ; mov BYTE r13 => RunState.trap, 1
+                    ; mov BYTE r12 => RunState.trap, 1
                     ; jmp ->exit_jit
                 );
             }
@@ -952,8 +956,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         #[cfg(feature = "gas")]
         let emit_gas_check = |ops: &mut Assembler, off: usize, cost: usize, stores: &[Emit]| {
             dynasm!(ops
-                ; sub QWORD r13 => RunState.gas, cost as i32
-                ; mov WORD r13 => RunState.current_off, (off as i16)
+                ; sub QWORD r12 => RunState.gas, cost as i32
+                ; mov WORD r12 => RunState.current_off, (off as i16)
                 ; ja >have_gas
             );
             for &emit in stores {
@@ -961,7 +965,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             dynasm!(ops
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
-                ; mov BYTE r13 => RunState.trap, 1
+                ; mov BYTE r12 => RunState.trap, 1
                 ; jmp ->exit_jit
                 ; have_gas:
             );
@@ -1032,7 +1036,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             window_dump!(self.jctx, "      tests r10 <- [{idx}]{counted}");
                             dynasm!(ops
                                 ; .arch x64
-                                ; mov r10, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                                ; mov r10, QWORD r13 => LBoxed<'src, 'intern>[*idx as i32]
                             );
                             10 // r10
                         }
@@ -1096,7 +1100,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let expected_u8 = *expected as u8;
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r13 // state
+                        ; mov rdi, r12 // state
                         ; mov rsi, WORD (*idx as i32) // idx
                         ; mov rdx, WORD (expected_u8 as i32) // expected
                         ; call extern (JitHelper::check_guard as *const () as usize)
@@ -1110,7 +1114,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // `native` fn pointer and compare to the specialized target.
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                        ; mov rax, QWORD r13 => LBoxed<'src, 'intern>[*idx as i32]
                         ; mov rcx, QWORD (*ptr as i64)
                         ; cmp rcx, QWORD rax => NClosureCell.native
                         ; jz =>insts[off + 2]
@@ -1123,7 +1127,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // and compare its `prototype` to the specialized identity.
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rax, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
+                        ; mov rax, QWORD r13 => LBoxed<'src, 'intern>[*idx as i32]
                         ; lea rax, rax => GcInner<TLCell<TlcOwner, LClosure<'src, 'intern>>>.val
                         ; mov rcx, QWORD (*ptr as i64)
                         ; cmp rcx, QWORD rax => LClosure<'src, 'intern>.prototype
@@ -1135,7 +1139,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let href_u8 = href.0;
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r13 // state
+                        ; mov rdi, r12 // state
                         ; mov rsi, WORD (*tab as i32)
                         ; mov rdx, WORD (href_u8 as i32)
                         ; call extern (JitHelper::check_epoch as *const () as usize)
@@ -1149,7 +1153,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let expected_u8 = *expected as u8;
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r13 // state
+                        ; mov rdi, r12 // state
                         ; mov rsi, WORD (*tab as i32)
                         ; mov rdx, WORD (href_u8 as i32)
                         ; mov rcx, WORD (expected_u8 as i32)
@@ -1164,15 +1168,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("JIT memory @ {:?}, operation @ {:#x}, desired {:?}", x, this_call, &mut JitHelper::check_guard as &mut _ as *mut _ as *mut core::ffi::c_void);
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rsi, r12 // owner
-                        ; mov rdx, r13 // state
+                        ; mov rsi, QWORD FORGED_OWNER // owner
+                        ; mov rdx, r12 // state
                         ; mov rdi, QWORD (this_obj as i64)
                         ; mov rax, QWORD (this_vtable as i64)
                         // Lua wants to see PC+1, and also we want to resume to PC+1 if we trap.
-                        ; mov WORD r13 => RunState.current_off, ((off + 1) as i16)
+                        ; mov WORD r12 => RunState.current_off, ((off + 1) as i16)
                         ; call extern (this_call)
                         //// Check for trap
-                        ; mov al, BYTE r13 => RunState.trap
+                        ; mov al, BYTE r12 => RunState.trap
                         ; test al, al
                         ; jz >no_trap
                         //// Trap 4 so specializer can handle it
@@ -1198,28 +1202,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // Pin the exact monomorphized address of the extern "C" call_lua.
                             let call_lua: extern "C" fn(&mut RunState<'src, 'intern>, &mut Owner, PackedLocation, u16, u16, u16) -> usize = RunState::call_lua;
                             dynasm!(ops
-                                ; mov rdi, r13 // &mut RunState
-                                ; mov rsi, r12 // owner
+                                ; mov rdi, r12 // &mut RunState
+                                ; mov rsi, QWORD FORGED_OWNER // owner
                                 ; mov rdx, QWORD (packed_ret.bits() as i64)
                                 ; mov rcx, WORD (*a as i32)
                                 ; mov  r8, WORD (*b as i32)
                                 ; mov  r9, WORD (*c as i32)
                                 ; call extern (call_lua as *const () as usize)
 
-                                // Reload r14 = callee base ptr = vals.stack_ptr + base*sizeof(LBoxed)
-                                ; lea rcx, r13 => RunState.vals
+                                // Reload r13 = callee base ptr = vals.stack_ptr + base*sizeof(LBoxed)
+                                ; lea rcx, r12 => RunState.vals
                                 ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
-                                ; mov rcx, QWORD r13 => RunState.base
-                                ; lea r14, [rax + rcx * 8]
+                                ; mov rcx, QWORD r12 => RunState.base
+                                ; lea r13, [rax + rcx * 8]
 
-                                // state is already in r13
+                                // state is already in r12
                                 ; call extern (entry as usize)
-                                ; mov r14, QWORD [rsp - 0]
+                                ; mov r13, QWORD [rsp - 0]
 
                                 // Check if the call is trying to bailout: we propagate the bailout
                                 // if so, unwinding our native stack but yielding to the generator run loop
                                 // with a suspended ReturnLocation stack.
-                                ; cmp BYTE r13 => RunState.trap, 0
+                                ; cmp BYTE r12 => RunState.trap, 0
                                 ; jnz ->exit_jit
 
                                 // Reload the correct base ptr for the remainder of our function
@@ -1235,7 +1239,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::NativeCall { nf, a, b, c } => {
                     // Native signature `fn(seq, args, returns, owner)` with ZST seq/owner,
                     // so the two `&[LBoxed]` slice views arrive as (rdi=args ptr, rsi=args
-                    // len, rdx=returns ptr, rcx=returns len); r14 is `&vals[base]`. `a/b/c`
+                    // len, rdx=returns ptr, rcx=returns len); r13 is `&vals[base]`. `a/b/c`
                     // are compile-time constants, so specialize the lengths per site: a
                     // fixed count when b/c are non-zero, else `vals.used - base - off` for
                     // the "to top-of-stack" (0) shape. Then call the native directly.
@@ -1243,8 +1247,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     if b == 0 {
                         dynasm!(ops
                             ; .arch x64
-                            ; mov rax, QWORD r13 => RunState.top
-                            ; sub rax, QWORD r13 => RunState.base
+                            ; mov rax, QWORD r12 => RunState.top
+                            ; sub rax, QWORD r12 => RunState.base
                             ; sub rax, (a + 1)
                             ; mov rsi, rax
                         );
@@ -1256,8 +1260,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     if c == 0 && b == 0 {
                         dynasm!(ops
                             ; .arch x64
-                            ; mov rax, QWORD r13 => RunState.top
-                            ; sub rax, QWORD r13 => RunState.base
+                            ; mov rax, QWORD r12 => RunState.top
+                            ; sub rax, QWORD r12 => RunState.base
                             ; sub rax, a
                             ; mov rcx, rax
                         );
@@ -1270,8 +1274,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     dynasm!(ops
                         ; .arch x64
-                        ; lea rdi, [r14 + ((a + 1) * 8)] // args ptr = &vals[base + a + 1]
-                        ; lea rdx, [r14 + (a * 8)]       // returns ptr = &vals[base + a]
+                        ; lea rdi, [r13 + ((a + 1) * 8)] // args ptr = &vals[base + a + 1]
+                        ; lea rdx, [r13 + (a * 8)]       // returns ptr = &vals[base + a]
                         ; call extern (*nf as usize)     // direct, statically-known target
                     );
                     // Taking every result, the caller reads up to the top: the
@@ -1280,8 +1284,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         if b == 0 {
                             dynasm!(ops
                                 ; .arch x64
-                                ; mov rcx, QWORD r13 => RunState.top
-                                ; sub rcx, QWORD r13 => RunState.base
+                                ; mov rcx, QWORD r12 => RunState.top
+                                ; sub rcx, QWORD r12 => RunState.base
                                 ; sub rcx, a
                             );
                         } else {
@@ -1291,9 +1295,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; .arch x64
                             ; cmp rax, rcx
                             ; cmova rax, rcx
-                            ; add rax, QWORD r13 => RunState.base
+                            ; add rax, QWORD r12 => RunState.base
                             ; add rax, a
-                            ; mov QWORD r13 => RunState.top, rax
+                            ; mov QWORD r12 => RunState.top, rax
                         );
                     }
                 },
@@ -1309,17 +1313,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Ret(pc, a, b) => {
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r13 // state
+                        ; mov rdi, r12 // state
                         ; mov rsi, WORD (*a as i32)
                         ; mov rdx, WORD (*b as i32)
-                        ; mov rcx, r14 // base_ptr
+                        ; mov rcx, r13 // base_ptr
                         ; call extern (JitHelper::lua_return as *const () as usize)
                         ; jmp ->exit_jit
                     );
                 },
                 Residual::Select(targets) => {
                     dynasm!(ops
-                        ; mov rax, QWORD r13 => RunState.select
+                        ; mov rax, QWORD r12 => RunState.select
                     );
                     // A taken target's transfer may use rax (`SCRATCH`): the
                     // comparisons only continue on the paths not taken.
@@ -1341,7 +1345,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::GC => {
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r12 // owner
                         ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
@@ -1384,10 +1387,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let vtable: *const () = unsafe { core::mem::transmute(vtable) };
                             dynasm!(ops
                                 ; .arch x64
-                                ; mov rdi, r12 // owner
-                                ; mov rsi, r13 // state
-                                ; mov rdx, QWORD (op as i64)
-                                ; mov rcx, QWORD (vtable as i64)
+                                ; mov rdi, r12 // state
+                                ; mov rsi, QWORD (op as i64)
+                                ; mov rdx, QWORD (vtable as i64)
                                 ; call extern (JitHelper::window_interp as *const () as usize)
                             );
                         }
@@ -1397,7 +1399,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // falls through to `off + 1`, both with the window live.
                         dynasm!(ops
                             ; .arch x64
-                            ; cmp QWORD r13 => RunState.select, 0
+                            ; cmp QWORD r12 => RunState.select, 0
                             ; jz =>insts[off + 2]
                         );
                     }
@@ -1410,9 +1412,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         emit_window_move(ops, emit);
                     }
                     dynasm!(ops
-                        ; mov WORD r13 => RunState.current_off, (off as i16)
+                        ; mov WORD r12 => RunState.current_off, (off as i16)
                         ; mov rax, QWORD (((-4i32 as u64) << 32 | (id.0 as u64)) as i64)
-                        ; mov BYTE r13 => RunState.trap, 1
+                        ; mov BYTE r12 => RunState.trap, 1
                         ; jmp ->exit_jit
                     );
                 },

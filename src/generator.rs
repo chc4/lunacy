@@ -2491,7 +2491,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let base_ptr = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
                     warn!("running jit for {id:?} with base_ptr {base_ptr:p}");
                     state.trap = false;
-                    let ret = jit_entry(owner, &mut state, base_ptr);
+                    let ret = jit_entry(&mut state, base_ptr);
                     let next_off = (ret >> 32) as i32 as isize;
                     let next_id = (ret & 0xFFFFFFFF) as usize;
                     self.clos = state.clos.clone();
