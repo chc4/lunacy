@@ -233,12 +233,13 @@ gdb-unsafe benchmark: unsafe-compile
 
 # Hyperfine reports
 # lunacy's interpreter, JIT and unsafe builds against Lua 5.1 and LuaJIT, its
-# interpreter alone (-joff) and with its JIT.
+# interpreter alone (-joff) and with its JIT. Lua 5.1 has no `bit`, so its run
+# of a benchmark requiring it fails at once, and times nothing.
 hyperfine benchmark times='10': unsafe-compile interpreter-compile
     just _luac {{benchmark}}
     cargo build --release --bin bench
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
-        "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}}" \
+        "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}} || true" \
         "luajit -joff bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}}" \
         "luajit bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}}" \
         "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \
@@ -307,7 +308,8 @@ hyperfine-unsafe benchmark: unsafe-compile
 
 
 # `hyperfine` over the benchmarks lunacy runs, each run enough times for a
-# stable mean; life twice, as for `hyperfines-traces`.
-hyperfines: (hyperfine "life" "1000") (hyperfine "life" "5000") (hyperfine "nbody" "10") (hyperfine "queens" "3000") (hyperfine "fannkuch_redux" "150")
+# stable mean; life twice, as for `hyperfines-traces`. euler14's count is the
+# bound of its search.
+hyperfines: (hyperfine "life" "1000") (hyperfine "life" "5000") (hyperfine "nbody" "10") (hyperfine "queens" "3000") (hyperfine "fannkuch_redux" "150") (hyperfine "euler14" "1000000") (hyperfine "nsieve_bit" "10")
 
 all: test benchmarks (hyperfine "binarytrees")
