@@ -433,7 +433,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
 /// The array slot of a number key: the array part holds the integer keys from
 /// 1 up (growing to fit on a write), the hash part every other number (zero,
 /// negatives, fractions), as Lua keeps them apart.
-fn array_slot(n: f64) -> Option<usize> {
+pub(crate) fn array_slot(n: f64) -> Option<usize> {
     (n >= 1.0 && n.fract() == 0.0 && n <= u32::MAX as f64).then(|| n as usize - 1)
 }
 
@@ -1899,13 +1899,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                                 // TODO: only run LBBV for hot code
                                 let types = vec![LType::Unknown; next_stack];
                                 let ctx = Rc::new(Context::new(types));
-                                let versions = spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
-                                let block = if let Some(block) = versions.get(&(SubPc::new(0), ctx.clone())) {
-                                    *block
-                                } else {
-                                    spec.set_current(lclos.clone());
-                                    spec.block(owner, 0, ctx)
-                                };
+                                spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
+                                spec.set_current(lclos.clone());
+                                let block = spec.version(owner, 0, ctx);
                                 debug!("{:?} {block:?}", spec.blocks);
                                 spec.set_current(lclos.clone());
                                 let (r_state, r_vals) = spec.run(gc, owner, block, state);

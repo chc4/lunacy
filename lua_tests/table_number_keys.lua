@@ -26,7 +26,19 @@ end
 print(nsieve({}, 100), nsieve({}, 10000))
 nsieve.__jit = 1
 print(nsieve({}, 100), nsieve({}, 10000))
+-- Stores through constant array indices, values in registers (straight into
+-- the array part, growing it when an index is past the end).
+local function fill(v)
+  local a = {}
+  a[1] = v; a[2] = v + 1; a[4] = v + 3; a[3] = v + 2
+  return a[1] + a[2] + a[3] + a[4], #a
+end
+print(fill(10))
+fill.__jit = 1
+print(fill(10))
 -- EXPECT: zero	minus one	one and a half	one	two	2
 -- EXPECT: nil	one
 -- EXPECT: 25	1229
 -- EXPECT: 25	1229
+-- EXPECT: 46	4
+-- EXPECT: 46	4

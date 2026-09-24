@@ -457,6 +457,10 @@ fn push_gray<T: Mark>(ptr: *const GcInner<T>) {
 
 /// Enqueue onto `grayagain`. See Note [Write barriers].
 #[inline]
+// Rare (a black table written during a cycle), and out of line so a table
+// store's copied stencil keeps only the barrier's color check.
+#[cold]
+#[inline(never)]
 fn push_grayagain<T: Mark>(ptr: *const GcInner<T>) {
     unsafe { (*hp()).grayagain.push((ptr as *const GcInner<()>, scan_thunk::<T>)); }
 }

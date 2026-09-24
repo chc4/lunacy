@@ -689,7 +689,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     .instructions
                     .iter()
                     .map(|res| match res {
-                        Residual::ExecWindow(w) => usable_skips(stencils, &**w),
+                        Residual::ExecWindow(w) | Residual::GuardDynamic(w) => usable_skips(stencils, &**w),
                         _ => SmallVec::new(),
                     })
                     .collect()
@@ -707,7 +707,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let mut events = Vec::new();
                     for (off, res) in self.blocks[block.0].instructions.iter().enumerate() {
                         match res {
-                            Residual::ExecWindow(w) if !skips[off].is_empty() => {
+                            Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[off].is_empty() => {
                                 let operands = w.operands().iter().zip(w.accesses());
                                 events.extend(operands.clone().filter(|(_, a)| **a == Access::Read).map(|(&slot, _)| Event::Read(slot)));
                                 events.extend(operands.filter(|(_, a)| **a == Access::Write).map(|(&slot, _)| Event::Write(slot)));
@@ -809,7 +809,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut of = vec![None; block.instructions.len()];
             for (off, res) in block.instructions.iter().enumerate() {
                 match res {
-                    Residual::ExecWindow(w) if !skips[b][off].is_empty() => {
+                    Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[b][off].is_empty() => {
                         of[off] = Some(steps.len());
                         steps.push(Step::Op(&**w, skips[b][off].clone()));
                     }
@@ -976,8 +976,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // points"). Every edge into a label carries the same window: a jump or
         // thunk leaves the window as it was, for the guard success edge that
         // reaches the residual after it, and a window residual following another
-        // gets no label, so a jump to one fails to assemble.
-        let window = |r: &Residual| matches!(r, Residual::ExecWindow(_));
+        // gets no label, so a jump to one fails to assemble. A `GuardDynamic` is a
+        // window residual whose op is the guard's test.
+        let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_));
         let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_));
         for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
@@ -1344,7 +1345,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
-                Residual::ExecWindow(w) => {
+                Residual::ExecWindow(w) | Residual::GuardDynamic(w) => {
                     let stencils = &mut self.jctx.stencils;
                     let emits = match plans.get(&id) {
                         Some(plan) => plan.placed[off].map(|(skip, want)| {
@@ -1390,6 +1391,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; call extern (JitHelper::window_interp as *const () as usize)
                             );
                         }
+                    }
+                    if let Residual::GuardDynamic(_) = res {
+                        // As an inline guard: a pass jumps to `off + 2`, a failure
+                        // falls through to `off + 1`, both with the window live.
+                        dynasm!(ops
+                            ; .arch x64
+                            ; cmp QWORD r13 => RunState.select, 0
+                            ; jz =>insts[off + 2]
+                        );
                     }
                 },
                 Residual::Thunk(_) => {
