@@ -25,9 +25,12 @@ COUNTED = re.compile(r' #(\d+)$')
 COUNT = re.compile(r'^count #(\d+) (\d+)$')
 
 
+RAW = False
+
+
 def weight(runs):
-    """How much code that ran `runs` times counts."""
-    return math.log2(1 + math.log2(1 + runs))
+    """How much code that ran `runs` times counts: `runs` itself with `--raw`."""
+    return runs if RAW else math.log2(1 + math.log2(1 + runs))
 
 
 def counted(path):
@@ -102,7 +105,10 @@ def main():
     parser.add_argument('--blocks', action='store_true', help="each hot block's counts, side by side")
     parser.add_argument('--all', action='store_true', help='with --blocks, every block, not just the hot ones')
     parser.add_argument('--top', type=int, help='the counted lines executing the most loads, stores and moves')
+    parser.add_argument('--raw', action='store_true', help='weight code by how often it ran, not log log of it')
     args = parser.parse_args()
+    global RAW
+    RAW = args.raw
     if args.top:
         for path in args.dumps:
             print('==', path)

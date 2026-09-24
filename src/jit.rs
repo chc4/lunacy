@@ -720,6 +720,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let live_in = region.liveness();
         let traces = region.traces(policy);
         window_dump!(self.jctx, "traces {}", traces.iter().map(|trace| trace.iter().map(|&b| ids[b].0.to_string()).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" | "));
+        for (b, live) in live_in.iter().enumerate() {
+            window_dump!(self.jctx, "live into block {}: {:?}", ids[b].0, live.iter().collect::<Vec<_>>());
+        }
         let mut plans = Plans::default();
         for trace in &traces {
             for (pos, &b) in trace.iter().enumerate().rev() {
