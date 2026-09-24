@@ -4,54 +4,24 @@ use lunacy::Vm;
 use lunacy::chunk;
 use lunacy::vm;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const TIMES: usize = 10;
-
-/// The system allocator, counting what goes through it (feature `alloc_count`).
-#[cfg(feature = "alloc_count")]
-mod alloc_count {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-
-    pub static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-    pub static REALLOCS: AtomicUsize = AtomicUsize::new(0);
-    pub static FREES: AtomicUsize = AtomicUsize::new(0);
-    pub static BYTES: AtomicUsize = AtomicUsize::new(0);
-
-    pub struct Counting;
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            ALLOCS.fetch_add(1, Relaxed);
-            BYTES.fetch_add(layout.size(), Relaxed);
-            unsafe { System.alloc(layout) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            FREES.fetch_add(1, Relaxed);
-            unsafe { System.dealloc(ptr, layout) }
-        }
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            REALLOCS.fetch_add(1, Relaxed);
-            BYTES.fetch_add(new_size.saturating_sub(layout.size()), Relaxed);
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-    }
-
-    #[global_allocator]
-    static COUNTING: Counting = Counting;
-
-    /// Print the counts so far, after `when`.
-    pub fn report(when: &str) {
-        eprintln!(
-            "allocations {when}: {} allocs, {} reallocs, {} frees, {} bytes allocated",
-            ALLOCS.load(Relaxed), REALLOCS.load(Relaxed), FREES.load(Relaxed), BYTES.load(Relaxed)
-        );
-    }
-}
 // LBBV (lazy basic-block versioning / specializer) lives in the `generator`
 // module, gated by the `lbbv` feature (independent of the native `jit`). In
 // interpreter-only builds it is disabled so execution stays in the vm.rs
 // `run()` loop.
 const LBBV: bool = cfg!(feature = "lbbv");
+
+/// mimalloc's statistics so far, after `when`, as JSON (feature `alloc_stats`).
+#[cfg(feature = "alloc_stats")]
+fn alloc_stats(when: &str) {
+    let json = unsafe { libmimalloc_sys::mi_stats_get_json(0, std::ptr::null_mut()) };
+    let text = unsafe { std::ffi::CStr::from_ptr(json) }.to_string_lossy().into_owned();
+    unsafe { libmimalloc_sys::mi_free(json.cast()) };
+    eprintln!("mimalloc stats {when}: {text}");
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder().format_timestamp(None).format_source_path(true).init();
@@ -77,12 +47,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             let vm::LValue::LClosure(run_iter) = run_iter_boxed.unbox() else { panic!() };
             println!("> starting benchmark");
             _r_vals = s.run::<LBBV>(owner, _g.clone(), run_iter, vec![vm::LBoxed::from_number(times as f64)].into())?;
-            #[cfg(feature = "alloc_count")]
-            alloc_count::report("after the benchmark");
+            #[cfg(feature = "alloc_stats")]
+            alloc_stats("after the benchmark");
             Ok(())
         })?;
-        #[cfg(feature = "alloc_count")]
-        alloc_count::report("after the heap's reset");
+        #[cfg(feature = "alloc_stats")]
+        alloc_stats("after the heap's reset");
     }
 
     Ok(())
