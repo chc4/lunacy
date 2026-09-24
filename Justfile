@@ -1,6 +1,9 @@
 set shell := ["bash", "-c"]
 TEST_FEATURES := "counters graph jit gas gc_sanitize"
 
+# Every test: `test`, then `test-stencils`.
+tests: test test-stencils
+
 # Run lunacy against the golden testcases
 [env("RUST_BACKTRACE","1")]
 test:
