@@ -1,5 +1,5 @@
 == region entered at block 3
-traces 3 4 7 8 9 10 | 5 6
+traces 10 | 9 | 8 | 7 | 6 | 5 | 4 | 3
 region entry block 3 loads w7 <- [1] #0
 block 3 hotness 0 entered with {w7=[1]}
     0 guard(1, number)
@@ -67,7 +67,7 @@ block 8 hotness 28 entered with {w5=[0] w6=[0]}
     6 thunk
       exit after [5] <- w6 #9
       window {w5=[1] w6=[5]* w7=[3]}
-    7 lua_guard(3, 0x611e690cc9e0)
+    7 lua_guard(3, 0x60298f8809e0)
       flush: [5] <- w6 #10
       window {}
     8 thunk
@@ -77,7 +77,7 @@ block 8 hotness 28 entered with {w5=[0] w6=[0]}
       to block 9 (entered with {}): 
       window {}
 block 9 hotness 28 entered with {}
-    0 lcall(0x611e690d64f8, 3, 3, 2)
+    0 lcall(0x60298f88a4f8, 3, 3, 2)
       window {}
     1 window(GetUpval, out 4)
       w3 <- [2]; w5 <- [1]; op at w7 #11
@@ -94,7 +94,7 @@ block 9 hotness 28 entered with {}
     5 thunk
       exit after [4] <- w7; [5] <- w4; [6] <- w6 #14
       window {w3=[2] w4=[5]* w5=[1] w6=[6]* w7=[4]*}
-    6 lua_guard(4, 0x611e690cc9e0)
+    6 lua_guard(4, 0x60298f8809e0)
       flush: [4] <- w7; [5] <- w4; [6] <- w6 #15
       window {}
     7 thunk
@@ -104,7 +104,7 @@ block 9 hotness 28 entered with {}
       to block 10 (entered with {}): 
       window {}
 block 10 hotness 37 entered with {}
-    0 lcall(0x611e690d6328, 4, 3, 2)
+    0 lcall(0x60298f88a328, 4, 3, 2)
       window {}
     1 exec(newtable)
       window {}
@@ -127,7 +127,7 @@ block 10 hotness 37 entered with {}
 == region entered at block 10
 block 10 compiled already, entered with {}: 
 == region entered at block 12
-traces 12 13 16 17 18 19 20 21 | 14 15
+traces 21 | 20 | 19 | 18 | 17 | 16 | 15 | 14 | 13 | 12
 region entry block 12 loads w7 <- [0] #20
 block 12 hotness 0 entered with {w7=[0]}
     0 guard(0, table)
@@ -172,7 +172,7 @@ block 16 hotness 28 entered with {}
     4 thunk
       exit after 
       window {}
-    5 lua_guard(2, 0x611e690ccac0)
+    5 lua_guard(2, 0x60298f880ac0)
       window {}
     6 thunk
       exit after 
@@ -181,7 +181,7 @@ block 16 hotness 28 entered with {}
       to block 17 (entered with {}): 
       window {}
 block 17 hotness 28 entered with {}
-    0 lcall(0x611e690d3d48, 2, 2, 2)
+    0 lcall(0x60298f887d48, 2, 2, 2)
       window {}
     1 guard(1, number)
       tests r10 <- [1] #24
@@ -218,7 +218,7 @@ block 19 hotness 37 entered with {w5=[1] w6=[2]}
     4 thunk
       exit after 
       window {}
-    5 lua_guard(2, 0x611e690ccac0)
+    5 lua_guard(2, 0x60298f880ac0)
       window {}
     6 thunk
       exit after 
@@ -227,7 +227,7 @@ block 19 hotness 37 entered with {w5=[1] w6=[2]}
       to block 20 (entered with {}): 
       window {}
 block 20 hotness 37 entered with {}
-    0 lcall(0x611e69373cf8, 2, 2, 2)
+    0 lcall(0x60298fb27d58, 2, 2, 2)
       window {}
     1 guard(2, number)
       tests r10 <- [2] #30
@@ -250,10 +250,10 @@ block 18 compiled already, entered with {w5=[1] w6=[2]}: w5 <- [1]; w6 <- [2] #3
 == region entered at block 21
 block 21 compiled already, entered with {w5=[1] w6=[2]}: w5 <- [1]; w6 <- [2] #35
 == region entered at block 35
-traces 35 36 37 38 39 40 45 | 41 42 | 43 44
+traces 45 | 44 | 43 | 42 | 41 | 40 | 39 | 38 | 37 | 36 | 35
 region entry block 35 loads 
 block 35 hotness 0 entered with {}
-    0 lcall(0x611e6920f1f8, 14, 3, 0)
+    0 lcall(0x60298f9c3258, 14, 3, 0)
       window {}
     1 guard(13, func)
       tests r10 <- [13] #36
@@ -261,7 +261,7 @@ block 35 hotness 0 entered with {}
     2 thunk
       exit after 
       window {}
-    3 lua_guard(13, 0x611e690ccac0)
+    3 lua_guard(13, 0x60298f880ac0)
       window {}
     4 thunk
       exit after 
@@ -270,7 +270,7 @@ block 35 hotness 0 entered with {}
       to block 36 (entered with {}): 
       window {}
 block 36 hotness 0 entered with {}
-    0 lcall(0x611e6920d088, 13, 0, 2)
+    0 lcall(0x60298f9c10c8, 13, 0, 2)
       window {}
     1 guard(13, number)
       tests r10 <- [13] #37
@@ -303,7 +303,7 @@ block 37 hotness 0 entered with {w2=[2] w3=[13] w5=[7]}
     6 thunk
       exit after [13] <- w4; [15] <- w7; [17] <- w6 #44
       window {w2=[2] w4=[13]* w5=[7] w6=[17]* w7=[15]*}
-    7 lua_guard(15, 0x611e690cc9e0)
+    7 lua_guard(15, 0x60298f8809e0)
       flush: [13] <- w4; [15] <- w7; [17] <- w6 #45
       window {}
     8 thunk
@@ -313,7 +313,7 @@ block 37 hotness 0 entered with {w2=[2] w3=[13] w5=[7]}
       to block 38 (entered with {}): 
       window {}
 block 38 hotness 0 entered with {}
-    0 lcall(0x611e69213058, 15, 3, 0)
+    0 lcall(0x60298f9c70b8, 15, 3, 0)
       window {}
     1 guard(14, func)
       tests r10 <- [14] #46
@@ -321,7 +321,7 @@ block 38 hotness 0 entered with {}
     2 thunk
       exit after 
       window {}
-    3 lua_guard(14, 0x611e690ccac0)
+    3 lua_guard(14, 0x60298f880ac0)
       window {}
     4 thunk
       exit after 
@@ -330,7 +330,7 @@ block 38 hotness 0 entered with {}
       to block 39 (entered with {}): 
       window {}
 block 39 hotness 0 entered with {}
-    0 lcall(0x611e69210668, 14, 0, 2)
+    0 lcall(0x60298f9c46c8, 14, 0, 2)
       window {}
     1 guard(14, number)
       tests r10 <- [14] #47
@@ -339,33 +339,33 @@ block 39 hotness 0 entered with {}
       exit after 
       window {}
     3 jump(40)
-      to block 40 (entered with {w0=[12] w1=[9] w2=[11] w3=[13] w4=[14] w6=[1] w7=[0]}): w0 <- [12]; w1 <- [9]; w2 <- [11]; w3 <- [13]; w4 <- [14]; w6 <- [1]; w7 <- [0] #48
+      to block 40 (entered with {w0=[12] w1=[9] w2=[11] w3=[13] w4=[14] w6=[4] w7=[0]}): w0 <- [12]; w1 <- [9]; w2 <- [11]; w3 <- [13]; w4 <- [14]; w6 <- [4]; w7 <- [0] #48
       window {}
-block 40 hotness 0 entered with {w0=[12] w1=[9] w2=[11] w3=[13] w4=[14] w6=[1] w7=[0]}
+block 40 hotness 0 entered with {w0=[12] w1=[9] w2=[11] w3=[13] w4=[14] w6=[4] w7=[0]}
     0 window(NumericIntInt, 13, 14, out 2)
       op at w3 #49
-      window {w0=[12] w1=[9] w2=[11] w3=[13] w4=[14] w5=[2]* w6=[1] w7=[0]}
+      window {w0=[12] w1=[9] w2=[11] w3=[13] w4=[14] w5=[2]* w6=[4] w7=[0]}
     1 window(NumericIntInt, 9, 11, out 9)
       [2] <- w5; w4 <- [10]; w5 <- [7]; op at w1 #50
-      window {w0=[12] w2=[11] w3=[9]* w4=[10] w5=[7] w6=[1] w7=[0]}
+      window {w0=[12] w2=[11] w3=[9]* w4=[10] w5=[7] w6=[4] w7=[0]}
     2 window(ForLoop, 9, 10, 11, 12, out 12)
       w1 <- w4; scratch <- w0; w0 <- w3; w3 <- scratch; op at w0 #51
-      window {w0=[9]* w1=[10] w2=[11] w4=[12]* w5=[7] w6=[1] w7=[0]}
+      window {w0=[9]* w1=[10] w2=[11] w4=[12]* w5=[7] w6=[4] w7=[0]}
     3 select
       to block 45 (entered with {w5=[7]}): [9] <- w0; [12] <- w4 #52
-      to block 41 (entered with {w0=[7] w1=[4] w2=[6] w4=[5] w5=[1] w6=[3] w7=[0]}): [9] <- w0; [12] <- w4; w0 <- w5; w1 <- [4]; w2 <- [6]; w4 <- [5]; w5 <- w6; w6 <- [3] #53
-      window {w0=[9]* w1=[10] w2=[11] w4=[12]* w5=[7] w6=[1] w7=[0]}
-block 41 hotness 64 entered with {w0=[7] w1=[4] w2=[6] w4=[5] w5=[1] w6=[3] w7=[0]}
+      to block 41 (entered with {w0=[0] w1=[7] w2=[4] w3=[6] w5=[5] w6=[3] w7=[1]}): [9] <- w0; [12] <- w4; w0 <- w7; w1 <- w5; w2 <- w6; w3 <- [6]; w5 <- [5]; w6 <- [3]; w7 <- [1] #53
+      window {w0=[9]* w1=[10] w2=[11] w4=[12]* w5=[7] w6=[4] w7=[0]}
+block 41 hotness 64 entered with {w0=[0] w1=[7] w2=[4] w3=[6] w5=[5] w6=[3] w7=[1]}
     0 window(NumericIntInt, 4, 6, out 4)
-      op at w1 #54
-      window {w0=[7] w2=[6] w3=[4]* w4=[5] w5=[1] w6=[3] w7=[0]}
+      op at w2 #54
+      window {w0=[0] w1=[7] w3=[6] w4=[4]* w5=[5] w6=[3] w7=[1]}
     1 window(ForLoop, 4, 5, 6, 7, out 7)
-      w1 <- w4; scratch <- w0; w0 <- w3; w3 <- scratch; op at w0 #55
-      window {w0=[4]* w1=[5] w2=[6] w4=[7]* w5=[1] w6=[3] w7=[0]}
+      w2 <- w5; scratch <- w1; w1 <- w4; w4 <- scratch; op at w1 #55
+      window {w0=[0] w1=[4]* w2=[5] w3=[6] w5=[7]* w6=[3] w7=[1]}
     2 select
-      to block 43 (entered with {w3=[1] w4=[7]* w6=[0]}): [4] <- w0; w3 <- w5; w6 <- w7 #56
-      to block 42 (entered with {w6=[3]}): [4] <- w0; [7] <- w4 #57
-      window {w0=[4]* w1=[5] w2=[6] w4=[7]* w5=[1] w6=[3] w7=[0]}
+      to block 43 (entered with {w3=[1] w4=[7]* w6=[0]}): [4] <- w1; w3 <- w7; w4 <- w5; w6 <- w0 #56
+      to block 42 (entered with {w6=[3]}): [4] <- w1; [7] <- w5 #57
+      window {w0=[0] w1=[4]* w2=[5] w3=[6] w5=[7]* w6=[3] w7=[1]}
 block 42 hotness 64 entered with {w6=[3]}
     0 window(GetUpval, out 4)
       op at w7 #58
@@ -387,31 +387,31 @@ block 43 hotness 64 entered with {w3=[1] w4=[7]* w6=[0]}
       flush: [7] <- w4; [8] <- w7 #63
       window {}
     3 window(LoadKNumber, out 9)
-      w0 <- [12]; w3 <- [8]; w5 <- [7]; w6 <- [6]; w7 <- [4]; op at w1 #64
-      window {w0=[12] w1=[9]* w3=[8] w5=[7] w6=[6] w7=[4]}
+      w0 <- [12]; w3 <- [8]; w5 <- [7]; w6 <- [1]; w7 <- [0]; op at w1 #64
+      window {w0=[12] w1=[9]* w3=[8] w5=[7] w6=[1] w7=[0]}
     4 window(Move, 8, out 10)
       op at w3 #65
-      window {w0=[12] w1=[9]* w3=[8] w4=[10]* w5=[7] w6=[6] w7=[4]}
+      window {w0=[12] w1=[9]* w3=[8] w4=[10]* w5=[7] w6=[1] w7=[0]}
     5 window(LoadKNumber, out 11)
       op at w2 #66
-      window {w0=[12] w1=[9]* w2=[11]* w3=[8] w4=[10]* w5=[7] w6=[6] w7=[4]}
+      window {w0=[12] w1=[9]* w2=[11]* w3=[8] w4=[10]* w5=[7] w6=[1] w7=[0]}
     6 window(NumericIntInt, 9, 11, out 9)
       op at w1 #67
-      window {w0=[12] w2=[11]* w3=[9]* w4=[10]* w5=[7] w6=[6] w7=[4]}
+      window {w0=[12] w2=[11]* w3=[9]* w4=[10]* w5=[7] w6=[1] w7=[0]}
     7 jump(44)
-      to block 44 (entered with {w0=[12] w1=[9]* w2=[11]* w4=[10]* w5=[7] w6=[6] w7=[4]}): w1 <- w3 #68
-      window {w0=[12] w2=[11]* w3=[9]* w4=[10]* w5=[7] w6=[6] w7=[4]}
-block 44 hotness 64 entered with {w0=[12] w1=[9]* w2=[11]* w4=[10]* w5=[7] w6=[6] w7=[4]}
+      to block 44 (entered with {w0=[12] w1=[9]* w2=[11]* w4=[10]* w5=[7] w6=[1] w7=[0]}): w1 <- w3 #68
+      window {w0=[12] w2=[11]* w3=[9]* w4=[10]* w5=[7] w6=[1] w7=[0]}
+block 44 hotness 64 entered with {w0=[12] w1=[9]* w2=[11]* w4=[10]* w5=[7] w6=[1] w7=[0]}
     0 window(NumericIntInt, 9, 11, out 9)
       op at w1 #69
-      window {w0=[12] w2=[11]* w3=[9]* w4=[10]* w5=[7] w6=[6] w7=[4]}
+      window {w0=[12] w2=[11]* w3=[9]* w4=[10]* w5=[7] w6=[1] w7=[0]}
     1 window(ForLoop, 9, 10, 11, 12, out 12)
       w1 <- w4; scratch <- w0; w0 <- w3; w3 <- scratch; op at w0 #70
-      window {w0=[9]* w1=[10]* w2=[11]* w4=[12]* w5=[7] w6=[6] w7=[4]}
+      window {w0=[9]* w1=[10]* w2=[11]* w4=[12]* w5=[7] w6=[1] w7=[0]}
     2 select
       to block 45 (entered with {w5=[7]}): [9] <- w0; [10] <- w1; [11] <- w2; [12] <- w4 #71
-      to block 41 (compiled, entered with {w0=[7] w1=[4] w2=[6] w4=[5] w5=[1] w6=[3] w7=[0]}): [9] <- w0; [10] <- w1; [11] <- w2; [12] <- w4; w0 <- w5; w1 <- w7; w2 <- w6; w4 <- [5]; w5 <- [1]; w6 <- [3]; w7 <- [0] #72
-      window {w0=[9]* w1=[10]* w2=[11]* w4=[12]* w5=[7] w6=[6] w7=[4]}
+      to block 41 (compiled, entered with {w0=[0] w1=[7] w2=[4] w3=[6] w5=[5] w6=[3] w7=[1]}): [9] <- w0; [10] <- w1; [11] <- w2; [12] <- w4; w0 <- w7; w1 <- w5; w2 <- [4]; w3 <- [6]; w5 <- [5]; w7 <- w6; w6 <- [3] #72
+      window {w0=[9]* w1=[10]* w2=[11]* w4=[12]* w5=[7] w6=[1] w7=[0]}
 block 45 hotness 0 entered with {w5=[7]}
     0 window(GetUpval, out 13)
       op at w7 #73
@@ -431,7 +431,7 @@ block 45 hotness 0 entered with {w5=[7]}
     5 thunk
       exit after [14] <- w7; [16] <- w6 #77
       window {w5=[7] w6=[16]* w7=[14]*}
-    6 lua_guard(14, 0x611e690cc9e0)
+    6 lua_guard(14, 0x60298f8809e0)
       flush: [14] <- w7; [16] <- w6 #78
       window {}
     7 thunk
@@ -447,7 +447,7 @@ block 37 compiled already, entered with {w2=[2] w3=[13] w5=[7]}: w2 <- [2]; w3 <
 == region entered at block 39
 block 39 compiled already, entered with {}: 
 == region entered at block 40
-block 40 compiled already, entered with {w0=[12] w1=[9] w2=[11] w3=[13] w4=[14] w6=[1] w7=[0]}: w0 <- [12]; w1 <- [9]; w2 <- [11]; w3 <- [13]; w4 <- [14]; w6 <- [1]; w7 <- [0] #80
+block 40 compiled already, entered with {w0=[12] w1=[9] w2=[11] w3=[13] w4=[14] w6=[4] w7=[0]}: w0 <- [12]; w1 <- [9]; w2 <- [11]; w3 <- [13]; w4 <- [14]; w6 <- [4]; w7 <- [0] #80
 count #0 26487577
 count #1 13134644
 count #2 13352933

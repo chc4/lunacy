@@ -178,6 +178,33 @@ fn emits_line(emits: &[Emit]) -> String {
     emits.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
 }
 
+/// Count how often the allocator code emitted next runs (feature `window_dump`):
+/// ` #id`, for its dump line, of a counter incremented just before it, whose
+/// total the dump ends with. Nothing for no code. Clobbers rax and the flags.
+macro_rules! window_count {
+    ($jctx:expr, $ops:expr, $emits:expr) => {{
+        #[cfg(feature = "window_dump")]
+        let id = if $emits.is_empty() { String::new() } else { format!(" #{}", window_count(&$jctx.window_counts, $ops)) };
+        #[cfg(not(feature = "window_dump"))]
+        let id = "";
+        id
+    }};
+}
+
+#[cfg(feature = "window_dump")]
+fn window_count(counts: &std::cell::RefCell<Vec<Box<std::sync::atomic::AtomicU64>>>, ops: &mut Assembler) -> usize {
+    let mut counts = counts.borrow_mut();
+    let counter = Box::new(std::sync::atomic::AtomicU64::new(0));
+    let at = counter.as_ptr() as i64;
+    counts.push(counter);
+    dynasm!(ops
+        ; .arch x64
+        ; mov rax, QWORD at
+        ; inc QWORD [rax]
+    );
+    counts.len() - 1
+}
+
 /// The window registers `w0..w7` in the order the stencil ABI passes them (the
 /// `rust-preserve-none` arguments after owner, state and base in r12, r13, r14),
 /// then `SCRATCH`: rax, which every stencil clobbers (LLVM loads its `become`
@@ -315,12 +342,28 @@ pub struct JitContext {
     pub used: usize,
     pub perf_map: Option<std::cell::RefCell<std::fs::File>>,
     pub window_dump: Option<std::cell::RefCell<std::fs::File>>,
-    /// How regions are partitioned into traces (`LUNACY_TRACES`).
-    pub trace_policy: Policy,
+    /// How often each counted piece of allocator code ran (`window_count!`).
+    #[cfg(feature = "window_dump")]
+    window_counts: std::cell::RefCell<Vec<Box<std::sync::atomic::AtomicU64>>>,
+    /// How regions are partitioned into traces (`LUNACY_TRACES`), or `None` to
+    /// allocate streaming instead: no plan, each op placing itself in the window
+    /// it finds and each block entered with the window of the first jump to it,
+    /// for comparison.
+    pub trace_policy: Option<Policy>,
 }
 
 #[derive(Copy, Clone)]
 struct JitPtr(*const u8);
+
+/// The dump ends with how often each counted piece of allocator code ran.
+#[cfg(feature = "window_dump")]
+impl Drop for JitContext {
+    fn drop(&mut self) {
+        for (id, count) in self.window_counts.borrow().iter().enumerate() {
+            window_dump!(self, "count #{id} {}", count.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+}
 
 /// A compiled block: its code, entered with the window holding `window` (see
 /// Note [Window allocation]).
@@ -394,7 +437,12 @@ impl JitContext {
             used: 0,
             perf_map,
             window_dump,
-            trace_policy: Policy::from_env(),
+            #[cfg(feature = "window_dump")]
+            window_counts: Default::default(),
+            trace_policy: match std::env::var("LUNACY_TRACES").as_deref() {
+                Ok("streaming") => None,
+                _ => Some(Policy::from_env()),
+            },
         }
     }
 
@@ -490,7 +538,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         if let Some(block) = self.jctx.blocks.get(&id) {
             // Load the window the block is entered with.
             let loads = WindowAlloc::default().transfer(&block.window);
-            window_dump!(self.jctx, "block {} compiled already, entered with {}: {}", id.0, block.window, emits_line(&loads));
+            let counted = window_count!(self.jctx, &mut ops, loads);
+            window_dump!(self.jctx, "block {} compiled already, entered with {}: {}{counted}", id.0, block.window, emits_line(&loads));
             for emit in loads {
                 emit_window_move(&mut ops, emit);
             }
@@ -498,11 +547,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; jmp extern block.ptr.0 as usize
             );
         } else {
-            plans = self.plan_region(id);
-            // Load the window the block is entered with, clean from the stack.
-            let window = Cache::entry(plans[&id].entry.unpack(), &Cache::default());
+            // Load the window the block is entered with, clean from the stack
+            // (empty, streaming).
+            let window = match self.jctx.trace_policy {
+                Some(policy) => {
+                    plans = self.plan_region(id, policy);
+                    Cache::entry(plans[&id].entry.unpack(), &Cache::default())
+                }
+                None => Cache::default(),
+            };
             let loads = WindowAlloc::default().transfer(&window);
-            window_dump!(self.jctx, "region entry block {} loads {}", id.0, emits_line(&loads));
+            let counted = window_count!(self.jctx, &mut ops, loads);
+            window_dump!(self.jctx, "region entry block {} loads {}{counted}", id.0, emits_line(&loads));
             for emit in loads {
                 emit_window_move(&mut ops, emit);
             }
@@ -597,7 +653,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// reachable from it not compiled yet, partitioned into traces by the JIT's
     /// policy, each trace placed by one backward pass. See Note [Trace register
     /// allocation].
-    fn plan_region(&mut self, entry: BlockId) -> Plans {
+    fn plan_region(&mut self, entry: BlockId, policy: Policy) -> Plans {
         let mut ids = vec![entry];
         let mut index: HashMap<BlockId, usize, FxBuildHasher> = HashMap::default();
         index.insert(entry, 0);
@@ -662,7 +718,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .collect(),
         );
         let live_in = region.liveness();
-        let traces = region.traces(self.jctx.trace_policy);
+        let traces = region.traces(policy);
         window_dump!(self.jctx, "traces {}", traces.iter().map(|trace| trace.iter().map(|&b| ids[b].0.to_string()).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" | "));
         let mut plans = Plans::default();
         for trace in &traces {
@@ -718,7 +774,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 };
                 for slot in used {
                     if !want.contains(&Some(slot)) {
-                        let Some(reg) = want.iter().position(Option::is_none) else { break };
+                        let Some(reg) = want.iter().rposition(Option::is_none) else { break };
                         want[reg] = Some(slot);
                     }
                 }
@@ -733,7 +789,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // in a register, if one is free.
                 Residual::Guard { idx, .. } if inline_guard(res) => {
                     if !want.contains(&Some(*idx)) {
-                        if let Some(reg) = want.iter().position(Option::is_none) {
+                        if let Some(reg) = want.iter().rposition(Option::is_none) {
                             want[reg] = Some(*idx);
                         }
                     }
@@ -766,7 +822,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let Some(target_block) = self.jctx.blocks.get(target) {
                 // We already JIT compiled the block, and can jump to it directly.
                 let transfer = alloc.transfer(&target_block.window);
-                window_dump!(self.jctx, "      to block {} (compiled, entered with {}): {}", target.0, target_block.window, emits_line(&transfer));
+                let counted = window_count!(self.jctx, ops, transfer);
+                window_dump!(self.jctx, "      to block {} (compiled, entered with {}): {}{counted}", target.0, target_block.window, emits_line(&transfer));
                 for emit in transfer {
                     emit_window_move(ops, emit);
                 }
@@ -781,10 +838,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // relocation.
                 let pending = self.jctx.pending.entry(*target).or_insert_with(|| Pending {
                     label: ops.new_dynamic_label(),
-                    window: Cache::entry(plans[target].entry.unpack(), alloc.cache()),
+                    window: match plans.get(target) {
+                        Some(plan) => Cache::entry(plan.entry.unpack(), alloc.cache()),
+                        // Streaming: entered with the window of the first jump to it.
+                        None => alloc.cache().clone(),
+                    },
                 });
                 let transfer = alloc.transfer(&pending.window);
-                window_dump!(self.jctx, "      to block {} (entered with {}): {}", target.0, pending.window, emits_line(&transfer));
+                let counted = window_count!(self.jctx, ops, transfer);
+                window_dump!(self.jctx, "      to block {} (entered with {}): {}{counted}", target.0, pending.window, emits_line(&transfer));
                 for emit in transfer {
                     emit_window_move(ops, emit);
                 }
@@ -865,7 +927,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 );
                 if !keeps_window && !alloc.is_empty() {
                     let stores = alloc.flush();
-                    window_dump!(self.jctx, "      flush: {}", emits_line(&stores));
+                    let counted = window_count!(self.jctx, ops, stores);
+                    window_dump!(self.jctx, "      flush: {}{counted}", emits_line(&stores));
                     for emit in stores {
                         emit_window_move(ops, emit);
                     }
@@ -891,11 +954,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // `v` holds the value: its window register, or else r10. rax,
                     // never a window register, is scratch for the masks.
                     let m = 0; // rax
-                    window_dump!(self.jctx, "      tests {}",
-                        alloc.register_of(*idx).map_or(format!("[{idx}]"), |reg| format!("w{reg}")));
                     let v = match alloc.register_of(*idx) {
-                        Some(reg) => WINDOW_REGS[reg],
+                        Some(reg) => {
+                            window_dump!(self.jctx, "      tests w{reg}");
+                            WINDOW_REGS[reg]
+                        }
                         None => {
+                            // Counted as the load it is, into r10.
+                            let counted = window_count!(self.jctx, ops, [()]);
+                            window_dump!(self.jctx, "      tests r10 <- [{idx}]{counted}");
                             dynasm!(ops
                                 ; .arch x64
                                 ; mov r10, QWORD r14 => LBoxed<'src, 'intern>[*idx as i32]
@@ -1187,11 +1254,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::ExecWindow(w) => {
                     let stencils = &mut self.jctx.stencils;
-                    match plans[&id].placed[off] {
-                        Some((skip, want)) => {
+                    let emits = match plans.get(&id) {
+                        Some(plan) => plan.placed[off].map(|(skip, want)| {
                             let mut emits = alloc.reconcile(&want.unpack(), &**w);
                             emits.extend(alloc.op(&**w, [skip as usize]).expect("a placed op runs at its SKIP"));
-                            window_dump!(self.jctx, "      {}", emits_line(&emits));
+                            emits
+                        }),
+                        // Streaming: the op picks its `SKIP` from the window it finds.
+                        None => {
+                            let skips: SmallVec<[usize; WINDOW]> =
+                                (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(&**w, skip).is_ok()).collect();
+                            alloc.op(&**w, skips)
+                        }
+                    };
+                    match emits {
+                        Some(emits) => {
+                            let counted = window_count!(self.jctx, ops, emits);
+                            window_dump!(self.jctx, "      {}{counted}", emits_line(&emits));
                             for emit in emits {
                                 match emit {
                                     Emit::Op { skip } => {
@@ -1205,7 +1284,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // No stencil to copy: call the op's body on the stack.
                         None => {
                             let stores = alloc.flush();
-                            window_dump!(self.jctx, "      no stencil: flush {}, then call window_interp", emits_line(&stores));
+                            let counted = window_count!(self.jctx, ops, stores);
+                            window_dump!(self.jctx, "      no stencil: flush {}, then call window_interp{counted}", emits_line(&stores));
                             for emit in stores {
                                 emit_window_move(ops, emit);
                             }
@@ -1224,7 +1304,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Thunk(_) => {
                     let stores = alloc.stores();
-                    window_dump!(self.jctx, "      exit after {}", emits_line(&stores));
+                    let counted = window_count!(self.jctx, ops, stores);
+                    window_dump!(self.jctx, "      exit after {}{counted}", emits_line(&stores));
                     for emit in stores {
                         emit_window_move(ops, emit);
                     }

@@ -5,17 +5,57 @@ A dump (`just window-dump`) lists each compiled block with its hotness when
 compiled, then the code the window allocator emitted per residual. This totals
 that code over every block and over the hot blocks (hotness 0: those entered as
 often as the block that triggered compilation), so two allocators' dumps of the
-same benchmark can be compared. With `--blocks`, it lists each hot block's
-counts in every dump side by side instead (every block's, with `--all`), where
-they differ.
+same benchmark can be compared. Each line of emitted code ends with ` #id`
+and the dump with how often each ran (`count #id n`), so it also totals the
+code weighted by how often it ran, by log2(1 + log2(1 + n)): zero for code
+that never ran, and growing slowly enough that the hottest edge doesn't
+swamp the rest. With `--blocks`, it lists each hot block's counts in
+every dump side by side instead (every block's, with `--all`), where they
+differ.
 """
 import argparse
+import math
 import re
 import sys
 
 BLOCK = re.compile(r'^block (\d+) hotness (\d+) entered with ')
 STUB = re.compile(r'^(?:block \d+ compiled already, entered with \{[^}]*\}|region entry block \d+ loads)[:]? ?(.*)$')
 EMIT = re.compile(r'(\w+|\[\d+\]) <- (\w+|\[\d+\])')
+COUNTED = re.compile(r' #(\d+)$')
+COUNT = re.compile(r'^count #(\d+) (\d+)$')
+
+
+def weight(runs):
+    """How much code that ran `runs` times counts."""
+    return math.log2(1 + math.log2(1 + runs))
+
+
+def counted(path):
+    """(block, code line, runs, [loads, stores, moves] weighted by `weight`) per
+    counted line."""
+    lines, runs = [], {}
+    block = None
+    for line in open(path):
+        line = line.rstrip('\n')
+        m = COUNT.match(line)
+        if m:
+            runs[int(m.group(1))] = int(m.group(2))
+            continue
+        m = BLOCK.match(line)
+        if m:
+            block = int(m.group(1))
+        m = COUNTED.search(line)
+        if m:
+            lines.append((block, int(m.group(1)), line[:m.start()]))
+    return [(block, code, runs.get(id, 0), [n * weight(runs.get(id, 0)) for n in emits(code)]) for block, id, code in lines]
+
+
+def executed(path):
+    """[loads, stores, moves] weighted by how often each counted line ran."""
+    total = [0, 0, 0]
+    for _, _, _, counts in counted(path):
+        total = [a + b for a, b in zip(total, counts)]
+    return total
 
 
 def emits(text):
@@ -61,7 +101,15 @@ def main():
     parser.add_argument('dumps', nargs='+', help='window_dump.txt files')
     parser.add_argument('--blocks', action='store_true', help="each hot block's counts, side by side")
     parser.add_argument('--all', action='store_true', help='with --blocks, every block, not just the hot ones')
+    parser.add_argument('--top', type=int, help='the counted lines executing the most loads, stores and moves')
     args = parser.parse_args()
+    if args.top:
+        for path in args.dumps:
+            print('==', path)
+            lines = sorted(counted(path), key=lambda line: -sum(line[3]))
+            for block, code, runs, counts in lines[:args.top]:
+                print('%7.1f %7.1f %7.1f  block %s x%d: %s' % (*counts, block, runs, code.strip()))
+        return 0
     found = [blocks(path) for path in args.dumps]
     if args.blocks:
         ids = sorted({b for dump in found for b, (hot, _) in dump.items() if hot or args.all})
@@ -71,7 +119,7 @@ def main():
             if len(set(cells)) > 1:
                 print('%-8d' % b + ''.join('%24s' % cell for cell in cells))
         return 0
-    print('%-50s %22s %22s' % ('dump', 'all: loads stores moves', 'hot: loads stores moves'))
+    print('%-44s %22s %22s %26s' % ('dump', 'all: loads stores moves', 'hot: loads stores moves', 'run: loads stores moves'))
     for path, dump in zip(args.dumps, found):
         total = [0, 0, 0]
         hot = [0, 0, 0]
@@ -79,7 +127,7 @@ def main():
             total = [a + b for a, b in zip(total, counts)]
             if is_hot:
                 hot = [a + b for a, b in zip(hot, counts)]
-        print('%-50s %22s %22s' % (path, '%d %d %d' % tuple(total), '%d %d %d' % tuple(hot)))
+        print('%-44s %22s %22s %26s' % (path, '%d %d %d' % tuple(total), '%d %d %d' % tuple(hot), '%.0f %.0f %.0f' % tuple(executed(path))))
     return 0
 
 

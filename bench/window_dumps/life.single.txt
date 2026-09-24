@@ -1,5 +1,5 @@
 == region entered at block 22
-traces 22 23 18 20 21 24 | 19
+traces 24 | 21 | 20 | 19 | 18 | 23 | 22
 region entry block 22 loads w5 <- [2]; w6 <- [6] #0
 block 22 hotness 0 entered with {w5=[2] w6=[6]}
     0 window(GetTableIndex, 2, 6, out 11)
@@ -86,7 +86,7 @@ block 24 hotness 63 entered with {w0=[7]* w1=[8]* w2=[9]* w3=[10] w5=[3] w6=[6] 
       to block 18 (compiled, entered with {w1=[3] w2=[5] w4=[4] w5=[5] w6=[6]}): [7] <- w0; [8] <- w1; [9] <- w2; [10] <- w4; w1 <- w5; w2 <- [5]; w4 <- [4]; w5 <- w2 #23
       window {w0=[7]* w1=[8]* w2=[9]* w4=[10]* w5=[3] w6=[6] w7=[2]}
 == region entered at block 132
-traces 132 133 134 135 136 137 138 139 140 141 142 143 144 145 146 147 148 149 154 122 129 130 131 | 150 151 152 | 153 | 123 124 125 128 | 126 127
+traces 153 | 152 | 151 | 150 | 131 | 130 | 129 | 128 | 127 | 126 | 125 | 124 | 123 | 122 | 154 | 149 | 148 | 147 | 146 | 145 | 144 | 143 | 142 | 141 | 140 | 139 | 138 | 137 | 136 | 135 | 134 | 133 | 132
 region entry block 132 loads w0 <- [0]; w1 <- [2]; w2 <- [8]; w3 <- [10]; w4 <- [11]; w6 <- [4]; w7 <- [6] #24
 block 132 hotness 0 entered with {w0=[0] w1=[2] w2=[8] w3=[10] w4=[11] w6=[4] w7=[6]}
     0 guard(11, number)
@@ -482,7 +482,7 @@ block 122 compiled already, entered with {}:
 == region entered at block 154
 block 154 compiled already, entered with {w3=[11] w4=[7] w5=[12]* w6=[8]}: w3 <- [11]; w4 <- [7]; w5 <- [12]; w6 <- [8] #115
 == region entered at block 188
-traces 188 189 190 195 200 201 | 191 | 196 198 199 | 197
+traces 191 | 201 | 200 | 199 | 198 | 197 | 196 | 195 | 190 | 189 | 188
 region entry block 188 loads 
 block 188 hotness 0 entered with {}
     0 exec(comp_cint_int_LT)
@@ -615,7 +615,7 @@ block 201 hotness 0 entered with {w5=[11]* w6=[9]*}
 == region entered at block 195
 block 195 compiled already, entered with {}: 
 == region entered at block 157
-traces 157 163
+traces 163 | 157
 region entry block 157 loads w3 <- [11]; w4 <- [7]; w5 <- [12]; w6 <- [8] #147
 block 157 hotness 0 entered with {w3=[11] w4=[7] w5=[12] w6=[8]}
     0 guard(11, table)
@@ -655,7 +655,7 @@ block 163 hotness 1 entered with {w3=[11] w4=[7] w5=[12] w6=[8]}
       to block 122 (compiled, entered with {}): [8] <- w3; [7] <- w5; [6] <- w7 #155
       window {w2=[13] w3=[8]* w4=[12] w5=[7]* w6=[11] w7=[6]*}
 == region entered at block 155
-traces 155 162 156
+traces 156 | 162 | 155
 region entry block 155 loads w3 <- [12]; w4 <- [7]; w6 <- [8]; w7 <- [11] #156
 block 155 hotness 0 entered with {w3=[12] w4=[7] w6=[8] w7=[11]}
     0 window(GetTableIndex, 12, 7, out 12)
@@ -692,7 +692,7 @@ block 193 hotness 0 entered with {w7=[11]}
       to block 195 (compiled, entered with {}): 
       window {w7=[11]}
 == region entered at block 202
-traces 202 192
+traces 192 | 202
 region entry block 202 loads w7 <- [11] #162
 block 202 hotness 0 entered with {w7=[11]}
     0 jump(192)

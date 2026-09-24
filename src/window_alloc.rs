@@ -246,17 +246,22 @@ impl WindowAlloc {
             .filter(|slot| !to.dirty.contains(slot))
             .map(|&slot| Emit::Store { slot, reg: now.position(slot).expect("dirty slot in a register") })
             .collect();
-        let mut moves: SmallVec<[(usize, Source); 8]> = to
-            .regs
-            .iter()
-            .enumerate()
-            .filter_map(|(reg, &slot)| {
-                let slot = slot?;
-                let src = if now.regs[reg] == Some(slot) { Some(reg) } else { now.position(slot) };
-                Some((reg, src.map_or(Source::Memory(slot), Source::Reg)))
-            })
-            .collect();
+        // A slot loaded into several registers is loaded once and copied.
+        let mut moves: SmallVec<[(usize, Source); 8]> = SmallVec::new();
+        let mut copies: SmallVec<[(usize, usize); WINDOW]> = SmallVec::new();
+        for (reg, &slot) in to.regs.iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            let src = if now.regs[reg] == Some(slot) { Some(reg) } else { now.position(slot) };
+            match src {
+                Some(src) => moves.push((reg, Source::Reg(src))),
+                None => match moves.iter().find(|(_, src)| *src == Source::Memory(slot)) {
+                    Some(&(first, _)) => copies.push((reg, first)),
+                    None => moves.push((reg, Source::Memory(slot))),
+                },
+            }
+        }
         parallel_move(&mut moves, &mut emits);
+        emits.extend(copies.into_iter().map(|(dst, src)| Emit::Move { dst, src }));
         emits
     }
 
@@ -340,7 +345,7 @@ impl WindowAlloc {
         for slot in displaced {
             if before.contains(&Some(slot)) {
                 cost += MOVE_COST;
-            } else if let Some(reg) = (0..self.width).find(|reg| !run.contains(reg) && before[*reg].is_none()) {
+            } else if let Some(reg) = (0..self.width).rev().find(|reg| !run.contains(reg) && before[*reg].is_none()) {
                 before[reg] = Some(slot);
                 cost += MOVE_COST;
             } else {
