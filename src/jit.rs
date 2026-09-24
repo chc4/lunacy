@@ -155,6 +155,33 @@ impl JitHelper {
         }
     }
 
+    /// A call from JIT code to whatever slot `a` holds: a native runs (the
+    /// interpreter's `call_native`), returning 1; a Lua function whose entry
+    /// has JIT code gets its frame pushed (`call_lua`, returning to `ret`,
+    /// `(off << 32) | block`), returning that entry for the JIT code to call;
+    /// anything else (a function not compiled yet, a `__call`) returns 0,
+    /// having done nothing, for the interpreter to call.
+    pub unsafe extern "C" fn dynamic_call(spec: *mut (), state: *mut (), ret: u64, a: u16, b: u16, c: u16) -> usize {
+        unsafe {
+            let spec = &mut *(spec as *mut Specializer<'static, 'static>);
+            let state = &mut *(state as *mut RunState<'static, 'static>);
+            let owner = crate::forge_owner();
+            match state.vals[state.base + a as usize].unbox() {
+                LValue::NClosure(ncall) => {
+                    state.call_native(ncall.native(), a, b, c, owner);
+                    1
+                }
+                LValue::LClosure(lclos) => {
+                    let Some(entry) = spec.lua_entry(owner, &lclos) else { return 0 };
+                    let ret = ReturnLocation::Generator(BlockId((ret & 0xffff_ffff) as usize), (ret >> 32) as usize).pack();
+                    state.call_lua(owner, ret, a, b, c);
+                    entry as usize
+                }
+                _ => 0,
+            }
+        }
+    }
+
     pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16, base_ptr: *const ()) -> u64 {
         unsafe {
             let rs = &mut *(state as *mut RunState);
@@ -382,6 +409,9 @@ pub struct JitContext {
     region_sites: Vec<(BlockId, usize, usize, Cache)>,
     /// Thunk sites to patch once their target block has JIT code.
     waiting: HashMap<BlockId, Vec<ThunkSite>, FxBuildHasher>,
+    /// The JIT entry of each prototype's all-unknown entry block, by the
+    /// prototype's address, once it has one. See `JitHelper::dynamic_call`.
+    lua_entries: HashMap<usize, JitExec, FxBuildHasher>,
     /// How regions are partitioned into traces (`LUNACY_TRACES`), or `None` to
     /// allocate streaming instead: no plan, each op placing itself in the window
     /// it finds and each block entered with the window of the first jump to it,
@@ -492,6 +522,7 @@ impl JitContext {
             thunk_sites: HashMap::default(),
             region_sites: Vec::new(),
             waiting: HashMap::default(),
+            lua_entries: HashMap::default(),
             stencils: Stencils::default(),
             used: 0,
             perf_map,
@@ -729,6 +760,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
 
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
+    }
+
+    /// The JIT entry of `lclos`'s all-unknown entry block, if it has one.
+    fn lua_entry(&mut self, owner: &Owner, lclos: &Tc<LClosure<'src, 'intern>>) -> Option<JitExec> {
+        let proto = lclos.ro(owner).prototype;
+        if let Some(&entry) = self.jctx.lua_entries.get(&(proto as usize)) {
+            return Some(entry);
+        }
+        let next_stack = unsafe { (*proto).max_stack.into() };
+        let ctx = Rc::new(Context::new(vec![LType::Unknown; next_stack]));
+        let block = *self.versions.get(&proto)?.get(&(SubPc::new(0), ctx))?;
+        let entry = self.blocks[block.0].jit_info.entry?;
+        self.jctx.lua_entries.insert(proto as usize, entry);
+        Some(entry)
     }
 
     /// The thunk at `off` in `block` is now a jump to `target`: patch its JIT
@@ -1000,6 +1045,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// JIT compile one block, returning the JIT code offset and optionally the next block to
     /// compile.
     pub fn jit_block(&mut self, id: BlockId, ops: &mut Assembler, pool: &mut Pool, owner: &mut Owner, plans: &Plans) -> (AssemblyOffset, Option<BlockId>) {
+        // The address `JitHelper::dynamic_call` gets: this code only runs while
+        // `self`, which owns it, is alive and in place.
+        let spec = &*self as *const Self as i64;
         // We try to bias the default exit as the next block to compile. This is only a suggestion,
         // and doesn't affect correctness; `GUARD; JMP failure; RET;` for example may say that
         // `failure` is the "next block" despite not quite being correct.
@@ -1108,6 +1156,43 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // reaches the residual after it, and a window residual following another
         // gets no label, so a jump to one fails to assemble. A `GuardDynamic` is a
         // window residual whose op is the guard's test.
+        // A call to whatever slot `a` holds, through `JitHelper::dynamic_call`: a
+        // native has run, a Lua function's JIT entry is called with its frame
+        // pushed, and anything else bails out for the interpreter to call.
+        let emit_dynamic_call = |ops: &mut Assembler, off: usize, a: u16, b: u16, c: u16| {
+            let ret = ((off as u64 + 1) << 32) | id.0 as u64;
+            dynasm!(ops
+                ; .arch x64
+                ; mov rdi, QWORD spec
+                ; mov rsi, r12 // state
+                ; mov rdx, QWORD (ret as i64)
+                ; mov ecx, a as i32
+                ; mov r8d, b as i32
+                ; mov r9d, c as i32
+                ; call extern (JitHelper::dynamic_call as *const () as usize)
+                ; cmp rax, 1
+                ; je >done
+                ; test rax, rax
+                ; jz >bail
+                ; mov r10, rax
+                // The callee's base: vals.stack_ptr + base * sizeof(LBoxed)
+                ; lea rcx, r12 => RunState.vals
+                ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
+                ; mov rcx, QWORD r12 => RunState.base
+                ; lea r13, [rax + rcx * 8]
+                ; call r10
+                ; mov r13, QWORD [rsp - 0]
+                ; cmp BYTE r12 => RunState.trap, 0
+                ; jnz ->exit_jit
+                ; jmp >done
+                ; bail:
+            );
+            emit_bailout(ops, off);
+            dynasm!(ops
+                ; .arch x64
+                ; done:
+            );
+        };
         let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_));
         let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_));
         for (off, res) in block.instructions.iter().enumerate() {
@@ -1355,11 +1440,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // Reload the correct base ptr for the remainder of our function
                             );
                         },
-                        None => {
-                            // TODO: we could emit a patchpoint and fill it in once the callee
-                            // block is compiled; for now bail to the interpreter for good.
-                            emit_bailout(ops, off)
-                        },
+                        // Not compiled yet: look again at run time.
+                        None => emit_dynamic_call(ops, off, *a, *b, *c),
                     }
                 },
                 Residual::NativeCall { nf, a, b, c } => {
@@ -1427,6 +1509,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         );
                     }
                 },
+                Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c),
                 Residual::Jump(target) => {
                     // If the block ends in a jump, and the block hasn't already been emitted, then
                     // we can elide a jump and instead fallthrough. We will use the target as
