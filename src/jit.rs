@@ -400,6 +400,16 @@ fn inline_guard(res: &Residual) -> bool {
     matches!(res, Residual::Guard { expected: LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String, .. })
 }
 
+/// The `SKIP`s a window op's stencil can be copied at. None in a build with debug
+/// assertions: its stencils are unoptimized, and too big to copy, so the op runs
+/// through its interpreter path instead, as an op the copier rejects does.
+fn usable_skips(stencils: &mut Stencils, w: &dyn Window) -> SmallVec<[usize; WINDOW]> {
+    if cfg!(debug_assertions) {
+        return SmallVec::new();
+    }
+    (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(w, skip).is_ok()).collect()
+}
+
 /// The blocks a residual jumps to.
 fn jump_targets(res: &Residual) -> SmallVec<[BlockId; 2]> {
     match res {
@@ -679,7 +689,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     .instructions
                     .iter()
                     .map(|res| match res {
-                        Residual::ExecWindow(w) => (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(&**w, skip).is_ok()).collect(),
+                        Residual::ExecWindow(w) => usable_skips(stencils, &**w),
                         _ => SmallVec::new(),
                     })
                     .collect()
@@ -1318,9 +1328,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }),
                         // Streaming: the op picks its `SKIP` from the window it finds.
                         None => {
-                            let skips: SmallVec<[usize; WINDOW]> =
-                                (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(&**w, skip).is_ok()).collect();
-                            alloc.op(&**w, skips)
+                            alloc.op(&**w, usable_skips(stencils, &**w))
                         }
                     };
                     match emits {

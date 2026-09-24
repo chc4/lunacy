@@ -10,7 +10,9 @@ test:
     cargo test --features "gc_sanitize"
     # Interpreter GC stress test
     cargo test --features "gc_stress gc_sanitize"
-    # Golden suite with every block JIT compiled on first run
+    # Golden suite with every block JIT compiled on first run (a debug build, so
+    # window ops run through their interpreter path; `just test-stencils` runs
+    # them as copied stencils)
     cargo test --features "immediate_jit gc_sanitize" --test golden_tests
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     cargo test --test gc_reset_frees
