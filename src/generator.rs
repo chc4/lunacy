@@ -163,6 +163,7 @@ macro_rules! dispatch_int_window {
             Opcode::ADD => Rc::new($name::<{Opcode::ADD}>::new($($arg),*)) as Rc<dyn Window>,
             Opcode::SUB => Rc::new($name::<{Opcode::SUB}>::new($($arg),*)),
             Opcode::MUL => Rc::new($name::<{Opcode::MUL}>::new($($arg),*)),
+            Opcode::MOD => Rc::new($name::<{Opcode::MOD}>::new($($arg),*)),
             _ => unreachable!(),
         }
     };
@@ -712,7 +713,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             let rint = yield YieldOp::GuardCType(rhs, CType::Integer);
             let int = |arg: &ResumeArg| matches!(arg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
             // Integers, not both constants: in 64 bits, an integer if it fits.
-            let integer = matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL)
+            let integer = matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::MOD)
                 && int(&lint)
                 && int(&rint)
                 && matches!((&larg, &rarg), (ResumeArg::Matched, _) | (_, ResumeArg::Matched));
@@ -741,7 +742,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     (ResumeArg::Matched, ResumeArg::Matched) => {
                         windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
                             let (l, r) = (lhs.as_double_unchecked(), rhs.as_double_unchecked());
-                            *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
+                            *dest = double_result(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                         });
                         dispatch_numeric_window!(opcode, NumericIntInt, (&[lhs, rhs, dest]))
                     }
@@ -751,7 +752,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                             let constants = &(&(*state.clos.ro(owner).prototype).constants.items);
                             let Constant::Number(l) = &constants[kl as usize] else { core::hint::unreachable_unchecked() };
                             let Constant::Number(r) = &constants[kr as usize] else { core::hint::unreachable_unchecked() };
-                            *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(*r)).unwrap());
+                            *dest = double_result(LValue::Number(*l).numeric_op(OP, &LValue::Number(*r)).unwrap());
                         });
                         dispatch_numeric_window!(opcode, NumericCintCint, (*lhsc as u32, *rhsc as u32, &[dest]))
                     }
@@ -761,7 +762,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                                 core::hint::unreachable_unchecked()
                             };
                             let r = rhs.as_double_unchecked();
-                            *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
+                            *dest = double_result(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                         });
                         dispatch_numeric_window!(opcode, NumericCintInt, (*lhsc as u32, &[rhs, dest]))
                     }
@@ -771,7 +772,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                             let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
                                 core::hint::unreachable_unchecked()
                             };
-                            *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(*r)).unwrap());
+                            *dest = double_result(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(*r)).unwrap());
                         });
                         dispatch_numeric_window!(opcode, NumericIntCint, (*rhsc as u32, &[lhs, dest]))
                     }
@@ -784,7 +785,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                         windowed!(NumericNum, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
                             let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
                             let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
-                            *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
+                            *dest = double_result(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                         });
                         dispatch_numeric_window!(opcode, NumericNum, (&[lhs, rhs, dest]))
                     }
@@ -794,7 +795,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                                 core::hint::unreachable_unchecked()
                             };
                             let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
-                            *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
+                            *dest = double_result(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
                         });
                         dispatch_numeric_window!(opcode, NumericKNum, (*lhsc as u32, &[rhs, dest]))
                     }
@@ -804,7 +805,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                             let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
                                 core::hint::unreachable_unchecked()
                             };
-                            *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(*r)).unwrap());
+                            *dest = double_result(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(*r)).unwrap());
                         });
                         dispatch_numeric_window!(opcode, NumericNumK, (*rhsc as u32, &[lhs, dest]))
                     }
@@ -1375,9 +1376,9 @@ impl std::fmt::Display for CType {
 // test is a tag test and a window op, so the JIT keeps the window across it.
 //
 // A numeric op then picks its window op by its register operands' encodings
-// (a constant is a double in the prototype, whatever its type): ADD, SUB and
-// MUL of integers compute in 64 bits and box an i32 if the result fits, else a
-// double, and guard their result `Integer`, the overflow check; doubles are
+// (a constant is a double in the prototype, whatever its type): ADD, SUB, MUL
+// and MOD of integers compute in 64 bits and box an i32 if the result fits,
+// else a double, and guard their result `Integer`, the overflow check; doubles are
 // decoded as doubles, giving a `Double`; anything else (an integer with a
 // double, an operation integers don't have yet) decodes either. A hash key's
 // known type is a number's `LType` only: a field holding either encoding keeps
@@ -1397,8 +1398,8 @@ crate::window::windowed!(IsInt, [], [INTEGER: bool], |owner, state, base| (value
     state.select = (!pass) as usize;
 });
 
-/// Integer ADD, SUB or MUL, in 64 bits: an integer if it fits, else a double.
-/// See Note [Integers].
+/// Integer ADD, SUB, MUL or MOD (Lua's, floored), in 64 bits: an integer if it
+/// fits, else a double (MOD by 0 is Lua's NaN). See Note [Integers].
 #[inline(always)]
 fn int_arith<'src, 'intern, const OP: Opcode>(l: i32, r: i32) -> LBoxed<'src, 'intern> {
     let (l, r) = (l as i64, r as i64);
@@ -1406,12 +1407,25 @@ fn int_arith<'src, 'intern, const OP: Opcode>(l: i32, r: i32) -> LBoxed<'src, 'i
         Opcode::ADD => l + r,
         Opcode::SUB => l - r,
         Opcode::MUL => l * r,
+        Opcode::MOD if r == 0 => return LBoxed::from_number(crate::vm::lua_mod(l as f64, 0.0)),
+        Opcode::MOD => {
+            let m = l % r;
+            if m != 0 && (m ^ r) < 0 { m + r } else { m }
+        }
         _ => unsafe { core::hint::unreachable_unchecked() },
     };
     match i32::try_from(wide) {
         Ok(i) => LBoxed::from_int(i),
         Err(_) => LBoxed::from_number(wide as f64),
     }
+}
+
+/// A double op's result, boxed as a double whatever its value, as its
+/// `Double` type says. See Note [Integers].
+#[inline(always)]
+fn double_result<'src, 'intern>(v: LValue<'src, 'intern>) -> LBoxed<'src, 'intern> {
+    let LValue::Number(n) = v else { unsafe { core::hint::unreachable_unchecked() } };
+    LBoxed::from_number(n.0)
 }
 
 /// The `CType::Integer` constant `k` of the running prototype.
@@ -2532,6 +2546,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op.window));
                                     result = Some(op.result);
                                 } else {
+                                    if c == 2 {
+                                        result = nf.result();
+                                    }
                                     self.blocks[block_id.0].instructions.push(Residual::NativeCall {
                                         nf: nf.native(), a: a as u16, b: b as u16, c: c as u16
                                     });
@@ -2578,7 +2595,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             //ctx.types = vec![LType::Unknown; ctx.types.len()];
                             let mut ctx = ctx;
                             if let Some(result) = result {
-                                Rc::make_mut(&mut ctx).types[a] = CType::Type(result);
+                                Rc::make_mut(&mut ctx).types[a] = result;
                             }
                             return Some((pc.0 + 1, ctx, ResumeArg::Start));
                         },

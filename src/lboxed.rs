@@ -51,14 +51,17 @@ pub(crate) struct NClosureCell {
     /// The native's window op for a call, if it offers one. See Note [Native
     /// windows] in `library`.
     pub(crate) window: Option<NativeWindow>,
+    /// The type of the native's first result, if it declares one. See Note
+    /// [Native windows] in `library`.
+    pub(crate) result: Option<crate::generator::CType>,
 }
 
 impl NClosureCell {
     /// Leak a headered cell for `native`. `NClosure` holds the returned pointer
     /// for its whole life, so boxing a native only reads it; the cell is `'static`
     /// and outside the GC, so `Mark` needn't trace it.
-    pub(crate) fn leak(native: NativeFunc, window: Option<NativeWindow>) -> &'static NClosureCell {
-        Box::leak(Box::new(NClosureCell { kind: LBoxed::KIND_NCLOSURE, native, window }))
+    pub(crate) fn leak(native: NativeFunc, window: Option<NativeWindow>, result: Option<crate::generator::CType>) -> &'static NClosureCell {
+        Box::leak(Box::new(NClosureCell { kind: LBoxed::KIND_NCLOSURE, native, window, result }))
     }
 }
 
@@ -93,7 +96,10 @@ impl<'src> IStr<'src> {
 // encoding as the same `f64` (`as_number`, and `unbox`, whose `LValue::Number`
 // never says which it was). A number's encoding isn't canonical: an integer and
 // the equal double are the same value, which `LCanon` accounts for (Note
-// [Canonical values] in `vm`).
+// [Canonical values] in `vm`). But code that doesn't know which encoding a number
+// should have (the interpreter, natives, `box_lvalue`) boxes it canonically, a
+// whole number in the i32 range, but -0, as an integer, so the same value only
+// arrives in both encodings where a specialized op boxed a whole `Double`.
 
 impl<'src, 'intern> LBoxed<'src, 'intern> {
     pub const NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;
@@ -141,6 +147,15 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     pub fn from_number(n: f64) -> Self {
         let bits = if n.is_nan() { Self::CANONICAL_NAN } else { n.to_bits() };
         Self::from_raw(bits.wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
+    }
+
+    /// Box a number canonically: a whole number in the i32 range (but -0,
+    /// whose sign an integer would lose) as an integer, anything else as a
+    /// double. See Note [Integer encoding].
+    #[inline(always)]
+    pub fn from_number_canonical(n: f64) -> Self {
+        let i = n as i32;
+        if i as f64 == n && !(i == 0 && n.is_sign_negative()) { Self::from_int(i) } else { Self::from_number(n) }
     }
 
     /// Box an integer. See Note [Integer encoding].
@@ -228,7 +243,7 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         match val {
             LValue::Nil => Self::NIL,
             LValue::Bool(b) => Self::from_bool(b),
-            LValue::Number(n) => Self::from_number(n.0),
+            LValue::Number(n) => Self::from_number_canonical(n.0),
             // Cells box as their raw, untagged pointer; the type lives in the
             // object's offset-0 `kind` header (see gc::CellKind).
             LValue::Table(t) => Self::from_raw(t.0.to_addr()),
@@ -303,7 +318,7 @@ impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LBoxed<'src, 'intern> {
         match value {
             Constant::Nil => Self::NIL,
             Constant::Bool(b) => Self::from_bool(*b),
-            Constant::Number(n) => Self::from_number(n.0),
+            Constant::Number(n) => Self::from_number_canonical(n.0),
             Constant::String(s) => Self::interned(*s),
         }
     }

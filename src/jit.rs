@@ -390,7 +390,7 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
     dynasm!(ops ; .arch x64 ; =>fall ; add rsp, 8);
 }
 
-const JIT_SIZE: usize = 0x1000 * 16;
+const JIT_SIZE: usize = 0x1000 * 4096;
 pub struct JitContext {
     pub memory: std::cell::Cell<dynasmrt::mmap::ExecutableBuffer>,
     pub blocks: HashMap<BlockId, JitBlock, FxBuildHasher>,
@@ -577,8 +577,7 @@ impl JitContext {
 
     // Reserve memory in the JIT buffer
     fn reserve(&mut self, len: usize) {
-        #[cfg(debug_assertions)]
-        assert!(self.used + len < JIT_SIZE);
+        assert!(self.used + len < JIT_SIZE, "JIT code past the end of its buffer");
         self.used += len;
     }
 
