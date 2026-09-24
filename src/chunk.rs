@@ -208,6 +208,19 @@ pub struct FunctionBlock<'a, C> {
     pub prototypes: PackedList<FunctionBlock<'a, C>>,
 }
 
+impl<'a, C> FunctionBlock<'a, C> {
+    /// How many locals are in scope at `pc`, from the debug information: they hold
+    /// registers `0..` that many, in declaration order, and every register above
+    /// holds a temporary or nothing. `None` if the debug information was stripped.
+    pub fn locals_in_scope(&self, pc: usize) -> Option<usize> {
+        if self.line_info.items.is_empty() && !self.instructions.items.is_empty() {
+            return None;
+        }
+        let pc = pc as u32;
+        Some(self.local_info.items.iter().filter(|local| local.start_pc <= pc && pc < local.end_pc).count())
+    }
+}
+
 pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock<Constant<PackedString<'_>>>> {
     let (input, (source, line_defined, last_line, upval_count, param_count, is_vararg, max_stack)) =
         tuple((packed_string, le_u32, le_u32, le_u8, le_u8, le_u8, le_u8))(input)?;

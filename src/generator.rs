@@ -1993,6 +1993,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Rc::make_mut(&mut ctx).set_types(owner, ty_effects)
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
+                    // The jump kills what has no later use along it: every register not
+                    // holding a local in scope at its target (a register a local leaves
+                    // is written before it is read again). Forgetting their types lets
+                    // paths that differ only in dead registers share the target's
+                    // version. The context of the block itself is unchanged, as it may
+                    // jump elsewhere too.
+                    let mut ctx = ctx.clone();
+                    let in_scope = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(dest_pc);
+                    if let Some(in_scope) = in_scope {
+                        let dead: Vec<(usize, CType)> = (in_scope..ctx.types.len())
+                            .filter(|&idx| ctx.types[idx] != CType::Type(LType::Unknown))
+                            .map(|idx| (idx, CType::Type(LType::Unknown)))
+                            .collect();
+                        if !dead.is_empty() {
+                            Rc::make_mut(&mut ctx).set_types(owner, dead);
+                        }
+                    }
                     if let Some(exists) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(SubPc::new(dest_pc), ctx.clone())) {
                         debug!("jump exist {dest_pc} -> {exists:?}");
                         arg = ResumeArg::BlockId(*exists);
