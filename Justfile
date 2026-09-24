@@ -41,7 +41,7 @@ test-stencils:
 # with the `graph` dump, then list each function's blocks with window runs,
 # hottest first.
 window-runs benchmark times='20':
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     rm -f func_*.dot func_*.pdf
     cargo run --release --no-default-features --features "lbbv graph" --bin bench -- {{benchmark}}.bin {{times}}
     python3 tools/window_runs.py func_*.dot
@@ -54,7 +54,7 @@ window-runs benchmark times='20':
 window-dump benchmark times='20' ref='':
     #!/usr/bin/env bash
     set -euo pipefail
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     if [ -z "{{ref}}" ]; then
         cargo run --release --features window_dump --bin bench -- {{benchmark}}.bin {{times}}
     else
@@ -83,7 +83,7 @@ window-dump-policies name:
 # benchmark that fails (lunacy lacks some of Lua) says why.
 window-dump-compare times +benchmarks:
     cargo build --release --features window_dump --bin bench
-    for b in {{benchmarks}}; do luac5.1 -o $b.bin lua_benchmarking/benchmarks/$b/bench.lua || continue; for policy in streaming unidirectional; do if LUNACY_TRACES=$policy timeout 600 ./target/release/bench $b.bin {{times}} > /dev/null 2> target/window-dump-compare.err; then python3 tools/window_dump_stats.py --raw window_dump.txt | tail -1 | sed "s|^window_dump.txt|$b $policy|"; else echo "$b $policy: failed: $(grep -A1 -m1 panicked target/window-dump-compare.err | tail -1)"; fi; done; done
+    for b in {{benchmarks}}; do just _luac $b || continue; for policy in streaming unidirectional; do if LUNACY_TRACES=$policy timeout 600 ./target/release/bench $b.bin {{times}} > /dev/null 2> target/window-dump-compare.err; then python3 tools/window_dump_stats.py --raw window_dump.txt | tail -1 | sed "s|^window_dump.txt|$b $policy|"; else echo "$b $policy: failed: $(grep -A1 -m1 panicked target/window-dump-compare.err | tail -1)"; fi; done; done
 
 # The loads, stores and moves in window dumps, over all blocks and hot ones.
 window-dump-stats *dumps='bench/window_dumps/*.txt':
@@ -116,13 +116,22 @@ gdb-test name:
     gdb --args ./target/release/lunacy {{name}}.bin
 
 # Benchmarks
+# Compile a benchmark to <benchmark>.bin: this repository's
+# benchmarks/<benchmark>, else lua_benchmarking's.
+_luac benchmark:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src=benchmarks/{{benchmark}}/bench.lua
+    if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
+    luac5.1 -o {{benchmark}}.bin $src
+
 run benchmark:
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     time cargo run --release --bin bench -- {{benchmark}}.bin
 
 [env("RUST_LOG", "debug")]
 run-debug benchmark:
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     time cargo run --bin bench -- {{benchmark}}.bin
 
 graph name:
@@ -137,7 +146,7 @@ graph-release name:
 graph-guards benchmark times='10':
     #!/usr/bin/env bash
     set -euo pipefail
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     for variant in guards no_guards; do
         features=graph
         if [ $variant = no_guards ]; then features="graph no_dynamic_guards"; fi
@@ -157,7 +166,7 @@ baseline benchmark:
     time lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench
 
 gdb-benchmark benchmark:
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     cargo build --release --bin bench
     gdb --args ./target/release/bench {{benchmark}}.bin
 
@@ -167,7 +176,7 @@ gdb-benchmark benchmark:
 flamegraph benchmark times='10' ref='':
     #!/usr/bin/env bash
     set -euo pipefail
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     rm -f /tmp/perf-*.map
     if [ -z "{{ref}}" ]; then
         cargo flamegraph --features "perf" --bin bench -- {{benchmark}}.bin {{times}}
@@ -187,7 +196,7 @@ INTERPRETER_FEATURES := "magic"
 interpreter-compile:
     cargo build --release --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin bench --target-dir ./target/interpreter
 interpreter benchmark: interpreter-compile
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     time ./target/interpreter/release/bench {{benchmark}}.bin
 interpreter-test name: interpreter-compile
     luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
@@ -214,17 +223,17 @@ unsafe-compile:
     cargo build --profile unsafe --no-default-features --features unsafe --bin bench \
         -Z build-std="core,std,panic_abort"
 unsafe benchmark: unsafe-compile
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     time ./target/unsafe/bench {{benchmark}}.bin
 
 gdb-unsafe benchmark: unsafe-compile
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     gdb --args ./target/unsafe/bench {{benchmark}}.bin
 
 
 # Hyperfine reports
 hyperfine benchmark times='10': unsafe-compile interpreter-compile
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     cargo build --release --bin bench
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}.md \
         "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}}" \
@@ -235,7 +244,7 @@ hyperfine benchmark times='10': unsafe-compile interpreter-compile
 # allocation, on a benchmark
 # (LUNACY_TRACES; see docs/trace-register-allocation.md).
 hyperfine-traces benchmark times='10' policies='streaming,single,unidirectional,bidirectional':
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     cargo build --release --bin bench
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
         "LUNACY_TRACES={policy} ./target/release/bench {{benchmark}}.bin {{times}}"
@@ -248,7 +257,7 @@ hyperfines-traces policies='streaming,unidirectional,bidirectional': (hyperfine-
 # after the heap's final reset (feature `alloc_stats`), each policy's in
 # target/alloc-stats-<benchmark>-<policy>.txt.
 alloc-stats benchmark times='10' policies='streaming unidirectional':
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     cargo build --release --features alloc_stats --bin bench
     for policy in {{policies}}; do LUNACY_TRACES=$policy ./target/release/bench {{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-$policy.txt; echo "target/alloc-stats-{{benchmark}}-$policy.txt"; done
 
@@ -266,7 +275,7 @@ _compare-worktree ref:
 # benchmark: `ref` is built in a detached worktree under target/compare/ (kept
 # for reruns, its submodules linked to this checkout's).
 hyperfine-vs ref benchmark times='10':
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     cargo build --release --bin bench
     just _compare-worktree {{ref}}
     cd target/compare/{{ref}} && cargo build --release --bin bench
@@ -276,19 +285,19 @@ hyperfine-vs ref benchmark times='10':
 # Compare this checkout's release build with and without cargo feature
 # `feature` on one benchmark: the feature's build is in target/features/<feature>.
 hyperfine-feature feature benchmark times='10':
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     cargo build --release --bin bench
     cargo build --release --features {{feature}} --bin bench --target-dir target/features/{{feature}}
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
         -n default "./target/release/bench {{benchmark}}.bin {{times}}" \
         -n {{feature}} "target/features/{{feature}}/release/bench {{benchmark}}.bin {{times}}"
 hyperfine-jit benchmark:
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     cargo build --release --bin bench
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-jit.md \
         "./target/release/bench {{benchmark}}.bin"
 hyperfine-unsafe benchmark: unsafe-compile
-    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    just _luac {{benchmark}}
     hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-unsafe.md \
         "./target/unsafe/bench {{benchmark}}.bin"
 
