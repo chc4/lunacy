@@ -803,6 +803,11 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 Some(Gc::new(s))
 
             },
+            LValue::Bool(b) => {
+                let mut s: FVec<_> = vec![].into();
+                write!(s, "{b}");
+                Some(Gc::new(s))
+            },
             LValue::LClosure(l) => {
                 let mut s: FVec<_> = vec![].into();
                 let line = unsafe { (*l.0.ro(owner).prototype).line_defined };

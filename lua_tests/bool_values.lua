@@ -22,6 +22,7 @@ h.__jit = 1
 run()
 set(1, false)
 print(n(t[1]), n(g(1, 2)))
+print(true, false, h(1), g(2, 3))
 -- EXPECT: 1	0	0	1
 -- EXPECT: 1	0	0
 -- EXPECT: 1	0
@@ -31,3 +32,4 @@ print(n(t[1]), n(g(1, 2)))
 -- EXPECT: 1	0
 -- EXPECT: 1
 -- EXPECT: 0	0
+-- EXPECT: true	false	true	false
