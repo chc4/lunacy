@@ -728,8 +728,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         let mut plans = Plans::default();
         for trace in &traces {
-            let none = HashMap::default();
-            let mut planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &none);
             // A trace with an edge back into itself plans that edge blind:
             // plan it again, continuing into its entry windows from the first
             // pass. See Loops in docs/trace-register-allocation.md.
@@ -738,9 +736,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     trace.iter().position(|&t| ids[t] == target).is_some_and(|at| at <= pos)
                 })
             });
+            let none = HashMap::default();
+            let mut planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &none, !loops);
             if loops {
                 let seed: HashMap<BlockId, Placement, FxBuildHasher> = planned.iter().map(|(id, plan)| (*id, plan.entry.unpack())).collect();
-                planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &seed);
+                planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &seed, true);
                 for (id, plan) in &planned {
                     if seed[id] != plan.entry.unpack() {
                         let window = |regs| Cache::entry(regs, &Cache::default(), &Slots::default());
@@ -758,7 +758,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// its hottest target with an entry window (compiled, planned already, or
     /// in `seed`: the trace's own entry windows from a first pass). Every other
     /// edge is a pseudo-use: of its target's entry window, or of the slots live
-    /// into it.
+    /// into it. With `dump`, the requests its ops demote go to the window dump.
     #[allow(clippy::too_many_arguments)]
     fn plan_trace(
         &self,
@@ -769,6 +769,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         live_in: &[Slots],
         plans: &Plans,
         seed: &HashMap<BlockId, Placement, FxBuildHasher>,
+        dump: bool,
     ) -> Vec<(BlockId, BlockPlan)> {
         let window_of = |target: BlockId| match self.jctx.blocks.get(&target) {
             Some(done) => Some(*done.window.regs()),
@@ -827,6 +828,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             step_of.push(of);
         }
         let plan = plan_trace(&steps, WINDOW);
+        // Where each step came from, for the dump: its block, and its residual.
+        let origin = |step: usize| {
+            let pos = starts.partition_point(|&start| start <= step) - 1;
+            let off = step_of[pos].iter().position(|&s| s == Some(step));
+            (ids[trace[pos]].0, off)
+        };
+        for d in plan.demotions.iter().filter(|_| dump) {
+            let ((block, off), (used_block, used_off)) = (origin(d.step), origin(d.used));
+            let kept = match d.kept {
+                Some((skip, cost)) => format!("at w{skip} it would keep it, for cost {cost}"),
+                None => "no SKIP keeps it".to_string(),
+            };
+            window_dump!(
+                self.jctx,
+                "demoted [{}] in w{} (used by block {} residual {:?}) at block {} residual {:?}: placed at w{} for cost {}; {}",
+                d.slot, d.reg, used_block, used_off, block, off, d.skip, d.cost, kept
+            );
+        }
         let placed = |of: &[Option<usize>]| of.iter().map(|step| step.map(|step| (plan.skips[step] as u8, Packed::pack(&plan.windows[step])))).collect();
         trace
             .iter()

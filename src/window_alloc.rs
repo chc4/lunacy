@@ -479,6 +479,22 @@ pub struct TracePlan {
     pub windows: Vec<Placement>,
     pub skips: Vec<usize>,
     pub dirty: Vec<Slots>,
+    /// Every request an op demoted, for window dumps.
+    pub demotions: Vec<Demotion>,
+}
+
+/// A request for `slot` in `reg`, used at step `used`, demoted by the op at
+/// `step` placed at `skip` for `cost`; `kept` is the cheapest `SKIP` of that
+/// op that would have kept it, and its cost, if any.
+#[derive(Debug, Clone, Copy)]
+pub struct Demotion {
+    pub step: usize,
+    pub slot: usize,
+    pub reg: usize,
+    pub used: usize,
+    pub skip: usize,
+    pub cost: u32,
+    pub kept: Option<(usize, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,27 +742,43 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
     }
     let mut planner = Planner { width, requests: Vec::new(), holds: [None; WINDOW], any: SmallVec::new(), occupied: [usize::MAX; WINDOW] };
     let mut skips = vec![0; steps.len()];
+    let mut demotions = Vec::new();
     for (step, s) in steps.iter().enumerate().rev() {
         match s {
             Step::Start => {}
             Step::Header => planner.anchor(step),
             Step::Op(op, usable) => {
                 let (slots, accesses) = (op.operands(), op.accesses());
-                let skip = usable
+                let costed: SmallVec<[(usize, u32, usize); WINDOW]> = usable
                     .iter()
                     .copied()
                     .filter(|&skip| skip + slots.len() <= width)
-                    .min_by_key(|&skip| {
+                    .map(|skip| {
                         let (mut cost, nearest) = planner.cost(&Run { slots, accesses, skip }, &dirty[step]);
                         // An input its producer can't write in place is a move.
                         let inputs = (skip..).zip(accesses).filter(|(_, a)| **a == Access::Read).map(|(reg, _)| reg);
                         for (reg, mask) in inputs.zip(&in_place[step]) {
                             cost += u32::from(mask & 1 << reg == 0);
                         }
-                        (cost, std::cmp::Reverse(nearest), skip)
+                        (skip, cost, nearest)
                     })
-                    .expect("a usable SKIP");
-                planner.place(step, &Run { slots, accesses, skip });
+                    .collect();
+                let &(skip, cost, _) =
+                    costed.iter().min_by_key(|&&(skip, cost, nearest)| (cost, std::cmp::Reverse(nearest), skip)).expect("a usable SKIP");
+                let run = Run { slots, accesses, skip };
+                for reg in skip..skip + slots.len() {
+                    let Some(id) = planner.holds[reg] else { continue };
+                    let q = &planner.requests[id];
+                    if run.writes(q.slot).is_none() && !run.reads_at(q.slot, reg) {
+                        let keeps = |other: usize| {
+                            let run = Run { slots, accesses, skip: other };
+                            !run.contains(reg) || run.writes(q.slot).is_some() || run.reads_at(q.slot, reg)
+                        };
+                        let kept = costed.iter().filter(|&&(other, ..)| keeps(other)).min_by_key(|&&(_, cost, _)| cost).map(|&(other, cost, _)| (other, cost));
+                        demotions.push(Demotion { step, slot: q.slot, reg, used: q.at, skip, cost, kept });
+                    }
+                }
+                planner.place(step, &run);
                 skips[step] = skip;
             }
             Step::Flush => planner.drop_pending(),
@@ -819,7 +851,7 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
             dirty
         })
         .collect();
-    TracePlan { windows, skips, dirty }
+    TracePlan { windows, skips, dirty, demotions }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
