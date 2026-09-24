@@ -430,8 +430,12 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             });
             arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[b, a])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
-        } else if let ResumeArg::Matched = (yield YieldOp::GuardRk(c, LType::Number)) {
-            if let ResumeArg::Matched = (yield YieldOp::GuardCType(c, CType::Integer)) {
+        } else {
+            let integer = match yield YieldOp::GuardRk(c, LType::Number) {
+                ResumeArg::Matched => yield YieldOp::GuardCType(c, CType::Integer),
+                _ => ResumeArg::Failed,
+            };
+            if let ResumeArg::Matched = integer {
                 // An integer key in a register: the array part, if it is in it.
                 windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
                     let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
@@ -446,24 +450,17 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 });
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableInteger::new(&[b, c, a])));
             } else {
-                // Any other number key in a register.
-                windowed!(GetTableIndex, [], [], |owner, state, base| (table, key, out dest) {
-                    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-                    *dest = tab.get(owner, &key, state.intern).unwrap_or(LBoxed::NIL);
-                });
-                arg = yield YieldOp::ExecWindow(Rc::new(GetTableIndex::new(&[b, c, a])));
+                // Any other key: through `gettable`.
+                arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
+                    let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                        Ok(c) => Cow::Owned(LValue::from(c)),
+                        Err(lv) => Cow::Owned(lv.unbox()),
+                    };
+                    debug!("gettable {:?}", &kc);
+                    let val_b = state.vals[state.base + b as usize].unbox();
+                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(val_b.gettable(owner, kc, state.intern));
+                })));
             }
-            yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
-        } else {
-            arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
-                let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                    Ok(c) => Cow::Owned(LValue::from(c)),
-                    Err(lv) => Cow::Owned(lv.unbox()),
-                };
-                debug!("gettable {:?}", &kc);
-                let val_b = state.vals[state.base + b as usize].unbox();
-                state.vals[state.base + a as usize] = LBoxed::box_lvalue(val_b.gettable(owner, kc, state.intern));
-            })));
             yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
         }
         arg

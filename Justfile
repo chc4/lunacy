@@ -158,7 +158,7 @@ interpreter-test name: interpreter-compile
 # Disassemble a window op's stencil at SKIP 0 as the `unsafe` profile builds it,
 # in this checkout, or at revision `ref` (built in target/compare/<ref>, its
 # submodules linked to this checkout's, as for `hyperfine-vs`). For example
-# `just stencil-asm SetTableIndex`.
+# `just stencil-asm SetTableInteger`.
 stencil-asm op ref='':
     #!/usr/bin/env bash
     set -euo pipefail
