@@ -184,6 +184,13 @@ hyperfine-traces benchmark times='10' policies='streaming,single,unidirectional,
 # is the steady-state cost of the code, the rest the upfront cost (compiling).
 hyperfines-traces policies='streaming,unidirectional': (hyperfine-traces "life" "1000" policies) (hyperfine-traces "life" "5000" policies) (hyperfine-traces "nbody" "10" policies) (hyperfine-traces "queens" "3000" policies)
 
+# Allocations a benchmark makes under each trace policy, before and after the
+# heap's final reset (feature `alloc_count`).
+alloc-count benchmark times='10' policies='streaming unidirectional':
+    luac5.1 -o {{benchmark}}.bin lua_benchmarking/benchmarks/{{benchmark}}/bench.lua
+    cargo build --release --features alloc_count --bin bench
+    for policy in {{policies}}; do echo "== $policy"; LUNACY_TRACES=$policy ./target/release/bench {{benchmark}}.bin {{times}} 2>&1 >/dev/null | grep allocations; done
+
 # Compare this checkout's release build against revision `ref`'s on one
 # benchmark: `ref` is built in a detached worktree under target/compare/ (kept
 # for reruns, its submodules linked to this checkout's).
