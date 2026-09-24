@@ -68,6 +68,74 @@ macro_rules! h {
 windowed!(Add1 (|w0, w1, w2|) { w1 = w1.wrapping_add(w2); });
 windowed!(Mul0 (|w0, w1, w2|) { w0 = w0.wrapping_mul(w1); });
 
+// ---- immediate holes --------------------------------------------------------
+// A hole as an immediate in the code: `movabs reg, MAGIC + id` in inline asm,
+// which leaves LLVM the register (any, clobbering nothing) and can't be folded.
+// The copier finds the instruction by its immediate and overwrites the eight
+// bytes with the value: no pool slot, no RIP-relative load, and a whole u64.
+//
+// (`llvm.experimental.patchpoint.i64` would do the same through
+// `link_llvm_intrinsics`, but the intrinsic is variadic: declaring it so ICEs
+// rustc (`!fn_sig.c_variadic()`), and declaring it with fixed arguments is
+// invalid IR ("intrinsic was not defined with variable arguments").)
+const HOLE_MAGIC: u64 = 0x5EED_C0DE_0000_0000;
+
+#[inline(always)]
+fn imm_hole<const ID: u64>() -> u64 {
+    let x: u64;
+    unsafe { core::arch::asm!("movabs {0}, {1}", out(reg) x, const HOLE_MAGIC + ID, options(pure, nomem, nostack)) };
+    x
+}
+
+/// The `become` continuation of a 9-slot window, the size of lunacy's: here
+/// r12, r13, r14, r15, rdi, rsi, rdx, rcx, r8, most of them caller-saved in C.
+#[linkage = "weak"]
+pub extern "rust-preserve-none" fn __next9(_w0: usize, _w1: usize, _w2: usize, _w3: usize, _w4: usize, _w5: usize, _w6: usize, _w7: usize, _w8: usize) {}
+
+/// w6 (rdx) += the hole `0x7001`; every other slot passes through.
+pub extern "rust-preserve-none" fn add_k6(w0: usize, w1: usize, w2: usize, w3: usize, w4: usize, w5: usize, mut w6: usize, w7: usize, w8: usize) {
+    w6 = w6.wrapping_add(imm_hole::<0x7001>() as usize);
+    become __next9(w0, w1, w2, w3, w4, w5, w6, w7, w8)
+}
+
+/// Where hole `id`'s immediate is in `code`: after a `movabs` (REX.W, B8+r).
+fn imm_hole_offset(code: &[u8], id: u64) -> usize {
+    let magic = (HOLE_MAGIC + id).to_le_bytes();
+    let at = (2..code.len() - 7).find(|&i| code[i..i + 8] == magic).expect("the hole's immediate");
+    assert!(code[at - 2] & 0xf8 == 0x48 && code[at - 1] & 0xf8 == 0xb8, "a movabs before the hole's immediate");
+    at
+}
+
+/// Copy `add_k6` up to its `become`, fill its hole with `value`, and run it on
+/// a window, returning (w6, w4).
+unsafe fn run_add_k6(value: u64, window: [usize; 9]) -> (usize, usize) {
+    let func = add_k6 as *const () as usize;
+    let next = __next9 as *const () as usize;
+    let raw = unsafe { core::slice::from_raw_parts(func as *const u8, 4096) };
+    let end = (0..raw.len() - 5)
+        .find(|&i| raw[i] == 0xe9 && (func + i + 5).wrapping_add(i32::from_le_bytes(raw[i + 1..i + 5].try_into().unwrap()) as isize as usize) == next)
+        .expect("no trailing `become __next9`");
+    let mut code = raw[..end].to_vec();
+    let site = imm_hole_offset(&code, 0x7001);
+    println!("add_k6: {end} bytes: {:02x?}", code);
+    code[site..site + 8].copy_from_slice(&value.to_le_bytes());
+    let mut results = [0usize; 2];
+    // mov rax, rdx (w6) ; ret, then mov rax, rdi (w4) ; ret
+    for (i, tail) in [[0x48u8, 0x89, 0xd0, 0xc3], [0x48, 0x89, 0xf8, 0xc3]].iter().enumerate() {
+        let mut prog = code.clone();
+        prog.extend_from_slice(tail);
+        let mut buf = MutableBuffer::new(prog.len()).unwrap();
+        buf.set_len(prog.len());
+        unsafe { core::ptr::copy_nonoverlapping(prog.as_ptr(), buf.as_mut_ptr(), prog.len()) };
+        let exec = buf.make_exec().unwrap();
+        let f: extern "rust-preserve-none" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize =
+            unsafe { core::mem::transmute(exec.ptr(AssemblyOffset(0))) };
+        let w = window;
+        results[i] = f(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8]);
+    }
+    (results[0], results[1])
+}
+
 // ---- relocation info ------------------------------------------------------
 struct Reloc {
     hole_got: HashMap<String, u64>, // runtime address of each hole's GOT slot
@@ -206,5 +274,14 @@ fn main() {
         println!("a*(b+c) = {out}  (a={a}, b={b}, c={c})");
         assert_eq!(out, a * (b + c), "shifting window: Add@1 (b+c) then Mul@0 (a*prev)");
         println!("OK");
+
+        // An immediate hole holding a whole u64.
+        let k = 0x1122_3344_5566_7788u64;
+        let window = [10, 11, 12, 13, 14, 15, 16, 17, 18];
+        let (w6, w4) = run_add_k6(k, window);
+        println!("w6 = {w6:#x}, w4 = {w4}");
+        assert_eq!(w6, 16usize.wrapping_add(k as usize), "the hole's value added to w6");
+        assert_eq!(w4, 14, "w4 passes through");
+        println!("immediate hole OK");
     }
 }
