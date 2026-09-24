@@ -70,6 +70,14 @@ pub const SCRATCH: usize = WINDOW;
 const MEMORY_COST: u32 = 4;
 const MOVE_COST: u32 = 1;
 
+// What planning a trace charges for the code a placement implies (Note [Trace
+// allocation]). A move between registers is renamed away and costs only its
+// bytes; a load of an L1-resident stack slot is cheap out of order; a store
+// is dearest, and one reloaded soon after waits on store forwarding.
+const PLAN_MOVE: u32 = 1;
+const PLAN_LOAD: u32 = 2;
+const PLAN_STORE: u32 = 5;
+
 /// Code the JIT emits for window ops, over [`SCRATCH`] and the window registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Emit {
@@ -589,17 +597,19 @@ impl Planner {
     /// trace since the last flush.
     fn cost(&self, run: &Run, dirty: &Slots) -> (u32, usize) {
         let weight = |id: usize| u32::from(self.requests[id].own);
+        // A demoted value is reloaded at its use, and stored first if dirty.
+        let dropped = |slot: usize| PLAN_LOAD + if dirty.contains(slot) { PLAN_STORE } else { 0 };
         let mut cost = 0;
         let mut nearest = usize::MAX;
         for reg in run.skip..run.skip + run.slots.len() {
             let Some(id) = self.holds[reg] else { continue };
             let q = &self.requests[id];
             match run.writes(q.slot) {
-                Some(out) if out != reg => cost += weight(id),
+                Some(out) if out != reg => cost += weight(id) * PLAN_MOVE,
                 Some(_) => {}
                 None if run.reads_at(q.slot, reg) => {}
                 None => {
-                    cost += weight(id) * (1 + u32::from(dirty.contains(q.slot)));
+                    cost += weight(id) * dropped(q.slot);
                     if q.own {
                         nearest = nearest.min(q.at);
                     }
@@ -610,9 +620,13 @@ impl Planner {
             for id in self.pending(slot) {
                 let q = &self.requests[id];
                 match (access, q.wants) {
-                    (Access::Write, Some(r)) if !run.contains(r) => cost += weight(id),
-                    (Access::Write, None) => cost += weight(id) * if self.free(reg, q.at, run) { 1 } else { 2 },
-                    (Access::Read, Some(r)) if !run.contains(r) && r != reg => cost += weight(id),
+                    (Access::Write, Some(r)) if !run.contains(r) => cost += weight(id) * PLAN_MOVE,
+                    // Kept in its register until the use, a move there; else
+                    // the new value is stored and reloaded.
+                    (Access::Write, None) => {
+                        cost += weight(id) * if self.free(reg, q.at, run) { PLAN_MOVE } else { PLAN_STORE + PLAN_LOAD }
+                    }
+                    (Access::Read, Some(r)) if !run.contains(r) && r != reg => cost += weight(id) * PLAN_MOVE,
                     _ => {}
                 }
             }
@@ -758,7 +772,7 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
                         // An input its producer can't write in place is a move.
                         let inputs = (skip..).zip(accesses).filter(|(_, a)| **a == Access::Read).map(|(reg, _)| reg);
                         for (reg, mask) in inputs.zip(&in_place[step]) {
-                            cost += u32::from(mask & 1 << reg == 0);
+                            cost += u32::from(mask & 1 << reg == 0) * PLAN_MOVE;
                         }
                         (skip, cost, nearest)
                     })
