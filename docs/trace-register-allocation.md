@@ -196,12 +196,19 @@ its entry window, the others are dropped, and the code above the header is
 asked for that window, as for a jump into it. Left to reach up to their
 sources above the loop, they would be dropped there by the code before the
 loop, under its own register pressure, and the loop would reload its
-invariants every iteration. Not yet handled: a value the header keeps in a
-register that the loop's own ops always cover (any five-operand op covers
-`w3` and `w4`) is still dropped and reloaded on every back edge, and a
-header's entry window takes its dirty slots from the first jump compiled into
-it, so an accumulator arriving clean from before the loop is stored on every
-back edge.
+invariants every iteration.
+
+The plan also says which slots of a header's entry window are dirty: those the
+loop writes, as its back edge brings them dirty. The window is otherwise
+created by whichever jump into the header is compiled first, or by the entry
+stub when the header is where the region was entered, which loads it clean,
+and the back edge would store the loop's values every iteration to match. A
+clean value marked dirty is at most stored again, so this is safe for every
+edge into the header.
+
+Not yet handled: a value the header keeps in a register that the loop's own
+ops always cover (any five-operand op covers `w3` and `w4`) is still dropped
+and reloaded on every back edge.
 
 **The plan.** The pass decides each request's fate (kept in a register from its
 source to its use, or Home) and each op's `SKIP`; the window wanted before each

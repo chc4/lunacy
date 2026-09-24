@@ -385,6 +385,9 @@ pub struct BlockPlan {
     /// The registers of its entry window: the slots it and its successors read
     /// before writing, where they read them.
     entry: Packed,
+    /// The slots its entry window has dirty whichever jump into it is compiled
+    /// first: at a loop's header, those the loop writes.
+    dirty: Slots,
     /// Per residual, for a window op with a stencil, its `SKIP` and the placement
     /// planned before it.
     placed: Vec<Option<(u8, Packed)>>,
@@ -552,7 +555,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let window = match self.jctx.trace_policy {
                 Some(policy) => {
                     plans = self.plan_region(id, policy);
-                    Cache::entry(plans[&id].entry.unpack(), &Cache::default())
+                    Cache::entry(plans[&id].entry.unpack(), &Cache::default(), &plans[&id].dirty)
                 }
                 None => Cache::default(),
             };
@@ -822,7 +825,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         trace
             .iter()
             .enumerate()
-            .map(|(pos, &b)| (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[starts[pos]]), placed: placed(&step_of[pos]) }))
+            .map(|(pos, &b)| {
+                let start = starts[pos];
+                (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), dirty: plan.dirty[start], placed: placed(&step_of[pos]) })
+            })
             .collect()
     }
 
@@ -864,7 +870,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let pending = self.jctx.pending.entry(*target).or_insert_with(|| Pending {
                     label: ops.new_dynamic_label(),
                     window: match plans.get(target) {
-                        Some(plan) => Cache::entry(plan.entry.unpack(), alloc.cache()),
+                        Some(plan) => Cache::entry(plan.entry.unpack(), alloc.cache(), &plan.dirty),
                         // Streaming: entered with the window of the first jump to it.
                         None => alloc.cache().clone(),
                     },

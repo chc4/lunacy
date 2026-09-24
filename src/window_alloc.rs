@@ -43,9 +43,11 @@ use crate::window::{Access, Window, WINDOW};
 // where they read them), and any jump to it transfers the window to that one
 // ([`WindowAlloc::transfer`]): dirty values the target doesn't carry dirty are
 // stored, then its registers are filled as one parallel move. A block's entry
-// window takes its dirty slots from the first jump to it that is compiled. The
-// entry stub, for a block entered from the interpreter, loads its window from
-// the stack.
+// window takes its dirty slots from the first jump to it that is compiled, and
+// from its plan: a loop header's has the slots the loop writes dirty, as its
+// back edge brings them, so the back edge doesn't store them every iteration.
+// The entry stub, for a block entered from the interpreter, loads its window
+// from the stack.
 
 // Note [Parallel moves]
 // ~~~~~~~~~~~~~~~~~~~~~
@@ -164,9 +166,10 @@ impl std::fmt::Display for Cache {
 
 impl Cache {
     /// A block's entry window: `regs`, each slot dirty if it is dirty in `from`,
-    /// the window of the first jump to the block.
-    pub fn entry(regs: Placement, from: &Cache) -> Cache {
-        let dirty = from.dirty.iter().filter(|slot| regs.contains(&Some(**slot))).copied().collect();
+    /// the window of the first jump to the block, or planned dirty in `dirty`.
+    /// A clean value marked dirty is only stored again, so any slot can be.
+    pub fn entry(regs: Placement, from: &Cache, dirty: &Slots) -> Cache {
+        let dirty = regs.iter().flatten().copied().filter(|slot| from.dirty.contains(slot) || dirty.contains(*slot)).collect();
         Cache { regs, dirty }
     }
 
@@ -469,10 +472,13 @@ pub enum Step<'a> {
 }
 
 /// A planned trace: per step, the placement wanted before it (an op's, or a
-/// block's entry window at its `Start`), and an op's `SKIP`.
+/// block's entry window at its `Start`), an op's `SKIP`, and at a loop's
+/// `Header`, the slots its entry window has dirty: those the loop writes,
+/// which its back edge brings dirty (see Note [Trace allocation]).
 pub struct TracePlan {
     pub windows: Vec<Placement>,
     pub skips: Vec<usize>,
+    pub dirty: Vec<Slots>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -798,7 +804,22 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
             }
         }
     }
-    TracePlan { windows, skips }
+    // A loop header's entry window has the slots the trace leaves dirty
+    // dirty, as its back edge brings them: whichever jump into it is compiled
+    // first, or the entry stub, would otherwise fix them clean, and every
+    // iteration would store them.
+    let dirty = steps
+        .iter()
+        .zip(&windows)
+        .map(|(s, window)| {
+            let mut dirty = Slots::default();
+            if let Step::Header = s {
+                window.iter().flatten().filter(|&&slot| written.contains(slot)).for_each(|&slot| dirty.insert(slot));
+            }
+            dirty
+        })
+        .collect();
+    TracePlan { windows, skips, dirty }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1142,7 +1163,7 @@ mod tests {
             for (step, s) in steps.iter().enumerate() {
                 match s {
                     Step::Start | Step::Header => {
-                        let entry = Cache::entry(plan.windows[step], alloc.cache());
+                        let entry = Cache::entry(plan.windows[step], alloc.cache(), &plan.dirty[step]);
                         for emit in alloc.transfer(&entry) {
                             machine.exec(emit, None);
                         }
@@ -1163,7 +1184,7 @@ mod tests {
                     }
                     Step::Exit { window, .. } => {
                         let mut taken = Machine { memory: machine.memory.clone(), current: machine.current.clone(), regs: machine.regs };
-                        for emit in alloc.transfer(&Cache::entry(*window, alloc.cache())) {
+                        for emit in alloc.transfer(&Cache::entry(*window, alloc.cache(), &Slots::default())) {
                             taken.exec(emit, None);
                         }
                         for (reg, slot) in window.iter().enumerate() {
