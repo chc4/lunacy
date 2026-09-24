@@ -623,10 +623,9 @@ impl crate::gc::CellKind for FVec<u8> {
 // `LCanon` is an `LBoxed` in canonical form: equal values have identical bits, so it
 // implements `Hash`/`Eq` by value — comparing the raw bits, pointers included — with no
 // `owner`. `LCanon::new` does the canonicalizing: an owned string is interned, which the
-// arena dedups to the one pointer shared by every string with those bytes, and an
-// integer becomes the equal double (Note [Integer encoding] in `lboxed`). Everything
+// arena dedups to the one pointer shared by every string with those bytes. Everything
 // else is already canonical: interned strings are that unique pointer, tables/closures
-// compare by identity, and doubles/bool/nil are their own bits.
+// compare by identity, and numbers/bool/nil are their own bits.
 //
 // Hashing agrees with that equality: an interned string hashes by its precomputed content
 // hash (so strings spread by content, not by arena address), everything else by its bits.
@@ -642,9 +641,6 @@ impl<'src, 'intern> LCanon<'src, 'intern> {
     /// header-tag check (cf. `as_table`).
     #[inline(always)]
     pub fn new(v: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> Self {
-        if let Some(i) = v.as_int() {
-            return LCanon(LBoxed::from_number(i as f64));
-        }
         match v.unbox() {
             LValue::OwnedString(g) => LCanon(LBoxed::interned(intern_bytes(intern, g.as_slice()))),
             _ => LCanon(v),
@@ -937,7 +933,7 @@ pub type NativeWindow = fn(a: usize, b: u16, c: u16) -> Option<NativeOp>;
 pub struct NativeOp {
     pub window: std::rc::Rc<dyn crate::window::Window>,
     pub args: LType,
-    pub result: crate::generator::CType,
+    pub result: LType,
 }
 
 #[derive(Clone, Copy)]
@@ -985,19 +981,12 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: NativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(native, None, None) }
+        NClosure { cell: NClosureCell::leak(native, None) }
     }
 
-    /// A native that runs as a window op where `window` gives one, and whose
-    /// first result has the type `result`, if given. See Note [Native windows]
-    /// in `library`.
-    pub fn typed(native: NativeFunc, window: Option<NativeWindow>, result: Option<crate::generator::CType>) -> Self {
-        NClosure { cell: NClosureCell::leak(native, window, result) }
-    }
-
-    /// The type of this native's first result, if it declares one.
-    pub fn result(&self) -> Option<crate::generator::CType> {
-        self.cell.result.clone()
+    /// A native that runs as a window op where `window` gives one.
+    pub fn windowed(native: NativeFunc, window: NativeWindow) -> Self {
+        NClosure { cell: NClosureCell::leak(native, Some(window)) }
     }
 
     /// The window op a call `a`, `b`, `c` to this native runs as, if any.
@@ -1420,7 +1409,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             ($f:expr) => {
                 LValue::NClosure(NClosure::new(|mut seq, args, returns, _owner| {
                     let r = match args.ro(&seq) {
-                        [b] => LBoxed::from_number_canonical(($f)(b.as_number().unwrap_or_else(|| unimplemented!()))),
+                        [b] => LBoxed::from_number(($f)(b.as_number().unwrap_or_else(|| unimplemented!()))),
                         _ => unimplemented!(),
                     };
                     returns.rw(&mut seq).into_iter().zip([r]).for_each(|(slot, o)| *slot = o);
@@ -1823,7 +1812,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             Opcode::POW => x.powf(y),
                             _ => unsafe { std::hint::unreachable_unchecked() },
                         };
-                        LBoxed::from_number_canonical(r)
+                        LBoxed::from_number(r)
                     } else {
                         // Fallback (metamethods / coercions): decode to the view type.
                         let lb = match kb { Ok(c) => LValue::from(c), Err(v) => v.unbox() };
@@ -1836,7 +1825,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let (a, b) = <UNM as InstructionDecode>::Unpack::unpack(inst.0);
                     // TODO: metatables
                     let n = state.vals[state.base + b as usize].as_number().unwrap_or_else(|| unimplemented!("unm on non-number"));
-                    state.vals[state.base + a as usize] = LBoxed::from_number_canonical(-n);
+                    state.vals[state.base + a as usize] = LBoxed::from_number(-n);
                 },
                 Opcode::LEN => {
                     let (a, b) = <LEN as InstructionDecode>::Unpack::unpack(inst.0);
@@ -1863,7 +1852,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     debug!("{} {}", a, sbx);
                     let init = state.vals[state.base + a as usize].as_number().expect("forprep index non-number");
                     let step = state.vals[state.base + a as usize + 2].as_number().expect("forprep step non-number");
-                    state.vals[state.base + a as usize] = LBoxed::from_number_canonical(init - step);
+                    state.vals[state.base + a as usize] = LBoxed::from_number(init - step);
                     state.pc += sbx as usize;
                 },
                 Opcode::FORLOOP => {
@@ -1872,12 +1861,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     // Hot numeric loop: step / index / limit are always numbers.
                     let step = state.vals[state.base + a as usize + 2].as_number().expect("forloop step non-number");
                     let idx = state.vals[state.base + a as usize].as_number().expect("forloop index non-number") + step;
-                    state.vals[state.base + a as usize] = LBoxed::from_number_canonical(idx);
+                    state.vals[state.base + a as usize] = LBoxed::from_number(idx);
                     let limit = state.vals[state.base + a as usize + 1].as_number().expect("forloop limit non-number");
                     let comp = if step < 0.0 { limit <= idx } else { idx <= limit };
                     if comp {
                         state.pc = (state.pc as isize + sbx as isize) as usize;
-                        state.vals[state.base + a as usize + 3] = LBoxed::from_number_canonical(idx);
+                        state.vals[state.base + a as usize + 3] = LBoxed::from_number(idx);
                     }
                 },
                 Opcode::JMP => {

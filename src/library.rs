@@ -10,7 +10,6 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::gc::Gc;
 use crate::lboxed::LBoxed;
-use crate::generator::CType;
 use crate::vm::{FVec, IStr, InternString, InternedHasher, LType, LValue, NClosure, NativeOp, Table, Tc};
 
 // Note [Library natives]
@@ -39,7 +38,7 @@ thread_local! {
 // Note [Native windows]
 // ~~~~~~~~~~~~~~~~~~~~~
 // A native whose work fits a window op can offer one for a call's arity
-// (`NClosure::typed`), with the type its arguments must have and its
+// (`NClosure::windowed`), with the type its arguments must have and its
 // result's type. A call the specializer knows is to it (a `NativeFunction`
 // ctype, which `NativeGuard` checks), with every argument known to have that
 // type, then runs as that op, reading its arguments' slots and writing its
@@ -48,24 +47,13 @@ thread_local! {
 // Any other call to the native is an ordinary `NativeCall`. The bit library's
 // natives offer one for one result from their fixed arities, of numbers,
 // computing it as the native does (`bit1`, `bit2`).
-//
-// A native can also declare its first result's type, which a call to it known
-// to keep one result gives its result slot, native call or window op: the bit
-// library's are integers, as are `string.len`'s and `string.byte`'s.
 
 /// A native computing its results from its arguments. See Note [Library natives].
-/// With `window:`, also a window op for calls to it, and with `result:`, its
-/// first result's type. See Note [Native windows].
+/// With `window:`, also a window op for calls to it. See Note [Native windows].
 macro_rules! native {
-    (window: $window:expr, result: $result:expr, |$owner:ident, $args:ident| $body:expr) => {
+    (window: $window:expr, |$owner:ident, $args:ident| $body:expr) => {
         match native!(|$owner, $args| $body) {
-            LValue::NClosure(n) => LValue::NClosure(NClosure::typed(n.native(), Some($window), Some($result))),
-            _ => unreachable!(),
-        }
-    };
-    (result: $result:expr, |$owner:ident, $args:ident| $body:expr) => {
-        match native!(|$owner, $args| $body) {
-            LValue::NClosure(n) => LValue::NClosure(NClosure::typed(n.native(), None, Some($result))),
+            LValue::NClosure(n) => LValue::NClosure(NClosure::windowed(n.native(), $window)),
             _ => unreachable!(),
         }
     };
@@ -152,7 +140,7 @@ unsafe fn checked_number(v: LBoxed) -> f64 {
 }
 
 fn bit_result<'s, 'i>(x: i32) -> SmallVec<[LBoxed<'s, 'i>; 4]> {
-    smallvec![LBoxed::from_int(x)]
+    smallvec![LBoxed::from_number(x as f64)]
 }
 
 // The bit operations, by the `OP` of their window ops.
@@ -197,20 +185,20 @@ fn bit2<const OP: u8>(x: i32, y: i32) -> i32 {
 }
 
 crate::window::windowed!(BitUnary, [], [OP: u8], |owner, state, base| (x, out r) {
-    *r = LBoxed::from_int(bit1::<OP>(to_bit(checked_number(x))));
+    *r = LBoxed::from_number(bit1::<OP>(to_bit(checked_number(x))) as f64);
 });
 crate::window::windowed!(BitBinary, [], [OP: u8], |owner, state, base| (x, y, out r) {
-    *r = LBoxed::from_int(bit2::<OP>(to_bit(checked_number(x)), to_bit(checked_number(y))));
+    *r = LBoxed::from_number(bit2::<OP>(to_bit(checked_number(x)), to_bit(checked_number(y))) as f64);
 });
 
 /// `bit1::<OP>` as a window op, for a call with one number and one result.
 fn bit1_window<const OP: u8>(a: usize, b: u16, c: u16) -> Option<NativeOp> {
-    (b == 2 && c == 2).then(|| NativeOp { window: std::rc::Rc::new(BitUnary::<OP>::new(&[a + 1, a])), args: LType::Number, result: CType::Integer })
+    (b == 2 && c == 2).then(|| NativeOp { window: std::rc::Rc::new(BitUnary::<OP>::new(&[a + 1, a])), args: LType::Number, result: LType::Number })
 }
 
 /// `bit2::<OP>` as a window op, for a call with two numbers and one result.
 fn bit2_window<const OP: u8>(a: usize, b: u16, c: u16) -> Option<NativeOp> {
-    (b == 3 && c == 2).then(|| NativeOp { window: std::rc::Rc::new(BitBinary::<OP>::new(&[a + 1, a + 2, a])), args: LType::Number, result: CType::Integer })
+    (b == 3 && c == 2).then(|| NativeOp { window: std::rc::Rc::new(BitBinary::<OP>::new(&[a + 1, a + 2, a])), args: LType::Number, result: LType::Number })
 }
 
 /// A table of `entries`, keyed by interned names.
@@ -254,21 +242,21 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             }
             _ => None,
         };
-        smallvec![parsed.map_or(LBoxed::NIL, LBoxed::from_number_canonical)]
+        smallvec![parsed.map_or(LBoxed::NIL, LBoxed::from_number)]
     });
 
     let string_lib = module(intern, vec![
-        ("len", native!(result: CType::Integer, |owner, args| smallvec![LBoxed::from_int(bytes(arg(&args, 0)).len() as i32)])),
+        ("len", native!(|owner, args| smallvec![LBoxed::from_number(bytes(arg(&args, 0)).len() as f64)])),
         ("sub", native!(|owner, args| {
             let s = bytes(arg(&args, 0));
             let range = span(s.len(), number_or(arg(&args, 1), 1.0), number_or(arg(&args, 2), -1.0));
             smallvec![string(s[range].to_vec())]
         })),
-        ("byte", native!(result: CType::Integer, |owner, args| {
+        ("byte", native!(|owner, args| {
             let s = bytes(arg(&args, 0));
             let i = number_or(arg(&args, 1), 1.0);
             let range = span(s.len(), i, number_or(arg(&args, 2), i));
-            s[range].iter().map(|&b| LBoxed::from_int(b as i32)).collect()
+            s[range].iter().map(|&b| LBoxed::from_number(b as f64)).collect()
         })),
         ("char", native!(|owner, args| smallvec![string(args.iter().map(|&b| number(b) as u8).collect())])),
     ]);
@@ -334,17 +322,17 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     ]);
 
     let bit_lib = module(intern, vec![
-        ("tobit", native!(window: bit1_window::<TOBIT>, result: CType::Integer, |owner, args| bit_result(bit1::<TOBIT>(tobit(arg(&args, 0)))))),
-        ("bnot", native!(window: bit1_window::<BNOT>, result: CType::Integer, |owner, args| bit_result(bit1::<BNOT>(tobit(arg(&args, 0)))))),
-        ("band", native!(window: bit2_window::<BAND>, result: CType::Integer, |owner, args| bit_result(args.iter().fold(-1, |x, &v| bit2::<BAND>(x, tobit(v)))))),
-        ("bor", native!(window: bit2_window::<BOR>, result: CType::Integer, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BOR>(x, tobit(v)))))),
-        ("bxor", native!(window: bit2_window::<BXOR>, result: CType::Integer, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BXOR>(x, tobit(v)))))),
-        ("lshift", native!(window: bit2_window::<LSHIFT>, result: CType::Integer, |owner, args| bit_result(bit2::<LSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("rshift", native!(window: bit2_window::<RSHIFT>, result: CType::Integer, |owner, args| bit_result(bit2::<RSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("arshift", native!(window: bit2_window::<ARSHIFT>, result: CType::Integer, |owner, args| bit_result(bit2::<ARSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("rol", native!(window: bit2_window::<ROL>, result: CType::Integer, |owner, args| bit_result(bit2::<ROL>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("ror", native!(window: bit2_window::<ROR>, result: CType::Integer, |owner, args| bit_result(bit2::<ROR>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("bswap", native!(window: bit1_window::<BSWAP>, result: CType::Integer, |owner, args| bit_result(bit1::<BSWAP>(tobit(arg(&args, 0)))))),
+        ("tobit", native!(window: bit1_window::<TOBIT>, |owner, args| bit_result(bit1::<TOBIT>(tobit(arg(&args, 0)))))),
+        ("bnot", native!(window: bit1_window::<BNOT>, |owner, args| bit_result(bit1::<BNOT>(tobit(arg(&args, 0)))))),
+        ("band", native!(window: bit2_window::<BAND>, |owner, args| bit_result(args.iter().fold(-1, |x, &v| bit2::<BAND>(x, tobit(v)))))),
+        ("bor", native!(window: bit2_window::<BOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BOR>(x, tobit(v)))))),
+        ("bxor", native!(window: bit2_window::<BXOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BXOR>(x, tobit(v)))))),
+        ("lshift", native!(window: bit2_window::<LSHIFT>, |owner, args| bit_result(bit2::<LSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("rshift", native!(window: bit2_window::<RSHIFT>, |owner, args| bit_result(bit2::<RSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("arshift", native!(window: bit2_window::<ARSHIFT>, |owner, args| bit_result(bit2::<ARSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("rol", native!(window: bit2_window::<ROL>, |owner, args| bit_result(bit2::<ROL>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("ror", native!(window: bit2_window::<ROR>, |owner, args| bit_result(bit2::<ROR>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("bswap", native!(window: bit1_window::<BSWAP>, |owner, args| bit_result(bit1::<BSWAP>(tobit(arg(&args, 0)))))),
     ]);
 
     let require = native!(|owner, args| {

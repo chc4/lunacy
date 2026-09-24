@@ -157,18 +157,6 @@ macro_rules! dispatch_numeric_window {
     };
 }
 
-macro_rules! dispatch_int_window {
-    ($opcode:expr, $name:ident, ($($arg:expr),*)) => {
-        match $opcode {
-            Opcode::ADD => Rc::new($name::<{Opcode::ADD}>::new($($arg),*)) as Rc<dyn Window>,
-            Opcode::SUB => Rc::new($name::<{Opcode::SUB}>::new($($arg),*)),
-            Opcode::MUL => Rc::new($name::<{Opcode::MUL}>::new($($arg),*)),
-            Opcode::MOD => Rc::new($name::<{Opcode::MOD}>::new($($arg),*)),
-            _ => unreachable!(),
-        }
-    };
-}
-
 macro_rules! dispatch_compare_window {
     ($opcode:expr, $name:ident, ($($arg:expr),*)) => {
         match $opcode {
@@ -252,8 +240,8 @@ pub enum YieldOp {
                          // type
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
                            // is the expected type
-    GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: a number's
-                              // encoding, Integer. See Note [Integers]
+    GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer.
+                              // See Note [Integers]
     TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
@@ -313,10 +301,9 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
     move |mut arg: ResumeArg| {
         // One op per constant kind: converting any constant is a `match` on its
         // kind, which compiles to a jump table the copier can't copy.
-        // In the integer encoding if `INT`, the constant being an `Integer`.
-        windowed!(LoadKNumber, [index: u32], [INT: bool], |owner, state, base| (out dest) {
+        windowed!(LoadKNumber, [index: u32], [], |owner, state, base| (out dest) {
             let Constant::Number(n) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
-            *dest = if INT { LBoxed::from_int(n.0 as i32) } else { LBoxed::from_number(n.0) };
+            *dest = LBoxed::from_number(n.0);
         });
         windowed!(LoadKString, [index: u32], [], |owner, state, base| (out dest) {
             let Constant::String(s) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
@@ -324,12 +311,8 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
         });
         match c {
             LType::Number => {
+                yield YieldOp::ExecWindow(Rc::new(LoadKNumber::new(bx, &[dest])));
                 let ResumeArg::Type(t) = (yield YieldOp::TypeofK(bx as usize)) else { unreachable!() };
-                if t == CType::Integer {
-                    yield YieldOp::ExecWindow(Rc::new(LoadKNumber::<true>::new(bx, &[dest])));
-                } else {
-                    yield YieldOp::ExecWindow(Rc::new(LoadKNumber::<false>::new(bx, &[dest])));
-                }
                 yield YieldOp::SetCTypes(vec![(dest, t)]);
             },
             LType::String => {
@@ -473,7 +456,8 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             } else if let (ResumeArg::Matched, ResumeArg::Matched) = (&integer, &in_array) {
                 windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
                     let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-                    *dest = *tab.ro(owner).array.get_unchecked(int_slot(key.as_int_unchecked()));
+                    let Some(n) = key.as_number() else { core::hint::unreachable_unchecked() };
+                    *dest = *tab.ro(owner).array.get_unchecked(integer_slot(n));
                 });
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableInteger::new(&[b, c, a])));
             } else {
@@ -531,8 +515,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         } else if let (ResumeArg::Matched, ResumeArg::Matched) = (&integer, &in_array) {
             windowed!(SetTableInteger, [], [], |owner, state, base| (table, key, value) {
                 let LValue::Table(mut tab) = table.unbox() else { core::hint::unreachable_unchecked() };
+                let Some(n) = key.as_number() else { core::hint::unreachable_unchecked() };
                 tab.barrier_back();
-                *tab.rw(owner).array.get_unchecked_mut(int_slot(key.as_int_unchecked())) = value;
+                *tab.rw(owner).array.get_unchecked_mut(integer_slot(n)) = value;
             });
             arg = yield YieldOp::ExecWindow(Rc::new(SetTableInteger::new(&[a, b, c])));
         } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
@@ -559,7 +544,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 arg = yield YieldOp::TypeofRk(c);
                 let mut mismatched_type = None;
                 if let ResumeArg::Type(t) = arg {
-                    if !htype.accepts(&t) {
+                    if t != htype {
                         mismatched_type = Some(t);
                     } else {
                         // The value we're setting is statically known to be the same type as our
@@ -702,123 +687,61 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 return arg;
             }
         }
-        // --- Number Path ---
-        // Each register operand's encoding, which picks the op. See Note [Integers].
+        // --- Int Path ---
         let larg = yield YieldOp::GuardRk(lhs, LType::Number);
         let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
-        let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
-            && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
-        if numbers {
-            let lint = yield YieldOp::GuardCType(lhs, CType::Integer);
-            let rint = yield YieldOp::GuardCType(rhs, CType::Integer);
-            let int = |arg: &ResumeArg| matches!(arg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
-            // Integers, not both constants: in 64 bits, an integer if it fits.
-            let integer = matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::MOD)
-                && int(&lint)
-                && int(&rint)
-                && matches!((&larg, &rarg), (ResumeArg::Matched, _) | (_, ResumeArg::Matched));
-            let window = match (&larg, &rarg) {
-                (ResumeArg::Matched, ResumeArg::Matched) if integer => {
-                    windowed!(IntArith, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
-                        *dest = int_arith::<OP>(lhs.as_int_unchecked(), rhs.as_int_unchecked());
-                    });
-                    dispatch_int_window!(opcode, IntArith, (&[lhs, rhs, dest]))
-                }
-                (ResumeArg::MatchedConst(k), ResumeArg::Matched) if integer => {
-                    windowed!(IntArithKX, [k: u32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
-                        *dest = int_arith::<OP>(int_constant(state, owner, k), rhs.as_int_unchecked());
-                    });
-                    dispatch_int_window!(opcode, IntArithKX, (*k as u32, &[rhs, dest]))
-                }
-                (ResumeArg::Matched, ResumeArg::MatchedConst(k)) if integer => {
-                    windowed!(IntArithXK, [k: u32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
-                        *dest = int_arith::<OP>(lhs.as_int_unchecked(), int_constant(state, owner, k));
-                    });
-                    dispatch_int_window!(opcode, IntArithXK, (*k as u32, &[lhs, dest]))
-                }
-                // Doubles in registers (a constant is a double in the prototype
-                // whatever its type): decoded as doubles.
-                _ if !matches!(lint, ResumeArg::Matched) && !matches!(rint, ResumeArg::Matched) => match (&larg, &rarg) {
-                    (ResumeArg::Matched, ResumeArg::Matched) => {
-                        windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
-                            let (l, r) = (lhs.as_double_unchecked(), rhs.as_double_unchecked());
-                            *dest = double_result(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
-                        });
-                        dispatch_numeric_window!(opcode, NumericIntInt, (&[lhs, rhs, dest]))
-                    }
-                    // A constant operand is read from the prototype, as `k`.
-                    (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
-                        windowed!(NumericCintCint, [kl: u32, kr: u32], [OP: Opcode], |owner, state, base| (out dest) {
-                            let constants = &(&(*state.clos.ro(owner).prototype).constants.items);
-                            let Constant::Number(l) = &constants[kl as usize] else { core::hint::unreachable_unchecked() };
-                            let Constant::Number(r) = &constants[kr as usize] else { core::hint::unreachable_unchecked() };
-                            *dest = double_result(LValue::Number(*l).numeric_op(OP, &LValue::Number(*r)).unwrap());
-                        });
-                        dispatch_numeric_window!(opcode, NumericCintCint, (*lhsc as u32, *rhsc as u32, &[dest]))
-                    }
-                    (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
-                        windowed!(NumericCintInt, [k: u32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
-                            let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-                                core::hint::unreachable_unchecked()
-                            };
-                            let r = rhs.as_double_unchecked();
-                            *dest = double_result(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
-                        });
-                        dispatch_numeric_window!(opcode, NumericCintInt, (*lhsc as u32, &[rhs, dest]))
-                    }
-                    (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
-                        windowed!(NumericIntCint, [k: u32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
-                            let l = lhs.as_double_unchecked();
-                            let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-                                core::hint::unreachable_unchecked()
-                            };
-                            *dest = double_result(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(*r)).unwrap());
-                        });
-                        dispatch_numeric_window!(opcode, NumericIntCint, (*rhsc as u32, &[lhs, dest]))
-                    }
-                    _ => unreachable!(),
-                },
-                // An integer in a register with a double, or an operation integers
-                // don't have yet: decoded as either.
-                _ => match (&larg, &rarg) {
-                    (ResumeArg::Matched, ResumeArg::Matched) => {
-                        windowed!(NumericNum, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
-                            let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
-                            let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
-                            *dest = double_result(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
-                        });
-                        dispatch_numeric_window!(opcode, NumericNum, (&[lhs, rhs, dest]))
-                    }
-                    (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
-                        windowed!(NumericKNum, [k: u32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
-                            let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-                                core::hint::unreachable_unchecked()
-                            };
-                            let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
-                            *dest = double_result(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
-                        });
-                        dispatch_numeric_window!(opcode, NumericKNum, (*lhsc as u32, &[rhs, dest]))
-                    }
-                    (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
-                        windowed!(NumericNumK, [k: u32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
-                            let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
-                            let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-                                core::hint::unreachable_unchecked()
-                            };
-                            *dest = double_result(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(*r)).unwrap());
-                        });
-                        dispatch_numeric_window!(opcode, NumericNumK, (*rhsc as u32, &[lhs, dest]))
-                    }
-                    _ => unreachable!(),
-                },
-            };
+        let window = match (larg, rarg) {
+            (ResumeArg::Matched, ResumeArg::Matched) => {
+                windowed!(NumericIntInt, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
+                    // Guarded numbers. Unchecked, so that no panic path follows the
+                    // stencil's `become` and the copy can slice it off.
+                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
+                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
+                    *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
+                });
+                Some(dispatch_numeric_window!(opcode, NumericIntInt, (&[lhs, rhs, dest])))
+            },
+            // A constant operand is read from the prototype, as `k`.
+            (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
+                windowed!(NumericCintCint, [kl: u32, kr: u32], [OP: Opcode], |owner, state, base| (out dest) {
+                    let constants = &(&(*state.clos.ro(owner).prototype).constants.items);
+                    let Constant::Number(l) = &constants[kl as usize] else { core::hint::unreachable_unchecked() };
+                    let Constant::Number(r) = &constants[kr as usize] else { core::hint::unreachable_unchecked() };
+                    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(*r)).unwrap());
+                });
+                Some(dispatch_numeric_window!(opcode, NumericCintCint, (lhsc as u32, rhsc as u32, &[dest])))
+            },
+            (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
+                windowed!(NumericCintInt, [k: u32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
+                    let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+                        core::hint::unreachable_unchecked()
+                    };
+                    let Some(r) = rhs.as_number() else { core::hint::unreachable_unchecked() };
+                    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
+                });
+                Some(dispatch_numeric_window!(opcode, NumericCintInt, (lhsc as u32, &[rhs, dest])))
+            },
+            (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
+                windowed!(NumericIntCint, [k: u32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
+                    let Some(l) = lhs.as_number() else { core::hint::unreachable_unchecked() };
+                    let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
+                        core::hint::unreachable_unchecked()
+                    };
+                    *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(*r)).unwrap());
+                });
+                Some(dispatch_numeric_window!(opcode, NumericIntCint, (rhsc as u32, &[lhs, dest])))
+            },
+            _ => None,
+        };
+        if let Some(window) = window {
+            // Integer operands give an integer, unless it overflows. See Note [Integers].
+            let integers = matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL)
+                && (yield YieldOp::TypeofRk(lhs)) == ResumeArg::Type(CType::Integer)
+                && (yield YieldOp::TypeofRk(rhs)) == ResumeArg::Type(CType::Integer);
             yield YieldOp::ExecWindow(window);
-            if integer {
-                // An integer unless it overflowed. See Note [Integers].
-                yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+            yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+            if integers {
                 yield YieldOp::GuardCType(dest, CType::Integer);
-            } else {
-                yield YieldOp::SetCTypes(vec![(dest, CType::Double)]);
             }
             return arg;
         }
@@ -1271,10 +1194,8 @@ pub enum Residual {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum CType {
     Type(LType),
-    /// A number in the integer encoding. See Note [Integers].
+    /// A number that is a whole number in the i32 range. See Note [Integers].
     Integer,
-    /// A number in the double encoding. See Note [Integers].
-    Double,
     Shape(SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
     LuaFunction(Tc<LClosure<'static, 'static>>),
@@ -1297,7 +1218,7 @@ impl CType {
         match (self, other) {
             (a, b) if a == b => true,
             (CType::Type(LType::Unknown), _) => true,
-            (CType::Type(LType::Number), CType::Integer | CType::Double) => true,
+            (CType::Type(LType::Number), CType::Integer) => true,
             (CType::Type(LType::Closure), CType::NativeFunction(_) | CType::LuaFunction(_)) => true,
             _ => false,
         }
@@ -1329,7 +1250,7 @@ impl CType {
     fn as_ltype(&self) -> LType {
         match self {
             CType::Type(ty) => ty.clone(),
-            CType::Integer | CType::Double => LType::Number,
+            CType::Integer => LType::Number,
             CType::Shape(_) => LType::Table,
             CType::NativeFunction(_) => LType::Closure,
             CType::LuaFunction(_) => LType::Closure,
@@ -1342,7 +1263,6 @@ impl std::fmt::Display for CType {
         match self {
             CType::Type(ltype) => ltype.fmt(f),
             CType::Integer => write!(f, "integer"),
-            CType::Double => write!(f, "double"),
             CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
             CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
             CType::LuaFunction(lclos) => write!(f, "fn({:?})", lclos.as_ptr()),
@@ -1352,91 +1272,42 @@ impl std::fmt::Display for CType {
 
 // Note [Integers]
 // ~~~~~~~~~~~~~~~
-// A number is boxed as an i32 or as a double (Note [Integer encoding] in
-// `lboxed`), and `LType::Number` is either. `CType::Integer` is a number known
-// to be in the integer encoding and `CType::Double` one known to be in the
-// double encoding, which an op reads without testing which. The encoding is
-// known where it's produced: a whole constant in the i32 range is `Integer` and
-// loads as one, and every other number constant and every double-producing op
-// gives a `Double`. Discovery doesn't tell encodings apart (an unknown value
-// found to be a number is a `Number`), so a slot's versions only split by
-// encoding where its consumers ask: a numeric op, or a table key, yields
-// `GuardCType(slot, Integer)` after its number guard. That answers statically
-// when the context knows (`Integer` passes; `Double`, or not a number, fails),
-// and otherwise ends the block in a discovery thunk, like `Guard`'s. Forcing it
-// tests the value it finds:
+// Numbers are doubles. `CType::Integer` is a number that is a whole number in
+// the i32 range: exact as a double, and an array slot after one truncation. No
+// `LType` tells one apart, so it is discovered where a consumer wants one (a
+// table key): `GuardCType(slot, Integer)` answers statically when the context
+// knows (the slot is `Integer`, or not a number), and otherwise ends the block
+// in a discovery thunk, like `Guard`'s. Forcing it tests the value it finds:
 //
-//   * an integer: a `GuardDynamic(IsInt<true>)`, continuing on the success path
-//     with the slot `Integer`;
-//   * a double: a `GuardDynamic(IsInt<false>)`, continuing on the failure path
-//     with the slot `Double`;
+//   * an integer: a `GuardDynamic(CheckInteger<true>)`, continuing on the
+//     success path with the slot `Integer`;
+//   * another number: a `GuardDynamic(CheckInteger<false>)`, continuing on the
+//     failure path with the slot a number;
 //   * anything else: a `Guard` on its type, continuing on the failure path.
 //
 // Its fail thunk does the same for the next value that fails the guard. The
-// test is a tag test and a window op, so the JIT keeps the window across it.
+// check is a window op, so the JIT keeps the window across it, as across an
+// inline `Guard`.
 //
-// A numeric op then picks its window op by its register operands' encodings
-// (a constant is a double in the prototype, whatever its type): ADD, SUB, MUL
-// and MOD of integers compute in 64 bits and box an i32 if the result fits,
-// else a double, and guard their result `Integer`, the overflow check; doubles are
-// decoded as doubles, giving a `Double`; anything else (an integer with a
-// double, an operation integers don't have yet) decodes either. A hash key's
-// known type is a number's `LType` only: a field holding either encoding keeps
-// its epoch. FORLOOP's variable has its index's type.
+// A constant's type is `Integer` if it is one, so LOADK's and constant
+// operands are. Arithmetic propagates it with no guard on its operands: ADD,
+// SUB and MUL of two `Integer`s guard their result `Integer`, the overflow
+// check (their exact result is a double's up to 2^53, where rounding starts,
+// far out of the range), and otherwise give a number. FORLOOP's variable has
+// its index's type.
 
-/// Whether `n` is a whole number in the i32 range, which a constant is to be a
-/// `CType::Integer`. See Note [Integers].
+/// Whether `n` is a `CType::Integer`. See Note [Integers].
 #[inline(always)]
 pub fn is_integer(n: f64) -> bool {
     n == (n as i32) as f64
 }
 
-// A `GuardDynamic` test: whether the value is a number in the integer encoding
-// (`INTEGER`) or in the double encoding. See Note [Integers].
-crate::window::windowed!(IsInt, [], [INTEGER: bool], |owner, state, base| (value) {
-    let pass = if INTEGER { value.is_int() } else { value.is_number() && !value.is_int() };
+// A `GuardDynamic` test: whether the value is a number that is (`INTEGER`) or
+// isn't a `CType::Integer`. See Note [Integers].
+crate::window::windowed!(CheckInteger, [], [INTEGER: bool], |owner, state, base| (value) {
+    let pass = value.as_number().is_some_and(|n| is_integer(n) == INTEGER);
     state.select = (!pass) as usize;
 });
-
-/// Integer ADD, SUB, MUL or MOD (Lua's, floored), in 64 bits: an integer if it
-/// fits, else a double (MOD by 0 is Lua's NaN). See Note [Integers].
-#[inline(always)]
-fn int_arith<'src, 'intern, const OP: Opcode>(l: i32, r: i32) -> LBoxed<'src, 'intern> {
-    let (l, r) = (l as i64, r as i64);
-    let wide = match OP {
-        Opcode::ADD => l + r,
-        Opcode::SUB => l - r,
-        Opcode::MUL => l * r,
-        Opcode::MOD if r == 0 => return LBoxed::from_number(crate::vm::lua_mod(l as f64, 0.0)),
-        Opcode::MOD => {
-            let m = l % r;
-            if m != 0 && (m ^ r) < 0 { m + r } else { m }
-        }
-        _ => unsafe { core::hint::unreachable_unchecked() },
-    };
-    match i32::try_from(wide) {
-        Ok(i) => LBoxed::from_int(i),
-        Err(_) => LBoxed::from_number(wide as f64),
-    }
-}
-
-/// A double op's result, boxed as a double whatever its value, as its
-/// `Double` type says. See Note [Integers].
-#[inline(always)]
-fn double_result<'src, 'intern>(v: LValue<'src, 'intern>) -> LBoxed<'src, 'intern> {
-    let LValue::Number(n) = v else { unsafe { core::hint::unreachable_unchecked() } };
-    LBoxed::from_number(n.0)
-}
-
-/// The `CType::Integer` constant `k` of the running prototype.
-#[inline(always)]
-unsafe fn int_constant(state: &RunState, owner: &Owner, k: u32) -> i32 {
-    let constants = unsafe { &(*state.clos.ro(owner).prototype).constants.items };
-    let Constant::Number(n) = (unsafe { constants.get_unchecked(k as usize) }) else {
-        unsafe { core::hint::unreachable_unchecked() }
-    };
-    n.0 as i32
-}
 
 // Note [Dynamic guards]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -1459,27 +1330,22 @@ unsafe fn int_constant(state: &RunState, owner: &Owner, k: u32) -> i32 {
 // fails statically instead, to measure the blocks the guards cost (`just
 // graph-guards`).
 //
-// `IsInt` guards with the same residual, but through `GuardCType`: what it finds
-// is a ctype, which each side's context records. See Note [Integers].
+// `CheckInteger` guards with the same residual, but through `GuardCType`: what it
+// finds is a ctype, which each side's context records. See Note [Integers].
 
-/// The array part slot of an integer key. Keys below 1 wrap past any array part.
-#[inline(always)]
-fn int_slot(k: i32) -> usize {
-    (k as i64 - 1) as usize
-}
-
-/// The array part slot of a `CType::Integer` constant key, a double in the
-/// prototype.
+/// The array part slot of a `CType::Integer` key. Keys below 1 wrap past any
+/// array part.
 #[inline(always)]
 unsafe fn integer_slot(n: f64) -> usize {
-    int_slot(unsafe { n.to_int_unchecked::<i32>() })
+    (unsafe { n.to_int_unchecked::<i32>() } as i64 - 1) as usize
 }
 
 // `GuardDynamic` tests: whether a `CType::Integer` key, in a register or the
 // constant `k`, is in a table's array part. See Note [Dynamic guards].
 crate::window::windowed!(InArray, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-    state.select = (int_slot(key.as_int_unchecked()) >= tab.ro(owner).array.len()) as usize;
+    let Some(n) = key.as_number() else { core::hint::unreachable_unchecked() };
+    state.select = (integer_slot(n) >= tab.ro(owner).array.len()) as usize;
 });
 crate::window::windowed!(InArrayK, [k: u32], [], |owner, state, base| (table) {
     let Constant::Number(n) = (&(*state.clos.ro(owner).prototype).constants.items).get_unchecked(k as usize) else {
@@ -1495,7 +1361,7 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
         crate::chunk::Constant::Nil => CType::Type(LType::Nil),
         crate::chunk::Constant::Bool(_) => CType::Type(LType::Bool),
         crate::chunk::Constant::Number(n) if is_integer(n.0) => CType::Integer,
-        crate::chunk::Constant::Number(_) => CType::Double,
+        crate::chunk::Constant::Number(_) => CType::Type(LType::Number),
         crate::chunk::Constant::String(_) => CType::Type(LType::String),
     }
 }
@@ -1998,19 +1864,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// `make_discovery_thunk`, for `GuardCType(idx, Integer)`. See Note [Integers].
     fn make_integer_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            let value = state.vals[state.base + idx];
+            let value = state.vals[state.base + idx].unbox();
             let mut forced_ctx = thunk_ctx.clone();
             let forced_mut = Rc::make_mut(&mut forced_ctx);
-            let (guard, next, arg) = if value.is_int() {
-                forced_mut.types[idx] = CType::Integer;
-                (Residual::GuardDynamic(Rc::new(IsInt::<true>::new(&[idx]))), pc.next_true(), ResumeArg::Matched)
-            } else if value.is_number() {
-                forced_mut.types[idx] = CType::Double;
-                (Residual::GuardDynamic(Rc::new(IsInt::<false>::new(&[idx]))), pc.next_false(), ResumeArg::Failed)
-            } else {
-                let runtime_type = value.unbox().typeof_();
-                forced_mut.types[idx] = CType::Type(runtime_type);
-                (Residual::Guard { idx, expected: runtime_type }, pc.next_false(), ResumeArg::Failed)
+            let (guard, next, arg) = match value {
+                LValue::Number(n) if is_integer(n.0) => {
+                    forced_mut.types[idx] = CType::Integer;
+                    (Residual::GuardDynamic(Rc::new(CheckInteger::<true>::new(&[idx]))), pc.next_true(), ResumeArg::Matched)
+                },
+                LValue::Number(_) => {
+                    forced_mut.types[idx] = CType::Type(LType::Number);
+                    (Residual::GuardDynamic(Rc::new(CheckInteger::<false>::new(&[idx]))), pc.next_false(), ResumeArg::Failed)
+                },
+                value => {
+                    let runtime_type = value.typeof_();
+                    forced_mut.types[idx] = CType::Type(runtime_type);
+                    (Residual::Guard { idx, expected: runtime_type }, pc.next_false(), ResumeArg::Failed)
+                },
             };
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
@@ -2293,11 +2163,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // a type guard anyway.
                     let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
                     if *ty != CType::Type(LType::Unknown) {
-                        // A field's number may be in either encoding. See Note [Integers].
-                        hkey.known_type = match ty {
-                            CType::Integer | CType::Double => CType::Type(LType::Number),
-                            ty => ty.clone(),
-                        };
+                        hkey.known_type = ty.clone();
                     }
                     // If we updated an href, then we also need to set optimization hazards for any
                     // potentially aliased ones. We also need to invalidate this stack slot as
@@ -2444,7 +2310,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         match &ctx.types[rk] {
                             CType::Integer => Some(ResumeArg::Matched),
-                            CType::Double => Some(ResumeArg::Failed),
                             ctype if !matches!(ctype.as_ltype(), LType::Number | LType::Unknown) => Some(ResumeArg::Failed),
                             // A number, or unknown: tested at runtime. See Note [Integers].
                             _ => None,
@@ -2546,9 +2411,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op.window));
                                     result = Some(op.result);
                                 } else {
-                                    if c == 2 {
-                                        result = nf.result();
-                                    }
                                     self.blocks[block_id.0].instructions.push(Residual::NativeCall {
                                         nf: nf.native(), a: a as u16, b: b as u16, c: c as u16
                                     });
@@ -2595,7 +2457,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             //ctx.types = vec![LType::Unknown; ctx.types.len()];
                             let mut ctx = ctx;
                             if let Some(result) = result {
-                                Rc::make_mut(&mut ctx).types[a] = result;
+                                Rc::make_mut(&mut ctx).types[a] = CType::Type(result);
                             }
                             return Some((pc.0 + 1, ctx, ResumeArg::Start));
                         },
