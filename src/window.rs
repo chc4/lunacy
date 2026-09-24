@@ -723,7 +723,8 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     // Whether instruction `i` jumps to the continuation. rustc builds with
     // `-Z plt=no`, so depending on whether the continuation is known to be local
     // that's `jmp rel32`, `jmp *[rip+got]`, or `jmp *reg` with `reg` loaded from
-    // the GOT slot earlier (LLVM hoists that load above the epilogue). A GOT slot
+    // the GOT slot earlier, maybe into another register first (LLVM hoists that
+    // load above the epilogue, and may move it into rax for the jump). A GOT slot
     // holds the loader-relocated address, so read it to check.
     let next = op.next();
     let got = |slot: usize| unsafe { core::ptr::read_unaligned(slot as *const usize) };
@@ -735,18 +736,25 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
         Ok(match inst.operand(0) {
             Operand::ImmediateI32 { imm } => (addr + end).wrapping_add(imm as isize as usize) == next,
             Operand::Register { reg } => {
-                let feeder = insts[..i]
-                    .iter()
-                    .rev()
-                    .take_while(|(_, _, i)| i.opcode() != Opcode::CALL)
-                    .find(|(_, _, i)| {
-                        i.operand_count() > 0 && matches!(i.operand(0), Operand::Register { reg: r } if r == reg)
-                    });
-                match feeder {
-                    Some((o, e, i)) if i.opcode() == Opcode::MOV => {
-                        rip_operand(*o, *e, i)?.is_some_and(|(_, t)| got(t) == next)
+                // The register's last writer, back through register-to-register
+                // moves, is the GOT load.
+                let (mut reg, mut before) = (reg, i);
+                loop {
+                    let feeder = insts[..before]
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .take_while(|(_, (_, _, i))| i.opcode() != Opcode::CALL)
+                        .find(|(_, (_, _, i))| {
+                            i.operand_count() > 0 && matches!(i.operand(0), Operand::Register { reg: r } if r == reg)
+                        });
+                    match feeder {
+                        Some((j, (o, e, i))) if i.opcode() == Opcode::MOV => match i.operand(1) {
+                            Operand::Register { reg: from } => (reg, before) = (from, j),
+                            _ => break rip_operand(*o, *e, i)?.is_some_and(|(_, t)| got(t) == next),
+                        },
+                        _ => break false,
                     }
-                    _ => false,
                 }
             }
             _ => rip_operand(*off, *end, inst)?.is_some_and(|(_, t)| got(t) == next),

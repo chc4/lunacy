@@ -16,7 +16,7 @@ use internment::ArenaIntern;
 use crate::chunk::Constant;
 use crate::gc::Gc;
 use crate::vm::{
-    LClosure, LConstant, LValue, NClosure, NativeFunc, Number, Table, Tc, FVec,
+    LClosure, LConstant, LValue, NClosure, NativeFunc, NativeWindow, Number, Table, Tc, FVec,
 };
 
 /// A NuN-boxed Lua value (JavaScriptCore `JSValue` encoding). 8 bytes:
@@ -48,14 +48,17 @@ pub(crate) struct NClosureCell {
     // `pub(crate)` so the JIT's native-identity guard can address it with dynasm's
     // `=> NClosureCell.native` typed offset.
     pub(crate) native: NativeFunc,
+    /// The native's window op for a call, if it offers one. See Note [Native
+    /// windows] in `library`.
+    pub(crate) window: Option<NativeWindow>,
 }
 
 impl NClosureCell {
     /// Leak a headered cell for `native`. `NClosure` holds the returned pointer
     /// for its whole life, so boxing a native only reads it; the cell is `'static`
     /// and outside the GC, so `Mark` needn't trace it.
-    pub(crate) fn leak(native: NativeFunc) -> &'static NClosureCell {
-        Box::leak(Box::new(NClosureCell { kind: LBoxed::KIND_NCLOSURE, native }))
+    pub(crate) fn leak(native: NativeFunc, window: Option<NativeWindow>) -> &'static NClosureCell {
+        Box::leak(Box::new(NClosureCell { kind: LBoxed::KIND_NCLOSURE, native, window }))
     }
 }
 

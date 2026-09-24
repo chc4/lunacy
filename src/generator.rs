@@ -2400,12 +2400,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
+                            // A native run as a window op, with its arguments of the type it
+                            // assumes, gives its result's type. See Note [Native windows].
+                            let mut result = None;
                             if let CType::NativeFunction(nf) = &ctx.types[a] {
-                                self.blocks[block_id.0].instructions.push(Residual::NativeCall {
-                                    nf: nf.native(), a: a as u16, b: b as u16, c: c as u16
-                                });
-                                // A native may allocate (a table, a string).
-                                self.blocks[block_id.0].allocates = true;
+                                let op = nf
+                                    .window(a, b as u16, c as u16)
+                                    .filter(|op| (a + 1..a + b).all(|slot| ctx.types[slot].as_ltype() == op.args));
+                                if let Some(op) = op {
+                                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op.window));
+                                    result = Some(op.result);
+                                } else {
+                                    self.blocks[block_id.0].instructions.push(Residual::NativeCall {
+                                        nf: nf.native(), a: a as u16, b: b as u16, c: c as u16
+                                    });
+                                    // A native may allocate (a table, a string).
+                                    self.blocks[block_id.0].allocates = true;
+                                }
                             } else if let CType::LuaFunction(lclos) = &ctx.types[a] {
                                 // TODO: we should probably track the number of incoming edges, and
                                 // subtract that count from the initial hotness of the entry block.
@@ -2444,6 +2455,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ctx
                             };
                             //ctx.types = vec![LType::Unknown; ctx.types.len()];
+                            let mut ctx = ctx;
+                            if let Some(result) = result {
+                                Rc::make_mut(&mut ctx).types[a] = CType::Type(result);
+                            }
                             return Some((pc.0 + 1, ctx, ResumeArg::Start));
                         },
                     }

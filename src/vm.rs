@@ -439,6 +439,13 @@ impl<'src, 'intern> Table<'src, 'intern> {
 /// The array slot of a number key: the array part holds the integer keys from
 /// 1 up (growing to fit on a write), the hash part every other number (zero,
 /// negatives, fractions), as Lua keeps them apart.
+/// Lua's `%`: `a - floor(a / b) * b`, taking the sign of `b` where Rust's `%`
+/// takes the sign of `a`.
+#[inline(always)]
+pub fn lua_mod(a: f64, b: f64) -> f64 {
+    a - (a / b).floor() * b
+}
+
 pub(crate) fn array_slot(n: f64) -> Option<usize> {
     (n >= 1.0 && n.fract() == 0.0 && n <= u32::MAX as f64).then(|| n as usize - 1)
 }
@@ -762,7 +769,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                     Opcode::DIV =>
                         Ok(LValue::Number(Number(left_n.0 / right_n.0))),
                     Opcode::MOD =>
-                        Ok(LValue::Number(Number(left_n.0 % right_n.0))),
+                        Ok(LValue::Number(Number(lua_mod(left_n.0, right_n.0)))),
                     Opcode::POW =>
                         Ok(LValue::Number(Number(left_n.0.powf(right_n.0)))),
                     _ => unsafe { std::hint::unreachable_unchecked() },
@@ -917,6 +924,18 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
 /// for them (which overlap the arguments; see Note [Library natives] in
 /// `library`), and returns how many it wrote.
 pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner) -> usize;
+/// A native's window op for a call to it (the `CALL`'s `a`, `b`, `c`), if it
+/// has one for that call's arity. See Note [Native windows] in `library`.
+pub type NativeWindow = fn(a: usize, b: u16, c: u16) -> Option<NativeOp>;
+
+/// A call to a native run as a window op: the op, the type every argument must
+/// have for it (the op assumes it), and its result's type.
+pub struct NativeOp {
+    pub window: std::rc::Rc<dyn crate::window::Window>,
+    pub args: LType,
+    pub result: LType,
+}
+
 #[derive(Clone, Copy)]
 pub struct NClosure {
     // A `'static`, non-GC cell (leaked at `new`) whose pointer is the native's
@@ -962,7 +981,17 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: NativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(native) }
+        NClosure { cell: NClosureCell::leak(native, None) }
+    }
+
+    /// A native that runs as a window op where `window` gives one.
+    pub fn windowed(native: NativeFunc, window: NativeWindow) -> Self {
+        NClosure { cell: NClosureCell::leak(native, Some(window)) }
+    }
+
+    /// The window op a call `a`, `b`, `c` to this native runs as, if any.
+    pub fn window(&self, a: usize, b: u16, c: u16) -> Option<NativeOp> {
+        self.cell.window.and_then(|window| window(a, b, c))
     }
 
     pub fn native(&self) -> NativeFunc {
@@ -1779,7 +1808,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                             Opcode::SUB => x - y,
                             Opcode::MUL => x * y,
                             Opcode::DIV => x / y,
-                            Opcode::MOD => x % y,
+                            Opcode::MOD => lua_mod(x, y),
                             Opcode::POW => x.powf(y),
                             _ => unsafe { std::hint::unreachable_unchecked() },
                         };
