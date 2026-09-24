@@ -40,6 +40,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             LValue::Table(t) => LType::Table,
             LValue::LClosure(_) | LValue::NClosure(_) => LType::Closure,
             LValue::Nil => LType::Nil,
+            LValue::Bool(_) => LType::Bool,
             _ => LType::Unknown,
         }
     }
@@ -294,6 +295,39 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
             _ => unreachable!(),
         }
         return arg;
+    }
+}
+
+/// `R(A) := (Bool)B; if (C) pc++`, `pc` being the next instruction's.
+pub fn emit_loadbool(dest: usize, value: bool, skip: bool, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        windowed!(LoadBool, [value: u8], [], |owner, state, base| (out dest) {
+            *dest = LBoxed::from_bool(value != 0);
+        });
+        yield YieldOp::ExecWindow(Rc::new(LoadBool::new(value as u8, &[dest])));
+        yield YieldOp::SetTypes(vec![(dest, LType::Bool)]);
+        if skip {
+            arg = yield YieldOp::GetBlock(pc + 1);
+            let ResumeArg::BlockId(target) = arg else { unreachable!() };
+            arg = yield YieldOp::Jump(target);
+        }
+        arg
+    }
+}
+
+/// `R(A) := ... := R(B) := nil`.
+pub fn emit_loadnil(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        windowed!(LoadNil, [], [], |owner, state, base| (out dest) {
+            *dest = LBoxed::NIL;
+        });
+        for dest in a..=b {
+            yield YieldOp::ExecWindow(Rc::new(LoadNil::new(&[dest])));
+        }
+        yield YieldOp::SetTypes((a..=b).map(|dest| (dest, LType::Nil)).collect());
+        arg
     }
 }
 
@@ -771,14 +805,15 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
             arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
             return arg
         }
-        // Nil = false
+        // The next instruction (a jump) runs when R(A)'s truthiness is C, else it
+        // is skipped. Nil is false.
         arg = yield YieldOp::Guard(a, LType::Nil);
         if let ResumeArg::Matched = arg {
-            arg = yield YieldOp::Jump(taken);
+            arg = yield YieldOp::Jump(if c == 0 { fallthrough } else { taken });
             return arg;
         }
-        // Everything else = true
-        arg = yield YieldOp::Jump(fallthrough);
+        // Everything else is true.
+        arg = yield YieldOp::Jump(if c != 0 { fallthrough } else { taken });
         arg
     }
 }
@@ -1343,6 +1378,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadk(bx, c.typeof_(), a as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::LOADNIL => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadnil(a as usize, b as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::LOADBOOL => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadbool(a as usize, b != 0, c != 0, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::MOVE => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
