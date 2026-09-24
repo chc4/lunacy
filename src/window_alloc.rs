@@ -883,9 +883,9 @@ mod tests {
     windowed!(Out, [], [], |owner, state, base| (out d) {
         *d = LBoxed::NIL;
     });
-    windowed!(Loop, [], [], |owner, state, base| (i, l, s, p, out v) {
+    windowed!(Loop, [], [], |owner, state, base| (i, l, s, out v) {
         *v = i;
-        core::hint::black_box((l, s, p));
+        core::hint::black_box((l, s));
     });
 
     /// An op of a test run: its input slots, then its output slot.
@@ -903,8 +903,7 @@ mod tests {
         Store(usize, usize, usize),
         /// An upvalue get or constant load, `(out d)`.
         Out(usize),
-        /// A for loop step, `(idx, limit, step, prev, out var)` with `prev` and
-        /// `var` the same slot.
+        /// A for loop step, `(idx, limit, step, out var)`.
         Loop(usize, usize, usize, usize),
     }
 
@@ -963,7 +962,7 @@ mod tests {
                     TestOp::Set(a, b) => Box::new(Set::new(&[a, b])),
                     TestOp::Store(a, b, c) => Box::new(Store::new(&[a, b, c])),
                     TestOp::Out(d) => Box::new(Out::new(&[d])),
-                    TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[i, l, s, v, v])),
+                    TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[i, l, s, v])),
                 }
             })
             .collect()
@@ -1046,7 +1045,7 @@ mod tests {
             TestOp::Bin(..) | TestOp::BinFirst(..) | TestOp::Store(..) => 3,
             TestOp::Get(..) | TestOp::Set(..) => 2,
             TestOp::Out(..) => 1,
-            TestOp::Loop(..) => 5,
+            TestOp::Loop(..) => 4,
         };
         let shapes = [B(0, 0, 0), TestOp::BinFirst(0, 0, 0), G(0, 0), S(0, 0), TestOp::Store(0, 0, 0), U(0), L(0, 0, 0, 0)];
         let mut runs: Vec<Vec<TestOp>> = Vec::new();

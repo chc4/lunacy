@@ -206,9 +206,13 @@ and the back edge would store the loop's values every iteration to match. A
 clean value marked dirty is at most stored again, so this is safe for every
 edge into the header.
 
-Not yet handled: a value the header keeps in a register that the loop's own
-ops always cover (any five-operand op covers `w3` and `w4`) is still dropped
-and reloaded on every back edge.
+Not yet handled: the second pass recomputes the header's entry window, so the
+latch, planned to deliver the first pass's window, may deliver a different one
+than the header is compiled with, and the back edge moves between them. The
+passes don't settle: repeating the second alternates between two windows, the
+body's placement following the latch's requests and the header's window
+following the body. Fixing the header's window to the second pass's in a third
+pass moved the mismatch into the header instead, and cost more.
 
 **The plan.** The pass decides each request's fate (kept in a register from its
 source to its use, or Home) and each op's `SKIP`; the window wanted before each

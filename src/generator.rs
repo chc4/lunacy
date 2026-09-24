@@ -976,10 +976,12 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
-                // The loop variable is set only when the loop continues. An output
-                // is always written back, so it also reads the variable's previous
-                // value (`prev`, the same slot) and writes that back on exit.
-                windowed!(ForLoop, [], [], |owner, state, base| (idx, limit, step, prev, out var) {
+                // Lua sets the loop variable only when the loop continues, but it is
+                // local to the loop's body: after the loop exits nothing reads it
+                // before writing it, and a closure capturing it has it closed
+                // (`CLOSE`) at the end of each iteration, before this runs. So it
+                // is set on exit too, and the op needn't read its old value.
+                windowed!(ForLoop, [], [], |owner, state, base| (idx, limit, step, out var) {
                     let Some(nidx) = idx.as_number() else { unreachable!() };
                     let Some(nlimit) = limit.as_number() else { unreachable!() };
                     let Some(nstep) = step.as_number() else { unreachable!() };
@@ -989,10 +991,10 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
                     } else {
                         nidx <= nlimit
                     };
-                    *var = if comp { idx } else { prev };
+                    *var = idx;
                     state.select = if comp { 0 } else { 1 };
                 });
-                yield YieldOp::ExecWindow(Rc::new(ForLoop::new(&[a, a + 1, a + 2, a + 3, a + 3])));
+                yield YieldOp::ExecWindow(Rc::new(ForLoop::new(&[a, a + 1, a + 2, a + 3])));
                 yield YieldOp::SetTypes(vec![(a + 3, LType::Number)]);
             },
             _ => {

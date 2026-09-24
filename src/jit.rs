@@ -739,8 +739,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 })
             });
             if loops {
-                let seed = planned.iter().map(|(id, plan)| (*id, plan.entry.unpack())).collect();
+                let seed: HashMap<BlockId, Placement, FxBuildHasher> = planned.iter().map(|(id, plan)| (*id, plan.entry.unpack())).collect();
                 planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &seed);
+                for (id, plan) in &planned {
+                    if seed[id] != plan.entry.unpack() {
+                        let window = |regs| Cache::entry(regs, &Cache::default(), &Slots::default());
+                        window_dump!(self.jctx, "replanned block {}: entry {} in the first pass, {} in the second", id.0, window(seed[id]), window(plan.entry.unpack()));
+                    }
+                }
             }
             plans.extend(planned);
         }
