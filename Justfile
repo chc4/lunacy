@@ -155,6 +155,24 @@ interpreter-test name: interpreter-compile
     time ./target/interpreter/release/bench {{name}}.bin
 
 # Unsafe
+# Disassemble a window op's stencil at SKIP 0 as the `unsafe` profile builds it,
+# in this checkout, or at revision `ref` (built in target/compare/<ref>, its
+# submodules linked to this checkout's, as for `hyperfine-vs`). For example
+# `just stencil-asm SetTableIndex`.
+stencil-asm op ref='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=.
+    if [ -n "{{ref}}" ]; then
+        dir=target/compare/{{ref}}
+        test -d $dir || git worktree add --detach $dir {{ref}}
+        git -C $dir checkout --detach {{ref}}
+        for module in dynasm-rs memmap2-rs; do test -L $dir/$module || { rmdir $dir/$module && ln -s "$(realpath $module)" $dir/$module; }; done
+    fi
+    (cd $dir && cargo build --profile unsafe --no-default-features --features unsafe --bin bench -Z build-std="core,std,panic_abort")
+    read start size < <(objdump -t -C $dir/target/unsafe/bench | awk '/{{op}}>::__stencil::<0>$/ {print $1, $5}')
+    objdump -d -C --no-show-raw-insn --start-address=0x$start --stop-address=$((0x$start + 0x$size)) $dir/target/unsafe/bench | grep -E '^ +[0-9a-f]+:'
+
 unsafe-compile:
     cargo build --profile unsafe --no-default-features --features unsafe --bin bench \
         -Z build-std="core,std,panic_abort"
