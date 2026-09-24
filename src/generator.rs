@@ -477,13 +477,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Ok(c) => LBoxed::from(c),
                     Err(lv) => *lv,
                 };
-                let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
-                t.barrier_back();
-                let t = t.rw(owner);
-                if t.array.len() <= kb.0 as usize {
-                    t.array.resize_with(kb.0 as usize, || LBoxed::NIL);
-                }
-                t.array[kb.0 as usize-1] = kc;
+                let LValue::Table(mut t) = state.vals[state.base + a].unbox() else { unreachable!() };
+                t.set(owner, LBoxed::from_number(kb.0), kc, state.intern);
             })));
         } else {
             // Hash part set

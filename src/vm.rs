@@ -430,6 +430,13 @@ impl<'src, 'intern> Table<'src, 'intern> {
     }
 }
 
+/// The array slot of a number key: the array part holds the integer keys from
+/// 1 up (growing to fit on a write), the hash part every other number (zero,
+/// negatives, fractions), as Lua keeps them apart.
+fn array_slot(n: f64) -> Option<usize> {
+    (n >= 1.0 && n.fract() == 0.0 && n <= u32::MAX as f64).then(|| n as usize - 1)
+}
+
 impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// Fire the table write barrier before mutating this table's array/hash in place.
     /// See Note [Write barriers].
@@ -442,8 +449,8 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// the hash part as an `LCanon`. See Note [Canonical values].
     #[inline]
     pub fn get(&self, owner: &Owner, key: &LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> Option<LBoxed<'src, 'intern>> {
-        if let Some(n) = key.as_number() {
-            return Some(self.ro(owner).array.get(n as usize - 1).copied().unwrap_or(LBoxed::NIL));
+        if let Some(slot) = key.as_number().and_then(array_slot) {
+            return Some(self.ro(owner).array.get(slot).copied().unwrap_or(LBoxed::NIL));
         }
         let k = LCanon::new(*key, intern);
         self.ro(owner).hash.get(&k).copied()
@@ -452,13 +459,12 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     #[inline]
     pub fn set(&mut self, owner: &mut Owner, key: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) {
         self.barrier_back();
-        if let Some(n) = key.as_number() {
+        if let Some(slot) = key.as_number().and_then(array_slot) {
             // TODO: sparse arrays
-            let n = n as usize;
-            if self.rw(owner).array.len() < n {
-                self.rw(owner).array.resize_with(n, || LBoxed::NIL);
+            if self.rw(owner).array.len() <= slot {
+                self.rw(owner).array.resize_with(slot + 1, || LBoxed::NIL);
             }
-            self.rw(owner).array[n - 1] = value;
+            self.rw(owner).array[slot] = value;
             return;
         }
         let k = LCanon::new(key, intern);
