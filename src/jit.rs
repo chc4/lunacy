@@ -10,7 +10,7 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::generator::{Block, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
-use crate::window_alloc::{Cache, Emit, Packed, Placement, WindowAlloc};
+use crate::window_alloc::{plan_trace, Cache, Emit, Packed, Placement, Step, WindowAlloc};
 use crate::trace::{Block as TraceBlock, Event, Policy, Region, Slots};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
@@ -725,83 +725,103 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         let mut plans = Plans::default();
         for trace in &traces {
-            for (pos, &b) in trace.iter().enumerate().rev() {
-                let next = trace.get(pos + 1).map(|&n| ids[n]);
-                let plan = self.plan_block(ids[b], next, &skips[b], &index, &live_in, &plans);
-                plans.insert(ids[b], plan);
+            let none = HashMap::default();
+            let mut planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &none);
+            // A trace with an edge back into itself plans that edge blind:
+            // plan it again, continuing into its entry windows from the first
+            // pass. See Loops in docs/trace-register-allocation.md.
+            let loops = trace.iter().enumerate().any(|(pos, &b)| {
+                self.blocks[ids[b].0].instructions.iter().flat_map(jump_targets).any(|target| {
+                    trace.iter().position(|&t| ids[t] == target).is_some_and(|at| at <= pos)
+                })
+            });
+            if loops {
+                let seed = planned.iter().map(|(id, plan)| (*id, plan.entry.unpack())).collect();
+                planned = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &seed);
             }
+            plans.extend(planned);
         }
         plans
     }
 
-    /// Place a block's window ops by one backward pass (see Note [Window
-    /// allocation]), continuing into `next`, the block after it in its trace, or
-    /// if it ends its trace into its hottest target with an entry window already.
-    /// Every other target's slots are pseudo-uses where it jumps: live into the
-    /// target (its entry window's, if it has one), they keep or take a free
-    /// register, else stay in their stack homes.
-    fn plan_block(
+    /// Plan one trace's window ops (see Note [Trace allocation]): its blocks'
+    /// residuals as steps, each block continuing into the next, the last into
+    /// its hottest target with an entry window (compiled, planned already, or
+    /// in `seed`: the trace's own entry windows from a first pass). Every other
+    /// edge is a pseudo-use: of its target's entry window, or of the slots live
+    /// into it.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_trace(
         &self,
-        id: BlockId,
-        next: Option<BlockId>,
-        skips: &[SmallVec<[usize; WINDOW]>],
+        trace: &[usize],
+        ids: &[BlockId],
+        skips: &[Vec<SmallVec<[usize; WINDOW]>>],
         index: &HashMap<BlockId, usize, FxBuildHasher>,
         live_in: &[Slots],
         plans: &Plans,
-    ) -> BlockPlan {
-        let block = &self.blocks[id.0];
+        seed: &HashMap<BlockId, Placement, FxBuildHasher>,
+    ) -> Vec<(BlockId, BlockPlan)> {
         let window_of = |target: BlockId| match self.jctx.blocks.get(&target) {
             Some(done) => Some(*done.window.regs()),
-            None => plans.get(&target).map(|plan| plan.entry.unpack()),
+            None => plans.get(&target).map(|plan| plan.entry.unpack()).or_else(|| seed.get(&target).copied()),
         };
-        let continues = next.or_else(|| {
-            block
-                .instructions
-                .iter()
-                .flat_map(jump_targets)
-                .filter(|&target| window_of(target).is_some())
-                .min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0))
-        });
-        let alloc = WindowAlloc::default();
-        let mut placed = vec![None; block.instructions.len()];
-        let mut want: Placement = [None; WINDOW];
-        for (off, res) in block.instructions.iter().enumerate().rev() {
-            let targets = jump_targets(res);
-            if let Some(target) = continues.filter(|target| targets.contains(target)) {
-                want = window_of(target).expect("the trace continues into a planned block");
-            }
-            for target in targets.into_iter().filter(|&target| Some(target) != continues) {
-                let used = match window_of(target) {
-                    Some(window) => window.into_iter().flatten().collect::<SmallVec<[usize; WINDOW]>>(),
-                    None => live_in[index[&target]].iter().collect(),
-                };
-                for slot in used {
-                    if !want.contains(&Some(slot)) {
-                        let Some(reg) = want.iter().rposition(Option::is_none) else { break };
-                        want[reg] = Some(slot);
+        let mut steps = Vec::new();
+        let mut starts = Vec::new();
+        let mut step_of = Vec::new();
+        for (pos, &b) in trace.iter().enumerate() {
+            let block = &self.blocks[ids[b].0];
+            let next = trace.get(pos + 1).map(|&n| ids[n]);
+            // The jump the trace goes on to `next` through: the block's last to it.
+            let flow = next.and_then(|next| block.instructions.iter().rposition(|res| jump_targets(res).contains(&next)));
+            let continues = match next {
+                Some(_) => None,
+                None => block
+                    .instructions
+                    .iter()
+                    .flat_map(jump_targets)
+                    .filter(|&target| window_of(target).is_some())
+                    .min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0)),
+            };
+            starts.push(steps.len());
+            steps.push(Step::Start);
+            let mut of = vec![None; block.instructions.len()];
+            for (off, res) in block.instructions.iter().enumerate() {
+                match res {
+                    Residual::ExecWindow(w) if !skips[b][off].is_empty() => {
+                        of[off] = Some(steps.len());
+                        steps.push(Step::Op(&**w, skips[b][off].clone()));
                     }
-                }
-            }
-            match res {
-                Residual::ExecWindow(w) if !skips[off].is_empty() => {
-                    let (skip, before) = alloc.place(&**w, skips[off].iter().copied(), &want).expect("a usable SKIP");
-                    placed[off] = Some((skip as u8, Packed::pack(&before)));
-                    want = before;
-                }
-                // An inline guard tests its slot where the window has it: keep it
-                // in a register, if one is free.
-                Residual::Guard { idx, .. } if inline_guard(res) => {
-                    if !want.contains(&Some(*idx)) {
-                        if let Some(reg) = want.iter().rposition(Option::is_none) {
-                            want[reg] = Some(*idx);
+                    Residual::Guard { .. } if inline_guard(res) => {}
+                    Residual::Jump(_) | Residual::Select(_) => {
+                        let targets = jump_targets(res);
+                        for &target in &targets {
+                            if (Some(off) == flow && Some(target) == next) || Some(target) == continues {
+                                continue;
+                            }
+                            steps.push(match window_of(target) {
+                                Some(window) => Step::Exit { window, own: false },
+                                None => Step::ExitLive(live_in[index[&target]].iter().collect()),
+                            });
+                        }
+                        // Last, so the backward walk takes the trace's own
+                        // continuation before its pseudo-uses.
+                        if let Some(target) = continues.filter(|target| targets.contains(target)) {
+                            steps.push(Step::Exit { window: window_of(target).expect("a continuation with a window"), own: true });
                         }
                     }
+                    Residual::Thunk(_) => {}
+                    _ => steps.push(Step::Flush),
                 }
-                Residual::Jump(_) | Residual::Select(_) | Residual::Thunk(_) => {}
-                _ => want = [None; WINDOW],
             }
+            step_of.push(of);
         }
-        BlockPlan { entry: Packed::pack(&want), placed }
+        let plan = plan_trace(&steps, WINDOW);
+        let placed = |of: &[Option<usize>]| of.iter().map(|step| step.map(|step| (plan.skips[step] as u8, Packed::pack(&plan.windows[step])))).collect();
+        trace
+            .iter()
+            .enumerate()
+            .map(|(pos, &b)| (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[starts[pos]]), placed: placed(&step_of[pos]) }))
+            .collect()
     }
 
     /// JIT compile one block, returning the JIT code offset and optionally the next block to

@@ -124,11 +124,21 @@ At a window op, walking backwards:
    - an Any of its output: kept in the output's register if that register is
      free until the use (cost 1, the move at the use), else dropped (cost 2: the
      store the dirty value then needs, and the load);
-   - an At(r) of an input in another register: a copy, cost 1.
+   - an At(r) of an input in another register: a copy, cost 1;
+   - an input that its producer in the trace can't write in place: a move, cost
+     1. A forward pre-pass over the trace records where each op's output can be
+     produced: the registers it lands in at the usable `SKIP`s where the fewest
+     of its own inputs miss the places their producers can write them. This
+     looks down a whole chain of producers, so a use leaves exactly the room its
+     definers need below it.
 
    The cheapest `SKIP` wins, ties to the one demoting requests whose next uses
-   are furthest (Belady), then to the highest `SKIP`: a use placed high leaves
-   its definers room below it, where their outputs land on its inputs. An input
+   are furthest (Belady), then to the lowest `SKIP`: with the room below
+   accounted for, a chain placed low leaves the registers above it to values
+   kept between their uses, like an accumulator carried from one repetition of
+   an op shape to the next. (Breaking ties high instead packs chains against
+   the top of the window, where an accumulator's output has nowhere to wait
+   for its next use and is stored and reloaded.) An input
    already wanted in place by a later use costs nothing, so a repeated op shape
    settles at the same `SKIP` in every instance, and a value both use (a loop
    invariant, a table the same row is read from) stays put between them.

@@ -16,203 +16,203 @@ live into block 9: [1, 2, 3, 4, 5, 6, 7, 8]
 live into block 14: [1, 2, 3, 4, 5, 6, 7]
 live into block 12: [1, 2, 3, 4, 5, 6, 7, 8]
 live into block 13: [1, 2, 3, 4, 5, 6, 7, 8]
-region entry block 0 loads w0 <- [7]; w3 <- [0]; w5 <- [1]; w6 <- [2] #0
-block 0 hotness 0 pc 0 entered with {w0=[7] w3=[0] w5=[1] w6=[2]}
+region entry block 0 loads w1 <- [0]; w3 <- [7]; w6 <- [2] #0
+block 0 hotness 0 pc 0 entered with {w1=[0] w3=[7] w6=[2]}
     0 window(LoadKNumber, out 3)
-      op at w7 #1
-      window {w0=[7] w3=[0] w5=[1] w6=[2] w7=[3]*}
+      op at w0 #1
+      window {w0=[3]* w1=[0] w3=[7] w6=[2]}
     1 window(LoadKNumber, out 4)
-      op at w1 #2
-      window {w0=[7] w1=[4]* w3=[0] w5=[1] w6=[2] w7=[3]*}
+      [3] <- w0; op at w0 #2
+      window {w0=[4]* w1=[0] w3=[7] w6=[2]}
     2 window(Move, 0, out 5)
-      op at w3 #3
-      window {w0=[7] w1=[4]* w3=[0] w4=[5]* w5=[1] w6=[2] w7=[3]*}
+      op at w1 #3
+      window {w0=[4]* w1=[0] w2=[5]* w3=[7] w6=[2]}
     3 window(LoadKNumber, out 6)
-      op at w2 #4
-      window {w0=[7] w1=[4]* w2=[6]* w3=[0] w4=[5]* w5=[1] w6=[2] w7=[3]*}
+      op at w1 #4
+      window {w0=[4]* w1=[6]* w2=[5]* w3=[7] w6=[2]}
     4 window(NumericIntInt, 4, 6, out 4)
-      op at w1 #5
-      window {w0=[7] w2=[6]* w3=[4]* w4=[5]* w5=[1] w6=[2] w7=[3]*}
+      [5] <- w2; op at w0 #5
+      window {w1=[6]* w2=[4]* w3=[7] w6=[2]}
     5 jump(1)
-      to block 1 (entered with {w0=[7] w1=[4]* w2=[6]* w4=[5]* w5=[1] w6=[2] w7=[3]*}): w1 <- w3 #6
-      window {w0=[7] w2=[6]* w3=[4]* w4=[5]* w5=[1] w6=[2] w7=[3]*}
-block 1 hotness 0 pc 13 entered with {w0=[7] w1=[4]* w2=[6]* w4=[5]* w5=[1] w6=[2] w7=[3]*}
+      to block 1 (entered with {w0=[4]* w1=[6]* w3=[7] w6=[2]}): w0 <- w2 #6
+      window {w1=[6]* w2=[4]* w3=[7] w6=[2]}
+block 1 hotness 0 pc 13 entered with {w0=[4]* w1=[6]* w3=[7] w6=[2]}
     0 window(NumericIntInt, 4, 6, out 4)
-      op at w1 #7
-      window {w0=[7] w2=[6]* w3=[4]* w4=[5]* w5=[1] w6=[2] w7=[3]*}
+      op at w0 #7
+      window {w1=[6]* w2=[4]* w3=[7] w6=[2]}
     1 guard(5, number)
-      tests w4
-      window {w0=[7] w2=[6]* w3=[4]* w4=[5]* w5=[1] w6=[2] w7=[3]*}
+      tests r10 <- [5] #8
+      window {w1=[6]* w2=[4]* w3=[7] w6=[2]}
     2 thunk
-      exit after [3] <- w7; [4] <- w3; [5] <- w4; [6] <- w2 #8
-      window {w0=[7] w2=[6]* w3=[4]* w4=[5]* w5=[1] w6=[2] w7=[3]*}
+      exit after [4] <- w2; [6] <- w1 #9
+      window {w1=[6]* w2=[4]* w3=[7] w6=[2]}
     3 jump(2)
-      to block 2 (entered with {w0=[4]* w1=[5]* w2=[6]* w3=[7] w5=[1] w6=[2] w7=[3]*}): w1 <- w4; scratch <- w0; w0 <- w3; w3 <- scratch #9
-      window {w0=[7] w2=[6]* w3=[4]* w4=[5]* w5=[1] w6=[2] w7=[3]*}
-block 2 hotness 0 pc 13 entered with {w0=[4]* w1=[5]* w2=[6]* w3=[7] w5=[1] w6=[2] w7=[3]*}
+      to block 2 (entered with {w0=[4]* w1=[5] w2=[6]* w3=[7] w6=[2]}): w0 <- w2; w2 <- w1; w1 <- [5] #10
+      window {w1=[6]* w2=[4]* w3=[7] w6=[2]}
+block 2 hotness 0 pc 13 entered with {w0=[4]* w1=[5] w2=[6]* w3=[7] w6=[2]}
     0 window(ForLoop, 4, 5, 6, 7, out 7)
-      op at w0 #10
-      window {w0=[4]* w1=[5]* w2=[6]* w4=[7]* w5=[1] w6=[2] w7=[3]*}
+      op at w0 #11
+      window {w0=[4]* w1=[5] w2=[6]* w4=[7]* w6=[2]}
     1 select
-      to block 4 (entered with {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}): scratch <- w0; w0 <- w7; w7 <- w1; w1 <- w4; w4 <- scratch; scratch <- w2; w2 <- w5; w5 <- scratch #11
-      to block 3 (entered with {}): [3] <- w7; [4] <- w0; [5] <- w1; [6] <- w2; [7] <- w4 #12
-      window {w0=[4]* w1=[5]* w2=[6]* w4=[7]* w5=[1] w6=[2] w7=[3]*}
+      to block 4 (entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}): w1 <- w2; w2 <- [3]; w3 <- w4; w4 <- [1] #12
+      to block 3 (entered with {}): [4] <- w0; [6] <- w2; [7] <- w4 #13
+      window {w0=[4]* w1=[5] w2=[6]* w4=[7]* w6=[2]}
 block 3 hotness 0 pc 14 entered with {}
     0 ret
       window {}
-block 4 hotness 0 pc 5 entered with {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+block 4 hotness 0 pc 5 entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
     0 guard(7, number)
-      tests w1
-      window {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+      tests w3
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
     1 thunk
-      exit after [3] <- w0; [4] <- w4; [5] <- w7; [6] <- w5; [7] <- w1 #13
-      window {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+      exit after [4] <- w0; [6] <- w1; [7] <- w3 #14
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
     2 jump(5)
-      to block 5 (entered with {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}): 
-      window {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}
-block 5 hotness 0 pc 5 entered with {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+      to block 5 (entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}): 
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
+block 5 hotness 0 pc 5 entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
     0 guard(1, number)
-      tests w2
-      window {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+      tests w4
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
     1 thunk
-      exit after [3] <- w0; [4] <- w4; [5] <- w7; [6] <- w5; [7] <- w1 #14
-      window {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+      exit after [4] <- w0; [6] <- w1; [7] <- w3 #15
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
     2 jump(6)
-      to block 6 (entered with {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}): 
-      window {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}
-block 6 hotness 0 pc 5 entered with {w0=[3]* w1=[7]* w2=[1] w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+      to block 6 (entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}): 
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
+block 6 hotness 0 pc 5 entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
     0 window(NumericIntInt, 7, 1, out 8)
-      op at w1 #15
-      window {w0=[3]* w1=[7]* w2=[1] w3=[8]* w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+      op at w3 #16
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w5=[8]* w6=[2]}
     1 guard(2, number)
       tests w6
-      window {w0=[3]* w1=[7]* w2=[1] w3=[8]* w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w5=[8]* w6=[2]}
     2 thunk
-      exit after [3] <- w0; [4] <- w4; [5] <- w7; [6] <- w5; [7] <- w1; [8] <- w3 #16
-      window {w0=[3]* w1=[7]* w2=[1] w3=[8]* w4=[4]* w5=[6]* w6=[2] w7=[5]*}
+      exit after [4] <- w0; [6] <- w1; [7] <- w3; [8] <- w5 #17
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w5=[8]* w6=[2]}
     3 jump(7)
-      to block 7 (entered with {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[2]}): w2 <- w7; scratch <- w3; w3 <- w5; w5 <- scratch #17
-      window {w0=[3]* w1=[7]* w2=[1] w3=[8]* w4=[4]* w5=[6]* w6=[2] w7=[5]*}
-block 7 hotness 0 pc 6 entered with {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[2]}
+      to block 7 (entered with {w0=[4]* w1=[6]* w2=[3] w4=[1] w5=[8]* w6=[2]}): [7] <- w3 #18
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w5=[8]* w6=[2]}
+block 7 hotness 0 pc 6 entered with {w0=[4]* w1=[6]* w2=[3] w4=[1] w5=[8]* w6=[2]}
     0 window(NumericIntInt, 8, 2, out 8)
-      op at w5 #18
-      window {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w6=[2] w7=[8]*}
+      op at w5 #19
+      window {w0=[4]* w1=[6]* w2=[3] w4=[1] w6=[2] w7=[8]*}
     1 window(CompareCIntInt, 8)
-      w5 <- w7; w6 <- [1]; op at w5 #19
-      window {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[1] w7=[8]*}
+      w3 <- w7; op at w3 #20
+      window {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1] w6=[2] w7=[8]*}
     2 select
-      to block 15 (entered with {}): [3] <- w0; [4] <- w4; [5] <- w2; [6] <- w3; [7] <- w1; [8] <- w5 #20
-      to block 8 (entered with {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[1]}): 
-      window {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[1] w7=[8]*}
-block 8 hotness 0 pc 8 entered with {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[1]}
+      to block 15 (entered with {}): [4] <- w0; [6] <- w1; [8] <- w3 #21
+      to block 8 (entered with {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}): 
+      window {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1] w6=[2] w7=[8]*}
+block 8 hotness 0 pc 8 entered with {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}
     0 jump(9)
-      to block 9 (entered with {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[1]}): 
-      window {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[1]}
-block 9 hotness 0 pc 10 entered with {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[1]}
+      to block 9 (entered with {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}): 
+      window {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}
+block 9 hotness 0 pc 10 entered with {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}
     0 window(NumericIntInt, 8, 1, out 9)
-      op at w5 #21
-      window {w0=[3]* w1=[7]* w2=[5]* w3=[6]* w4=[4]* w5=[8]* w6=[1] w7=[9]*}
+      op at w3 #22
+      window {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1] w5=[9]*}
     1 window(NumericIntInt, 3, 9, out 9)
-      [8] <- w5; w5 <- w2; scratch <- w1; w1 <- w7; w7 <- scratch; op at w0 #22
-      window {w0=[3]* w2=[9]* w3=[6]* w4=[4]* w5=[5]* w6=[1] w7=[7]*}
+      [8] <- w3; w3 <- w5; op at w2 #23
+      window {w0=[4]* w1=[6]* w2=[3] w4=[9]*}
     2 window(NumericIntInt, 9, 2, out 3)
-      w0 <- w2; w1 <- [2]; op at w0 #23
-      window {w0=[9]* w1=[2] w2=[3]* w3=[6]* w4=[4]* w5=[5]* w6=[1] w7=[7]*}
+      w5 <- [2]; op at w4 #24
+      window {w0=[4]* w1=[6]* w4=[9]* w5=[2] w6=[3]*}
     3 window(NumericIntInt, 4, 6, out 4)
-      [9] <- w0; w0 <- w1; w1 <- w7; w7 <- w2; w2 <- w4; op at w2 #24
-      window {w0=[2] w1=[7]* w3=[6]* w4=[4]* w5=[5]* w6=[1] w7=[3]*}
+      op at w0 #25
+      window {w1=[6]* w2=[4]* w4=[9]* w5=[2] w6=[3]*}
     4 window(ForLoop, 4, 5, 6, 7, out 7)
-      w2 <- w5; scratch <- w1; w1 <- w4; w4 <- scratch; op at w1 #25
-      window {w0=[2] w1=[4]* w2=[5]* w3=[6]* w5=[7]* w6=[1] w7=[3]*}
+      [9] <- w4; w3 <- [5]; w4 <- w1; w5 <- [7]; [3] <- w6; op at w2 #26
+      window {w1=[6]* w2=[4]* w3=[5] w4=[6]* w6=[7]*}
     5 select
-      to block 11 (entered with {w0=[7]* w1=[1] w3=[2] w4=[4]* w5=[3]* w6=[5]* w7=[6]*}): w4 <- w1; w1 <- w6; w6 <- w2; scratch <- w0; w0 <- w5; w5 <- w7; w7 <- w3; w3 <- scratch #26
-      to block 10 (entered with {}): [4] <- w1; [5] <- w2; [6] <- w3; [7] <- w5; [3] <- w7 #27
-      window {w0=[2] w1=[4]* w2=[5]* w3=[6]* w5=[7]* w6=[1] w7=[3]*}
+      to block 11 (entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}): w0 <- w2; w2 <- [3]; w3 <- w6; w4 <- [1]; w6 <- [2] #27
+      to block 10 (entered with {}): [4] <- w2; [6] <- w1; [7] <- w6 #28
+      window {w1=[6]* w2=[4]* w3=[5] w4=[6]* w6=[7]*}
 block 10 hotness 0 pc 14 entered with {}
     0 ret
       window {}
-block 11 hotness 0 pc 5 entered with {w0=[7]* w1=[1] w3=[2] w4=[4]* w5=[3]* w6=[5]* w7=[6]*}
+block 11 hotness 0 pc 5 entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}
     0 window(NumericIntInt, 7, 1, out 8)
-      op at w0 #28
-      window {w0=[7]* w1=[1] w2=[8]* w3=[2] w4=[4]* w5=[3]* w6=[5]* w7=[6]*}
+      op at w3 #29
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w5=[8]* w6=[2]}
     1 window(NumericIntInt, 8, 2, out 8)
-      w1 <- w4; op at w2 #29
-      window {w0=[7]* w1=[4]* w3=[2] w4=[8]* w5=[3]* w6=[5]* w7=[6]*}
+      op at w5 #30
+      window {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2] w7=[8]*}
     2 window(CompareCIntInt, 8)
-      w2 <- w4; w3 <- [1]; op at w2 #30
-      window {w0=[7]* w1=[4]* w2=[8]* w3=[1] w4=[8]* w5=[3]* w6=[5]* w7=[6]*}
+      [7] <- w3; w3 <- w7; op at w3 #31
+      window {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1] w6=[2] w7=[8]*}
     3 select
-      to block 14 (entered with {}): [4] <- w1; [5] <- w6; [6] <- w7; [7] <- w0; [3] <- w5; [8] <- w2 #31
-      to block 12 (entered with {w0=[7]* w1=[4]* w2=[8]* w3=[1] w5=[3]* w6=[5]* w7=[6]*}): 
-      window {w0=[7]* w1=[4]* w2=[8]* w3=[1] w4=[8]* w5=[3]* w6=[5]* w7=[6]*}
-block 12 hotness 0 pc 8 entered with {w0=[7]* w1=[4]* w2=[8]* w3=[1] w5=[3]* w6=[5]* w7=[6]*}
+      to block 14 (entered with {}): [4] <- w0; [6] <- w1; [8] <- w3 #32
+      to block 12 (entered with {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}): 
+      window {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1] w6=[2] w7=[8]*}
+block 12 hotness 0 pc 8 entered with {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}
     0 jump(13)
-      to block 13 (entered with {w0=[7]* w1=[4]* w2=[8]* w3=[1] w5=[3]* w6=[5]* w7=[6]*}): 
-      window {w0=[7]* w1=[4]* w2=[8]* w3=[1] w5=[3]* w6=[5]* w7=[6]*}
-block 13 hotness 0 pc 10 entered with {w0=[7]* w1=[4]* w2=[8]* w3=[1] w5=[3]* w6=[5]* w7=[6]*}
+      to block 13 (entered with {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}): 
+      window {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}
+block 13 hotness 0 pc 10 entered with {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1]}
     0 window(NumericIntInt, 8, 1, out 9)
-      op at w2 #32
-      window {w0=[7]* w1=[4]* w2=[8]* w3=[1] w4=[9]* w5=[3]* w6=[5]* w7=[6]*}
+      op at w3 #33
+      window {w0=[4]* w1=[6]* w2=[3] w3=[8]* w4=[1] w5=[9]*}
     1 window(NumericIntInt, 3, 9, out 9)
-      [8] <- w2; w2 <- w7; scratch <- w4; w4 <- w6; w6 <- scratch; op at w5 #33
-      window {w0=[7]* w1=[4]* w2=[6]* w3=[1] w4=[5]* w5=[3]* w7=[9]*}
+      [8] <- w3; w3 <- w5; op at w2 #34
+      window {w0=[4]* w1=[6]* w2=[3] w4=[9]*}
     2 window(NumericIntInt, 9, 2, out 3)
-      w5 <- w7; w6 <- [2]; op at w5 #34
-      window {w0=[7]* w1=[4]* w2=[6]* w3=[1] w4=[5]* w5=[9]* w6=[2] w7=[3]*}
+      w5 <- [2]; op at w4 #35
+      window {w0=[4]* w1=[6]* w4=[9]* w5=[2] w6=[3]*}
     3 window(NumericIntInt, 4, 6, out 4)
-      [9] <- w5; w5 <- w7; w7 <- w3; op at w1 #35
-      window {w0=[7]* w2=[6]* w3=[4]* w4=[5]* w5=[3]* w6=[2] w7=[1]}
+      op at w0 #36
+      window {w1=[6]* w2=[4]* w4=[9]* w5=[2] w6=[3]*}
     4 window(ForLoop, 4, 5, 6, 7, out 7)
-      w1 <- w4; scratch <- w0; w0 <- w3; w3 <- scratch; op at w0 #36
-      window {w0=[4]* w1=[5]* w2=[6]* w4=[7]* w5=[3]* w6=[2] w7=[1]}
+      [9] <- w4; w3 <- [5]; w4 <- w1; w5 <- [7]; [3] <- w6; op at w2 #37
+      window {w1=[6]* w2=[4]* w3=[5] w4=[6]* w6=[7]*}
     5 select
-      to block 11 (compiled, entered with {w0=[7]* w1=[1] w3=[2] w4=[4]* w5=[3]* w6=[5]* w7=[6]*}): w3 <- w6; w6 <- w1; w1 <- w7; w7 <- w2; scratch <- w0; w0 <- w4; w4 <- scratch #37
-      to block 10 (compiled, entered with {}): [4] <- w0; [5] <- w1; [6] <- w2; [7] <- w4; [3] <- w5 #38
-      window {w0=[4]* w1=[5]* w2=[6]* w4=[7]* w5=[3]* w6=[2] w7=[1]}
+      to block 11 (compiled, entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}): w0 <- w2; w2 <- [3]; w3 <- w6; w4 <- [1]; w6 <- [2] #38
+      to block 10 (compiled, entered with {}): [4] <- w2; [6] <- w1; [7] <- w6 #39
+      window {w1=[6]* w2=[4]* w3=[5] w4=[6]* w6=[7]*}
 block 14 hotness 0 pc 9 entered with {}
     0 exec(numeric_int_cint_SUB)
       window {}
     1 window(NumericIntInt, 8, 1, out 9)
-      w0 <- [7]; w1 <- [4]; w2 <- [8]; w3 <- [1]; w5 <- [3]; w6 <- [5]; w7 <- [6]; op at w2 #39
-      window {w0=[7] w1=[4] w2=[8] w3=[1] w4=[9]* w5=[3] w6=[5] w7=[6]}
+      w3 <- [8]; w4 <- [1]; op at w3 #40
+      window {w3=[8] w4=[1] w5=[9]*}
     2 window(NumericIntInt, 3, 9, out 9)
-      w2 <- w7; scratch <- w4; w4 <- w6; w6 <- scratch; op at w5 #40
-      window {w0=[7] w1=[4] w2=[6] w3=[1] w4=[5] w5=[3] w7=[9]*}
+      w2 <- [3]; w3 <- w5; op at w2 #41
+      window {w2=[3] w4=[9]*}
     3 window(NumericIntInt, 9, 2, out 3)
-      w5 <- w7; w6 <- [2]; op at w5 #41
-      window {w0=[7] w1=[4] w2=[6] w3=[1] w4=[5] w5=[9]* w6=[2] w7=[3]*}
+      w5 <- [2]; op at w4 #42
+      window {w4=[9]* w5=[2] w6=[3]*}
     4 window(NumericIntInt, 4, 6, out 4)
-      [9] <- w5; w5 <- w7; w7 <- w3; op at w1 #42
-      window {w0=[7] w2=[6] w3=[4]* w4=[5] w5=[3]* w6=[2] w7=[1]}
+      w0 <- [4]; w1 <- [6]; op at w0 #43
+      window {w1=[6] w2=[4]* w4=[9]* w5=[2] w6=[3]*}
     5 window(ForLoop, 4, 5, 6, 7, out 7)
-      w1 <- w4; scratch <- w0; w0 <- w3; w3 <- scratch; op at w0 #43
-      window {w0=[4]* w1=[5] w2=[6] w4=[7]* w5=[3]* w6=[2] w7=[1]}
+      [9] <- w4; w3 <- [5]; w4 <- w1; w5 <- [7]; [3] <- w6; op at w2 #44
+      window {w1=[6] w2=[4]* w3=[5] w4=[6] w6=[7]*}
     6 select
-      to block 11 (compiled, entered with {w0=[7]* w1=[1] w3=[2] w4=[4]* w5=[3]* w6=[5]* w7=[6]*}): w3 <- w6; w6 <- w1; w1 <- w7; w7 <- w2; scratch <- w0; w0 <- w4; w4 <- scratch #44
-      to block 10 (compiled, entered with {}): [3] <- w5; [4] <- w0; [7] <- w4 #45
-      window {w0=[4]* w1=[5] w2=[6] w4=[7]* w5=[3]* w6=[2] w7=[1]}
+      to block 11 (compiled, entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}): w0 <- w2; w2 <- [3]; w3 <- w6; w4 <- [1]; w6 <- [2] #45
+      to block 10 (compiled, entered with {}): [4] <- w2; [7] <- w6 #46
+      window {w1=[6] w2=[4]* w3=[5] w4=[6] w6=[7]*}
 block 15 hotness 0 pc 9 entered with {}
     0 exec(numeric_int_cint_SUB)
       window {}
     1 window(NumericIntInt, 8, 1, out 9)
-      w0 <- [3]; w1 <- [7]; w2 <- [5]; w3 <- [6]; w4 <- [4]; w5 <- [8]; w6 <- [1]; op at w5 #46
-      window {w0=[3] w1=[7] w2=[5] w3=[6] w4=[4] w5=[8] w6=[1] w7=[9]*}
+      w3 <- [8]; w4 <- [1]; op at w3 #47
+      window {w3=[8] w4=[1] w5=[9]*}
     2 window(NumericIntInt, 3, 9, out 9)
-      w5 <- w2; scratch <- w1; w1 <- w7; w7 <- scratch; op at w0 #47
-      window {w0=[3] w2=[9]* w3=[6] w4=[4] w5=[5] w6=[1] w7=[7]}
+      w2 <- [3]; w3 <- w5; op at w2 #48
+      window {w2=[3] w4=[9]*}
     3 window(NumericIntInt, 9, 2, out 3)
-      w0 <- w2; w1 <- [2]; op at w0 #48
-      window {w0=[9]* w1=[2] w2=[3]* w3=[6] w4=[4] w5=[5] w6=[1] w7=[7]}
+      w5 <- [2]; op at w4 #49
+      window {w4=[9]* w5=[2] w6=[3]*}
     4 window(NumericIntInt, 4, 6, out 4)
-      [9] <- w0; w0 <- w1; w1 <- w7; w7 <- w2; w2 <- w4; op at w2 #49
-      window {w0=[2] w1=[7] w3=[6] w4=[4]* w5=[5] w6=[1] w7=[3]*}
+      w0 <- [4]; w1 <- [6]; op at w0 #50
+      window {w1=[6] w2=[4]* w4=[9]* w5=[2] w6=[3]*}
     5 window(ForLoop, 4, 5, 6, 7, out 7)
-      w2 <- w5; scratch <- w1; w1 <- w4; w4 <- scratch; op at w1 #50
-      window {w0=[2] w1=[4]* w2=[5] w3=[6] w5=[7]* w6=[1] w7=[3]*}
+      [9] <- w4; w3 <- [5]; w4 <- w1; w5 <- [7]; [3] <- w6; op at w2 #51
+      window {w1=[6] w2=[4]* w3=[5] w4=[6] w6=[7]*}
     6 select
-      to block 11 (compiled, entered with {w0=[7]* w1=[1] w3=[2] w4=[4]* w5=[3]* w6=[5]* w7=[6]*}): w4 <- w1; w1 <- w6; w6 <- w2; scratch <- w0; w0 <- w5; w5 <- w7; w7 <- w3; w3 <- scratch #51
-      to block 10 (compiled, entered with {}): [3] <- w7; [4] <- w1; [7] <- w5 #52
-      window {w0=[2] w1=[4]* w2=[5] w3=[6] w5=[7]* w6=[1] w7=[3]*}
+      to block 11 (compiled, entered with {w0=[4]* w1=[6]* w2=[3] w3=[7]* w4=[1] w6=[2]}): w0 <- w2; w2 <- [3]; w3 <- w6; w4 <- [1]; w6 <- [2] #52
+      to block 10 (compiled, entered with {}): [4] <- w2; [7] <- w6 #53
+      window {w1=[6] w2=[4]* w3=[5] w4=[6] w6=[7]*}
 count #0 2
 count #1 2
 count #2 2
@@ -221,48 +221,49 @@ count #4 2
 count #5 2
 count #6 2
 count #7 2
-count #8 0
-count #9 2
+count #8 2
+count #9 0
 count #10 2
 count #11 2
-count #12 0
+count #12 2
 count #13 0
 count #14 0
-count #15 2
-count #16 0
-count #17 2
+count #15 0
+count #16 2
+count #17 0
 count #18 2
 count #19 2
-count #20 0
-count #21 2
+count #20 2
+count #21 0
 count #22 2
 count #23 2
 count #24 2
 count #25 2
 count #26 2
-count #27 0
-count #28 68
+count #27 2
+count #28 0
 count #29 68
 count #30 68
-count #31 66
-count #32 2
+count #31 68
+count #32 66
 count #33 2
 count #34 2
 count #35 2
 count #36 2
 count #37 2
-count #38 0
-count #39 66
+count #38 2
+count #39 0
 count #40 66
 count #41 66
 count #42 66
 count #43 66
-count #44 64
-count #45 2
-count #46 0
+count #44 66
+count #45 64
+count #46 2
 count #47 0
 count #48 0
 count #49 0
 count #50 0
 count #51 0
 count #52 0
+count #53 0
