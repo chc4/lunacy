@@ -473,25 +473,16 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
             windowed!(GetTableHref, [href: u8, key: usize], [], |owner, state, base| (table, out dest) {
-                let witness = &state.hash_witnesses[state.witness_base + href as usize];
+                let witness = state.hash_witnesses[state.witness_base + href as usize];
                 debug!("gettable_href with {:?}", &witness);
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
-                #[cfg(debug_assertions)]
-                let witness = witness.as_ref().unwrap();
-                #[cfg(not(debug_assertions))]
-                let witness = witness.as_ref().unwrap_unchecked();
                 let (k, val1) = tab.ro(owner).hash.get_index(witness.index).unwrap();
 
-                // Sanity check
-                // Move this into make_href_check since we need it attached to the HashKey instead
+                // The witness is at the instruction's key.
                 #[cfg(debug_assertions)]
                 {
-                    let val2 = tab.ro(owner).hash.get(&LCanon::new((&witness.key).into(), state.intern)).copied().unwrap();
-                    let full_key = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, key as u16);
-                    debug!("{:?}", &tab.ro(owner));
-                    let Ok(const_key) = full_key else { unreachable!() };
-                    assert_eq!(*k, LCanon::new(LBoxed::from(const_key), state.intern));
-                    assert_eq!(val1.bits(), val2.bits());
+                    let Ok(const_key) = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, key as u16) else { unreachable!() };
+                    assert_eq!(*k, LCanon::constant(const_key));
                 }
 
                 debug!("gettable_href fetched {val1:?}");
@@ -642,11 +633,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // table (and so the witness) to a new epoch.
                 fn store<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, href: u8, expected: LType, retype: bool) {
                     let hidx = state.witness_base + href as usize;
-                    let witness = &state.hash_witnesses[hidx];
+                    let witness = state.hash_witnesses[hidx];
                     debug!("settable_href with {:?} {:?}", &witness, expected);
                     let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     tab.barrier_back();
-                    let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.as_ref().unwrap().index).unwrap();
+                    let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.index).unwrap();
                     debug!("settable_href {:?} {:?}", &val1, expected);
                     #[cfg(debug_assertions)]
                     assert!(val1.unbox().typeof_() == expected);
@@ -654,7 +645,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     if retype {
                         tab.rw(owner).epoch += 1;
                         // This is safe because we're statically updating the known type as well.
-                        state.hash_witnesses[hidx].as_mut().unwrap().epoch = tab.rw(owner).epoch;
+                        state.hash_witnesses[hidx].epoch = tab.rw(owner).epoch;
                     }
                 }
                 let expected = htype.as_ltype();
@@ -2390,17 +2381,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else {
                 thunk_mut.types[idx] = CType::Shape(vec![href].into());
             }
-            let init_key = hkey.key.clone();
+            // The key's canonical form, made here once. See Note [Hash witnesses].
+            let lkey = LCanon::constant(&hkey.key);
             let href_init = Residual::Exec(ResidualExec::new("href_init", Rc::new(move |owner, state| {
                 let mut index = index;
                 let hidx = state.witness_base + href.0 as usize;
                 if state.hash_witnesses.len() <= hidx {
-                    state.hash_witnesses.resize_with(hidx + 1, || None);
+                    state.hash_witnesses.resize_with(hidx + 1, HashWitness::default);
                 }
+                state.witness_top = state.witness_top.max(hidx + 1);
                 debug!("populating hashkey witness {}", hidx);
-                let witness = &mut state.hash_witnesses[hidx];
+                // Safety: the constant outlives the closure, which the closure
+                // it came from owns, as for `emit_getglobal`'s.
+                let lkey: LCanon<'_, '_> = unsafe { core::mem::transmute(lkey) };
                 let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
-                let lkey = LCanon::new((&init_key).into(), state.intern);
                 // Inline cache for assuming the index stays the same
                 match tab.ro(owner).hash.get_index(index) {
                     Some((key, _)) if *key != lkey => {
@@ -2420,12 +2414,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         state.select = 1
                     },
                 }
-                *witness = Some(HashWitness {
-                    href,
-                    key: init_key.clone(),
-                    epoch: tab.ro(owner).epoch,
-                    index,
-                });
+                state.hash_witnesses[hidx] = HashWitness { epoch: tab.ro(owner).epoch, index };
             })));
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
@@ -2496,9 +2485,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // Re-init the witness and jump back to success block
                 let LValue::Table(t) = state.vals[state.base + tab].unbox() else { unreachable!() };
                 let epoch = t.ro(owner).epoch;
-                let Some(witness) = &mut state.hash_witnesses[state.witness_base + href.0 as usize] else { unreachable!() };
                 debug!("repairing {:?} epoch", href);
-                witness.epoch = epoch;
+                state.hash_witnesses[state.witness_base + href.0 as usize].epoch = epoch;
             }))));
             vm.blocks[check_block.0].instructions.push(Residual::Jump(success_block));
         })));
@@ -3025,7 +3013,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::EpochCheck { tab, href } => {
-                    let hwit = &state.hash_witnesses[state.witness_base + href.0 as usize].as_ref().unwrap();
+                    let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let LValue::Table(tab) = state.vals[state.base + tab].unbox() else { unreachable!() };
                     warn!("epochcheck sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
                     if hwit.epoch == tab.ro(owner).epoch {
@@ -3036,12 +3024,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::HashGuard { tab, href, expected } => {
-                    let hwit = &state.hash_witnesses[state.witness_base + href.0 as usize].as_ref().unwrap();
+                    let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let LValue::Table(tab) = state.vals[state.base + tab].unbox() else { unreachable!() };
                     let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
-                    let cached_key = LCanon::new((&hwit.key).into(), state.intern);
-                    #[cfg(debug_assertions)]
-                    assert!(*key == cached_key);
                     if val.unbox().typeof_() == expected {
                         // Fallthrough
                         off += 2;

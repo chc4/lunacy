@@ -648,6 +648,11 @@ impl<'src, 'intern> LCanon<'src, 'intern> {
     }
 
     #[inline(always)]
+    /// A constant, which is canonical already: string constants are interned.
+    pub fn constant(k: &LConstant<'src, 'intern>) -> Self {
+        LCanon(LBoxed::from(k))
+    }
+
     pub fn boxed(self) -> LBoxed<'src, 'intern> {
         self.0
     }
@@ -1163,15 +1168,25 @@ impl ReturnLocation {
 // overshoot, which is what stops it lingering (and being GC-marked) for the rest of
 // foo's execution.
 #[derive(Debug)]
-pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_limit: usize, pub rloc: usize, pub c: u16 }
+pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_top: usize, pub rloc: usize, pub c: u16 }
 
-#[derive(Debug)]
+/// Where a frame's hash key was found in its table's hash part, and the
+/// table's epoch then. See Note [Hash witnesses].
+#[derive(Debug, Default, Clone, Copy)]
 pub struct HashWitness {
-    pub href: HashRef,
-    pub key: LConstant<'static, 'static>,
     pub index: usize,
     pub epoch: usize,
 }
+
+// Note [Hash witnesses]
+// ~~~~~~~~~~~~~~~~~~~~~
+// A frame's hash witnesses are the region of `hash_witnesses` from its
+// `witness_base` up; a call's region starts at the caller's `witness_top`,
+// which `href_init` raises past each witness it writes, and a return resets it.
+// The vector itself never shrinks, so a call never refills it: entries above
+// `witness_top` are stale, but no frame reads one it hasn't written, as a
+// function's entry context has no hash keys and a hash key's `href_init` runs
+// before any use of it.
 
 pub struct RunState<'src, 'intern> {
     pub base: usize,
@@ -1195,7 +1210,9 @@ pub struct RunState<'src, 'intern> {
     pub counters: PerfCounters,
     pub select: usize,
     pub witness_base: usize,
-    pub hash_witnesses: FVec<Option<HashWitness>>,
+    /// The end of the innermost frame's hash witnesses. See Note [Hash witnesses].
+    pub witness_top: usize,
+    pub hash_witnesses: FVec<HashWitness>,
     pub trap: bool,
     pub current_off: u16,
     pub gas: i64,
@@ -1299,13 +1316,13 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             limit,
             rloc: self.base + a as usize,
             witness_frame: self.witness_base,
-            witness_limit: self.hash_witnesses.len(),
+            witness_top: self.witness_top,
             c
         });
         self.base = next_base;
         // Start `top` at the end of the callee's register file.
         self.top = next_base + next_stack;
-        self.witness_base = self.hash_witnesses.len();
+        self.witness_base = self.witness_top;
         self.clos = lclos.clone();
         next_stack
     }
@@ -1336,7 +1353,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             unreachable!()
         };
         match self.callstack.pop() {
-            Some(CallstackEntry { clos: ret_clos, ret, frame, limit, witness_frame, witness_limit, rloc, c }) => {
+            Some(CallstackEntry { clos: ret_clos, ret, frame, limit, witness_frame, witness_top, rloc, c }) => {
                 debug!("{} {:?} {}", self.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, c);
                 self.clos = ret_clos.clone();
                 self.base = frame;
@@ -1365,7 +1382,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                     self.top = rloc + r_count;
                     self.vals.truncate(limit.max(rloc + r_count));
                 }
-                self.hash_witnesses.truncate(witness_limit);
+                self.witness_top = witness_top;
                 return Ok(ret)
             },
             None => {
@@ -1590,6 +1607,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 top,
                 natural_max: top,
                 witness_base,
+                witness_top: 0,
                 pc,
                 _G,
                 clos,

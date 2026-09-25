@@ -112,7 +112,7 @@ impl JitHelper {
             let mut owner = ();
             let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
-            let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
+            let hwit = rs.hash_witnesses[rs.witness_base + href as usize];
             let tab_val = rs.vals[rs.base + tab].unbox();
             let LValue::Table(tab) = tab_val else { unreachable!() };
             debug!("JIT check_epoch sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
@@ -126,7 +126,7 @@ impl JitHelper {
             let mut owner = ();
             let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
-            let hwit = rs.hash_witnesses[rs.witness_base + href as usize].as_ref().unwrap();
+            let hwit = rs.hash_witnesses[rs.witness_base + href as usize];
             let tab_val = rs.vals[rs.base + tab].unbox();
             let LValue::Table(tab) = tab_val else { unreachable!() };
             let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
