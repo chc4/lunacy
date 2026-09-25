@@ -26,6 +26,7 @@ magic = [] # Magic JIT intrinsics
 perf = [] # Create perf JIT map file
 alloc_stats = ["mimalloc/extended", "dep:libmimalloc-sys"] # bench prints mimalloc's statistics
 window_dump = ["jit"] # Dump the JIT's window allocation to window_dump.txt
+jit_disasm = ["jit", "yaxpeax-x86/fmt", "dep:rustc-demangle"] # Disassemble the JIT's code, annotated, to jit_disasm.txt when it's dropped
 no_dynamic_guards = [] # GuardDynamic yields fail statically (Note [Dynamic guards])
 gc_sanitize = []
 gc_stress = []
@@ -54,6 +55,7 @@ memmap2 = { version = "0.9.10", path = "./memmap2-rs" }
 smallvec = "1.15.1"
 rsprocmaps = "0.3.2"
 goblin = "0.9"
+rustc-demangle = { version = "0.1", optional = true }
 yaxpeax-x86 = { version = "2.2.0", default-features = false, features = ["std"] }
 yaxpeax-arch = { version = "0.3.2", default-features = false, features = ["std"] }
 

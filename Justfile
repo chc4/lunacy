@@ -69,6 +69,14 @@ window-dump benchmark times='20' ref='':
         (cd target/compare/{{ref}} && cargo run --release --features window_dump --bin bench -- $bin {{times}})
     fi
 
+# A benchmark's JIT code, disassembled when the VM drops it and annotated with
+# what emitted it (regions, blocks, residuals, thunk stubs, the blocks and
+# helpers branches go to), in jit_disasm.txt.
+jit-disasm benchmark times='10':
+    just _luac {{benchmark}}
+    cargo run --release --features jit_disasm --bin bench --target-dir target/jit_disasm -- {{benchmark}}.bin {{times}} > /dev/null
+    @echo jit_disasm.txt
+
 # Save a benchmark's window dump as bench/window_dumps/<benchmark>.<name>.txt, a
 # reference to compare window allocators against with `just window-dump-stats`.
 window-dump-save benchmark name times='20':

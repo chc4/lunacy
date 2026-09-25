@@ -28,6 +28,8 @@ pub mod window_alloc;
 pub mod trace;
 #[cfg(feature = "jit")]
 pub mod jit;
+#[cfg(feature = "jit_disasm")]
+pub mod disasm;
 pub mod gc;
 pub mod library;
 

@@ -229,6 +229,15 @@ macro_rules! window_dump {
     };
 }
 
+/// Note what the code `$ops` assembles next is, for the disassembly (feature
+/// `jit_disasm`).
+macro_rules! jit_note {
+    ($jctx:expr, $ops:expr, $($arg:tt)*) => {
+        #[cfg(feature = "jit_disasm")]
+        $jctx.disasm.note($ops.offset().0, format!($($arg)*));
+    };
+}
+
 /// Allocator code as one line, for `window_dump!`.
 #[cfg(feature = "window_dump")]
 fn emits_line(emits: &[Emit]) -> String {
@@ -412,6 +421,9 @@ pub struct JitContext {
     /// How often each counted piece of allocator code ran (`window_count!`).
     #[cfg(feature = "window_dump")]
     window_counts: std::cell::RefCell<Vec<Box<std::sync::atomic::AtomicU64>>>,
+    /// The code committed, and notes on it, disassembled on drop.
+    #[cfg(feature = "jit_disasm")]
+    pub disasm: crate::disasm::Disasm,
     /// Each thunk compiled into JIT code, by block and offset. See Note
     /// [Thunk patching].
     thunk_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
@@ -438,12 +450,29 @@ struct ThunkSite {
     window: Cache,
 }
 
-/// The dump ends with how often each counted piece of allocator code ran.
-#[cfg(feature = "window_dump")]
+/// The window dump ends with how often each counted piece of allocator code
+/// ran, and the code is disassembled.
+#[cfg(any(feature = "window_dump", feature = "jit_disasm"))]
 impl Drop for JitContext {
     fn drop(&mut self) {
+        #[cfg(feature = "window_dump")]
         for (id, count) in self.window_counts.borrow().iter().enumerate() {
             window_dump!(self, "count #{id} {}", count.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        #[cfg(feature = "jit_disasm")]
+        {
+            let mut symbols: HashMap<usize, String> = self.blocks.iter().map(|(id, block)| (block.ptr.0 as usize, format!("block {}", id.0))).collect();
+            let helpers: [(usize, &str); 7] = [
+                (JitHelper::check_epoch as *const () as usize, "JitHelper::check_epoch"),
+                (JitHelper::check_guard as *const () as usize, "JitHelper::check_guard"),
+                (JitHelper::check_hash_guard as *const () as usize, "JitHelper::check_hash_guard"),
+                (JitHelper::dynamic_call as *const () as usize, "JitHelper::dynamic_call"),
+                (JitHelper::gc_safepoint as *const () as usize, "JitHelper::gc_safepoint"),
+                (JitHelper::lua_return as *const () as usize, "JitHelper::lua_return"),
+                (JitHelper::window_interp as *const () as usize, "JitHelper::window_interp"),
+            ];
+            symbols.extend(helpers.iter().map(|&(addr, name)| (addr, name.to_string())));
+            self.disasm.write("jit_disasm.txt", &symbols);
         }
     }
 }
@@ -535,6 +564,8 @@ impl JitContext {
             window_dump,
             #[cfg(feature = "window_dump")]
             window_counts: Default::default(),
+            #[cfg(feature = "jit_disasm")]
+            disasm: Default::default(),
             trace_policy: match std::env::var("LUNACY_TRACES").as_deref() {
                 Ok("streaming") => None,
                 _ => Some(Policy::from_env()),
@@ -619,6 +650,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let base = self.jctx.end();
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
         let entry = ops.offset();
+        jit_note!(self.jctx, ops, "region entry: prologue");
 
         // SystemV ABI is RDI, RSI, RDX, RCX, R8, R9
         // JitExec (rust-preserve-none): R12=state, R13=base_ptr
@@ -642,6 +674,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         if let Some(block) = self.jctx.blocks.get(&id) {
             // Load the window the block is entered with.
             let loads = WindowAlloc::default().transfer(&block.window);
+            jit_note!(self.jctx, ops, "load the window block {} is entered with, and jump to it", id.0);
             let counted = window_count!(self.jctx, &mut ops, loads);
             window_dump!(self.jctx, "block {} compiled already, entered with {}: {}{counted}", id.0, block.window, emits_line(&loads));
             for emit in loads {
@@ -665,6 +698,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 None => linked.clone().unwrap_or_default(),
             };
             let loads = WindowAlloc::default().transfer(&window);
+            jit_note!(self.jctx, ops, "load the entry window");
             let counted = window_count!(self.jctx, &mut ops, loads);
             window_dump!(self.jctx, "region entry block {} loads {}{counted}", id.0, emits_line(&loads));
             for emit in loads {
@@ -705,6 +739,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
 
         let epilogue = ops.offset();
+        jit_note!(self.jctx, ops, "exit_jit: epilogue");
         dynasm!(ops
             ; .arch x64
             ; ->exit_jit:
@@ -717,6 +752,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
         let pool_start = ops.offset();
         ops.align(8, 0xcc);
+        jit_note!(self.jctx, ops, "{}", crate::disasm::POOL);
         for (label, entry) in pool.entries {
             let value = match entry {
                 PoolEntry::Value(value) => value,
@@ -751,6 +787,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let line = unsafe { (*proto).line_defined };
             (source, line)
         };
+        #[cfg(feature = "jit_disasm")]
+        self.jctx.disasm.committed(slab as usize, buf.len(), format!("region entered at block {}, function {source}:{line}", id.0));
 
         #[cfg(feature = "perf")]
         {
@@ -813,6 +851,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let base = self.jctx.end();
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
         let emits = WindowAlloc::entering(window.clone()).transfer(&entry);
+        jit_note!(self.jctx, ops, "from the thunk's window {} to block {}'s {}", window, target.0, entry);
         let counted = window_count!(self.jctx, &mut ops, emits);
         window_dump!(self.jctx, "thunk linked from {} into block {} entered with {}: {}{counted}", window, target.0, entry, emits_line(&emits));
         for emit in emits {
@@ -824,7 +863,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         );
         let buf = ops.finalize().unwrap();
         self.jctx.reserve(buf.len());
-        self.jctx.commit(base, &buf).expect("a committed thunk stub") as usize
+        let stub = self.jctx.commit(base, &buf).expect("a committed thunk stub") as usize;
+        #[cfg(feature = "jit_disasm")]
+        self.jctx.disasm.committed(stub, buf.len(), format!("thunk stub into block {}", target.0));
+        stub
     }
 
     /// Plan the window allocation of the region compiled from `entry`: the blocks
@@ -1063,6 +1105,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
         let mut alloc = WindowAlloc::entering(self.jctx.blocks[&id].window.clone());
         window_dump!(self.jctx, "block {} hotness {} pc {} entered with {}", id.0, block.jit_info.hotness.get(), block.pc, alloc.cache());
+        jit_note!(self.jctx, ops, "block {} (pc {}, hotness {}) entered with {}", id.0, block.pc, block.jit_info.hotness.get(), alloc.cache());
 
         // Jump to `target`, or fall through to it if `skip`, transferring the
         // window to the one it is entered with: its planned entry window, dirty where the
@@ -1203,6 +1246,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
             window_dump!(self.jctx, "  {off:3} {res}");
+            jit_note!(self.jctx, ops, "  {off:3} {res}");
             let prev = off.checked_sub(1).map(|p| &block.instructions[p]);
             let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_));
             if window(res) && prev.is_some_and(|p| window(p)) {

@@ -672,7 +672,7 @@ impl Body {
 
 /// Opcodes whose first operand is a relative branch target (mirrors
 /// yaxpeax-x86's private `RELATIVE_BRANCHES`).
-const RELATIVE_BRANCHES: [yaxpeax_x86::long_mode::Opcode; 23] = {
+pub(crate) const RELATIVE_BRANCHES: [yaxpeax_x86::long_mode::Opcode; 23] = {
     use yaxpeax_x86::long_mode::Opcode::*;
     [
         JMP, CALL, JRCXZ, JECXZ, LOOP, LOOPZ, LOOPNZ, JO, JNO, JB, JNB, JZ, JNZ, JNA, JA, JS, JNS,
