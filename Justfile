@@ -156,6 +156,25 @@ graph-guards benchmark times='10':
         (cd $dir && ../../../graph-$variant/release/bench ../../../../{{benchmark}}.bin {{times}} > /dev/null)
     done
     tools/graph_blocks.py target/graphs/{{benchmark}}/guards target/graphs/{{benchmark}}/no_guards
+# A benchmark's residual graphs at this checkout and at revision `ref` (built in
+# target/compare/<ref>, as for `hyperfine-vs`), in
+# target/graphs/<benchmark>/{current,<ref>}, and their blocks compared.
+graph-vs ref benchmark times='10':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _luac {{benchmark}}
+    cargo build --release --features graph --bin bench --target-dir target/graph-current
+    just _compare-worktree {{ref}}
+    (cd target/compare/{{ref}} && cargo build --release --features graph --bin bench --target-dir target/graph)
+    bin=$(realpath {{benchmark}}.bin)
+    for variant in current {{ref}}; do
+        exe=$(realpath target/graph-current/release/bench)
+        if [ $variant != current ]; then exe=$(realpath target/compare/{{ref}}/target/graph/release/bench); fi
+        dir=target/graphs/{{benchmark}}/$variant
+        rm -rf $dir && mkdir -p $dir
+        (cd $dir && $exe $bin {{times}} > /dev/null)
+    done
+    tools/graph_blocks.py target/graphs/{{benchmark}}/current target/graphs/{{benchmark}}/{{ref}}
 gdb name:
     luac5.1 -o {{name}}.bin {{name}}.lua
     cargo build --release --bin lunacy
@@ -173,20 +192,21 @@ gdb-benchmark benchmark:
 # Profile a benchmark: perf.data and flamegraph.svg here, or with `ref`, revision
 # `ref`'s build (in target/compare/<ref>, as for `hyperfine-vs`) on this
 # checkout's benchmark, its perf.data there and flamegraph-<ref>.svg here.
-flamegraph benchmark times='10' ref='':
+# `freq` is perf's sampling rate, in Hz.
+flamegraph benchmark times='10' ref='' freq='997':
     #!/usr/bin/env bash
     set -euo pipefail
     just _luac {{benchmark}}
     rm -f /tmp/perf-*.map
     if [ -z "{{ref}}" ]; then
-        cargo flamegraph --features "perf" --bin bench -- {{benchmark}}.bin {{times}}
+        cargo flamegraph -F {{freq}} --features "perf" --bin bench -- {{benchmark}}.bin {{times}}
         firefox -new-tab flamegraph.svg || true
     else
         dir=target/compare/{{ref}}
         just _compare-worktree {{ref}}
         bin=$(realpath {{benchmark}}.bin)
         svg=$(realpath .)/flamegraph-{{ref}}.svg
-        (cd $dir && cargo flamegraph --features "perf" --bin bench -o $svg -- $bin {{times}})
+        (cd $dir && cargo flamegraph -F {{freq}} --features "perf" --bin bench -o $svg -- $bin {{times}})
     fi
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")

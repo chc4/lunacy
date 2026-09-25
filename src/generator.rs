@@ -292,6 +292,8 @@ pub enum YieldOp {
                             // unknown. See Note [Integers]
     TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
     IntegerK(usize), // Resumed with the value of CONSTANT[idx], a `CType::Integer`
+    NumberK(usize), // Resumed with the value of CONSTANT[idx], a number
+    BoxedK(usize), // Resumed with the boxed value of CONSTANT[idx], as its bits
     Demote(std::ops::Range<usize>), // Lower the integers in STACK[range] to doubles, for code
                                     // reading them as any value. See Note [Integers]
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
@@ -346,23 +348,21 @@ pub enum ResumeArg {
     BlockId(BlockId),
     HashRef(HashRef, CType),
     Integer(i32),
+    Number(f64),
+    Boxed(u64),
 }
 
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // One op per constant kind: converting any constant is a `match` on its
-        // kind, which compiles to a jump table the copier can't copy.
-        windowed!(LoadKNumber, [index: u32], [], |owner, state, base| (out dest) {
-            let Constant::Number(n) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
-            *dest = LBoxed::from_number(n.0);
+        // The constant's boxed value is the op's hole, so it is a store; an
+        // integer's is in the integer encoding. See Note [Integers].
+        windowed!(LoadK, [bits: u64], [], |owner, state, base| (out dest) {
+            // A constant's value lives as long as its prototype.
+            *dest = LBoxed::from_bits(bits);
         });
         windowed!(LoadKInteger, [value: i32], [], |owner, state, base| (out dest) {
             *dest = LBoxed::from_int(value);
-        });
-        windowed!(LoadKString, [index: u32], [], |owner, state, base| (out dest) {
-            let Constant::String(s) = &(&(*state.clos.ro(owner).prototype).constants.items)[index as usize] else { unreachable!() };
-            *dest = LBoxed::interned(*s);
         });
         match c {
             LType::Number => {
@@ -371,12 +371,14 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
                     let ResumeArg::Integer(value) = (yield YieldOp::IntegerK(bx as usize)) else { unreachable!() };
                     yield YieldOp::ExecWindow(Rc::new(LoadKInteger::new(value, &[dest])));
                 } else {
-                    yield YieldOp::ExecWindow(Rc::new(LoadKNumber::new(bx, &[dest])));
+                    let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
+                    yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
                 }
                 yield YieldOp::SetCTypes(vec![(dest, t)]);
             },
             LType::String => {
-                yield YieldOp::ExecWindow(Rc::new(LoadKString::new(bx, &[dest])));
+                let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
+                yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
                 yield YieldOp::SetTypes(vec![(dest, LType::String)]);
             },
             _ => unreachable!(),
@@ -811,29 +813,20 @@ crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base|
 });
 
 // The double ops on registers, `LI`/`RI` if in the integer encoding, and
-// constants (index `k`), read from the prototype. Unchecked, so that no panic
-// path follows the stencil's `become` and the copy can slice it off.
+// constants, `k` their value. Unchecked, so that no panic path follows the
+// stencil's `become` and the copy can slice it off.
 crate::window::windowed!(NumericRR, [], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs, out dest) {
     let (l, r) = (number::<LI>(lhs), number::<RI>(rhs));
     *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
 });
-crate::window::windowed!(NumericKK, [kl: u32, kr: u32], [OP: Opcode], |owner, state, base| (out dest) {
-    let constants = &(&(*state.clos.ro(owner).prototype).constants.items);
-    let Constant::Number(l) = &constants[kl as usize] else { core::hint::unreachable_unchecked() };
-    let Constant::Number(r) = &constants[kr as usize] else { core::hint::unreachable_unchecked() };
-    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(*r)).unwrap());
+crate::window::windowed!(NumericKK, [kl: f64, kr: f64], [OP: Opcode], |owner, state, base| (out dest) {
+    *dest = LBoxed::box_lvalue(LValue::Number(Number(kl)).numeric_op(OP, &LValue::Number(Number(kr))).unwrap());
 });
-crate::window::windowed!(NumericKR, [k: u32], [OP: Opcode, RI: bool], |owner, state, base| (rhs, out dest) {
-    let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-        core::hint::unreachable_unchecked()
-    };
-    *dest = LBoxed::box_lvalue(LValue::Number(*l).numeric_op(OP, &LValue::Number(Number(number::<RI>(rhs)))).unwrap());
+crate::window::windowed!(NumericKR, [k: f64], [OP: Opcode, RI: bool], |owner, state, base| (rhs, out dest) {
+    *dest = LBoxed::box_lvalue(LValue::Number(Number(k)).numeric_op(OP, &LValue::Number(Number(number::<RI>(rhs)))).unwrap());
 });
-crate::window::windowed!(NumericRK, [k: u32], [OP: Opcode, LI: bool], |owner, state, base| (lhs, out dest) {
-    let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-        core::hint::unreachable_unchecked()
-    };
-    *dest = LBoxed::box_lvalue(LValue::Number(Number(number::<LI>(lhs))).numeric_op(OP, &LValue::Number(*r)).unwrap());
+crate::window::windowed!(NumericRK, [k: f64], [OP: Opcode, LI: bool], |owner, state, base| (lhs, out dest) {
+    *dest = LBoxed::box_lvalue(LValue::Number(Number(number::<LI>(lhs))).numeric_op(OP, &LValue::Number(Number(k))).unwrap());
 });
 
 /// `NumericRR` for `opcode`, reading integer registers as `li`/`ri` say.
@@ -847,7 +840,7 @@ fn numeric_rr(opcode: Opcode, li: bool, ri: bool, operands: &[usize]) -> Rc<dyn 
 }
 
 /// `NumericKR` for `opcode`, reading an integer register if `ri`.
-fn numeric_kr(opcode: Opcode, ri: bool, k: u32, operands: &[usize]) -> Rc<dyn Window> {
+fn numeric_kr(opcode: Opcode, ri: bool, k: f64, operands: &[usize]) -> Rc<dyn Window> {
     match ri {
         false => dispatch_numeric_window!(opcode, NumericKR, [false], (k, operands)),
         true => dispatch_numeric_window!(opcode, NumericKR, [true], (k, operands)),
@@ -855,7 +848,7 @@ fn numeric_kr(opcode: Opcode, ri: bool, k: u32, operands: &[usize]) -> Rc<dyn Wi
 }
 
 /// `NumericRK` for `opcode`, reading an integer register if `li`.
-fn numeric_rk(opcode: Opcode, li: bool, k: u32, operands: &[usize]) -> Rc<dyn Window> {
+fn numeric_rk(opcode: Opcode, li: bool, k: f64, operands: &[usize]) -> Rc<dyn Window> {
     match li {
         false => dispatch_numeric_window!(opcode, NumericRK, [false], (k, operands)),
         true => dispatch_numeric_window!(opcode, NumericRK, [true], (k, operands)),
@@ -917,10 +910,18 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         let window = match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => Some(numeric_rr(opcode, lint, rint, &[lhs, rhs, dest])),
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
-                Some(dispatch_numeric_window!(opcode, NumericKK, [], (lhsc as u32, rhsc as u32, &[dest])))
+                let ResumeArg::Number(l) = (yield YieldOp::NumberK(lhsc)) else { unreachable!() };
+                let ResumeArg::Number(r) = (yield YieldOp::NumberK(rhsc)) else { unreachable!() };
+                Some(dispatch_numeric_window!(opcode, NumericKK, [], (l, r, &[dest])))
             },
-            (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => Some(numeric_kr(opcode, rint, lhsc as u32, &[rhs, dest])),
-            (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => Some(numeric_rk(opcode, lint, rhsc as u32, &[lhs, dest])),
+            (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
+                let ResumeArg::Number(k) = (yield YieldOp::NumberK(lhsc)) else { unreachable!() };
+                Some(numeric_kr(opcode, rint, k, &[rhs, dest]))
+            },
+            (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
+                let ResumeArg::Number(k) = (yield YieldOp::NumberK(rhsc)) else { unreachable!() };
+                Some(numeric_rk(opcode, lint, k, &[lhs, dest]))
+            },
             _ => None,
         };
         if let Some(window) = window {
@@ -985,22 +986,33 @@ crate::window::windowed!(CompareIntRK, [a: u8, k: i32], [OP: Opcode], |owner, st
 });
 
 // Compares of numbers: registers, `LI`/`RI` if in the integer encoding, and a
-// constant, `k` its index, read from the prototype.
+// constant, `k` its value.
 crate::window::windowed!(CompareRR, [a: u8], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs) {
     select::<OP, f64>(state, a, number::<LI>(lhs), number::<RI>(rhs));
 });
-crate::window::windowed!(CompareKR, [a: u8, k: u32], [OP: Opcode, RI: bool], |owner, state, base| (rhs) {
-    let Constant::Number(l) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-        core::hint::unreachable_unchecked()
-    };
-    select::<OP, f64>(state, a, l.0, number::<RI>(rhs));
+crate::window::windowed!(CompareKR, [a: u8, k: f64], [OP: Opcode, RI: bool], |owner, state, base| (rhs) {
+    select::<OP, f64>(state, a, k, number::<RI>(rhs));
 });
-crate::window::windowed!(CompareRK, [a: u8, k: u32], [OP: Opcode, LI: bool], |owner, state, base| (lhs) {
-    let Constant::Number(r) = &(&(*state.clos.ro(owner).prototype).constants.items)[k as usize] else {
-        core::hint::unreachable_unchecked()
-    };
-    select::<OP, f64>(state, a, number::<LI>(lhs), r.0);
+crate::window::windowed!(CompareRK, [a: u8, k: f64], [OP: Opcode, LI: bool], |owner, state, base| (lhs) {
+    select::<OP, f64>(state, a, number::<LI>(lhs), k);
 });
+
+// EQ of a double against a number constant `k` (its boxed bits) other than ±0
+// or NaN: in the double encoding, equal numbers have equal bits but for ±0
+// (unequal bits) and NaN (equal to nothing), so it compares the bits.
+crate::window::windowed!(EqualBits, [a: u8, k: u64], [], |owner, state, base| (value) {
+    state.select = if ((value.bits() == k) as u8) != a { 0 } else { 1 };
+});
+
+/// A double compared with the constant `k` by `opcode`: `EqualBits` when it can
+/// be, else `CompareKR` or `CompareRK` (`k_left` if the constant is the left
+/// operand).
+fn compare_k(opcode: Opcode, int: bool, a: u8, k: f64, k_left: bool, operand: usize) -> Rc<dyn Window> {
+    if opcode == Opcode::EQ && !int && k != 0.0 && !k.is_nan() {
+        return Rc::new(EqualBits::new(a, LBoxed::from_number(k).bits(), &[operand]));
+    }
+    if k_left { compare_kr(opcode, int, a, k, &[operand]) } else { compare_rk(opcode, int, a, k, &[operand]) }
+}
 
 /// `CompareRR` for `opcode`, reading integer registers as `li`/`ri` say.
 fn compare_rr(opcode: Opcode, li: bool, ri: bool, a: u8, operands: &[usize]) -> Rc<dyn Window> {
@@ -1013,7 +1025,7 @@ fn compare_rr(opcode: Opcode, li: bool, ri: bool, a: u8, operands: &[usize]) -> 
 }
 
 /// `CompareKR` for `opcode`, reading an integer register if `ri`.
-fn compare_kr(opcode: Opcode, ri: bool, a: u8, k: u32, operands: &[usize]) -> Rc<dyn Window> {
+fn compare_kr(opcode: Opcode, ri: bool, a: u8, k: f64, operands: &[usize]) -> Rc<dyn Window> {
     match ri {
         false => dispatch_compare_window!(opcode, CompareKR, [false], (a, k, operands)),
         true => dispatch_compare_window!(opcode, CompareKR, [true], (a, k, operands)),
@@ -1021,7 +1033,7 @@ fn compare_kr(opcode: Opcode, ri: bool, a: u8, k: u32, operands: &[usize]) -> Rc
 }
 
 /// `CompareRK` for `opcode`, reading an integer register if `li`.
-fn compare_rk(opcode: Opcode, li: bool, a: u8, k: u32, operands: &[usize]) -> Rc<dyn Window> {
+fn compare_rk(opcode: Opcode, li: bool, a: u8, k: f64, operands: &[usize]) -> Rc<dyn Window> {
     match li {
         false => dispatch_compare_window!(opcode, CompareRK, [false], (a, k, operands)),
         true => dispatch_compare_window!(opcode, CompareRK, [true], (a, k, operands)),
@@ -1061,14 +1073,16 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                 arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntKR, [], (a, k, &[c])));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) => {
-                arg = yield YieldOp::ExecWindow(compare_kr(opcode, rint, a, rb as u32, &[c]));
+                let ResumeArg::Number(k) = (yield YieldOp::NumberK(rb)) else { unreachable!() };
+                arg = yield YieldOp::ExecWindow(compare_k(opcode, rint, a, k, true, c));
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) if integers => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rc)) else { unreachable!() };
                 arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRK, [], (a, k, &[b])));
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
-                arg = yield YieldOp::ExecWindow(compare_rk(opcode, lint, a, rc as u32, &[b]));
+                let ResumeArg::Number(k) = (yield YieldOp::NumberK(rc)) else { unreachable!() };
+                arg = yield YieldOp::ExecWindow(compare_k(opcode, lint, a, k, false, b));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::MatchedConst(rc)) => {
                 unimplemented!()
@@ -2497,6 +2511,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let crate::chunk::Constant::Number(n) = (unsafe { &(&(*proto).constants.items)[k] }) else { unreachable!() };
                     assert!(is_integer(n.0), "{} isn't an integer", n.0);
                     arg = ResumeArg::Integer(n.0 as i32);
+                },
+                CoroutineState::Yielded(YieldOp::NumberK(k)) => {
+                    let proto = self.clos.ro(owner).prototype;
+                    let crate::chunk::Constant::Number(n) = (unsafe { &(&(*proto).constants.items)[k] }) else { unreachable!() };
+                    arg = ResumeArg::Number(n.0);
+                },
+                CoroutineState::Yielded(YieldOp::BoxedK(k)) => {
+                    let proto = self.clos.ro(owner).prototype;
+                    arg = ResumeArg::Boxed(LBoxed::from(unsafe { &(&(*proto).constants.items)[k] }).bits());
                 },
                 CoroutineState::Yielded(YieldOp::Demote(slots)) => {
                     self.demote(block_id, &mut ctx, slots);

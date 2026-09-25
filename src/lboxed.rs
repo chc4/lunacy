@@ -140,6 +140,18 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         self.0
     }
 
+    /// The value whose payload is `bits`.
+    ///
+    /// # Safety
+    ///
+    /// `bits` is the `bits()` of a value that is still live: a number, bool or
+    /// nil, or a cell that hasn't been collected (a constant's interned string
+    /// lives as long as the interner).
+    #[inline(always)]
+    pub unsafe fn from_bits(bits: u64) -> Self {
+        Self::from_raw(bits)
+    }
+
     #[inline(always)]
     pub fn from_number(n: f64) -> Self {
         let bits = if n.is_nan() { Self::CANONICAL_NAN } else { n.to_bits() };
