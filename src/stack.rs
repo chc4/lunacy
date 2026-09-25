@@ -1,3 +1,4 @@
+use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 #[cfg(feature = "skip_vec")]
 use std::ops::{Index, IndexMut};
@@ -71,25 +72,31 @@ impl<'src, 'intern> ValueStack<'src, 'intern> {
         }
     }
 
+    /// The mapping past the live values, as `Vec::spare_capacity_mut`.
+    fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<LBoxed<'src, 'intern>>] {
+        let spare = self.stack_ptr.len() - self.used;
+        unsafe { std::slice::from_raw_parts_mut(self.stack_ptr.as_non_null_ptr().add(self.used).as_ptr().cast(), spare) }
+    }
+
+    /// The `n` slots past the live values.
+    fn spare(&mut self, n: usize) -> &mut [MaybeUninit<LBoxed<'src, 'intern>>] {
+        self.spare_capacity_mut().get_mut(..n).expect("ValueStack overflow")
+    }
+
     pub fn extend_from_slice(&mut self, slice: &[LBoxed<'src, 'intern>]) {
-        let new_len = self.used + slice.len();
-        if new_len > self.mmap.len() / std::mem::size_of::<LBoxed<'src, 'intern>>() {
-            panic!("ValueStack overflow");
-        }
-        for (i, val) in slice.iter().enumerate() {
-            unsafe {
-                std::ptr::write(self.stack_ptr.as_non_null_ptr().add(self.used + i).as_ptr(), *val);
-            }
-        }
-        self.used = new_len;
+        self.spare(slice.len()).write_copy_of_slice(slice);
+        self.used += slice.len();
     }
 
     pub fn resize_with<F>(&mut self, new_len: usize, mut f: F)
     where
-        F: Fn() -> LBoxed<'src, 'intern>,
+        F: FnMut() -> LBoxed<'src, 'intern>,
     {
         if new_len > self.used {
-            self.extend_from_slice(vec![f(); new_len - self.used].as_slice());
+            for slot in self.spare(new_len - self.used) {
+                slot.write(f());
+            }
+            self.used = new_len;
         } else {
             self.truncate(new_len);
         }
