@@ -186,8 +186,11 @@ macro_rules! dispatch_compare_window {
 }
 
 /// In a generator, the types of an op's two operands, as `TypeofRk` gives
-/// them, for an op computing on integers: with one an integer, whether an
-/// unknown other is one is found out (`DiscoverInteger`). See Note [Integers].
+/// them, for an op computing on integers: with one an integer register, whether
+/// an unknown other register is one is found out (`DiscoverInteger`). See Note
+/// [Integers]. An integer constant finds out nothing: it says nothing of how
+/// the program uses the other operand, and is an integer to an op whose other
+/// operand is one already.
 ///
 /// The other register is guarded even when its type is known, statically, so
 /// that a way into the op already holding both integers takes the same guard
@@ -199,11 +202,12 @@ macro_rules! discover_integers {
         let integer = ResumeArg::Type(CType::Integer);
         let mut lt = yield YieldOp::TypeofRk($lhs);
         let mut rt = yield YieldOp::TypeofRk($rhs);
-        if lt == integer && ($rhs & 0x100) == 0 {
+        let registers = ($lhs & 0x100) == 0 && ($rhs & 0x100) == 0;
+        if registers && lt == integer {
             if (yield YieldOp::DiscoverInteger($rhs)) == ResumeArg::Matched {
                 rt = integer.clone();
             }
-        } else if rt == integer && ($lhs & 0x100) == 0 {
+        } else if registers && rt == integer {
             if (yield YieldOp::DiscoverInteger($lhs)) == ResumeArg::Matched {
                 lt = integer.clone();
             }
@@ -1587,12 +1591,13 @@ impl std::fmt::Display for CType {
 // SUB, MUL and MOD of two `Integer` operands give one, guarded by a
 // `GuardDynamic` test that the exact result fits the encoding, which a failing
 // one computes as doubles instead. Compares of two compare them as integers.
-// With one operand an integer, these ask which part of the number sublattice
-// the other is in (`DiscoverInteger`), like a `Typeof` restricted to numbers:
-// an `Integer` or a number the context knows answers statically, taking the
-// integer or the double op, and an unknown one is found out as by a
-// `GuardCType`. A known number isn't tested, so arithmetic on doubles tests
-// nothing. The double ops, compares and FORLOOP read an integer operand as a
+// With one operand an integer register, these ask which part of the number
+// sublattice another register is in (`DiscoverInteger`), like a `Typeof`
+// restricted to numbers: an `Integer` or a number the context knows answers
+// statically, taking the integer or the double op, and an unknown one is found
+// out as by a `GuardCType`. A known number isn't tested, so arithmetic on
+// doubles tests nothing, and an integer constant asks nothing of the other
+// operand. The double ops, compares and FORLOOP read an integer operand as a
 // double, and FORPREP finds out whether its operands are integers, so an
 // integer loop's index and variable stay ones.
 

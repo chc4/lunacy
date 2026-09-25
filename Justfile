@@ -1,5 +1,8 @@
 set shell := ["bash", "-c"]
 TEST_FEATURES := "counters graph jit gas gc_sanitize"
+# Runs hyperfine makes of each command before timing it, so the CPU has ramped
+# up and caches are warm.
+WARMUP := "3"
 
 # Every test: `test`, then `test-stencils`.
 tests: test test-stencils
@@ -258,7 +261,7 @@ gdb-unsafe benchmark: unsafe-compile
 hyperfine benchmark times='10': unsafe-compile interpreter-compile
     just _luac {{benchmark}}
     cargo build --release --bin bench
-    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
+    hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
         "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}} || true" \
         "luajit -joff bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}}" \
         "luajit bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}}" \
@@ -271,7 +274,7 @@ hyperfine benchmark times='10': unsafe-compile interpreter-compile
 hyperfine-traces benchmark times='10' policies='streaming,single,unidirectional,bidirectional':
     just _luac {{benchmark}}
     cargo build --release --bin bench
-    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
+    hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
         "LUNACY_TRACES={policy} ./target/release/bench {{benchmark}}.bin {{times}}"
 # `hyperfine-traces` over the benchmarks lunacy runs, each run enough times for
 # a stable mean. life runs twice: the difference between its 1000 and 5000 runs
@@ -304,7 +307,7 @@ hyperfine-vs ref benchmark times='10':
     cargo build --release --bin bench
     just _compare-worktree {{ref}}
     cd target/compare/{{ref}} && cargo build --release --bin bench
-    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-vs-{{ref}}.md \
+    hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-vs-{{ref}}.md \
         "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \
         "./target/release/bench {{benchmark}}.bin {{times}}"
 # Compare this checkout's release build with and without cargo feature
@@ -313,17 +316,17 @@ hyperfine-feature feature benchmark times='10':
     just _luac {{benchmark}}
     cargo build --release --bin bench
     cargo build --release --features {{feature}} --bin bench --target-dir target/features/{{feature}}
-    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
+    hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
         -n default "./target/release/bench {{benchmark}}.bin {{times}}" \
         -n {{feature}} "target/features/{{feature}}/release/bench {{benchmark}}.bin {{times}}"
 hyperfine-jit benchmark:
     just _luac {{benchmark}}
     cargo build --release --bin bench
-    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-jit.md \
+    hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-jit.md \
         "./target/release/bench {{benchmark}}.bin"
 hyperfine-unsafe benchmark: unsafe-compile
     just _luac {{benchmark}}
-    hyperfine --warmup 1 --export-markdown hyperfine-{{benchmark}}-unsafe.md \
+    hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-unsafe.md \
         "./target/unsafe/bench {{benchmark}}.bin"
 
 

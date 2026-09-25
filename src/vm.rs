@@ -926,10 +926,12 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
 pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner) -> usize;
 /// A native's window op for a call to it (the `CALL`'s `a`, `b`, `c`), if it
 /// has one for that call's arity. See Note [Native windows] in `library`.
+#[cfg(feature = "lbbv")]
 pub type NativeWindow = fn(a: usize, b: u16, c: u16) -> Option<NativeOp>;
 
 /// A call to a native run as a window op: the op, the type every argument must
 /// have for it (the op assumes it), and its result's type.
+#[cfg(feature = "lbbv")]
 pub struct NativeOp {
     pub window: std::rc::Rc<dyn crate::window::Window>,
     pub args: LType,
@@ -981,15 +983,17 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: NativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(native, None) }
+        NClosure { cell: NClosureCell::leak(native) }
     }
 
     /// A native that runs as a window op where `window` gives one.
+    #[cfg(feature = "lbbv")]
     pub fn windowed(native: NativeFunc, window: NativeWindow) -> Self {
-        NClosure { cell: NClosureCell::leak(native, Some(window)) }
+        NClosure { cell: NClosureCell::leak_windowed(native, window) }
     }
 
     /// The window op a call `a`, `b`, `c` to this native runs as, if any.
+    #[cfg(feature = "lbbv")]
     pub fn window(&self, a: usize, b: u16, c: u16) -> Option<NativeOp> {
         self.cell.window.and_then(|window| window(a, b, c))
     }
