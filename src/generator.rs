@@ -473,10 +473,14 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
             windowed!(GetTableHref, [href: u8, key: usize], [], |owner, state, base| (table, out dest) {
-                let witness = state.hash_witnesses[state.witness_base + href as usize];
+                // Written by the frame's `href_init` already. See Note [Hash
+                // witnesses].
+                let witness = *state.hash_witnesses.get_unchecked(state.witness_base + href as usize);
                 debug!("gettable_href with {:?}", &witness);
-                let LValue::Table(tab) = table.unbox() else { unreachable!() };
-                let (k, val1) = tab.ro(owner).hash.get_index(witness.index).unwrap();
+                let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
+                // The witness holds for the table (its epoch, or no hazard since),
+                // so no key has been inserted or removed since it found the index.
+                let (k, val1) = tab.ro(owner).hash.get_index(witness.index).unwrap_unchecked();
 
                 // The witness is at the instruction's key.
                 #[cfg(debug_assertions)]
