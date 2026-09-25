@@ -1121,10 +1121,15 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
 
         arg = yield YieldOp::Guard(a, LType::Bool);
         if let ResumeArg::Matched = arg {
-            arg = yield YieldOp::Exec(ResidualExec::new("test_bool", Rc::new(move |owner, state| {
-                let LValue::Bool(b) = state.vals[state.base + a as usize].unbox() else { unreachable!() };
-                state.select = (b as u16 == c) as usize;
-            })));
+            // `select` is 1, the fallthrough, when the guarded bool is `C`.
+            windowed!(TestBool, [], [C: bool], |owner, state, base| (value) {
+                state.select = ((value.bits() == LBoxed::VALUE_TRUE) == C) as usize;
+            });
+            arg = yield YieldOp::ExecWindow(if c != 0 {
+                Rc::new(TestBool::<true>::new(&[a]))
+            } else {
+                Rc::new(TestBool::<false>::new(&[a]))
+            });
             arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
             return arg
         }
