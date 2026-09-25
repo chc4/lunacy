@@ -15,7 +15,11 @@ differ. With `--kinds`, it totals the code by what emitted it (region entries,
 jumps into compiled blocks, other jumps, exits, ops) in each dump. With `--ops`,
 it lists how often each window op ran (a residual `window(Op, ...)` or
 `guard_dynamic(Op, ...)`, counted by its `op at` line) in each dump side by
-side, most changed first.
+side, most changed first. With `--ngrams N`, it lists the most executed runs of
+N residuals adjacent in a block, over all the dumps: a residual ran as often as
+its counted code, or as the residual before it with none (a guard, a select;
+a thunk, a side exit, runs nothing),
+and a run as often as its last residual.
 """
 import argparse
 import math
@@ -28,6 +32,8 @@ EMIT = re.compile(r'(\w+|\[\d+\]) <- (\w+|\[\d+\])')
 COUNTED = re.compile(r' #(\d+)$')
 COUNT = re.compile(r'^count #(\d+) (\d+)$')
 RESIDUAL = re.compile(r'^    \d+ (window|guard_dynamic)\((\w+)')
+# Any residual: its kind, and a window op's, a guard's or an exec's name.
+ANY_RESIDUAL = re.compile(r'^    \d+ ([a-z_]+)(?:\(([A-Za-z_]+|\d+, (\w+)))?')
 
 
 RAW = False
@@ -73,6 +79,58 @@ def kind(code):
 
 
 KINDS = ['region entry', 'into compiled', 'jump', 'exit', 'op']
+
+
+def residuals(path):
+    """[(block, residual name, times run)] over the dump at `path`, in order."""
+    runs, found = {}, []
+    block = None
+    for line in open(path):
+        line = line.rstrip('\n')
+        m = COUNT.match(line)
+        if m:
+            runs[int(m.group(1))] = int(m.group(2))
+            continue
+        m = BLOCK.match(line)
+        if m:
+            block = int(m.group(1))
+            continue
+        m = ANY_RESIDUAL.match(line)
+        if m:
+            kind, arg, guarded = m.groups()
+            # A guard's expected type, not a native guard's pointer.
+            if guarded is not None and guarded.startswith('0x'):
+                guarded = None
+            name = kind if arg is None else '%s(%s)' % (kind, guarded or ('' if arg.isdigit() else arg))
+            found.append([block, name, None])
+            continue
+        m = COUNTED.search(line)
+        if m and found and found[-1][2] is None and line.startswith('      '):
+            found[-1][2] = int(m.group(1))
+    # A residual with no counted code of its own ran as often as the one before it.
+    # A thunk is a side exit, compiling on its first run, so it runs nothing.
+    result, last = [], (None, 0)
+    for block, name, id in found:
+        if name == 'thunk':
+            continue
+        n = runs.get(id, 0) if id is not None else (last[1] if last[0] == block else 0)
+        result.append((block, name, n))
+        last = (block, n)
+    return result
+
+
+def ngrams(paths, n):
+    """{run of `n` residual names: times run} over the dumps at `paths`."""
+    totals = {}
+    for path in paths:
+        found = residuals(path)
+        for i in range(len(found) - n + 1):
+            window = found[i:i + n]
+            if len({block for block, _, _ in window}) != 1:
+                continue
+            key = tuple(name for _, name, _ in window)
+            totals[key] = totals.get(key, 0) + window[-1][2]
+    return totals
 
 
 def ops(path):
@@ -156,9 +214,17 @@ def main():
     parser.add_argument('--raw', action='store_true', help='weight code by how often it ran, not log log of it')
     parser.add_argument('--kinds', action='store_true', help='the code totalled by what emitted it, in each dump')
     parser.add_argument('--ops', action='store_true', help='how often each window op ran, in each dump')
+    parser.add_argument('--ngrams', type=int, metavar='N', help='the most executed runs of N adjacent residuals, over all dumps')
     args = parser.parse_args()
     global RAW
     RAW = args.raw
+    if args.ngrams:
+        totals = ngrams(args.dumps, args.ngrams)
+        executed = sum(n for path in args.dumps for _, _, n in residuals(path))
+        print('residuals run: %d' % executed)
+        for key, n in sorted(totals.items(), key=lambda kv: -kv[1])[:args.top or 40]:
+            print('%14d %5.1f%%  %s' % (n, 100 * n / executed, ' ; '.join(key)))
+        return 0
     if args.ops:
         per = [ops(path) for path in args.dumps]
         names = sorted({op for t in per for op in t}, key=lambda op: -(max(t.get(op, 0) for t in per) - min(t.get(op, 0) for t in per)))
