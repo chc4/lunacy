@@ -225,10 +225,10 @@ def main():
     RAW = args.raw
     if args.ngrams:
         totals = ngrams(args.dumps, args.ngrams)
-        executed = sum(n for path in args.dumps for _, _, n in residuals(path))
-        print('residuals run: %d' % executed)
+        ran = sum(n for path in args.dumps for _, _, n in residuals(path))
+        print("residuals run: %d" % ran)
         for key, n in sorted(totals.items(), key=lambda kv: -kv[1])[:args.top or 40]:
-            print('%14d %5.1f%%  %s' % (n, 100 * n / executed, ' ; '.join(key)))
+            print('%14d %5.1f%%  %s' % (n, 100 * n / ran, ' ; '.join(key)))
         return 0
     if args.residuals:
         per = []
