@@ -159,8 +159,11 @@ impl<T: Mark> Mark for Vec<T> {
 //     Tables are mutated often, so this avoids shading every write, paying an atomic
 //     re-scan of the mutated tables instead.
 // Neither barrier re-enters the incremental `gray` worklist, so a hot mutation loop cannot
-// keep the collector marking forever. Both are self-gating: nothing is black while idle,
-// so the fast path is one load and branch.
+// keep the collector marking forever. Both are self-gating: nothing is black while idle.
+// The backward barrier, on every table store, is gated on `GC_IN_PROGRESS`, a thread-local
+// flag the collector keeps with its phase (`set_phase`): outside a cycle a store pays one
+// load and branch, and the barrier itself, testing the table's color against the heap's
+// current white, is cold.
 //
 // Note [GC roots]
 // ~~~~~~~~~~~~~~~
@@ -305,8 +308,9 @@ impl<T> Gc<T> {
     }
 
     /// Backward barrier for tables: revert this (black) object to gray onto `grayagain` for
-    /// a later atomic re-scan. See Note [Write barriers].
-    #[inline]
+    /// a later atomic re-scan. Called only in a collection cycle (`gc_in_progress`). See Note
+    /// [Write barriers].
+    #[cold]
     pub fn backward_barrier(&self) {
         let inner = self.ptr.as_ptr();
         unsafe {
@@ -437,6 +441,26 @@ struct RootRef {
 /// `ptr` must point to a live `*const T`.
 unsafe fn root_thunk<T: Mark>(ptr: *const (), owner: &Owner) {
     unsafe { (&*(ptr as *const T)).mark(owner) }
+}
+
+thread_local! {
+    /// Whether this thread's heap is in a collection cycle (`Phase::Mark`), outside which
+    /// nothing is black. `const`-initialized and without a destructor, so reading it is a
+    /// bare TLS load. See Note [Write barriers].
+    static GC_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread's heap is in a collection cycle. See Note [Write barriers].
+#[inline(always)]
+pub fn gc_in_progress() -> bool {
+    GC_IN_PROGRESS.with(|flag| flag.get())
+}
+
+/// Set the heap's phase, and `GC_IN_PROGRESS` with it. See Note [Write barriers].
+unsafe fn set_phase(heap: *mut Heap, phase: Phase) {
+    let marking = matches!(phase, Phase::Mark);
+    unsafe { (*heap).phase = phase; }
+    GC_IN_PROGRESS.with(|flag| flag.set(marking));
 }
 
 thread_local! {
@@ -627,7 +651,7 @@ impl Heap {
         }
         let heap = hp();
         unsafe {
-            (*heap).phase = Phase::Idle;
+            set_phase(heap, Phase::Idle);
             let live = (*heap).total_bytes;
             (*heap).threshold = core::cmp::max(MIN_THRESHOLD, live.saturating_mul(2));
         }
@@ -653,7 +677,7 @@ impl Heap {
             match (*heap).phase {
                 Phase::Idle => {
                     if (*heap).total_bytes < trigger { return; }
-                    (*heap).phase = Phase::Mark;
+                    set_phase(heap, Phase::Mark);
                     Self::mark_roots(owner);
                 }
                 Phase::Mark => {}
@@ -674,9 +698,9 @@ impl Heap {
     unsafe fn full_collect_inner(owner: &Owner) {
         let heap = hp();
         unsafe {
-            (*heap).phase = Phase::Mark;
+            set_phase(heap, Phase::Mark);
             Self::finish(owner);
-            (*heap).phase = Phase::Mark;
+            set_phase(heap, Phase::Mark);
             Self::finish(owner);
         }
     }
@@ -697,7 +721,7 @@ impl Heap {
     /// SAFETY: See [`Heap::finish`].
     unsafe fn sweep_inner(owner: &Owner) {
         unsafe {
-            (*hp()).phase = Phase::Mark;
+            set_phase(hp(), Phase::Mark);
             Self::finish(owner);
         }
     }

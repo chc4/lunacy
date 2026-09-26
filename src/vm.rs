@@ -456,7 +456,11 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// See Note [Write barriers].
     #[inline]
     pub fn barrier_back(&self) {
-        self.0.backward_barrier();
+        // Nothing is black outside a collection cycle. See Note [Write barriers].
+        debug_assert!(crate::gc::gc_in_progress() || !self.0.is_black(), "a black table outside a collection cycle");
+        if crate::gc::gc_in_progress() {
+            self.0.backward_barrier();
+        }
     }
 
     /// Look up a key. Numbers index the array part; everything else goes through
