@@ -1319,6 +1319,13 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         if next_base + next_stack > self.vals.len() {
             self.vals.resize_with(next_base + next_stack, || LBoxed::NIL);
         }
+        // The parameters the call doesn't pass are nil: their slots may hold what an
+        // earlier frame left there. Its arguments are `b - 1` values, or up to the top.
+        let passed = if b == 0 { self.top } else { next_base + b as usize - 1 };
+        let params = next_base + unsafe { (*lclos.ro(owner).prototype).param_count as usize };
+        for slot in passed..params {
+            self.vals[slot] = LBoxed::NIL;
+        }
         // The callee's frame extends the live max-extent while it runs.
         self.natural_max = self.natural_max.max(next_base + next_stack);
         self.callstack.push(CallstackEntry {
