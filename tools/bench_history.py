@@ -12,7 +12,9 @@ changes to what builds it, its HEAD marked dirty.
 current dirty one's, the best and the first recorded, flagging a time worse
 than the best or the commit before it by more than noise. `plot` writes the
 same history as an HTML page of charts, one per benchmark (bench/history.html):
-a line per build across commits in commit order, and the dirty time apart.
+each commit's runs as a box and whiskers per build, in commit order, and the
+dirty ones apart. `attach-times` adds the runs' times to results recorded
+without them, from the hyperfine exports they came from.
 """
 import argparse
 import datetime
@@ -89,7 +91,7 @@ def record(args):
             'date': now, 'commit': commit, 'dirty': is_dirty,
             'benchmark': args.benchmark, 'arg': args.arg, 'build': build,
             'mean': r['mean'], 'stddev': r['stddev'], 'median': r['median'],
-            'min': r['min'], 'max': r['max'], 'runs': len(times),
+            'min': r['min'], 'max': r['max'], 'runs': len(times), 'times': times,
         })
     os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
     with open(HISTORY, 'a') as f:
@@ -98,6 +100,49 @@ def record(args):
     for line in lines:
         mark = ' (dirty)' if line['dirty'] else ''
         print(f"recorded {line['benchmark']} {line['arg']} {line['build']} @ {line['commit'][:8]}{mark}: {line['mean']:.4f} s")
+
+
+def attach_times(args):
+    """Add each hyperfine export's runs' times to the results recorded from it,
+    which have its benchmark, argument, build and mean."""
+    lines = load()
+    attached = 0
+    for path in args.json:
+        for r in json.load(open(path))['results']:
+            build = r['command'][len('ref '):] if r['command'].startswith('ref ') else r['command']
+            for line in lines:
+                if 'times' not in line and line['build'] == build and line['mean'] == r['mean'] \
+                        and path.startswith(f"hyperfine-{line['benchmark']}-{line['arg']}"):
+                    line['times'] = r['times']
+                    attached += 1
+    with open(HISTORY, 'w') as f:
+        for line in lines:
+            f.write(json.dumps(line, sort_keys=True) + '\n')
+    missing = sum('times' not in line for line in lines)
+    print(f'attached {attached}; {missing} results without times')
+
+
+def quantile(sorted_times, q):
+    """The `q` quantile of `sorted_times`, interpolated linearly."""
+    at = q * (len(sorted_times) - 1)
+    below = int(at)
+    above = min(below + 1, len(sorted_times) - 1)
+    return sorted_times[below] + (sorted_times[above] - sorted_times[below]) * (at - below)
+
+
+def box(r):
+    """A result's box and whiskers: its quartiles, and the furthest runs within
+    1.5 interquartile ranges of them (Tukey's), leaving out the runs past them.
+    Without its runs' times, its mean and a standard deviation either side."""
+    times = sorted(r.get('times') or [])
+    if len(times) < 2:
+        m, d = r['mean'], r['stddev']
+        return {'q1': m - d, 'median': m, 'q3': m + d, 'lo': m - d, 'hi': m + d, 'outliers': 0}
+    q1, median, q3 = quantile(times, 0.25), quantile(times, 0.5), quantile(times, 0.75)
+    fence_lo, fence_hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+    inside = [t for t in times if fence_lo <= t <= fence_hi]
+    return {'q1': q1, 'median': median, 'q3': q3, 'lo': min(inside), 'hi': max(inside),
+            'outliers': len(times) - len(inside)}
 
 
 def series():
@@ -191,21 +236,25 @@ def table(args):
 
 
 def chart(bench, arg, runs_by_build, info):
-    """One benchmark's chart, as SVG: commits left to right, dirty last."""
+    """One benchmark's chart, as SVG: commits left to right, dirty last, each
+    column a box and whiskers per charted build, their medians joined."""
     commits = ordered({c for runs in runs_by_build.values() for c in runs if c != 'dirty'}, info)
     has_dirty = any('dirty' in runs for runs in runs_by_build.values())
     columns = commits + (['dirty'] if has_dirty else [])
     if not columns:
         return ''
-    values = [v for build in CHARTED for r in runs_by_build.get(build, {}).values() for v in (r['min'], r['max'])]
+    boxes = {build: {c: box(r) for c, r in runs_by_build.get(build, {}).items()} for build in CHARTED}
+    values = [v for bs in boxes.values() for b in bs.values() for v in (b['lo'], b['hi'])]
     if not values:
         return ''
     lo, hi = min(values), max(values)
     lo, hi = lo - 0.05 * (hi - lo or hi), hi + 0.05 * (hi - lo or hi)
-    width, height, left, right, top, bottom = 900, 320, 70, 150, 20, 90
+    width, height, left, right, top, bottom = 900, 320, 70, 170, 20, 90
     step = (width - left - right) / max(len(columns) - 1, 1)
     x = lambda i: left + i * step if len(columns) > 1 else left + (width - left - right) / 2
     y = lambda v: top + (hi - v) / (hi - lo) * (height - top - bottom)
+    half = min(5.0, step / (2 * len(CHARTED) + 1))
+    offset = {build: (k - (len(CHARTED) - 1) / 2) * 2.4 * half for k, build in enumerate(CHARTED)}
     parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" aria-label="{html.escape(bench)} {arg}">']
     for k in range(5):
         v = lo + (hi - lo) * k / 4
@@ -216,33 +265,48 @@ def chart(bench, arg, runs_by_build, info):
         title = 'uncommitted changes on HEAD' if c == 'dirty' else f'{c[:8]} {info[c][2]}'
         parts.append(f'<text transform="translate({x(i):.1f},{height - bottom + 12}) rotate(45)" class="axis"><title>{html.escape(title)}</title>{label}</text>')
     legend = 0
-    for build in BUILDS + sorted(set(runs_by_build) - set(BUILDS)):
-        runs = runs_by_build.get(build)
-        if not runs:
+    for build in CHARTED:
+        bs = boxes[build]
+        if not bs:
             continue
         color = COLORS.get(build, '#000')
-        points = [(i, runs[c]) for i, c in enumerate(commits) if c in runs]
-        label = build
-        if build in CHARTED:
-            if len(points) > 1:
-                path = ' '.join(f'{x(i):.1f},{y(r["mean"]):.1f}' for i, r in points)
-                parts.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="{2 if build == "unsafe" else 1.2}"/>')
-            for i, r in points:
-                parts.append(f'<line x1="{x(i):.1f}" x2="{x(i):.1f}" y1="{y(r["min"]):.1f}" y2="{y(r["max"]):.1f}" stroke="{color}" stroke-width="1"/>')
-                parts.append(f'<circle cx="{x(i):.1f}" cy="{y(r["mean"]):.1f}" r="3" fill="{color}"><title>{build} {r["mean"]:.4f} ± {r["stddev"]:.4f} s</title></circle>')
-            if 'dirty' in runs:
-                r = runs['dirty']
-                i = len(columns) - 1
-                parts.append(f'<circle cx="{x(i):.1f}" cy="{y(r["mean"]):.1f}" r="4" fill="none" stroke="{color}" stroke-width="2"><title>{build} dirty {r["mean"]:.4f} ± {r["stddev"]:.4f} s</title></circle>')
-        else:
-            r = runs['dirty'] if 'dirty' in runs else points[-1][1] if points else None
-            if r is None:
+        medians = [(x(i) + offset[build], y(bs[c]['median'])) for i, c in enumerate(commits) if c in bs]
+        if len(medians) > 1:
+            path = ' '.join(f'{px:.1f},{py:.1f}' for px, py in medians)
+            parts.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-opacity="0.5" stroke-width="{1.5 if build == "unsafe" else 1}"/>')
+        for i, c in enumerate(columns):
+            if c not in bs:
                 continue
-            label = f'{build} {r["mean"]:.3f}s'
-            if lo <= r['mean'] <= hi:
-                parts.append(f'<line x1="{left}" x2="{width - right}" y1="{y(r["mean"]):.1f}" y2="{y(r["mean"]):.1f}" stroke="{color}" stroke-dasharray="4 3"><title>{build} {r["mean"]:.4f} s</title></line>')
-            else:
-                label += ' ↑' if r['mean'] > hi else ' ↓'
+            b, r, cx = bs[c], runs_by_build[build][c], x(i) + offset[build]
+            dirty = c == 'dirty'
+            fill = 'none' if dirty else color
+            tip = (f"{build}{' dirty' if dirty else ''}: median {b['median']:.4f}, quartiles {b['q1']:.4f}–{b['q3']:.4f}, "
+                   f"whiskers {b['lo']:.4f}–{b['hi']:.4f} s, mean {r['mean']:.4f} ± {r['stddev']:.4f}, "
+                   f"{r['runs']} runs, {b['outliers']} outliers left out")
+            parts.append(f'<g><title>{html.escape(tip)}</title>'
+                         f'<line x1="{cx:.1f}" x2="{cx:.1f}" y1="{y(b["hi"]):.1f}" y2="{y(b["q3"]):.1f}" stroke="{color}"/>'
+                         f'<line x1="{cx:.1f}" x2="{cx:.1f}" y1="{y(b["q1"]):.1f}" y2="{y(b["lo"]):.1f}" stroke="{color}"/>'
+                         f'<line x1="{cx - half / 2:.1f}" x2="{cx + half / 2:.1f}" y1="{y(b["hi"]):.1f}" y2="{y(b["hi"]):.1f}" stroke="{color}"/>'
+                         f'<line x1="{cx - half / 2:.1f}" x2="{cx + half / 2:.1f}" y1="{y(b["lo"]):.1f}" y2="{y(b["lo"]):.1f}" stroke="{color}"/>'
+                         f'<rect x="{cx - half:.1f}" y="{y(b["q3"]):.1f}" width="{2 * half:.1f}" height="{max(y(b["q1"]) - y(b["q3"]), 1):.1f}" '
+                         f'fill="{fill}" fill-opacity="0.35" stroke="{color}" stroke-width="{2 if dirty else 1}"/>'
+                         f'<line x1="{cx - half:.1f}" x2="{cx + half:.1f}" y1="{y(b["median"]):.1f}" y2="{y(b["median"]):.1f}" stroke="{color}" stroke-width="2"/></g>')
+        parts.append(f'<rect x="{width - right + 12}" y="{top + legend * 18}" width="10" height="10" fill="{color}"/>')
+        parts.append(f'<text x="{width - right + 28}" y="{top + legend * 18 + 9}" class="axis">{html.escape(build)}</text>')
+        legend += 1
+    for build in sorted(set(runs_by_build) - set(CHARTED), key=lambda b: (b not in BUILDS, b)):
+        runs = runs_by_build[build]
+        color = COLORS.get(build, '#000')
+        latest = [c for c in commits if c in runs]
+        r = runs['dirty'] if 'dirty' in runs else runs[latest[-1]] if latest else None
+        if r is None:
+            continue
+        median = box(r)['median']
+        label = f'{build} {median:.3f}s'
+        if lo <= median <= hi:
+            parts.append(f'<line x1="{left}" x2="{width - right}" y1="{y(median):.1f}" y2="{y(median):.1f}" stroke="{color}" stroke-dasharray="4 3"><title>{build} median {median:.4f} s</title></line>')
+        else:
+            label += ' ↑' if median > hi else ' ↓'
         parts.append(f'<rect x="{width - right + 12}" y="{top + legend * 18}" width="10" height="10" fill="{color}"/>')
         parts.append(f'<text x="{width - right + 28}" y="{top + legend * 18 + 9}" class="axis">{html.escape(label)}</text>')
         legend += 1
@@ -279,7 +343,7 @@ table {{ border-collapse: collapse; margin: 8px 0 24px; }} td, th {{ padding: 2p
 .bad {{ color: var(--bad); font-weight: 600; }}
 </style></head><body>
 <h1>Benchmark history</h1>
-<p>Mean time per commit of the unsafe and release builds, in commit order, with min–max bars; the hollow marker is HEAD with uncommitted changes. Unsafe is the build that matters. The interpreter and other Luas are dashed lines of their latest times, or in the legend alone, marked ↑ or ↓, off the chart's scale.</p>
+<p>Each commit's runs of the unsafe and release builds, in commit order: the box spans the quartiles, the bar in it is the median, and the whiskers reach the furthest runs within 1.5 interquartile ranges (runs past them are left out, and counted in the tooltip); a line joins the medians. The hollow box is HEAD with uncommitted changes. Unsafe is the build that matters. The interpreter and other Luas are dashed lines of their latest medians, or in the legend alone, marked ↑ or ↓, off the chart's scale.</p>
 {"".join(sections)}
 </body></html>
 '''
@@ -300,6 +364,9 @@ def main():
     p = sub.add_parser('report', help='print each benchmark and build, flagging regressions')
     p.add_argument('--strict', action='store_true', help='exit 1 on a regression')
     p.set_defaults(func=report)
+    a = sub.add_parser('attach-times', help='add the runs\' times to results recorded without them')
+    a.add_argument('json', nargs='+', help='the hyperfine exports they were recorded from')
+    a.set_defaults(func=attach_times)
     t = sub.add_parser('table', help="every commit's time for one build, a column per benchmark")
     t.add_argument('--build', default='unsafe')
     t.set_defaults(func=table)
