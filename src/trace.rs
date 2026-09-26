@@ -201,6 +201,11 @@ impl Region {
         self.root
     }
 
+    /// The blocks entered by a retreating edge: the loops' headers.
+    pub fn loop_headers(&self) -> impl Iterator<Item = usize> + '_ {
+        self.retreating.iter().map(|&(_, header)| header)
+    }
+
     pub fn is_retreating(&self, from: usize, to: usize) -> bool {
         self.retreating.contains(&(from, to))
     }

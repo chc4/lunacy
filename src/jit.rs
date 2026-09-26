@@ -430,6 +430,12 @@ pub struct JitContext {
     thunk_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
     /// The thunk sites of the region being compiled, by offset in it.
     region_sites: Vec<(BlockId, usize, usize, Cache)>,
+    /// The loop headers of the region being compiled, which start aligned
+    /// (`LOOP_ALIGN`) with feature `align_loops`.
+    region_headers: std::collections::HashSet<BlockId, FxBuildHasher>,
+    /// The address the region being compiled starts at, which alignment is
+    /// relative to.
+    region_base: usize,
     /// Thunk sites to patch once their target block has JIT code.
     waiting: HashMap<BlockId, Vec<ThunkSite>, FxBuildHasher>,
     /// The JIT entry of each prototype's all-unknown entry block, by the
@@ -519,6 +525,51 @@ fn usable_skips(stencils: &mut Stencils, w: &dyn Window) -> SmallVec<[usize; WIN
     (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(w, skip).is_ok()).collect()
 }
 
+/// The alignment of a loop header's code, which a loop's back edge enters on
+/// every iteration: where the code falls on the fetch window's and cache line's
+/// boundaries otherwise moves with the size of all the code before it.
+const LOOP_ALIGN: usize = 32;
+
+/// Multi-byte NOPs, by length (1 to 9 bytes), as the Intel and AMD
+/// optimization manuals recommend them.
+const NOPS: [&[u8]; 9] = [
+    &[0x90],
+    &[0x66, 0x90],
+    &[0x0f, 0x1f, 0x00],
+    &[0x0f, 0x1f, 0x40, 0x00],
+    &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+    &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+    &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+    &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+];
+
+/// A cache line, which a branch on `select` doesn't cross (feature
+/// `align_selects`): a compare and its conditional jump are fused into one
+/// operation, but not across a line.
+const CACHE_LINE: usize = 64;
+
+/// The bytes of a `Select`'s test of one target: `cmp rax, imm32; jnz rel32`
+/// (dynasm encodes the target's index as an imm32).
+const SELECT_TEST: usize = 12;
+
+/// The bytes of a `GuardDynamic`'s test: `cmp qword [r12 + disp32], imm32; jz
+/// rel32` (dynasm encodes the 0 as an imm32).
+const GUARD_TEST: usize = 18;
+
+/// Pad the code `ops` assembles at `base` with NOPs, which the code before
+/// may fall through, to a multiple of `align`: the bytes padded.
+fn pad(ops: &mut Assembler, base: usize, align: usize) -> usize {
+    let padding = (align - (base + ops.offset().0) % align) % align;
+    let mut left = padding;
+    while left > 0 {
+        let nop = NOPS[left.min(NOPS.len()) - 1];
+        ops.extend(nop);
+        left -= nop.len();
+    }
+    padding
+}
+
 /// The blocks a residual jumps to.
 fn jump_targets(res: &Residual) -> SmallVec<[BlockId; 2]> {
     match res {
@@ -557,6 +608,8 @@ impl JitContext {
             pending: BTreeMap::new(),
             thunk_sites: HashMap::default(),
             region_sites: Vec::new(),
+            region_headers: Default::default(),
+            region_base: 0,
             waiting: HashMap::default(),
             lua_entries: HashMap::default(),
             stencils: Stencils::default(),
@@ -649,6 +702,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         debug!("JIT compiling block {:?}", id);
         window_dump!(self.jctx, "== region entered at block {}", id.0);
         let base = self.jctx.end();
+        self.jctx.region_base = base.0 as usize;
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
         let entry = ops.offset();
         jit_note!(self.jctx, ops, "region entry: prologue");
@@ -705,6 +759,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             for emit in loads {
                 emit_window_move(&mut ops, emit);
             }
+            // A loop header starts aligned. The entry's code is reserved as a
+            // whole below, padding and all.
+            #[cfg(feature = "align_loops")]
+            if self.jctx.region_headers.contains(&id) {
+                jit_note!(self.jctx, ops, "loop header padding, to {LOOP_ALIGN} bytes");
+                pad(&mut ops, base.0 as usize, LOOP_ALIGN);
+            }
             // We need to skip over the uncommitted prologue
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
             self.jctx.blocks.insert(id, JitBlock { ptr: new_block, window });
@@ -727,6 +788,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let successor_pair = successor.and_then(|succ| self.jctx.pending.remove(&succ).map(|pending| (succ, pending)));
             let Some((pending_block, pending)) = successor_pair.or_else(|| self.jctx.pending.pop_first()) else { break };
             debug!("pending block {:?} {:?}", pending_block.0, pending.label);
+            // A loop header starts aligned: its padding reserved first, so the
+            // block's pointer is past it.
+            #[cfg(feature = "align_loops")]
+            if self.jctx.region_headers.contains(&pending_block) {
+                jit_note!(self.jctx, ops, "loop header padding, to {LOOP_ALIGN} bytes");
+                let padding = pad(&mut ops, base.0 as usize, LOOP_ALIGN);
+                self.jctx.reserve(padding);
+            }
             let pending_ptr = self.jctx.end();
             let pending_start = ops.offset();
             self.jctx.blocks.insert(pending_block, JitBlock { ptr: pending_ptr, window: pending.window });
@@ -948,6 +1017,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .collect(),
         );
         let live_in = region.liveness();
+        self.jctx.region_headers = region.loop_headers().map(|header| ids[header]).collect();
         let traces = region.traces(policy);
         window_dump!(self.jctx, "traces {}", traces.iter().map(|trace| trace.iter().map(|&b| ids[b].0.to_string()).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" | "));
         for (b, live) in live_in.iter().enumerate() {
@@ -1588,10 +1658,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // A taken target's transfer may use rax (`SCRATCH`): the
                     // comparisons only continue on the paths not taken.
                     for (i, target) in targets.iter().enumerate() {
+                        #[cfg(feature = "align_selects")]
+                        if (self.jctx.region_base + ops.offset().0) % CACHE_LINE + SELECT_TEST > CACHE_LINE {
+                            pad(ops, self.jctx.region_base, CACHE_LINE);
+                        }
+                        let test = ops.offset().0;
                         dynasm!(ops
                             ; cmp rax, i as i32
                             ; jnz >next_target
                         );
+                        debug_assert_eq!(ops.offset().0 - test, SELECT_TEST, "a Select's test");
                         emit_jump(ops, &alloc, &target.1, false);
                         dynasm!(ops
                             ; next_target:
@@ -1657,11 +1733,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     if let Residual::GuardDynamic(_) = res {
                         // As an inline guard: a pass jumps to `off + 2`, a failure
                         // falls through to `off + 1`, both with the window live.
+                        #[cfg(feature = "align_selects")]
+                        if (self.jctx.region_base + ops.offset().0) % CACHE_LINE + GUARD_TEST > CACHE_LINE {
+                            pad(ops, self.jctx.region_base, CACHE_LINE);
+                        }
+                        let test = ops.offset().0;
                         dynasm!(ops
                             ; .arch x64
                             ; cmp QWORD r12 => RunState.select, 0
                             ; jz =>insts[off + 2]
                         );
+                        debug_assert_eq!(ops.offset().0 - test, GUARD_TEST, "a GuardDynamic's test");
                     }
                 },
                 Residual::Thunk(_) => {

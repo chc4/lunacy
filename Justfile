@@ -360,6 +360,29 @@ hyperfines:
     set -euo pipefail
     for run in {{HYPERFINES}}; do just hyperfine ${run%:*} ${run#*:}; done
 
+# Compare this checkout's release build under each feature set in `sets`
+# (comma separated features, or `none`) on one benchmark: each built in turn
+# into target/release and copied to target/features/<set>/bench.
+hyperfine-features benchmark times +sets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _luac {{benchmark}}
+    commands=()
+    for set in {{sets}}; do
+        features=$set; if [ $set = none ]; then features=""; fi
+        cargo build --release --bin bench --features "$features"
+        mkdir -p target/features/$set && cp target/release/bench target/features/$set/bench
+        commands+=(-n $set "target/features/$set/bench {{benchmark}}.bin {{times}}")
+    done
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-features.md "${commands[@]}"
+
+# `hyperfine-features` over HYPERFINES, then every comparison's table.
+hyperfines-features +sets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do just hyperfine-features ${run%:*} ${run#*:} {{sets}}; done
+    for run in {{HYPERFINES}}; do echo "${run%:*} ${run#*:}"; tail -n +3 hyperfine-${run%:*}-${run#*:}-features.md; done
+
 # `hyperfine-vs ref` over HYPERFINES, then every comparison's table.
 hyperfines-vs ref:
     #!/usr/bin/env bash
