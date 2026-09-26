@@ -433,6 +433,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
     /// and so satisfy the canonical-form invariant of Note [Canonical values] directly.
     pub fn insert_lvalue(&mut self, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
         self.hash.insert(LCanon(LBoxed::box_lvalue(key)), LBoxed::box_lvalue(value));
+        self.epoch += 1;
     }
 }
 
@@ -1170,12 +1171,20 @@ impl ReturnLocation {
 #[derive(Debug)]
 pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_top: usize, pub rloc: usize, pub c: u16 }
 
-/// Where a frame's hash key was found in its table's hash part, and the
-/// table's epoch then. See Note [Hash witnesses].
-#[derive(Debug, Default, Clone, Copy)]
+/// Where a frame's hash key was found in its table's hash part (its entry's
+/// index, and its value's address), and the table's epoch then. See Note
+/// [Hash witnesses].
+#[derive(Debug, Clone, Copy)]
 pub struct HashWitness {
     pub index: usize,
+    pub value: *mut LBoxed<'static, 'static>,
     pub epoch: usize,
+}
+
+impl Default for HashWitness {
+    fn default() -> Self {
+        HashWitness { index: 0, value: core::ptr::null_mut(), epoch: 0 }
+    }
 }
 
 // Note [Hash witnesses]
@@ -1187,6 +1196,13 @@ pub struct HashWitness {
 // `witness_top` are stale, but no frame reads one it hasn't written, as a
 // function's entry context has no hash keys and a hash key's `href_init` runs
 // before any use of it.
+//
+// A witness holds its entry's index and its value's address while the table's
+// epoch is the one it saw: a table's hash part only reallocates or moves an
+// entry when a key is inserted or removed, which bumps the epoch, and the
+// collector doesn't move tables. Field reads and writes go through the
+// address; the paths repairing a witness after the epoch changes find the
+// entry again by its index.
 
 pub struct RunState<'src, 'intern> {
     pub base: usize,

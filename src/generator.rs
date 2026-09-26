@@ -477,20 +477,21 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // witnesses].
                 let witness = *state.hash_witnesses.get_unchecked(state.witness_base + href as usize);
                 debug!("gettable_href with {:?}", &witness);
-                let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-                // The witness holds for the table (its epoch, or no hazard since),
-                // so no key has been inserted or removed since it found the index.
-                let (k, val1) = tab.ro(owner).hash.get_index(witness.index).unwrap_unchecked();
+                // The witness holds for the table (its epoch, or no hazard
+                // since), so its value's address does. See Note [Hash witnesses].
+                let val1 = *witness.value.cast::<LBoxed<'_, '_>>();
 
                 // The witness is at the instruction's key.
                 #[cfg(debug_assertions)]
                 {
+                    let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     let Ok(const_key) = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, key as u16) else { unreachable!() };
-                    assert_eq!(*k, LCanon::constant(const_key));
+                    let found = tab.ro(owner).hash.get(&LCanon::constant(const_key)).unwrap();
+                    assert!(core::ptr::eq(found, witness.value.cast::<LBoxed<'_, '_>>()));
                 }
 
                 debug!("gettable_href fetched {val1:?}");
-                *dest = *val1;
+                *dest = val1;
             });
             arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[b, a])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
@@ -641,7 +642,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     debug!("settable_href with {:?} {:?}", &witness, expected);
                     let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     tab.barrier_back();
-                    let (k, val1) = tab.rw(owner).hash.get_index_mut(witness.index).unwrap();
+                    // See Note [Hash witnesses].
+                    let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
                     debug!("settable_href {:?} {:?}", &val1, expected);
                     #[cfg(debug_assertions)]
                     assert!(val1.unbox().typeof_() == expected);
@@ -2418,7 +2420,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         state.select = 1
                     },
                 }
-                state.hash_witnesses[hidx] = HashWitness { epoch: tab.ro(owner).epoch, index };
+                let value = match state.select {
+                    0 => tab.rw(owner).hash.get_index_mut(index).unwrap().1 as *mut LBoxed<'_, '_>,
+                    _ => core::ptr::null_mut(),
+                };
+                state.hash_witnesses[hidx] = HashWitness { epoch: tab.ro(owner).epoch, index, value: value.cast() };
             })));
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
@@ -2487,10 +2493,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
             vm.blocks[check_block.0].instructions.push(Residual::Exec(ResidualExec::new("epoch_repair", Rc::new(move |owner, state| {
                 // Re-init the witness and jump back to success block
+                // The entry may have moved with the epoch: find its value again
+                // by its index. See Note [Hash witnesses].
                 let LValue::Table(t) = state.vals[state.base + tab].unbox() else { unreachable!() };
                 let epoch = t.ro(owner).epoch;
                 debug!("repairing {:?} epoch", href);
-                state.hash_witnesses[state.witness_base + href.0 as usize].epoch = epoch;
+                let witness = &mut state.hash_witnesses[state.witness_base + href.0 as usize];
+                let value = t.rw(owner).hash.get_index_mut(witness.index).unwrap().1 as *mut LBoxed<'_, '_>;
+                witness.value = value.cast();
+                witness.epoch = epoch;
             }))));
             vm.blocks[check_block.0].instructions.push(Residual::Jump(success_block));
         })));
