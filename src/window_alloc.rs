@@ -939,10 +939,10 @@ mod tests {
     // Ops of each shape, their operands in window order as the emit sites
     // declare them, and one with its output first.
     windowed!(Bin, [], [], |owner, state, base| (a, b, out d) {
-        *d = LBoxed::from_number(a.as_number().unwrap_unchecked() + b.as_number().unwrap_unchecked());
+        *d = LBoxed::from_number(crate::unchecked_unwrap(a.as_number()) + crate::unchecked_unwrap(b.as_number()));
     });
     windowed!(BinFirst, [], [], |owner, state, base| (out d, a, b) {
-        *d = LBoxed::from_number(a.as_number().unwrap_unchecked() + b.as_number().unwrap_unchecked());
+        *d = LBoxed::from_number(crate::unchecked_unwrap(a.as_number()) + crate::unchecked_unwrap(b.as_number()));
     });
     windowed!(Get, [], [], |owner, state, base| (a, out d) {
         *d = a;

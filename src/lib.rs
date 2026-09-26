@@ -9,6 +9,20 @@
 // For GC
 #![feature(core_intrinsics, generic_const_exprs)]
 
+/// `option`'s value, which the caller knows is there. With feature `unreachable`
+/// (the `unsafe` profile), unchecked: `None` is undefined behavior, as for the
+/// crate's `unreachable!`. Otherwise `None` panics.
+#[inline(always)]
+pub fn unchecked_unwrap<T>(option: Option<T>) -> T {
+    match option {
+        Some(value) => value,
+        #[cfg(feature = "unreachable")]
+        None => unsafe { core::hint::unreachable_unchecked() },
+        #[cfg(not(feature = "unreachable"))]
+        None => panic!("unchecked_unwrap of None"),
+    }
+}
+
 pub mod chunk;
 pub mod stack;
 pub mod lboxed;

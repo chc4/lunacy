@@ -475,7 +475,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
                 // Written by the frame's `href_init` already. See Note [Hash
                 // witnesses].
-                let witness = *state.hash_witnesses.get_unchecked(state.witness_base + href as usize);
+                let witness = state.hash_witnesses[state.witness_base + href as usize];
                 debug!("gettable_href with {:?}", &witness);
                 // The witness holds for the table (its epoch, or no hazard
                 // since), so its value's address does. See Note [Hash witnesses].
@@ -504,14 +504,14 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             };
             if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
                 windowed!(GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
-                    let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-                    *dest = *tab.ro(owner).array.get_unchecked(integer_slot(k));
+                    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                    *dest = tab.ro(owner).array[integer_slot(k)];
                 });
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableArray::new(k, &[b, a])));
             } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
                 windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
-                    let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
-                    *dest = *tab.ro(owner).array.get_unchecked(integer_slot(key.as_int()));
+                    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                    *dest = tab.ro(owner).array[integer_slot(key.as_int())];
                 });
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableInteger::new(&[b, c, a])));
             } else {
@@ -581,9 +581,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         let int_value = in_array == ResumeArg::Matched && (yield YieldOp::TypeofRk(c)) == ResumeArg::Type(CType::Integer);
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableArray, [k: i32], [INT: bool], |owner, state, base| (table, value) {
-                let LValue::Table(mut tab) = table.unbox() else { core::hint::unreachable_unchecked() };
+                let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
                 tab.barrier_back();
-                *tab.rw(owner).array.get_unchecked_mut(integer_slot(k)) = double::<INT>(value);
+                tab.rw(owner).array[integer_slot(k)] = double::<INT>(value);
             });
             arg = yield YieldOp::ExecWindow(if int_value {
                 Rc::new(SetTableArray::<true>::new(k, &[a, c]))
@@ -592,9 +592,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             });
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableInteger, [], [INT: bool], |owner, state, base| (table, key, value) {
-                let LValue::Table(mut tab) = table.unbox() else { core::hint::unreachable_unchecked() };
+                let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
                 tab.barrier_back();
-                *tab.rw(owner).array.get_unchecked_mut(integer_slot(key.as_int())) = double::<INT>(value);
+                tab.rw(owner).array[integer_slot(key.as_int())] = double::<INT>(value);
             });
             arg = yield YieldOp::ExecWindow(if int_value {
                 Rc::new(SetTableInteger::<true>::new(&[a, b, c]))
@@ -823,13 +823,13 @@ crate::window::windowed!(FitsRK, [k: i32], [OP: Opcode], |owner, state, base| (l
     state.select = integer_op::<OP>(lhs.as_int(), k).is_none() as usize;
 });
 crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
-    *dest = LBoxed::from_int(integer_op::<OP>(lhs.as_int(), rhs.as_int()).unwrap_unchecked());
+    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), rhs.as_int())));
 });
 crate::window::windowed!(IntegerKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
-    *dest = LBoxed::from_int(integer_op::<OP>(k, rhs.as_int()).unwrap_unchecked());
+    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(k, rhs.as_int())));
 });
 crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
-    *dest = LBoxed::from_int(integer_op::<OP>(lhs.as_int(), k).unwrap_unchecked());
+    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), k)));
 });
 
 // The double ops on registers, `LI`/`RI` if in the integer encoding, and
@@ -1649,7 +1649,7 @@ crate::window::windowed!(CheckInteger, [], [INTEGER: bool], |owner, state, base|
 // Convert a number between its encodings, in place: a double that is a
 // `CType::Integer` to one, and back. See Note [Integers].
 crate::window::windowed!(ToInteger, [], [], |owner, state, base| (inout value) {
-    let Some(n) = value.as_number() else { core::hint::unreachable_unchecked() };
+    let Some(n) = value.as_number() else { unreachable!() };
     *value = LBoxed::from_int(n.to_int_unchecked::<i32>());
 });
 crate::window::windowed!(ToNumber, [], [], |owner, state, base| (inout value) {
@@ -1690,11 +1690,11 @@ fn integer_slot(i: i32) -> usize {
 // `GuardDynamic` tests: whether a `CType::Integer` key, in a register or the
 // constant `k`, is in a table's array part. See Note [Dynamic guards].
 crate::window::windowed!(InArray, [], [], |owner, state, base| (table, key) {
-    let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
     state.select = (integer_slot(key.as_int()) >= tab.ro(owner).array.len()) as usize;
 });
 crate::window::windowed!(InArrayK, [k: i32], [], |owner, state, base| (table) {
-    let LValue::Table(tab) = table.unbox() else { core::hint::unreachable_unchecked() };
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
     state.select = (integer_slot(k) >= tab.ro(owner).array.len()) as usize;
 });
 

@@ -1061,13 +1061,13 @@ mod tests {
 
     // Test-local window ops, declared exactly as an emit site would.
     windowed!(TAdd, [], [], |owner, state, base| (out d, a, b) {
-        *d = LBoxed::from_number(a.as_number().unwrap_unchecked() + b.as_number().unwrap_unchecked());
+        *d = LBoxed::from_number(crate::unchecked_unwrap(a.as_number()) + crate::unchecked_unwrap(b.as_number()));
     });
     windowed!(TMul, [], [], |owner, state, base| (out d, a, b) {
-        *d = LBoxed::from_number(a.as_number().unwrap_unchecked() * b.as_number().unwrap_unchecked());
+        *d = LBoxed::from_number(crate::unchecked_unwrap(a.as_number()) * crate::unchecked_unwrap(b.as_number()));
     });
     windowed!(TAddK, [k: f64], [], |owner, state, base| (out d, a) {
-        *d = LBoxed::from_number(a.as_number().unwrap_unchecked() + k);
+        *d = LBoxed::from_number(crate::unchecked_unwrap(a.as_number()) + k);
     });
     // Flush the whole window to `base[0..WINDOW]`, to observe the result.
     windowed!(Flush, [], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7, w8) {
@@ -1082,13 +1082,13 @@ mod tests {
         core::hint::black_box(x * 3.0 + 1.0)
     }
     windowed!(TCall, [], [], |owner, state, base| (out d, a) {
-        *d = LBoxed::from_number(out_of_line(a.as_number().unwrap_unchecked()));
+        *d = LBoxed::from_number(out_of_line(crate::unchecked_unwrap(a.as_number())));
     });
 
     // A branchy stencil: one arm calls out, the other doesn't, which invites the
     // compiler to duplicate the `become` onto each path.
     windowed!(TBranch, [], [], |owner, state, base| (out d, a) {
-        let x = a.as_number().unwrap_unchecked();
+        let x = crate::unchecked_unwrap(a.as_number());
         if x < 0.0 {
             *d = LBoxed::from_number(out_of_line(x));
         } else {
