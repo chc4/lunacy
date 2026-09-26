@@ -88,10 +88,12 @@ stencil-cold: unsafe-compile
 
 # A benchmark's JIT code, disassembled when the VM drops it and annotated with
 # what emitted it (regions, blocks, residuals, thunk stubs, the blocks and
-# helpers branches go to), in jit_disasm.txt.
-jit-disasm benchmark times='10':
+# helpers branches go to), in jit_disasm.txt. Built as `unsafe-compile` builds,
+# with `features` (by default the unsafe build's).
+jit-disasm benchmark times='10' features='unsafe':
     just _luac {{benchmark}}
-    cargo run --release --features jit_disasm --bin bench --target-dir target/jit_disasm -- {{benchmark}}.bin {{times}} > /dev/null
+    cargo run --profile unsafe --no-default-features --features "{{features}} jit_disasm" --bin bench \
+        --target-dir target/jit_disasm -Z build-std="core,std,panic_abort" -- {{benchmark}}.bin {{times}} > /dev/null
     @echo jit_disasm.txt
 
 # Save a benchmark's window dump as bench/window_dumps/<benchmark>.<name>.txt, a
