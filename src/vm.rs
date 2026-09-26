@@ -932,16 +932,18 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
 /// for them (which overlap the arguments; see Note [Library natives] in
 /// `library`), and returns how many it wrote.
 pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner) -> usize;
-/// A native's window op for a call to it (the `CALL`'s `a`, `b`, `c`), if it
-/// has one for that call's arity. See Note [Native windows] in `library`.
-pub type NativeWindow = fn(a: usize, b: u16, c: u16) -> Option<NativeOp>;
+/// A native's window op for a call to it (the `CALL`'s `a`, `b`, `c`), with
+/// which of its arguments are in the integer encoding (`ints`), if it has one
+/// for that call's arity. See Note [Native windows] in `library`.
+pub type NativeWindow = fn(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<NativeOp>;
 
-/// A call to a native run as a window op: the op, the type every argument must
-/// have for it (the op assumes it), and its result's type.
+/// A call to a native run as a window op: the op, the type every argument not
+/// in the integer encoding must have for it (the op assumes it), and its
+/// result's type.
 pub struct NativeOp {
     pub window: std::rc::Rc<dyn crate::window::Window>,
     pub args: LType,
-    pub result: LType,
+    pub result: crate::generator::CType,
 }
 
 #[derive(Clone, Copy)]
@@ -998,8 +1000,8 @@ impl NClosure {
     }
 
     /// The window op a call `a`, `b`, `c` to this native runs as, if any.
-    pub fn window(&self, a: usize, b: u16, c: u16) -> Option<NativeOp> {
-        self.cell.window.and_then(|window| window(a, b, c))
+    pub fn window(&self, a: usize, b: u16, c: u16, ints: &[bool]) -> Option<NativeOp> {
+        self.cell.window.and_then(|window| window(a, b, c, ints))
     }
 
     pub fn native(&self) -> NativeFunc {

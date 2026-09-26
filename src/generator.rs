@@ -289,8 +289,10 @@ pub enum YieldOp {
                          // type
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
                            // is the expected type
-    GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer.
-                              // See Note [Integers]
+    GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer. See
+                              // Note [Integers]. For a `CType::Type`, Guard of a register
+                              // that passes an Integer for a Number as it is, where Guard
+                              // lowers it to a double
     DiscoverInteger(usize), // Which of the number sublattice STACK[idx] is in: Integer, or a
                             // number, statically, or as GuardCType(idx, Integer) finds out if
                             // unknown. See Note [Integers]
@@ -1564,8 +1566,9 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
 fn native_window(ctx: &Context, a: usize, b: usize, c: usize) -> Option<(usize, crate::vm::NativeOp)> {
     let end = if b == 0 { ctx.top? } else { a + b };
     let CType::NativeFunction(nf) = &ctx.types[a] else { return None };
+    let ints: SmallVec<[bool; 4]> = (a + 1..end).map(|slot| ctx.slot(slot) == CType::Integer).collect();
     // A call taking every result gets the op's one.
-    nf.window(a, (end - a) as u16, if c == 0 { 2 } else { c as u16 }).map(|op| (end, op))
+    nf.window(a, (end - a) as u16, if c == 0 { 2 } else { c as u16 }, &ints).map(|op| (end, op))
 }
 
 // The frame's top, at `slot`: after a native's window op with C = 0. See Note
@@ -1590,7 +1593,8 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         // it has it. See Note [Native windows] in `library`.
         if let ResumeArg::WindowArgs(end, args) = (yield YieldOp::NativeWindowArgs(a, b, c)) {
             for slot in a + 1..end {
-                yield YieldOp::Guard(slot, args);
+                // One in the integer encoding, the op reads as it is.
+                yield YieldOp::GuardCType(slot, CType::Type(args));
             }
         }
         // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch
@@ -2934,7 +2938,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         continue 'machine;
                     }
                 },
-                op @ CoroutineState::Yielded(YieldOp::GuardCType(_, _) | YieldOp::DiscoverInteger(_)) => {
+                CoroutineState::Yielded(YieldOp::GuardCType(_, expected @ (CType::Shape(_) | CType::NativeFunction(_) | CType::LuaFunction(_)))) => {
+                    unreachable!("GuardCType tests for Integer or a CType::Type, not {expected}");
+                },
+                op @ CoroutineState::Yielded(YieldOp::GuardCType(_, CType::Integer) | YieldOp::DiscoverInteger(_)) => {
                     let (rk, discover) = match op {
                         CoroutineState::Yielded(YieldOp::GuardCType(rk, expected)) => {
                             assert_eq!(expected, CType::Integer, "GuardCType tests only for Integer");
@@ -2992,17 +2999,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
-                CoroutineState::Yielded(guard @ YieldOp::Guard(idx, expected)) => {
+                CoroutineState::Yielded(guard @ (YieldOp::Guard(idx, expected) | YieldOp::GuardCType(idx, CType::Type(expected)))) => {
                     debug!("guard {:?} == {:?}", ctx.types[idx], expected);
+                    let keep_integer = matches!(guard, YieldOp::GuardCType(..));
                     let ctype = &ctx.types[idx];
                     // Erase any hkeys and say its just a table before checking
                     let ltype = ctype.as_ltype();
 
                     if ltype == expected {
                         // Statically true: pump the success path, with an
-                        // integer read as a number lowered to a double. See
-                        // Note [Integers].
-                        if ctx.types[idx] == CType::Integer {
+                        // integer read as a number lowered to a double, unless
+                        // it's kept. See Note [Integers].
+                        if ctx.types[idx] == CType::Integer && !keep_integer {
                             self.demote(block_id, &mut ctx, idx..idx + 1);
                         }
                         pc = pc.next_true();
@@ -3057,16 +3065,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // The arguments' end: fixed, or the top the call before left, if
                             // known. See Note [Known top].
                             let end = if b == 0 { ctx.top } else { Some(a + b) };
-                            // The callee reads its arguments as any value. See
-                            // Note [Integers].
-                            self.demote(block_id, &mut ctx, a + 1..end.unwrap_or(usize::MAX));
-                            // A native run as a window op, with its arguments of the type it
-                            // assumes, gives its result's type: its one result, with C = 0
-                            // too. See Note [Native windows].
+                            // A native run as a window op, with its arguments in the integer
+                            // encoding or of the type it assumes, gives its result's type: its
+                            // one result, with C = 0 too. See Note [Native windows].
                             let mut result = None;
                             let window = native_window(&ctx, a, b, c)
-                                .filter(|(end, op)| (a + 1..*end).all(|slot| ctx.types[slot].as_ltype() == op.args))
+                                .filter(|(end, op)| (a + 1..*end).all(|slot| ctx.types[slot] == CType::Integer || ctx.types[slot].as_ltype() == op.args))
                                 .map(|(_, op)| op);
+                            // Any other callee reads its arguments as any value. See Note
+                            // [Integers].
+                            if window.is_none() {
+                                self.demote(block_id, &mut ctx, a + 1..end.unwrap_or(usize::MAX));
+                            }
                             // Any other call may run a closure, which reads and writes the
                             // slots it captured. See Note [Captured slots].
                             let captured = if window.is_none() {
@@ -3114,8 +3124,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 .map(|idx| (idx, CType::Type(LType::Unknown)))
                                 .collect();
                             Rc::make_mut(&mut ctx).set_types(owner, clobbered);
-                            if let Some(result) = result {
-                                Rc::make_mut(&mut ctx).types[a] = CType::Type(result);
+                            if let Some(result) = &result {
+                                Rc::make_mut(&mut ctx).types[a] = result.clone();
                             }
                             Rc::make_mut(&mut ctx).top = (result.is_some() && c == 0).then_some(a + 1);
                             return Some((pc.0 + 1, ctx, ResumeArg::Start));

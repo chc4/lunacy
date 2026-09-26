@@ -47,6 +47,9 @@ thread_local! {
 // type runs as that op, reading its arguments' slots and writing its
 // result's slot, the function's, in the register window: no flush and no call.
 // The op assumes the arguments' type, unchecked, and the result has its type.
+// An argument in the integer encoding (`CType::Integer`) is neither guarded
+// nor converted: the native picks the op reading it as it is (`ints`), as the
+// bit library's do, whose results are integers too.
 // Any other call to the native is an ordinary `NativeCall`. The bit library's
 // natives offer one for one result from their fixed arities, of numbers,
 // computing it as the native does (`bit1`, `bit2`). A call taking every result
@@ -192,22 +195,51 @@ fn bit2<const OP: u8>(x: i32, y: i32) -> i32 {
     }
 }
 
-crate::window::windowed!(BitUnary, [], [OP: u8], |owner, state, base| (x, out r) {
-    // An integer converted. See Note [Arithmetic NaNs] in `lboxed`.
-    *r = LBoxed::from_arith(bit1::<OP>(to_bit(checked_number(x))) as f64);
-});
-crate::window::windowed!(BitBinary, [], [OP: u8], |owner, state, base| (x, y, out r) {
-    *r = LBoxed::from_arith(bit2::<OP>(to_bit(checked_number(x)), to_bit(checked_number(y))) as f64);
-});
-
-/// `bit1::<OP>` as a window op, for a call with one number and one result.
-fn bit1_window<const OP: u8>(a: usize, b: u16, c: u16) -> Option<NativeOp> {
-    (b == 2 && c == 2).then(|| NativeOp { window: std::rc::Rc::new(BitUnary::<OP>::new(&[a + 1, a])), args: LType::Number, result: LType::Number })
+/// A bit op's window op's argument: in the integer encoding (`INT`), read as it
+/// is, or a number the specializer checked. See Note [Integers] in `generator`.
+#[inline(always)]
+unsafe fn bit_arg<const INT: bool>(v: LBoxed) -> i32 {
+    if INT { unsafe { v.as_int() } } else { to_bit(unsafe { checked_number(v) }) }
 }
 
-/// `bit2::<OP>` as a window op, for a call with two numbers and one result.
-fn bit2_window<const OP: u8>(a: usize, b: u16, c: u16) -> Option<NativeOp> {
-    (b == 3 && c == 2).then(|| NativeOp { window: std::rc::Rc::new(BitBinary::<OP>::new(&[a + 1, a + 2, a])), args: LType::Number, result: LType::Number })
+// A bit op's result is an i32, so it is in the integer encoding. See Note
+// [Integers] in `generator`.
+crate::window::windowed!(BitUnary, [], [OP: u8, X: bool], |owner, state, base| (x, out r) {
+    *r = LBoxed::from_int(bit1::<OP>(bit_arg::<X>(x)));
+});
+crate::window::windowed!(BitBinary, [], [OP: u8, X: bool, Y: bool], |owner, state, base| (x, y, out r) {
+    *r = LBoxed::from_int(bit2::<OP>(bit_arg::<X>(x), bit_arg::<Y>(y)));
+});
+
+/// `bit1::<OP>` as a window op, for a call with one number and one result: its
+/// argument in the encoding it has (`ints`).
+fn bit1_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<NativeOp> {
+    if !(b == 2 && c == 2) {
+        return None;
+    }
+    let operands = [a + 1, a];
+    let window: std::rc::Rc<dyn crate::window::Window> = if ints[0] {
+        std::rc::Rc::new(BitUnary::<OP, true>::new(&operands))
+    } else {
+        std::rc::Rc::new(BitUnary::<OP, false>::new(&operands))
+    };
+    Some(NativeOp { window, args: LType::Number, result: crate::generator::CType::Integer })
+}
+
+/// `bit2::<OP>` as a window op, for a call with two numbers and one result: its
+/// arguments in the encodings they have (`ints`).
+fn bit2_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<NativeOp> {
+    if !(b == 3 && c == 2) {
+        return None;
+    }
+    let operands = [a + 1, a + 2, a];
+    let window: std::rc::Rc<dyn crate::window::Window> = match (ints[0], ints[1]) {
+        (false, false) => std::rc::Rc::new(BitBinary::<OP, false, false>::new(&operands)),
+        (false, true) => std::rc::Rc::new(BitBinary::<OP, false, true>::new(&operands)),
+        (true, false) => std::rc::Rc::new(BitBinary::<OP, true, false>::new(&operands)),
+        (true, true) => std::rc::Rc::new(BitBinary::<OP, true, true>::new(&operands)),
+    };
+    Some(NativeOp { window, args: LType::Number, result: crate::generator::CType::Integer })
 }
 
 /// A table of `entries`, keyed by interned names.
