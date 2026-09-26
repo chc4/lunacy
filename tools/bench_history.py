@@ -28,8 +28,12 @@ PAGE = 'bench/history.html'
 # What builds the benchmarked binaries: a change elsewhere doesn't make a run
 # dirty.
 BUILD_PATHS = ['src', 'Cargo.toml', 'Cargo.lock', 'build.rs']
-# Builds of this project, drawn as lines; the rest (other Luas) as references.
+# Builds of this project, in the order reports list them.
 BUILDS = ['unsafe', 'release', 'interpreter']
+# The builds a chart is scaled to and draws across commits; the rest (the
+# interpreter, other Luas), an order of magnitude apart, as reference lines of
+# their latest times where they fit.
+CHARTED = ['unsafe', 'release']
 COLORS = {'unsafe': '#d62728', 'release': '#1f77b4', 'interpreter': '#7f7f7f',
           'lua5.1': '#2ca02c', 'luajit -joff': '#9467bd', 'luajit': '#8c564b'}
 
@@ -193,7 +197,9 @@ def chart(bench, arg, runs_by_build, info):
     columns = commits + (['dirty'] if has_dirty else [])
     if not columns:
         return ''
-    values = [r['mean'] for runs in runs_by_build.values() for r in runs.values()]
+    values = [v for build in CHARTED for r in runs_by_build.get(build, {}).values() for v in (r['min'], r['max'])]
+    if not values:
+        return ''
     lo, hi = min(values), max(values)
     lo, hi = lo - 0.05 * (hi - lo or hi), hi + 0.05 * (hi - lo or hi)
     width, height, left, right, top, bottom = 900, 320, 70, 150, 20, 90
@@ -216,7 +222,8 @@ def chart(bench, arg, runs_by_build, info):
             continue
         color = COLORS.get(build, '#000')
         points = [(i, runs[c]) for i, c in enumerate(commits) if c in runs]
-        if build in BUILDS:
+        label = build
+        if build in CHARTED:
             if len(points) > 1:
                 path = ' '.join(f'{x(i):.1f},{y(r["mean"]):.1f}' for i, r in points)
                 parts.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="{2 if build == "unsafe" else 1.2}"/>')
@@ -227,12 +234,17 @@ def chart(bench, arg, runs_by_build, info):
                 r = runs['dirty']
                 i = len(columns) - 1
                 parts.append(f'<circle cx="{x(i):.1f}" cy="{y(r["mean"]):.1f}" r="4" fill="none" stroke="{color}" stroke-width="2"><title>{build} dirty {r["mean"]:.4f} ± {r["stddev"]:.4f} s</title></circle>')
-        elif points:
-            # Another Lua: its latest time, as a reference line.
-            r = points[-1][1]
-            parts.append(f'<line x1="{left}" x2="{width - right}" y1="{y(r["mean"]):.1f}" y2="{y(r["mean"]):.1f}" stroke="{color}" stroke-dasharray="4 3"><title>{build} {r["mean"]:.4f} s</title></line>')
+        else:
+            r = runs['dirty'] if 'dirty' in runs else points[-1][1] if points else None
+            if r is None:
+                continue
+            label = f'{build} {r["mean"]:.3f}s'
+            if lo <= r['mean'] <= hi:
+                parts.append(f'<line x1="{left}" x2="{width - right}" y1="{y(r["mean"]):.1f}" y2="{y(r["mean"]):.1f}" stroke="{color}" stroke-dasharray="4 3"><title>{build} {r["mean"]:.4f} s</title></line>')
+            else:
+                label += ' ↑' if r['mean'] > hi else ' ↓'
         parts.append(f'<rect x="{width - right + 12}" y="{top + legend * 18}" width="10" height="10" fill="{color}"/>')
-        parts.append(f'<text x="{width - right + 28}" y="{top + legend * 18 + 9}" class="axis">{html.escape(build)}</text>')
+        parts.append(f'<text x="{width - right + 28}" y="{top + legend * 18 + 9}" class="axis">{html.escape(label)}</text>')
         legend += 1
     parts.append('</svg>')
     return '\n'.join(parts)
@@ -267,7 +279,7 @@ table {{ border-collapse: collapse; margin: 8px 0 24px; }} td, th {{ padding: 2p
 .bad {{ color: var(--bad); font-weight: 600; }}
 </style></head><body>
 <h1>Benchmark history</h1>
-<p>Mean time per commit, in commit order, with min–max bars; the hollow marker is HEAD with uncommitted changes. Unsafe is the build that matters.</p>
+<p>Mean time per commit of the unsafe and release builds, in commit order, with min–max bars; the hollow marker is HEAD with uncommitted changes. Unsafe is the build that matters. The interpreter and other Luas are dashed lines of their latest times, or in the legend alone, marked ↑ or ↓, off the chart's scale.</p>
 {"".join(sections)}
 </body></html>
 '''
