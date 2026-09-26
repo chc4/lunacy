@@ -111,6 +111,22 @@ impl<'src> IStr<'src> {
 // register) may keep an integer it never reads again, which the collector
 // skips.
 
+// Note [Arithmetic NaNs]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// A double boxes by adding `DOUBLE_ENCODE_OFFSET`, 2^49, to its bits, which is
+// safe for every double but the negative NaNs whose top 16 bits are `FFFC` or
+// more: those carry into `NUMBER_TAG` (an integer) or wrap around into
+// pointers. `from_number` boxes any NaN as `CANONICAL_NAN`, for doubles from
+// outside the encoding (a constant, a native's result, parsed text), whose
+// bits could be anything.
+//
+// A double computed from boxed numbers needn't be canonicalized, as in
+// JavaScriptCore (which purifies NaNs only where a double comes from outside):
+// x86's floating point results are the default NaN, `FFF8:...`, which boxes to
+// `FFFA:...`, or an operand's NaN, quieted by setting its bit 51, which leaves a
+// safe NaN safe; and every boxed double is safe. `from_arith` boxes such a
+// result with the add alone, and asserts it is safe in debug builds.
+
 impl<'src, 'intern> LBoxed<'src, 'intern> {
     pub const NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;
     pub const DOUBLE_ENCODE_OFFSET: u64 = 0x0002_0000_0000_0000; // 2^49
@@ -168,6 +184,21 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     #[inline(always)]
     pub fn from_number(n: f64) -> Self {
         let bits = if n.is_nan() { Self::CANONICAL_NAN } else { n.to_bits() };
+        Self::from_raw(bits.wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
+    }
+
+    /// Box a double computed from boxed numbers (arithmetic on them, or an
+    /// integer converted), without canonicalizing a NaN. See Note [Arithmetic
+    /// NaNs].
+    ///
+    /// # Safety
+    ///
+    /// `n` is such a result, so its bits aren't those of a NaN that would box
+    /// into another type.
+    #[inline(always)]
+    pub unsafe fn from_arith(n: f64) -> Self {
+        let bits = n.to_bits();
+        debug_assert!(bits >> 48 < 0xfffc, "{bits:#x} would box into another type");
         Self::from_raw(bits.wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
     }
 

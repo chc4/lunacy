@@ -193,11 +193,12 @@ fn bit2<const OP: u8>(x: i32, y: i32) -> i32 {
 
 #[cfg(feature = "lbbv")]
 crate::window::windowed!(BitUnary, [], [OP: u8], |owner, state, base| (x, out r) {
-    *r = LBoxed::from_number(bit1::<OP>(to_bit(checked_number(x))) as f64);
+    // An integer converted. See Note [Arithmetic NaNs] in `lboxed`.
+    *r = LBoxed::from_arith(bit1::<OP>(to_bit(checked_number(x))) as f64);
 });
 #[cfg(feature = "lbbv")]
 crate::window::windowed!(BitBinary, [], [OP: u8], |owner, state, base| (x, y, out r) {
-    *r = LBoxed::from_number(bit2::<OP>(to_bit(checked_number(x)), to_bit(checked_number(y))) as f64);
+    *r = LBoxed::from_arith(bit2::<OP>(to_bit(checked_number(x)), to_bit(checked_number(y))) as f64);
 });
 
 /// `bit1::<OP>` as a window op, for a call with one number and one result.

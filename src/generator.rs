@@ -771,11 +771,27 @@ unsafe fn number<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>) -> f6
     }
 }
 
+/// The double op `OP` on `l` and `r`, boxed. See Note [Arithmetic NaNs] in
+/// `lboxed`.
+#[inline(always)]
+unsafe fn arith<'src, 'intern, const OP: Opcode>(l: f64, r: f64) -> LBoxed<'src, 'intern> {
+    let n = match OP {
+        Opcode::ADD => l + r,
+        Opcode::SUB => l - r,
+        Opcode::MUL => l * r,
+        Opcode::DIV => l / r,
+        Opcode::MOD => crate::vm::lua_mod(l, r),
+        Opcode::POW => l.powf(r),
+        _ => unsafe { core::hint::unreachable_unchecked() },
+    };
+    unsafe { LBoxed::from_arith(n) }
+}
+
 /// A value as a double, for a table to hold: re-encoded if `INT`. See Note
 /// [Integers].
 #[inline(always)]
 unsafe fn double<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>) -> LBoxed<'src, 'intern> {
-    if INT { LBoxed::from_number((unsafe { v.as_int() }) as f64) } else { v }
+    if INT { unsafe { LBoxed::from_arith(v.as_int() as f64) } } else { v }
 }
 
 /// The integer op `OP`'s result, if it fits the integer encoding: it must be in
@@ -821,17 +837,18 @@ crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base|
 // constants, `k` their value. Unchecked, so that no panic path follows the
 // stencil's `become` and the copy can slice it off.
 crate::window::windowed!(NumericRR, [], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs, out dest) {
-    let (l, r) = (number::<LI>(lhs), number::<RI>(rhs));
-    *dest = LBoxed::box_lvalue(LValue::Number(Number(l)).numeric_op(OP, &LValue::Number(Number(r))).unwrap());
+    *dest = arith::<OP>(number::<LI>(lhs), number::<RI>(rhs));
 });
+// A constant's NaN is canonicalized when it is captured (`NumberK`), as it
+// came from outside the encoding. See Note [Arithmetic NaNs] in `lboxed`.
 crate::window::windowed!(NumericKK, [kl: f64, kr: f64], [OP: Opcode], |owner, state, base| (out dest) {
-    *dest = LBoxed::box_lvalue(LValue::Number(Number(kl)).numeric_op(OP, &LValue::Number(Number(kr))).unwrap());
+    *dest = arith::<OP>(kl, kr);
 });
 crate::window::windowed!(NumericKR, [k: f64], [OP: Opcode, RI: bool], |owner, state, base| (rhs, out dest) {
-    *dest = LBoxed::box_lvalue(LValue::Number(Number(k)).numeric_op(OP, &LValue::Number(Number(number::<RI>(rhs)))).unwrap());
+    *dest = arith::<OP>(k, number::<RI>(rhs));
 });
 crate::window::windowed!(NumericRK, [k: f64], [OP: Opcode, LI: bool], |owner, state, base| (lhs, out dest) {
-    *dest = LBoxed::box_lvalue(LValue::Number(Number(number::<LI>(lhs))).numeric_op(OP, &LValue::Number(Number(k))).unwrap());
+    *dest = arith::<OP>(number::<LI>(lhs), k);
 });
 
 /// `NumericRR` for `opcode`, reading integer registers as `li`/`ri` say.
@@ -1637,7 +1654,7 @@ crate::window::windowed!(ToInteger, [], [], |owner, state, base| (inout value) {
     *value = LBoxed::from_int(n.to_int_unchecked::<i32>());
 });
 crate::window::windowed!(ToNumber, [], [], |owner, state, base| (inout value) {
-    *value = LBoxed::from_number(value.as_int() as f64);
+    *value = LBoxed::from_arith(value.as_int() as f64);
 });
 
 // Note [Dynamic guards]
@@ -2535,7 +2552,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::NumberK(k)) => {
                     let proto = self.clos.ro(owner).prototype;
                     let crate::chunk::Constant::Number(n) = (unsafe { &(&(*proto).constants.items)[k] }) else { unreachable!() };
-                    arg = ResumeArg::Number(n.0);
+                    // Its NaN canonicalized, as boxing it would. See Note
+                    // [Arithmetic NaNs] in `lboxed`.
+                    arg = ResumeArg::Number(if n.0.is_nan() { f64::NAN } else { n.0 });
                 },
                 CoroutineState::Yielded(YieldOp::BoxedK(k)) => {
                     let proto = self.clos.ro(owner).prototype;
