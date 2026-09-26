@@ -1684,7 +1684,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; ud2
                         );
                     } else {
-                        emit_jump(ops, &alloc, &targets[0].1, false);
+                        // The first target is laid out next if it isn't compiled
+                        // yet, as a `Jump`'s is: falling through, it needs no jump.
+                        debug_assert_eq!(off, block.instructions.len() - 1, "a Select ends its block");
+                        let first = targets[0].1;
+                        emit_jump(ops, &alloc, &first, self.jctx.blocks.get(&first).is_none());
+                        successor = Some(first);
                     }
                 },
                 Residual::GC => {
