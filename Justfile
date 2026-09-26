@@ -230,8 +230,11 @@ gdb-benchmark benchmark:
     cargo build --release --bin bench
     gdb --args ./target/release/bench {{benchmark}}.bin
 
-# Profile a benchmark: perf.data and flamegraph.svg here, or with `ref`, revision
-# `ref`'s build (in target/compare/<ref>, as for `hyperfine-vs`) on this
+# Profile a benchmark, built with the `flamegraph` profile (the unsafe build with
+# frame pointers) and unwound through frame pointers, as perf's default DWARF
+# unwinding can't unwind JIT code, which has no unwind tables (`tools/unwound.py`
+# reports how much of a profile reached `main`): perf.data and flamegraph.svg here, or with `ref`, revision `ref`'s build (in
+# target/compare/<ref>, as for `hyperfine-vs`; it must have the profile) on this
 # checkout's benchmark, its perf.data there and flamegraph-<ref>.svg here.
 # `freq` is perf's sampling rate, in Hz.
 flamegraph benchmark times='10' ref='' freq='997':
@@ -239,15 +242,18 @@ flamegraph benchmark times='10' ref='' freq='997':
     set -euo pipefail
     just _luac {{benchmark}}
     rm -f /tmp/perf-*.map
+    # The profile's panic strategy needs std rebuilt, as for `unsafe-compile`:
+    # `-Z build-std`, which `cargo flamegraph` takes from the environment.
+    export CARGO_UNSTABLE_BUILD_STD=core,std,panic_abort
     if [ -z "{{ref}}" ]; then
-        cargo flamegraph -F {{freq}} --features "perf" --bin bench -- {{benchmark}}.bin {{times}}
+        cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -- {{benchmark}}.bin {{times}}
         firefox -new-tab flamegraph.svg || true
     else
         dir=target/compare/{{ref}}
         just _compare-worktree {{ref}}
         bin=$(realpath {{benchmark}}.bin)
         svg=$(realpath .)/flamegraph-{{ref}}.svg
-        (cd $dir && cargo flamegraph -F {{freq}} --features "perf" --bin bench -o $svg -- $bin {{times}})
+        (cd $dir && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o $svg -- $bin {{times}})
     fi
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")

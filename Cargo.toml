@@ -96,3 +96,9 @@ rustflags = ["-C", "target-cpu=native"]
 inherits = "release"
 panic = "immediate-abort"
 rustflags = ["-C", "target-cpu=native"]
+
+# `just flamegraph`: the unsafe build with frame pointers, so perf unwinds
+# through the JIT's code (whose stencils then keep them too).
+[profile.flamegraph]
+inherits = "unsafe"
+rustflags = ["-C", "force-frame-pointers=yes", "-C", "target-cpu=native"]
