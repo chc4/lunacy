@@ -67,6 +67,11 @@ regex = "1.11.1"
 [target.jit]
 [target.jit.dependencies]
 
+# Demangles the Rust symbols in its input (`just stencil-sizes`).
+[[bin]]
+name = "demangle"
+required-features = ["jit_disasm"]
+
 [profile.release]
 codegen-units = 1
 panic = "abort"

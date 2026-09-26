@@ -69,6 +69,14 @@ window-dump benchmark times='20' ref='':
         (cd target/compare/{{ref}} && cargo run --release --features window_dump --bin bench -- $bin {{times}})
     fi
 
+# The instructions in every window op's stencil, in the release build (as
+# `hyperfine` times it, with frame pointers) and the unsafe one: those copied
+# into JIT code and run, and those after the continuation jump (cold).
+stencil-sizes: unsafe-compile
+    cargo build --release --bin bench
+    cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
+    python3 tools/stencil_sizes.py target/release/bench target/unsafe/bench
+
 # A benchmark's JIT code, disassembled when the VM drops it and annotated with
 # what emitted it (regions, blocks, residuals, thunk stubs, the blocks and
 # helpers branches go to), in jit_disasm.txt.
