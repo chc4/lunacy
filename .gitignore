@@ -9,3 +9,5 @@ rustc-ice*
 hyperfine*-vs-*
 hyperfine*-traces.md
 window_dump.txt
+hyperfine-*.json
+bench/history.html

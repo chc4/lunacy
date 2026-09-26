@@ -334,13 +334,17 @@ hyperfine benchmark times='10': unsafe-compile interpreter-compile
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
     cargo build --release --bin bench
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
-        "lua5.1 bench.lua -- {{benchmark}}.bin {{times}} || true" \
-        "luajit -joff bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
-        "luajit bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
-        "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \
-        "./target/release/bench {{benchmark}}.bin {{times}}" \
-        "./target/unsafe/bench {{benchmark}}.bin {{times}}"
+    # A command failing (lua5.1 lacks the bit library) is timed, and left out of
+    # the history for its exit code.
+    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
+        --export-json hyperfine-{{benchmark}}-{{times}}.json \
+        -n lua5.1 "lua5.1 bench.lua -- {{benchmark}}.bin {{times}}" \
+        -n "luajit -joff" "luajit -joff bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
+        -n luajit "luajit bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
+        -n interpreter "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \
+        -n release "./target/release/bench {{benchmark}}.bin {{times}}" \
+        -n unsafe "./target/unsafe/bench {{benchmark}}.bin {{times}}"
+    python3 tools/bench_history.py record hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
 # Compare the trace-building policies of the window allocator, and streaming
 # allocation, on a benchmark
 # (LUNACY_TRACES; see docs/trace-register-allocation.md).
@@ -386,10 +390,36 @@ _build-vs ref:
 hyperfine-vs ref benchmark times='10': (_build-vs ref)
     just _luac {{benchmark}}
     taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
-        "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \
-        "./target/release/bench {{benchmark}}.bin {{times}}" \
-        "target/compare/{{ref}}/target/unsafe/bench {{benchmark}}.bin {{times}}" \
-        "./target/unsafe/bench {{benchmark}}.bin {{times}}"
+        --export-json hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.json \
+        -n "ref release" "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \
+        -n release "./target/release/bench {{benchmark}}.bin {{times}}" \
+        -n "ref unsafe" "target/compare/{{ref}}/target/unsafe/bench {{benchmark}}.bin {{times}}" \
+        -n unsafe "./target/unsafe/bench {{benchmark}}.bin {{times}}"
+    python3 tools/bench_history.py record hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.json --benchmark {{benchmark}} --arg {{times}} --ref {{ref}}
+
+# Revision `ref`'s release and unsafe builds (as `_build-vs` builds them) on
+# every benchmark of HYPERFINES, into the history (tools/bench_history.py): to
+# fill in the commits before the history was kept.
+bench-rev ref:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _compare-worktree {{ref}}
+    (cd target/compare/{{ref}} && cargo build --release --bin bench && just unsafe-compile)
+    for run in {{HYPERFINES}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        just _luac $benchmark
+        taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-json hyperfine-$benchmark-$times-{{ref}}.json \
+            -n "ref release" "target/compare/{{ref}}/target/release/bench $benchmark.bin $times" \
+            -n "ref unsafe" "target/compare/{{ref}}/target/unsafe/bench $benchmark.bin $times"
+        python3 tools/bench_history.py record hyperfine-$benchmark-$times-{{ref}}.json --benchmark $benchmark --arg $times --ref {{ref}}
+    done
+
+# The benchmark history (tools/bench_history.py): each benchmark's and build's
+# latest, dirty, best and first times, regressions flagged, and the charts, in
+# bench/history.html.
+bench-history:
+    python3 tools/bench_history.py report
+    python3 tools/bench_history.py plot
 # Hardware counters (`perf stat`) for this checkout's build of `profile`
 # (`release` or `unsafe`) and revision `ref`'s (built as `_build-vs` builds
 # them) on one benchmark, each pinned as `hyperfine` runs it and repeated `runs`
@@ -430,6 +460,7 @@ hyperfines:
     #!/usr/bin/env bash
     set -euo pipefail
     for run in {{HYPERFINES}}; do just hyperfine ${run%:*} ${run#*:}; done
+    python3 tools/bench_history.py report
 
 # Compare this checkout's release build under each feature set in `sets`
 # (comma separated features, or `none`) on one benchmark: each built in turn
@@ -460,5 +491,6 @@ hyperfines-vs ref:
     set -euo pipefail
     for run in {{HYPERFINES}}; do just hyperfine-vs {{ref}} ${run%:*} ${run#*:}; done
     for run in {{HYPERFINES}}; do tail -n 4 hyperfine-${run%:*}-${run#*:}-vs-{{ref}}.md; done
+    python3 tools/bench_history.py report
 
 all: test benchmarks (hyperfine "binarytrees")
