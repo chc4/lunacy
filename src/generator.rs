@@ -3571,9 +3571,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             id = block;
                             off = disp;
                         },
-                        // The entry closure returned. See `Vm::run`.
-                        Err(r_vals) => {
-                            return (state, r_vals);
+                        // The entry closure returned: its results leave the stack.
+                        // See `Vm::run`.
+                        Err(results) => {
+                            let results = Vec::from(&state.vals[results]).into();
+                            state.vals.truncate(0);
+                            return (state, results);
                         },
                     }
                 },

@@ -1359,30 +1359,17 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
-    pub fn do_return(&mut self, owner: &mut Owner, a: usize, b: usize) -> Result<ReturnLocation, FVec<LBoxed<'src, 'intern>>> {
+    /// Return from the running frame to its caller's `ReturnLocation`, the results
+    /// moved in place to the call's, or, from the outermost frame, the range of
+    /// the stack its results are in, which the caller takes off it.
+    pub fn do_return(&mut self, owner: &mut Owner, a: usize, b: usize) -> Result<ReturnLocation, std::ops::Range<usize>> {
         // we're going to be removing this frame, so close any open
         // upvalues.
         self.close_upvalues(owner);
 
-        let mut r_count = 0 as usize;
-        let mut r_vals: FVec<_> = if b == 1 {
-            // no return values
-            vec![].into()
-        } else if b >= 2 {
-            // there are b-1 return values from R(A) onwards
-            r_count = b as usize-1;
-            let r_vals = &self.vals[self.base + a as usize..(self.base + a as usize + r_count as usize)];
-            debug!("{:?}", r_vals);
-            Vec::from(r_vals).into()
-        } else if b == 0 {
-            // return all values from R(A) to the current top
-            let r_vals = &self.vals[self.base + a as usize..self.top];
-            r_count = r_vals.len() as usize;
-            debug!("{:?}", r_vals);
-            Vec::from(r_vals).into()
-        } else {
-            unreachable!()
-        };
+        // The results: `b - 1` values from R(A), or every value up to the top.
+        let from = self.base + a;
+        let count = if b == 0 { self.top - from } else { b - 1 };
         match self.callstack.pop() {
             Some(CallstackEntry { clos: ret_clos, ret, frame, limit, witness_frame, witness_top, rloc, c }) => {
                 debug!("{} {:?} {}", self.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, c);
@@ -1391,35 +1378,23 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                 self.witness_base = witness_frame;
                 // The callee frame is gone; the live max-extent is the caller's again.
                 self.natural_max = limit;
-                // Shrink the register file back to the caller's extent (`limit`) so the
-                // popped callee frame stops being marked by the GC. See Note [Stack frames].
-                if c == 1 {
-                    // results discarded
-                    self.top = rloc;
-                    self.vals.truncate(limit);
-                } else if c >= 2 {
-                    // exactly c-1 results, padded with nil
-                    for i in 0..(c as usize - 1) {
-                        self.vals[rloc + i] = r_vals.get(i).copied().unwrap_or(LBoxed::NIL);
-                    }
-                    self.top = rloc + (c as usize - 1);
-                    self.vals.truncate(limit);
-                } else {
-                    // MULTRET: every returned value, which can exceed `limit` when the
-                    // callee returned more than the caller's extent covers.
-                    for (i, v) in r_vals.drain(..).enumerate() {
-                        self.vals[rloc + i] = v;
-                    }
-                    self.top = rloc + r_count;
-                    self.vals.truncate(limit.max(rloc + r_count));
+                // The results move down to the caller's `rloc`, in place: exactly `c
+                // - 1`, padded with nil, or with C = 0 (MULTRET) all of them.
+                let wanted = if c == 0 { count } else { c as usize - 1 };
+                let moved = wanted.min(count);
+                self.vals.copy_within(from..from + moved, rloc);
+                for slot in rloc + moved..rloc + wanted {
+                    self.vals[slot] = LBoxed::NIL;
                 }
+                self.top = rloc + wanted;
+                // Shrink the register file back to the caller's extent (`limit`) so the
+                // popped callee frame stops being marked by the GC, but for MULTRET
+                // results past it. See Note [Stack frames].
+                self.vals.truncate(if c == 0 { limit.max(rloc + wanted) } else { limit });
                 self.witness_top = witness_top;
                 return Ok(ret)
             },
-            None => {
-                self.vals.truncate(0);
-                Err(r_vals)
-            }
+            None => Err(from..from + count),
         }
     }
 }
