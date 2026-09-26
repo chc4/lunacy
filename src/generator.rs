@@ -311,6 +311,9 @@ pub enum YieldOp {
                                       // `state.select` at runtime
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
     Call(CallTarget), // Call a block target. Probably need a ResumeArg for returned values later.
+    NativeWindowArgs(usize, usize, usize), // For CALL A B C: resumed with WindowArgs if STACK[A] is
+                                           // a native with a window op for the call, else Failed.
+                                           // See Note [Native windows] in `library`
 
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
     TryHashKey(usize, usize), // Looks up but does not allocate an HREF..
@@ -354,6 +357,9 @@ pub enum ResumeArg {
     Integer(i32),
     Number(f64),
     Boxed(u64),
+    /// The end of a call's arguments, and the type its native's window op
+    /// assumes they have.
+    WindowArgs(usize, LType),
 }
 
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -1551,6 +1557,17 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
     }
 }
 
+/// The window op for `CALL A B C` in `ctx`, if STACK[A] is a native with one for
+/// the call's arity, and the end of its arguments: fixed, or the top the call
+/// before left, if known (Note [Known top]). See Note [Native windows] in
+/// `library`.
+fn native_window(ctx: &Context, a: usize, b: usize, c: usize) -> Option<(usize, crate::vm::NativeOp)> {
+    let end = if b == 0 { ctx.top? } else { a + b };
+    let CType::NativeFunction(nf) = &ctx.types[a] else { return None };
+    // A call taking every result gets the op's one.
+    nf.window(a, (end - a) as u16, if c == 0 { 2 } else { c as u16 }).map(|op| (end, op))
+}
+
 // The frame's top, at `slot`: after a native's window op with C = 0. See Note
 // [Known top].
 windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
@@ -1567,6 +1584,14 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
                 panic!("call metamethod {} {:?} {:?}", a, &state.vals, &state.vals[state.base + a])
             })));
             return arg;
+        }
+        // A native's window op assumes its arguments' type: guard them to it, so an
+        // argument of unknown type is discovered, and the call can run as the op if
+        // it has it. See Note [Native windows] in `library`.
+        if let ResumeArg::WindowArgs(end, args) = (yield YieldOp::NativeWindowArgs(a, b, c)) {
+            for slot in a + 1..end {
+                yield YieldOp::Guard(slot, args);
+            }
         }
         // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch
         // guard here for specializing the call + return continuation for each one.
@@ -2949,6 +2974,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         },
                     }
                 },
+                CoroutineState::Yielded(YieldOp::NativeWindowArgs(a, b, c)) => {
+                    arg = match native_window(&ctx, a, b, c) {
+                        Some((end, op)) => ResumeArg::WindowArgs(end, op.args),
+                        None => ResumeArg::Failed,
+                    };
+                },
                 CoroutineState::Yielded(YieldOp::GuardDynamic(test)) => {
                     assert!(test.accesses().iter().all(|access| *access == Access::Read), "{}: a guard's test has no outputs", test.name());
                     if cfg!(feature = "no_dynamic_guards") {
@@ -3033,12 +3064,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // assumes, gives its result's type: its one result, with C = 0
                             // too. See Note [Native windows].
                             let mut result = None;
-                            let window = match (&ctx.types[a], end) {
-                                (CType::NativeFunction(nf), Some(end)) => nf
-                                    .window(a, (end - a) as u16, if c == 0 { 2 } else { c as u16 })
-                                    .filter(|op| (a + 1..end).all(|slot| ctx.types[slot].as_ltype() == op.args)),
-                                _ => None,
-                            };
+                            let window = native_window(&ctx, a, b, c)
+                                .filter(|(end, op)| (a + 1..*end).all(|slot| ctx.types[slot].as_ltype() == op.args))
+                                .map(|(_, op)| op);
                             // Any other call may run a closure, which reads and writes the
                             // slots it captured. See Note [Captured slots].
                             let captured = if window.is_none() {

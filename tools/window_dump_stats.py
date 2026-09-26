@@ -15,7 +15,9 @@ differ. With `--kinds`, it totals the code by what emitted it (region entries,
 jumps into compiled blocks, other jumps, exits, ops) in each dump. With `--ops`,
 it lists how often each window op ran (a residual `window(Op, ...)` or
 `guard_dynamic(Op, ...)`, counted by its `op at` line) in each dump side by
-side, most changed first. With `--ngrams N`, it lists the most executed runs of
+side, most changed first. With `--residuals`, it lists each kind of residual
+(a guard by the type it expects, a window op by its name) in each dump side by
+side: how many were compiled, and how often they ran. With `--ngrams N`, it lists the most executed runs of
 N residuals adjacent in a block, over all the dumps: a residual ran as often as
 its counted code, or as the residual before it with none (a guard, a select;
 a thunk, a side exit, runs nothing),
@@ -98,10 +100,12 @@ def residuals(path):
         m = ANY_RESIDUAL.match(line)
         if m:
             kind, arg, guarded = m.groups()
-            # A guard's expected type, not a native guard's pointer.
+            # A guard's expected type, not a native guard's pointer, which moves
+            # from run to run.
             if guarded is not None and guarded.startswith('0x'):
-                guarded = None
-            name = kind if arg is None else '%s(%s)' % (kind, guarded or ('' if arg.isdigit() else arg))
+                name = kind
+            else:
+                name = kind if arg is None else '%s(%s)' % (kind, guarded or ('' if arg.isdigit() else arg))
             found.append([block, name, None])
             continue
         m = COUNTED.search(line)
@@ -214,6 +218,7 @@ def main():
     parser.add_argument('--raw', action='store_true', help='weight code by how often it ran, not log log of it')
     parser.add_argument('--kinds', action='store_true', help='the code totalled by what emitted it, in each dump')
     parser.add_argument('--ops', action='store_true', help='how often each window op ran, in each dump')
+    parser.add_argument('--residuals', action='store_true', help='each kind of residual, compiled and run, in each dump')
     parser.add_argument('--ngrams', type=int, metavar='N', help='the most executed runs of N adjacent residuals, over all dumps')
     args = parser.parse_args()
     global RAW
@@ -224,6 +229,19 @@ def main():
         print('residuals run: %d' % executed)
         for key, n in sorted(totals.items(), key=lambda kv: -kv[1])[:args.top or 40]:
             print('%14d %5.1f%%  %s' % (n, 100 * n / executed, ' ; '.join(key)))
+        return 0
+    if args.residuals:
+        per = []
+        for path in args.dumps:
+            totals = {}
+            for _, name, n in residuals(path):
+                compiled, ran = totals.get(name, (0, 0))
+                totals[name] = (compiled + 1, ran + n)
+            per.append(totals)
+        names = sorted({name for t in per for name in t}, key=lambda name: (-max(t.get(name, (0, 0))[1] for t in per), name))
+        print('%-36s' % 'residual (compiled, ran)' + ''.join('%28s' % path.split('/')[-1] for path in args.dumps))
+        for name in names:
+            print('%-36s' % name + ''.join('%28s' % ('%d, %d' % t.get(name, (0, 0))) for t in per))
         return 0
     if args.ops:
         per = [ops(path) for path in args.dumps]

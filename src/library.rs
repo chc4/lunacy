@@ -41,8 +41,10 @@ thread_local! {
 // A native whose work fits a window op can offer one for a call's arity
 // (`NClosure::windowed`), with the type its arguments must have and its
 // result's type. A call the specializer knows is to it (a `NativeFunction`
-// ctype, which `NativeGuard` checks), with every argument known to have that
-// type, then runs as that op, reading its arguments' slots and writing its
+// ctype, which `NativeGuard` checks) guards its arguments to that type (a
+// guard the context answers statically, for an argument already known, or a
+// discovery thunk, for one of unknown type), and with every argument of that
+// type runs as that op, reading its arguments' slots and writing its
 // result's slot, the function's, in the register window: no flush and no call.
 // The op assumes the arguments' type, unchecked, and the result has its type.
 // Any other call to the native is an ordinary `NativeCall`. The bit library's
