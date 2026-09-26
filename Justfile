@@ -69,9 +69,9 @@ window-dump benchmark times='20' ref='':
         (cd target/compare/{{ref}} && cargo run --release --features window_dump --bin bench -- $bin {{times}})
     fi
 
-# The instructions in every window op's stencil, in the release build (as
-# `hyperfine` times it, with frame pointers) and the unsafe one: those copied
-# into JIT code and run, and those after the continuation jump (cold).
+# The size of every window op's stencil (bytes and instructions) in the release
+# build (as `hyperfine` times it, with frame pointers) and the unsafe one, and
+# how many instructions of it the copier copies.
 stencil-sizes: unsafe-compile
     cargo build --release --bin bench
     cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
