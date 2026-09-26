@@ -156,6 +156,15 @@ _luac benchmark:
     if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
     luac5.1 -o {{benchmark}}.bin $src
 
+# Compile a benchmark, as `_luac`, to LuaJIT's bytecode in <benchmark>.luajit.bin:
+# LuaJIT can't load luac5.1's.
+_luajitc benchmark:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src=benchmarks/{{benchmark}}/bench.lua
+    if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
+    luajit -b $src {{benchmark}}.luajit.bin
+
 run benchmark:
     just _luac {{benchmark}}
     time cargo run --release --bin bench -- {{benchmark}}.bin
@@ -212,8 +221,9 @@ gdb name:
     gdb --args ./target/release/lunacy {{name}}.bin
 
 
-baseline benchmark:
-    time lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench
+baseline benchmark times='10':
+    just _luac {{benchmark}}
+    time lua5.1 bench.lua -- {{benchmark}}.bin {{times}}
 
 gdb-benchmark benchmark:
     just _luac {{benchmark}}
@@ -288,11 +298,12 @@ gdb-unsafe benchmark: unsafe-compile
 # of a benchmark requiring it fails at once, and times nothing.
 hyperfine benchmark times='10': unsafe-compile interpreter-compile
     just _luac {{benchmark}}
+    just _luajitc {{benchmark}}
     cargo build --release --bin bench
     taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
-        "lua5.1 bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}} || true" \
-        "luajit -joff bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}}" \
-        "luajit bench.lua -- lua_benchmarking/benchmarks/{{benchmark}}/bench {{times}}" \
+        "lua5.1 bench.lua -- {{benchmark}}.bin {{times}} || true" \
+        "luajit -joff bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
+        "luajit bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
         "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \
         "./target/release/bench {{benchmark}}.bin {{times}}" \
         "./target/unsafe/bench {{benchmark}}.bin {{times}}"
