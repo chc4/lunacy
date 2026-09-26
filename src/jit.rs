@@ -1657,7 +1657,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                     // A taken target's transfer may use rax (`SCRATCH`): the
                     // comparisons only continue on the paths not taken.
-                    for (i, target) in targets.iter().enumerate() {
+                    //
+                    // `select` is always one of the targets: debug builds test
+                    // each and trap on anything else, which release builds
+                    // trust, testing only the targets after the first and
+                    // falling through to it.
+                    let tested = if cfg!(debug_assertions) { 0 } else { 1 };
+                    for (i, target) in targets.iter().enumerate().skip(tested) {
                         #[cfg(feature = "align_selects")]
                         if (self.jctx.region_base + ops.offset().0) % CACHE_LINE + SELECT_TEST > CACHE_LINE {
                             pad(ops, self.jctx.region_base, CACHE_LINE);
@@ -1673,10 +1679,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; next_target:
                         );
                     }
-                    // Should be unreachable, emit a trap
-                    dynasm!(ops
-                        ; ud2
-                    );
+                    if cfg!(debug_assertions) {
+                        dynasm!(ops
+                            ; ud2
+                        );
+                    } else {
+                        emit_jump(ops, &alloc, &targets[0].1, false);
+                    }
                 },
                 Residual::GC => {
                     dynasm!(ops
