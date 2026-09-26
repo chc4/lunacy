@@ -644,7 +644,6 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let witness = state.hash_witnesses[hidx];
                     debug!("settable_href with {:?} {:?}", &witness, expected);
                     let LValue::Table(tab) = table.unbox() else { unreachable!() };
-                    tab.barrier_back();
                     // See Note [Hash witnesses].
                     let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
                     debug!("settable_href {:?} {:?}", &val1, expected);
@@ -659,6 +658,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         }
                         Retype::Unknown => tab.rw(owner).epoch += 1,
                     }
+                    // Last, so that its cold call rejoins the stencil at its tailcall.
+                    tab.barrier_back();
                 }
                 let expected = htype.as_ltype();
                 if c & 0x100 == 0 {
