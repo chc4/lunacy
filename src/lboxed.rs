@@ -199,7 +199,45 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     pub unsafe fn from_arith(n: f64) -> Self {
         let bits = n.to_bits();
         debug_assert!(bits >> 48 < 0xfffc, "{bits:#x} would box into another type");
+        // As JavaScriptCore's JIT boxes a double: subtracting `NUMBER_TAG` (which
+        // is adding `DOUBLE_ENCODE_OFFSET`, modulo 2^64), written as an
+        // instruction LLVM can't see through. As arithmetic, LLVM reasons about
+        // which doubles the operands decode to and adds a branch folding a NaN
+        // result into its own, and materializes a second constant for the add.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let boxed: u64;
+            unsafe {
+                core::arch::asm!("sub {v}, {tag}", v = inout(reg) bits => boxed, tag = in(reg) Self::NUMBER_TAG, options(pure, nomem, nostack));
+            }
+            Self::from_raw(boxed)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         Self::from_raw(bits.wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
+    }
+
+    /// Decode a number known to be a double. See Note [Arithmetic NaNs].
+    ///
+    /// # Safety
+    ///
+    /// The value is a number, in the double encoding.
+    #[inline(always)]
+    pub unsafe fn as_double(&self) -> f64 {
+        debug_assert!(self.is_number() && !self.is_int(), "{:#x} isn't a double", self.0);
+        // Adding `NUMBER_TAG`, as JavaScriptCore's JIT decodes it, written as an
+        // instruction for the reason `from_arith` gives: a `lea` into another
+        // register, as the boxed value usually stays live (in its window
+        // register), which an `add` in place would need copying first.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let bits: u64;
+            unsafe {
+                core::arch::asm!("lea {out}, [{v} + {tag}]", out = lateout(reg) bits, v = in(reg) self.0, tag = in(reg) Self::NUMBER_TAG, options(pure, nomem, nostack));
+            }
+            f64::from_bits(bits)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        f64::from_bits(self.0.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET))
     }
 
     /// Box an integer. See Note [Integer encoding].

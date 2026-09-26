@@ -766,8 +766,7 @@ unsafe fn number<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>) -> f6
     if INT {
         (unsafe { v.as_int() }) as f64
     } else {
-        let Some(n) = v.as_number() else { unsafe { core::hint::unreachable_unchecked() } };
-        n
+        unsafe { v.as_double() }
     }
 }
 
