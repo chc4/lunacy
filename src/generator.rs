@@ -243,7 +243,7 @@ impl std::fmt::Display for Residual {
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
             Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
             Residual::LuaCall { lclos, a, b, c } => write!(f, "lcall({:p}, {}, {}, {})", lclos, a, b, c),
-            Residual::HashGuard { tab, href, expected } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
+            Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
             Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Select(targets) => write!(f, "select"),
@@ -472,7 +472,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
-            windowed!(GetTableHref, [href: u8, key: usize], [], |owner, state, base| (table, out dest) {
+            windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
                 // Written by the frame's `href_init` already. See Note [Hash
                 // witnesses].
                 let witness = *state.hash_witnesses.get_unchecked(state.witness_base + href as usize);
@@ -481,19 +481,10 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // since), so its value's address does. See Note [Hash witnesses].
                 let val1 = *witness.value.cast::<LBoxed<'_, '_>>();
 
-                // The witness is at the instruction's key.
-                #[cfg(debug_assertions)]
-                {
-                    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-                    let Ok(const_key) = Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, key as u16) else { unreachable!() };
-                    let found = tab.ro(owner).hash.get(&LCanon::constant(const_key)).unwrap();
-                    assert!(core::ptr::eq(found, witness.value.cast::<LBoxed<'_, '_>>()));
-                }
-
                 debug!("gettable_href fetched {val1:?}");
                 *dest = val1;
             });
-            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, c, &[b, a])));
+            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, &[a])));
             yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
         } else {
             // An integer key in the array part, in a register or a constant (its
@@ -1466,7 +1457,9 @@ pub enum Residual {
     Jump(BlockId),
     Thunk(ThunkRef),
     Ret(Pc, u8, u16),
-    HashGuard { tab: usize, href: HashRef, expected: LType },
+    /// Whether the witness `href`'s index in the table in `tab` still holds its
+    /// key, `key` (canonical bits), with a value of type `expected`.
+    HashGuard { tab: usize, href: HashRef, key: u64, expected: LType },
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
@@ -2355,7 +2348,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let Some((index, key, val)) = tab.ro(owner).hash.get_full(&LCanon::new((&hkey.key).into(), state.intern)) else {
                 // The table doesn't have this key, which means we should actually just bailout
                 let fail_block = vm.new_block(pc.0);
-                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), thunk_coro, ResumeArg::Failed, block_id) {
+                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), thunk_coro, ResumeArg::Failed, fail_block) {
                     vm.compile(owner, succ_next, succ_ty, fail_block);
                 }
                 vm.jump_thunk(block_id, thunk_pc, fail_block);
@@ -2487,7 +2480,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let proto = lclos.ro(owner).prototype.cast();
                 vm.blocks[check_block.0].instructions.push(Residual::LuaGuard { idx: tab, ptr: proto });
             }else {
-                vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), expected: expected.as_ltype() });
+                let key = LCanon::constant(&thunk_ctx.hkeys[href.0 as usize].key).boxed().bits();
+                vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected: expected.as_ltype() });
             }
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
             vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
@@ -3038,11 +3032,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
-                Residual::HashGuard { tab, href, expected } => {
+                Residual::HashGuard { tab, href, key, expected } => {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let LValue::Table(tab) = state.vals[state.base + tab].unbox() else { unreachable!() };
-                    let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
-                    if val.unbox().typeof_() == expected {
+                    let entry = tab.ro(owner).hash.get_index(hwit.index);
+                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && val.unbox().typeof_() == expected) {
                         // Fallthrough
                         off += 2;
                     } else {

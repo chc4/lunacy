@@ -119,7 +119,7 @@ impl JitHelper {
             hwit.epoch == tab.ro(owner).epoch
         }
     }
-    pub unsafe extern "C" fn check_hash_guard(state: *mut (), tab: usize, href: u8, expected: u8) -> bool {
+    pub unsafe extern "C" fn check_hash_guard(state: *mut (), tab: usize, href: u8, expected: u8, key: u64) -> bool {
         unsafe {
             let state = state as *mut RunState;
             // Forge an owner
@@ -129,8 +129,9 @@ impl JitHelper {
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize];
             let tab_val = rs.vals[rs.base + tab].unbox();
             let LValue::Table(tab) = tab_val else { unreachable!() };
-            let Some((key, val)) = tab.ro(owner).hash.get_index(hwit.index) else { unreachable!() };
-            (val.unbox().typeof_() as u8) == expected
+            // The witness's index still holds its key, with a value of the type.
+            let entry = tab.ro(owner).hash.get_index(hwit.index);
+            entry.is_some_and(|(k, val)| k.boxed().bits() == key && (val.unbox().typeof_() as u8) == expected)
         }
     }
 
@@ -1408,7 +1409,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
-                Residual::HashGuard { tab, href, expected } => {
+                Residual::HashGuard { tab, href, key, expected } => {
                     let href_u8 = href.0;
                     let expected_u8 = *expected as u8;
                     dynasm!(ops
@@ -1417,6 +1418,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rsi, WORD (*tab as i32)
                         ; mov rdx, WORD (href_u8 as i32)
                         ; mov rcx, WORD (expected_u8 as i32)
+                        ; mov r8, QWORD (*key as i64)
                         ; call extern (JitHelper::check_hash_guard as *const () as usize)
                         ; test al, al
                         ; jnz =>insts[off + 2]

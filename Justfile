@@ -318,7 +318,7 @@ hyperfine-vs ref benchmark times='10':
     cargo build --release --bin bench
     just _compare-worktree {{ref}}
     cd target/compare/{{ref}} && cargo build --release --bin bench
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-vs-{{ref}}.md \
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
         "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \
         "./target/release/bench {{benchmark}}.bin {{times}}"
 # Compare this checkout's release build with and without cargo feature
@@ -341,9 +341,22 @@ hyperfine-unsafe benchmark: unsafe-compile
         "./target/unsafe/bench {{benchmark}}.bin"
 
 
-# `hyperfine` over the benchmarks lunacy runs, each run enough times for a
+# The benchmarks lunacy runs, as `benchmark:times`, each run enough times for a
 # stable mean; life twice, as for `hyperfines-traces`. euler14's count is the
 # bound of its search.
-hyperfines: (hyperfine "life" "1000") (hyperfine "life" "5000") (hyperfine "nbody" "10") (hyperfine "queens" "3000") (hyperfine "fannkuch_redux" "150") (hyperfine "euler14" "1000000") (hyperfine "nsieve_bit" "10")
+HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10"
+
+# `hyperfine` over HYPERFINES.
+hyperfines:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do just hyperfine ${run%:*} ${run#*:}; done
+
+# `hyperfine-vs ref` over HYPERFINES, then every comparison's table.
+hyperfines-vs ref:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do just hyperfine-vs {{ref}} ${run%:*} ${run#*:}; done
+    for run in {{HYPERFINES}}; do tail -n 2 hyperfine-${run%:*}-${run#*:}-vs-{{ref}}.md; done
 
 all: test benchmarks (hyperfine "binarytrees")
