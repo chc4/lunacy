@@ -533,6 +533,22 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
     }
 }
 
+/// What a store through a hash key's witness does to its field's type, which
+/// the context knows as the hash key's type (`known_type`). See Note [Hash
+/// witnesses].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
+pub enum Retype {
+    /// The value has the field's known type.
+    Same,
+    /// The value has another known type, which becomes the field's: the table
+    /// moves to a new epoch, and the witness with it.
+    Known,
+    /// The value's type is unknown, and the field keeps its known type
+    /// (`UpdateHashRef`): the table moves to a new epoch but the witness
+    /// doesn't, so the next access checks the field's type (`HashGuard`).
+    Unknown,
+}
+
 pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -610,24 +626,20 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = ResumeArg::Failed;
             arg = yield YieldOp::TryHashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
-                arg = yield YieldOp::TypeofRk(c);
-                let mut mismatched_type = None;
-                if let ResumeArg::Type(t) = arg {
-                    // A table holds an integer constant as a double. See Note [Integers].
-                    let t = if t == CType::Integer { CType::Type(LType::Number) } else { t };
-                    if t != htype {
-                        mismatched_type = Some(t);
-                    } else {
-                        // The value we're setting is statically known to be the same type as our
-                        // hashkey, and so everything is fine
-                    }
+                let ResumeArg::Type(new_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
+                // A table holds an integer constant as a double. See Note [Integers].
+                let new_type = if new_type == CType::Integer { CType::Type(LType::Number) } else { new_type };
+                let retype = if new_type == htype {
+                    Retype::Same
+                } else if new_type == CType::Type(LType::Unknown) {
+                    Retype::Unknown
                 } else {
-                    mismatched_type = Some(CType::Type(LType::Unknown));
-                }
+                    Retype::Known
+                };
 
                 // Store through the witness; retyping the key's value moves the
-                // table (and so the witness) to a new epoch.
-                fn store<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, href: u8, expected: LType, retype: bool) {
+                // table to a new epoch. See `Retype`.
+                fn store<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, href: u8, expected: LType, retype: Retype) {
                     let hidx = state.witness_base + href as usize;
                     let witness = state.hash_witnesses[hidx];
                     debug!("settable_href with {:?} {:?}", &witness, expected);
@@ -639,22 +651,24 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     #[cfg(debug_assertions)]
                     assert!(val1.unbox().typeof_() == expected);
                     *val1 = value;
-                    if retype {
-                        tab.rw(owner).epoch += 1;
-                        // This is safe because we're statically updating the known type as well.
-                        state.hash_witnesses[hidx].epoch = tab.rw(owner).epoch;
+                    match retype {
+                        Retype::Same => {}
+                        Retype::Known => {
+                            tab.rw(owner).epoch += 1;
+                            state.hash_witnesses[hidx].epoch = tab.rw(owner).epoch;
+                        }
+                        Retype::Unknown => tab.rw(owner).epoch += 1,
                     }
                 }
                 let expected = htype.as_ltype();
-                let retype = mismatched_type.is_some();
                 if c & 0x100 == 0 {
-                    windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: bool], |owner, state, base| (table, value) {
+                    windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, state, base| (table, value) {
                         store(owner, state, table, value, href, expected, RETYPE);
                     });
-                    arg = yield YieldOp::ExecWindow(if retype {
-                        Rc::new(SetTableHref::<true>::new(hb.0, expected, &[a, c]))
-                    } else {
-                        Rc::new(SetTableHref::<false>::new(hb.0, expected, &[a, c]))
+                    arg = yield YieldOp::ExecWindow(match retype {
+                        Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
+                        Retype::Known => Rc::new(SetTableHref::<{ Retype::Known }>::new(hb.0, expected, &[a, c])),
+                        Retype::Unknown => Rc::new(SetTableHref::<{ Retype::Unknown }>::new(hb.0, expected, &[a, c])),
                     });
                 } else {
                     arg = yield YieldOp::Exec(ResidualExec::new("settable_href", Rc::new(move |owner, state| {
@@ -666,13 +680,12 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         store(owner, state, table, value, hb.0, expected, retype);
                     })));
                 }
-                if let Some(new_type) = mismatched_type {
-                    // We statically know we will increment the epoch, so update the hashkey's
-                    // known type. This also will set hazards.
-                    arg = yield YieldOp::UpdateHashRef(hb, new_type);
-                } else {
-                    arg = yield YieldOp::SetHazards(Some(a), Some(hb));
-                }
+                arg = match retype {
+                    Retype::Same => yield YieldOp::SetHazards(Some(a), Some(hb)),
+                    // The table moves to a new epoch: the hash key's known type
+                    // is the value's, if known. This also sets hazards.
+                    Retype::Known | Retype::Unknown => yield YieldOp::UpdateHashRef(hb, new_type),
+                };
             } else {
                 arg = yield YieldOp::Exec(ResidualExec::new("settable_hash", Rc::new(move |owner, state| {
                     let kb: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
@@ -2549,8 +2562,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // the slot is free to be reused (and it doesn't really make sense).
                     // Instead, we ignore the update and keep using the old type: there's
                     // a chance the unknown static type is in fact still our old type and
-                    // we just didn't know, and if there is a runtime mismatch we will hit
-                    // a type guard anyway.
+                    // we just didn't know, and if there is a runtime mismatch the next
+                    // access's type guard finds it, as the store left the witness at the
+                    // old epoch (`Retype::Unknown`).
                     let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
                     if *ty != CType::Type(LType::Unknown) {
                         hkey.known_type = ty.clone();
