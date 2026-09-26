@@ -77,6 +77,15 @@ stencil-sizes: unsafe-compile
     cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
     python3 tools/stencil_sizes.py target/release/bench target/unsafe/bench
 
+# Cold code in every window op's stencil (see tools/stencil_cold.py), in the
+# release and unsafe builds, and every stencil's assembly in
+# stencils-release.s and stencils-unsafe.s.
+stencil-cold: unsafe-compile
+    cargo build --release --bin bench
+    cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
+    python3 tools/stencil_cold.py target/release/bench --dump stencils-release.s
+    python3 tools/stencil_cold.py target/unsafe/bench --dump stencils-unsafe.s
+
 # A benchmark's JIT code, disassembled when the VM drops it and annotated with
 # what emitted it (regions, blocks, residuals, thunk stubs, the blocks and
 # helpers branches go to), in jit_disasm.txt.
