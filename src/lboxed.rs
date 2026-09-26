@@ -50,7 +50,6 @@ pub(crate) struct NClosureCell {
     pub(crate) native: NativeFunc,
     /// The native's window op for a call, if it offers one. See Note [Native
     /// windows] in `library`.
-    #[cfg(feature = "lbbv")]
     pub(crate) window: Option<crate::vm::NativeWindow>,
 }
 
@@ -62,14 +61,12 @@ impl NClosureCell {
         Box::leak(Box::new(NClosureCell {
             kind: LBoxed::KIND_NCLOSURE,
             native,
-            #[cfg(feature = "lbbv")]
             window: None,
         }))
     }
 
     /// `leak`, for a native offering window ops. See Note [Native windows] in
     /// `library`.
-    #[cfg(feature = "lbbv")]
     pub(crate) fn leak_windowed(native: NativeFunc, window: crate::vm::NativeWindow) -> &'static NClosureCell {
         Box::leak(Box::new(NClosureCell { kind: LBoxed::KIND_NCLOSURE, native, window: Some(window) }))
     }

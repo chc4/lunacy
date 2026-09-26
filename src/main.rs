@@ -7,8 +7,6 @@ use lunacy::vm;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const LBBV: bool = true;
-
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder().format_timestamp(None).format_source_path(true).init();
     let mut owner = Owner::new();
@@ -23,7 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         vm.scope(&intern_strings, &mut owner, |s, owner| -> Result<(), Box<dyn Error>> {
             let _g = s.global_env();
             let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
-            let _r_vals = s.run::<LBBV>(owner, _g.clone(), clos, vec![].into())?;
+            let _r_vals = s.run(owner, _g.clone(), clos, vec![].into())?;
             Ok(())
         })?;
     }

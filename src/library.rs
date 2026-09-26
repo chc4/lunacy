@@ -11,7 +11,6 @@ use smallvec::{smallvec, SmallVec};
 use crate::gc::Gc;
 use crate::lboxed::LBoxed;
 use crate::vm::{FVec, IStr, InternString, InternedHasher, LType, LValue, NClosure, Table, Tc};
-#[cfg(feature = "lbbv")]
 use crate::vm::NativeOp;
 
 // Note [Library natives]
@@ -55,13 +54,10 @@ thread_local! {
 /// [Native windows].
 macro_rules! native {
     (window: $window:expr, |$owner:ident, $args:ident| $body:expr) => {{
-        #[cfg(feature = "lbbv")]
         let native = match native!(|$owner, $args| $body) {
             LValue::NClosure(n) => LValue::NClosure(NClosure::windowed(n.native(), $window)),
             _ => unreachable!(),
         };
-        #[cfg(not(feature = "lbbv"))]
-        let native = native!(|$owner, $args| $body);
         native
     }};
     (|$owner:ident, $args:ident| $body:expr) => {
@@ -191,24 +187,20 @@ fn bit2<const OP: u8>(x: i32, y: i32) -> i32 {
     }
 }
 
-#[cfg(feature = "lbbv")]
 crate::window::windowed!(BitUnary, [], [OP: u8], |owner, state, base| (x, out r) {
     // An integer converted. See Note [Arithmetic NaNs] in `lboxed`.
     *r = LBoxed::from_arith(bit1::<OP>(to_bit(checked_number(x))) as f64);
 });
-#[cfg(feature = "lbbv")]
 crate::window::windowed!(BitBinary, [], [OP: u8], |owner, state, base| (x, y, out r) {
     *r = LBoxed::from_arith(bit2::<OP>(to_bit(checked_number(x)), to_bit(checked_number(y))) as f64);
 });
 
 /// `bit1::<OP>` as a window op, for a call with one number and one result.
-#[cfg(feature = "lbbv")]
 fn bit1_window<const OP: u8>(a: usize, b: u16, c: u16) -> Option<NativeOp> {
     (b == 2 && c == 2).then(|| NativeOp { window: std::rc::Rc::new(BitUnary::<OP>::new(&[a + 1, a])), args: LType::Number, result: LType::Number })
 }
 
 /// `bit2::<OP>` as a window op, for a call with two numbers and one result.
-#[cfg(feature = "lbbv")]
 fn bit2_window<const OP: u8>(a: usize, b: u16, c: u16) -> Option<NativeOp> {
     (b == 3 && c == 2).then(|| NativeOp { window: std::rc::Rc::new(BitBinary::<OP>::new(&[a + 1, a + 2, a])), args: LType::Number, result: LType::Number })
 }

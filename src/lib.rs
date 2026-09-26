@@ -28,13 +28,9 @@ pub mod stack;
 pub mod lboxed;
 pub mod vm;
 pub mod perf;
-// The generator (lazy basic-block versioner / specializer) compiles with the
-// `lbbv` feature; the native code generator adds `jit` on top. Interpreter-only
-// builds (`--no-default-features --features magic`) enable neither and stay
-// entirely in `vm::run`.
-#[cfg(feature = "lbbv")]
+// The generator (lazy basic-block versioner / specializer) runs every closure;
+// the native code generator (feature `jit`) compiles its hot blocks.
 pub mod generator;
-#[cfg(feature = "lbbv")]
 pub mod window;
 #[cfg(feature = "jit")]
 pub mod window_alloc;

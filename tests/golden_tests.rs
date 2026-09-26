@@ -117,7 +117,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
             let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
             let args = vec![].into();
 
-            s.run::<true>(owner, _g.clone(), clos, args).expect("VM failed");
+            s.run(owner, _g.clone(), clos, args).expect("VM failed");
             CAPTURED.with(|c| c.ro(owner).clone())
         })
     };

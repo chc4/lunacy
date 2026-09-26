@@ -555,7 +555,20 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         arg = yield YieldOp::Guard(a, LType::Table);
         if arg != ResumeArg::Matched {
             arg = yield YieldOp::Exec(ResidualExec::new("settable_meta", Rc::new(move |owner, state| {
-                panic!("settable_meta {:?}", state.vals)
+                let key: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
+                    Ok(b) => LValue::from(b),
+                    Err(lv) => lv.unbox(),
+                };
+                // The debugging key `closure.__jit = ...` (feature `magic`): the
+                // closure's entry blocks compile when next entered. See
+                // `Specializer::force_jit`.
+                match (state.vals[state.base + a].unbox(), key) {
+                    #[cfg(feature = "magic")]
+                    (LValue::LClosure(lc), LValue::InternedString(key)) if key.as_bytes() == b"__jit" => {
+                        state.force_jit.push(lc.ro(owner).prototype);
+                    },
+                    _ => panic!("settable_meta {:?}", state.vals),
+                }
             })));
             arg = yield YieldOp::SetHazards(None, None);
             return arg;
@@ -1235,17 +1248,18 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
 pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        for i in (b as usize)..=(c as usize) {
-            // Weird, but we can do it
-            arg = yield YieldOp::Guard(i, LType::String);
-        }
+        // A number operand converts to a string, from a double. See Note [Integers].
+        yield YieldOp::Demote(b..c + 1);
         arg = yield YieldOp::Exec(ResidualExec::new("concat", Rc::new(move |owner, state| {
             let mut s: FVec<_> = vec![].into();
             for i in (b as usize)..=(c as usize) {
                 match state.vals[state.base + i as usize].unbox() {
                     LValue::OwnedString(g) => s.extend_from_slice(g.as_slice()),
                     LValue::InternedString(is) => s.extend_from_slice(is.as_bytes()),
-                    _ => unreachable!(),
+                    value => {
+                        let Some(part) = value.as_string(owner) else { panic!("attempt to concatenate {value:?}") };
+                        s.extend_from_slice(part.as_slice());
+                    },
                 }
             }
             debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
@@ -1317,13 +1331,125 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
     }
 }
 
+// Note [Captured slots]
+// ~~~~~~~~~~~~~~~~~~~~~
+// A closure's upvalue is a cell shared by every closure capturing the same
+// variable: while the variable's frame runs, the cell is open, naming its stack
+// slot, and when the frame returns, `close_upvalues` closes it, moving the
+// slot's value into it. A CLOSURE's pseudo-instructions say where each upvalue
+// comes from: a MOVE a slot of the running frame, whose open cell the closure
+// shares with any other capturing it (`RunState::upvals`), and a GETUPVAL the
+// running closure's own upvalue, the same cell.
+//
+// A closure may read or write a slot it captured whenever it runs, which is
+// during a call: so a slot any CLOSURE of a function captures (`captured_slots`)
+// is demoted before each call, and before a return (which closes it), and its
+// type forgotten after each call. Nothing outside LBBV code then sees an
+// integer, and no context types a captured slot with what a call may have
+// changed. See Note [Integers].
+//
+// GETUPVAL and SETUPVAL read and write an open cell's slot in memory, never the
+// register window: it is a slot of an enclosing frame, below the running one's.
+
+/// The slots of `proto`'s frame some CLOSURE in it captures. See Note [Captured
+/// slots].
+pub fn captured_slots<'src, C>(proto: &crate::chunk::FunctionBlock<'src, C>) -> Vec<usize> {
+    let code = &proto.instructions.items;
+    let mut captured = vec![];
+    for (pc, inst) in code.iter().enumerate() {
+        if inst.0.Opcode() == Opcode::CLOSURE {
+            let (_, bx) = crate::vm::ABx::unpack(inst.0);
+            let upvalues = proto.prototypes.items[bx as usize].upval_count as usize;
+            for pseudo in &code[pc + 1..pc + 1 + upvalues] {
+                if pseudo.0.Opcode() == Opcode::MOVE {
+                    captured.push(crate::vm::AB::unpack(pseudo.0).1 as usize);
+                }
+            }
+        }
+    }
+    captured.sort();
+    captured.dedup();
+    captured
+}
+
+/// `R(A) := closure(KPROTO[Bx], R(A), ... ,R(A+n))`: a closure of the function's
+/// prototype `bx`, its upvalues from the `upvalues` pseudo-instructions after it,
+/// continuing at `next`, the instruction after them. See Note [Captured slots].
+pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        let skip = !upvalues.is_empty();
+        let upvalues = upvalues.clone();
+        arg = yield YieldOp::Exec(ResidualExec::new("closure", Rc::new(move |owner, state| {
+            let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx] };
+            let mut fresh = LClosure::new(proto as *const _);
+            for &(from, b) in upvalues.iter() {
+                let cell = if from == Opcode::MOVE {
+                    let slot = state.base + b;
+                    let open = state.upvals.iter().find(|(upval, _)| matches!(upval, Upvalue::Open(o) if *o == slot));
+                    match open {
+                        Some((_, uses)) => uses[0].clone(),
+                        None => {
+                            let cell = Tc::new(Upvalue::Open(slot));
+                            state.upvals.push((Upvalue::Open(slot), vec![cell.clone()].into()));
+                            cell
+                        }
+                    }
+                } else {
+                    state.clos.ro(owner).upvalues[b].clone()
+                };
+                fresh.upvalues.push(cell);
+            }
+            state.vals[state.base + a] = LBoxed::box_lvalue(LValue::LClosure(Tc::new(fresh)));
+        })));
+        yield YieldOp::SetTypes(vec![(a, LType::Closure)]);
+        yield YieldOp::CollectGarbage;
+        if skip {
+            arg = yield YieldOp::GetBlock(next);
+            let ResumeArg::BlockId(target) = arg else { unreachable!() };
+            arg = yield YieldOp::Jump(target);
+        }
+        arg
+    }
+}
+
+/// Store into a closed upvalue's cell. Out of line: its write barrier's marking
+/// dispatches through a jump table, which a stencil can't hold.
+#[inline(never)]
+fn set_closed<'src, 'intern>(owner: &mut Owner, cell: Tc<LBoxed<'src, 'intern>>, value: LBoxed<'src, 'intern>) {
+    cell.replace(owner, value);
+}
+
+/// `UpValue[B] := R(A)`. See Note [Captured slots].
+pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        // An upvalue holds any value. See Note [Integers].
+        yield YieldOp::Demote(a..a + 1);
+        windowed!(SetUpval, [index: usize], [], |owner, state, base| (value) {
+            let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
+            match upval {
+                Upvalue::Open(o) => {
+                    assert!(o < state.base, "open upvalue in the running frame");
+                    state.vals[o] = value;
+                },
+                Upvalue::Closed(c) => set_closed(owner, c, value),
+            }
+        });
+        arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, &[a])));
+        arg
+    }
+}
+
+/// `R(A+1) := R(B); R(A) := R(B)[RK(C)]`: the move first, as the method's load
+/// overwrites `R(B)` when `B` is `A`.
 pub fn emit_self(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        let mut getmem = emit_gettable(a, b, c);
-        drain!(getmem, arg);
         let mut moveself = emit_move(a + 1, b);
         drain!(moveself, arg);
+        let mut getmem = emit_gettable(a, b, c);
+        drain!(getmem, arg);
         ResumeArg::Start
     }
 }
@@ -1586,8 +1712,8 @@ impl std::fmt::Display for CType {
 // not -0, held in the integer encoding (Note [Integer encoding] in `lboxed`): a
 // stack slot is in the integer encoding exactly when its context types it
 // `Integer`. Every other number is a double, and nothing outside LBBV code
-// sees an integer: no closure captures a slot of a frame LBBV runs, as it has
-// no CLOSURE.
+// sees an integer: a slot a closure captures is demoted wherever the closure
+// could read it. See Note [Captured slots].
 //
 // They are found by demand: an op that wants an integer (a table key,
 // FORPREP's operands) yields `GuardCType(slot, Integer)`, which answers
@@ -2064,6 +2190,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
+                Opcode::SETUPVAL => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setupval(a as usize, b as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::CLOSURE => {
+                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                    let proto = unsafe { &*self.clos.ro(owner).prototype };
+                    let count = proto.prototypes.items[bx as usize].upval_count as usize;
+                    let upvalues = proto.instructions.items[pc + 1..pc + 1 + count].iter()
+                        .map(|pseudo| (pseudo.0.Opcode(), crate::vm::AB::unpack(pseudo.0).1 as usize))
+                        .collect();
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_closure(a as usize, bx as usize, upvalues, pc + 1 + count)), ResumeArg::Start, block_id)
+                },
                 Opcode::SELF => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_self(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
@@ -2108,6 +2247,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     let end = if b == 0 { usize::MAX } else { a as usize + b as usize - 1 };
                     self.demote(block_id, &mut ctx, a as usize..end);
+                    // Returning closes the frame's upvalues. See Note [Captured slots].
+                    for slot in captured_slots(unsafe { &*self.clos.ro(owner).prototype }) {
+                        self.demote(block_id, &mut ctx, slot..slot + 1);
+                    }
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b)); None
                 },
@@ -2852,11 +2995,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // A native run as a window op, with its arguments of the type it
                             // assumes, gives its result's type. See Note [Native windows].
                             let mut result = None;
-                            if let CType::NativeFunction(nf) = &ctx.types[a] {
-                                let op = nf
+                            let window = match &ctx.types[a] {
+                                CType::NativeFunction(nf) => nf
                                     .window(a, b as u16, c as u16)
-                                    .filter(|op| (a + 1..a + b).all(|slot| ctx.types[slot].as_ltype() == op.args));
-                                if let Some(op) = op {
+                                    .filter(|op| (a + 1..a + b).all(|slot| ctx.types[slot].as_ltype() == op.args)),
+                                _ => None,
+                            };
+                            // Any other call may run a closure, which reads and writes the
+                            // slots it captured. See Note [Captured slots].
+                            let captured = if window.is_none() {
+                                captured_slots(unsafe { &*self.clos.ro(owner).prototype })
+                            } else {
+                                vec![]
+                            };
+                            for &slot in &captured {
+                                self.demote(block_id, &mut ctx, slot..slot + 1);
+                            }
+                            if let CType::NativeFunction(nf) = &ctx.types[a] {
+                                if let Some(op) = window {
                                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op.window));
                                     result = Some(op.result);
                                 } else {
@@ -2885,6 +3041,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // every register from `a` on: their types are unknown.
                             // TODO: compile a type specialized thunk instead? is that better?
                             let clobbered: Vec<(usize, CType)> = (a..ctx.types.len())
+                                .chain(captured.into_iter().filter(|&slot| slot < a))
                                 .map(|idx| (idx, CType::Type(LType::Unknown)))
                                 .collect();
                             Rc::make_mut(&mut ctx).set_types(owner, clobbered);
@@ -2938,7 +3095,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut Owner, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, Option<FVec<LBoxed<'src, 'intern>>>) {
+    pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut Owner, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, FVec<LBoxed<'src, 'intern>>) {
         let mut off: usize = 0;
         debug!("run");
         // Republish on entry: `state` was moved into this frame (the caller's pointer is now
@@ -2972,6 +3129,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     warn!("running jit for {id:?} with base_ptr {base_ptr:p}");
                     state.trap = false;
                     let ret = jit_entry(&mut state, base_ptr);
+                    #[cfg(feature = "magic")]
+                    if !state.force_jit.is_empty() {
+                        self.force_jit(&mut state);
+                    }
                     let next_off = (ret >> 32) as i32 as isize;
                     let next_id = (ret & 0xFFFFFFFF) as usize;
                     self.clos = state.clos.clone();
@@ -3006,10 +3167,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off = state.current_off as usize;
                         // Fallthrough to immediately handle the instruction: if we have a
                         // thunk at offset=0, we don't want to jump back to the JIT again.
-                    } else if next_off == -5 {
-                        // Returning to interpreter
-                        debug!("jit bailout to interpreter");
-                        return (state, None);
                     }
                 }
             }
@@ -3092,6 +3249,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Exec(f) => {
                     off += 1;
                     (f.body)(owner, &mut state);
+                    #[cfg(feature = "magic")]
+                    if !state.force_jit.is_empty() {
+                        self.force_jit(&mut state);
+                    }
                 },
                 Residual::ExecWindow(w) => {
                     off += 1;
@@ -3105,7 +3266,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     // Safety: transmute the 'static lifetime back down. This is always shorter.
                     let lclos: Tc<LClosure<'src, 'intern>> = unsafe { core::mem::transmute(lclos) };
-                    let next_stack = state.call_lua(owner, ReturnLocation::Generator(id, off).pack(), a, b, c);
+                    let next_stack = state.call_lua(owner, ReturnLocation(id, off).pack(), a, b, c);
                     // Either use existing block, compile a new one, or use most
                     // generic.
                     let types = vec![LType::Unknown; next_stack];
@@ -3130,7 +3291,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("{:?}", to_call);
                     // push where to return to once we RETURN
                     if let LValue::LClosure(ref lclos) = to_call {
-                        let next_stack = state.call_lua(owner, ReturnLocation::Generator(id, off).pack(),
+                        let next_stack = state.call_lua(owner, ReturnLocation(id, off).pack(),
                             a as u16, b as u16, c as u16
                         );
                         // Either use existing block, compile a new one, or use most
@@ -3165,17 +3326,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Ret(pc, a, b) => {
                     debug!("spec final blocks: {:?}", self.blocks);
                     match state.do_return(owner, a as usize, b as usize) {
-                        Ok(ReturnLocation::Interpreter(caller)) => {
-                            state.pc = caller;
-                            return (state, None);
-                        },
-                        Ok(ReturnLocation::Generator(block, disp)) => {
+                        Ok(ReturnLocation(block, disp)) => {
                             self.set_current(state.clos.clone());
                             id = block;
                             off = disp;
                         },
+                        // The entry closure returned. See `Vm::run`.
                         Err(r_vals) => {
-                            return (state, Some(r_vals));
+                            return (state, r_vals);
                         },
                     }
                 },
@@ -3188,6 +3346,27 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     unsafe { gc.step(&state, &*self, owner); }
                 },
             }
+        }
+    }
+
+    /// Force the entry blocks of the prototypes `closure.__jit = ...` named (feature
+    /// `magic`): each version of one compiles when next entered, with the blocks
+    /// reachable from it, which keep their hotness, for building traces. Without
+    /// the JIT there is nothing to compile.
+    #[cfg(feature = "magic")]
+    fn force_jit(&mut self, state: &mut RunState<'src, 'intern>) {
+        for proto in state.force_jit.drain(..) {
+            #[cfg(feature = "jit")]
+            if let Some(versions) = self.versions.get(&proto) {
+                for ((pc, _), block) in versions.iter() {
+                    if *pc == SubPc::new(0) {
+                        warn!("Forcing JIT for block {}", block.0);
+                        self.blocks[block.0].jit_info.hotness.set(0);
+                    }
+                }
+            }
+            #[cfg(not(feature = "jit"))]
+            let _ = proto;
         }
     }
 

@@ -22,12 +22,10 @@ use indexmap::IndexMap;
 use qcell::{LCell, LCellOwner};
 use crate::{TLCell, TlcOwner, Owner};
 
-#[cfg(feature = "lbbv")]
 use crate::generator::{Specializer, Context, SubPc};
 
-// `BlockId` and `HashRef` are referenced by `ReturnLocation` / `HashWitness`,
-// which exist in every build, so they live here rather than in the
-// lbbv-gated generator module (which re-imports them).
+// `BlockId` and `HashRef` are referenced by `ReturnLocation` / `HashWitness`, so they
+// live here rather than in the generator module (which re-imports them).
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Debug)]
 pub struct BlockId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -936,12 +934,10 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
 pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner) -> usize;
 /// A native's window op for a call to it (the `CALL`'s `a`, `b`, `c`), if it
 /// has one for that call's arity. See Note [Native windows] in `library`.
-#[cfg(feature = "lbbv")]
 pub type NativeWindow = fn(a: usize, b: u16, c: u16) -> Option<NativeOp>;
 
 /// A call to a native run as a window op: the op, the type every argument must
 /// have for it (the op assumes it), and its result's type.
-#[cfg(feature = "lbbv")]
 pub struct NativeOp {
     pub window: std::rc::Rc<dyn crate::window::Window>,
     pub args: LType,
@@ -997,13 +993,11 @@ impl NClosure {
     }
 
     /// A native that runs as a window op where `window` gives one.
-    #[cfg(feature = "lbbv")]
     pub fn windowed(native: NativeFunc, window: NativeWindow) -> Self {
         NClosure { cell: NClosureCell::leak_windowed(native, window) }
     }
 
     /// The window op a call `a`, `b`, `c` to this native runs as, if any.
-    #[cfg(feature = "lbbv")]
     pub fn window(&self, a: usize, b: u16, c: u16) -> Option<NativeOp> {
         self.cell.window.and_then(|window| window(a, b, c))
     }
@@ -1057,17 +1051,17 @@ impl<'gc> Scoped<'gc> {
         self.vm().global_env(self.intern())
     }
 
-    /// Enter the interpreter — the only way in, since `Vm::run` is crate-private. See Note
-    /// [Scoped heap].
+    /// Run a closure — the only way in, since `Vm::run` is crate-private. See Note [Scoped
+    /// heap].
     #[inline]
-    pub fn run<const LBBV: bool>(
+    pub fn run(
         &self,
         owner: &mut Owner,
         _G: Tc<Table<'gc, 'gc>>,
         clos: Tc<LClosure<'gc, 'gc>>,
         args: ValueStack<'gc, 'gc>,
     ) -> Result<FVec<LValue<'gc, 'gc>>, Box<dyn Error>> {
-        self.vm().run::<LBBV>(self.gc, owner, _G, clos, args, self.intern())
+        self.vm().run(self.gc, owner, _G, clos, args, self.intern())
     }
 }
 
@@ -1091,11 +1085,10 @@ impl Drop for ScopeGuard {
     fn drop(&mut self) { IN_SCOPE.with(|f| f.set(false)); }
 }
 
+/// Where a call returns to: a specializer block and the offset of the residual after the
+/// call in it.
 #[derive(Debug)]
-pub enum ReturnLocation {
-    Interpreter(usize),
-    Generator(BlockId, usize),
-}
+pub struct ReturnLocation(pub BlockId, pub usize);
 
 /// A [`ReturnLocation`] packed into a single register-sized word (see
 /// [`ReturnLocation::pack`]). `#[repr(transparent)]` over `usize`, so it crosses the
@@ -1114,23 +1107,15 @@ impl PackedLocation {
 
 impl ReturnLocation {
     /// Pack into a `PackedLocation` so it can cross the JIT/`extern "C"` boundary
-    /// without passing a `repr(Rust)` enum by value. Bit 63 selects the variant;
-    /// `Generator` packs `(off << 32) | block` in the low bits (the same layout the
-    /// JIT's `lua_return` already uses for its return encoding).
+    /// without passing a `repr(Rust)` struct by value: `(off << 32) | block`, the
+    /// layout the JIT's `lua_return` uses for its return encoding.
     pub fn pack(self) -> PackedLocation {
-        PackedLocation(match self {
-            ReturnLocation::Interpreter(pc) => pc,
-            ReturnLocation::Generator(BlockId(block), off) => (1usize << 63) | (off << 32) | block,
-        })
+        let ReturnLocation(BlockId(block), off) = self;
+        PackedLocation((off << 32) | block)
     }
 
     pub fn unpack(p: PackedLocation) -> Self {
-        let p = p.0;
-        if (p >> 63) == 1 {
-            ReturnLocation::Generator(BlockId(p & 0xffff_ffff), (p >> 32) & 0x7fff_ffff)
-        } else {
-            ReturnLocation::Interpreter(p)
-        }
+        ReturnLocation(BlockId(p.0 & 0xffff_ffff), p.0 >> 32)
     }
 }
 
@@ -1236,6 +1221,10 @@ pub struct RunState<'src, 'intern> {
     pub trap: bool,
     pub current_off: u16,
     pub gas: i64,
+    /// Prototypes whose entry blocks `closure.__jit = ...` asked to compile, for
+    /// `Specializer::run` to force (feature `magic`). See `emit_settable`.
+    #[cfg(feature = "magic")]
+    pub force_jit: FVec<LProto<'src, 'intern>>,
     /// Intern arena for canonicalizing owned strings at box time.
     pub intern: &'intern internment::Arena<IStr<'src>>,
 }
@@ -1255,20 +1244,23 @@ impl<'src, 'intern> Debug for RunState<'src, 'intern> {
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
+    /// Close the running frame's open upvalues, the slots from `base` up: each takes the
+    /// slot's value into a cell of its own, as it leaves the stack. An enclosing frame's
+    /// stay open. See Note [Captured slots] in `generator`.
     pub fn close_upvalues(&mut self, owner: &mut Owner)
     {
-        for upval in self.upvals.iter() {
-            let idx = match &upval.0 {
-                Upvalue::Open(o) => o,
-                Upvalue::Closed(u) => panic!(), // we shouldn't have any closed upvals
-            };
-            // migrate all the stack references to be GC references, since we're
-            // going to be removing it from the stack
-            let closed = Tc::new(self.vals[*idx].clone());
-            for up_use in upval.1.iter() {
+        let (base, vals) = (self.base, &self.vals);
+        self.upvals.retain(|(upval, uses)| {
+            let Upvalue::Open(idx) = upval else { unreachable!("a closed upvalue in the open list") };
+            if *idx < base {
+                return true;
+            }
+            let closed = Tc::new(vals[*idx]);
+            for up_use in uses.iter() {
                 up_use.replace(owner, Upvalue::Closed(closed.clone()));
             }
-        }
+            false
+        });
     }
 
     #[inline(always)]
@@ -1351,7 +1343,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         // we're going to be removing this frame, so close any open
         // upvalues.
         self.close_upvalues(owner);
-        self.upvals.truncate(0);
 
         let mut r_count = 0 as usize;
         let mut r_vals: FVec<_> = if b == 1 {
@@ -1588,9 +1579,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
     }
 
-    /// The interpreter entry, gated behind the scope's `GcCtx` token. Crate-private so the only
-    /// way in is [`Scoped::run`]. See Note [Scoped heap].
-    pub(crate) fn run<'lua, 'gc, const LBBV: bool>(&'lua self,
+    /// Run a closure in the specializer, gated behind the scope's `GcCtx` token. Crate-private
+    /// so the only way in is [`Scoped::run`]. See Note [Scoped heap].
+    pub(crate) fn run<'lua, 'gc>(&'lua self,
         gc: GcCtx<'gc>,
         owner: &mut Owner,
         mut _G: Tc<Table<'src, 'intern>>,
@@ -1605,13 +1596,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LBoxed::NIL);
 
-        #[cfg(feature = "lbbv")]
         let mut spec = Specializer::new(clos.clone());
-        // Interpreter-only builds have no generator to trace; the GC safepoints
-        // still take a "spec" root, so bind a no-op `()` (Mark's default is a
-        // trivial no-op for non-drop types).
-        #[cfg(not(feature = "lbbv"))]
-        let spec = ();
         let mut state = {
             let mut vals = args;
             // The top-level frame occupies the whole allocated register file.
@@ -1638,6 +1623,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 hash_witnesses: vec![].into(),
                 select: 0,
                 trap: false,
+                #[cfg(feature = "magic")]
+                force_jit: vec![].into(),
                 current_off: 0,
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
                 intern,
@@ -1645,397 +1632,21 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         };
         // `gc` is the scope's rooting token, threaded in by `Scoped::run`; the rooting scope
         // stays live for the whole `Vm::scope`. See Note [GC roots].
-        // we need to track where to return to, along with the base pointer and where to put return
-        // values
-        let r_vals = 'int: loop {
-            // SAFETY: at instruction boundaries every live GC value is in the RunState.
-            #[cfg(feature = "gc_stress")]
-            unsafe { gc.step(&state, &spec, owner); }
-
-            let inst = unsafe { state.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[state.pc] };
-            state.pc += 1;
-            state.counters.interpreter_count.increment();
-            debug!("pc {} inst {:?}", state.pc, inst.0.Opcode());
-            debug!("stack: {}, {:?}", state.base, &state.vals);
-            match inst.0.Opcode() {
-                Opcode::MOVE => {
-                    let (a, b) = <MOVE as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("move {} {}", a, b);
-                    state.vals[state.base + a as usize] = state.vals[state.base + b as usize].clone();
-                },
-                Opcode::GETUPVAL => {
-                    let (a, b) = <GETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let upval = match state.clos.ro(owner).upvalues[b as usize].ro(owner) {
-                        Upvalue::Open(o) => {
-                            state.vals[*o as usize].clone()
-                        },
-                        Upvalue::Closed(c) => {
-                            c.ro(owner).clone()
-                        },
-                    };
-                    state.vals[state.base + a as usize] = upval.clone();
-                },
-                Opcode::SETUPVAL => {
-                    let (a, b) = <SETUPVAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let upval = match state.clos.ro(owner).upvalues[b as usize].ro(owner) {
-                        Upvalue::Open(o) => {
-                            state.vals[*o as usize] = state.vals[state.base + a as usize].clone()
-                        },
-                        Upvalue::Closed(c) => {
-                            let c = c.clone();
-                            let new_val = state.vals[state.base + a as usize].clone();
-                            c.replace(owner, new_val);
-                        },
-                    };
-                },
-                Opcode::LOADK => {
-                    let (a, bx) = <LOADK as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("loadk {} {} {:?}", a, bx, unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] });
-                    state.vals[state.base + a as usize] = unsafe { (&(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
-                    ()
-                },
-                Opcode::LOADNIL => {
-                    let (a, b) = <LOADNIL as InstructionDecode>::Unpack::unpack(inst.0);
-                    state.vals[state.base + a as usize..=state.base + b as usize].iter_mut().for_each(|i| *i = LBoxed::NIL);
-                    ()
-                },
-                Opcode::LOADBOOL => {
-                    let (a, b, c) = <LOADBOOL as InstructionDecode>::Unpack::unpack(inst.0);
-                    state.vals[state.base + a as usize] = LBoxed::from_bool(b != 0);
-                    if c != 0 {
-                        state.pc += 1;
-                    }
-                    ()
-                },
-                Opcode::NEWTABLE => {
-                    let (a, b, c) = <NEWTABLE as InstructionDecode>::Unpack::unpack(inst.0);
-                    // TODO: properly decode the "floating point byte" size hints instead
-                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::Table(Tc::new(Table::new(b as usize, c as usize))));
-                    // SAFETY: the newly created table is reachable through the RunState.
-                    unsafe { gc.step(&state, &spec, owner); }
-                },
-                Opcode::SELF => {
-                    let (a, b, c) = <SELF as InstructionDecode>::Unpack::unpack(inst.0);
-                    let rb = state.vals[state.base + b as usize];
-                    state.vals[state.base + a as usize + 1] = rb;
-                    let key = Self::rk_boxed(Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c));
-                    let tab = rb.as_table().unwrap_or_else(|| unimplemented!("self on non-table"));
-                    state.vals[state.base + a as usize] = tab.get(owner, &key, state.intern).unwrap_or(LBoxed::NIL);
-                },
-                Opcode::SETLIST => {
-                    let (a, b, c) = <SETLIST as InstructionDecode>::Unpack::unpack(inst.0);
-                    let tab = state.vals[state.base + a as usize].as_table().unwrap_or_else(|| unimplemented!("setlist on non-table"));
-                    assert_ne!(c, 0);
-                    tab.barrier_back();
-                    let start = state.base + a as usize + 1;
-                    let end = if b == 0 { state.top } else { start + b as usize };
-                    let src: Vec<LBoxed> = state.vals[start..end].iter().copied().collect();
-                    tab.rw(owner).array.splice((c as usize-1)*50.., src).for_each(drop);
-                },
-                Opcode::GETTABLE => {
-                    let (a, b, c) = <GETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("gettable {} {} {}", a, b, c);
-                    let key = Self::rk_boxed(Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c));
-                    let tab = state.vals[state.base + b as usize].as_table().unwrap_or_else(|| unimplemented!("gettable on non-table"));
-                    state.vals[state.base + a as usize] = tab.get(owner, &key, state.intern).unwrap_or(LBoxed::NIL);
-                },
-                Opcode::SETTABLE => {
-                    let (a, b, c) = <SETTABLE as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("settable {} {} {}", a, b, c);
-                    let kb = Self::rk_boxed(Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b));
-                    let kc = Self::rk_boxed(Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c));
-                    let target = state.vals[state.base + a as usize];
-                    if let Some(mut tab) = target.as_table() {
-                        tab.set(owner, kb, kc, state.intern);
-                    } else {
-                        // Handle magic debugging keys (`t.__jit = ...` forces JIT
-                        // compilation). Meaningful only in JIT builds; in the
-                        // interpreter it is a no-op.
-                        // Forcing JIT compilation only means anything with the
-                        // native code generator; it reaches into `jit_info`,
-                        // which only exists under `jit`.
-                        #[cfg(feature = "jit")]
-                        if let (LValue::LClosure(lc), LValue::InternedString(key)) = (target.unbox(), kb.unbox()) {
-                            match key.as_bytes() {
-                                // Its entry blocks compile when next entered, with the
-                                // blocks reachable from them; those keep their hotness,
-                                // for building traces.
-                                x if x == const { "__jit".as_bytes() } => {
-                                    if let Entry::Occupied(mut entry) = spec.versions.entry(lc.rw(owner).prototype) {
-                                        for ((pc, _), block) in entry.get_mut().iter() {
-                                            if *pc == crate::generator::SubPc::new(0) {
-                                                warn!("Forcing JIT for block {}", block.0);
-                                                spec.blocks[block.0].jit_info.hotness.set(0);
-                                            }
-                                        }
-                                    }
-                                },
-                                _ => unimplemented!(),
-                            }
-                        } else {
-                            unimplemented!()
-                        }
-                        // Without the JIT there is nothing to force; treat
-                        // `closure.__jit = ...` as a no-op (matching the JIT
-                        // build's behaviour when no blocks are versioned).
-                        #[cfg(not(feature = "jit"))]
-                        if let (LValue::LClosure(_), LValue::InternedString(key)) = (target.unbox(), kb.unbox()) {
-                            match key.as_bytes() {
-                                x if x == const { "__jit".as_bytes() } => {},
-                                _ => unimplemented!(),
-                            }
-                        } else {
-                            unimplemented!()
-                        }
-                    }
-                },
-                Opcode::SETGLOBAL => {
-                    let (a, bx) = <SETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
-                    debug!("setglobal {} {} {:?}", a, bx, &kst);
-                    state._G.set(owner, kst.into(), state.vals[state.base + a as usize].clone(), state.intern);
-                },
-                Opcode::GETGLOBAL => {
-                    let (a, bx) = <GETGLOBAL as InstructionDecode>::Unpack::unpack(inst.0);
-                    let kst = unsafe { &(&(*state.clos.ro(owner).prototype).constants.items)[bx as usize] };
-                    debug!("getglobal {} {} {:?}", a, bx, &kst);
-                    // FIXME(error handling)
-                    state.vals[state.base + a as usize] = state._G.get(owner, &kst.into(), state.intern).unwrap_or((&Constant::Nil).into()).clone();
-                },
-                Opcode::TEST => {
-                    let (a, _, c) = <TEST as InstructionDecode>::Unpack::unpack(inst.0);
-                    // R(A) truthiness compared against C, straight off the bits.
-                    if state.vals[state.base + a as usize].truthy() == (c != 0) {
-                        // No-op
-                    } else {
-                        state.pc += 1;
-                    }
-                },
-                opcode @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
-                    let (a, b, c) = ABC::unpack(inst.0);
-                    let kb = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b);
-                    let kc = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c);
-                    // Numeric fast path: pull both operands out as f64 without
-                    // ever building an `LValue`.
-                    let bn = match kb { Ok(Constant::Number(n)) => Some(n.0), Ok(_) => None, Err(lb) => lb.as_number() };
-                    let cn = match kc { Ok(Constant::Number(n)) => Some(n.0), Ok(_) => None, Err(lb) => lb.as_number() };
-                    let cond = if let (Some(x), Some(y)) = (bn, cn) {
-                        match opcode {
-                            Opcode::EQ => x == y,
-                            Opcode::LT => x < y,
-                            Opcode::LE => x <= y,
-                            _ => unsafe { std::hint::unreachable_unchecked() },
-                        }
-                    } else {
-                        // Fallback (strings / other): decode to the view type.
-                        let lb = match kb { Ok(c) => LValue::from(c), Err(v) => v.unbox() };
-                        let lc = match kc { Ok(c) => LValue::from(c), Err(v) => v.unbox() };
-                        lb.compare(opcode, lc, owner).unwrap()
-                    };
-                    if (cond as u8) != a {
-                        state.pc += 1;
-                    }
-                },
-                opcode @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW)
-                => {
-                    let (a, b, c) = ABC::unpack(inst.0);
-                    let kb = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b);
-                    let kc = Self::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c);
-                    let bn = match kb { Ok(Constant::Number(n)) => Some(n.0), Ok(_) => None, Err(lb) => lb.as_number() };
-                    let cn = match kc { Ok(Constant::Number(n)) => Some(n.0), Ok(_) => None, Err(lb) => lb.as_number() };
-                    let res = if let (Some(x), Some(y)) = (bn, cn) {
-                        // Numeric fast path: compute in f64 and re-box directly.
-                        let r = match opcode {
-                            Opcode::ADD => x + y,
-                            Opcode::SUB => x - y,
-                            Opcode::MUL => x * y,
-                            Opcode::DIV => x / y,
-                            Opcode::MOD => lua_mod(x, y),
-                            Opcode::POW => x.powf(y),
-                            _ => unsafe { std::hint::unreachable_unchecked() },
-                        };
-                        LBoxed::from_number(r)
-                    } else {
-                        // Fallback (metamethods / coercions): decode to the view type.
-                        let lb = match kb { Ok(c) => LValue::from(c), Err(v) => v.unbox() };
-                        let lc = match kc { Ok(c) => LValue::from(c), Err(v) => v.unbox() };
-                        LBoxed::box_lvalue(lb.numeric_op(opcode, &lc)?)
-                    };
-                    state.vals[state.base + a as usize] = res;
-                },
-                Opcode::UNM => {
-                    let (a, b) = <UNM as InstructionDecode>::Unpack::unpack(inst.0);
-                    // TODO: metatables
-                    let n = state.vals[state.base + b as usize].as_number().unwrap_or_else(|| unimplemented!("unm on non-number"));
-                    state.vals[state.base + a as usize] = LBoxed::from_number(-n);
-                },
-                Opcode::LEN => {
-                    let (a, b) = <LEN as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, b);
-                    let res = state.vals[state.base + b as usize].unbox().len(owner)?;
-                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(res);
-                },
-                Opcode::CONCAT => {
-                    let (a, b, c) = <CONCAT as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, b);
-                    let mut s: FVec<_> = vec![].into();
-                    for i in (b as usize)..=(c as usize) {
-                        let val = state.vals[state.base + i as usize].unbox();
-                        s.extend_from_slice(val.as_string(owner).ok_or("nil concat")?.as_slice())
-                    }
-                    debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-                    // Concat stays cheap: the result is an owned string, not
-                    // interned. It only gets canonicalized if/when used as a
-                    // table key (via `LCanon`).
-                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::OwnedString(Gc::new(s)));
-                },
-                Opcode::FORPREP => {
-                    let (a, sbx) = <FORPREP as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, sbx);
-                    let init = state.vals[state.base + a as usize].as_number().expect("forprep index non-number");
-                    let step = state.vals[state.base + a as usize + 2].as_number().expect("forprep step non-number");
-                    state.vals[state.base + a as usize] = LBoxed::from_number(init - step);
-                    state.pc += sbx as usize;
-                },
-                Opcode::FORLOOP => {
-                    let (a, sbx) = <FORLOOP as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, sbx);
-                    // Hot numeric loop: step / index / limit are always numbers.
-                    let step = state.vals[state.base + a as usize + 2].as_number().expect("forloop step non-number");
-                    let idx = state.vals[state.base + a as usize].as_number().expect("forloop index non-number") + step;
-                    state.vals[state.base + a as usize] = LBoxed::from_number(idx);
-                    let limit = state.vals[state.base + a as usize + 1].as_number().expect("forloop limit non-number");
-                    let comp = if step < 0.0 { limit <= idx } else { idx <= limit };
-                    if comp {
-                        state.pc = (state.pc as isize + sbx as isize) as usize;
-                        state.vals[state.base + a as usize + 3] = LBoxed::from_number(idx);
-                    }
-                },
-                Opcode::JMP => {
-                    debug!("{:?}", inst.0);
-                    let sbx = <JMP as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{}", sbx);
-                    state.pc = (state.pc as isize + sbx as isize) as usize;
-                },
-                Opcode::CLOSURE => {
-                    let (a, bx) = <CLOSURE as InstructionDecode>::Unpack::unpack(inst.0);
-                    let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx as usize] };
-                    debug!("{} {} {:?}", a, bx, proto);
-                    // handle the MOVE/GETUPVALUE pseudoinstructions
-                    let mut fresh = LClosure::new(proto as *const _);
-                    {
-                        for upval in 0..proto.upval_count {
-                            let pseudo = unsafe { (&(*state.clos.ro(owner).prototype).instructions.items)[state.pc+upval as usize] };
-                            let label = match pseudo.0.Opcode() {
-                                Opcode::MOVE => {
-                                    let (_, b) = <MOVE as InstructionDecode>::Unpack::unpack(pseudo.0);
-                                    // we can't just copy vals[b], because we need
-                                    // to reference the stack slot not the value.
-                                    // instead we reference the stack slot, and add
-                                    // this new use to the list of uses. on CLOSE
-                                    // we will iterate over all these uses and close
-                                    // them - but only then.
-                                    let fresh_upval = Upvalue::Open(b as usize);
-                                    let fresh_use = Tc::new(fresh_upval.clone());
-                                    fresh.upvalues.push(fresh_use.clone());
-                                    state.upvals.push((fresh_upval, vec![fresh_use].into()));
-                                    "move"
-                                },
-                                Opcode::GETUPVAL => {
-                                    let (_, b) = <GETUPVAL as InstructionDecode>::Unpack::unpack(pseudo.0);
-                                    // the upvalue already exists in our current
-                                    // scope. add ourselves to the existing
-                                    // use list.
-                                    let fresh_use = Tc::new(state.upvals[b as usize].clone().0);
-                                    fresh.upvalues.push(fresh_use.clone());
-                                    state.upvals[b as usize].1.push(fresh_use);
-                                    "getupvval"
-                                },
-                                _ => panic!(),
-                            };
-                            debug!("pseudo: {:?} ({})", pseudo, label);
-                        }
-                        state.pc += proto.upval_count as usize;
-                        //assert_eq!(proto.upval_count, 0);
-                    }
-                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::LClosure(Tc::new(fresh)));
-                },
-                Opcode::CALL => {
-                    let (a, b, c) = <CALL as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {} {}", a, b, c);
-                    let to_call = state.vals[state.base + a as usize].unbox();
-                    debug!("{:?}", to_call);
-                    // push where to return to once we RETURN
-                    if let LValue::LClosure(ref lclos) = to_call {
-                        let next_stack = state.call_lua(owner, ReturnLocation::Interpreter(state.pc).pack(),
-                            a as u16, b as u16, c as u16
-                        );
-                        #[cfg(feature = "lbbv")]
-                        {
-                            if LBBV {
-                                // TODO: only run LBBV for hot code
-                                let types = vec![LType::Unknown; next_stack];
-                                let ctx = Rc::new(Context::new(types));
-                                spec.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
-                                spec.set_current(lclos.clone());
-                                let block = spec.version(owner, 0, ctx);
-                                debug!("{:?} {block:?}", spec.blocks);
-                                spec.set_current(lclos.clone());
-                                let (r_state, r_vals) = spec.run(gc, owner, block, state);
-                                state = r_state;
-                                // Unlike a normal call, LBBV might have returned *out* of our current
-                                // function and exitted the top-level.
-                                if let Some(r_vals) = r_vals {
-                                    break 'int r_vals;
-                                }
-                            } else {
-                                state.pc = 0;
-                            }
-                        }
-                        #[cfg(not(feature = "lbbv"))]
-                        {
-                            let _ = next_stack;
-                            state.pc = 0;
-                        }
-                    } else if let LValue::NClosure(ncall) = to_call {
-                        let nf = ncall.native();
-                        // Publish roots so a native (e.g. `collectgarbage`) can reach them.
-                        // See Note [GC roots].
-                        gc.publish(&state, &spec);
-                        state.call_native(nf, a as u16, b, c, owner);
-                        // FIXME(metatables): __call
-                    } else {
-                        panic!("cant call {:?}", to_call);
-                    }
-                },
-                Opcode::RETURN => {
-                    let (a, b) = <RETURN as InstructionDecode>::Unpack::unpack(inst.0);
-                    debug!("{} {}", a, b);
-                    match state.do_return(owner, a as usize, b as usize) {
-                        Ok(ReturnLocation::Interpreter(caller)) => {
-                            state.pc = caller;
-                        },
-                        Ok(ReturnLocation::Generator(block, off)) => {
-                            unimplemented!()
-                        },
-                        Err(r_vals) => {
-                            break 'int r_vals;
-                        },
-                    }
-                },
-                Opcode::INVALID => unreachable!(),
-                x => unimplemented!("opcode {:?}", x),
-                _ => (),
-            };
-        };
-        #[cfg(all(feature = "counters", feature = "lbbv", not(test)))] {
+        //
+        // The entry closure runs in the specializer from its first instruction, as a call
+        // does: its frame is the whole register file, and with no caller to return to, its
+        // return ends the run.
+        let entry = state.clos.clone();
+        let ctx = Rc::new(Context::new(vec![LType::Unknown; state.vals.len()]));
+        spec.versions.entry(entry.ro(owner).prototype).or_insert_with(|| HashMap::default());
+        spec.set_current(entry);
+        let block = spec.version(owner, 0, ctx);
+        let (state, r_vals) = spec.run(gc, owner, block, state);
+        #[cfg(all(feature = "counters", not(test)))] {
             println!("counters after run {:?} instructions {:?}", state.counters, spec.count());
         }
-        #[cfg(all(feature = "counters", not(feature = "lbbv"), not(test)))] {
-            println!("counters after run {:?}", state.counters);
-        }
 
-        #[cfg(all(feature = "graph", feature = "lbbv"))]
+        #[cfg(feature = "graph")]
         for proto in unsafe { &(*self.top_level).prototypes.items } {
             let outfile = format!("func_{}.pdf", proto.line_defined);
             spec.dump(owner, proto, outfile.as_str());

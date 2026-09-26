@@ -40,14 +40,12 @@ impl Counter {
 
 #[derive(Default)]
 pub struct PerfCounters {
-    pub interpreter_count: Counter,
     pub versioned_count: Counter,
 }
 
 impl std::fmt::Debug for PerfCounters {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PerfCounters {{")?;
-        write!(f, " interpreter_count({})", self.interpreter_count)?;
         write!(f, " versioned_count({})", self.versioned_count)?;
         write!(f, " }}")
     }

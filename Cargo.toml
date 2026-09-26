@@ -11,15 +11,12 @@ skip_vec = []
 counters = []
 graph = []
 immediate_jit = []
-# Lazy basic-block versioning (the `generator` specializer). Independent of the
-# native code generator: LBBV can run as a second interpreter tier on its own.
-lbbv = []
-# Native JIT (the dynasm `jit` module). Requires LBBV, since it compiles the
-# specialized blocks LBBV produces.
-jit = ["lbbv"]
+# Native JIT (the dynasm `jit` module): compiles the specialized blocks LBBV
+# (the `generator` specializer, which runs every closure) produces.
+jit = []
 # Differential-check every window op the interpreter runs against its
 # copy&patched stencil (see src/window.rs; ops the copier rejects are skipped).
-check_windows = ["lbbv"]
+check_windows = []
 unreachable = []
 gas = []
 magic = [] # Magic JIT intrinsics

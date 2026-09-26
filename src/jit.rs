@@ -174,7 +174,7 @@ impl JitHelper {
                 }
                 LValue::LClosure(lclos) => {
                     let Some(entry) = spec.lua_entry(owner, &lclos) else { return 0 };
-                    let ret = ReturnLocation::Generator(BlockId((ret & 0xffff_ffff) as usize), (ret >> 32) as usize).pack();
+                    let ret = ReturnLocation(BlockId((ret & 0xffff_ffff) as usize), (ret >> 32) as usize).pack();
                     state.call_lua(owner, ret, a, b, c);
                     entry as usize
                 }
@@ -183,35 +183,29 @@ impl JitHelper {
         }
     }
 
-    pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16, base_ptr: *const ()) -> u64 {
+    /// Return from the running frame, from the `Ret` at `(id, off)`: the caller's block
+    /// and offset to continue at, or, from the entry closure's frame, a bail (-2) for
+    /// `Specializer::run` to run the `Ret` and end the run with its values.
+    pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16, base_ptr: *const (), id: u32, off: u16) -> u64 {
         unsafe {
             let rs = &mut *(state as *mut RunState);
             warn!("lua_return base {base} base_ptr {base_ptr:p} stack_ptr {stack_ptr:p}", base = rs.base, stack_ptr = rs.vals.stack_ptr.as_non_null_ptr());
             #[cfg(debug_assertions)]
             assert_eq!(base_ptr, rs.vals.stack_ptr.as_non_null_ptr().add(rs.base).as_ptr().cast());
+            if rs.callstack.is_empty() {
+                rs.current_off = off;
+                return ((-2i32 as u64) << 32) | id as u64;
+            }
             let mut owner = ();
             let mut owner = (&raw mut owner as *mut Owner).as_mut_unchecked();
             match rs.do_return(owner, a as usize, b as usize) {
-                Ok(ReturnLocation::Interpreter(caller)) => {
-                    // Bailout and return to interpreter
-                    debug!("returning to {}", caller);
-                    rs.trap = true;
-                    return ((-5i32 as u64) << 32);
-                }
-                Ok(ReturnLocation::Generator(block, off)) => {
+                Ok(ReturnLocation(block, off)) => {
                     // Return block and offset
                     debug!("returning to {:?} {}", block, off);
                     return ((off as u64) << 32) | (block.0 as u64);
                 }
-                Err(r_vals) => {
-                    panic!();
-                    // Done
-                    // TODO: Ugh we probably need to stash these r_vals somewhere instead of
-                    // forgetting them. This would show up if we tailcall return through a JIT
-                    // function to the top-level.
-                    rs.trap = true;
-                    return ((-5i32 as u64) << 32);
-                }
+                // With a caller frame, `do_return` returns to it.
+                Err(_) => unreachable!(),
             }
         }
     }
@@ -1530,7 +1524,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     match entry {
                         Some(entry) => {
                             // Return location for this call site, packed to a single word.
-                            let packed_ret = ReturnLocation::Generator(BlockId(id.0), off + 1).pack();
+                            let packed_ret = ReturnLocation(BlockId(id.0), off + 1).pack();
                             // Pin the exact monomorphized address of the extern "C" call_lua.
                             let call_lua: extern "C" fn(&mut RunState<'src, 'intern>, &mut Owner, PackedLocation, u16, u16, u16) -> usize = RunState::call_lua;
                             dynasm!(ops
@@ -1647,6 +1641,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rsi, WORD (*a as i32)
                         ; mov rdx, WORD (*b as i32)
                         ; mov rcx, r13 // base_ptr
+                        ; mov r8, QWORD id.0 as i64
+                        ; mov r9, QWORD off as i64
                         ; call extern (JitHelper::lua_return as *const () as usize)
                         ; jmp ->exit_jit
                     );

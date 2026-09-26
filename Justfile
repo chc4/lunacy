@@ -49,7 +49,7 @@ test-stencils:
 window-runs benchmark times='20':
     just _luac {{benchmark}}
     rm -f func_*.dot func_*.pdf
-    cargo run --release --no-default-features --features "lbbv graph" --bin bench -- {{benchmark}}.bin {{times}}
+    cargo run --release --no-default-features --features graph --bin bench -- {{benchmark}}.bin {{times}}
     python3 tools/window_runs.py func_*.dot
 
 # The JIT's window allocation for a benchmark, in window_dump.txt: each compiled
@@ -252,17 +252,6 @@ flamegraph benchmark times='10' ref='' freq='997':
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
-# Interpreter
-INTERPRETER_FEATURES := "magic"
-interpreter-compile:
-    cargo build --release --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin bench --target-dir ./target/interpreter
-interpreter benchmark: interpreter-compile
-    just _luac {{benchmark}}
-    time ./target/interpreter/release/bench {{benchmark}}.bin
-interpreter-test name: interpreter-compile
-    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
-    time ./target/interpreter/release/bench {{name}}.bin
-
 # Unsafe
 # Disassemble a window op's stencil at SKIP 0 as the `unsafe` profile builds it,
 # in this checkout, or at revision `ref` (built in target/compare/<ref>, its
@@ -293,10 +282,10 @@ gdb-unsafe benchmark: unsafe-compile
 
 
 # Hyperfine reports
-# lunacy's interpreter, JIT and unsafe builds against Lua 5.1 and LuaJIT, its
-# interpreter alone (-joff) and with its JIT. Lua 5.1 has no `bit`, so its run
+# lunacy's JIT and unsafe builds against Lua 5.1 and LuaJIT, its interpreter
+# alone (-joff) and with its JIT. Lua 5.1 has no `bit`, so its run
 # of a benchmark requiring it fails at once, and times nothing.
-hyperfine benchmark times='10': unsafe-compile interpreter-compile
+hyperfine benchmark times='10': unsafe-compile
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
     cargo build --release --bin bench
@@ -304,7 +293,6 @@ hyperfine benchmark times='10': unsafe-compile interpreter-compile
         "lua5.1 bench.lua -- {{benchmark}}.bin {{times}} || true" \
         "luajit -joff bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
         "luajit bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
-        "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \
         "./target/release/bench {{benchmark}}.bin {{times}}" \
         "./target/unsafe/bench {{benchmark}}.bin {{times}}"
 # Compare the trace-building policies of the window allocator, and streaming
