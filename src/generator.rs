@@ -104,10 +104,12 @@ impl Block {
     }
 }
 
+// With feature `unreachable`, `unreachable!` is unchecked, its message (as
+// std's takes) unused.
 #[cfg(feature = "unreachable")]
 #[macro_export]
 macro_rules! unreachable {
-    () => { unsafe { core::hint::unreachable_unchecked() } }
+    ($($message:tt)*) => { unsafe { core::hint::unreachable_unchecked() } }
 }
 
 macro_rules! define_exec {
