@@ -582,8 +582,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableArray, [k: i32], [INT: bool], |owner, state, base| (table, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
-                tab.barrier_back();
                 tab.rw(owner).array[integer_slot(k)] = double::<INT>(value);
+                // Last. See Note [Write barriers].
+                tab.barrier_back();
             });
             arg = yield YieldOp::ExecWindow(if int_value {
                 Rc::new(SetTableArray::<true>::new(k, &[a, c]))
@@ -593,8 +594,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableInteger, [], [INT: bool], |owner, state, base| (table, key, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
-                tab.barrier_back();
                 tab.rw(owner).array[integer_slot(key.as_int())] = double::<INT>(value);
+                // Last. See Note [Write barriers].
+                tab.barrier_back();
             });
             arg = yield YieldOp::ExecWindow(if int_value {
                 Rc::new(SetTableInteger::<true>::new(&[a, b, c]))
@@ -658,7 +660,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         }
                         Retype::Unknown => tab.rw(owner).epoch += 1,
                     }
-                    // Last, so that its cold call rejoins the stencil at its tailcall.
+                    // Last. See Note [Write barriers].
                     tab.barrier_back();
                 }
                 let expected = htype.as_ltype();
@@ -699,7 +701,6 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Err(lv) => *lv,
                     };
                     let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
-                    t.barrier_back();
                     let kc_type = kc.unbox().typeof_();
                     if let Some(existing) = t.rw(owner).hash.insert(kb, kc) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
@@ -711,6 +712,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         // metatable or resolved to nil are invalidated.
                         t.rw(owner).epoch += 1;
                     }
+                    // Last. See Note [Write barriers].
+                    t.barrier_back();
                 })));
                 arg = yield YieldOp::SetHazards(None, None);
             }

@@ -164,6 +164,9 @@ impl<T: Mark> Mark for Vec<T> {
 // flag the collector keeps with its phase (`set_phase`): outside a cycle a store pays one
 // load and branch, and the barrier itself, testing the table's color against the heap's
 // current white, is cold.
+// The backward barrier may come before or after the store it covers, as long as nothing
+// between them can step the collector. The generator's table stores call it last, so that in
+// a stencil its cold call rejoins at the tailcall rather than before the store.
 //
 // Note [GC roots]
 // ~~~~~~~~~~~~~~~
