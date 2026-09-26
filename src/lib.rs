@@ -2,7 +2,7 @@
 // For LBBV
 #![feature(coroutines, coroutine_trait, coroutine_clone, stmt_expr_attributes)]
 // For JIT
-#![feature(ptr_metadata, rust_preserve_none_cc, iter_map_windows)]
+#![feature(ptr_metadata, rust_preserve_none_cc, rust_cold_cc, iter_map_windows)]
 // For copy&patch window stencils
 #![feature(linkage, explicit_tail_calls)]
 #![feature(fn_traits, unboxed_closures, adt_const_params)]

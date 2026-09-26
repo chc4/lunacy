@@ -309,9 +309,11 @@ impl<T> Gc<T> {
 
     /// Backward barrier for tables: revert this (black) object to gray onto `grayagain` for
     /// a later atomic re-scan. Called only in a collection cycle (`gc_in_progress`). See Note
-    /// [Write barriers].
+    /// [Write barriers]. `rust-cold` (LLVM's `preserve_most`), so the callee saves the
+    /// registers it uses and a table store's stencil need not spill its window around the
+    /// call.
     #[cold]
-    pub fn backward_barrier(&self) {
+    pub extern "rust-cold" fn backward_barrier(&self) {
         let inner = self.ptr.as_ptr();
         unsafe {
             if (*inner).color.get() == black() {
