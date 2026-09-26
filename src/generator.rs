@@ -315,6 +315,10 @@ pub enum YieldOp {
                                       // `state.select` at runtime
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
     Call(CallTarget), // Call a block target. Probably need a ResumeArg for returned values later.
+    LoadUpvalue(usize, usize), // STACK[idx] was just loaded from UPVALUE[b]: what the context knows
+                               // of the upvalue is its type. See Note [Fragile information]
+    Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
+                    // Note [Fragile information]
     NativeWindowArgs(usize, usize, usize), // For CALL A B C: resumed with WindowArgs if STACK[A] is
                                            // a native with a window op for the call, else Failed.
                                            // See Note [Native windows] in `library`
@@ -1334,9 +1338,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             *dest = upval;
         });
         arg = yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[a])));
-        // TODO: We can resolve upvalues to types, but would need to make sure to
-        // keep them synced with the type of the stack slot or SETUPVAL/calls.
-        arg = yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
+        arg = yield YieldOp::LoadUpvalue(a, b);
         return arg;
     }
 }
@@ -1447,6 +1449,7 @@ pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             }
         });
         arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, &[a])));
+        yield YieldOp::Effect(Effect::SetUpvalue(b));
         arg
     }
 }
@@ -1911,7 +1914,114 @@ pub struct Context {
     /// The frame's top, as a slot, when the instruction before left it at one
     /// the specializer knows. See Note [Known top].
     pub top: Option<usize>,
+    /// What the specializer assumes and no guard checks, in `Fragile::key`
+    /// order. See Note [Fragile information].
+    pub fragile: SmallVec<[Fragile; 2]>,
 }
+
+// Note [Fragile information]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Fragile information is speculation the specializer assumes under a closed-
+// world model, with no guard to check it: once established, a fact holds until
+// an effect the specializer sees could falsify it, where it is dropped, never
+// repaired. Every effect that could falsify a fact must be visible; where the
+// closed world can't be shown to hold, across code the specializer doesn't see
+// (`Effect::Opaque`: a call that isn't a window op, which may run any Lua
+// code), all of it is dropped. The known top (Note [Known top]) is information
+// of this kind.
+//
+// It is in the context (`Context::fragile`), so it is part of every block's
+// key: a block compiled relying on a fact is only entered by paths that
+// established it and kept it since, as any path reaching a block with an equal
+// context shares it. It is per activation: a function's entry block has none,
+// and a call's continuation none either, after the call's effect.
+//
+// Effects come from the residuals as they are yielded (`Context::effect`): a
+// window op writes the slots its accesses say it writes (`Effect::Write`), an
+// exec may write any slot (`Effect::WriteAny`; it runs no Lua code), a call
+// that isn't a window op is `Effect::Opaque`, and what a residual can't show a
+// yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A thunk
+// pushes guards, jumps, and conversions of an integer's encoding, none of which
+// changes a value. A kind of fact says which effects it survives
+// (`Fragile::survives`); a new kind is a variant, its `key` and `survives`, and
+// where it is established.
+//
+// Established in a loop's peeled first iteration, a fact the loop body keeps
+// comes back along the back edge, into the version compiled with it. One the
+// body drops arrives without it, and needs a version without it. So that the
+// facts different paths drop don't multiply versions (every subset of n facts
+// could arrive), a pc's versions differing only in fragile information are a
+// chain of subsets: a context enters the version with the most facts that it
+// has all of, and otherwise one is compiled with the facts the context shares
+// with the version with the fewest (`version`). A pc then has at most n + 1
+// such versions; a loop, typically the peeled one and one without what its
+// body drops.
+//
+// Facts:
+//
+//   * `Holds { slot, upvalue }`: the slot holds the value the upvalue held when
+//     loaded into it (GETUPVAL), until either is written.
+//   * `Upvalue { upvalue, ctype }`: the upvalue holds a native function, its
+//     identity (`CType::NativeFunction`), until it is set or the closed world
+//     breaks. A call's discovery thunk finds it, guarding the slot it calls
+//     (Note [Native windows] in `library`): a slot holding the upvalue's value
+//     tells of the upvalue too. GETUPVAL then types its register with it, so a
+//     call through the upvalue guards nothing. Debug builds check it where it
+//     is used (`CheckNative`).
+
+/// Speculation the specializer assumes without a guard. See Note [Fragile
+/// information].
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum Fragile {
+    /// Stack slot `slot` holds the value upvalue `upvalue` held when loaded
+    /// into it.
+    Holds { slot: usize, upvalue: usize },
+    /// Upvalue `upvalue` holds a value of `ctype`: a native function's, which
+    /// is its identity.
+    Upvalue { upvalue: usize, ctype: CType },
+}
+
+/// What fragile information an operation may falsify. See Note [Fragile
+/// information].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// The stack slot is written.
+    Write(usize),
+    /// Any stack slot may be written.
+    WriteAny,
+    /// The upvalue is set.
+    SetUpvalue(usize),
+    /// Code the specializer doesn't see runs: every fact is dropped.
+    Opaque,
+}
+
+impl Fragile {
+    /// What the fact is about, unique among a context's facts, and their order.
+    fn key(&self) -> (u8, usize) {
+        match self {
+            Fragile::Holds { slot, .. } => (0, *slot),
+            Fragile::Upvalue { upvalue, .. } => (1, *upvalue),
+        }
+    }
+
+    /// Whether the fact still holds after `effect`.
+    fn survives(&self, effect: Effect) -> bool {
+        match (self, effect) {
+            (_, Effect::Opaque) => false,
+            (Fragile::Holds { slot, .. }, Effect::Write(written)) => written != *slot,
+            (Fragile::Holds { .. }, Effect::WriteAny) => false,
+            (Fragile::Holds { upvalue, .. } | Fragile::Upvalue { upvalue, .. }, Effect::SetUpvalue(set)) => set != *upvalue,
+            (Fragile::Upvalue { .. }, Effect::Write(_) | Effect::WriteAny) => true,
+        }
+    }
+}
+
+// A native function the context assumes a slot holds: debug builds check it
+// does. See Note [Fragile information].
+windowed!(CheckNative, [native: usize], [], |owner, state, base| (value) {
+    let LValue::NClosure(nf) = value.unbox() else { panic!("fragile information: a native was assumed, {:?} found", value) };
+    assert_eq!(nf.get_ptr() as usize, native, "fragile information: another native was assumed");
+});
 
 // Note [Known top]
 // ~~~~~~~~~~~~~~~~
@@ -1934,6 +2044,11 @@ impl Mark for Context {
         for ctype in &self.types {
             ctype.mark(owner);
         }
+        for fact in &self.fragile {
+            if let Fragile::Upvalue { ctype, .. } = fact {
+                ctype.mark(owner);
+            }
+        }
     }
 }
 
@@ -1943,14 +2058,55 @@ impl Context {
             types: types.drain(..).map(|t| CType::Type(t)).collect(),
             hkeys: vec![],
             top: None,
+            fragile: SmallVec::new(),
         }
     }
 
     fn tostring(&self, owner: &Owner) -> String {
-        format!("context([{}], hkeys: {})",
+        format!("context([{}], hkeys: {}, fragile: {:?})",
             self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
             self.hkeys.iter().map(|hk| hk.tostring(owner)).intersperse(",".to_string()).collect::<String>(),
+            self.fragile,
         )
+    }
+
+    /// Assume `fact`, in place of any about the same thing. See Note [Fragile
+    /// information].
+    fn assume(&mut self, fact: Fragile) {
+        self.fragile.retain(|known| known.key() != fact.key());
+        self.fragile.push(fact);
+        self.fragile.sort_by_key(|fact| fact.key());
+    }
+
+    /// Drop the facts `effect` may falsify. See Note [Fragile information].
+    fn effect(&mut self, effect: Effect) {
+        self.fragile.retain(|fact| fact.survives(effect));
+    }
+
+    /// The upvalue whose value slot `slot` holds, if known.
+    fn holds(&self, slot: usize) -> Option<usize> {
+        self.fragile.iter().find_map(|fact| match fact {
+            Fragile::Holds { slot: held, upvalue } if *held == slot => Some(*upvalue),
+            _ => None,
+        })
+    }
+
+    /// The type of upvalue `upvalue`'s value, if known.
+    fn upvalue(&self, upvalue: usize) -> Option<&CType> {
+        self.fragile.iter().find_map(|fact| match fact {
+            Fragile::Upvalue { upvalue: known, ctype } if *known == upvalue => Some(ctype),
+            _ => None,
+        })
+    }
+
+    /// Whether `other` has every fact `self` has.
+    fn fragile_within(&self, other: &Context) -> bool {
+        self.fragile.iter().all(|fact| other.fragile.contains(fact))
+    }
+
+    /// Whether `self` and `other` differ at most in fragile information.
+    fn alike(&self, other: &Context) -> bool {
+        self.types == other.types && self.hkeys == other.hkeys && self.top == other.top
     }
 
     /// The type of slot `idx`: unknown past the end.
@@ -1963,12 +2119,14 @@ impl Context {
     fn accepts(&self, other: &Context) -> bool {
         self.hkeys == other.hkeys
             && (self.top.is_none() || self.top == other.top)
+            && self.fragile_within(other)
             && (0..self.types.len().max(other.types.len())).all(|idx| self.slot(idx).accepts(&other.slot(idx)))
     }
 
     /// The lattice height `self` loses from `other`, which it accepts.
     fn distance(&self, other: &Context) -> usize {
-        (0..self.types.len().max(other.types.len())).map(|idx| other.slot(idx).depth() - self.slot(idx).depth()).sum()
+        (0..self.types.len().max(other.types.len())).map(|idx| other.slot(idx).depth() - self.slot(idx).depth()).sum::<usize>()
+            + (other.fragile.len() - self.fragile.len())
     }
 
     /// Widen `self` to accept `other`'s types too, forgetting every shape if
@@ -1984,6 +2142,7 @@ impl Context {
         if self.top != other.top {
             self.top = None;
         }
+        self.fragile.retain(|fact| other.fragile.contains(fact));
         if self.hkeys != other.hkeys {
             let shapes: Vec<(usize, CType)> = (0..self.types.len())
                 .filter(|&idx| matches!(self.types[idx], CType::Shape(_)))
@@ -2153,6 +2312,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .filter(|((epc, _), _)| *epc == subpc)
             .map(|((_, ectx), block)| (ectx.clone(), *block))
             .collect();
+        // Versions differing only in fragile information are a chain of subsets:
+        // enter the one with the most facts `ctx` has all of, or compile one with
+        // those `ctx` shares with the one with the fewest. See Note [Fragile
+        // information].
+        let alike: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
+        if let Some((_, block)) = alike.iter().filter(|(ectx, _)| ectx.fragile_within(&ctx)).max_by_key(|(ectx, block)| (ectx.fragile.len(), std::cmp::Reverse(block.0))) {
+            return *block;
+        }
+        let ctx = match alike.iter().min_by_key(|(ectx, _)| ectx.fragile.len()) {
+            Some((fewest, _)) => {
+                let mut lowered = (*ctx).clone();
+                lowered.fragile.retain(|fact| fewest.fragile.contains(fact));
+                Rc::new(lowered)
+            },
+            None => ctx,
+        };
         if existing.len() < MAX_VERSIONS {
             return self.block(owner, pc, ctx);
         }
@@ -2344,6 +2519,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if ctx.types[idx] == CType::Integer {
                 self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(ToNumber::new(&[idx]))));
                 Rc::make_mut(ctx).types[idx] = CType::Type(LType::Number);
+                Rc::make_mut(ctx).effect(Effect::Write(idx));
             }
         }
     }
@@ -2549,6 +2725,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // We know this original value has the correct native function, and so can compile
                 // a block for it immediately.
                 forced_mut.types[idx] = idx_ctype.clone();
+                // A slot holding an upvalue's value tells of the upvalue: the native
+                // guard below checks both. See Note [Fragile information].
+                if let Some(upvalue) = forced_mut.holds(idx) {
+                    forced_mut.assume(Fragile::Upvalue { upvalue, ctype: idx_ctype.clone() });
+                }
                 let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx, thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
                 // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
@@ -3036,9 +3217,29 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
+                    Rc::make_mut(&mut ctx).effect(Effect::WriteAny);
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
+                    for (&slot, access) in w.operands().iter().zip(w.accesses()) {
+                        if access.writes() {
+                            Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
+                        }
+                    }
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
+                },
+                CoroutineState::Yielded(YieldOp::Effect(effect)) => {
+                    Rc::make_mut(&mut ctx).effect(effect);
+                },
+                CoroutineState::Yielded(YieldOp::LoadUpvalue(slot, upvalue)) => {
+                    // See Note [Fragile information].
+                    let known = ctx.upvalue(upvalue).cloned();
+                    #[cfg(debug_assertions)]
+                    if let Some(CType::NativeFunction(nf)) = &known {
+                        self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckNative::new(nf.get_ptr() as usize, &[slot]))));
+                    }
+                    let ctx = Rc::make_mut(&mut ctx);
+                    ctx.set_types(owner, vec![(slot, known.unwrap_or(CType::Type(LType::Unknown)))]);
+                    ctx.assume(Fragile::Holds { slot, upvalue });
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
                     self.blocks[block_id.0].allocates = true;
@@ -3091,6 +3292,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                             if let CType::NativeFunction(nf) = &ctx.types[a] {
                                 if let Some(op) = window {
+                                    Rc::make_mut(&mut ctx).effect(Effect::Write(a));
                                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op.window));
                                     if c == 0 {
                                         self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(SetTop::new(a + 1, &[]))));
@@ -3117,6 +3319,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 });
                                 // It may call a native, which may allocate.
                                 self.blocks[block_id.0].allocates = true;
+                            }
+                            // Any other callee runs code the specializer doesn't see. See
+                            // Note [Fragile information].
+                            if result.is_none() {
+                                Rc::make_mut(&mut ctx).effect(Effect::Opaque);
                             }
                             // The results, and the callee's frame above them, overwrote
                             // every register from `a` on: their types are unknown.
