@@ -338,6 +338,18 @@ hyperfine-vs ref benchmark times='10':
     taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
         "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \
         "./target/release/bench {{benchmark}}.bin {{times}}"
+# Hardware counters (`perf stat`) for this checkout's release build and revision
+# `ref`'s (built as for `hyperfine-vs`) on one benchmark, each pinned as
+# `hyperfine` runs it and repeated `runs` times.
+perf-stat-vs ref benchmark times='10' runs='5':
+    just _luac {{benchmark}}
+    cargo build --release --bin bench
+    just _compare-worktree {{ref}}
+    cd target/compare/{{ref}} && cargo build --release --bin bench
+    taskset -c {{CPU}} perf stat -r {{runs}} -e task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
+        target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}} > /dev/null
+    taskset -c {{CPU}} perf stat -r {{runs}} -e task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
+        ./target/release/bench {{benchmark}}.bin {{times}} > /dev/null
 # Compare this checkout's release build with and without cargo feature
 # `feature` on one benchmark: the feature's build is in target/features/<feature>.
 hyperfine-feature feature benchmark times='10':
