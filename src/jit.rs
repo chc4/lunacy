@@ -514,9 +514,11 @@ fn inline_guard(res: &Residual) -> bool {
 }
 
 /// The `SKIP`s a window op's stencil can be copied at: none where stencils
-/// aren't copied (`COPIES`), and the op runs through its interpreter path.
+/// aren't copied (`COPIES`), and the op runs through its interpreter path. A
+/// skip is below `WINDOW`, the stencils there are, even for an op with no
+/// operands.
 fn usable_skips(stencils: &mut Stencils, w: &dyn Window) -> SmallVec<[usize; WINDOW]> {
-    (0..=WINDOW - w.arity()).filter(|&skip| stencils.body(w, skip).is_ok()).collect()
+    (0..=(WINDOW - w.arity()).min(WINDOW - 1)).filter(|&skip| stencils.body(w, skip).is_ok()).collect()
 }
 
 /// The alignment of a loop header's code, which a loop's back edge enters on

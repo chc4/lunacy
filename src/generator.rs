@@ -1551,6 +1551,12 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
     }
 }
 
+// The frame's top, at `slot`: after a native's window op with C = 0. See Note
+// [Known top].
+windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
+    state.top = state.base + slot;
+});
+
 pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -1871,7 +1877,26 @@ const HARD_MAX_VERSIONS: usize = 16;
 pub struct Context {
     pub types: SmallVec<[CType; 8]>,
     pub hkeys: Vec<HashKey<'static, 'static>>,
+    /// The frame's top, as a slot, when the instruction before left it at one
+    /// the specializer knows. See Note [Known top].
+    pub top: Option<usize>,
 }
+
+// Note [Known top]
+// ~~~~~~~~~~~~~~~~
+// A CALL with C = 0 leaves every result from R(A) up, and the frame's top
+// (`RunState::top`) past them; the instruction after it, a CALL, RETURN or
+// SETLIST with B = 0, takes its operands from there to the top. Lua 5.1 emits
+// such a pair for a call that is another call's last argument, as in
+// `bor(x, band(y, z))`.
+//
+// A call run as a native's window op (Note [Native windows] in `library`)
+// returns exactly one result, so after one with C = 0 the context records the
+// top as the slot past R(A) (`Context::top`), and a CALL with B = 0 after it
+// knows its arguments: it can run as a window op in turn. Every other
+// instruction forgets the top, and a version with no top accepts one with a
+// top. So that the top in memory is right wherever the context doesn't know it,
+// the window op's call stores it too (`SetTop`).
 
 impl Mark for Context {
     fn mark(&self, owner: &Owner) {
@@ -1886,6 +1911,7 @@ impl Context {
         Self {
             types: types.drain(..).map(|t| CType::Type(t)).collect(),
             hkeys: vec![],
+            top: None,
         }
     }
 
@@ -1905,6 +1931,7 @@ impl Context {
     /// [Version compatibility].
     fn accepts(&self, other: &Context) -> bool {
         self.hkeys == other.hkeys
+            && (self.top.is_none() || self.top == other.top)
             && (0..self.types.len().max(other.types.len())).all(|idx| self.slot(idx).accepts(&other.slot(idx)))
     }
 
@@ -1923,6 +1950,9 @@ impl Context {
             })
             .collect();
         self.set_types(owner, widened);
+        if self.top != other.top {
+            self.top = None;
+        }
         if self.hkeys != other.hkeys {
             let shapes: Vec<(usize, CType)> = (0..self.types.len())
                 .filter(|&idx| matches!(self.types[idx], CType::Shape(_)))
@@ -2127,6 +2157,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn compile(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
         loop {
             let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
+            // Only a CALL uses the top the instruction before left. See Note [Known top].
+            if ctx.top.is_some() && inst.0.Opcode() != Opcode::CALL {
+                Rc::make_mut(&mut ctx).top = None;
+            }
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
             if let Some((next, nctx, ret)) = match inst.0.Opcode() {
                 op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
@@ -2989,16 +3023,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
+                            // The arguments' end: fixed, or the top the call before left, if
+                            // known. See Note [Known top].
+                            let end = if b == 0 { ctx.top } else { Some(a + b) };
                             // The callee reads its arguments as any value. See
                             // Note [Integers].
-                            self.demote(block_id, &mut ctx, a + 1..if b == 0 { usize::MAX } else { a + b });
+                            self.demote(block_id, &mut ctx, a + 1..end.unwrap_or(usize::MAX));
                             // A native run as a window op, with its arguments of the type it
-                            // assumes, gives its result's type. See Note [Native windows].
+                            // assumes, gives its result's type: its one result, with C = 0
+                            // too. See Note [Native windows].
                             let mut result = None;
-                            let window = match &ctx.types[a] {
-                                CType::NativeFunction(nf) => nf
-                                    .window(a, b as u16, c as u16)
-                                    .filter(|op| (a + 1..a + b).all(|slot| ctx.types[slot].as_ltype() == op.args)),
+                            let window = match (&ctx.types[a], end) {
+                                (CType::NativeFunction(nf), Some(end)) => nf
+                                    .window(a, (end - a) as u16, if c == 0 { 2 } else { c as u16 })
+                                    .filter(|op| (a + 1..end).all(|slot| ctx.types[slot].as_ltype() == op.args)),
                                 _ => None,
                             };
                             // Any other call may run a closure, which reads and writes the
@@ -3014,6 +3052,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             if let CType::NativeFunction(nf) = &ctx.types[a] {
                                 if let Some(op) = window {
                                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op.window));
+                                    if c == 0 {
+                                        self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(SetTop::new(a + 1, &[]))));
+                                    }
                                     result = Some(op.result);
                                 } else {
                                     self.blocks[block_id.0].instructions.push(Residual::NativeCall {
@@ -3048,6 +3089,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             if let Some(result) = result {
                                 Rc::make_mut(&mut ctx).types[a] = CType::Type(result);
                             }
+                            Rc::make_mut(&mut ctx).top = (result.is_some() && c == 0).then_some(a + 1);
                             return Some((pc.0 + 1, ctx, ResumeArg::Start));
                         },
                     }

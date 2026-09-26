@@ -47,7 +47,10 @@ thread_local! {
 // The op assumes the arguments' type, unchecked, and the result has its type.
 // Any other call to the native is an ordinary `NativeCall`. The bit library's
 // natives offer one for one result from their fixed arities, of numbers,
-// computing it as the native does (`bit1`, `bit2`).
+// computing it as the native does (`bit1`, `bit2`). A call taking every result
+// (C = 0) gets exactly the one, and a call taking its arguments up to the top
+// (B = 0) has a fixed arity when the specializer knows the top. See Note [Known
+// top] in `generator`.
 
 /// A native computing its results from its arguments. See Note [Library natives].
 /// With `window:`, also a window op for calls to it, which LBBV runs. See Note
