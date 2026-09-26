@@ -33,9 +33,13 @@ STUB = re.compile(r'^(?:block \d+ compiled already, entered with \{[^}]*\}|regio
 EMIT = re.compile(r'(\w+|\[\d+\]) <- (\w+|\[\d+\])')
 COUNTED = re.compile(r' #(\d+)$')
 COUNT = re.compile(r'^count #(\d+) (\d+)$')
-RESIDUAL = re.compile(r'^    \d+ (window|guard_dynamic)\((\w+)')
+# A residual's line: its offset in its block, right-aligned in three columns
+# after two spaces (`"  {off:3} {res}"` in `jit.rs`).
+INDEX = r'^  [ \d]{2}\d '
+RESIDUAL_LINE = re.compile(INDEX)
+RESIDUAL = re.compile(INDEX + r'(window|guard_dynamic)\((\w+)')
 # Any residual: its kind, and a window op's, a guard's or an exec's name.
-ANY_RESIDUAL = re.compile(r'^    \d+ ([a-z_]+)(?:\(([A-Za-z_]+|\d+, (\w+)))?')
+ANY_RESIDUAL = re.compile(INDEX + r'([a-z_]+)(?:\(([A-Za-z_]+|\d+, (\w+)))?')
 
 
 RAW = False
@@ -151,7 +155,7 @@ def ops(path):
         if m:
             op = m.group(2)
             continue
-        if line.startswith('    ') and not line.startswith('      '):
+        if RESIDUAL_LINE.match(line):
             op = None
         m = COUNTED.search(line)
         if m and op is not None and 'op at' in line:
