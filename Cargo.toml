@@ -77,18 +77,22 @@ panic = "abort"
 lto = "fat"
 strip = false
 debug = true
-rustflags = ["-C", "force-frame-pointers=yes"]
+# For this machine's instruction set (SSE4.1's `roundsd` for `f64::trunc`, not a
+# libm call, and so on): binaries are for benchmarking here, not distribution.
+rustflags = ["-C", "force-frame-pointers=yes", "-C", "target-cpu=native"]
 
 # `just test-stencils`: stencils compiled as in release (every package optimized,
 # so a stencil inlines the code it calls as release does; no debug assertions or
-# overflow checks), without release's LTO so that it builds quickly.
+# overflow checks, for release's target CPU), without release's LTO so that it
+# builds quickly.
 [profile.stencils]
 inherits = "dev"
 opt-level = 2
 debug-assertions = false
 overflow-checks = false
+rustflags = ["-C", "target-cpu=native"]
 
 [profile.unsafe]
 inherits = "release"
 panic = "immediate-abort"
-rustflags = []
+rustflags = ["-C", "target-cpu=native"]
