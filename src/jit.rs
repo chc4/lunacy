@@ -1171,7 +1171,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let block = &self.blocks[id.0];
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
         let mut alloc = WindowAlloc::entering(self.jctx.blocks[&id].window.clone());
-        window_dump!(self.jctx, "block {} hotness {} pc {} entered with {}", id.0, block.jit_info.hotness.get(), block.pc, alloc.cache());
+        window_dump!(self.jctx, "block {} hotness {} pc {} entered with {}; fragile {:?}", id.0, block.jit_info.hotness.get(), block.pc, alloc.cache(),
+            block.context.as_ref().map(|ctx| ctx.fragile.len()));
         jit_note!(self.jctx, ops, "block {} (pc {}, hotness {}) entered with {}", id.0, block.pc, block.jit_info.hotness.get(), alloc.cache());
 
         // Jump to `target`, or fall through to it if `skip`, transferring the

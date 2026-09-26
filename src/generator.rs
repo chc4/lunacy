@@ -70,7 +70,7 @@ pub struct Block {
     allocates: bool,
     /// A version of a pc's context, which jumps to it enter. See Note [Version
     /// compatibility].
-    context: Option<Rc<Context>>,
+    pub(crate) context: Option<Rc<Context>>,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
     /// Times the interpreter entered the block, shown by `dump`.
@@ -1946,16 +1946,17 @@ pub struct Context {
 // (`Fragile::survives`); a new kind is a variant, its `key` and `survives`, and
 // where it is established.
 //
-// Established in a loop's peeled first iteration, a fact the loop body keeps
-// comes back along the back edge, into the version compiled with it. One the
-// body drops arrives without it, and needs a version without it. So that the
-// facts different paths drop don't multiply versions (every subset of n facts
-// could arrive), a pc's versions differing only in fragile information are a
-// chain of subsets: a context enters the version with the most facts that it
-// has all of, and otherwise one is compiled with the facts the context shares
-// with the version with the fewest (`version`). A pc then has at most n + 1
-// such versions; a loop, typically the peeled one and one without what its
-// body drops.
+// Established in a loop's first iteration, which LBBV then peels, a fact the
+// loop body keeps comes back along the back edge, into a version compiled with
+// it; one the body drops, into a version without it. So that the facts
+// different paths bring don't multiply versions (every subset of n facts could
+// arrive), a pc's versions differing only in fragile information are kept a
+// chain of subsets, each version's facts in the next's, a context keeping the
+// most facts that keep it one (`version`): all of its own, if it has every fact
+// of the top version; otherwise those it shares with the version above the
+// highest it has every fact of (or with the bottom), entering that one if they
+// are all its facts. A chain of subsets of n facts has at most n + 1 versions;
+// a loop, typically the peeled first iteration and one with what it found.
 //
 // Facts:
 //
@@ -2312,18 +2313,27 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .filter(|((epc, _), _)| *epc == subpc)
             .map(|((_, ectx), block)| (ectx.clone(), *block))
             .collect();
-        // Versions differing only in fragile information are a chain of subsets:
-        // enter the one with the most facts `ctx` has all of, or compile one with
-        // those `ctx` shares with the one with the fewest. See Note [Fragile
-        // information].
-        let alike: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
-        if let Some((_, block)) = alike.iter().filter(|(ectx, _)| ectx.fragile_within(&ctx)).max_by_key(|(ectx, block)| (ectx.fragile.len(), std::cmp::Reverse(block.0))) {
-            return *block;
-        }
-        let ctx = match alike.iter().min_by_key(|(ectx, _)| ectx.fragile.len()) {
-            Some((fewest, _)) => {
+        // Versions differing only in fragile information are a chain of subsets,
+        // each version's facts in the next's: `ctx` keeps the most facts that
+        // keep it one. See Note [Fragile information].
+        let mut chain: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
+        chain.sort_by_key(|(ectx, _)| ectx.fragile.len());
+        let below = chain.iter().rposition(|(ectx, _)| ectx.fragile_within(&ctx));
+        // Above the top every fact is kept; otherwise those shared with the
+        // version above the highest `ctx` has all of, or with the bottom.
+        let bound = match below {
+            Some(below) => chain.get(below + 1),
+            None => chain.first(),
+        };
+        let ctx = match bound {
+            Some((above, _)) => {
                 let mut lowered = (*ctx).clone();
-                lowered.fragile.retain(|fact| fewest.fragile.contains(fact));
+                lowered.fragile.retain(|fact| above.fragile.contains(fact));
+                if let Some((under, block)) = below.map(|below| chain[below]) {
+                    if under.fragile == lowered.fragile {
+                        return *block;
+                    }
+                }
                 Rc::new(lowered)
             },
             None => ctx,
