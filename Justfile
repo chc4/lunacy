@@ -258,6 +258,32 @@ flamegraph benchmark times='10' ref='' freq='997':
         (cd $dir && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o $svg -- $bin {{times}})
     fi
 
+# `flamegraph` of revision `ref` (as for `hyperfine-vs`) and of this checkout on
+# one benchmark, kept side by side: flamegraph-<benchmark>-<ref>.svg and
+# perf-<benchmark>-<ref>.data, flamegraph-<benchmark>.svg and
+# perf-<benchmark>.data, and each one's hottest symbols. Both runs' JIT symbol
+# maps (/tmp/perf-<pid>.map) are kept, so either perf.data reports afterwards.
+flamegraph-vs ref benchmark times='10' freq='997' top='25':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _luac {{benchmark}}
+    rm -f /tmp/perf-*.map
+    export CARGO_UNSTABLE_BUILD_STD=core,std,panic_abort
+    here=$(realpath .)
+    bin=$(realpath {{benchmark}}.bin)
+    dir=target/compare/{{ref}}
+    just _compare-worktree {{ref}}
+    (cd $dir && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o $here/flamegraph-{{benchmark}}-{{ref}}.svg -- $bin {{times}})
+    mv $dir/perf.data perf-{{benchmark}}-{{ref}}.data
+    cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o flamegraph-{{benchmark}}.svg -- {{benchmark}}.bin {{times}}
+    mv perf.data perf-{{benchmark}}.data
+    # `head` closing the pipe early isn't a failure.
+    set +o pipefail
+    for data in perf-{{benchmark}}-{{ref}}.data perf-{{benchmark}}.data; do
+        echo "== $data"
+        perf report -i $data --no-children -g none --sort sym --stdio 2>/dev/null | grep '%' | head -n {{top}}
+    done
+
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
 # Interpreter: no JIT, every closure run by the specializer's interpreter loop.
