@@ -47,9 +47,10 @@ thread_local! {
 // type runs as that op, reading its arguments' slots and writing its
 // result's slot, the function's, in the register window: no flush and no call.
 // The op assumes the arguments' type, unchecked, and the result has its type.
-// An argument in the integer encoding (`CType::Integer`) is neither guarded
-// nor converted: the native picks the op reading it as it is (`ints`), as the
-// bit library's do, whose results are integers too.
+// The native picks the op by which arguments the context knows are in the
+// integer encoding (`CType::Integer`, `ints`), which it may read as they are,
+// as the bit library's do, whose results are integers too; it reads any other
+// number in either encoding.
 // Any other call to the native is an ordinary `NativeCall`. The bit library's
 // natives offer one for one result from their fixed arities, of numbers,
 // computing it as the native does (`bit1`, `bit2`). A call taking every result
@@ -151,7 +152,7 @@ unsafe fn checked_number(v: LBoxed) -> f64 {
 }
 
 fn bit_result<'s, 'i>(x: i32) -> SmallVec<[LBoxed<'s, 'i>; 4]> {
-    smallvec![LBoxed::from_number(x as f64)]
+    smallvec![LBoxed::from_int(x)]
 }
 
 // The bit operations, by the `OP` of their window ops.
@@ -196,7 +197,8 @@ fn bit2<const OP: u8>(x: i32, y: i32) -> i32 {
 }
 
 /// A bit op's window op's argument: in the integer encoding (`INT`), read as it
-/// is, or a number the specializer checked. See Note [Integers] in `generator`.
+/// is, or a number of either encoding the specializer checked. See Note
+/// [Integers] in `generator`.
 #[inline(always)]
 unsafe fn bit_arg<const INT: bool>(v: LBoxed) -> i32 {
     if INT { unsafe { v.as_int() } } else { to_bit(unsafe { checked_number(v) }) }

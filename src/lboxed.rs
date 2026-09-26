@@ -1,7 +1,7 @@
 //! The NuN-boxed value type, `LBoxed`, in a module of its own so its `u64`
 //! payload can be a *private* field. That seal is what makes `unbox` safe: the
 //! only ways to obtain an `LBoxed` are the safe constructors here (`box_lvalue`,
-//! `from_number`, `from_bool`, `interned`, `NIL`, `From<&LConstant>`), each of
+//! `from_number`, `from_double`, `from_int`, `from_bool`, `interned`, `NIL`, `From<&LConstant>`), each of
 //! which produces bits that validly encode a live value. Since no code outside
 //! this module can fabricate an `LBoxed` from arbitrary bits, decoding one is no
 //! less safe than dereferencing the `Gc` it came from (which the GC treats as a
@@ -97,16 +97,19 @@ impl<'src> IStr<'src> {
 // A number has two encodings, as in JavaScriptCore's NuN boxing (JSCJSValue.h):
 // a double, offset by `DOUBLE_ENCODE_OFFSET` into `0002:...` to `FFFC:...` (a
 // NaN canonicalized first, so none reaches higher), or an i32, `NUMBER_TAG` or'd
-// with its bits, `FFFE:0000:IIII:IIII`.
+// with its bits, `FFFE:0000:IIII:IIII`. A value with every `NUMBER_TAG` bit set
+// is an integer, and one with some but not all a double.
 //
-// Only LBBV code produces the integer encoding, and only in a stack slot its
-// context types `CType::Integer` (Note [Integers] in `generator`): everything
-// else, from tables and upvalues to natives and the interpreter, only ever
-// sees doubles. So the generic decoders (`as_number`, `unbox`) read doubles
-// alone, and assert that in debug builds; code that knows a slot is an integer
-// reads it with `as_int`. A slot whose context no longer tracks it (a dead
-// register) may keep an integer it never reads again, which the collector
-// skips.
+// Either may be anywhere a value is: a stack slot, a table, an upvalue, a
+// native's argument. The encoding says nothing of the number: an integer and
+// the equal double are the same Lua value, so the generic decoders
+// (`as_number`, `unbox`) read either as the same `f64`, and a table key is
+// canonicalized (Note [Canonical values] in `vm`). Code producing a number
+// without knowing which encoding its consumers want (`from_number`: a
+// constant, a native's result, the generic paths) boxes it canonically, a
+// whole i32 but -0 as an integer, so equal numbers from there reach code in
+// the same encoding. The specializer's typed ops box the encoding their
+// result's type says. See Note [Integers] in `generator`.
 
 // Note [Arithmetic NaNs]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -178,8 +181,16 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         Self::from_raw(bits)
     }
 
+    /// Box a number canonically: a whole i32 but -0 as an integer, anything else
+    /// as a double. See Note [Integer encoding].
     #[inline(always)]
     pub fn from_number(n: f64) -> Self {
+        if is_integer(n) { Self::from_int(n as i32) } else { Self::from_double(n) }
+    }
+
+    /// Box a number in the double encoding, whatever its value.
+    #[inline(always)]
+    pub fn from_double(n: f64) -> Self {
         let bits = if n.is_nan() { Self::CANONICAL_NAN } else { n.to_bits() };
         Self::from_raw(bits.wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
     }
@@ -274,12 +285,13 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         self.0 as u32 as i32
     }
 
-    /// Decode a number, or `None` if this value isn't a number. Never an
-    /// integer: see Note [Integer encoding].
+    /// Decode a number, in either encoding, or `None` if this value isn't a
+    /// number. See Note [Integer encoding].
     #[inline(always)]
     pub fn as_number(&self) -> Option<f64> {
-        debug_assert!(!self.is_int(), "integer {} outside LBBV", self.0 as u32 as i32);
-        if self.is_number() {
+        if self.is_int() {
+            Some(self.0 as u32 as i32 as f64)
+        } else if self.is_number() {
             Some(f64::from_bits(self.0.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET)))
         } else {
             None
@@ -335,9 +347,8 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     #[inline(always)]
     pub fn unbox(&self) -> LValue<'src, 'intern> {
         let bits = self.0;
-        debug_assert!(!self.is_int(), "integer {} outside LBBV", bits as u32 as i32);
-        if bits & Self::NUMBER_TAG != 0 {
-            return LValue::Number(Number(f64::from_bits(bits.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET))));
+        if let Some(n) = self.as_number() {
+            return LValue::Number(Number(n));
         }
         if bits & Self::NOT_CELL_MASK != 0 {
             return match bits {
@@ -395,4 +406,11 @@ impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LBoxed<'src, 'intern> {
             Constant::String(s) => Self::interned(*s),
         }
     }
+}
+
+/// Whether `n` is boxed in the integer encoding canonically: a whole i32, but
+/// not -0. See Note [Integer encoding].
+#[inline(always)]
+pub fn is_integer(n: f64) -> bool {
+    ((n as i32) as f64).to_bits() == n.to_bits()
 }

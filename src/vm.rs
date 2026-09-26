@@ -626,9 +626,11 @@ impl crate::gc::CellKind for FVec<u8> {
 // `LCanon` is an `LBoxed` in canonical form: equal values have identical bits, so it
 // implements `Hash`/`Eq` by value — comparing the raw bits, pointers included — with no
 // `owner`. `LCanon::new` does the canonicalizing: an owned string is interned, which the
-// arena dedups to the one pointer shared by every string with those bytes. Everything
-// else is already canonical: interned strings are that unique pointer, tables/closures
-// compare by identity, and numbers/bool/nil are their own bits.
+// arena dedups to the one pointer shared by every string with those bytes, and a number
+// is boxed canonically (`LBoxed::from_number`), as an integer and the equal double are
+// one key (Note [Integer encoding] in `lboxed`), as are 0 and -0. Everything else is
+// already canonical: interned strings are that unique pointer, tables/closures compare
+// by identity, and bool/nil are their own bits.
 //
 // Hashing agrees with that equality: an interned string hashes by its precomputed content
 // hash (so strings spread by content, not by arena address), everything else by its bits.
@@ -646,14 +648,24 @@ impl<'src, 'intern> LCanon<'src, 'intern> {
     pub fn new(v: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> Self {
         match v.unbox() {
             LValue::OwnedString(g) => LCanon(LBoxed::interned(intern_bytes(intern, g.as_slice()))),
+            LValue::Number(n) => Self::number(n.0),
             _ => LCanon(v),
         }
     }
 
+    /// A number key, -0 as 0. See Note [Canonical values].
     #[inline(always)]
-    /// A constant, which is canonical already: string constants are interned.
+    fn number(n: f64) -> Self {
+        LCanon(LBoxed::from_number(if n == 0.0 { 0.0 } else { n }))
+    }
+
+    #[inline(always)]
+    /// A constant: string constants are interned already.
     pub fn constant(k: &LConstant<'src, 'intern>) -> Self {
-        LCanon(LBoxed::from(k))
+        match k {
+            Constant::Number(n) => Self::number(n.0),
+            k => LCanon(LBoxed::from(k)),
+        }
     }
 
     pub fn boxed(self) -> LBoxed<'src, 'intern> {
@@ -937,9 +949,8 @@ pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<
 /// for that call's arity. See Note [Native windows] in `library`.
 pub type NativeWindow = fn(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<NativeOp>;
 
-/// A call to a native run as a window op: the op, the type every argument not
-/// in the integer encoding must have for it (the op assumes it), and its
-/// result's type.
+/// A call to a native run as a window op: the op, the type every argument must
+/// have for it (the op assumes it), and its result's type.
 pub struct NativeOp {
     pub window: std::rc::Rc<dyn crate::window::Window>,
     pub args: LType,

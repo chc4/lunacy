@@ -1,7 +1,7 @@
--- The integer encoding of numbers (see Note [Integers]): integers held as ones
--- in registers across arithmetic, compares and loops, lowered to doubles
--- wherever they leave (calls, returns, tables, globals, jumps) or stop being
--- integers (overflow, -0, fractions, NaN).
+-- The integer encoding of numbers (see Note [Integers]): integers across
+-- arithmetic, compares and loops, leaving through calls, returns, tables,
+-- globals and jumps as they are, and doubles where they stop being integers
+-- (overflow, -0, fractions, NaN).
 local function id(x) return x end
 
 local function arith(n)

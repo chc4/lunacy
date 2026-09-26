@@ -8,7 +8,7 @@ use crate::vm::{BlockId, LBoxed, LClosure, LType, LValue, PackedLocation, Return
 use crate::gc::{GcInner, GcCtx};
 use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
-use crate::generator::{Block, Context, Residual, Specializer, SubPc};
+use crate::generator::{Block, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
 use crate::window_alloc::{plan_trace, Cache, Emit, Packed, Placement, Step, WindowAlloc};
 use crate::trace::{Block as TraceBlock, Event, Policy, Region, Slots};
@@ -131,7 +131,7 @@ impl JitHelper {
             let LValue::Table(tab) = tab_val else { unreachable!() };
             // The witness's index still holds its key, with a value of the type.
             let entry = tab.ro(owner).hash.get_index(hwit.index);
-            entry.is_some_and(|(k, val)| k.boxed().bits() == key && (val.unbox().typeof_() as u8) == expected)
+            entry.is_some_and(|(k, val)| k.boxed().bits() == key && crate::generator::passes_guard_code(*val, expected))
         }
     }
 
@@ -510,7 +510,10 @@ type Plans = HashMap<BlockId, BlockPlan, FxBuildHasher>;
 
 /// A type guard tested inline, in the window register caching its slot.
 fn inline_guard(res: &Residual) -> bool {
-    matches!(res, Residual::Guard { expected: LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String, .. })
+    matches!(res, Residual::Guard {
+        expected: CType::Integer | CType::Double | CType::Type(LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String),
+        ..
+    })
 }
 
 /// The `SKIP`s a window op's stencil can be copied at: none where stencils
@@ -1335,7 +1338,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1), &alloc.stores());
             }
             loop { match res {
-                Residual::Guard { idx, expected } if inline_guard(res) => {
+                Residual::Guard { idx, known, expected } if inline_guard(res) => {
                     // NuN-boxed type check of the value in `STACK[idx]`: in the window
                     // register caching it, or else loaded from its stack home. A
                     // *match* jumps to the success continuation at `off + 2`, a
@@ -1343,6 +1346,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // both with the window live.
                     //
                     //   * Number   : the value has any `NUMBER_TAG` bit set.
+                    //   * Integer  : it has all of them: at least `NUMBER_TAG`, unsigned.
+                    //   * Double   : some but not all: below `NUMBER_TAG`, and, unless
+                    //     `known` a number, any set. See Note [Integers] in `generator`.
                     //   * Nil/Bool : exact immediate compare (nil = 2, false/true = 6/7).
                     //   * cell types (Table/Closure/String): the value is a raw pointer
                     //     (no `NOT_CELL_MASK` bits) whose offset-0 header byte is the kind.
@@ -1369,25 +1375,46 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     };
                     match expected {
-                        LType::Number => dynasm!(ops
+                        CType::Type(LType::Number) => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; test Rq(v), Rq(m)
                             ; jnz =>insts[off + 2]
                         ),
-                        LType::Nil => dynasm!(ops
+                        CType::Integer => dynasm!(ops
+                            ; .arch x64
+                            ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
+                            ; cmp Rq(v), Rq(m)
+                            ; jae =>insts[off + 2]
+                        ),
+                        CType::Double if *known == LType::Number => dynasm!(ops
+                            ; .arch x64
+                            ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
+                            ; cmp Rq(v), Rq(m)
+                            ; jb =>insts[off + 2]
+                        ),
+                        CType::Double => dynasm!(ops
+                            ; .arch x64
+                            ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
+                            ; cmp Rq(v), Rq(m)
+                            ; jae >guard_fail // an integer
+                            ; test Rq(v), Rq(m)
+                            ; jnz =>insts[off + 2]
+                            ; guard_fail:
+                        ),
+                        CType::Type(LType::Nil) => dynasm!(ops
                             ; .arch x64
                             ; cmp Rq(v), (LBoxed::VALUE_NIL as i32)
                             ; jz =>insts[off + 2]
                         ),
-                        LType::Bool => dynasm!(ops
+                        CType::Type(LType::Bool) => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), Rq(v)
                             ; or Rq(m), 1 // false(6) -> 7, true(7) -> 7
                             ; cmp Rq(m), (LBoxed::VALUE_TRUE as i32)
                             ; jz =>insts[off + 2]
                         ),
-                        LType::Table => dynasm!(ops
+                        CType::Type(LType::Table) => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
                             ; test Rq(v), Rq(m)
@@ -1396,7 +1423,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; jz =>insts[off + 2]
                             ; guard_fail:
                         ),
-                        LType::Closure => dynasm!(ops
+                        CType::Type(LType::Closure) => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
                             ; test Rq(v), Rq(m)
@@ -1407,7 +1434,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; jbe =>insts[off + 2]
                             ; guard_fail:
                         ),
-                        LType::String => dynasm!(ops
+                        CType::Type(LType::String) => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
                             ; test Rq(v), Rq(m)
@@ -1421,9 +1448,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         _ => unreachable!(),
                     }
                 },
-                Residual::Guard { idx, expected } => {
+                Residual::Guard { idx, expected, .. } => {
                     // A type with no inline test: ask `check_guard`. The window was
                     // flushed, since the call clobbers it.
+                    let CType::Type(expected) = expected else { unreachable!("{expected} has an inline test") };
                     let expected_u8 = *expected as u8;
                     dynasm!(ops
                         ; .arch x64
@@ -1477,7 +1505,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::HashGuard { tab, href, key, expected } => {
                     let href_u8 = href.0;
-                    let expected_u8 = *expected as u8;
+                    let expected_u8 = crate::generator::guard_code(expected);
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r12 // state

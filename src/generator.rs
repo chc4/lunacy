@@ -14,6 +14,7 @@ use crate::vm::{Tc, Vm};
 use crate::vm::{BlockId, HashRef};
 use crate::vm::{LClosure, LProto};
 use crate::vm::{LValue, LType, Number, Table, FVec, LBoxed, LCanon, IStr};
+use crate::lboxed::is_integer;
 use crate::vm::{InstructionDecode, Unpacker};
 use crate::vm::RunState;
 use crate::vm::LConstant;
@@ -189,7 +190,8 @@ macro_rules! dispatch_compare_window {
 
 /// In a generator, the types of an op's two operands, as `TypeofRk` gives
 /// them, for an op computing on integers: with one an integer register, whether
-/// an unknown other register is one is found out (`DiscoverInteger`). See Note
+/// the other register is one is found out (`GuardCType(Integer)`), which tests
+/// its tag if it is unknown or a number of either encoding. See Note
 /// [Integers]. An integer constant finds out nothing: it says nothing of how
 /// the program uses the other operand, and is an integer to an op whose other
 /// operand is one already.
@@ -206,15 +208,31 @@ macro_rules! discover_integers {
         let mut rt = yield YieldOp::TypeofRk($rhs);
         let registers = ($lhs & 0x100) == 0 && ($rhs & 0x100) == 0;
         if registers && lt == integer {
-            if (yield YieldOp::DiscoverInteger($rhs)) == ResumeArg::Matched {
+            if (yield YieldOp::GuardCType($rhs, CType::Integer)) == ResumeArg::Matched {
                 rt = integer.clone();
             }
         } else if registers && rt == integer {
-            if (yield YieldOp::DiscoverInteger($lhs)) == ResumeArg::Matched {
+            if (yield YieldOp::GuardCType($lhs, CType::Integer)) == ResumeArg::Matched {
                 lt = integer.clone();
             }
         }
         (lt, rt)
+    }};
+}
+
+/// In a generator, a number operand's encoding: whether a register the op reads
+/// as a number, after its number guard passed, is in the integer encoding, as
+/// `GuardCType(Integer)` finds out: statically if the context knows, else by
+/// testing its tag. It is yielded either way, so the ways knowing and finding
+/// out continue at the same `SubPc`. A constant is read from the prototype, as
+/// a double. See Note [Integers].
+macro_rules! encoding {
+    ($rk:expr) => {{
+        if ($rk & 0x100) != 0 {
+            false
+        } else {
+            (yield YieldOp::GuardCType($rk, CType::Integer)) == ResumeArg::Matched
+        }
     }};
 }
 
@@ -235,7 +253,7 @@ pub struct ResidualExec {
 impl std::fmt::Display for Residual {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Residual::Guard { idx, expected } => write!(f, "guard({}, {})", idx, expected),
+            Residual::Guard { idx, expected, .. } => write!(f, "guard({}, {})", idx, expected),
             Residual::NativeGuard { idx, ptr } => write!(f, "native_guard({}, {:p})", idx, *ptr),
             Residual::LuaGuard { idx, ptr } => write!(f, "lua_guard({}, {:p})", idx, *ptr),
             Residual::Exec(ResidualExec { name, .. }) => write!(f, "exec({})", name),
@@ -291,19 +309,12 @@ pub enum YieldOp {
                          // type
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
                            // is the expected type
-    GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer. See
-                              // Note [Integers]. For a `CType::Type`, Guard of a register
-                              // that passes an Integer for a Number as it is, where Guard
-                              // lowers it to a double
-    DiscoverInteger(usize), // Which of the number sublattice STACK[idx] is in: Integer, or a
-                            // number, statically, or as GuardCType(idx, Integer) finds out if
-                            // unknown. See Note [Integers]
+    GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer, a
+                              // number's encoding. See Note [Integers]
     TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
     IntegerK(usize), // Resumed with the value of CONSTANT[idx], a `CType::Integer`
     NumberK(usize), // Resumed with the value of CONSTANT[idx], a number
     BoxedK(usize), // Resumed with the boxed value of CONSTANT[idx], as its bits
-    Demote(std::ops::Range<usize>), // Lower the integers in STACK[range] to doubles, for code
-                                    // reading them as any value. See Note [Integers]
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
     Exec(ResidualExec), // Emit a residual operation that will be executed
@@ -315,6 +326,9 @@ pub enum YieldOp {
                                       // `state.select` at runtime
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
     Call(CallTarget), // Call a block target. Probably need a ResumeArg for returned values later.
+    FieldType(usize, HashRef), // STACK[idx] was just loaded from HREF's field: its type is the
+                               // hash key's, or found out, as a guard of it that always passes.
+                               // See Note [Field types]
     LoadUpvalue(usize, usize), // STACK[idx] was just loaded from UPVALUE[b]: what the context knows
                                // of the upvalue is its type. See Note [Fragile information]
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
@@ -373,25 +387,18 @@ pub enum ResumeArg {
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // The constant's boxed value is the op's hole, so it is a store; an
-        // integer's is in the integer encoding. See Note [Integers].
+        // The constant's boxed value is the op's hole, so it is a store; a
+        // number's is canonical, an integer's in the integer encoding. See Note
+        // [Integers].
         windowed!(LoadK, [bits: u64], [], |owner, state, base| (out dest) {
             // A constant's value lives as long as its prototype.
             *dest = LBoxed::from_bits(bits);
         });
-        windowed!(LoadKInteger, [value: i32], [], |owner, state, base| (out dest) {
-            *dest = LBoxed::from_int(value);
-        });
         match c {
             LType::Number => {
                 let ResumeArg::Type(t) = (yield YieldOp::TypeofK(bx as usize)) else { unreachable!() };
-                if t == CType::Integer {
-                    let ResumeArg::Integer(value) = (yield YieldOp::IntegerK(bx as usize)) else { unreachable!() };
-                    yield YieldOp::ExecWindow(Rc::new(LoadKInteger::new(value, &[dest])));
-                } else {
-                    let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
-                    yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
-                }
+                let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
+                yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
                 yield YieldOp::SetCTypes(vec![(dest, t)]);
             },
             LType::String => {
@@ -463,7 +470,6 @@ pub fn emit_setglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>
     move |mut arg: ResumeArg| {
         // TODO: env shape specialization
         debug!("setglobal {} = {:?}", dest, &kst);
-        yield YieldOp::Demote(dest..dest + 1);
         yield YieldOp::Exec(ResidualExec::new("setglobal", Rc::new(move |owner, state| {
             state._G.set(owner, (&kst).into(), state.vals[state.base + dest as usize], state.intern);
         })));
@@ -499,7 +505,8 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 *dest = val1;
             });
             arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, &[a])));
-            yield YieldOp::SetCTypes(vec![(a, htype.clone())]);
+            // Its type: the hash key's, or found out. See Note [Field types].
+            yield YieldOp::FieldType(a, hc);
         } else {
             // An integer key in the array part, in a register or a constant (its
             // value, `k`): the array slot. See Note [Dynamic guards].
@@ -530,7 +537,6 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableInteger::new(&[b, c, a])));
             } else {
                 // Any other key: through `gettable`.
-                yield YieldOp::Demote(c..c + 1);
                 arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
                     let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
                         Ok(c) => Cow::Owned(LValue::from(c)),
@@ -604,37 +610,23 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             (Some(None), 0) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[a, b]))),
             _ => ResumeArg::Failed,
         };
-        // A table holds a double. See Note [Integers].
-        let int_value = in_array == ResumeArg::Matched && (yield YieldOp::TypeofRk(c)) == ResumeArg::Type(CType::Integer);
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableArray, [k: i32], [INT: bool], |owner, state, base| (table, value) {
+            windowed!(SetTableArray, [k: i32], [], |owner, state, base| (table, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
-                tab.rw(owner).array[integer_slot(k)] = double::<INT>(value);
+                tab.rw(owner).array[integer_slot(k)] = value;
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            arg = yield YieldOp::ExecWindow(if int_value {
-                Rc::new(SetTableArray::<true>::new(k, &[a, c]))
-            } else {
-                Rc::new(SetTableArray::<false>::new(k, &[a, c]))
-            });
+            arg = yield YieldOp::ExecWindow(Rc::new(SetTableArray::new(k, &[a, c])));
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableInteger, [], [INT: bool], |owner, state, base| (table, key, value) {
+            windowed!(SetTableInteger, [], [], |owner, state, base| (table, key, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
-                tab.rw(owner).array[integer_slot(key.as_int())] = double::<INT>(value);
+                tab.rw(owner).array[integer_slot(key.as_int())] = value;
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            arg = yield YieldOp::ExecWindow(if int_value {
-                Rc::new(SetTableInteger::<true>::new(&[a, b, c]))
-            } else {
-                Rc::new(SetTableInteger::<false>::new(&[a, b, c]))
-            });
-        } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = {
-            yield YieldOp::Demote(b..b + 1);
-            yield YieldOp::Demote(c..c + 1);
-            yield YieldOp::GuardRk(b, LType::Number)
-        } {
+            arg = yield YieldOp::ExecWindow(Rc::new(SetTableInteger::new(&[a, b, c])));
+        } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = (yield YieldOp::GuardRk(b, LType::Number)) {
             // Any other number key, one past the array part, or a constant value:
             // through `set`.
             arg = yield YieldOp::Exec(ResidualExec::new("settable_array", Rc::new(move |owner, state| {
@@ -656,9 +648,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::TryHashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 let ResumeArg::Type(new_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                // A table holds an integer constant as a double. See Note [Integers].
-                let new_type = if new_type == CType::Integer { CType::Type(LType::Number) } else { new_type };
-                let retype = if new_type == htype {
+                // A field of unknown type (its hash key's type not found out yet)
+                // may be of another type than the value. See Note [Field types].
+                let retype = if new_type == htype && htype != CType::Type(LType::Unknown) {
                     Retype::Same
                 } else if new_type == CType::Type(LType::Unknown) {
                     Retype::Unknown
@@ -677,7 +669,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
                     debug!("settable_href {:?} {:?}", &val1, expected);
                     #[cfg(debug_assertions)]
-                    assert!(val1.unbox().typeof_() == expected);
+                    assert!(expected == LType::Unknown || val1.unbox().typeof_() == expected);
                     *val1 = value;
                     match retype {
                         Retype::Same => {}
@@ -728,10 +720,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Err(lv) => *lv,
                     };
                     let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
-                    let kc_type = kc.unbox().typeof_();
+                    // A field's type is a number's encoding. See Note [Field types].
+                    let kc_type = guard_type(kc);
                     if let Some(existing) = t.rw(owner).hash.insert(kb, kc) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
-                        if existing.unbox().typeof_() != kc_type {
+                        if guard_type(existing) != kc_type {
                             t.rw(owner).epoch += 1;
                         }
                     } else {
@@ -768,7 +761,6 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
         // We don't need to guard on LType::Table, because this instruction is only ever used for
         // table initialization, which means it is definitely a table and doesn't e.g. have a
         // metatable we have to chain to.
-        yield YieldOp::Demote(a + 1..if b == 0 { usize::MAX } else { a + 1 + b });
         arg = yield YieldOp::Exec(ResidualExec::new("setlist", Rc::new(move |owner, state| {
             match state.vals[state.base + a as usize].unbox() {
                 LValue::Table(tab) => {
@@ -815,13 +807,6 @@ unsafe fn arith<'src, 'intern, const OP: Opcode>(l: f64, r: f64) -> LBoxed<'src,
         _ => unsafe { core::hint::unreachable_unchecked() },
     };
     unsafe { LBoxed::from_arith(n) }
-}
-
-/// A value as a double, for a table to hold: re-encoded if `INT`. See Note
-/// [Integers].
-#[inline(always)]
-unsafe fn double<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>) -> LBoxed<'src, 'intern> {
-    if INT { unsafe { LBoxed::from_arith(v.as_int() as f64) } } else { v }
 }
 
 /// The integer op `OP`'s result, if it fits the integer encoding: it must be in
@@ -954,11 +939,12 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             }
         }
         // --- Number Path ---
-        // An integer register is decoded, not lowered. See Note [Integers].
-        let lint = (lhs & 0x100) == 0 && (yield YieldOp::TypeofRk(lhs)) == integer;
-        let rint = (rhs & 0x100) == 0 && (yield YieldOp::TypeofRk(rhs)) == integer;
-        let larg = if lint { ResumeArg::Matched } else { yield YieldOp::GuardRk(lhs, LType::Number) };
-        let rarg = if rint { ResumeArg::Matched } else { yield YieldOp::GuardRk(rhs, LType::Number) };
+        // Each register decoded from the encoding it is in. See Note [Integers].
+        let larg = yield YieldOp::GuardRk(lhs, LType::Number);
+        let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
+        let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
+            && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
+        let (lint, rint) = if numbers { (encoding!(lhs), encoding!(rhs)) } else { (false, false) };
         let window = match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => Some(numeric_rr(opcode, lint, rint, &[lhs, rhs, dest])),
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
@@ -978,7 +964,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         };
         if let Some(window) = window {
             yield YieldOp::ExecWindow(window);
-            yield YieldOp::SetTypes(vec![(dest, LType::Number)]);
+            yield YieldOp::SetCTypes(vec![(dest, CType::Double)]);
             return arg;
         }
 
@@ -1049,9 +1035,10 @@ crate::window::windowed!(CompareRK, [a: u8, k: f64], [OP: Opcode, LI: bool], |ow
     select::<OP, f64>(state, a, number::<LI>(lhs), k);
 });
 
-// EQ of a double against a number constant `k` (its boxed bits) other than ±0
-// or NaN: in the double encoding, equal numbers have equal bits but for ±0
-// (unequal bits) and NaN (equal to nothing), so it compares the bits.
+// EQ of a double against a number constant `k` (its bits in the double
+// encoding) other than ±0 or NaN: in the double encoding, equal numbers have
+// equal bits but for ±0 (unequal bits) and NaN (equal to nothing), so it
+// compares the bits.
 crate::window::windowed!(EqualBits, [a: u8, k: u64], [], |owner, state, base| (value) {
     state.select = if ((value.bits() == k) as u8) != a { 0 } else { 1 };
 });
@@ -1061,7 +1048,7 @@ crate::window::windowed!(EqualBits, [a: u8, k: u64], [], |owner, state, base| (v
 /// operand).
 fn compare_k(opcode: Opcode, int: bool, a: u8, k: f64, k_left: bool, operand: usize) -> Rc<dyn Window> {
     if opcode == Opcode::EQ && !int && k != 0.0 && !k.is_nan() {
-        return Rc::new(EqualBits::new(a, LBoxed::from_number(k).bits(), &[operand]));
+        return Rc::new(EqualBits::new(a, LBoxed::from_double(k).bits(), &[operand]));
     }
     if k_left { compare_kr(opcode, int, a, k, &[operand]) } else { compare_rk(opcode, int, a, k, &[operand]) }
 }
@@ -1095,15 +1082,16 @@ fn compare_rk(opcode: Opcode, li: bool, a: u8, k: f64, operands: &[usize]) -> Rc
 pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // Integers compare as integers, and an integer register is decoded, not
-        // lowered. See Note [Integers].
+        // Integers compare as integers, and each other register is decoded from
+        // the encoding it is in. See Note [Integers].
         let integer = ResumeArg::Type(CType::Integer);
         let (lt, rt) = discover_integers!(b, c);
         let integers = lt == integer && rt == integer;
-        let lint = (b & 0x100) == 0 && lt == integer;
-        let rint = (c & 0x100) == 0 && rt == integer;
-        let larg = if lint { ResumeArg::Matched } else { yield YieldOp::GuardRk(b, LType::Number) };
-        let rarg = if rint { ResumeArg::Matched } else { yield YieldOp::GuardRk(c, LType::Number) };
+        let larg = yield YieldOp::GuardRk(b, LType::Number);
+        let rarg = yield YieldOp::GuardRk(c, LType::Number);
+        let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
+            && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
+        let (lint, rint) = if numbers { (encoding!(b), encoding!(c)) } else { (false, false) };
 
         let lnil = yield YieldOp::GuardRk(b, LType::Nil);
         let rnil = yield YieldOp::GuardRk(c, LType::Nil);
@@ -1262,8 +1250,6 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
 pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // A number operand converts to a string, from a double. See Note [Integers].
-        yield YieldOp::Demote(b..c + 1);
         arg = yield YieldOp::Exec(ResidualExec::new("concat", Rc::new(move |owner, state| {
             let mut s: FVec<_> = vec![].into();
             for i in (b as usize)..=(c as usize) {
@@ -1354,11 +1340,9 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
 // running closure's own upvalue, the same cell.
 //
 // A closure may read or write a slot it captured whenever it runs, which is
-// during a call: so a slot any CLOSURE of a function captures (`captured_slots`)
-// is demoted before each call, and before a return (which closes it), and its
-// type forgotten after each call. Nothing outside LBBV code then sees an
-// integer, and no context types a captured slot with what a call may have
-// changed. See Note [Integers].
+// during a call: so the type of a slot any CLOSURE of a function captures
+// (`captured_slots`) is forgotten after each call, and no context types a
+// captured slot with what a call may have changed.
 //
 // GETUPVAL and SETUPVAL read and write an open cell's slot in memory, never the
 // register window: it is a slot of an enclosing frame, below the running one's.
@@ -1436,8 +1420,6 @@ fn set_closed<'src, 'intern>(owner: &mut Owner, cell: Tc<LBoxed<'src, 'intern>>,
 pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // An upvalue holds any value. See Note [Integers].
-        yield YieldOp::Demote(a..a + 1);
         windowed!(SetUpval, [index: usize], [], |owner, state, base| (value) {
             let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
             match upval {
@@ -1528,17 +1510,14 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         let mut add = emit_numeric(Opcode::ADD, a, a, a + 2);
         drain!(add, arg);
 
-        // Integers are decoded, not lowered. See Note [Integers].
-        let integer = ResumeArg::Type(CType::Integer);
-        let ii = (yield YieldOp::Typeof(a)) == integer;
-        let li = (yield YieldOp::Typeof(a + 1)) == integer;
-        let si = (yield YieldOp::Typeof(a + 2)) == integer;
-        let idx_number = if ii { ResumeArg::Matched } else { yield YieldOp::Guard(a, LType::Number) };
-        let limit_number = if li { ResumeArg::Matched } else { yield YieldOp::Guard(a + 1, LType::Number) };
-        let step_number = if si { ResumeArg::Matched } else { yield YieldOp::Guard(a + 2, LType::Number) };
+        // Each decoded from the encoding it is in. See Note [Integers].
+        let idx_number = yield YieldOp::Guard(a, LType::Number);
+        let limit_number = yield YieldOp::Guard(a + 1, LType::Number);
+        let step_number = yield YieldOp::Guard(a + 2, LType::Number);
 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
+                let (ii, li, si) = (encoding!(a), encoding!(a + 1), encoding!(a + 2));
                 yield YieldOp::ExecWindow(for_loop(ii, li, si, &[a, a + 1, a + 2, a + 3]));
                 let ResumeArg::Type(t) = (yield YieldOp::Typeof(a)) else { unreachable!() };
                 yield YieldOp::SetCTypes(vec![(a + 3, t)]);
@@ -1598,8 +1577,7 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         // it has it. See Note [Native windows] in `library`.
         if let ResumeArg::WindowArgs(end, args) = (yield YieldOp::NativeWindowArgs(a, b, c)) {
             for slot in a + 1..end {
-                // One in the integer encoding, the op reads as it is.
-                yield YieldOp::GuardCType(slot, CType::Type(args));
+                yield YieldOp::Guard(slot, args);
             }
         }
         // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch
@@ -1640,7 +1618,10 @@ impl std::fmt::Debug for ThunkRef {
 
 #[derive(Debug, Clone)]
 pub enum Residual {
-    Guard { idx: usize, expected: LType },
+    /// Whether `STACK[idx]`, known to be of type `known` (a number, or
+    /// unknown), has the type `expected`: a `CType::Type`, or a number's
+    /// encoding, `Integer` or `Double`. See Note [Integers].
+    Guard { idx: usize, known: LType, expected: CType },
     Exec(ResidualExec),
     /// A copy&patch window op (see `crate::window`): a trait object, like
     /// `Exec`'s closure, so processing sites never enumerate ops. Its operands
@@ -1658,7 +1639,7 @@ pub enum Residual {
     Ret(Pc, u8, u16),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
-    HashGuard { tab: usize, href: HashRef, key: u64, expected: LType },
+    HashGuard { tab: usize, href: HashRef, key: u64, expected: CType },
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
@@ -1670,8 +1651,10 @@ pub enum Residual {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum CType {
     Type(LType),
-    /// A number that is a whole number in the i32 range. See Note [Integers].
+    /// A number in the integer encoding. See Note [Integers].
     Integer,
+    /// A number in the double encoding. See Note [Integers].
+    Double,
     Shape(SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
     LuaFunction(Tc<LClosure<'static, 'static>>),
@@ -1694,7 +1677,7 @@ impl CType {
         match (self, other) {
             (a, b) if a == b => true,
             (CType::Type(LType::Unknown), _) => true,
-            (CType::Type(LType::Number), CType::Integer) => true,
+            (CType::Type(LType::Number), CType::Integer | CType::Double) => true,
             (CType::Type(LType::Closure), CType::NativeFunction(_) | CType::LuaFunction(_)) => true,
             _ => false,
         }
@@ -1726,7 +1709,7 @@ impl CType {
     fn as_ltype(&self) -> LType {
         match self {
             CType::Type(ty) => ty.clone(),
-            CType::Integer => LType::Number,
+            CType::Integer | CType::Double => LType::Number,
             CType::Shape(_) => LType::Table,
             CType::NativeFunction(_) => LType::Closure,
             CType::LuaFunction(_) => LType::Closure,
@@ -1739,6 +1722,7 @@ impl std::fmt::Display for CType {
         match self {
             CType::Type(ltype) => ltype.fmt(f),
             CType::Integer => write!(f, "integer"),
+            CType::Double => write!(f, "double"),
             CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
             CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
             CType::LuaFunction(lclos) => write!(f, "fn({:?})", lclos.as_ptr()),
@@ -1748,83 +1732,125 @@ impl std::fmt::Display for CType {
 
 // Note [Integers]
 // ~~~~~~~~~~~~~~~
-// `CType::Integer` is a number that is a whole number in the i32 range, but
-// not -0, held in the integer encoding (Note [Integer encoding] in `lboxed`): a
-// stack slot is in the integer encoding exactly when its context types it
-// `Integer`. Every other number is a double, and nothing outside LBBV code
-// sees an integer: a slot a closure captures is demoted wherever the closure
-// could read it. See Note [Captured slots].
+// A number is in the integer or the double encoding (Note [Integer encoding] in
+// `lboxed`), anywhere, and its tag says which: `CType::Integer` is a number in
+// the integer encoding, `CType::Double` one in the double encoding, and
+// `CType::Type(Number)` a number in either. As the value carries its encoding, a
+// context knowing less of it needs no code: a jump into a version typing a slot
+// `Number` or `Unknown` enters it as it is, and generic code (a table, an
+// upvalue, a native, a return) reads either.
 //
-// They are found by demand: an op that wants an integer (a table key,
-// FORPREP's operands) yields `GuardCType(slot, Integer)`, which answers
-// statically when the context knows (the slot is `Integer`, or not a number)
-// and otherwise ends the block in a discovery thunk, like `Guard`'s. Forcing
-// it tests the value it finds:
+// Discovery finds out the encoding with the type: a discovery thunk forced on a
+// number types its slot `Integer` or `Double` and guards that, one residual
+// testing for it from what the context knew (`Guard`'s `known`): an integer has
+// every `NUMBER_TAG` bit set, one compare from anything; a double has some but
+// not all, a compare and a test from an unknown slot, and a compare alone from a
+// number. A guard continues its generator a `SubPc` step for each level of the
+// lattice it tests down to, the context answering it or not (`navigate`), so a
+// way knowing a number and a way finding out from nothing share the blocks
+// after. An op that wants
+// an integer (a table key, FORPREP's operands) yields `GuardCType(slot,
+// Integer)`, answered statically when the context knows the encoding (or that
+// the slot isn't a number), and otherwise ending the block in a discovery
+// thunk: an unknown value, or a `Number` in either encoding. An op reading a
+// number as a double reads each register in the encoding its context says,
+// testing the tag of a `Number` of either (`encoding`), so no op decodes a tag.
+// A field's number is found out with the field, in its encoding (Note [Field
+// types]).
 //
-//   * an integer: a `GuardDynamic(CheckInteger<true>)`, continuing on the
-//     success path with the slot `Integer`, through a block converting it
-//     (`ToInteger`);
-//   * another number: a `GuardDynamic(CheckInteger<false>)`, continuing on the
-//     failure path with the slot a number;
-//   * anything else: a `Guard` on its type, continuing on the failure path.
-//
-// Its fail thunk does the same for the next value that fails the guard.
-//
-// An integer is lowered back to a double (`ToNumber`, typing its slot a
-// number) wherever code would read it as any number or value: at a
-// `Guard(slot, Number)`, and a `Demote` by an op handing it to generic code (a
-// store to a table or a global, a table op's generic path), for a call's
-// arguments and a return's values, and before a jump into a version typing the
-// slot less precisely (Note [Version compatibility]), in a block of its own on
-// that edge. A jump forgetting the types of registers holding no local keeps an
-// integer's (`forgotten`), as forgetting it would lower it every time. Its context must still be one the version accepts, so a generator
-// lowers nothing once it has its jump targets. `Typeof` answers `Integer`, so
-// MOVE copies an integer as one.
-//
-// Integer ops read and give integers. A whole i32 constant loads as one. ADD,
-// SUB, MUL and MOD of two `Integer` operands give one, guarded by a
-// `GuardDynamic` test that the exact result fits the encoding, which a failing
-// one computes as doubles instead. Compares of two compare them as integers.
-// With one operand an integer register, these ask which part of the number
-// sublattice another register is in (`DiscoverInteger`), like a `Typeof`
-// restricted to numbers: an `Integer` or a number the context knows answers
-// statically, taking the integer or the double op, and an unknown one is found
-// out as by a `GuardCType`. A known number isn't tested, so arithmetic on
-// doubles tests nothing, and an integer constant asks nothing of the other
-// operand. The double ops, compares and FORLOOP read an integer operand as a
-// double, and FORPREP finds out whether its operands are integers, so an
+// Integer ops read and give integers. A whole i32 constant is one. ADD, SUB, MUL
+// and MOD of two `Integer` operands give one, guarded by a `GuardDynamic` test
+// that the exact result fits the encoding, which a failing one computes as
+// doubles instead: that overflow is the only way from one encoding to the other
+// in specialized code. Compares of two compare them as integers. With one
+// operand an integer register, these find out whether another register is one
+// (`GuardCType`), and an integer constant asks nothing of the other operand.
+// The double ops and compares and FORLOOP read an integer operand as a double,
+// and give a `Double`; FORPREP finds out whether its operands are integers, so an
 // integer loop's index and variable stay ones.
+
+/// The type a guard finds `value` has: a number's encoding, or its `LType`.
+/// See Note [Integers].
+pub fn guard_type(value: LBoxed) -> CType {
+    if value.is_int() {
+        CType::Integer
+    } else if value.is_number() {
+        CType::Double
+    } else {
+        CType::Type(value.unbox().typeof_())
+    }
+}
+
+/// Where a guard for `expected` continues its generator, with what, when the
+/// value's type is `found` (as precise as a guard finds, or a context knows it
+/// to be): a step down the lattice for each level `expected` is below the top,
+/// the right one if `found` is at or below that level's type and else the left
+/// one (and none further), whether the context answers it or a thunk finds it
+/// out, so the ways share the blocks after. `Integer` is two levels, a
+/// `Number`, then the encoding; every `CType::Type` one. See Note [Integers].
+fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
+    match expected {
+        CType::Integer if found.as_ltype() != LType::Number => (pc.next_false(), ResumeArg::Failed),
+        CType::Integer if *found == CType::Integer => (pc.next_true().next_true(), ResumeArg::Matched),
+        CType::Integer => (pc.next_true().next_false(), ResumeArg::Failed),
+        expected if expected.accepts(found) => (pc.next_true(), ResumeArg::Matched),
+        _ => (pc.next_false(), ResumeArg::Failed),
+    }
+}
+
+/// Whether `value` passes a `Residual::Guard` of `expected`: has its type, or,
+/// for `Integer` or `Double`, is a number in that encoding. See Note [Integers].
+pub fn passes_guard(value: LBoxed, expected: &CType) -> bool {
+    passes_guard_code(value, guard_code(expected))
+}
+
+/// A type a guard tests for, as a byte for code that can't hold a `CType`: its
+/// `LType`'s, or past them, an encoding's.
+pub fn guard_code(expected: &CType) -> u8 {
+    match expected {
+        CType::Type(ltype) => *ltype as u8,
+        CType::Integer => GUARD_INTEGER,
+        CType::Double => GUARD_DOUBLE,
+        _ => unreachable!("a type guard tests for a CType::Type or an encoding, not {expected}"),
+    }
+}
+
+const GUARD_INTEGER: u8 = 0x80;
+const GUARD_DOUBLE: u8 = 0x81;
+
+/// `passes_guard` of the type `guard_code` gave `code`.
+#[inline(always)]
+pub fn passes_guard_code(value: LBoxed, code: u8) -> bool {
+    match code {
+        GUARD_INTEGER => value.is_int(),
+        GUARD_DOUBLE => value.is_number() && !value.is_int(),
+        ltype => value.unbox().typeof_() as u8 == ltype,
+    }
+}
+
+// Note [Field types]
+// ~~~~~~~~~~~~~~~~~~
+// A hash key's type (`known_type`) is its field's value's, a number's encoding
+// included, which tables of one shape needn't share: `href_init` finds the key
+// in whatever table reaches it. So an href is made with its type unknown, and
+// the gettable loading its field finds it out (`FieldType`): the slot it loaded
+// is discovered like any other, its guard testing the value in the slot, and
+// the type found is the hash key's too. The same load through the hash key
+// again, while it holds, has that type without a guard.
+//
+// It holds while the witness has the table's epoch: a store retyping the field
+// moves it, through the witness as `Retype` says (a hash key of unknown type
+// never `Same`), and generically when the value's type, a number's encoding
+// included, changes. An access finding the epoch moved checks the type is
+// intact (`HashGuard`), and failing that, falls back to a fresh href of unknown
+// type, whose blocks after are those of the first way in for the context, or
+// others its guards find, up to the version limit.
 
 /// Whether a jump forgets a type of a register holding no local in scope at
 /// its target, which may still be an expression's temporary (`a and b or c`).
-/// Not an `Integer`: forgetting one would lower it, a conversion on every jump
-/// with it, where forgetting any other type costs nothing.
 fn forgotten(ctype: &CType) -> bool {
-    !matches!(ctype, CType::Type(LType::Unknown) | CType::Integer)
+    *ctype != CType::Type(LType::Unknown)
 }
-
-/// Whether `n` is a `CType::Integer`. See Note [Integers].
-#[inline(always)]
-pub fn is_integer(n: f64) -> bool {
-    ((n as i32) as f64).to_bits() == n.to_bits()
-}
-
-// A `GuardDynamic` test: whether the value is a number that is (`INTEGER`) or
-// isn't a `CType::Integer`, in either case a double. See Note [Integers].
-crate::window::windowed!(CheckInteger, [], [INTEGER: bool], |owner, state, base| (value) {
-    let pass = value.as_number().is_some_and(|n| is_integer(n) == INTEGER);
-    state.select = (!pass) as usize;
-});
-
-// Convert a number between its encodings, in place: a double that is a
-// `CType::Integer` to one, and back. See Note [Integers].
-crate::window::windowed!(ToInteger, [], [], |owner, state, base| (inout value) {
-    let Some(n) = value.as_number() else { unreachable!() };
-    *value = LBoxed::from_int(n.to_int_unchecked::<i32>());
-});
-crate::window::windowed!(ToNumber, [], [], |owner, state, base| (inout value) {
-    *value = LBoxed::from_arith(value.as_int() as f64);
-});
 
 // Note [Dynamic guards]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -1846,9 +1872,6 @@ crate::window::windowed!(ToNumber, [], [], |owner, state, base| (inout value) {
 // in place of its thunk. With feature `no_dynamic_guards`, every such yield
 // fails statically instead, to measure the blocks the guards cost (`just
 // graph-guards`).
-//
-// `CheckInteger` guards with the same residual, but through `GuardCType`: what it
-// finds is a ctype, which each side's context records. See Note [Integers].
 
 /// The array part slot of a `CType::Integer` key. Keys below 1 wrap past any
 /// array part.
@@ -1874,7 +1897,7 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
         crate::chunk::Constant::Nil => CType::Type(LType::Nil),
         crate::chunk::Constant::Bool(_) => CType::Type(LType::Bool),
         crate::chunk::Constant::Number(n) if is_integer(n.0) => CType::Integer,
-        crate::chunk::Constant::Number(_) => CType::Type(LType::Number),
+        crate::chunk::Constant::Number(_) => CType::Double,
         crate::chunk::Constant::String(_) => CType::Type(LType::String),
     }
 }
@@ -1885,11 +1908,10 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
 // describe, so a jump may enter a version whose context *accepts* its own:
 // slot by slot the same type or one above it in the lattice
 //
-//   Unknown  >  each LType  >  Number > Integer, Closure > a known function
+//   Unknown  >  each LType  >  Number > Integer or Double, Closure > a known function
 //
 // (a shape accepts only itself), with the same hkeys, whose indexes the
-// block's hash witnesses are at. An `Integer` a version types less precisely
-// is lowered on the way in (Note [Integers]). A bytecode pc's first `MAX_VERSIONS`
+// block's hash witnesses are at. A bytecode pc's first `MAX_VERSIONS`
 // contexts each get a version. A jump past that enters the accepting version
 // that tells the most (loses the least lattice height), and failing any, a
 // version for the join of its context and every existing one's, which the
@@ -2495,12 +2517,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    let end = if b == 0 { usize::MAX } else { a as usize + b as usize - 1 };
-                    self.demote(block_id, &mut ctx, a as usize..end);
-                    // Returning closes the frame's upvalues. See Note [Captured slots].
-                    for slot in captured_slots(unsafe { &*self.clos.ro(owner).prototype }) {
-                        self.demote(block_id, &mut ctx, slot..slot + 1);
-                    }
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b)); None
                 },
@@ -2522,44 +2538,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    /// Lower the integers in `slots` to doubles, for code reading them as any
-    /// value. See Note [Integers].
-    fn demote(&mut self, block_id: BlockId, ctx: &mut Rc<Context>, slots: std::ops::Range<usize>) {
-        for idx in slots.start..slots.end.min(ctx.types.len()) {
-            if ctx.types[idx] == CType::Integer {
-                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(ToNumber::new(&[idx]))));
-                Rc::make_mut(ctx).types[idx] = CType::Type(LType::Number);
-                Rc::make_mut(ctx).effect(Effect::Write(idx));
-            }
-        }
-    }
-
-    /// Where a jump in `ctx` to `target` goes: to a version of a pc, through a
-    /// block lowering the integers it types less precisely first. See Note
-    /// [Integers].
+    /// Where a jump in `ctx` to `target` goes: `target`, a version of a pc whose
+    /// context accepts the jump's, once it forgets the types of registers
+    /// holding no local (`forgotten`). See Note [Version compatibility].
     fn edge(&mut self, owner: &mut Owner, ctx: &Context, target: BlockId) -> BlockId {
         let Some(entered) = self.blocks[target.0].context.clone() else { return target };
         let pc = self.blocks[target.0].pc;
-        // Every integer the version doesn't keep: one that joined with another
-        // type into a less precise one.
-        let lower: Vec<usize> = (0..ctx.types.len())
-            .filter(|&idx| ctx.types[idx] == CType::Integer && entered.slot(idx) != CType::Integer)
-            .collect();
         let live = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
         let mut jumping = ctx.clone();
-        jumping.set_types(owner, lower.iter().map(|&idx| (idx, CType::Type(LType::Number))).collect());
         let dead = (live..jumping.types.len()).filter(|&idx| forgotten(&jumping.types[idx])).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
         jumping.set_types(owner, dead);
         assert!(entered.accepts(&jumping), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
-        if lower.is_empty() {
-            return target;
-        }
-        let lowering = self.new_block(pc);
-        for idx in lower {
-            self.blocks[lowering.0].instructions.push(Residual::ExecWindow(Rc::new(ToNumber::new(&[idx]))));
-        }
-        self.blocks[lowering.0].instructions.push(Residual::Jump(target));
-        lowering
+        target
     }
 
     /// Before the residual ending a block: its GC safepoint, if it may have
@@ -2645,53 +2635,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    /// `make_discovery_thunk`, for `GuardCType(idx, Integer)`. See Note [Integers].
-    fn make_integer_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
-        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            let value = state.vals[state.base + idx].unbox();
-            let mut forced_ctx = thunk_ctx.clone();
-            let forced_mut = Rc::make_mut(&mut forced_ctx);
-            let (guard, next, arg, integer) = match value {
-                LValue::Number(n) if is_integer(n.0) => {
-                    forced_mut.types[idx] = CType::Integer;
-                    (Residual::GuardDynamic(Rc::new(CheckInteger::<true>::new(&[idx]))), pc.next_true(), ResumeArg::Matched, true)
-                },
-                LValue::Number(_) => {
-                    forced_mut.types[idx] = CType::Type(LType::Number);
-                    (Residual::GuardDynamic(Rc::new(CheckInteger::<false>::new(&[idx]))), pc.next_false(), ResumeArg::Failed, false)
-                },
-                value => {
-                    let runtime_type = value.typeof_();
-                    forced_mut.types[idx] = CType::Type(runtime_type);
-                    (Residual::Guard { idx, expected: runtime_type }, pc.next_false(), ResumeArg::Failed, false)
-                },
-            };
-            // In place, unless the thunk's JIT code can only be patched to a
-            // jump. See Note [Thunk patching].
-            if !appends || vm.compiled(block_id) {
-                let old_block = block_id;
-                block_id = vm.new_block(pc.0);
-                vm.jump_thunk(old_block, thunk_pc, block_id);
-                vm.blocks[block_id.0].instructions.push(guard);
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = guard;
-            }
-            let fail_thunk = vm.make_integer_thunk(block_id, thunk_coro.clone(), idx, pc, thunk_ctx.clone(), false);
-            vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
-            let mut guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro.clone(), arg);
-            // An integer is converted on the edge into the subblock, which the
-            // ways holding it as one already share.
-            if integer {
-                let converting = vm.new_block(pc.0);
-                vm.blocks[converting.0].instructions.push(Residual::ExecWindow(Rc::new(ToInteger::new(&[idx]))));
-                vm.blocks[converting.0].instructions.push(Residual::Jump(guard_block));
-                guard_block = converting;
-            }
-            vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
-        })))
-    }
-
-    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: LType, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
+    /// The thunk a `Guard(idx, t)` (`expected` `CType::Type(t)`) or a
+    /// `GuardCType(idx, Integer)` ends its block in when the context can't
+    /// answer it.
+    /// With `field`, the slot was just loaded from that hash key's field
+    /// (`FieldType`), whose type is the one found too. See Note [Field types].
+    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The thunk was forced, so now we know the runtime value and if it
@@ -2706,13 +2655,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // like, not do that. If needed, there's a jankier version of this that filters the
             // remainder of thunk_coro to hoist specifically the successful type guard for idx in
             // our git history.
+            //
+            // A number's type is its encoding, found a step down the lattice at a
+            // time: see Note [Integers].
             let mut thunk_coro  = thunk_coro.clone();
-            let runtime_type = state.vals[state.base + idx].unbox().typeof_();
+            let found = guard_type(state.vals[state.base + idx]);
+            let known = thunk_ctx.types[idx].as_ltype();
             let mut forced_ctx = thunk_ctx.clone();;
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
-            forced_mut.types[idx] = CType::Type(runtime_type);
-            debug!("forcing thunk with {:?} == {:?}", runtime_type, expected);
-            let arg = if runtime_type == expected { ResumeArg::Matched } else { ResumeArg::Failed };
+            forced_mut.types[idx] = found.clone();
+            if let Some(href) = field {
+                forced_mut.hkeys[href.0 as usize].known_type = found.clone();
+            }
+            debug!("forcing thunk with {} == {}", found, expected);
+            // Continued as a guard the context answers would be, so the ways
+            // finding out and knowing share the subblock.
+            let (next, arg) = navigate(pc, &expected, &found);
             // TODO: search for if we already have a compatible block
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
@@ -2720,12 +2678,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let old_block = block_id;
                 block_id = vm.new_block(pc.0);
                 vm.jump_thunk(old_block, thunk_pc, block_id);
-                vm.blocks[block_id.0].instructions.push(Residual::Guard { idx, expected: runtime_type });
+                vm.blocks[block_id.0].instructions.push(Residual::Guard { idx, known, expected: found.clone() });
             } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Guard { idx, expected: runtime_type };
+                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Guard { idx, known, expected: found.clone() };
             }
             // Push the same thunk down for the next value that fails the guard
-            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected, pc, thunk_ctx.clone(), false);
+            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected.clone(), field, pc, thunk_ctx.clone(), false);
             vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk.clone()));
             // If we're in the success block and the guarded value is a native function, we can
             // also try to emit a guard to specialize the function value as well. This lets us
@@ -2740,7 +2698,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if let Some(upvalue) = forced_mut.holds(idx) {
                     forced_mut.assume(Fragile::Upvalue { upvalue, ctype: idx_ctype.clone() });
                 }
-                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx, thunk_coro, arg);
+                let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
                 // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
                 // we have to do this all over again with the newly observed type (up to our block
@@ -2755,13 +2713,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else if let CType::LuaFunction(lclos) = &idx_ctype {
                 // Likewise we can do the same thing with statically known Lua functions
                 forced_mut.types[idx] = idx_ctype.clone();
-                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx, thunk_coro, arg);
+                let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 let proto = lclos.ro(owner).prototype.cast();
                 vm.blocks[block_id.0].instructions.push(Residual::LuaGuard { idx, ptr: proto });
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
             } else {
-                let guard_block = vm.subblock(owner, pc.next_true(), forced_ctx, thunk_coro, arg);
+                let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
             }
 
@@ -2788,8 +2746,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
             debug!("href forced by {tab:?} -> {val:?}");
             // TODO: give the environment a shape as well
-            let discovered_type = val.unbox().typeof_();
-            hkey.known_type = CType::Type(discovered_type);
+            // Its type is found out from the value loaded, in each table. See
+            // Note [Field types].
+            hkey.known_type = CType::Type(LType::Unknown);
             // Initialize the hkey after discovery with a cleared hazard for the index
             if hkey.hazards.len() <= idx {
                 hkey.hazards.resize_with(idx + 1, || false);
@@ -2808,7 +2767,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
             // Now transition into the populated hkey
             if let CType::Shape(existing) = &mut thunk_mut.types[idx] {
-                existing.push(href)
+                if !existing.contains(&href) {
+                    existing.push(href)
+                }
             } else {
                 thunk_mut.types[idx] = CType::Shape(vec![href].into());
             }
@@ -2876,10 +2837,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.jump_thunk(missing_key, thunk_pc, fail_block);
             })))));
 
-            let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, CType::Type(discovered_type)));
-            // TODO: do we need this? im pretty sure the answer is no, because we've always just
-            // initialized it to the correct value.
-            //vm.make_epoch_check(owner, has_key, thunk_coro, idx, href, pc, thunk_ctx.clone(), guard_block);
+            let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, CType::Type(LType::Unknown)));
             vm.blocks[has_key.0].instructions.push(Residual::Jump(guard_block));
         })))
     }
@@ -2913,7 +2871,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.blocks[check_block.0].instructions.push(Residual::LuaGuard { idx: tab, ptr: proto });
             }else {
                 let key = LCanon::constant(&thunk_ctx.hkeys[href.0 as usize].key).boxed().bits();
-                vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected: expected.as_ltype() });
+                vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected: expected.clone() });
             }
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
             vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
@@ -2961,9 +2919,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::BoxedK(k)) => {
                     let proto = self.clos.ro(owner).prototype;
                     arg = ResumeArg::Boxed(LBoxed::from(unsafe { &(&(*proto).constants.items)[k] }).bits());
-                },
-                CoroutineState::Yielded(YieldOp::Demote(slots)) => {
-                    self.demote(block_id, &mut ctx, slots);
                 },
                 op @ CoroutineState::Yielded(YieldOp::Typeof(idx) | YieldOp::TypeofRk(idx)) => {
                     if let CoroutineState::Yielded(YieldOp::TypeofRk(key)) = op {
@@ -3077,7 +3032,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
                         // Try to find an orphaned HashKey slot to re-use
                         let href;
-                        if let Some((i, hkey)) = Rc::make_mut(&mut ctx).hkeys.iter_mut().enumerate().find(|(i, hk)| hk.known_type == CType::Type(LType::Unknown)) {
+                        // One of unknown type no shape lists: a hash key is of unknown
+                        // type while in use too, until its field's type is found out.
+                        // See Note [Field types].
+                        let listed = |i: usize| ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&HashRef(i as u8))));
+                        let orphan = ctx.hkeys.iter().enumerate().position(|(i, hk)| hk.known_type == CType::Type(LType::Unknown) && !listed(i));
+                        if let Some((i, hkey)) = orphan.map(|i| (i, &mut Rc::make_mut(&mut ctx).hkeys[i])) {
                             href = HashRef(i as u8);
                             *hkey = HashKey { idx, key: k_val.clone(), known_type: CType::Type(LType::Unknown), hazards: Default::default() };
                         } else {
@@ -3131,43 +3091,27 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         continue 'machine;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::GuardCType(_, expected @ (CType::Shape(_) | CType::NativeFunction(_) | CType::LuaFunction(_)))) => {
-                    unreachable!("GuardCType tests for Integer or a CType::Type, not {expected}");
+                CoroutineState::Yielded(YieldOp::GuardCType(_, ref expected)) if *expected != CType::Integer => {
+                    unreachable!("GuardCType tests only for Integer, not {expected}");
                 },
-                op @ CoroutineState::Yielded(YieldOp::GuardCType(_, CType::Integer) | YieldOp::DiscoverInteger(_)) => {
-                    let (rk, discover) = match op {
-                        CoroutineState::Yielded(YieldOp::GuardCType(rk, expected)) => {
-                            assert_eq!(expected, CType::Integer, "GuardCType tests only for Integer");
-                            (rk, false)
-                        },
-                        CoroutineState::Yielded(YieldOp::DiscoverInteger(rk)) => (rk, true),
-                        _ => unreachable!(),
-                    };
-                    let pass = if (rk & 0x100) != 0 {
-                        let k = rk & 0xff;
+                CoroutineState::Yielded(YieldOp::GuardCType(rk, _)) => {
+                    let known = if (rk & 0x100) != 0 {
                         let proto = self.clos.ro(owner).prototype;
-                        let pass = constant_ctype(unsafe { &(&(*proto).constants.items)[k] }) == CType::Integer;
-                        Some(if pass { ResumeArg::MatchedConst(k) } else { ResumeArg::Failed })
+                        Some(constant_ctype(unsafe { &(&(*proto).constants.items)[rk & 0xff] }))
                     } else {
-                        match &ctx.types[rk] {
-                            CType::Integer => Some(ResumeArg::Matched),
-                            CType::Type(LType::Number) if discover => Some(ResumeArg::Failed),
-                            ctype if !matches!(ctype.as_ltype(), LType::Number | LType::Unknown) => Some(ResumeArg::Failed),
-                            // A number, or unknown: tested at runtime. See Note [Integers].
-                            _ => None,
-                        }
+                        // A number of either encoding, or unknown, is tested at
+                        // runtime. See Note [Integers].
+                        Some(ctx.types[rk].clone()).filter(|ctype| !matches!(ctype, CType::Type(LType::Number | LType::Unknown)))
                     };
-                    match pass {
-                        Some(ResumeArg::Failed) => {
-                            pc = pc.next_false();
-                            arg = ResumeArg::Failed;
-                        },
-                        Some(pass) => {
-                            pc = pc.next_true();
-                            arg = pass;
+                    match known {
+                        Some(known) => {
+                            (pc, arg) = navigate(pc, &CType::Integer, &known);
+                            if (rk & 0x100) != 0 && arg == ResumeArg::Matched {
+                                arg = ResumeArg::MatchedConst(rk & 0xff);
+                            }
                         },
                         None => {
-                            let thunk = Residual::Thunk(self.make_integer_thunk(block_id, coro.clone(), rk, pc, ctx.clone(), true));
+                            let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, CType::Integer, None, pc, ctx.clone(), true));
                             self.end_block(block_id);
                             self.blocks[block_id.0].instructions.push(thunk);
                             return None;
@@ -3192,20 +3136,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
-                CoroutineState::Yielded(guard @ (YieldOp::Guard(idx, expected) | YieldOp::GuardCType(idx, CType::Type(expected)))) => {
+                CoroutineState::Yielded(YieldOp::Guard(idx, expected)) => {
                     debug!("guard {:?} == {:?}", ctx.types[idx], expected);
-                    let keep_integer = matches!(guard, YieldOp::GuardCType(..));
                     let ctype = &ctx.types[idx];
                     // Erase any hkeys and say its just a table before checking
                     let ltype = ctype.as_ltype();
 
                     if ltype == expected {
-                        // Statically true: pump the success path, with an
-                        // integer read as a number lowered to a double, unless
-                        // it's kept. See Note [Integers].
-                        if ctx.types[idx] == CType::Integer && !keep_integer {
-                            self.demote(block_id, &mut ctx, idx..idx + 1);
-                        }
+                        // Statically true: pump the success path
                         pc = pc.next_true();
                         arg = ResumeArg::Matched;
                     }
@@ -3219,7 +3157,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         debug!("emitting discovery thunk");
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, expected, pc, thunk_ctx, true));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), None, pc, thunk_ctx, true));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -3239,6 +3177,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Effect(effect)) => {
                     Rc::make_mut(&mut ctx).effect(effect);
+                },
+                CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
+                    let known = ctx.hkeys[href.0 as usize].known_type.clone();
+                    Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.clone())]);
+                    if known != CType::Type(LType::Unknown) {
+                        (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &known);
+                    } else {
+                        // Unless the load overwrote the table, and its hash keys with it.
+                        let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Type(LType::Unknown), live.then_some(href), pc, ctx.clone(), true));
+                        self.end_block(block_id);
+                        self.blocks[block_id.0].instructions.push(thunk);
+                        return None;
+                    }
                 },
                 CoroutineState::Yielded(YieldOp::LoadUpvalue(slot, upvalue)) => {
                     // See Note [Fragile information].
@@ -3275,21 +3227,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
-                            // The arguments' end: fixed, or the top the call before left, if
-                            // known. See Note [Known top].
-                            let end = if b == 0 { ctx.top } else { Some(a + b) };
-                            // A native run as a window op, with its arguments in the integer
-                            // encoding or of the type it assumes, gives its result's type: its
-                            // one result, with C = 0 too. See Note [Native windows].
+                            // A native run as a window op, with its arguments of the type it
+                            // assumes, gives its result's type: its one result, with C = 0
+                            // too. See Note [Native windows].
                             let mut result = None;
                             let window = native_window(&ctx, a, b, c)
-                                .filter(|(end, op)| (a + 1..*end).all(|slot| ctx.types[slot] == CType::Integer || ctx.types[slot].as_ltype() == op.args))
+                                .filter(|(end, op)| (a + 1..*end).all(|slot| ctx.types[slot].as_ltype() == op.args))
                                 .map(|(_, op)| op);
-                            // Any other callee reads its arguments as any value. See Note
-                            // [Integers].
-                            if window.is_none() {
-                                self.demote(block_id, &mut ctx, a + 1..end.unwrap_or(usize::MAX));
-                            }
                             // Any other call may run a closure, which reads and writes the
                             // slots it captured. See Note [Captured slots].
                             let captured = if window.is_none() {
@@ -3297,9 +3241,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             } else {
                                 vec![]
                             };
-                            for &slot in &captured {
-                                self.demote(block_id, &mut ctx, slot..slot + 1);
-                            }
                             if let CType::NativeFunction(nf) = &ctx.types[a] {
                                 if let Some(op) = window {
                                     Rc::make_mut(&mut ctx).effect(Effect::Write(a));
@@ -3484,8 +3425,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             state.counters.versioned_count.increment();
             debug!("RUN {:?}", &res);
             match res {
-                Residual::Guard { idx, expected } => {
-                    if state.vals[state.base + idx].unbox().typeof_() == expected {
+                Residual::Guard { idx, expected, .. } => {
+                    if passes_guard(state.vals[state.base + idx], &expected) {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -3534,7 +3475,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let LValue::Table(tab) = state.vals[state.base + tab].unbox() else { unreachable!() };
                     let entry = tab.ro(owner).hash.get_index(hwit.index);
-                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && val.unbox().typeof_() == expected) {
+                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && passes_guard(*val, &expected)) {
                         // Fallthrough
                         off += 2;
                     } else {
