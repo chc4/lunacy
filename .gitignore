@@ -11,3 +11,4 @@ hyperfine*-traces.md
 window_dump.txt
 hyperfine-*.json
 bench/history.html
+bench/bars.html

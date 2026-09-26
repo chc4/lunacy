@@ -420,6 +420,12 @@ bench-rev ref:
 bench-history:
     python3 tools/bench_history.py report
     python3 tools/bench_history.py plot
+
+# The latest commit's times from the benchmark history as one grouped bar chart,
+# a group per benchmark, in bench/bars.html (tools/bench_bars.py: `args` picks
+# the implementations, `--builds`, and those not setting the scale, `--clamp`).
+bench-bars *args:
+    python3 tools/bench_bars.py {{args}}
 # Hardware counters (`perf stat`) for this checkout's build of `profile`
 # (`release` or `unsafe`) and revision `ref`'s (built as `_build-vs` builds
 # them) on one benchmark, each pinned as `hyperfine` runs it and repeated `runs`
