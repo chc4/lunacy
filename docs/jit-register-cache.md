@@ -14,7 +14,10 @@ in GPRs across JIT code instead of round-tripping every operand through
 - **Residuals are backend-neutral IR.** Bytecode ops are Rust coroutines
   (`emit_*`) that yield `YieldOp`s, which the specializer drives into a
   `Vec<Residual>` per `Block`. The same residuals feed **both** tiers: the
-  specializer's interpreter loop and the native codegen.
+  specializer's interpreter loop and the native codegen. There is no bytecode
+  interpreter below them: `Vm::run` enters the specializer at the entry
+  closure's first instruction, so every closure, the top-level chunk included,
+  runs as residuals.
 - **`Residual::Exec(ResidualExec)`** carries an opaque closure body over
   `(&mut Owner, &mut RunState)`. The interpreter calls it; the JIT emits a
   **static call** to the closure's body.
@@ -44,7 +47,8 @@ in GPRs across JIT code instead of round-tripping every operand through
   `jit_compile`s the block (if not already) and calls its JIT entry.
 - **Bailout:** JIT code returns a packed `(off, id)`; negative `off` codes are
   bail reasons the interpreter loop handles: `-1` post-trap resume,
-  `-2` handle RET, `-3` Select, `-4` resume-at-thunk, `-5` return to interpreter.
+  `-2` handle RET (the entry closure's return, which ends the run), `-3` Select,
+  `-4` resume-at-thunk.
   On any bail the interpreter resumes at `(id, off)` **reading from
   `state.vals`** — the interpreter has no registers.
 - Therefore: **the interpreter always enters/re-enters a block from memory.** A
