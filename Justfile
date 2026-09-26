@@ -372,29 +372,34 @@ _compare-worktree ref:
     git -C $dir checkout --detach {{ref}}
     for module in dynasm-rs memmap2-rs; do test -L $dir/$module || { rmdir $dir/$module && ln -s "$(realpath $module)" $dir/$module; }; done
 
-# Compare this checkout's release build against revision `ref`'s on one
-# benchmark: `ref` is built in a detached worktree under target/compare/ (kept
-# for reruns, its submodules linked to this checkout's).
-hyperfine-vs ref benchmark times='10':
-    just _luac {{benchmark}}
+# This checkout's release and unsafe builds (as `unsafe-compile` builds), and
+# revision `ref`'s, in a detached worktree under target/compare/ (kept for
+# reruns, its submodules linked to this checkout's).
+_build-vs ref:
     cargo build --release --bin bench
+    just unsafe-compile
     just _compare-worktree {{ref}}
-    cd target/compare/{{ref}} && cargo build --release --bin bench
+    cd target/compare/{{ref}} && cargo build --release --bin bench && just unsafe-compile
+
+# Compare this checkout's release and unsafe builds against revision `ref`'s on
+# one benchmark (built as `_build-vs` builds them).
+hyperfine-vs ref benchmark times='10': (_build-vs ref)
+    just _luac {{benchmark}}
     taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
         "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \
-        "./target/release/bench {{benchmark}}.bin {{times}}"
-# Hardware counters (`perf stat`) for this checkout's release build and revision
-# `ref`'s (built as for `hyperfine-vs`) on one benchmark, each pinned as
-# `hyperfine` runs it and repeated `runs` times.
-perf-stat-vs ref benchmark times='10' runs='5':
+        "./target/release/bench {{benchmark}}.bin {{times}}" \
+        "target/compare/{{ref}}/target/unsafe/bench {{benchmark}}.bin {{times}}" \
+        "./target/unsafe/bench {{benchmark}}.bin {{times}}"
+# Hardware counters (`perf stat`) for this checkout's build of `profile`
+# (`release` or `unsafe`) and revision `ref`'s (built as `_build-vs` builds
+# them) on one benchmark, each pinned as `hyperfine` runs it and repeated `runs`
+# times.
+perf-stat-vs ref benchmark times='10' runs='5' profile='unsafe': (_build-vs ref)
     just _luac {{benchmark}}
-    cargo build --release --bin bench
-    just _compare-worktree {{ref}}
-    cd target/compare/{{ref}} && cargo build --release --bin bench
     taskset -c {{CPU}} perf stat -r {{runs}} -e task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
-        target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}} > /dev/null
+        target/compare/{{ref}}/target/{{profile}}/bench {{benchmark}}.bin {{times}} > /dev/null
     taskset -c {{CPU}} perf stat -r {{runs}} -e task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
-        ./target/release/bench {{benchmark}}.bin {{times}} > /dev/null
+        ./target/{{profile}}/bench {{benchmark}}.bin {{times}} > /dev/null
 # Compare this checkout's release build with and without cargo feature
 # `feature` on one benchmark: the feature's build is in target/features/<feature>.
 hyperfine-feature feature benchmark times='10':
@@ -454,6 +459,6 @@ hyperfines-vs ref:
     #!/usr/bin/env bash
     set -euo pipefail
     for run in {{HYPERFINES}}; do just hyperfine-vs {{ref}} ${run%:*} ${run#*:}; done
-    for run in {{HYPERFINES}}; do tail -n 2 hyperfine-${run%:*}-${run#*:}-vs-{{ref}}.md; done
+    for run in {{HYPERFINES}}; do tail -n 4 hyperfine-${run%:*}-${run#*:}-vs-{{ref}}.md; done
 
 all: test benchmarks (hyperfine "binarytrees")
