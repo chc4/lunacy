@@ -2619,8 +2619,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         }
                                         let mut holds_ctx = ctx.clone();
                                         // If we check the epoch and it still holds, we'll have
-                                        // cleared any optimzation hazards until its potentially
-                                        // invallidated.
+                                        // cleared any optimization hazards until it's potentially
+                                        // invalidated.
                                         // `idx` may be past the slots the hash key has
                                         // seen: a register the table was moved to.
                                         let hazards = &mut Rc::make_mut(&mut holds_ctx).hkeys[cached.0 as usize].hazards;
