@@ -2621,7 +2621,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         // If we check the epoch and it still holds, we'll have
                                         // cleared any optimzation hazards until its potentially
                                         // invallidated.
-                                        Rc::make_mut(&mut holds_ctx).hkeys[cached.0 as usize].hazards[idx] = true;
+                                        // `idx` may be past the slots the hash key has
+                                        // seen: a register the table was moved to.
+                                        let hazards = &mut Rc::make_mut(&mut holds_ctx).hkeys[cached.0 as usize].hazards;
+                                        if hazards.len() <= idx {
+                                            hazards.resize(idx + 1, false);
+                                        }
+                                        hazards[idx] = true;
                                         let holds_block = self.subblock(owner, pc.next_true(), holds_ctx.clone(), coro.clone(), arg);
                                         self.make_epoch_check(owner, block_id, coro.clone(), idx, cached.clone(), pc, ctx.clone(), holds_block);
 
