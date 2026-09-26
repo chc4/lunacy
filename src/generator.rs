@@ -70,7 +70,7 @@ pub struct Block {
     allocates: bool,
     /// A version of a pc's context, which jumps to it enter. See Note [Version
     /// compatibility].
-    pub(crate) context: Option<Rc<Context>>,
+    context: Option<Rc<Context>>,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
     /// Times the interpreter entered the block, shown by `dump`.
