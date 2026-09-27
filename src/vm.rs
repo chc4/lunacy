@@ -1369,14 +1369,14 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let limit = self.natural_max;
         // push empty stack frame
         if next_base + next_stack > self.vals.len() {
-            self.vals.resize_with(next_base + next_stack, || LBoxed::NIL);
+            self.grow_stack(next_base + next_stack);
         }
         // The parameters the call doesn't pass are nil: their slots may hold what an
         // earlier frame left there. Its arguments are `b - 1` values, or up to the top.
         let passed = if b == 0 { self.top } else { next_base + b as usize - 1 };
         let params = next_base + unsafe { (*lclos.ro(owner).prototype).param_count as usize };
-        for slot in passed..params {
-            self.vals[slot] = LBoxed::NIL;
+        if passed < params {
+            self.nil_slots(passed, params);
         }
         // The callee's frame extends the live max-extent while it runs.
         self.natural_max = self.natural_max.max(next_base + next_stack);
@@ -1398,6 +1398,23 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
+    /// Grow the stack to `len` slots, the new ones nil. Out of line from
+    /// `push_frame`, as `nil_slots` is: inlined, LLVM vectorizes their loops,
+    /// and the window op pushing a frame (`PushFrame`) then ends in a
+    /// `vzeroupper` on every call.
+    #[inline(never)]
+    fn grow_stack(&mut self, len: usize) {
+        self.vals.resize_with(len, || LBoxed::NIL);
+    }
+
+    /// Nil the slots `from..to`. Out of line from `push_frame`: see `grow_stack`.
+    #[inline(never)]
+    fn nil_slots(&mut self, from: usize, to: usize) {
+        for slot in from..to {
+            self.vals[slot] = LBoxed::NIL;
+        }
+    }
+
     /// Move `count` results from `from` to `wanted` slots from `rloc`, padded
     /// with nil. Out of line from `do_return`, which moves one itself.
     #[inline(never)]
@@ -1414,11 +1431,18 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
     /// Note [Frame ops] in `generator`.
     #[inline(always)]
-    pub fn do_return(&mut self, owner: &mut Owner, a: usize, b: usize) -> Result<ReturnLocation, std::ops::Range<usize>> {
-        // we're going to be removing this frame, so close any open
-        // upvalues.
-        if !self.upvals.is_empty() {
-            self.close_upvalues(owner);
+    pub fn do_return(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) -> Result<ReturnLocation, std::ops::Range<usize>> {
+        // The frame is going: close its open upvalues, if its function can have
+        // opened any (`Residual::Ret`).
+        if closes {
+            if !self.upvals.is_empty() {
+                self.close_upvalues(owner);
+            }
+        } else {
+            debug_assert!(
+                self.upvals.iter().all(|(upval, _)| matches!(upval, Upvalue::Open(idx) if *idx < self.base)),
+                "an upvalue open into a frame whose function captures none of it"
+            );
         }
 
         // The results: `b - 1` values from R(A), or every value up to the top.

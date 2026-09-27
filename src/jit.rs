@@ -217,7 +217,7 @@ impl JitHelper {
             }
             let mut owner = ();
             let mut owner = (&raw mut owner as *mut Owner).as_mut_unchecked();
-            match rs.do_return(owner, a as usize, b as usize) {
+            match rs.do_return(owner, a as usize, b as usize, true) {
                 Ok(ReturnLocation(block, off)) => {
                     // Return block and offset
                     debug!("returning to {:?} {}", block, off);
@@ -1666,8 +1666,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // [Frame ops] in `generator`.
                             let packed_ret = ReturnLocation(BlockId(id.0), off + 1).pack();
                             let push: Rc<dyn Window> = Rc::new(crate::generator::PushFrame::new(packed_ret.bits() as u64, *a as u64 | (*b as u64) << 16 | (*c as u64) << 32, &[]));
+                            jit_note!(self.jctx, ops, "        PushFrame");
                             emit_frame_op(ops, &mut self.jctx.stencils, pool, &push);
                             self.jctx.frame_ops.push(push);
+                            jit_note!(self.jctx, ops, "        enter the callee");
                             dynasm!(ops
                                 ; .arch x64
                                 // Reload r13 = callee base ptr = vals.stack_ptr + base*sizeof(LBoxed)
@@ -1791,12 +1793,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none());
                     successor = Some(*target);
                 },
-                Residual::Ret(pc, a, b) => {
+                Residual::Ret(pc, a, b, closes) => {
                     // The frame, popped by `PopFrame`, and the JIT code left with
                     // where the caller continues. See Note [Frame ops] in `generator`.
-                    let pop: Rc<dyn Window> = Rc::new(crate::generator::PopFrame::new(id.0 as u64 | (off as u64) << 32, *a as u64 | (*b as u64) << 16, &[]));
+                    let (at, ab) = (id.0 as u64 | (off as u64) << 32, *a as u64 | (*b as u64) << 16);
+                    let pop: Rc<dyn Window> = if *closes {
+                        Rc::new(crate::generator::PopFrame::<true>::new(at, ab, &[]))
+                    } else {
+                        Rc::new(crate::generator::PopFrame::<false>::new(at, ab, &[]))
+                    };
+                    jit_note!(self.jctx, ops, "        PopFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &pop);
                     self.jctx.frame_ops.push(pop);
+                    jit_note!(self.jctx, ops, "        leave for where the caller continues");
                     dynasm!(ops
                         ; .arch x64
                         ; mov rax, QWORD r12 => RunState.exit

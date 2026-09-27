@@ -277,7 +277,7 @@ impl std::fmt::Display for Residual {
             Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Select(targets) => write!(f, "select"),
-            Residual::Ret(_, _, _) => write!(f, "ret"),
+            Residual::Ret(..) => write!(f, "ret"),
             Residual::GC => write!(f, "gc"),
         }
     }
@@ -1796,20 +1796,20 @@ windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
 
 // `call_lua` for a call of R(A), `abc` its `a | b << 16 | c << 32`, returning to
 // `ret` (a `PackedLocation`). See Note [Frame ops].
-windowed!(PushFrame, [ret: u64, abc: u64], [], |owner, state, base| () {
+windowed!(frame PushFrame, [ret: u64, abc: u64], [], |owner, state, base| () {
     state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), abc as u16, (abc >> 16) as u16, (abc >> 32) as u16);
 });
 
 // A `Ret` at `off` in `block`, `at` their `block | off << 32` and `ab` its
-// `a | b << 16`: `do_return`, `state.exit` where the caller continues, or -2 from
-// the entry frame. See Note [Frame ops].
-windowed!(PopFrame, [at: u64, ab: u64], [], |owner, state, base| () {
+// `a | b << 16`, closing upvalues if `CLOSES`: `do_return`, `state.exit` where
+// the caller continues, or -2 from the entry frame. See Note [Frame ops].
+windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool], |owner, state, base| () {
     let (block, off) = (at as u32, (at >> 32) as u16);
     state.exit = if state.callstack.is_empty() {
         state.current_off = off;
         ((-2i32 as u64) << 32) | block as u64
     } else {
-        match state.do_return(owner, ab as u16 as usize, (ab >> 16) as u16 as usize) {
+        match state.do_return(owner, ab as u16 as usize, (ab >> 16) as u16 as usize, CLOSES) {
             Ok(location) => location.pack().bits() as u64,
             // With a caller frame, `do_return` returns to it.
             Err(_) => unreachable!(),
@@ -1923,7 +1923,10 @@ pub enum Residual {
     Select(Vec<(&'static str, BlockId)>),
     Jump(BlockId),
     Thunk(ThunkRef),
-    Ret(Pc, u8, u16),
+    /// A RETURN of `b - 1` values from R(A), or up to the top, which closes
+    /// the frame's open upvalues if its function captures a slot of it
+    /// (`captured_slots`): with none, no upvalue is open into it.
+    Ret(Pc, u8, u16, bool),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
     HashGuard { tab: usize, href: HashRef, key: u64, expected: CType },
@@ -2924,7 +2927,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.end_block(block_id);
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b)); None
+                    let closes = !captured_slots(unsafe { &*self.clos.ro(owner).prototype }).is_empty();
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes)); None
                 },
                 x => {
                     #[cfg(debug_assertions)]
@@ -2932,7 +2936,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         unreachable!("{:?}", x)
                     }
                     panic!("{:?}", x);
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0)); None
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true)); None
                 },
             } {
                 pc = next;
@@ -3977,9 +3981,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("thunk {:?}", &thunk);
                     (thunk.0.borrow_mut())(self, owner, &mut state, off)
                 },
-                Residual::Ret(pc, a, b) => {
+                Residual::Ret(pc, a, b, closes) => {
                     debug!("spec final blocks: {:?}", self.blocks);
-                    match state.do_return(owner, a as usize, b as usize) {
+                    match state.do_return(owner, a as usize, b as usize, closes) {
                         Ok(ReturnLocation(block, disp)) => {
                             self.set_current(state.clos.clone());
                             id = block;

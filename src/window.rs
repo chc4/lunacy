@@ -317,7 +317,26 @@ pub(crate) use bind_holes;
 ///
 /// `new(captures.., operands)` takes the operands' stack slots in the same
 /// order. See Note [Register window].
+///
+/// `windowed!(frame Name, ...)`, with no operands, declares an op that only
+/// runs at `SKIP` 0 into an empty window, and after which the JIT code loads
+/// `base` again, if it needs it: its stencil takes only `state`, and passes on
+/// only `state`, so every other register is free for it, rather than kept for a
+/// window it has none of.
 macro_rules! windowed {
+    (
+        $(#[$meta:meta])*
+        frame $name:ident,
+        [$($cap:ident : $cty:ty),* $(,)?],
+        [$($cp:ident : $cpt:ty),* $(,)?],
+        |$owner:ident, $state:ident, $base:ident| ()
+        $body:block
+    ) => {
+        $crate::window::windowed!(@sort
+            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body]
+            [] [] [] (0usize)
+        );
+    };
     (
         $(#[$meta:meta])*
         $name:ident,
@@ -327,7 +346,7 @@ macro_rules! windowed {
         $body:block
     ) => {
         $crate::window::windowed!(@sort
-            [$(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body]
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body]
             [] [] [] (0usize) $($operands)*
         );
     };
@@ -343,7 +362,7 @@ macro_rules! windowed {
         $crate::window::windowed!(@sort $decl [$($in)* ($op, $i)] [$($out)*] [$($acc)* Read] ($i + 1) $($($rest)*)?);
     };
     (@sort
-        [$(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block]
+        [$kind:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block]
         [$(($in:ident, $ii:expr))*] [$(($out:ident, $oi:expr))*] [$($acc:ident)*] ($arity:expr)
     ) => {
         $(#[$meta])*
@@ -397,56 +416,7 @@ macro_rules! windowed {
                 $( w[skip + $oi] = $out; )*
             }
 
-            /// The stencil running at `SKIP`.
-            pub extern "rust-preserve-none" fn __stencil<'b, 'src, 'intern, const SKIP: usize>(
-                state: &'b mut $crate::vm::RunState<'src, 'intern>,
-                base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
-                w0: $crate::lboxed::LBoxed<'src, 'intern>,
-                w1: $crate::lboxed::LBoxed<'src, 'intern>,
-                w2: $crate::lboxed::LBoxed<'src, 'intern>,
-                w3: $crate::lboxed::LBoxed<'src, 'intern>,
-                w4: $crate::lboxed::LBoxed<'src, 'intern>,
-                w5: $crate::lboxed::LBoxed<'src, 'intern>,
-                w6: $crate::lboxed::LBoxed<'src, 'intern>,
-                w7: $crate::lboxed::LBoxed<'src, 'intern>,
-                w8: $crate::lboxed::LBoxed<'src, 'intern>,
-            ) {
-                if SKIP + Self::ARITY > $crate::window::WINDOW {
-                    // Never used: `stencil(skip)` rejects such `skip`.
-                    unsafe { core::hint::unreachable_unchecked() }
-                }
-                let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
-                $crate::window::bind_holes!(0; $($cap : $cty),*);
-                // The JIT lends this code the thread's owner. See `crate::forge_owner`.
-                unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
-                become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
-            }
-
-            /// This op's `become` target; the `jmp` to it is sliced off when
-            /// copying, so it never runs. Per-op and private (and generic over
-            /// the op's const params) so it is monomorphized next to the stencil
-            /// with internal linkage, which makes the tail a direct `jmp rel32`: a
-            /// shared exported continuation is reached through the GOT
-            /// (`jmp *[rip+got]`) from other codegen units. `inline(never)` keeps
-            /// the tail a real jump, and the body must visibly consume the whole
-            /// window: LLVM deletes a tail call to an empty internal callee, and
-            /// with it every computation feeding the window.
-            #[inline(never)]
-            extern "rust-preserve-none" fn __next<'b, 'src, 'intern>(
-                state: &'b mut $crate::vm::RunState<'src, 'intern>,
-                base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
-                w0: $crate::lboxed::LBoxed<'src, 'intern>,
-                w1: $crate::lboxed::LBoxed<'src, 'intern>,
-                w2: $crate::lboxed::LBoxed<'src, 'intern>,
-                w3: $crate::lboxed::LBoxed<'src, 'intern>,
-                w4: $crate::lboxed::LBoxed<'src, 'intern>,
-                w5: $crate::lboxed::LBoxed<'src, 'intern>,
-                w6: $crate::lboxed::LBoxed<'src, 'intern>,
-                w7: $crate::lboxed::LBoxed<'src, 'intern>,
-                w8: $crate::lboxed::LBoxed<'src, 'intern>,
-            ) {
-                core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8));
-            }
+            $crate::window::windowed!(@stencil $kind, [$($cap : $cty),*]);
         }
 
         impl<$(const $cp: $cpt),*> $crate::window::Window for $name<$($cp),*> {
@@ -497,6 +467,79 @@ macro_rules! windowed {
                 $( state.vals[at + self.operands[$oi]] = $out; )*
             }
         }
+    };
+    (@stencil window, [$($cap:ident : $cty:ty),*]) => {
+            /// The stencil running at `SKIP`.
+            pub extern "rust-preserve-none" fn __stencil<'b, 'src, 'intern, const SKIP: usize>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+                base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                w0: $crate::lboxed::LBoxed<'src, 'intern>,
+                w1: $crate::lboxed::LBoxed<'src, 'intern>,
+                w2: $crate::lboxed::LBoxed<'src, 'intern>,
+                w3: $crate::lboxed::LBoxed<'src, 'intern>,
+                w4: $crate::lboxed::LBoxed<'src, 'intern>,
+                w5: $crate::lboxed::LBoxed<'src, 'intern>,
+                w6: $crate::lboxed::LBoxed<'src, 'intern>,
+                w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                w8: $crate::lboxed::LBoxed<'src, 'intern>,
+            ) {
+                if SKIP + Self::ARITY > $crate::window::WINDOW {
+                    // Never used: `stencil(skip)` rejects such `skip`.
+                    unsafe { core::hint::unreachable_unchecked() }
+                }
+                let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
+                $crate::window::bind_holes!(0; $($cap : $cty),*);
+                // The JIT lends this code the thread's owner. See `crate::forge_owner`.
+                unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+            }
+
+            /// This op's `become` target; the `jmp` to it is sliced off when
+            /// copying, so it never runs. Per-op and private (and generic over
+            /// the op's const params) so it is monomorphized next to the stencil
+            /// with internal linkage, which makes the tail a direct `jmp rel32`: a
+            /// shared exported continuation is reached through the GOT
+            /// (`jmp *[rip+got]`) from other codegen units. `inline(never)` keeps
+            /// the tail a real jump, and the body must visibly consume the whole
+            /// window: LLVM deletes a tail call to an empty internal callee, and
+            /// with it every computation feeding the window.
+            #[inline(never)]
+            extern "rust-preserve-none" fn __next<'b, 'src, 'intern>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+                base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                w0: $crate::lboxed::LBoxed<'src, 'intern>,
+                w1: $crate::lboxed::LBoxed<'src, 'intern>,
+                w2: $crate::lboxed::LBoxed<'src, 'intern>,
+                w3: $crate::lboxed::LBoxed<'src, 'intern>,
+                w4: $crate::lboxed::LBoxed<'src, 'intern>,
+                w5: $crate::lboxed::LBoxed<'src, 'intern>,
+                w6: $crate::lboxed::LBoxed<'src, 'intern>,
+                w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                w8: $crate::lboxed::LBoxed<'src, 'intern>,
+            ) {
+                core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8));
+            }
+    };
+    (@stencil frame, [$($cap:ident : $cty:ty),*]) => {
+            /// The stencil, at `SKIP` 0 into an empty window: see `windowed!(frame ..)`.
+            pub extern "rust-preserve-none" fn __stencil<'b, 'src, 'intern, const SKIP: usize>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+            ) {
+                let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
+                let mut w = [$crate::lboxed::LBoxed::NIL; $crate::window::WINDOW];
+                $crate::window::bind_holes!(0; $($cap : $cty),*);
+                // The JIT lends this code the thread's owner. See `crate::forge_owner`.
+                unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                become Self::__next(state)
+            }
+
+            /// This op's `become` target, as for a window op's.
+            #[inline(never)]
+            extern "rust-preserve-none" fn __next<'b, 'src, 'intern>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+            ) {
+                core::hint::black_box(state as *mut _);
+            }
     };
 }
 pub(crate) use windowed;
