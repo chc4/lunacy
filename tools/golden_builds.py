@@ -10,6 +10,7 @@ target/golden-<name>; a test that panics says where.
 (in the devshell, which has luac5.1; `just golden-builds` runs it)
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,14 @@ BUILDS = {
     'no_dynamic_guards': ['no_dynamic_guards'],
     'immediate_jit+no_dynamic_guards': ['immediate_jit', 'no_dynamic_guards'],
 }
+
+
+# Addresses normalized, as the golden harness (tests/golden_tests.rs) does.
+ADDRESS = re.compile(r'(table|tc|native|function):?\s*(0x[0-9a-f]+|\(0x[0-9a-f]+\))')
+
+
+def normal(lines):
+    return [ADDRESS.sub('table: <addr>', line) for line in lines]
 
 
 def expected(test):
@@ -43,14 +52,14 @@ def main():
                 run = subprocess.run([f'{target}/release/lunacy', binary], capture_output=True, text=True, cwd=tmp, timeout=600)
                 got = [line for line in run.stdout.splitlines() if not line.startswith('counters after run')]
                 want = expected(test)
-                if run.returncode == 0 and got == want:
+                if run.returncode == 0 and normal(got) == normal(want):
                     print(f'{name:32} {test}: ok')
                     continue
                 failed += 1
                 panic = next((line for line in run.stderr.splitlines() if 'panicked' in line), '')
                 message = run.stderr.splitlines()[run.stderr.splitlines().index(panic) + 1] if panic else ''
                 print(f'{name:32} {test}: FAILED (exit {run.returncode}) {panic} {message}')
-                for index, (g, w) in enumerate(zip(got, want)):
+                for index, (g, w) in enumerate(zip(normal(got), normal(want))):
                     if g != w:
                         print(f'    line {index + 1}: got {g!r}, want {w!r}')
                 if len(got) != len(want):
