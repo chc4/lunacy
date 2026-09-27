@@ -122,13 +122,19 @@ unsafe extern "C" {
 #[doc(hidden)]
 #[inline(always)]
 pub unsafe fn hole<const I: usize>() -> u64 {
-    unsafe {
+    let mut value = unsafe {
         match I {
             0 => __lunacy_hole0 as u64,
             1 => __lunacy_hole1 as u64,
             _ => unresolved_window_hole__too_many_captures as u64,
         }
-    }
+    };
+    // A value the op takes apart (`(v >> 16) as u16`) could otherwise be loaded a
+    // piece at a time from inside the GOT slot, which the copier can't point at
+    // the hole: the empty `asm!` wants all of it in a register, so the slot is
+    // loaded whole.
+    unsafe { core::arch::asm!("/* hole {0} */", inout(reg) value, options(pure, nomem, nostack, preserves_flags)) };
+    value
 }
 
 /// Stable symbol for recovering the PIE load bias (runtime address vs ELF vaddr).
@@ -521,6 +527,9 @@ pub enum StencilError {
     IndirectJump { op: &'static str, at: usize },
     /// A reference is out of rel32 range of where the copy landed.
     OutOfRange { target: usize, base: usize },
+    /// A load of part of a hole's GOT slot, which the copy can't point at the
+    /// hole (see `hole`).
+    PartialHole { op: &'static str, at: usize },
     /// No executable mapping within rel32 range of the binary.
     Map(String),
 }
@@ -546,6 +555,9 @@ impl std::fmt::Display for StencilError {
             }
             Self::OutOfRange { target, base } => {
                 write!(f, "{target:#x} is out of rel32 range of the copy at {base:#x}")
+            }
+            Self::PartialHole { op, at } => {
+                write!(f, "{op} stencil loads part of a hole's GOT slot at +{at:#x}")
             }
             Self::Map(e) => write!(f, "no executable mapping near the binary: {e}"),
         }
@@ -833,6 +845,8 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
             let rel = RipRel { field, end, target };
             if let Some(i) = image.holes.iter().position(|h| *h == Some(target)) {
                 holes.push((rel, i));
+            } else if image.holes.iter().flatten().any(|&slot| slot < target && target < slot + 8) {
+                return Err(StencilError::PartialHole { op: name, at: off });
             } else if inst.opcode() == Opcode::LEA && target == next {
                 nexts.push(NextRef::Direct(rel));
             } else if inst.opcode() != Opcode::LEA && got(target) == next {
