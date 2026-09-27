@@ -413,8 +413,25 @@ impl std::hash::BuildHasher for InternedHasher {
 #[derive(Debug)]
 pub struct Table<'src, 'intern> {
     pub array: FVec<LBoxed<'src, 'intern>>,
+    /// Inserted into and cleared only through `insert_hash` and `clear_hash`,
+    /// which count the global environment's entry moves.
     pub hash: IndexMap<LCanon<'src, 'intern>, LBoxed<'src, 'intern>, InternedHasher>,
     pub epoch: usize,
+    /// Whether this is the global environment. See Note [Global caches] in
+    /// `generator`.
+    pub environment: bool,
+}
+
+thread_local! {
+    /// How many times the global environment's hash entries have moved: global
+    /// caches holding an entry's address are valid while it's unchanged. See
+    /// Note [Global caches] in `generator`.
+    static ENV_MOVES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// See `ENV_MOVES`.
+pub fn env_moves() -> u64 {
+    ENV_MOVES.with(|moves| moves.get())
 }
 
 impl<'src, 'intern> Table<'src, 'intern> {
@@ -423,6 +440,25 @@ impl<'src, 'intern> Table<'src, 'intern> {
             array: vec![LBoxed::NIL; array].into(),
             hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
             epoch: 0,
+            environment: false,
+        }
+    }
+
+    /// Insert into the hash part. A new key may reallocate the entries, moving
+    /// them. Returns the key's old value.
+    pub fn insert_hash(&mut self, key: LCanon<'src, 'intern>, value: LBoxed<'src, 'intern>) -> Option<LBoxed<'src, 'intern>> {
+        let old = self.hash.insert(key, value);
+        if old.is_none() && self.environment {
+            ENV_MOVES.with(|moves| moves.set(moves.get() + 1));
+        }
+        old
+    }
+
+    /// Empty the hash part, moving every entry out.
+    pub fn clear_hash(&mut self) {
+        self.hash.clear();
+        if self.environment {
+            ENV_MOVES.with(|moves| moves.set(moves.get() + 1));
         }
     }
 
@@ -430,7 +466,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
     /// `set`/`get`). Valid only for builtin keys, which are already interned strings
     /// and so satisfy the canonical-form invariant of Note [Canonical values] directly.
     pub fn insert_lvalue(&mut self, key: LValue<'src, 'intern>, value: LValue<'src, 'intern>) {
-        self.hash.insert(LCanon(LBoxed::box_lvalue(key)), LBoxed::box_lvalue(value));
+        self.insert_hash(LCanon(LBoxed::box_lvalue(key)), LBoxed::box_lvalue(value));
         self.epoch += 1;
     }
 }
@@ -484,7 +520,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
             return;
         }
         let k = LCanon::new(key, intern);
-        self.rw(owner).hash.insert(k, value);
+        self.rw(owner).insert_hash(k, value);
         self.rw(owner).epoch += 1;
     }
 }
@@ -1400,16 +1436,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
-    /// The table at `place`: a register's, or with `None` the global environment.
-    /// See Note [Global witnesses] in `generator`.
-    pub fn table_at(&self, place: Option<usize>) -> Tc<Table<'src, 'intern>> {
-        match place {
-            Some(slot) => {
-                let LValue::Table(tab) = self.vals[self.base + slot].unbox() else { unreachable!("slot {slot} holds no table") };
-                tab
-            },
-            None => self._G.clone(),
-        }
+    /// The table in `slot` of the running frame.
+    pub fn table_at(&self, slot: usize) -> Tc<Table<'src, 'intern>> {
+        let LValue::Table(tab) = self.vals[self.base + slot].unbox() else { unreachable!("slot {slot} holds no table") };
+        tab
     }
 }
 
@@ -1531,6 +1561,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 ].into_iter().chain(crate::library::globals(intern)).map(|(k, v)| (LCanon(LBoxed::box_lvalue(k)), LBoxed::box_lvalue(v)))
             ),
             epoch: 0,
+            environment: true,
         });
         // `_g` needs no explicit root: it lives in the `RunState` (`RunState::mark` shades it)
         // for the whole run, which is the only time a collection can see it. See Note [GC roots].

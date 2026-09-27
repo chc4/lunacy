@@ -263,8 +263,8 @@ impl std::fmt::Display for Residual {
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
             Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
             Residual::LuaCall { lclos, a, b, c } => write!(f, "lcall({:p}, {}, {}, {})", lclos, a, b, c),
-            Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({:?}, {:?}, {})", tab, href, expected),
-            Residual::EpochCheck { tab, href } => write!(f, "epoch({:?}, {:?})", tab, href),
+            Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
+            Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Select(targets) => write!(f, "select"),
             Residual::Ret(_, _, _) => write!(f, "ret"),
@@ -340,80 +340,63 @@ pub enum YieldOp {
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
     TryHashKey(usize, usize), // Looks up but does not allocate an HREF..
     UpdateHashRef(HashRef, CType), // Update the type of HREF to a new type
-    GlobalKey(usize), // HashKey for global CONSTANT[k]. See Note [Global witnesses]
-    TryGlobalKey(usize), // TryHashKey for global CONSTANT[k]
-    SetHazards(Option<Place>, Option<HashRef>), // Set optimization hazards, potentially
+    GlobalCache(usize), // Resumed with a new cache for global CONSTANT[k], as its address. See
+                        // Note [Global caches]
+    SetKeyHazards(usize), // SetHazards, for the hash keys of CONSTANT[k] only
+    SetHazards(Option<usize>, Option<HashRef>), // Set optimization hazards, potentially
                                         // scoped to only information that may alias with an href,
                                         // and potentially keeping information about a specific
                                         // stack slot intact.
     CollectGarbage,
 }
 
-/// Where a table is: `Some(slot)` of the running frame, or `None` for the global
-/// environment. See Note [Global witnesses].
-pub type Place = Option<usize>;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HashKey<'src, 'intern> {
-    /// The table the key is in.
-    pub idx: Place,
+    /// The slot of the table the key is in.
+    pub idx: usize,
     pub key: LConstant<'src, 'intern>,
     pub known_type: CType,
     /// Per slot: whether access through that slot is already checked for
     /// aliasing, so it needs no epoch check.
     pub hazards: SmallVec<[bool; 8]>,
-    /// The same, for access through the global environment.
-    pub env_checked: bool,
 }
 
 impl<'src, 'intern> HashKey<'src, 'intern> {
     fn tostring(&self, owner: &Owner) -> String {
         let lv: LValue = (&self.key).into();
-        format!("hkey({}{}, {})",
-            if self.idx.is_none() { "env." } else { "" },
+        format!("hkey({}, {})",
             String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
             self.known_type)
     }
 
     /// A new hash key, its type not yet discovered.
-    fn new(idx: Place, key: LConstant<'src, 'intern>) -> Self {
-        HashKey { idx, key, known_type: CType::Type(LType::Unknown), hazards: Default::default(), env_checked: false }
+    fn new(idx: usize, key: LConstant<'src, 'intern>) -> Self {
+        HashKey { idx, key, known_type: CType::Type(LType::Unknown), hazards: Default::default() }
     }
 
-    /// Whether access through `at` needs no epoch check.
-    fn checked(&self, at: Place) -> bool {
-        match at {
-            Some(slot) => self.hazards.get(slot) == Some(&true),
-            None => self.env_checked,
-        }
+    /// Whether access through slot `at` needs no epoch check.
+    fn checked(&self, at: usize) -> bool {
+        self.hazards.get(at) == Some(&true)
     }
 
-    /// Record that access through `at` needs no epoch check.
-    fn check(&mut self, at: Place) {
-        match at {
-            Some(slot) => {
-                if self.hazards.len() <= slot {
-                    self.hazards.resize(slot + 1, false);
-                }
-                self.hazards[slot] = true;
-            },
-            None => self.env_checked = true,
+    /// Record that access through slot `at` needs no epoch check.
+    fn check(&mut self, at: usize) {
+        if self.hazards.len() <= at {
+            self.hazards.resize(at + 1, false);
         }
+        self.hazards[at] = true;
     }
 
     /// Make every access check the epoch again.
     fn clear_checks(&mut self) {
         self.hazards.iter_mut().for_each(|checked| *checked = false);
-        self.env_checked = false;
     }
 
     /// Whether this index is free for a new hash key: its type is unknown and no
     /// shape lists it. A live hash key can also have an unknown type briefly
     /// (before its field's type is discovered), but then a shape lists it.
-    /// Environment hash keys are never orphans, as no shape lists them.
     fn orphan(&self, href: HashRef, types: &[CType]) -> bool {
         self.known_type == CType::Type(LType::Unknown)
-            && self.idx.is_some()
             && !types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)))
     }
 
@@ -423,7 +406,6 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
         self.idx == other.idx
             && self.key == other.key
             && self.known_type.accepts(&other.known_type)
-            && (!self.env_checked || other.env_checked)
             && self.hazards.iter().enumerate().all(|(slot, &checked)| !checked || other.hazards.get(slot) == Some(&true))
     }
 }
@@ -440,6 +422,8 @@ pub enum ResumeArg {
     Integer(i32),
     Number(f64),
     Boxed(u64),
+    /// A global cache's address. See Note [Global caches].
+    Cache(usize),
     /// The end of a call's arguments, and the type its native's window op
     /// assumes they have.
     WindowArgs(usize, LType),
@@ -520,62 +504,98 @@ windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
     *dest = val1;
 });
 
-/// GETGLOBAL: `R(A) := Gbl[Kst(Bx)]`, with `k` = Bx and `kst` its constant. See
-/// Note [Global witnesses].
-pub fn emit_getglobal<'src, 'intern>(dest: usize, k: usize, kst: &LConstant<'src, 'intern>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
-    // We need unsafe here, because we can't prove to rustc that this Rc<Fn> won't outlive
-    // 'src and 'intern which it refers to. We only ever store these closures in the
-    // closure object which itself borrows from the same data, and so this is safe.
-    let kst: LConstant<'static, 'static> = unsafe { core::mem::transmute(kst.clone()) };
+/// A global's cache: where its value is in the global environment, while the
+/// environment's entries haven't moved since. See Note [Global caches].
+pub struct GlobalCache {
+    key: LCanon<'static, 'static>,
+    /// `env_moves()` when `value` was found; `u64::MAX` before.
+    moves: Cell<u64>,
+    value: Cell<*mut LBoxed<'static, 'static>>,
+}
+
+impl GlobalCache {
+    fn new(key: LCanon<'static, 'static>) -> Self {
+        GlobalCache { key, moves: Cell::new(u64::MAX), value: Cell::new(core::ptr::null_mut()) }
+    }
+
+    /// The entry's address, if the cache holds it.
+    fn hit(&self) -> Option<*mut LBoxed<'static, 'static>> {
+        (self.moves.get() == crate::vm::env_moves()).then(|| self.value.get())
+    }
+
+    /// Look the key up again: its entry's address, or `None` if the environment
+    /// lacks it.
+    fn refill(&self, owner: &mut Owner, env: &Tc<Table<'_, '_>>) -> Option<*mut LBoxed<'static, 'static>> {
+        let key: &LCanon<'_, '_> = unsafe { core::mem::transmute(&self.key) };
+        let (_, _, value) = env.rw(owner).hash.get_full_mut(key)?;
+        self.value.set((value as *mut LBoxed<'_, '_>).cast());
+        self.moves.set(crate::vm::env_moves());
+        Some(self.value.get())
+    }
+}
+
+// GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
+// [Global caches].
+windowed!(GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
+    let cache = &*(cache as *const GlobalCache);
+    let entry = match cache.hit() {
+        Some(entry) => {
+            #[cfg(debug_assertions)]
+            {
+                let key: &LCanon<'_, '_> = core::mem::transmute(&cache.key);
+                assert_eq!(state._G.ro(owner).hash.get(key).map(|value| value as *const _ as usize), Some(entry as usize), "a stale global cache");
+            }
+            Some(entry)
+        },
+        None => cache.refill(owner, &state._G),
+    };
+    *dest = entry.map_or(LBoxed::NIL, |entry| *entry.cast());
+});
+windowed!(SetGlobal, [cache: usize], [], |owner, state, base| (value) {
+    let cache = &*(cache as *const GlobalCache);
+    match cache.hit().or_else(|| cache.refill(owner, &state._G)) {
+        Some(entry) => {
+            let entry = &mut *entry.cast::<LBoxed<'_, '_>>();
+            // Hash keys of registers holding the environment know a field's type
+            // by its epoch. See Note [Field types].
+            if guard_type(*entry) != guard_type(value) {
+                state._G.rw(owner).epoch += 1;
+            }
+            *entry = value;
+            // Last. See Note [Write barriers].
+            state._G.barrier_back();
+        },
+        None => set_global(owner, state, cache, value),
+    }
+});
+
+/// A store to a global the environment lacks.
+fn set_global<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, cache: &GlobalCache, value: LBoxed<'src, 'intern>) {
+    let key: LCanon<'src, 'intern> = unsafe { core::mem::transmute(cache.key) };
+    let mut env = state._G.clone();
+    env.set(owner, key.boxed(), value, state.intern);
+}
+
+/// GETGLOBAL: `R(A) := Gbl[Kst(Bx)]`, with `k` = Bx. See Note [Global caches].
+pub fn emit_getglobal(dest: usize, k: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        debug!("getglobal {} = {:?}", dest, &kst);
-        if let ResumeArg::HashRef(href, _) = (yield YieldOp::GlobalKey(k)) {
-            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(href.0, &[dest])));
-            // Its type: the hash key's, or found out. See Note [Field types].
-            yield YieldOp::FieldType(dest, href);
-            return arg;
-        }
-        yield YieldOp::Exec(ResidualExec::new("getglobal", Rc::new(move |owner, state| {
-            state.vals[state.base + dest as usize] = state._G.get(owner, &(&kst).into(), state.intern).unwrap_or((&Constant::Nil).into());
-        })));
+        let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
+        arg = yield YieldOp::ExecWindow(Rc::new(GetGlobal::new(cache, &[dest])));
         yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
         arg
     }
 }
 
-/// SETGLOBAL: `Gbl[Kst(Bx)] := R(A)`, with `k` = Bx and `kst` its constant. See
-/// Note [Global witnesses].
-pub fn emit_setglobal<'src, 'intern>(src: usize, k: usize, kst: &LConstant<'src, 'intern>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
-    // We need unsafe for the same reason, and with the same justification, as emit_getglobal.
-    let kst: LConstant<'static, 'static> = unsafe { core::mem::transmute(kst.clone()) };
+/// SETGLOBAL: `Gbl[Kst(Bx)] := R(A)`, with `k` = Bx. See Note [Global caches].
+pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        debug!("setglobal {} = {:?}", src, &kst);
-        if let ResumeArg::HashRef(href, htype) = (yield YieldOp::TryGlobalKey(k)) {
-            let ResumeArg::Type(value_type) = (yield YieldOp::Typeof(src)) else { unreachable!() };
-            let new_type = field_type(value_type);
-            let retype = retype(&new_type, &htype);
-            let expected = htype.as_ltype();
-            arg = yield YieldOp::ExecWindow(match retype {
-                Retype::Same => Rc::new(SetGlobalHref::<{ Retype::Same }>::new(href.0, expected, &[src])) as Rc<dyn Window>,
-                Retype::Known => Rc::new(SetGlobalHref::<{ Retype::Known }>::new(href.0, expected, &[src])),
-                Retype::Unknown => Rc::new(SetGlobalHref::<{ Retype::Unknown }>::new(href.0, expected, &[src])),
-            });
-            arg = match retype {
-                Retype::Same => yield YieldOp::SetHazards(Some(None), Some(href)),
-                // The store bumped the environment's epoch; the hash key takes the
-                // value's type, and other hash keys of this key are checked again.
-                Retype::Known | Retype::Unknown => yield YieldOp::UpdateHashRef(href, new_type),
-            };
-            return arg;
-        }
-        yield YieldOp::Exec(ResidualExec::new("setglobal", Rc::new(move |owner, state| {
-            state._G.set(owner, (&kst).into(), state.vals[state.base + src as usize], state.intern);
-        })));
-        // A register may hold the environment, so every witness must recheck its
-        // epoch.
-        arg = yield YieldOp::SetHazards(None, None);
+        let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
+        arg = yield YieldOp::ExecWindow(Rc::new(SetGlobal::new(cache, &[src])));
+        // A register may hold the environment: its hash keys of this global must
+        // check the epoch again.
+        yield YieldOp::SetKeyHazards(k);
         arg
     }
 }
@@ -707,15 +727,10 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
     tab.barrier_back();
 }
 
-// Store through a hash key's witness, into a register's table or into the global
-// environment. See Note [Global witnesses].
+// Store through a hash key's witness into a register's table.
 windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, state, base| (table, value) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     store_field(owner, state, tab, value, href, expected, RETYPE);
-});
-windowed!(SetGlobalHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, state, base| (value) {
-    let env = state._G.clone();
-    store_field(owner, state, env, value, href, expected, RETYPE);
 });
 
 pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -818,7 +833,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     })));
                 }
                 arg = match retype {
-                    Retype::Same => yield YieldOp::SetHazards(Some(Some(a)), Some(hb)),
+                    Retype::Same => yield YieldOp::SetHazards(Some(a), Some(hb)),
                     // The table moves to a new epoch: the hash key's known type
                     // is the value's, if known. This also sets hazards.
                     Retype::Known | Retype::Unknown => yield YieldOp::UpdateHashRef(hb, new_type),
@@ -837,7 +852,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
                     // A field's type is a number's encoding. See Note [Field types].
                     let kc_type = guard_type(kc);
-                    if let Some(existing) = t.rw(owner).hash.insert(kb, kc) {
+                    if let Some(existing) = t.rw(owner).insert_hash(kb, kc) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
                         if guard_type(existing) != kc_type {
                             t.rw(owner).epoch += 1;
@@ -1755,8 +1770,8 @@ pub enum Residual {
     Ret(Pc, u8, u16),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
-    HashGuard { tab: Place, href: HashRef, key: u64, expected: CType },
-    EpochCheck { tab: Place, href: HashRef },
+    HashGuard { tab: usize, href: HashRef, key: u64, expected: CType },
+    EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
     LuaCall { lclos: Tc<LClosure<'static, 'static>>, a: u16, b: u16, c: u16 },
@@ -1920,17 +1935,6 @@ pub fn passes_guard(value: LBoxed, expected: &CType) -> bool {
     passes_guard_code(value, guard_code(expected))
 }
 
-/// A `Place` as a machine word for JIT helper calls: the slot, or `usize::MAX`
-/// for the global environment.
-pub fn place_code(place: Place) -> usize {
-    place.unwrap_or(usize::MAX)
-}
-
-/// The inverse of `place_code`.
-pub fn place_of(code: usize) -> Place {
-    (code != usize::MAX).then_some(code)
-}
-
 /// A type a guard tests for, as a byte for code that can't hold a `CType`: its
 /// `LType`'s, or past them, an encoding's.
 pub fn guard_code(expected: &CType) -> u8 {
@@ -1955,28 +1959,27 @@ pub fn passes_guard_code(value: LBoxed, code: u8) -> bool {
     }
 }
 
-// Note [Global witnesses]
-// ~~~~~~~~~~~~~~~~~~~~~~~
-// Globals use the same hash keys and witnesses as table fields, so a global read
-// in a loop is a load from its witness instead of a hash lookup each time.
+// Note [Global caches]
+// ~~~~~~~~~~~~~~~~~~~~~
+// Each GETGLOBAL and SETGLOBAL has a cache (`GlobalCache`) of where its global's
+// value is in the global environment, so an access is a compare and a load, not
+// a hash lookup. Nothing about globals goes in the context: which globals a path
+// happens to touch would otherwise split versions at every merge.
 //
-// The global environment isn't in a register, so a hash key records its table as
-// a `Place`: `Some(slot)` for a register's table, `None` for the environment
-// (`RunState::table_at` fetches either). GETGLOBAL and SETGLOBAL use
-// `GlobalKey`/`TryGlobalKey` where GETTABLE and SETTABLE use `HashKey`/
-// `TryHashKey`. A global the environment doesn't have, or a store with no hash
-// key yet, takes the generic path.
+// A cache holds the entry's address and `env_moves()` when it found it. The
+// entry stays at that address until the environment's entries move, which only
+// an insert of a new key (reallocating) or a clear does; those bump the counter
+// (`Table::insert_hash`, `Table::clear_hash`), and a cache whose count differs
+// looks the key up again. The table's epoch can't serve: a store changing a
+// global's type bumps it too, which would miss every cache in a loop storing a
+// global.
 //
-// An environment hash key belongs to no shape, so it has its own aliasing check
-// (`env_checked`). Anything that may write the environment clears it, and the
-// next access then checks the epoch:
-//   * a store into a register's table, since the register may hold the
-//     environment (via `_G`, or any other alias), unless the key differs;
-//   * a generic global store;
-//   * a call other than a native's window op, since it may run any code.
+// The cache has a stable address (the specializer owns it), which is the window
+// op's hole, so refilling it needs no change to compiled code.
 //
-// `_G` is an ordinary global that holds the environment: assigning it doesn't
-// change which table globals live in.
+// A register may hold the environment too (`_G`, or an alias of it), with hash
+// keys whose field types rely on its epoch. So a SETGLOBAL changing a value's
+// type bumps the epoch, and makes hash keys of the same key check it again.
 
 // Note [Field types]
 // ~~~~~~~~~~~~~~~~~~
@@ -2336,7 +2339,8 @@ impl Context {
                 .map(|idx| (idx, CType::Type(LType::Table)))
                 .collect();
             self.set_types(owner, shapes);
-            // Environment hash keys aren't dropped with the shapes above.
+            // What's left are orphans: with none, the joined version accepts any
+            // hash keys.
             self.hkeys.clear();
         }
     }
@@ -2363,7 +2367,7 @@ impl Context {
             // de-duplicated branch but with different indexes.
             if let CType::Shape(shape) = &self.types[idx] {
                 for (kidx, key) in self.hkeys.iter_mut().enumerate() {
-                    if key.idx != Some(idx) { continue; }
+                    if key.idx != idx { continue; }
                     // Try to migrate
                     let mut migrated = false;
                     for (new_idx, other_type) in self.types.iter().enumerate() {
@@ -2372,7 +2376,7 @@ impl Context {
                         let hr: u8 = kidx.try_into().expect("too many hkeys");
                         if other_shape.contains(&HashRef(hr)) {
                             warn!("migrating {} to stack slot {}", kidx, new_idx);
-                            key.idx = Some(new_idx);
+                            key.idx = new_idx;
                             migrated = true;
                             break;
                         }
@@ -2389,7 +2393,7 @@ impl Context {
                 // pre-SetTypes context entirely). This is safe because we only ever
                 // have LType::Unknown as the known_type for an hkey before forcing an
                 // href_thunk, which happens immediately.
-                while let Some(_) = self.hkeys.pop_if(|hkey| hkey.idx == Some(idx)) { }
+                while let Some(_) = self.hkeys.pop_if(|hkey| hkey.idx == idx) { }
             }
             self.types[idx] = ty;
             warn!("set types to {:?}", &self.types);
@@ -2399,7 +2403,14 @@ impl Context {
     /// Set optimization hazards for a stack slot, potentially scoped to only information which
     /// can alias with a specific hash key, and potentially keeping intact information about a
     /// stack slot.
-    pub fn set_hazards(&mut self, keep: Option<Place>, href: Option<HashRef>) {
+    /// Make every hash key of `key` check the epoch again.
+    pub fn set_key_hazards(&mut self, key: &LConstant<'static, 'static>) {
+        for hkey in self.hkeys.iter_mut().filter(|hkey| hkey.key == *key) {
+            hkey.clear_checks();
+        }
+    }
+
+    pub fn set_hazards(&mut self, keep: Option<usize>, href: Option<HashRef>) {
         let mut invalidate: Vec<usize> = (0..self.hkeys.len()).collect();
         if let Some(href) = href {
             // If we know we wrote to an href, then we can set hazards only on hkeys
@@ -2423,6 +2434,9 @@ pub struct Specializer<'src, 'intern> {
     #[cfg(feature = "jit")]
     pub jctx: JitContext,
 
+    /// The global caches its blocks use, at stable addresses. See Note [Global
+    /// caches].
+    pub global_caches: Vec<Box<GlobalCache>>,
     pub versions: std::collections::HashMap<
         LProto<'src, 'intern>,
         std::collections::HashMap<(SubPc, Rc<Context>), BlockId, rustc_hash::FxBuildHasher>, InternedHasher>,
@@ -2444,6 +2458,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn new(clos: Tc<LClosure<'src, 'intern>>) -> Self {
         Self {
             blocks: Vec::new(),
+            global_caches: Vec::new(),
             versions: HashMap::default(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
@@ -2651,12 +2666,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getglobal(a as usize, bx as usize, kst)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setglobal(a as usize, bx as usize, kst)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETTABLE => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
@@ -2888,13 +2903,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: Place, href: HashRef, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
+    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let thunk_coro = thunk_coro.clone();
             let mut orig_ctx = thunk_ctx.clone();
             let thunk_mut = Rc::make_mut(&mut thunk_ctx);
             let hkey = &mut thunk_mut.hkeys[href.0 as usize];
-            debug!("forcing href thunk for {idx:?} {href:?} {hkey:?}");
+            debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
             let tab = state.table_at(idx);
             let Some((index, key, val)) = tab.ro(owner).hash.get_full(&LCanon::new((&hkey.key).into(), state.intern)) else {
                 // The table doesn't have this key, which means we should actually just bailout
@@ -2916,15 +2931,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // TODO: track the maximum number of hkeys + grow here instead so we can initialize the RunState
             // array.
 
-            // A register's table now has this hash key in its shape.
-            if let Some(idx) = idx {
-                if let CType::Shape(existing) = &mut thunk_mut.types[idx] {
-                    if !existing.contains(&href) {
-                        existing.push(href)
-                    }
-                } else {
-                    thunk_mut.types[idx] = CType::Shape(vec![href].into());
+            // The table's shape now has this hash key.
+            if let CType::Shape(existing) = &mut thunk_mut.types[idx] {
+                if !existing.contains(&href) {
+                    existing.push(href)
                 }
+            } else {
+                thunk_mut.types[idx] = CType::Shape(vec![href].into());
             }
             // The key's canonical form, made here once. See Note [Hash witnesses].
             let lkey = LCanon::constant(&hkey.key);
@@ -2995,7 +3008,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: Place, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId) {
+    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId) {
         // In order to assert that an href is still valid, we need to check that the witnessed
         // epoch is still the same: if so, all of its keys still have the same type as the
         // cached hashkey, and no additional hashkeys were inserted (which may otherwise cause
@@ -3097,15 +3110,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::Failed;
                     continue 'machine;
                 },
-                op @ CoroutineState::Yielded(YieldOp::HashKey(..) | YieldOp::TryHashKey(..) | YieldOp::GlobalKey(_) | YieldOp::TryGlobalKey(_)) => {
+                op @ CoroutineState::Yielded(YieldOp::HashKey(..) | YieldOp::TryHashKey(..)) => {
                     let proto = self.clos.ro(owner).prototype;
-                    // Which table, which constant key, and whether to make a hash key
-                    // if none exists yet. See Note [Global witnesses].
+                    // The table's slot, the constant key, and whether to make a hash key
+                    // if none exists yet.
                     let (place, k_const, allocate) = match op {
-                        CoroutineState::Yielded(YieldOp::HashKey(idx, key)) => (Some(idx), ((key & 0x100) != 0).then_some(key & 0xff), true),
-                        CoroutineState::Yielded(YieldOp::TryHashKey(idx, key)) => (Some(idx), ((key & 0x100) != 0).then_some(key & 0xff), false),
-                        CoroutineState::Yielded(YieldOp::GlobalKey(k)) => (None, Some(k), true),
-                        CoroutineState::Yielded(YieldOp::TryGlobalKey(k)) => (None, Some(k), false),
+                        CoroutineState::Yielded(YieldOp::HashKey(idx, key)) => (idx, ((key & 0x100) != 0).then_some(key & 0xff), true),
+                        CoroutineState::Yielded(YieldOp::TryHashKey(idx, key)) => (idx, ((key & 0x100) != 0).then_some(key & 0xff), false),
                         _ => unreachable!(),
                     };
                     // Only cache string keys
@@ -3117,15 +3128,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         arg = ResumeArg::Failed;
                         break 'machine;
                     };
-                    // The table's existing hash keys: its shape's for a register, or
-                    // every environment hash key.
-                    let existing: SmallVec<[HashRef; 4]> = match place {
-                        Some(idx) => match &ctx.types[idx] {
-                            CType::Type(LType::Table) => SmallVec::new(),
-                            CType::Shape(existing) => existing.clone(),
-                            _ => panic!("HashKey should only be used on a table"),
-                        },
-                        None => ctx.hkeys.iter().enumerate().filter(|(_, hkey)| hkey.idx.is_none()).map(|(i, _)| HashRef(i as u8)).collect(),
+                    // The table's existing hash keys: its shape's.
+                    let existing: SmallVec<[HashRef; 4]> = match &ctx.types[place] {
+                        CType::Type(LType::Table) => SmallVec::new(),
+                        CType::Shape(existing) => existing.clone(),
+                        _ => panic!("HashKey should only be used on a table"),
                     };
                     debug!("hashkey on existing {existing:?}");
                     if let Some(cached) = existing.into_iter().find(|cached| &ctx.hkeys[cached.0 as usize].key == k_val) {
@@ -3303,15 +3310,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
                     let known = ctx.hkeys[href.0 as usize].known_type.clone();
-                    let env = ctx.hkeys[href.0 as usize].idx.is_none();
                     Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.clone())]);
                     if known != CType::Type(LType::Unknown) {
                         (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &known);
                     } else {
                         // Record the type on the hash key too, unless the load overwrote
-                        // the table's register and dropped its hash keys. Environment
-                        // hash keys are never dropped this way.
-                        let live = env || ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
+                        // the table's register and dropped its hash keys.
+                        let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
                         let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Type(LType::Unknown), live.then_some(href), pc, ctx.clone(), true));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
@@ -3423,6 +3428,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::SetTypes(mut ty_effects)) => {
                     Rc::make_mut(&mut ctx).set_types(owner, ty_effects.drain(..).map(|(idx, ty)| (idx, CType::Type(ty))).collect())
+                },
+                CoroutineState::Yielded(YieldOp::GlobalCache(k)) => {
+                    let proto = self.clos.ro(owner).prototype;
+                    let key = LCanon::constant(unsafe { &(&(*proto).constants.items)[k] });
+                    // A constant lives as long as its prototype, which the specializer's
+                    // blocks do too.
+                    let key: LCanon<'static, 'static> = unsafe { core::mem::transmute(key) };
+                    let cache = Box::new(GlobalCache::new(key));
+                    arg = ResumeArg::Cache(&*cache as *const GlobalCache as usize);
+                    self.global_caches.push(cache);
+                },
+                CoroutineState::Yielded(YieldOp::SetKeyHazards(k)) => {
+                    let proto = self.clos.ro(owner).prototype;
+                    let key: &LConstant<'static, 'static> = unsafe { core::mem::transmute(&(&(*proto).constants.items)[k]) };
+                    Rc::make_mut(&mut ctx).set_key_hazards(key);
                 },
                 CoroutineState::Yielded(YieldOp::SetHazards(idx, href)) => {
                     Rc::make_mut(&mut ctx).set_hazards(idx, href)
