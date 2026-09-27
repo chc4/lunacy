@@ -48,6 +48,7 @@
             luaVersioned      # `lua5.1` / `luac5.1`, `lua5.5` / `luac5.5` for the Justfile
             pkgs.hyperfine    # used by the `just hyperfine*` recipes
             pkgs.luajit       # the reference JIT `just hyperfine` compares against
+            pkgs.luau         # Luau, which `just hyperfine-full` compares against
             pkgs.graphviz     # `dot`, which the `graph` feature renders block graphs with
             pkgs.python3      # tools/window_runs.py (`just window-runs`)
             pkgs.perf         # `just flamegraph`

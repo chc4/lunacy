@@ -37,7 +37,7 @@ BUILDS = ['unsafe', 'release', 'interpreter']
 # their latest times where they fit.
 CHARTED = ['unsafe', 'release']
 COLORS = {'unsafe': '#d62728', 'release': '#1f77b4', 'interpreter': '#7f7f7f',
-          'lua5.1': '#2ca02c', 'lua5.5': '#17becf', 'luajit -joff': '#9467bd', 'luajit': '#8c564b'}
+          'lua5.1': '#2ca02c', 'lua5.5': '#17becf', 'luau': '#bcbd22', 'luau --codegen': '#e377c2', 'luajit -joff': '#9467bd', 'luajit': '#8c564b'}
 
 
 def git(*args):

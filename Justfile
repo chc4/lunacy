@@ -180,6 +180,18 @@ _lua55c benchmark:
     if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
     luac5.5 -o working/{{benchmark}}.lua55.bin $src
 
+# Luau's copy of a benchmark, as `_luac`, in working/<benchmark>.luau: its
+# source, then a call of its `run_iter` with the count Luau is given (`-a`).
+# Luau has no dofile, and runs each file with its own globals, so it can't run
+# the benchmark as bench.lua does for the other Luas.
+_luauc benchmark:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p working
+    src=benchmarks/{{benchmark}}/bench.lua
+    if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
+    { cat $src; printf '\nrun_iter(tonumber((...)))\n'; } > working/{{benchmark}}.luau
+
 run benchmark:
     just _luac {{benchmark}}
     time cargo run --release --bin bench -- working/{{benchmark}}.bin
@@ -370,20 +382,24 @@ hyperfine benchmark times='10': unsafe-compile
         -n unsafe "./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
 
-# `hyperfine`, with lunacy's interpreter (no JIT), Lua 5.1 and Lua 5.5 too,
-# whose runs take most of its time. Neither Lua has `bit`, so their runs of a
-# benchmark requiring it fail at once, and time nothing.
+# `hyperfine`, with lunacy's interpreter (no JIT), Lua 5.1, Lua 5.5, and Luau
+# interpreted and with its native code generator too. Lua 5.1 and 5.5's and the
+# interpreter's runs take most of its time. None of the others has `bit`, so
+# their runs of a benchmark requiring it fail at once, and time nothing.
 hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
     just _lua55c {{benchmark}}
+    just _luauc {{benchmark}}
     cargo build --release --bin bench
-    # A command failing (lua5.1 and lua5.5 lack the bit library) is timed, and
-    # left out of the history for its exit code.
+    # A command failing (lua5.1, lua5.5 and Luau lack the bit library) is timed,
+    # and left out of the history for its exit code.
     taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
         -n lua5.1 "lua5.1 bench.lua -- working/{{benchmark}}.bin {{times}}" \
         -n lua5.5 "lua5.5 bench.lua -- working/{{benchmark}}.lua55.bin {{times}}" \
+        -n luau "luau -O2 working/{{benchmark}}.luau -a {{times}}" \
+        -n "luau --codegen" "luau -O2 --codegen working/{{benchmark}}.luau -a {{times}}" \
         -n "luajit -joff" "luajit -joff bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
         -n luajit "luajit bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
         -n interpreter "./target/interpreter/release/bench working/{{benchmark}}.bin {{times}}" \
@@ -473,7 +489,7 @@ bench-history:
 # a group per benchmark, in working/bars.html (tools/bench_bars.py): `builds`,
 # the implementations, in bar order, and `clamp`, those whose bars don't set
 # the scale past 1.5 times the rest's highest (comma separated).
-bench-bars builds='lua5.1,lua5.5,luajit -joff,luajit,interpreter,release,unsafe' clamp='lua5.1,lua5.5':
+bench-bars builds='lua5.1,lua5.5,luau,luau --codegen,luajit -joff,luajit,interpreter,release,unsafe' clamp='lua5.1,lua5.5,interpreter':
     python3 tools/bench_bars.py --builds "{{builds}}" --clamp "{{clamp}}"
 # Hardware counters (`perf stat`) for this checkout's build of `profile`
 # (`release` or `unsafe`) and revision `ref`'s (built as `_build-vs` builds
