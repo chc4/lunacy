@@ -28,12 +28,15 @@
           "rust-std"
         ];
 
-        # The Justfile invokes `lua5.1` / `luac5.1`, but nixpkgs' lua5_1
-        # ships unversioned `lua` / `luac`. Provide the versioned aliases.
+        # The Justfile invokes `lua5.1` / `luac5.1` and `lua5.5` / `luac5.5`,
+        # but nixpkgs' lua5_1 and lua5_5 ship unversioned `lua` / `luac`.
+        # Provide the versioned aliases; lua5_5 is only reachable through them.
         luaVersioned = pkgs.runCommand "lua5.1-versioned" { } ''
           mkdir -p $out/bin
           ln -s ${pkgs.lua5_1}/bin/lua  $out/bin/lua5.1
           ln -s ${pkgs.lua5_1}/bin/luac $out/bin/luac5.1
+          ln -s ${pkgs.lua5_5}/bin/lua  $out/bin/lua5.5
+          ln -s ${pkgs.lua5_5}/bin/luac $out/bin/luac5.5
         '';
       in
       {
@@ -42,7 +45,7 @@
             rustToolchain
             pkgs.just         # `just` task runner
             pkgs.lua5_1       # Lua 5.1 (unversioned `lua`/`luac`)
-            luaVersioned      # `lua5.1` / `luac5.1` aliases for the Justfile
+            luaVersioned      # `lua5.1` / `luac5.1`, `lua5.5` / `luac5.5` for the Justfile
             pkgs.hyperfine    # used by the `just hyperfine*` recipes
             pkgs.luajit       # the reference JIT `just hyperfine` compares against
             pkgs.graphviz     # `dot`, which the `graph` feature renders block graphs with

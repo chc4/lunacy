@@ -167,6 +167,14 @@ _luajitc benchmark:
     if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
     luajit -b $src {{benchmark}}.luajit.bin
 
+# Compile a benchmark, as `_luac`, to Lua 5.5's bytecode in <benchmark>.lua55.bin.
+_lua55c benchmark:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src=benchmarks/{{benchmark}}/bench.lua
+    if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
+    luac5.5 -o {{benchmark}}.lua55.bin $src
+
 run benchmark:
     just _luac {{benchmark}}
     time cargo run --release --bin bench -- {{benchmark}}.bin
@@ -347,18 +355,20 @@ hyperfine benchmark times='10': unsafe-compile
         -n unsafe "./target/unsafe/bench {{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
 
-# `hyperfine`, with lunacy's interpreter (no JIT) and Lua 5.1 too, whose runs
-# take most of its time. Lua 5.1 has no `bit`, so its run of a benchmark
-# requiring it fails at once, and times nothing.
+# `hyperfine`, with lunacy's interpreter (no JIT), Lua 5.1 and Lua 5.5 too,
+# whose runs take most of its time. Neither Lua has `bit`, so their runs of a
+# benchmark requiring it fail at once, and time nothing.
 hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
+    just _lua55c {{benchmark}}
     cargo build --release --bin bench
-    # A command failing (lua5.1 lacks the bit library) is timed, and left out of
-    # the history for its exit code.
+    # A command failing (lua5.1 and lua5.5 lack the bit library) is timed, and
+    # left out of the history for its exit code.
     taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
         --export-json hyperfine-{{benchmark}}-{{times}}.json \
         -n lua5.1 "lua5.1 bench.lua -- {{benchmark}}.bin {{times}}" \
+        -n lua5.5 "lua5.5 bench.lua -- {{benchmark}}.lua55.bin {{times}}" \
         -n "luajit -joff" "luajit -joff bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
         -n luajit "luajit bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
         -n interpreter "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """The latest benchmark times as one grouped bar chart, as compiler papers draw
-them: a group of bars per benchmark, one per implementation (lua5.1, LuaJIT
-without and with its JIT, and this project's interpreter, release and unsafe
-builds), on one linear axis of seconds.
+them: a group of bars per benchmark, one per implementation (lua5.1, lua5.5,
+LuaJIT without and with its JIT, and this project's interpreter, release and
+unsafe builds), on one linear axis of seconds.
 
 Each bar is the median of its runs, with a whisker across their quartiles,
 from the most recent clean commit the history (bench/history.jsonl, see
 tools/bench_history.py) has that build's time at; a build without one (lua5.1
-lacks the bit library some benchmarks use) is marked n/a. `--builds` picks the
-implementations (the interpreter's times, an order of magnitude past the
-rest, set the scale when it's drawn); `--clamp`'s (lua5.1 by default) don't set
-it past 1.5 times the rest's highest, a bar past the top cut under a hat with
-its time. Writes bench/bars.html.
+and lua5.5 lack the bit library some benchmarks use) is marked n/a. `--builds`
+picks the implementations (the interpreter's times, an order of magnitude past
+the rest, set the scale when it's drawn); `--clamp`'s (lua5.1 and lua5.5 by
+default) don't set it past 1.5 times the rest's highest, a bar past the top cut
+under a hat with its time. Writes bench/bars.html.
 """
 import argparse
 import html
@@ -22,8 +22,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_history import box, series, ordered, COLORS  # noqa: E402
 
-ORDER = ['lua5.1', 'luajit -joff', 'luajit', 'interpreter', 'release', 'unsafe']
-LABELS = {'luajit -joff': 'LuaJIT (interpreter)', 'luajit': 'LuaJIT', 'lua5.1': 'Lua 5.1',
+ORDER = ['lua5.1', 'lua5.5', 'luajit -joff', 'luajit', 'interpreter', 'release', 'unsafe']
+LABELS = {'luajit -joff': 'LuaJIT (interpreter)', 'luajit': 'LuaJIT', 'lua5.1': 'Lua 5.1', 'lua5.5': 'Lua 5.5',
           'interpreter': 'lunacy interpreter', 'release': 'lunacy release', 'unsafe': 'lunacy unsafe'}
 
 
@@ -116,7 +116,7 @@ def table(data, info, builds):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--builds', default=','.join(ORDER), help='the implementations, comma separated, in bar order')
-    ap.add_argument('--clamp', default='lua5.1', help="the implementations, comma separated, whose bars don't set the scale past 1.5 times the rest's highest")
+    ap.add_argument('--clamp', default='lua5.1,lua5.5', help="the implementations, comma separated, whose bars don't set the scale past 1.5 times the rest's highest")
     ap.add_argument('--out', default='bench/bars.html')
     args = ap.parse_args()
     builds = args.builds.split(',')
