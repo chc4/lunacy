@@ -201,6 +201,15 @@ macro_rules! dispatch_compare_window {
 /// as one finding out: the subblocks after the guard are shared by its outcome
 /// and the context, which are then the same, so the op must be at the same
 /// point in each.
+///
+/// Only whether both are integers may be acted on, as the key the macro leaves
+/// the generator at determines it and nothing else it returns (Note
+/// [Subblocks]). Taking no guard leaves the `SubPc` and context as they were,
+/// so the two types are the context's. Taking one, it leaves after `tt` only
+/// if the guarded register was found an integer, with the other known to be
+/// one: both are, in the context too. After `tf` or `f` one isn't. The types
+/// themselves can differ between ways reaching one key: a register read as a
+/// `Number` and found a double meets one known to be a double.
 macro_rules! discover_integers {
     ($lhs:expr, $rhs:expr) => {{
         let integer = ResumeArg::Type(CType::Integer);
@@ -1733,7 +1742,34 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
     }
 }
 
+// Note [Subblocks]
+// ~~~~~~~~~~~~~~~~
+// An instruction's generator can end its block partway through: at a guard
+// found out at runtime (a thunk), whose outcome picks how the instruction goes
+// on. Forcing the thunk compiles the rest of the instruction, resuming the
+// generator, into a subblock, and each outcome gets its own.
+//
+// A subblock is keyed, like a version, by where it is and its context. Where
+// is a `SubPc`: the instruction's pc and the outcomes of the guards the
+// generator has taken in it so far, a bit each after a leading 1, 1 passed and
+// 0 failed. Every guard steps it, whether the context decides it or a thunk
+// finds it out (`navigate`), so a way knowing a type and one finding it out
+// share the subblocks after. `subblock` returns the block already compiled for
+// a key and drops the generator it was handed, so:
+//
+//   Whatever a generator holds that decides what it yields later must be
+//   determined by the key of every subblock it can reach.
+//
+// Which guards led to a `SubPc` isn't part of it, only their outcomes: two
+// ways taking different guards can reach one, and only their contexts tell
+// them apart. Nor is what the generator read without guarding: `Typeof` reads
+// the context as it is then, and the guards after it narrow the context, so
+// two ways reading different types can meet in one key. A generator may only
+// act on what it read through a property the key determines, as
+// `discover_integers!` does.
+
 pub type Pc = usize;
+/// Where in an instruction a subblock continues: see Note [Subblocks].
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 pub struct SubPc(usize, usize);
 
@@ -1823,6 +1859,7 @@ impl CType {
             (a, b) if a == b => true,
             (CType::Type(LType::Unknown), _) => true,
             (CType::Type(LType::Number), CType::Integer | CType::Double) => true,
+            (CType::Type(LType::Table), CType::Shape(_)) => true,
             (CType::Type(LType::Closure), CType::NativeFunction(_) | CType::LuaFunction(_)) => true,
             _ => false,
         }
@@ -2079,9 +2116,12 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
 // describe, so a jump may enter a version whose context *accepts* its own:
 // slot by slot the same type or one above it in the lattice
 //
-//   Unknown  >  each LType  >  Number > Integer or Double, Closure > a known function
+//   Unknown  >  each LType  >  Number > Integer or Double, Table > a shape,
+//                              Closure > a known function
 //
-// (a shape accepts only itself).
+// (a shape accepts only itself). A version for a table in a slot is correct for
+// a shape there: the jump's hash keys on it are extra keys the version doesn't
+// know, as below. The join relies on this, widening shapes to tables.
 //
 // Hash keys are compared index by index, since the version's blocks read
 // witnesses at those indexes. At each index the version's hash key must be the

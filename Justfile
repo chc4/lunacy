@@ -214,6 +214,12 @@ graph-guards benchmark times='10':
         (cd $dir && ../../../graph-$variant/release/bench ../../../../working/{{benchmark}}.bin {{times}} > /dev/null)
     done
     tools/graph_blocks.py target/graphs/{{benchmark}}/guards target/graphs/{{benchmark}}/no_guards
+# `graph-guards` over HYPERFINES: a benchmark whose run fails under
+# `no_dynamic_guards` says so.
+graphs-guards:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for run in {{HYPERFINES}}; do echo "== ${run%:*} ${run#*:}"; just graph-guards ${run%:*} ${run#*:} 2>&1 | grep -E 'panicked|jump in| \| ' | tail -n 3; done
 # A benchmark's residual graphs at this checkout and at revision `ref` (built in
 # target/compare/<ref>, as for `hyperfine-vs`), in
 # target/graphs/<benchmark>/{current,<ref>}, and their blocks compared.
