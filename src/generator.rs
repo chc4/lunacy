@@ -270,6 +270,7 @@ impl std::fmt::Display for Residual {
             Residual::GuardDynamic(w) => write!(f, "guard_dynamic({})", window_label(&**w)),
             Residual::Jump(target) => write!(f, "jump({})", target.0),
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
+            Residual::Arrive { a, c } => write!(f, "arrive({}, {})", a, c),
             Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
             Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, .. } => write!(f, "lcall({}, {}, {}, {})", block.0, a, b, c),
             Residual::LuaCall { entry: CallEntry::Context(_), a, b, c, .. } => write!(f, "lcall(?, {}, {}, {})", a, b, c),
@@ -1783,28 +1784,45 @@ windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
     state.top = state.base + slot;
 });
 
+// Note [Returns]
+// ~~~~~~~~~~~~~~
+// A return is in two halves, each where one of its counts is known. The
+// callee's (`RunState::leave`, at its RETURN, which knows B) pops its frame and
+// moves its results down to the slot the function was called from, the top
+// just past them. The caller's (`RunState::arrive`, in the `Arrive` residual
+// right after the call, which knows C) pads them with nil to the count it
+// wants, and shrinks the stack back to its frame (Note [Stack frames]).
+//
+// A call returns to its `Arrive`: its `ReturnLocation` is the `Arrive`'s, so
+// every way back into the caller takes its results there, whether the callee
+// returns to the caller's JIT code, to the interpreter running the caller, or
+// through a bailout. A generic `Call` that calls a native skips the `Arrive`:
+// `call_native` puts the results in place itself.
+
 // Note [Frame ops]
 // ~~~~~~~~~~~~~~~~
-// A Lua call's frame is pushed (`call_lua`) and popped (`do_return`) by window
-// ops the JIT copies into its code for the call (`PushFrame`, in a `LuaCall`)
-// and the return (`PopFrame`, in a `Ret`), rather than calling out to them.
-// The window is flushed at a call and a return, so the ops run at `SKIP` 0
-// into an empty window, and read and write only `state`. The frame is in
-// `state.callstack` whichever pushed it, so a bailout out of JIT code finds
-// it there. A return leaves its JIT code with where its caller continues,
-// which `PopFrame` writes to `state.exit` for the `Ret` to load.
+// A Lua call's frame is pushed (`call_lua`) and popped (`leave`), and its
+// results taken (`arrive`), by window ops the JIT copies into its code for the
+// call (`PushFrame`, in a `LuaCall`), the return (`PopFrame`, in a `Ret`), and
+// the call's results (`Arrive`), rather than calling out to them. The window
+// is flushed at a call and a return, so the ops run at `SKIP` 0 into an empty
+// window, and read and write only `state`. The frame is in `state.callstack`
+// whichever pushed it, so a bailout out of JIT code finds it there. A return
+// leaves its JIT code with where its caller continues, which `PopFrame` writes
+// to `state.exit` for the `Ret` to load. See Note [Returns].
 //
-// The ops' A, B and C each have a const `Count`: whether it is 0, 1 or more,
-// so that an op's stencil has the branches on them (a count up to the top, one
-// result, none) decided. 0 and 1 are constants, and more is in the op's hole,
-// less 2, so the stencil knows it is more than 1 by adding 2 back
+// The ops' A, B and C each have a const `Count`: whether it is 0, 1, 2 or more,
+// so that an op's stencil has the branches on them (a count up to the top, no
+// value, one) decided. 0, 1 and 2 are constants, and more is in the op's hole,
+// less 3, so the stencil knows it is more than 2 by adding 3 back
 // (`Count::hold`, `Count::lift`).
 
-/// Which of 0, 1, or more a frame op's A, B or C is (Note [Frame ops]).
+/// Which of 0, 1, 2, or more a frame op's A, B or C is (Note [Frame ops]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
 pub enum Count {
     Zero,
     One,
+    Two,
     Many,
 }
 
@@ -1813,13 +1831,14 @@ impl Count {
         match value {
             0 => Count::Zero,
             1 => Count::One,
+            2 => Count::Two,
             _ => Count::Many,
         }
     }
 
-    /// What an op's hole holds for `value`: past 1, `value - 2`.
+    /// What an op's hole holds for `value`: past 2, `value - 3`.
     pub fn hold(value: u16) -> u16 {
-        value.saturating_sub(2)
+        value.saturating_sub(3)
     }
 
     /// The value, of this count, a hole holding `held` (`hold`) stands for.
@@ -1827,24 +1846,25 @@ impl Count {
         match self {
             Count::Zero => 0,
             Count::One => 1,
-            Count::Many => held as usize + 2,
+            Count::Two => 2,
+            Count::Many => held as usize + 3,
         }
     }
 }
 
-// `call_lua` for a call of R(A), `abcs` its `a | b << 16 | c << 32 | stack << 48`
-// (A, B and C as `Count::hold` holds them, `stack` the callee's `max_stack`),
-// returning to `ret` (a `PackedLocation`),
-// nilling the callee's frame if `FILLS` (else the JIT code does). See Note [Frame
-// ops].
-windowed!(frame PushFrame, [ret: u64, abcs: u64], [FILLS: bool, A: Count, B: Count, C: Count], |owner, state, base| () {
-    let (a, b, c) = (A.lift(abcs as u16), B.lift((abcs >> 16) as u16), C.lift((abcs >> 32) as u16));
-    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), a, b, c, (abcs >> 48) as u8, FILLS);
+// `call_lua` for a call of R(A), `abs` its `a | b << 16 | stack << 32` (A and B
+// as `Count::hold` holds them, `stack` the callee's `max_stack`), returning to
+// `ret` (a `PackedLocation`), nilling the callee's frame if `FILLS` (else the
+// JIT code does). See Note [Frame ops].
+windowed!(frame PushFrame, [ret: u64, abs: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
+    let (a, b) = (A.lift(abs as u16), B.lift((abs >> 16) as u16));
+    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), a, b, (abs >> 32) as u8, FILLS);
 });
 
-// A `Ret` at `off` in `block`, `at` their `block | off << 32` and `ab` its
-// `a | b << 16` (as `Count::hold` holds them), closing upvalues if `CLOSES`: `do_return`, `state.exit` where
-// the caller continues, or -2 from the entry frame. See Note [Frame ops].
+// A `Ret` at `off` in `block`, `at` their `block | off << 32` and `ab` its `a |
+// b << 16` (as `Count::hold` holds them), closing upvalues if `CLOSES`:
+// `leave`, `state.exit` where the caller continues, or -2 from the entry frame.
+// See Note [Frame ops].
 windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, A: Count, B: Count], |owner, state, base| () {
     let (block, off) = (at as u32, (at >> 32) as u16);
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
@@ -1852,12 +1872,18 @@ windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, A: Count, B: Count]
         state.current_off = off;
         ((-2i32 as u64) << 32) | block as u64
     } else {
-        match state.do_return(owner, a, b, CLOSES) {
+        match state.leave(owner, a, b, CLOSES) {
             Ok(location) => location.pack().bits() as u64,
-            // With a caller frame, `do_return` returns to it.
+            // With a caller frame, `leave` returns to it.
             Err(_) => unreachable!(),
         }
     };
+});
+
+// `arrive` for the call of R(A) before it, `ac` its `a | c << 16` (as
+// `Count::hold` holds them). See Note [Frame ops].
+windowed!(frame Arrive, [ac: u64], [A: Count, C: Count], |owner, state, base| () {
+    state.arrive(A.lift(ac as u16), C.lift((ac >> 16) as u16));
 });
 
 pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -1980,6 +2006,9 @@ pub enum Residual {
     /// context knows, entering its version `entry`, with a frame of `stack`
     /// slots (the prototype's `max_stack`). See Note [Call sites].
     LuaCall { entry: CallEntry, a: u16, b: u16, c: u16, stack: u8 },
+    /// The results of the call of R(A) before it, which returns here: `c - 1`
+    /// of them, or with C = 0 all. See Note [Returns].
+    Arrive { a: u16, c: u16 },
     LuaGuard { idx: usize, ptr: *const () },
     GC,
 }
@@ -3238,6 +3267,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let stack = unsafe { (*proto).max_stack };
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack });
+                    layout.push(Residual::Arrive { a: a16, c: c16 });
                 },
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
@@ -3248,6 +3278,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 _ => {
                     layout.push(Residual::Call { a: a16, b: b16, c: c16 });
+                    layout.push(Residual::Arrive { a: a16, c: c16 });
                     // It may call a native, which may allocate.
                     layout.push(Residual::GC);
                 },
@@ -3963,7 +3994,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::LuaCall { entry, a, b, c, stack } => {
                     let (caller, call) = (id, off);
                     off += 1;
-                    state.call_lua(owner, ReturnLocation(id, off).pack(), a, b, c);
+                    state.call_lua(owner, ReturnLocation(id, off).pack(), a, b);
                     // The closure called, which may be another of the prototype the
                     // guard checked.
                     let callee = state.clos.clone();
@@ -3994,9 +4025,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("{:?}", to_call);
                     // push where to return to once we RETURN
                     if let LValue::LClosure(ref lclos) = to_call {
-                        let next_stack = state.call_lua(owner, ReturnLocation(id, off).pack(),
-                            a as u16, b as u16, c as u16
-                        );
+                        let next_stack = state.call_lua(owner, ReturnLocation(id, off).pack(), a, b);
                         // Either use existing block, compile a new one, or use most
                         // generic.
                         let types = vec![LType::Unknown; next_stack];
@@ -4013,6 +4042,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let nf = ncall.native();
                         gc.publish(&state, &*self);
                         state.call_native(nf, a as u16, b, c, owner);
+                        // Past the `Arrive`: the native put its results in place.
+                        // See Note [Returns].
+                        off += 1;
                         // FIXME(metatables): __call
                     } else {
                         panic!("cant call {:?}", to_call);
@@ -4026,9 +4058,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("thunk {:?}", &thunk);
                     (thunk.0.borrow_mut())(self, owner, &mut state, off)
                 },
+                Residual::Arrive { a, c } => {
+                    off += 1;
+                    state.arrive(a as usize, c as usize);
+                },
                 Residual::Ret(pc, a, b, closes) => {
                     debug!("spec final blocks: {:?}", self.blocks);
-                    match state.do_return(owner, a as usize, b as usize, closes) {
+                    match state.leave(owner, a as usize, b as usize, closes) {
                         Ok(ReturnLocation(block, disp)) => {
                             self.set_current(state.clos.clone());
                             id = block;

@@ -1165,9 +1165,10 @@ impl ReturnLocation {
 // A call frame occupies a contiguous span of the register file (`vals`) starting at
 // `base`; `RunState::top` is its dynamic Lua top (the variable-count-span cursor).
 // `call_lua` grows `vals` to fit the callee's `max_stack` and records the caller's
-// state in a `CallstackEntry`; `do_return` pops it and restores that state.
+// state in a `CallstackEntry`; a return pops it and restores that state
+// (`leave`), and the caller takes the results (`arrive`). See Note [Returns].
 //
-// The GC marks `0..vals.len()`, so `do_return` shrinks `vals` back down as frames pop,
+// The GC marks `0..vals.len()`, so `arrive` shrinks `vals` back down as frames pop,
 // or dead frames would be marked forever. The bound it must never cross is
 // `RunState::natural_max` = `max` over all *live* frames of `base_i + max_stack_i`:
 // truncating below that would strip registers a suspended outer frame still reads. A
@@ -1175,12 +1176,12 @@ impl ReturnLocation {
 // in a deeper stack sits below it), so it can't be used directly.
 //
 // `natural_max` follows call/return stack discipline: `call_lua` saves it as the
-// callee's `limit`, then grows it by the callee's frame; `do_return` restores it from
-// `limit` and truncates `vals` to it.
+// callee's `limit`, then grows it by the callee's frame; `leave` restores it from
+// `limit`, and `arrive` truncates `vals` to it.
 //
 // MULTRET results are the one thing that can sit *above* `natural_max`: a call
 // returning a variable count writes them from `rloc` up to `rloc + r_count`, which can
-// overshoot the caller's frame, so `do_return` truncates to `limit.max(rloc +
+// overshoot the caller's frame, so `arrive` truncates to `limit.max(rloc +
 // r_count)` to keep them. That overshoot is deliberately *not* recorded as any later
 // frame's `limit` (a `limit` is always a `natural_max`), so a subsequent return
 // truncates it away — and that is sound, not a leak of live data, because of a Lua
@@ -1199,7 +1200,7 @@ impl ReturnLocation {
 // overshoot, which is what stops it lingering (and being GC-marked) for the rest of
 // foo's execution.
 #[derive(Debug)]
-pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_top: usize, pub rloc: usize, pub c: u16 }
+pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_top: usize }
 
 /// Where a frame's hash key was found in its table's hash part (its entry's
 /// index, and its value's address), and the table's epoch then. See Note
@@ -1244,7 +1245,7 @@ pub struct RunState<'src, 'intern> {
     pub top: usize,
     // The largest register-file extent (`base + max_stack`) over all live frames.
     // `vals` must never be truncated below this, or a suspended outer frame would
-    // lose registers it still reads. Maintained by `call_lua`/`do_return` (saved as
+    // lose registers it still reads. Maintained by `call_lua`/`leave` (saved as
     // each frame's `limit`). See Note [Stack frames].
     pub natural_max: usize,
     pub vals: ValueStack<'src, 'intern>,
@@ -1349,11 +1350,11 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     // from slot `a` of the boxed stack, and the return location arrives packed
     // into a single word (see `ReturnLocation::pack`).
     pub extern "C" fn call_lua(&mut self, owner: &mut Owner,
-        ret: PackedLocation, a: u16, b: u16, c: u16) -> usize
+        ret: PackedLocation, a: u16, b: u16) -> usize
     {
         let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
         let stack = unsafe { (*lclos.ro(owner).prototype).max_stack };
-        self.push_frame(owner, ret, a as usize, b as usize, c as usize, stack, true)
+        self.push_frame(owner, ret, a as usize, b as usize, stack, true)
     }
 
     /// `call_lua`, inlined into the window op pushing a frame in JIT code
@@ -1365,7 +1366,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// anything reads the stack or marks it. `stack` is the callee's
     /// `max_stack`, which the caller knows.
     #[inline(always)]
-    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, c: usize, stack: u8, fills: bool) -> usize {
+    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, stack: u8, fills: bool) -> usize {
         let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unreachable!() };
         debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "a call's frame size isn't its callee's");
         let ret_loc = ReturnLocation::unpack(ret);
@@ -1395,10 +1396,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             ret: ret_loc,
             frame: self.base,
             limit,
-            rloc: self.base + a,
             witness_frame: self.witness_base,
             witness_top: self.witness_top,
-            c: c as u16,
         });
         self.base = next_base;
         // Start `top` at the end of the callee's register file.
@@ -1418,25 +1417,27 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         }
     }
 
-    /// Move `count` results from `from` to `wanted` slots from `rloc`, padded
-    /// with nil. Out of line from `do_return`, which moves one itself.
+    /// Move `count` results from `from` down to `to`. Out of line from
+    /// `leave`, which moves one itself.
     #[inline(never)]
-    fn move_results(&mut self, from: usize, count: usize, rloc: usize, wanted: usize) {
-        for i in 0..wanted {
-            self.vals[rloc + i] = if i < count { self.vals[from + i] } else { LBoxed::NIL };
+    fn move_down(&mut self, from: usize, count: usize, to: usize) {
+        for i in 0..count {
+            self.vals[to + i] = self.vals[from + i];
         }
     }
 
-    /// Return from the running frame to its caller's `ReturnLocation`, the results
-    /// moved in place to the call's, or, from the outermost frame, the range of
-    /// the stack its results are in, which the caller takes off it.
+    /// Return from the running frame, the callee's half (Note [Returns]): close
+    /// the frame's open upvalues, if its function can have opened any
+    /// (`Residual::Ret`), pop it, and move its results, `b - 1` values from R(A)
+    /// or every one up to the top, down to the slot the function was called
+    /// from, the top just past them, for the caller to `arrive` at; then where
+    /// the caller continues. From the outermost frame, instead the range of the
+    /// stack its results are in, which the caller takes off it.
     ///
     /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
     /// Note [Frame ops] in `generator`.
     #[inline(always)]
-    pub fn do_return(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) -> Result<ReturnLocation, std::ops::Range<usize>> {
-        // The frame is going: close its open upvalues, if its function can have
-        // opened any (`Residual::Ret`).
+    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) -> Result<ReturnLocation, std::ops::Range<usize>> {
         if closes {
             if !self.upvals.is_empty() {
                 self.close_upvalues(owner);
@@ -1448,37 +1449,51 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             );
         }
 
-        // The results: `b - 1` values from R(A), or every value up to the top.
         let from = self.base + a;
         let count = if b == 0 { self.top - from } else { b - 1 };
         match self.callstack.pop() {
-            Some(CallstackEntry { clos: ret_clos, ret, frame, limit, witness_frame, witness_top, rloc, c }) => {
-                debug!("{} {:?} {}", self.base, unsafe { &(*ret_clos.ro(owner).prototype).instructions }, c);
-                self.clos = ret_clos.clone();
+            Some(CallstackEntry { clos, ret, frame, limit, witness_frame, witness_top }) => {
+                // The function's slot, just below the frame.
+                let to = self.base - 1;
+                match count {
+                    0 => {},
+                    1 => self.vals[to] = self.vals[from],
+                    _ => self.move_down(from, count, to),
+                }
+                self.top = to + count;
+                self.clos = clos;
                 self.base = frame;
                 self.witness_base = witness_frame;
+                self.witness_top = witness_top;
                 // The callee frame is gone; the live max-extent is the caller's again.
                 self.natural_max = limit;
-                // The results move down to the caller's `rloc`, in place: exactly `c
-                // - 1`, padded with nil, or with C = 0 (MULTRET) all of them.
-                let wanted = if c == 0 { count } else { c as usize - 1 };
-                // No result or one, the usual, moved here; more by `move_results`,
-                // so the window op popping a frame (`PopFrame`) is small.
-                match wanted {
-                    0 => {},
-                    1 => self.vals[rloc] = if count > 0 { self.vals[from] } else { LBoxed::NIL },
-                    _ => self.move_results(from, count, rloc, wanted),
-                }
-                self.top = rloc + wanted;
-                // Shrink the register file back to the caller's extent (`limit`) so the
-                // popped callee frame stops being marked by the GC, but for MULTRET
-                // results past it. See Note [Stack frames].
-                self.vals.truncate(if c == 0 { limit.max(rloc + wanted) } else { limit });
-                self.witness_top = witness_top;
-                return Ok(ret)
+                Ok(ret)
             },
             None => Err(from..from + count),
         }
+    }
+
+    /// Take the results of the call of R(A) that returned (`leave`), the
+    /// caller's half (Note [Returns]): exactly `c - 1`, padded with nil, or
+    /// with C = 0 all of them, up to the top. Then shrink the stack back to the
+    /// caller's extent, so the callee's frame stops being marked by the GC, but
+    /// for results past it with C = 0. See Note [Stack frames].
+    ///
+    /// Inlined into the window op for a call's results in JIT code (`Arrive`).
+    #[inline(always)]
+    pub fn arrive(&mut self, a: usize, c: usize) {
+        let at = self.base + a;
+        debug_assert!(self.top >= at, "results below the call");
+        if c != 0 {
+            let end = at + c - 1;
+            match c - 1 {
+                0 => {},
+                1 => if self.top == at { self.vals[at] = LBoxed::NIL },
+                _ => if self.top < end { self.nil_slots(self.top, end) },
+            }
+            self.top = end;
+        }
+        self.vals.truncate(if c == 0 { self.natural_max.max(self.top) } else { self.natural_max });
     }
 }
 

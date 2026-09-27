@@ -173,7 +173,7 @@ impl JitHelper {
                 LValue::LClosure(lclos) => {
                     let Some(entry) = spec.lua_entry(owner, &lclos) else { return 0 };
                     let ret = ReturnLocation(BlockId((ret & 0xffff_ffff) as usize), (ret >> 32) as usize).pack();
-                    state.call_lua(owner, ret, a, b, c);
+                    state.call_lua(owner, ret, a, b);
                     entry as usize
                 }
                 _ => 0,
@@ -194,38 +194,11 @@ impl JitHelper {
                 if let Some(code) = specializer.blocks[entry.0].jit_info.entry {
                     let state = &mut *(state as *mut RunState<'static, 'static>);
                     let owner = crate::forge_owner();
-                    state.call_lua(owner, ReturnLocation(BlockId(block), call + 1).pack(), a, b, c);
+                    state.call_lua(owner, ReturnLocation(BlockId(block), call + 1).pack(), a, b);
                     return code as usize;
                 }
             }
             Self::dynamic_call(spec, state, ret, a, b, c)
-        }
-    }
-
-    /// Return from the running frame, from the `Ret` at `(id, off)`: the caller's block
-    /// and offset to continue at, or, from the entry closure's frame, a bail (-2) for
-    /// `Specializer::run` to run the `Ret` and end the run with its values.
-    pub unsafe extern "C" fn lua_return(state: *mut (), a: u16, b: u16, base_ptr: *const (), id: u32, off: u16) -> u64 {
-        unsafe {
-            let rs = &mut *(state as *mut RunState);
-            warn!("lua_return base {base} base_ptr {base_ptr:p} stack_ptr {stack_ptr:p}", base = rs.base, stack_ptr = rs.vals.stack_ptr.as_non_null_ptr());
-            #[cfg(debug_assertions)]
-            assert_eq!(base_ptr, rs.vals.stack_ptr.as_non_null_ptr().add(rs.base).as_ptr().cast());
-            if rs.callstack.is_empty() {
-                rs.current_off = off;
-                return ((-2i32 as u64) << 32) | id as u64;
-            }
-            let mut owner = ();
-            let mut owner = (&raw mut owner as *mut Owner).as_mut_unchecked();
-            match rs.do_return(owner, a as usize, b as usize, true) {
-                Ok(ReturnLocation(block, off)) => {
-                    // Return block and offset
-                    debug!("returning to {:?} {}", block, off);
-                    return ((off as u64) << 32) | (block.0 as u64);
-                }
-                // With a caller frame, `do_return` returns to it.
-                Err(_) => unreachable!(),
-            }
         }
     }
 }
@@ -399,6 +372,7 @@ macro_rules! frame_op {
         match crate::generator::Count::of($count) {
             crate::generator::Count::Zero => frame_op!($op [$($pre)* { crate::generator::Count::Zero },] ($($args),*); $($rest),*),
             crate::generator::Count::One => frame_op!($op [$($pre)* { crate::generator::Count::One },] ($($args),*); $($rest),*),
+            crate::generator::Count::Two => frame_op!($op [$($pre)* { crate::generator::Count::Two },] ($($args),*); $($rest),*),
             crate::generator::Count::Many => frame_op!($op [$($pre)* { crate::generator::Count::Many },] ($($args),*); $($rest),*),
         }
     };
@@ -557,13 +531,12 @@ impl Drop for JitContext {
         #[cfg(feature = "jit_disasm")]
         {
             let mut symbols: HashMap<usize, String> = self.blocks.iter().map(|(id, block)| (block.ptr.0 as usize, format!("block {}", id.0))).collect();
-            let helpers: [(usize, &str); 7] = [
+            let helpers: [(usize, &str); 6] = [
                 (JitHelper::check_epoch as *const () as usize, "JitHelper::check_epoch"),
                 (JitHelper::check_guard as *const () as usize, "JitHelper::check_guard"),
                 (JitHelper::check_hash_guard as *const () as usize, "JitHelper::check_hash_guard"),
                 (JitHelper::dynamic_call as *const () as usize, "JitHelper::dynamic_call"),
                 (JitHelper::gc_safepoint as *const () as usize, "JitHelper::gc_safepoint"),
-                (JitHelper::lua_return as *const () as usize, "JitHelper::lua_return"),
                 (JitHelper::window_interp as *const () as usize, "JitHelper::window_interp"),
             ];
             symbols.extend(helpers.iter().map(|&(addr, name)| (addr, name.to_string())));
@@ -1401,9 +1374,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // native has run, a Lua function's JIT entry is called with its frame
         // pushed, and anything else bails out for the interpreter to call.
         // `helper` is `dynamic_call`, or `lua_call` for a `LuaCall`, which takes the call's
-        // version if it has code by then.
+        // version if it has code by then. A native's results are in place, so it
+        // continues past the `Arrive` after the call (Note [Returns]).
         let emit_dynamic_call = |ops: &mut Assembler, off: usize, a: u16, b: u16, c: u16, helper: usize| {
+            assert!(matches!(block.instructions.get(off + 1), Some(Residual::Arrive { .. })), "a call not followed by its `Arrive`");
             let ret = ((off as u64 + 1) << 32) | id.0 as u64;
+            let past_arrive = insts[off + 2];
             dynasm!(ops
                 ; .arch x64
                 ; mov rdi, QWORD spec
@@ -1414,7 +1390,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; mov r9d, c as i32
                 ; call extern (helper)
                 ; cmp rax, 1
-                ; je >done
+                ; je =>past_arrive
                 ; test rax, rax
                 ; jz >bail
                 ; mov r10, rax
@@ -1693,11 +1669,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // `PushFrame` nils, as it does past a count up to the top.
                             let packed_ret = ReturnLocation(BlockId(id.0), off + 1).pack();
                             let hold = |count: u16| crate::generator::Count::hold(count) as u64;
-                            let (ret, abcs) = (packed_ret.bits() as u64, hold(*a) | hold(*b) << 16 | hold(*c) << 32 | (*stack as u64) << 48);
+                            let (ret, abs) = (packed_ret.bits() as u64, hold(*a) | hold(*b) << 16 | (*stack as u64) << 32);
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
                             let push = match nils {
-                                Some(_) => frame_op!(PushFrame [false,] (ret, abcs); *a, *b, *c),
-                                None => frame_op!(PushFrame [true,] (ret, abcs); *a, *b, *c),
+                                Some(_) => frame_op!(PushFrame [false,] (ret, abs); *a, *b),
+                                None => frame_op!(PushFrame [true,] (ret, abs); *a, *b),
                             };
                             jit_note!(self.jctx, ops, "        PushFrame");
                             emit_frame_op(ops, &mut self.jctx.stencils, pool, &push);
@@ -1824,6 +1800,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize),
+                Residual::Arrive { a, c } => {
+                    // The call's results, taken by `Arrive`, which keeps no register
+                    // but `state`'s: the base pointer is loaded again. See Note
+                    // [Returns] in `generator`.
+                    let hold = |count: u16| crate::generator::Count::hold(count) as u64;
+                    let arrive = frame_op!(Arrive [] (hold(*a) | hold(*c) << 16); *a, *c);
+                    emit_frame_op(ops, &mut self.jctx.stencils, pool, &arrive);
+                    self.jctx.frame_ops.push(arrive);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov r13, QWORD [rsp - 0]
+                    );
+                },
                 Residual::Jump(target) => {
                     // If the block ends in a jump, and the block hasn't already been emitted, then
                     // we can elide a jump and instead fallthrough. We will use the target as
