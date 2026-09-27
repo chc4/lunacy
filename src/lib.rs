@@ -41,6 +41,8 @@ pub mod jit;
 #[cfg(feature = "jit_disasm")]
 pub mod disasm;
 pub mod gc;
+#[cfg(feature = "tracing")]
+pub mod tracing;
 pub mod library;
 
 pub use vm::Vm;

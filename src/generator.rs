@@ -3750,6 +3750,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let next_id = (ret & 0xFFFFFFFF) as usize;
                     self.clos = state.clos.clone();
 
+                    #[cfg(feature = "tracing")]
+                    self.trace_bailout(owner, &state, next_off, next_id);
                     if next_off >= 0 {
                         debug!("jit exit to {next_id} {next_off}");
                         id = BlockId(next_id as usize);
@@ -3994,6 +3996,29 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     // TODO: this is gross! if we spec a block we have to switch current, but then forcing a thunk
     // from another function may at runtime use the wrong current closure. figure out some better
     // way (worse case each block has its own closure and we switch in run when we enter...)
+    /// A `jit`/`bailout` trace event for JIT code exiting to the interpreter
+    /// with `off` and `block`: why (the exit's kind, or the residual it exits
+    /// at), and the function and block.
+    #[cfg(feature = "tracing")]
+    fn trace_bailout(&self, owner: &Owner, state: &RunState<'src, 'intern>, off: isize, block: usize) {
+        let reason = match off {
+            -1 => "trap".to_string(),
+            -2 => "return from the entry frame".to_string(),
+            -3 => "select".to_string(),
+            -4 => "thunk".to_string(),
+            // A residual the JIT code doesn't run there, as a call to a function
+            // with no code.
+            off => format!("{}", self.blocks[block].instructions[off as usize]),
+        };
+        let (source, line) = Vm::info(state.clos.ro(owner).prototype);
+        crate::tracing::instant("jit", "bailout", &[
+            ("reason", reason.as_str().into()),
+            ("block_id", block.into()),
+            ("source", source.as_str().into()),
+            ("line", (line as u64).into()),
+        ]);
+    }
+
     pub fn set_current(&mut self, clos: Tc<LClosure<'src, 'intern>>) {
         self.clos = clos;
     }

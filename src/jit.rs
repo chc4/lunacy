@@ -747,6 +747,8 @@ impl JitContext {
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn jit_compile(&mut self, id: BlockId, owner: &mut Owner) {
+        #[cfg(feature = "tracing")]
+        crate::tracing::begin("jit", "compile", &[("block_id", id.0.into())]);
         debug!("JIT compiling block {:?}", id);
         window_dump!(self.jctx, "== region entered at block {}", id.0);
         let base = self.jctx.end();
@@ -921,6 +923,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
 
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
+        #[cfg(feature = "tracing")]
+        crate::tracing::end("jit", "compile", &[("source", source.as_str().into()), ("line", (line as u64).into())]);
         // Calls waiting for this block to have code call it now, this region's
         // too. See Note [Call linking].
         for (block, site, call) in std::mem::take(&mut self.jctx.region_calls) {

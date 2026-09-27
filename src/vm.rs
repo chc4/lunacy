@@ -1456,7 +1456,17 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
 impl<'src, 'intern> Vm<'src, 'intern> {
     pub fn new(top_level: LProto<'src, 'intern>) -> Self {
         Heap::init();
+        #[cfg(feature = "tracing")]
+        crate::tracing::init("lunacy.fxt");
         Self { top_level }
+    }
+
+    /// A prototype's source and the line it's defined at.
+    pub fn info(proto: LProto<'src, 'intern>) -> (String, u32) {
+        unsafe {
+            let source = String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "");
+            (source, (*proto).line_defined)
+        }
     }
 
     pub(crate) fn global_env(&self, intern: &'intern internment::Arena<IStr<'src>>) -> Tc<Table<'src, 'intern>> {
@@ -1619,6 +1629,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         -> Result<FVec<LValue<'src, 'intern>>, Box<dyn Error>>
         where 'src: 'lua
     {
+        #[cfg(feature = "tracing")]
+        crate::tracing::begin("interpreter", "run", &[]);
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LBoxed::NIL);
@@ -1674,6 +1686,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let (state, r_vals) = spec.run(gc, owner, block, state);
         #[cfg(all(feature = "counters", not(test)))] {
             println!("counters after run {:?} instructions {:?}", state.counters, spec.count());
+        }
+        #[cfg(feature = "tracing")]
+        {
+            crate::tracing::end("interpreter", "run", &[]);
+            crate::tracing::flush();
         }
 
         #[cfg(feature = "graph")]

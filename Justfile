@@ -42,6 +42,20 @@ test-stencils:
     cargo test --features check_windows --test golden_tests {{STENCIL_OPT}}
     cargo test --features immediate_jit --test golden_tests {{STENCIL_OPT}}
 
+# A benchmark's run traced (feature `tracing`) to working/lunacy.fxt, a
+# Perfetto trace (https://ui.perfetto.dev opens it), and summarized with
+# Perfetto's trace processor: its JIT compiles, and its bailouts by reason and
+# by where they are.
+trace benchmark times='10':
+    just _luac {{benchmark}}
+    cargo build --release --features tracing --bin bench --target-dir target/tracing
+    cd working && ../target/tracing/release/bench {{benchmark}}.bin {{times}} > /dev/null
+    python3 tools/perfetto_summary.py working/lunacy.fxt
+
+# `trace`'s summary of working/lunacy.fxt again.
+show-trace:
+    python3 tools/perfetto_summary.py working/lunacy.fxt
+
 # Golden tests, each against its expected output, under the default build,
 # immediate_jit, no_dynamic_guards and both (tools/golden_builds.py).
 golden-builds +tests:
