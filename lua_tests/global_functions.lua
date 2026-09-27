@@ -1,6 +1,6 @@
--- Global functions called in loops and redefined between and during them: Lua
--- to Lua, Lua to a native and back, and the natives `print` and `tostring`
--- themselves overridden.
+-- Global functions redefined between and during loops that call them: one Lua
+-- function for another, a Lua function for a native and back, and `print` and
+-- `tostring` overridden.
 local bit = require("bit")
 
 local function apply(n)

@@ -263,8 +263,8 @@ impl std::fmt::Display for Residual {
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
             Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
             Residual::LuaCall { lclos, a, b, c } => write!(f, "lcall({:p}, {}, {}, {})", lclos, a, b, c),
-            Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
-            Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
+            Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({:?}, {:?}, {})", tab, href, expected),
+            Residual::EpochCheck { tab, href } => write!(f, "epoch({:?}, {:?})", tab, href),
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Select(targets) => write!(f, "select"),
             Residual::Ret(_, _, _) => write!(f, "ret"),
@@ -340,30 +340,91 @@ pub enum YieldOp {
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
     TryHashKey(usize, usize), // Looks up but does not allocate an HREF..
     UpdateHashRef(HashRef, CType), // Update the type of HREF to a new type
-    SetHazards(Option<usize>, Option<HashRef>), // Set optimization hazards, potentially
+    GlobalKey(usize), // HashKey for global CONSTANT[k]. See Note [Global witnesses]
+    TryGlobalKey(usize), // TryHashKey for global CONSTANT[k]
+    SetHazards(Option<Place>, Option<HashRef>), // Set optimization hazards, potentially
                                         // scoped to only information that may alias with an href,
                                         // and potentially keeping information about a specific
                                         // stack slot intact.
     CollectGarbage,
 }
 
+/// Where a table is: `Some(slot)` of the running frame, or `None` for the global
+/// environment. See Note [Global witnesses].
+pub type Place = Option<usize>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HashKey<'src, 'intern> {
-    /// The HashRef
-    pub idx: usize,
+    /// The table the key is in.
+    pub idx: Place,
     pub key: LConstant<'src, 'intern>,
     pub known_type: CType,
-    /// Optimization hazards: if set to `true` for an index, index is already checked
-    /// for aliasing and an epoch check can be elided.
+    /// Per slot: whether access through that slot is already checked for
+    /// aliasing, so it needs no epoch check.
     pub hazards: SmallVec<[bool; 8]>,
+    /// The same, for access through the global environment.
+    pub env_checked: bool,
 }
 
 impl<'src, 'intern> HashKey<'src, 'intern> {
     fn tostring(&self, owner: &Owner) -> String {
         let lv: LValue = (&self.key).into();
-        format!("hkey({}, {})",
+        format!("hkey({}{}, {})",
+            if self.idx.is_none() { "env." } else { "" },
             String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
             self.known_type)
+    }
+
+    /// A new hash key, its type not yet discovered.
+    fn new(idx: Place, key: LConstant<'src, 'intern>) -> Self {
+        HashKey { idx, key, known_type: CType::Type(LType::Unknown), hazards: Default::default(), env_checked: false }
+    }
+
+    /// Whether access through `at` needs no epoch check.
+    fn checked(&self, at: Place) -> bool {
+        match at {
+            Some(slot) => self.hazards.get(slot) == Some(&true),
+            None => self.env_checked,
+        }
+    }
+
+    /// Record that access through `at` needs no epoch check.
+    fn check(&mut self, at: Place) {
+        match at {
+            Some(slot) => {
+                if self.hazards.len() <= slot {
+                    self.hazards.resize(slot + 1, false);
+                }
+                self.hazards[slot] = true;
+            },
+            None => self.env_checked = true,
+        }
+    }
+
+    /// Make every access check the epoch again.
+    fn clear_checks(&mut self) {
+        self.hazards.iter_mut().for_each(|checked| *checked = false);
+        self.env_checked = false;
+    }
+
+    /// Whether this index is free for a new hash key: its type is unknown and no
+    /// shape lists it. A live hash key can also have an unknown type briefly
+    /// (before its field's type is discovered), but then a shape lists it.
+    /// Environment hash keys are never orphans, as no shape lists them.
+    fn orphan(&self, href: HashRef, types: &[CType]) -> bool {
+        self.known_type == CType::Type(LType::Unknown)
+            && self.idx.is_some()
+            && !types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)))
+    }
+
+    /// Whether blocks compiled knowing `self` are correct for a context with
+    /// `other` at the same index. See Note [Version compatibility].
+    fn accepts(&self, other: &Self) -> bool {
+        self.idx == other.idx
+            && self.key == other.key
+            && self.known_type.accepts(&other.known_type)
+            && (!self.env_checked || other.env_checked)
+            && self.hazards.iter().enumerate().all(|(slot, &checked)| !checked || other.hazards.get(slot) == Some(&true))
     }
 }
 
@@ -445,16 +506,36 @@ pub fn emit_loadnil(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yie
     }
 }
 
-pub fn emit_getglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
+// Load a field through its hash key's witness. See Note [Hash witnesses].
+windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
+    // Written by the frame's `href_init` already. See Note [Hash
+    // witnesses].
+    let witness = state.hash_witnesses[state.witness_base + href as usize];
+    debug!("gettable_href with {:?}", &witness);
+    // The witness holds for the table (its epoch, or no hazard
+    // since), so its value's address does. See Note [Hash witnesses].
+    let val1 = *witness.value.cast::<LBoxed<'_, '_>>();
+
+    debug!("gettable_href fetched {val1:?}");
+    *dest = val1;
+});
+
+/// GETGLOBAL: `R(A) := Gbl[Kst(Bx)]`, with `k` = Bx and `kst` its constant. See
+/// Note [Global witnesses].
+pub fn emit_getglobal<'src, 'intern>(dest: usize, k: usize, kst: &LConstant<'src, 'intern>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
     // We need unsafe here, because we can't prove to rustc that this Rc<Fn> won't outlive
     // 'src and 'intern which it refers to. We only ever store these closures in the
     // closure object which itself borrows from the same data, and so this is safe.
     let kst: LConstant<'static, 'static> = unsafe { core::mem::transmute(kst.clone()) };
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // TODO: env shape specialization
-        // maybe getting _G[kst] should be a yieldop...?
         debug!("getglobal {} = {:?}", dest, &kst);
+        if let ResumeArg::HashRef(href, _) = (yield YieldOp::GlobalKey(k)) {
+            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(href.0, &[dest])));
+            // Its type: the hash key's, or found out. See Note [Field types].
+            yield YieldOp::FieldType(dest, href);
+            return arg;
+        }
         yield YieldOp::Exec(ResidualExec::new("getglobal", Rc::new(move |owner, state| {
             state.vals[state.base + dest as usize] = state._G.get(owner, &(&kst).into(), state.intern).unwrap_or((&Constant::Nil).into());
         })));
@@ -463,16 +544,38 @@ pub fn emit_getglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>
     }
 }
 
-pub fn emit_setglobal<'src, 'intern>(dest: usize, kst: &LConstant<'src, 'intern>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
+/// SETGLOBAL: `Gbl[Kst(Bx)] := R(A)`, with `k` = Bx and `kst` its constant. See
+/// Note [Global witnesses].
+pub fn emit_setglobal<'src, 'intern>(src: usize, k: usize, kst: &LConstant<'src, 'intern>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
     // We need unsafe for the same reason, and with the same justification, as emit_getglobal.
     let kst: LConstant<'static, 'static> = unsafe { core::mem::transmute(kst.clone()) };
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // TODO: env shape specialization
-        debug!("setglobal {} = {:?}", dest, &kst);
+        debug!("setglobal {} = {:?}", src, &kst);
+        if let ResumeArg::HashRef(href, htype) = (yield YieldOp::TryGlobalKey(k)) {
+            let ResumeArg::Type(value_type) = (yield YieldOp::Typeof(src)) else { unreachable!() };
+            let new_type = field_type(value_type);
+            let retype = retype(&new_type, &htype);
+            let expected = htype.as_ltype();
+            arg = yield YieldOp::ExecWindow(match retype {
+                Retype::Same => Rc::new(SetGlobalHref::<{ Retype::Same }>::new(href.0, expected, &[src])) as Rc<dyn Window>,
+                Retype::Known => Rc::new(SetGlobalHref::<{ Retype::Known }>::new(href.0, expected, &[src])),
+                Retype::Unknown => Rc::new(SetGlobalHref::<{ Retype::Unknown }>::new(href.0, expected, &[src])),
+            });
+            arg = match retype {
+                Retype::Same => yield YieldOp::SetHazards(Some(None), Some(href)),
+                // The store bumped the environment's epoch; the hash key takes the
+                // value's type, and other hash keys of this key are checked again.
+                Retype::Known | Retype::Unknown => yield YieldOp::UpdateHashRef(href, new_type),
+            };
+            return arg;
+        }
         yield YieldOp::Exec(ResidualExec::new("setglobal", Rc::new(move |owner, state| {
-            state._G.set(owner, (&kst).into(), state.vals[state.base + dest as usize], state.intern);
+            state._G.set(owner, (&kst).into(), state.vals[state.base + src as usize], state.intern);
         })));
+        // A register may hold the environment, so every witness must recheck its
+        // epoch.
+        arg = yield YieldOp::SetHazards(None, None);
         arg
     }
 }
@@ -492,18 +595,6 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
-            windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
-                // Written by the frame's `href_init` already. See Note [Hash
-                // witnesses].
-                let witness = state.hash_witnesses[state.witness_base + href as usize];
-                debug!("gettable_href with {:?}", &witness);
-                // The witness holds for the table (its epoch, or no hazard
-                // since), so its value's address does. See Note [Hash witnesses].
-                let val1 = *witness.value.cast::<LBoxed<'_, '_>>();
-
-                debug!("gettable_href fetched {val1:?}");
-                *dest = val1;
-            });
             arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, &[a])));
             // Its type: the hash key's, or found out. See Note [Field types].
             yield YieldOp::FieldType(a, hc);
@@ -568,6 +659,64 @@ pub enum Retype {
     /// doesn't, so the next access checks the field's type (`HashGuard`).
     Unknown,
 }
+
+/// The field type to record after storing a value of type `ctype`: the value's
+/// `guard_type`, since shapes and function identities describe registers, not
+/// fields. See Note [Field types].
+fn field_type(ctype: CType) -> CType {
+    match ctype {
+        CType::Integer | CType::Double | CType::Type(_) => ctype,
+        ctype => CType::Type(ctype.as_ltype()),
+    }
+}
+
+/// How storing a value of type `new_type` changes a field known as `htype`. A
+/// field whose type isn't known yet is never `Same`: its value may have any
+/// type. See Note [Field types].
+fn retype(new_type: &CType, htype: &CType) -> Retype {
+    if new_type == htype && *htype != CType::Type(LType::Unknown) {
+        Retype::Same
+    } else if *new_type == CType::Type(LType::Unknown) {
+        Retype::Unknown
+    } else {
+        Retype::Known
+    }
+}
+
+/// Store through `href`'s witness into `tab`, bumping the table's epoch if the
+/// field's type changes. See `Retype`.
+fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: LType, retype: Retype) {
+    let hidx = state.witness_base + href as usize;
+    let witness = state.hash_witnesses[hidx];
+    debug!("settable_href with {:?} {:?}", &witness, expected);
+    // See Note [Hash witnesses].
+    let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
+    debug!("settable_href {:?} {:?}", &val1, expected);
+    #[cfg(debug_assertions)]
+    assert!(expected == LType::Unknown || val1.unbox().typeof_() == expected);
+    *val1 = value;
+    match retype {
+        Retype::Same => {}
+        Retype::Known => {
+            tab.rw(owner).epoch += 1;
+            state.hash_witnesses[hidx].epoch = tab.rw(owner).epoch;
+        }
+        Retype::Unknown => tab.rw(owner).epoch += 1,
+    }
+    // Last. See Note [Write barriers].
+    tab.barrier_back();
+}
+
+// Store through a hash key's witness, into a register's table or into the global
+// environment. See Note [Global witnesses].
+windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, state, base| (table, value) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    store_field(owner, state, tab, value, href, expected, RETYPE);
+});
+windowed!(SetGlobalHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, state, base| (value) {
+    let env = state._G.clone();
+    store_field(owner, state, env, value, href, expected, RETYPE);
+});
 
 pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
@@ -647,46 +796,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = ResumeArg::Failed;
             arg = yield YieldOp::TryHashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
-                let ResumeArg::Type(new_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                // A field of unknown type (its hash key's type not found out yet)
-                // may be of another type than the value. See Note [Field types].
-                let retype = if new_type == htype && htype != CType::Type(LType::Unknown) {
-                    Retype::Same
-                } else if new_type == CType::Type(LType::Unknown) {
-                    Retype::Unknown
-                } else {
-                    Retype::Known
-                };
-
-                // Store through the witness; retyping the key's value moves the
-                // table to a new epoch. See `Retype`.
-                fn store<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, href: u8, expected: LType, retype: Retype) {
-                    let hidx = state.witness_base + href as usize;
-                    let witness = state.hash_witnesses[hidx];
-                    debug!("settable_href with {:?} {:?}", &witness, expected);
-                    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-                    // See Note [Hash witnesses].
-                    let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
-                    debug!("settable_href {:?} {:?}", &val1, expected);
-                    #[cfg(debug_assertions)]
-                    assert!(expected == LType::Unknown || val1.unbox().typeof_() == expected);
-                    *val1 = value;
-                    match retype {
-                        Retype::Same => {}
-                        Retype::Known => {
-                            tab.rw(owner).epoch += 1;
-                            state.hash_witnesses[hidx].epoch = tab.rw(owner).epoch;
-                        }
-                        Retype::Unknown => tab.rw(owner).epoch += 1,
-                    }
-                    // Last. See Note [Write barriers].
-                    tab.barrier_back();
-                }
+                let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
+                let new_type = field_type(value_type);
+                let retype = retype(&new_type, &htype);
                 let expected = htype.as_ltype();
                 if c & 0x100 == 0 {
-                    windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, state, base| (table, value) {
-                        store(owner, state, table, value, href, expected, RETYPE);
-                    });
                     arg = yield YieldOp::ExecWindow(match retype {
                         Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
                         Retype::Known => Rc::new(SetTableHref::<{ Retype::Known }>::new(hb.0, expected, &[a, c])),
@@ -699,11 +813,12 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                             Ok(c) => LBoxed::from(c),
                             Err(lv) => *lv,
                         };
-                        store(owner, state, table, value, hb.0, expected, retype);
+                        let LValue::Table(table) = table.unbox() else { unreachable!() };
+                        store_field(owner, state, table, value, hb.0, expected, retype);
                     })));
                 }
                 arg = match retype {
-                    Retype::Same => yield YieldOp::SetHazards(Some(a), Some(hb)),
+                    Retype::Same => yield YieldOp::SetHazards(Some(Some(a)), Some(hb)),
                     // The table moves to a new epoch: the hash key's known type
                     // is the value's, if known. This also sets hazards.
                     Retype::Known | Retype::Unknown => yield YieldOp::UpdateHashRef(hb, new_type),
@@ -1582,8 +1697,9 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         }
         // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch
         // guard here for specializing the call + return continuation for each one.
+        // The specializer ends the instruction at the call, and clears the hazards
+        // itself: the generator isn't resumed after it.
         arg = yield YieldOp::Call(CallTarget::Dynamic(a, b, c));
-        arg = yield YieldOp::SetHazards(None, None);
         arg
     }
 }
@@ -1639,8 +1755,8 @@ pub enum Residual {
     Ret(Pc, u8, u16),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
-    HashGuard { tab: usize, href: HashRef, key: u64, expected: CType },
-    EpochCheck { tab: usize, href: HashRef },
+    HashGuard { tab: Place, href: HashRef, key: u64, expected: CType },
+    EpochCheck { tab: Place, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
     LuaCall { lclos: Tc<LClosure<'static, 'static>>, a: u16, b: u16, c: u16 },
@@ -1804,6 +1920,17 @@ pub fn passes_guard(value: LBoxed, expected: &CType) -> bool {
     passes_guard_code(value, guard_code(expected))
 }
 
+/// A `Place` as a machine word for JIT helper calls: the slot, or `usize::MAX`
+/// for the global environment.
+pub fn place_code(place: Place) -> usize {
+    place.unwrap_or(usize::MAX)
+}
+
+/// The inverse of `place_code`.
+pub fn place_of(code: usize) -> Place {
+    (code != usize::MAX).then_some(code)
+}
+
 /// A type a guard tests for, as a byte for code that can't hold a `CType`: its
 /// `LType`'s, or past them, an encoding's.
 pub fn guard_code(expected: &CType) -> u8 {
@@ -1828,23 +1955,50 @@ pub fn passes_guard_code(value: LBoxed, code: u8) -> bool {
     }
 }
 
+// Note [Global witnesses]
+// ~~~~~~~~~~~~~~~~~~~~~~~
+// Globals use the same hash keys and witnesses as table fields, so a global read
+// in a loop is a load from its witness instead of a hash lookup each time.
+//
+// The global environment isn't in a register, so a hash key records its table as
+// a `Place`: `Some(slot)` for a register's table, `None` for the environment
+// (`RunState::table_at` fetches either). GETGLOBAL and SETGLOBAL use
+// `GlobalKey`/`TryGlobalKey` where GETTABLE and SETTABLE use `HashKey`/
+// `TryHashKey`. A global the environment doesn't have, or a store with no hash
+// key yet, takes the generic path.
+//
+// An environment hash key belongs to no shape, so it has its own aliasing check
+// (`env_checked`). Anything that may write the environment clears it, and the
+// next access then checks the epoch:
+//   * a store into a register's table, since the register may hold the
+//     environment (via `_G`, or any other alias), unless the key differs;
+//   * a generic global store;
+//   * a call other than a native's window op, since it may run any code.
+//
+// `_G` is an ordinary global that holds the environment: assigning it doesn't
+// change which table globals live in.
+
 // Note [Field types]
 // ~~~~~~~~~~~~~~~~~~
-// A hash key's type (`known_type`) is its field's value's, a number's encoding
-// included, which tables of one shape needn't share: `href_init` finds the key
-// in whatever table reaches it. So an href is made with its type unknown, and
-// the gettable loading its field finds it out (`FieldType`): the slot it loaded
-// is discovered like any other, its guard testing the value in the slot, and
-// the type found is the hash key's too. The same load through the hash key
-// again, while it holds, has that type without a guard.
+// A hash key's `known_type` is the type of its field's value, including a
+// number's encoding. It has to be checked per table: `href_init` finds the key in
+// whatever table reaches the code, and tables of the same shape can hold
+// different types there (one table's field an integer, another's a double).
 //
-// It holds while the witness has the table's epoch: a store retyping the field
-// moves it, through the witness as `Retype` says (a hash key of unknown type
-// never `Same`), and generically when the value's type, a number's encoding
-// included, changes. An access finding the epoch moved checks the type is
-// intact (`HashGuard`), and failing that, falls back to a fresh href of unknown
-// type, whose blocks after are those of the first way in for the context, or
-// others its guards find, up to the version limit.
+// So a new href starts with an unknown type, and the load after it discovers
+// the type (`FieldType`): the loaded slot gets an ordinary type guard, and the
+// type it finds becomes the hash key's too. Later loads through the same hash key
+// use that type without a guard.
+//
+// The type stays valid while the witness has the table's current epoch, because
+// anything that changes a field's type bumps the epoch: a witness store per its
+// `Retype` (never `Same` for an unknown type), and a generic store whose value's
+// type differs. When an access finds the epoch changed, `HashGuard` checks the
+// type again; if that fails it falls back to a fresh href, which rediscovers the
+// type and can rejoin the blocks already compiled for it.
+//
+// A field's type is only ever a `guard_type` (an `LType`, or an encoding): a
+// shape or a function's identity describes a register, not a field.
 
 /// Whether a jump forgets a type of a register holding no local in scope at
 /// its target, which may still be an expression's temporary (`a and b or c`).
@@ -1910,12 +2064,20 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
 //
 //   Unknown  >  each LType  >  Number > Integer or Double, Closure > a known function
 //
-// (a shape accepts only itself), with the same hkeys, whose indexes the
-// block's hash witnesses are at. A bytecode pc's first `MAX_VERSIONS`
-// contexts each get a version. A jump past that enters the accepting version
-// that tells the most (loses the least lattice height), and failing any, a
-// version for the join of its context and every existing one's, which the
-// contexts like those accept.
+// (a shape accepts only itself).
+//
+// Hash keys are compared index by index, since the version's blocks read
+// witnesses at those indexes. At each index the version's hash key must be the
+// jump's key of the same table, with a type accepting the jump's, and may claim
+// an aliasing check only if the jump's has done it too. An orphan accepts
+// anything, including no hash key. Extra hash keys the jump has beyond the
+// version's are simply unknown to it: their witnesses get overwritten.
+//
+// A bytecode pc's first `MAX_VERSIONS` contexts each get a version. A jump past
+// that enters the accepting version that loses the least lattice height; if none
+// accepts, it gets a version for the join of its context and every existing
+// one's. Where their hash keys differ, the join forgets all shapes and hash
+// keys.
 //
 // Only jumps to a pc go through this. A block continuing a generator inside an
 // instruction (a subblock) depends on that generator's own state as well as on
@@ -2140,7 +2302,9 @@ impl Context {
     /// Whether a block specialized to `self` is correct in `other`. See Note
     /// [Version compatibility].
     fn accepts(&self, other: &Context) -> bool {
-        self.hkeys == other.hkeys
+        self.hkeys.iter().enumerate().all(|(i, hkey)| {
+            hkey.orphan(HashRef(i as u8), &self.types) || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
+        })
             && (self.top.is_none() || self.top == other.top)
             && self.fragile_within(other)
             && (0..self.types.len().max(other.types.len())).all(|idx| self.slot(idx).accepts(&other.slot(idx)))
@@ -2152,8 +2316,8 @@ impl Context {
             + (other.fragile.len() - self.fragile.len())
     }
 
-    /// Widen `self` to accept `other`'s types too, forgetting every shape if
-    /// their hkeys differ.
+    /// Widen `self` to also accept `other`. Differing hash keys can't be merged,
+    /// so then every shape and hash key is dropped.
     fn join(&mut self, owner: &mut Owner, other: &Context) {
         let widened: Vec<(usize, CType)> = (0..self.types.len())
             .filter_map(|idx| {
@@ -2172,6 +2336,8 @@ impl Context {
                 .map(|idx| (idx, CType::Type(LType::Table)))
                 .collect();
             self.set_types(owner, shapes);
+            // Environment hash keys aren't dropped with the shapes above.
+            self.hkeys.clear();
         }
     }
 
@@ -2197,7 +2363,7 @@ impl Context {
             // de-duplicated branch but with different indexes.
             if let CType::Shape(shape) = &self.types[idx] {
                 for (kidx, key) in self.hkeys.iter_mut().enumerate() {
-                    if key.idx != idx { continue; }
+                    if key.idx != Some(idx) { continue; }
                     // Try to migrate
                     let mut migrated = false;
                     for (new_idx, other_type) in self.types.iter().enumerate() {
@@ -2206,7 +2372,7 @@ impl Context {
                         let hr: u8 = kidx.try_into().expect("too many hkeys");
                         if other_shape.contains(&HashRef(hr)) {
                             warn!("migrating {} to stack slot {}", kidx, new_idx);
-                            key.idx = new_idx;
+                            key.idx = Some(new_idx);
                             migrated = true;
                             break;
                         }
@@ -2223,7 +2389,7 @@ impl Context {
                 // pre-SetTypes context entirely). This is safe because we only ever
                 // have LType::Unknown as the known_type for an hkey before forcing an
                 // href_thunk, which happens immediately.
-                while let Some(_) = self.hkeys.pop_if(|hkey| hkey.idx == idx) { }
+                while let Some(_) = self.hkeys.pop_if(|hkey| hkey.idx == Some(idx)) { }
             }
             self.types[idx] = ty;
             warn!("set types to {:?}", &self.types);
@@ -2233,7 +2399,7 @@ impl Context {
     /// Set optimization hazards for a stack slot, potentially scoped to only information which
     /// can alias with a specific hash key, and potentially keeping intact information about a
     /// stack slot.
-    pub fn set_hazards(&mut self, keep: Option<usize>, href: Option<HashRef>) {
+    pub fn set_hazards(&mut self, keep: Option<Place>, href: Option<HashRef>) {
         let mut invalidate: Vec<usize> = (0..self.hkeys.len()).collect();
         if let Some(href) = href {
             // If we know we wrote to an href, then we can set hazards only on hkeys
@@ -2246,12 +2412,7 @@ impl Context {
             invalidate = invalidate.drain(..).filter(|i| self.hkeys[*i].idx != keep).collect();
         }
         for invalid in invalidate {
-            for know in &mut self.hkeys[invalid as usize].hazards {
-                if *know {
-                    debug!("hazard cleared {invalid}");
-                }
-                *know = false;
-            }
+            self.hkeys[invalid as usize].clear_checks();
         }
     }
 }
@@ -2490,12 +2651,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getglobal(a as usize, kst)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getglobal(a as usize, bx as usize, kst)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setglobal(a as usize, kst)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setglobal(a as usize, bx as usize, kst)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETTABLE => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
@@ -2727,14 +2888,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
+    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: Place, href: HashRef, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let thunk_coro = thunk_coro.clone();
             let mut orig_ctx = thunk_ctx.clone();
             let thunk_mut = Rc::make_mut(&mut thunk_ctx);
             let hkey = &mut thunk_mut.hkeys[href.0 as usize];
-            debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
-            let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
+            debug!("forcing href thunk for {idx:?} {href:?} {hkey:?}");
+            let tab = state.table_at(idx);
             let Some((index, key, val)) = tab.ro(owner).hash.get_full(&LCanon::new((&hkey.key).into(), state.intern)) else {
                 // The table doesn't have this key, which means we should actually just bailout
                 let fail_block = vm.new_block(pc.0);
@@ -2745,33 +2906,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 return;
             };
             debug!("href forced by {tab:?} -> {val:?}");
-            // TODO: give the environment a shape as well
             // Its type is found out from the value loaded, in each table. See
             // Note [Field types].
             hkey.known_type = CType::Type(LType::Unknown);
             // Initialize the hkey after discovery with a cleared hazard for the index
-            if hkey.hazards.len() <= idx {
-                hkey.hazards.resize_with(idx + 1, || false);
-                hkey.hazards[idx] = true;
-            }
-
-            // If we're loading a hashkey from a table and it's a native function, also try to
-            // specialize on its value. This lets us devirtualize code like `local t = { print =
-            // print }; t.print("xyz");`.
-            if let CType::NativeFunction(nf) = state.vals[state.base + idx].unbox().ctypeof_() {
-                debug!("todo href native function specialization");
-            }
+            hkey.clear_checks();
+            hkey.check(idx);
 
             // TODO: track the maximum number of hkeys + grow here instead so we can initialize the RunState
             // array.
 
-            // Now transition into the populated hkey
-            if let CType::Shape(existing) = &mut thunk_mut.types[idx] {
-                if !existing.contains(&href) {
-                    existing.push(href)
+            // A register's table now has this hash key in its shape.
+            if let Some(idx) = idx {
+                if let CType::Shape(existing) = &mut thunk_mut.types[idx] {
+                    if !existing.contains(&href) {
+                        existing.push(href)
+                    }
+                } else {
+                    thunk_mut.types[idx] = CType::Shape(vec![href].into());
                 }
-            } else {
-                thunk_mut.types[idx] = CType::Shape(vec![href].into());
             }
             // The key's canonical form, made here once. See Note [Hash witnesses].
             let lkey = LCanon::constant(&hkey.key);
@@ -2786,7 +2939,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // Safety: the constant outlives the closure, which the closure
                 // it came from owns, as for `emit_getglobal`'s.
                 let lkey: LCanon<'_, '_> = unsafe { core::mem::transmute(lkey) };
-                let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
+                let tab = state.table_at(idx);
                 // Inline cache for assuming the index stays the same
                 match tab.ro(owner).hash.get_index(index) {
                     Some((key, _)) if *key != lkey => {
@@ -2842,7 +2995,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId) {
+    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: Place, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId) {
         // In order to assert that an href is still valid, we need to check that the witnessed
         // epoch is still the same: if so, all of its keys still have the same type as the
         // cached hashkey, and no additional hashkeys were inserted (which may otherwise cause
@@ -2860,26 +3013,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // witness epoch and jump back to the success block.
             let check_block = vm.new_block(pc.0);
             vm.jump_thunk(block_id, thunk_pc, check_block);
-            let expected = &thunk_ctx.hkeys[href.0 as usize].known_type;
-            // Because we will need to JIT the guards, we split "simple" hashguards from other, more
-            // specialized ones such as for function targets.
-            if let CType::NativeFunction(nf) = expected {
-                let call = nf.get_ptr();
-                vm.blocks[check_block.0].instructions.push(Residual::NativeGuard { idx: tab, ptr: call });
-            } else if let CType::LuaFunction(lclos) = expected {
-                let proto = lclos.ro(owner).prototype.cast();
-                vm.blocks[check_block.0].instructions.push(Residual::LuaGuard { idx: tab, ptr: proto });
-            }else {
-                let key = LCanon::constant(&thunk_ctx.hkeys[href.0 as usize].key).boxed().bits();
-                vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected: expected.clone() });
-            }
+            // Hash key types are `guard_type`s, which `HashGuard` can test. See
+            // Note [Field types].
+            let expected = thunk_ctx.hkeys[href.0 as usize].known_type.clone();
+            let key = LCanon::constant(&thunk_ctx.hkeys[href.0 as usize].key).boxed().bits();
+            vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected });
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
             vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
             vm.blocks[check_block.0].instructions.push(Residual::Exec(ResidualExec::new("epoch_repair", Rc::new(move |owner, state| {
                 // Re-init the witness and jump back to success block
                 // The entry may have moved with the epoch: find its value again
                 // by its index. See Note [Hash witnesses].
-                let LValue::Table(t) = state.vals[state.base + tab].unbox() else { unreachable!() };
+                let t = state.table_at(tab);
                 let epoch = t.ro(owner).epoch;
                 debug!("repairing {:?} epoch", href);
                 let witness = &mut state.hash_witnesses[state.witness_base + href.0 as usize];
@@ -2952,113 +3097,91 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::Failed;
                     continue 'machine;
                 },
-                op @ CoroutineState::Yielded(YieldOp::HashKey(idx, key) | YieldOp::TryHashKey(idx, key)) => {
+                op @ CoroutineState::Yielded(YieldOp::HashKey(..) | YieldOp::TryHashKey(..) | YieldOp::GlobalKey(_) | YieldOp::TryGlobalKey(_)) => {
                     let proto = self.clos.ro(owner).prototype;
-                    if (key & 0x100)!=0 {
-                        let k_const = key & (0xff);
-                        let k_val = unsafe { &(&(*proto).constants.items)[k_const as usize] };
-                        let ty = match unsafe { &(&(*proto).constants.items)[k_const as usize] } {
-                            crate::chunk::Constant::Nil => LType::Nil,
-                            crate::chunk::Constant::Bool(_) => LType::Bool,
-                            crate::chunk::Constant::Number(_) => LType::Number,
-                            crate::chunk::Constant::String(_) => LType::String,
-                        };
-                        if ty != LType::String {
-                            // Only cache string keys
-                            pc = pc.next_false();
-                            arg = ResumeArg::Failed;
-                            break 'machine;
-                        }
-                        match &ctx.types[idx] {
-                            CType::Type(LType::Table) => {
-                            },
-                            CType::Shape(existing) => {
-                                debug!("hashkey on existing shape {existing:?}");
-                                for cached in existing {
-                                    let cached_hkey = &ctx.hkeys[cached.0 as usize];
-                                    if &cached_hkey.key == k_val {
-                                        debug!("using cached href {:?}", cached);
-                                        // We have a cached href, but still need to make sure that
-                                        // it holds if there are any optimization hazards.
-                                        // Compile a new block assuming the type holds, so that the
-                                        // check can jump to it for spurious epoch increments (or
-                                        // for blocks specialized for a different type that
-                                        // transition back to our type).
-                                        arg = ResumeArg::HashRef(cached.clone(), cached_hkey.known_type.clone());
-                                        if let Some(true) = cached_hkey.hazards.get(idx) {
-                                            // We can use the href without needing another epoch
-                                            // check, because we know nothing could have
-                                            // invalidated it.
-                                            pc = pc.next_true();
-                                            debug!("using cached hkey without hazards");
-                                            break 'machine;
-                                        }
-                                        let mut holds_ctx = ctx.clone();
-                                        // If we check the epoch and it still holds, we'll have
-                                        // cleared any optimization hazards until it's potentially
-                                        // invalidated.
-                                        // `idx` may be past the slots the hash key has
-                                        // seen: a register the table was moved to.
-                                        let hazards = &mut Rc::make_mut(&mut holds_ctx).hkeys[cached.0 as usize].hazards;
-                                        if hazards.len() <= idx {
-                                            hazards.resize(idx + 1, false);
-                                        }
-                                        hazards[idx] = true;
-                                        let holds_block = self.subblock(owner, pc.next_true(), holds_ctx.clone(), coro.clone(), arg);
-                                        self.make_epoch_check(owner, block_id, coro.clone(), idx, cached.clone(), pc, ctx.clone(), holds_block);
-
-                                        self.end_block(block_id);
-                                        self.blocks[block_id.0].instructions.push(Residual::Jump(holds_block));
-                                        return None;
-                                    }
-                                }
-                            },
-                            _ => panic!("HashKey should only be used on a table"),
-                        }
-                        if matches!(op, CoroutineState::Yielded(YieldOp::TryHashKey(idx, key))) {
-                            pc = pc.next_false();
-                            arg = ResumeArg::Failed;
-                            break 'machine;
-                        }
-                        let ty = match unsafe { &(&(*proto).constants.items)[k_const as usize] } {
-                            crate::chunk::Constant::Nil => LType::Nil,
-                            crate::chunk::Constant::Bool(_) => LType::Bool,
-                            crate::chunk::Constant::Number(_) => LType::Number,
-                            crate::chunk::Constant::String(_) => LType::String,
-                        };
-                        // We need these HashKeys to not have a lifetime, so that they can be
-                        // captured by the generator: we only ever store the generator in the
-                        // LClosure they came from, which is 'src 'lifetime, and so this is safe.
-                        let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
-                        // Try to find an orphaned HashKey slot to re-use
-                        let href;
-                        // One of unknown type no shape lists: a hash key is of unknown
-                        // type while in use too, until its field's type is found out.
-                        // See Note [Field types].
-                        let listed = |i: usize| ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&HashRef(i as u8))));
-                        let orphan = ctx.hkeys.iter().enumerate().position(|(i, hk)| hk.known_type == CType::Type(LType::Unknown) && !listed(i));
-                        if let Some((i, hkey)) = orphan.map(|i| (i, &mut Rc::make_mut(&mut ctx).hkeys[i])) {
-                            href = HashRef(i as u8);
-                            *hkey = HashKey { idx, key: k_val.clone(), known_type: CType::Type(LType::Unknown), hazards: Default::default() };
-                        } else {
-                            warn!("allocating new hkey for {} {:?}", idx, &k_val);
-                            let hr: u8 = ctx.hkeys.len().try_into().expect("too many hrefs");
-                            href = HashRef(hr);
-                            let hkey = HashKey { idx, key: k_val.clone(), known_type: CType::Type(LType::Unknown), hazards: Default::default() };
-                            #[cfg(debug_assertions)]
-                            assert_eq!(ctx.hkeys.iter().filter(|exist| **exist == hkey).next(), None);
-                            Rc::make_mut(&mut ctx).hkeys.push(hkey.clone());
-                        }
-                        let thunk_coro = coro.clone();
-                        let thunk_ctx = ctx.clone();
-                        let witness = Residual::Thunk(self.make_href_thunk(block_id, thunk_coro, idx, href.clone(), pc, thunk_ctx, true));
-                        self.end_block(block_id);
-                        self.blocks[block_id.0].instructions.push(witness);
-                        return None;
-                    } else {
+                    // Which table, which constant key, and whether to make a hash key
+                    // if none exists yet. See Note [Global witnesses].
+                    let (place, k_const, allocate) = match op {
+                        CoroutineState::Yielded(YieldOp::HashKey(idx, key)) => (Some(idx), ((key & 0x100) != 0).then_some(key & 0xff), true),
+                        CoroutineState::Yielded(YieldOp::TryHashKey(idx, key)) => (Some(idx), ((key & 0x100) != 0).then_some(key & 0xff), false),
+                        CoroutineState::Yielded(YieldOp::GlobalKey(k)) => (None, Some(k), true),
+                        CoroutineState::Yielded(YieldOp::TryGlobalKey(k)) => (None, Some(k), false),
+                        _ => unreachable!(),
+                    };
+                    // Only cache string keys
+                    let Some(k_val) = k_const
+                        .map(|k| unsafe { &(&(*proto).constants.items)[k] })
+                        .filter(|k_val| matches!(k_val, crate::chunk::Constant::String(_)))
+                    else {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
+                        break 'machine;
+                    };
+                    // The table's existing hash keys: its shape's for a register, or
+                    // every environment hash key.
+                    let existing: SmallVec<[HashRef; 4]> = match place {
+                        Some(idx) => match &ctx.types[idx] {
+                            CType::Type(LType::Table) => SmallVec::new(),
+                            CType::Shape(existing) => existing.clone(),
+                            _ => panic!("HashKey should only be used on a table"),
+                        },
+                        None => ctx.hkeys.iter().enumerate().filter(|(_, hkey)| hkey.idx.is_none()).map(|(i, _)| HashRef(i as u8)).collect(),
+                    };
+                    debug!("hashkey on existing {existing:?}");
+                    if let Some(cached) = existing.into_iter().find(|cached| &ctx.hkeys[cached.0 as usize].key == k_val) {
+                        debug!("using cached href {:?}", cached);
+                        let cached_hkey = &ctx.hkeys[cached.0 as usize];
+                        // A cached href. Unless nothing could have invalidated it
+                        // since it was last checked, it needs an epoch check first,
+                        // which continues into blocks assuming it still holds.
+                        arg = ResumeArg::HashRef(cached.clone(), cached_hkey.known_type.clone());
+                        if cached_hkey.checked(place) {
+                            // Nothing could have invalidated it: no check needed.
+                            pc = pc.next_true();
+                            debug!("using cached hkey without hazards");
+                            break 'machine;
+                        }
+                        // After a passing epoch check, later accesses need no check
+                        // until something may invalidate it again.
+                        let mut holds_ctx = ctx.clone();
+                        Rc::make_mut(&mut holds_ctx).hkeys[cached.0 as usize].check(place);
+                        let holds_block = self.subblock(owner, pc.next_true(), holds_ctx.clone(), coro.clone(), arg);
+                        self.make_epoch_check(owner, block_id, coro.clone(), place, cached.clone(), pc, ctx.clone(), holds_block);
+
+                        self.end_block(block_id);
+                        self.blocks[block_id.0].instructions.push(Residual::Jump(holds_block));
+                        return None;
                     }
+                    if !allocate {
+                        pc = pc.next_false();
+                        arg = ResumeArg::Failed;
+                        break 'machine;
+                    }
+                    // We need these HashKeys to not have a lifetime, so that they can be
+                    // captured by the generator: we only ever store the generator in the
+                    // LClosure they came from, which is 'src 'lifetime, and so this is safe.
+                    let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
+                    // Try to find an orphaned HashKey slot to re-use
+                    let href;
+                    let orphan = ctx.hkeys.iter().enumerate().position(|(i, hkey)| hkey.orphan(HashRef(i as u8), &ctx.types));
+                    if let Some(i) = orphan {
+                        href = HashRef(i as u8);
+                        Rc::make_mut(&mut ctx).hkeys[i] = HashKey::new(place, k_val.clone());
+                    } else {
+                        warn!("allocating new hkey for {:?} {:?}", place, &k_val);
+                        let hr: u8 = ctx.hkeys.len().try_into().expect("too many hrefs");
+                        href = HashRef(hr);
+                        let hkey = HashKey::new(place, k_val.clone());
+                        #[cfg(debug_assertions)]
+                        assert_eq!(ctx.hkeys.iter().filter(|exist| **exist == hkey).next(), None);
+                        Rc::make_mut(&mut ctx).hkeys.push(hkey);
+                    }
+                    let thunk_coro = coro.clone();
+                    let thunk_ctx = ctx.clone();
+                    let witness = Residual::Thunk(self.make_href_thunk(block_id, thunk_coro, place, href.clone(), pc, thunk_ctx, true));
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(witness);
+                    return None;
                 },
                 CoroutineState::Yielded(YieldOp::GuardRk(rk, ref expected)) => {
                     let proto = self.clos.ro(owner).prototype;
@@ -3180,12 +3303,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
                     let known = ctx.hkeys[href.0 as usize].known_type.clone();
+                    let env = ctx.hkeys[href.0 as usize].idx.is_none();
                     Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.clone())]);
                     if known != CType::Type(LType::Unknown) {
                         (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &known);
                     } else {
-                        // Unless the load overwrote the table, and its hash keys with it.
-                        let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
+                        // Record the type on the hash key too, unless the load overwrote
+                        // the table's register and dropped its hash keys. Environment
+                        // hash keys are never dropped this way.
+                        let live = env || ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
                         let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Type(LType::Unknown), live.then_some(href), pc, ctx.clone(), true));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
@@ -3275,6 +3401,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // Note [Fragile information].
                             if result.is_none() {
                                 Rc::make_mut(&mut ctx).effect(Effect::Opaque);
+                                // The callee may write any table, including the
+                                // environment, so every witness must recheck its epoch.
+                                Rc::make_mut(&mut ctx).set_hazards(None, None);
                             }
                             // The results, and the callee's frame above them, overwrote
                             // every register from `a` on: their types are unknown.
@@ -3462,7 +3591,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::EpochCheck { tab, href } => {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
-                    let LValue::Table(tab) = state.vals[state.base + tab].unbox() else { unreachable!() };
+                    let tab = state.table_at(tab);
                     warn!("epochcheck sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
                     if hwit.epoch == tab.ro(owner).epoch {
                         // Fallthrough
@@ -3473,7 +3602,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::HashGuard { tab, href, key, expected } => {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
-                    let LValue::Table(tab) = state.vals[state.base + tab].unbox() else { unreachable!() };
+                    let tab = state.table_at(tab);
                     let entry = tab.ro(owner).hash.get_index(hwit.index);
                     if entry.is_some_and(|(k, val)| k.boxed().bits() == key && passes_guard(*val, &expected)) {
                         // Fallthrough

@@ -1,6 +1,6 @@
--- The global environment reached other ways than a global's name: through the
--- global `_G`, a local holding it, and a table parameter that is it; and `_G`
--- rebound to another table, which leaves the environment where it was.
+-- Globals written and read through aliases of the environment: `_G`, a local
+-- holding it, and a table parameter that is it. Also `_G = t`, which must not
+-- change where globals live.
 
 local function via_g(n)
   for i = 1, n do

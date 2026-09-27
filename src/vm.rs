@@ -1399,6 +1399,20 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     }
 }
 
+impl<'src, 'intern> RunState<'src, 'intern> {
+    /// The table at `place`: a register's, or with `None` the global environment.
+    /// See Note [Global witnesses] in `generator`.
+    pub fn table_at(&self, place: Option<usize>) -> Tc<Table<'src, 'intern>> {
+        match place {
+            Some(slot) => {
+                let LValue::Table(tab) = self.vals[self.base + slot].unbox() else { unreachable!("slot {slot} holds no table") };
+                tab
+            },
+            None => self._G.clone(),
+        }
+    }
+}
+
 impl<'src, 'intern> Mark for RunState<'src, 'intern> {
     fn mark(&self, owner: &Owner) {
         for val in self.vals.iter() {

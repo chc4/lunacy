@@ -113,8 +113,7 @@ impl JitHelper {
             let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize];
-            let tab_val = rs.vals[rs.base + tab].unbox();
-            let LValue::Table(tab) = tab_val else { unreachable!() };
+            let tab = rs.table_at(crate::generator::place_of(tab));
             debug!("JIT check_epoch sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
             hwit.epoch == tab.ro(owner).epoch
         }
@@ -127,8 +126,7 @@ impl JitHelper {
             let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
             let hwit = rs.hash_witnesses[rs.witness_base + href as usize];
-            let tab_val = rs.vals[rs.base + tab].unbox();
-            let LValue::Table(tab) = tab_val else { unreachable!() };
+            let tab = rs.table_at(crate::generator::place_of(tab));
             // The witness's index still holds its key, with a value of the type.
             let entry = tab.ro(owner).hash.get_index(hwit.index);
             entry.is_some_and(|(k, val)| k.boxed().bits() == key && crate::generator::passes_guard_code(*val, expected))
@@ -1495,7 +1493,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r12 // state
-                        ; mov rsi, WORD (*tab as i32)
+                        ; mov rsi, QWORD (crate::generator::place_code(*tab) as i64)
                         ; mov rdx, WORD (href_u8 as i32)
                         ; call extern (JitHelper::check_epoch as *const () as usize)
                         ; test al, al
@@ -1509,7 +1507,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r12 // state
-                        ; mov rsi, WORD (*tab as i32)
+                        ; mov rsi, QWORD (crate::generator::place_code(*tab) as i64)
                         ; mov rdx, WORD (href_u8 as i32)
                         ; mov rcx, WORD (expected_u8 as i32)
                         ; mov r8, QWORD (*key as i64)

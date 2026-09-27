@@ -1,5 +1,6 @@
--- Globals read in loops while their values change type (a number's encoding,
--- or the Lua type), are defined late, or are set by a call the loop makes.
+-- Globals read in loops while their type changes (between integer and double,
+-- or to another Lua type), while undefined until partway through, and while a
+-- called function sets them.
 
 local function sum_g(n)
   local s = 0
