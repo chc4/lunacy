@@ -1798,6 +1798,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; mov QWORD r12 => RunState.top, rax
                         );
                     }
+                    // Wanting `c - 1`, the ones it didn't write are nil.
+                    let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
+                    for i in 0..(c - 1).max(0) {
+                        dynasm!(ops
+                            ; .arch x64
+                            ; cmp rax, i
+                            ; ja >written
+                            ; mov QWORD [r13 + ((a + i) * 8)], nil
+                            ; written:
+                        );
+                    }
                 },
                 Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize),
                 Residual::Arrive { a, c } => {

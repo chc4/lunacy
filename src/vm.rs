@@ -1340,9 +1340,15 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
             count = (nf)(seq, args, returns, owner);
         });
-        // Taking every result, the caller reads up to the top.
+        // Taking every result, the caller reads up to the top; wanting `c - 1`,
+        // the ones it didn't write are nil.
+        let at = self.base + a as usize;
         if c == 0 {
-            self.top = self.base + a as usize + count.min(wanted);
+            self.top = at + count.min(wanted);
+        } else {
+            for slot in at + count.min(wanted)..at + wanted {
+                self.vals[slot] = LBoxed::NIL;
+            }
         }
     }
 
