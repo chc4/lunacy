@@ -217,6 +217,12 @@ graph-vs ref benchmark times='10':
         (cd $dir && $exe $bin {{times}} > /dev/null)
     done
     tools/graph_blocks.py target/graphs/{{benchmark}}/current target/graphs/{{benchmark}}/{{ref}}
+
+# `graph-vs ref` over HYPERFINES.
+graphs-vs ref:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do echo "== ${run%:*} ${run#*:}"; just graph-vs {{ref}} ${run%:*} ${run#*:} 2>/dev/null | sed -n '/ \/ /,$p'; done
 gdb name:
     luac5.1 -o {{name}}.bin {{name}}.lua
     cargo build --release --bin lunacy
