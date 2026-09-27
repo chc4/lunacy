@@ -385,6 +385,10 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit) {
 /// Copy `op`, a window op with no operands, into the code at `SKIP` 0, the
 /// window empty: its stencil, or else a call of its body. See Note [Frame ops]
 /// in `generator`.
+/// The most slots of a callee's frame a call's JIT code nils itself, a store a
+/// slot, rather than `PushFrame` with a loop.
+const INLINE_NILS: usize = 16;
+
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
     match stencils.body(&**op, 0) {
         Ok(body) => splat(ops, &body, &op.captures(), pool),
@@ -1642,7 +1646,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; no_trap:
                     );
                 },
-                Residual::LuaCall { entry, a, b, c } => {
+                Residual::LuaCall { entry, a, b, c, stack } => {
                     // The callee's version's code, if the call has found the version
                     // and it has some; a version with none yet is linked when it has
                     // some (Note [Call linking]); else the call goes as one to a
@@ -1664,8 +1668,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                             // The frame, pushed by `PushFrame` returning here. See Note
                             // [Frame ops] in `generator`.
+                            // The callee's frame past a fixed count of arguments is
+                            // nilled here, a store a slot, but for a big one, which
+                            // `PushFrame` nils, as it does past a count up to the top.
                             let packed_ret = ReturnLocation(BlockId(id.0), off + 1).pack();
-                            let push: Rc<dyn Window> = Rc::new(crate::generator::PushFrame::new(packed_ret.bits() as u64, *a as u64 | (*b as u64) << 16 | (*c as u64) << 32, &[]));
+                            let (ret, abc) = (packed_ret.bits() as u64, *a as u64 | (*b as u64) << 16 | (*c as u64) << 32);
+                            let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
+                            let push: Rc<dyn Window> = match nils {
+                                Some(_) => Rc::new(crate::generator::PushFrame::<false>::new(ret, abc, &[])),
+                                None => Rc::new(crate::generator::PushFrame::<true>::new(ret, abc, &[])),
+                            };
                             jit_note!(self.jctx, ops, "        PushFrame");
                             emit_frame_op(ops, &mut self.jctx.stencils, pool, &push);
                             self.jctx.frame_ops.push(push);
@@ -1678,6 +1690,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; mov rcx, QWORD r12 => RunState.base
                                 ; lea r13, [rax + rcx * 8]
                             );
+                            let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
+                            for slot in nils.into_iter().flatten() {
+                                dynasm!(ops
+                                    ; .arch x64
+                                    ; mov QWORD [r13 + (slot * 8) as i32], nil
+                                );
+                            }
                             // state is already in r12
                             match code {
                                 Some(code) => dynasm!(ops

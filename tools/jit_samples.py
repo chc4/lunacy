@@ -13,8 +13,8 @@ and the JIT's by what emitted the code (the disassembly's notes: a region's
 entry and exit, and a block's residuals and the parts of one) summed over
 every copy. `--out` writes the disassembly of every range with a sample, each
 instruction with its count. `--op` sums the copies of what one note names
-(`PushFrame`, `window(GetTableInteger`) instruction by instruction, which
-copies of the same code are, and prints them with the first copy's text.
+(`PushFrame`, `window(GetTableInteger`) instruction by instruction, over the
+copies of the same code, and prints each code with its first copy's text.
 """
 import argparse
 import re
@@ -101,25 +101,36 @@ def main():
         print(f'  {n:7} {100 * n / total:5.1f}%  {k}')
 
     if args.op:
-        # A copy is a run of instructions under one note naming `op`.
-        by_offset, text, copies = defaultdict(int), {}, 0
+        # A copy is a run of instructions under one note naming `op`; copies of
+        # the same code (the same instructions, but for their displacements)
+        # are summed together, and each other code apart.
+        runs = []
         prev = None
-        start = None
         for i, (addr, r, line, notes) in enumerate(insts):
             under = notes and args.op in notes[-1]
             key = (r, notes) if under else None
             if under and key != prev:
-                copies += 1
-                start = addr
+                runs.append([])
             prev = key
             if under:
-                off = addr - start
+                runs[-1].append(i)
+        variants = {}
+        for run in runs:
+            texts = [INST.match(insts[i][2]).group(3).split(None, 1) for i in run]
+            shape = tuple(t[1].split()[0] if len(t) > 1 else t[0] for t in texts)
+            copies, by_offset, text = variants.setdefault(shape, [0, defaultdict(int), {}])
+            variants[shape][0] += 1
+            start = insts[run[0]][0]
+            for i, t in zip(run, texts):
+                off = insts[i][0] - start
                 by_offset[off] += counts.get(i, 0)
-                text.setdefault(off, INST.match(line).group(3))
-        n = sum(by_offset.values())
-        print(f'\n{args.op}: {copies} copies, {n} samples ({100 * n / total:.1f}%)')
-        for off in sorted(by_offset):
-            print(f'  {by_offset[off]:7} +{off:<4x} {text[off]}')
+                text.setdefault(off, ' '.join(t))
+        ordered = sorted(variants.values(), key=lambda v: -sum(v[1].values()))
+        for copies, by_offset, text in ordered:
+            n = sum(by_offset.values())
+            print(f'\n{args.op}: {len(by_offset)} instructions, {copies} copies, {n} samples ({100 * n / total:.1f}%)')
+            for off in sorted(by_offset):
+                print(f'  {by_offset[off]:7} +{off:<4x} {text[off]}')
 
     if args.out:
         with open(args.out, 'w') as out:

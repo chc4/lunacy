@@ -65,6 +65,13 @@ impl<'src, 'intern> ValueStack<'src, 'intern> {
         }
     }
 
+    /// Lengthen the stack to `len` slots, the new ones as the mapping has them:
+    /// the caller writes them before anything reads them or the GC marks them.
+    pub fn lengthen(&mut self, len: usize) {
+        assert!(len <= self.stack_ptr.len(), "ValueStack overflow");
+        self.used = len;
+    }
+
     pub fn truncate(&mut self, new_len: usize) {
         // `LBoxed` is `Copy` with no `Drop`, so shrinking is just a length change.
         if new_len < self.used {

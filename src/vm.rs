@@ -1351,13 +1351,18 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     pub extern "C" fn call_lua(&mut self, owner: &mut Owner,
         ret: PackedLocation, a: u16, b: u16, c: u16) -> usize
     {
-        self.push_frame(owner, ret, a, b, c)
+        self.push_frame(owner, ret, a, b, c, true)
     }
 
     /// `call_lua`, inlined into the window op pushing a frame in JIT code
     /// (`PushFrame`). See Note [Frame ops] in `generator`.
+    ///
+    /// The callee's frame past its arguments is nil when it starts, as Lua's
+    /// is: luac emits no LOADNIL for a local declared at a function's first
+    /// instruction. With `fills`, this nils it; without, the caller does, before
+    /// anything reads the stack or marks it.
     #[inline(always)]
-    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: u16, b: u16, c: u16) -> usize {
+    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: u16, b: u16, c: u16, fills: bool) -> usize {
         let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
         let ret_loc = ReturnLocation::unpack(ret);
         // record call stack: we say where to return to and where to put the values
@@ -1367,16 +1372,17 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         // the stack (and the GC's mark range) shrinks back as frames pop. See Note
         // [Stack frames].
         let limit = self.natural_max;
-        // push empty stack frame
-        if next_base + next_stack > self.vals.len() {
-            self.grow_stack(next_base + next_stack);
-        }
-        // The parameters the call doesn't pass are nil: their slots may hold what an
-        // earlier frame left there. Its arguments are `b - 1` values, or up to the top.
+        // Its arguments are `b - 1` values, or up to the top, in the caller's
+        // frame; the rest of its frame is nilled, so the stack only needs to be
+        // long enough.
         let passed = if b == 0 { self.top } else { next_base + b as usize - 1 };
-        let params = next_base + unsafe { (*lclos.ro(owner).prototype).param_count as usize };
-        if passed < params {
-            self.nil_slots(passed, params);
+        let end = next_base + next_stack;
+        debug_assert!(passed <= self.vals.len(), "arguments past the stack");
+        if end > self.vals.len() {
+            self.vals.lengthen(end);
+        }
+        if fills && passed < end {
+            self.nil_slots(passed, end);
         }
         // The callee's frame extends the live max-extent while it runs.
         self.natural_max = self.natural_max.max(next_base + next_stack);
@@ -1398,16 +1404,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
-    /// Grow the stack to `len` slots, the new ones nil. Out of line from
-    /// `push_frame`, as `nil_slots` is: inlined, LLVM vectorizes their loops,
-    /// and the window op pushing a frame (`PushFrame`) then ends in a
-    /// `vzeroupper` on every call.
-    #[inline(never)]
-    fn grow_stack(&mut self, len: usize) {
-        self.vals.resize_with(len, || LBoxed::NIL);
-    }
-
-    /// Nil the slots `from..to`. Out of line from `push_frame`: see `grow_stack`.
+    /// Nil the slots `from..to`. Out of line from `push_frame`: inlined, LLVM
+    /// vectorizes the loop, and the window op pushing a frame (`PushFrame`)
+    /// then ends in a `vzeroupper` on every call.
     #[inline(never)]
     fn nil_slots(&mut self, from: usize, to: usize) {
         for slot in from..to {

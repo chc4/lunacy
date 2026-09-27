@@ -271,8 +271,8 @@ impl std::fmt::Display for Residual {
             Residual::Jump(target) => write!(f, "jump({})", target.0),
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
             Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
-            Residual::LuaCall { entry: CallEntry::Block(block), a, b, c } => write!(f, "lcall({}, {}, {}, {})", block.0, a, b, c),
-            Residual::LuaCall { entry: CallEntry::Context(_), a, b, c } => write!(f, "lcall(?, {}, {}, {})", a, b, c),
+            Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, .. } => write!(f, "lcall({}, {}, {}, {})", block.0, a, b, c),
+            Residual::LuaCall { entry: CallEntry::Context(_), a, b, c, .. } => write!(f, "lcall(?, {}, {}, {})", a, b, c),
             Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
             Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
             Residual::Thunk(_) => write!(f, "thunk"),
@@ -1795,9 +1795,10 @@ windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
 // which `PopFrame` writes to `state.exit` for the `Ret` to load.
 
 // `call_lua` for a call of R(A), `abc` its `a | b << 16 | c << 32`, returning to
-// `ret` (a `PackedLocation`). See Note [Frame ops].
-windowed!(frame PushFrame, [ret: u64, abc: u64], [], |owner, state, base| () {
-    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), abc as u16, (abc >> 16) as u16, (abc >> 32) as u16);
+// `ret` (a `PackedLocation`), nilling the callee's frame if `FILLS` (else the JIT
+// code does). See Note [Frame ops].
+windowed!(frame PushFrame, [ret: u64, abc: u64], [FILLS: bool], |owner, state, base| () {
+    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), abc as u16, (abc >> 16) as u16, (abc >> 32) as u16, FILLS);
 });
 
 // A `Ret` at `off` in `block`, `at` their `block | off << 32` and `ab` its
@@ -1934,8 +1935,9 @@ pub enum Residual {
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
     /// A call to the Lua function in R(A), whose prototype a `LuaGuard` or the
-    /// context knows, entering its version `entry`. See Note [Call sites].
-    LuaCall { entry: CallEntry, a: u16, b: u16, c: u16 },
+    /// context knows, entering its version `entry`, with a frame of `stack`
+    /// slots (the prototype's `max_stack`). See Note [Call sites].
+    LuaCall { entry: CallEntry, a: u16, b: u16, c: u16, stack: u8 },
     LuaGuard { idx: usize, ptr: *const () },
     GC,
 }
@@ -3192,7 +3194,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         layout.push(next(vm));
                     }
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
-                    layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16 });
+                    let stack = unsafe { (*proto).max_stack };
+                    layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack });
                 },
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
@@ -3915,7 +3918,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     w.interp(owner, &mut state);
                     off += if state.select == 0 { 2 } else { 1 };
                 },
-                Residual::LuaCall { entry, a, b, c } => {
+                Residual::LuaCall { entry, a, b, c, stack } => {
                     let (caller, call) = (id, off);
                     off += 1;
                     state.call_lua(owner, ReturnLocation(id, off).pack(), a, b, c);
@@ -3930,7 +3933,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             self.versions.entry(callee.ro(owner).prototype).or_insert_with(|| HashMap::default());
                             let block = self.version(owner, 0, ctx);
                             self.set_current(callee.clone());
-                            self.blocks[caller.0].instructions[call] = Residual::LuaCall { entry: CallEntry::Block(block), a, b, c };
+                            self.blocks[caller.0].instructions[call] = Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, stack };
                             block
                         },
                     };
