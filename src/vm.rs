@@ -32,6 +32,7 @@ pub struct BlockId(pub usize);
 pub struct HashRef(pub u8);
 use crate::perf::PerfCounters;
 use crate::gc::{Mark, Heap, Gc, GcCtx};
+pub use crate::gc::LStr;
 use crate::{debug, warn};
 
 pub type LConstant<'src, 'intern> = Constant<internment::ArenaIntern<'intern, IStr<'src>>>;
@@ -529,7 +530,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
 #[derive(Hash, Clone)]
 pub enum InternString<'intern, 'src> {
     Interned(ArenaIntern<'intern, IStr<'src>>),
-    Owned(Gc<FVec<u8>>),
+    Owned(Gc<LStr>),
 }
 
 impl<'intern, 'src> PartialEq for InternString<'intern, 'src> {
@@ -568,7 +569,7 @@ impl<'intern, 'src> PartialOrd for InternString<'intern, 'src> {
                 inter.as_bytes().partial_cmp(own.as_slice())
             },
             (InternString::Owned(self_o), InternString::Owned(other_o)) => {
-                self_o.partial_cmp(other_o)
+                self_o.as_slice().partial_cmp(other_o.as_slice())
             }
         }
     }
@@ -580,7 +581,7 @@ impl<'intern, 'src> Debug for InternString<'intern, 'src> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InternString::Interned(i) => write!(f, "{}", String::from_utf8_lossy(i.as_bytes())),
-            InternString::Owned(o) => write!(f, "{}", String::from_utf8_lossy(o)),
+            InternString::Owned(o) => write!(f, "{}", String::from_utf8_lossy(o.as_slice())),
         }
     }
 }
@@ -601,7 +602,7 @@ impl<'intern, 'src> Deref for InternString<'intern, 'src> {
     fn deref(&self) -> &Self::Target {
         match self {
             InternString::Interned(i) => i.deref().as_bytes(),
-            InternString::Owned(o) => o.as_ref(),
+            InternString::Owned(o) => o.as_slice(),
         }
     }
 }
@@ -617,9 +618,9 @@ pub enum LValue<'src, 'intern> {
     // Strings
     InternedString(ArenaIntern<'intern, IStr<'src>>) = 4,
     // Strings are immutable, so owned strings need no interior mutability: a
-    // plain `Gc<FVec<u8>>` (not `Tc`) lets their bytes be read without an
+    // plain `Gc<LStr>` (not `Tc`) lets their bytes be read without an
     // `owner`, which is what makes content-based equality/hashing possible.
-    OwnedString(Gc<FVec<u8>>) = 5,
+    OwnedString(Gc<LStr>) = 5,
     // Closures
     LClosure(Tc<LClosure<'src, 'intern>>) = 8,
     NClosure(NClosure) = 9,
@@ -653,7 +654,7 @@ impl<'src, 'intern> crate::gc::CellKind for TLCell<TlcOwner, Table<'src, 'intern
 impl<'src, 'intern> crate::gc::CellKind for TLCell<TlcOwner, LClosure<'src, 'intern>> {
     fn cell_kind() -> u8 { LBoxed::KIND_LCLOSURE }
 }
-impl crate::gc::CellKind for FVec<u8> {
+impl crate::gc::CellKind for LStr {
     fn cell_kind() -> u8 { LBoxed::KIND_OWNED }
 }
 
@@ -857,71 +858,47 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         }
     }
 
-    pub fn as_string(&self, owner: &Owner) -> Option<Gc<FVec<u8>>> {
-        // TODO: metamethods?
+    pub fn as_string(&self, owner: &Owner) -> Option<Gc<LStr>> {
         match self {
             LValue::OwnedString(s) => Some(s.clone()),
-            LValue::InternedString(s) => Some(Gc::new(s.into_ref().as_bytes().to_vec().into())),
-            LValue::Number(f) => {
-                let mut s: FVec<_> = vec![].into();
-                write!(s, "{}", f.0);
-                Some(Gc::new(s))
-            },
-            LValue::Table(tc) => {
-                let mut s: FVec<_> = vec![].into();
-                write!(s, "{:?}", tc);
-                Some(Gc::new(s))
-            },
-            LValue::Nil => {
-                let mut s: FVec<_> = vec![].into();
-                write!(s, "nil");
-                Some(Gc::new(s))
-
-            },
-            LValue::Bool(b) => {
-                let mut s: FVec<_> = vec![].into();
-                write!(s, "{b}");
-                Some(Gc::new(s))
-            },
-            LValue::LClosure(l) => {
-                let mut s: FVec<_> = vec![].into();
-                let line = unsafe { (*l.0.ro(owner).prototype).line_defined };
-                let src = unsafe { &(*l.0.ro(owner).prototype).source };
-                write!(s, "function({:p}, {:?} @ {})", l.as_ptr(), src, line);
-                Some(Gc::new(s))
-            },
-            LValue::NClosure(nf) => {
-                let mut s: FVec<_> = vec![].into();
-                write!(s, "native({:p})", nf.native());
-                Some(Gc::new(s))
-            },
-            x => unimplemented!("{:?}", x),
+            value => Some(Gc::string(&value.string_bytes(owner))),
         }
     }
 
-    pub fn as_string_nolock(&self) -> Option<Gc<FVec<u8>>> {
+    /// The bytes `tostring` gives a value.
+    pub fn string_bytes(&self, owner: &Owner) -> Vec<u8> {
         // TODO: metamethods?
+        let mut s = vec![];
         match self {
-            LValue::OwnedString(s) => Some(s.clone()),
-            LValue::InternedString(s) => Some(Gc::new(s.into_ref().as_bytes().to_vec().into())),
-            LValue::Number(f) => {
-                let mut s: FVec<_> = vec![].into();
-                write!(s, "{}", f.0);
-                Some(Gc::new(s))
-            },
-            LValue::Table(tc) => {
-                let mut s: FVec<_> = vec![].into();
-                write!(s, "{:?}", tc);
-                Some(Gc::new(s))
-            },
-            LValue::Nil => None,
+            LValue::OwnedString(g) => s.extend_from_slice(g.as_slice()),
+            LValue::InternedString(i) => s.extend_from_slice(i.as_bytes()),
+            LValue::Number(f) => { write!(s, "{}", f.0); },
+            LValue::Table(tc) => { write!(s, "{:?}", tc); },
+            LValue::Nil => { write!(s, "nil"); },
+            LValue::Bool(b) => { write!(s, "{b}"); },
             LValue::LClosure(l) => {
-                let mut s: FVec<_> = vec![].into();
-                write!(s, "function({:p})", l.as_ptr());
-                Some(Gc::new(s))
+                let line = unsafe { (*l.0.ro(owner).prototype).line_defined };
+                let src = unsafe { &(*l.0.ro(owner).prototype).source };
+                write!(s, "function({:p}, {:?} @ {})", l.as_ptr(), src, line);
             },
+            LValue::NClosure(nf) => { write!(s, "native({:p})", nf.native()); },
+        }
+        s
+    }
+
+    pub fn as_string_nolock(&self) -> Option<Gc<LStr>> {
+        // TODO: metamethods?
+        let mut s = vec![];
+        match self {
+            LValue::OwnedString(g) => return Some(g.clone()),
+            LValue::InternedString(i) => s.extend_from_slice(i.as_bytes()),
+            LValue::Number(f) => { write!(s, "{}", f.0); },
+            LValue::Table(tc) => { write!(s, "{:?}", tc); },
+            LValue::Nil => return None,
+            LValue::LClosure(l) => { write!(s, "function({:p})", l.as_ptr()); },
             x => unimplemented!("{:?}", x),
         }
+        Some(Gc::string(&s))
     }
 
     pub fn gettable(&self, owner: &mut Owner, index: Cow<'_, LValue<'src, 'intern>>, intern: &'intern internment::Arena<IStr<'src>>) -> LValue<'src, 'intern> {

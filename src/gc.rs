@@ -244,15 +244,12 @@ impl<T> Gc<T> {
     }
 
     pub fn new(val: T) -> Self where T: CellKind {
-        let heap = hp();
-        let size = core::mem::size_of::<GcInner<T>>();
-        let mut top = unsafe { (*heap).top.load(Ordering::Acquire) };
         let inner = GcInner {
             kind: <T as CellKind>::cell_kind(),
-            next: AtomicPtr::new(top),
+            next: AtomicPtr::new(core::ptr::null_mut()),
             // Born white; swept next cycle unless reached. See Note [Incremental GC].
             color: Cell::new(white()),
-            size,
+            size: core::mem::size_of::<GcInner<T>>(),
             #[cfg(feature = "gc_sanitize")]
             finalize: |ptr| unsafe {
                 let ptr = ptr.cast::<GcInner<T>>();
@@ -265,30 +262,9 @@ impl<T> Gc<T> {
             finalize: |ptr| unsafe { drop(Box::from_raw(ptr.cast::<GcInner<T>>())) },
             val
         };
-        let ptr = Box::leak(Box::new(inner));
-        loop {
-            // Try to put ourself as the new top
-            let erased: *mut GcInner<()> = unsafe { core::mem::transmute(ptr as *mut _) };
-            match unsafe { (*heap).top.compare_exchange(top, erased, Ordering::Acquire, Ordering::Relaxed) } {
-                Ok(_) => {
-                    // We were able to swap ourself as the top, which means our next pointer is
-                    // correct.
-                    break;
-                },
-                Err(new_top) => {
-                    // We failed to set ourself as the top, which means something else did. Update
-                    // our next pointer and try again.
-                    ptr.next.store(new_top, Ordering::Release);
-                    top = new_top;
-                    continue;
-                },
-            }
-
-        }
-        // Only accounts for the allocation; stepping happens at safepoints, which have the
-        // roots. See Note [GC roots].
-        unsafe { (*heap).total_bytes += size; }
-        Self { ptr: core::ptr::NonNull::new(ptr as _).unwrap() }
+        let ptr = Box::leak(Box::new(inner)) as *mut GcInner<T>;
+        unsafe { link(ptr.cast()) };
+        Self { ptr: unsafe { core::ptr::NonNull::new_unchecked(ptr) } }
     }
 
     /// True if this object has been fully scanned this cycle (black).
@@ -391,6 +367,140 @@ pub(crate) struct GcInner<T: ?Sized> {
     // `pub(crate)` so the JIT can address a cell's payload with dynasm's typed
     // offset (`offset_of!(GcInner<_>, val)`).
     pub(crate) val: T,
+}
+
+/// Put a new cell on the heap's list of every cell, and charge the heap its `size`.
+/// Only accounts for the allocation; stepping happens at safepoints, which have the
+/// roots. See Note [GC roots].
+///
+/// # Safety
+/// `cell` must be a new, initialized cell, on no list yet.
+unsafe fn link(cell: *mut GcInner<()>) {
+    let heap = hp();
+    unsafe {
+        let mut top = (*heap).top.load(Ordering::Acquire);
+        loop {
+            (*cell).next.store(top, Ordering::Release);
+            match (*heap).top.compare_exchange(top, cell, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(new_top) => top = new_top,
+            }
+        }
+        (*heap).total_bytes += (*cell).size;
+    }
+}
+
+// Note [String cells]
+// ~~~~~~~~~~~~~~~~~~~
+// An owned string is one allocation: its `GcInner<LStr>` header, whose `LStr` is the
+// length, then the bytes. A string is immutable, so it's sized once, when it's built
+// (`Gc::<LStr>::build`), and its cell's `size` covers the bytes: the collector charges
+// the heap for them, and frees the cell with that size.
+//
+// The bytes are past the end of `LStr`, so they're read through the cell's pointer
+// (`Gc::<LStr>::as_slice`): a `&LStr` only covers the length.
+
+/// An owned string's cell payload. See Note [String cells].
+#[repr(C)]
+pub struct LStr {
+    len: usize,
+    bytes: [u8; 0],
+}
+
+/// The bytes of a string `Gc::<LStr>::build` is building, written in order.
+pub struct LStrWriter {
+    at: *mut u8,
+    left: usize,
+}
+
+impl LStrWriter {
+    /// Append `bytes`. Panics past the string's length.
+    #[inline]
+    pub fn push(&mut self, bytes: &[u8]) {
+        assert!(bytes.len() <= self.left, "string written past its length");
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at, bytes.len());
+            self.at = self.at.add(bytes.len());
+        }
+        self.left -= bytes.len();
+    }
+}
+
+impl Gc<LStr> {
+    /// The layout of a string cell of `len` bytes.
+    fn layout(len: usize) -> std::alloc::Layout {
+        let bytes = std::alloc::Layout::array::<u8>(len).expect("string too long");
+        std::alloc::Layout::new::<GcInner<LStr>>().extend(bytes).expect("string too long").0.pad_to_align()
+    }
+
+    /// A string of `len` bytes, which `fill` must write all of. See Note [String cells].
+    pub fn build(len: usize, fill: impl FnOnce(&mut LStrWriter)) -> Self {
+        let layout = Self::layout(len);
+        let cell = unsafe { std::alloc::alloc(layout) }.cast::<GcInner<LStr>>();
+        if cell.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        unsafe {
+            cell.write(GcInner {
+                kind: <LStr as CellKind>::cell_kind(),
+                next: AtomicPtr::new(core::ptr::null_mut()),
+                // Born white; swept next cycle unless reached. See Note [Incremental GC].
+                color: Cell::new(white()),
+                size: layout.size(),
+                #[cfg(feature = "gc_sanitize")]
+                finalize: |ptr| {
+                    (*ptr.cast::<GcInner<LStr>>()).alive.store(false, Ordering::Release)
+                },
+                #[cfg(feature = "gc_sanitize")]
+                alive: AtomicBool::new(true),
+                #[cfg(not(feature = "gc_sanitize"))]
+                finalize: |ptr| {
+                    let layout = std::alloc::Layout::from_size_align_unchecked(
+                        (*ptr).size, core::mem::align_of::<GcInner<LStr>>());
+                    std::alloc::dealloc(ptr.cast(), layout)
+                },
+                val: LStr { len, bytes: [] },
+            });
+            let mut writer = LStrWriter { at: (&raw mut (*cell).val.bytes).cast(), left: len };
+            fill(&mut writer);
+            assert!(writer.left == 0, "string written short of its length");
+            link(cell.cast());
+            Self { ptr: core::ptr::NonNull::new_unchecked(cell) }
+        }
+    }
+
+    /// A string of `bytes`.
+    pub fn string(bytes: &[u8]) -> Self {
+        Self::build(bytes.len(), |w| w.push(bytes))
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        let cell = self.ptr.as_ptr();
+        unsafe {
+            #[cfg(feature = "gc_sanitize")]
+            assert!((*cell).alive.load(Ordering::Acquire), "value is dead");
+            core::slice::from_raw_parts((&raw const (*cell).val.bytes).cast(), (*cell).val.len)
+        }
+    }
+}
+
+// Strings are equal, and hash, by their bytes.
+impl PartialEq for Gc<LStr> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Gc<LStr> {}
+
+impl Hash for Gc<LStr> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state)
+    }
 }
 
 /// The cell-type tag for a heap payload `T`, written into `GcInner::kind` at

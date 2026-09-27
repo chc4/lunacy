@@ -114,7 +114,7 @@ fn bytes(v: LBoxed) -> Vec<u8> {
 }
 
 fn string<'s, 'i>(bytes: Vec<u8>) -> LBoxed<'s, 'i> {
-    LBoxed::box_lvalue(LValue::OwnedString(Gc::new(FVec::from(bytes))))
+    LBoxed::box_lvalue(LValue::OwnedString(Gc::string(&bytes)))
 }
 
 /// A table argument.

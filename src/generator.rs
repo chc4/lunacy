@@ -1381,19 +1381,33 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
     #[coroutine]
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Exec(ResidualExec::new("concat", Rc::new(move |owner, state| {
-            let mut s: FVec<_> = vec![].into();
-            for i in (b as usize)..=(c as usize) {
-                match state.vals[state.base + i as usize].unbox() {
-                    LValue::OwnedString(g) => s.extend_from_slice(g.as_slice()),
-                    LValue::InternedString(is) => s.extend_from_slice(is.as_bytes()),
+            // The result is sized before it's written, so it's one allocation, with each
+            // operand copied into it once. Operands that aren't strings are converted first.
+            let operands = &state.vals[state.base + b..=state.base + c];
+            let mut converted: SmallVec<[Vec<u8>; 2]> = SmallVec::new();
+            let mut len = 0;
+            for operand in operands {
+                len += match operand.unbox() {
+                    LValue::OwnedString(g) => g.len(),
+                    LValue::InternedString(is) => is.as_bytes().len(),
                     value => {
-                        let Some(part) = value.as_string(owner) else { panic!("attempt to concatenate {value:?}") };
-                        s.extend_from_slice(part.as_slice());
+                        converted.push(value.string_bytes(owner));
+                        converted.last().unwrap().len()
                     },
-                }
+                };
             }
+            let mut converted = converted.iter();
+            let s = crate::gc::Gc::build(len, |w| {
+                for operand in operands {
+                    match operand.unbox() {
+                        LValue::OwnedString(g) => w.push(g.as_slice()),
+                        LValue::InternedString(is) => w.push(is.as_bytes()),
+                        _ => w.push(converted.next().unwrap()),
+                    }
+                }
+            });
             debug!("concat {:?}", String::from_utf8_lossy(s.as_slice()));
-            state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::new(s)));
+            state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::OwnedString(s));
         })));
         arg = yield YieldOp::SetTypes(vec![(a, LType::String)]);
         // It allocates. See Note [Block safepoints].
