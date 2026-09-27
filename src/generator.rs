@@ -326,6 +326,9 @@ pub enum YieldOp {
     BoxedK(usize), // Resumed with the boxed value of CONSTANT[idx], as its bits
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
+    Decided(bool), // A guard whose outcome is known, emitting nothing: steps the SubPc as a guard
+                   // with that outcome does, for a way meeting ones that take it. Resumed with
+                   // Matched or Failed. See Note [Subblocks]
     Exec(ResidualExec), // Emit a residual operation that will be executed
     ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op. See Note [Register window].
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
@@ -641,7 +644,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             let in_array = match integer {
                 Some(Some(k)) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[b]))),
                 Some(None) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[b, c]))),
-                None => ResumeArg::Failed,
+                None => yield YieldOp::Decided(false),
             };
             if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
                 windowed!(GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
@@ -781,7 +784,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         let in_array = match (integer, c & 0x100) {
             (Some(Some(k)), 0) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[a]))),
             (Some(None), 0) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[a, b]))),
-            _ => ResumeArg::Failed,
+            _ => yield YieldOp::Decided(false),
         };
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableArray, [k: i32], [], |owner, state, base| (table, value) {
@@ -1054,16 +1057,20 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             } else {
                 Some((Some(dispatch_integer_window!(opcode, FitsRR, (&[lhs, rhs]))), dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest]))))
             };
-            if let Some((test, op)) = op {
-                let fits = match test {
-                    Some(test) => yield YieldOp::GuardDynamic(test),
-                    None => ResumeArg::Matched,
-                };
-                if fits == ResumeArg::Matched {
-                    yield YieldOp::ExecWindow(op);
-                    yield YieldOp::SetCTypes(vec![(dest, CType::Integer)]);
-                    return arg;
-                }
+            // Whether the result fits, as one step each way: a way skipping the
+            // integer path fails it where a way taking it fails its test, and
+            // continues at the same point in the generator from the same key
+            // (Note [Subblocks]).
+            let step = match &op {
+                Some((Some(test), _)) => YieldOp::GuardDynamic(test.clone()),
+                Some((None, _)) => YieldOp::Decided(true),
+                None => YieldOp::Decided(false),
+            };
+            let fits = yield step;
+            if let (Some((_, op)), ResumeArg::Matched) = (op, fits) {
+                yield YieldOp::ExecWindow(op);
+                yield YieldOp::SetCTypes(vec![(dest, CType::Integer)]);
+                return arg;
             }
         }
         arg = yield YieldOp::GuardRk(lhs, LType::Table);
@@ -1761,8 +1768,11 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
 //   determined by the key of every subblock it can reach.
 //
 // Which guards led to a `SubPc` isn't part of it, only their outcomes: two
-// ways taking different guards can reach one, and only their contexts tell
-// them apart. Nor is what the generator read without guarding: `Typeof` reads
+// ways taking different guards could reach one, and only their contexts would
+// tell them apart. So ways through an instruction take the same steps: where
+// one way tests something at runtime and another already knows the outcome,
+// or skips the test, the other yields `Decided` for it, and ways meeting at a
+// key are at the same point in the generator. Nor is what the generator read without guarding: `Typeof` reads
 // the context as it is then, and the guards after it narrow the context, so
 // two ways reading different types can meet in one key. A generator may only
 // act on what it read through a property the key determines, as
@@ -3307,6 +3317,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Some((end, op)) => ResumeArg::WindowArgs(end, op.args),
                         None => ResumeArg::Failed,
                     };
+                },
+                CoroutineState::Yielded(YieldOp::Decided(passed)) => {
+                    (pc, arg) = if passed { (pc.next_true(), ResumeArg::Matched) } else { (pc.next_false(), ResumeArg::Failed) };
                 },
                 CoroutineState::Yielded(YieldOp::GuardDynamic(test)) => {
                     assert!(test.accesses().iter().all(|access| *access == Access::Read), "{}: a guard's test has no outputs", test.name());

@@ -50,11 +50,12 @@ local function carried(n)
 end
 
 -- One ADD with two predecessors, whose contexts differ only in x: an integer
--- (set on the flagged path) or unknown (the parameter). The unknown way finds
--- x an integer by the number path's failed table guard, and the known way's
--- overflow guard fails: both continue in the subblock at the same key, one
--- compiling it and the other entering it. `add_branch_a` compiles it from the
--- unknown way first, `add_branch_b` from the known one.
+-- (set on the flagged path) or unknown (the parameter). The known way's
+-- overflow guard fails; the unknown way skips the integer path, a step
+-- decided as failed at the same point, then finds x an integer by the number
+-- path's failed table guard, which the known way decides statically. Both
+-- continue through the same steps. `add_branch_a` compiles from the unknown
+-- way first, `add_branch_b` from the known one.
 local function add_branch_a(x, flag)
   if flag then x = 2147483000 end
   return x + 2147483000
