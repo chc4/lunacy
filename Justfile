@@ -402,8 +402,11 @@ _compare-worktree ref:
     #!/usr/bin/env bash
     set -euo pipefail
     dir=target/compare/{{ref}}
-    test -d $dir || git worktree add --detach $dir {{ref}}
-    git -C $dir checkout --detach {{ref}}
+    # Resolved here: in the worktree, a relative ref (HEAD, HEAD~1) names the
+    # worktree's own commit.
+    rev=$(git rev-parse {{ref}})
+    test -d $dir || git worktree add --detach $dir $rev
+    git -C $dir checkout --detach $rev
     for module in dynasm-rs memmap2-rs; do test -L $dir/$module || { rmdir $dir/$module && ln -s "$(realpath $module)" $dir/$module; }; done
 
 # This checkout's release and unsafe builds (as `unsafe-compile` builds), and
