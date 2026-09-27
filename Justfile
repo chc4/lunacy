@@ -290,7 +290,6 @@ flamegraph benchmark times='10' ref='' freq='997':
     #!/usr/bin/env bash
     set -euo pipefail
     just _luac {{benchmark}}
-    rm -f /tmp/perf-*.map
     # The profile's panic strategy needs std rebuilt, as for `unsafe-compile`:
     # `-Z build-std`, which `cargo flamegraph` takes from the environment.
     export CARGO_UNSTABLE_BUILD_STD=core,std,panic_abort
@@ -308,13 +307,13 @@ flamegraph benchmark times='10' ref='' freq='997':
 # `flamegraph` of revision `ref` (as for `hyperfine-vs`) and of this checkout on
 # one benchmark, kept side by side in working/: flamegraph-<benchmark>-<ref>.svg
 # and perf-<benchmark>-<ref>.data, flamegraph-<benchmark>.svg and
-# perf-<benchmark>.data, and each one's hottest symbols. Both runs' JIT symbol
-# maps (/tmp/perf-<pid>.map) are kept, so either perf.data reports afterwards.
+# perf-<benchmark>.data, and each one's hottest symbols. The runs' JIT symbol
+# maps (/tmp/perf-<pid>.map) are kept, as every profile's are, so any perf.data
+# reports afterwards: a run's map replaces a stale one of its pid.
 flamegraph-vs ref benchmark times='10' freq='997' top='25':
     #!/usr/bin/env bash
     set -euo pipefail
     just _luac {{benchmark}}
-    rm -f /tmp/perf-*.map
     export CARGO_UNSTABLE_BUILD_STD=core,std,panic_abort
     here=$(realpath working)
     bin=$(realpath working/{{benchmark}}.bin)
