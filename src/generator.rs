@@ -517,6 +517,67 @@ windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
     *dest = val1;
 });
 
+// A hash key's `href_init`: the witness of `key` (an `LCanon`'s bits) in the
+// table in its register, for the frame's `href`th witness, `select` 0 if the
+// table has the key and 1 if not. `at` is `index << 8 | href`, two holes being
+// all an op has. Its fast path is the key still at `index`, where the table
+// the thunk was forced with had it, and the witness's slot there already;
+// anything else is `href_init_slow`, out of line. See Note [Hash witnesses].
+windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
+    let (href, index) = (at as u8, (at >> 8) as usize);
+    let hidx = state.witness_base + href as usize;
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    let hit = {
+        let tab = tab.rw(owner);
+        let epoch = tab.epoch;
+        match tab.hash.get_index_mut(index) {
+            Some((k, value)) if k.boxed().bits() == key => Some((epoch, value as *mut LBoxed<'_, '_>)),
+            _ => None,
+        }
+    };
+    match hit {
+        Some((epoch, value)) if hidx < state.hash_witnesses.len() => {
+            state.witness_top = state.witness_top.max(hidx + 1);
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast() };
+            state.select = 0;
+        },
+        _ => href_init_slow(owner, state, table, href, index, key),
+    }
+});
+
+/// `HrefInit` when the key isn't at `index`, or the witness's slot isn't
+/// there yet: the witness vector grown, the key looked up again. `rust-cold`
+/// (LLVM's `preserve_most`), so the callee saves the registers it uses and the
+/// stencil's fast path needn't save its window around the call.
+extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, href: u8, index: usize, key: u64) {
+    let hidx = state.witness_base + href as usize;
+    if state.hash_witnesses.len() <= hidx {
+        state.hash_witnesses.resize_with(hidx + 1, HashWitness::default);
+    }
+    state.witness_top = state.witness_top.max(hidx + 1);
+    // Safety: the key is a constant's, which outlives the code using it.
+    let key: LCanon<'src, 'intern> = unsafe { LCanon::from_bits(key) };
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    let found = match tab.ro(owner).hash.get_index(index) {
+        Some((k, _)) if *k == key => Some(index),
+        _ => tab.ro(owner).hash.get_index_of(&key),
+    };
+    let tab = tab.rw(owner);
+    let epoch = tab.epoch;
+    state.hash_witnesses[hidx] = match found {
+        Some(index) => {
+            state.select = 0;
+            let value = tab.hash.get_index_mut(index).unwrap().1 as *mut LBoxed<'_, '_>;
+            HashWitness { epoch, index, value: value.cast() }
+        },
+        None => {
+            debug!("href_init missing key");
+            state.select = 1;
+            HashWitness { epoch, index, value: core::ptr::null_mut() }
+        },
+    };
+}
+
 /// A global's cache: where its value is in the global environment, while the
 /// environment's entries haven't moved since. See Note [Global caches].
 pub struct GlobalCache {
@@ -3151,43 +3212,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             // The key's canonical form, made here once. See Note [Hash witnesses].
             let lkey = LCanon::constant(&hkey.key);
-            let href_init = Residual::Exec(ResidualExec::new("href_init", Rc::new(move |owner, state| {
-                let mut index = index;
-                let hidx = state.witness_base + href.0 as usize;
-                if state.hash_witnesses.len() <= hidx {
-                    state.hash_witnesses.resize_with(hidx + 1, HashWitness::default);
-                }
-                state.witness_top = state.witness_top.max(hidx + 1);
-                debug!("populating hashkey witness {}", hidx);
-                // Safety: the constant outlives the closure, which the closure
-                // it came from owns, as for `emit_getglobal`'s.
-                let lkey: LCanon<'_, '_> = unsafe { core::mem::transmute(lkey) };
-                let tab = state.table_at(idx);
-                // Inline cache for assuming the index stays the same
-                match tab.ro(owner).hash.get_index(index) {
-                    Some((key, _)) if *key != lkey => {
-                        debug!("href_init key mismatch, {:?} {:?}", key, lkey);
-                        if let Some(new_index) = tab.ro(owner).hash.get_index_of(&lkey) {
-                            index = new_index;
-                            state.select = 0;
-                        } else {
-                            state.select = 1;
-                        }
-                    },
-                    Some((key, _)) => {
-                        state.select = 0
-                    },
-                    None => {
-                        debug!("href_init missing key");
-                        state.select = 1
-                    },
-                }
-                let value = match state.select {
-                    0 => tab.rw(owner).hash.get_index_mut(index).unwrap().1 as *mut LBoxed<'_, '_>,
-                    _ => core::ptr::null_mut(),
-                };
-                state.hash_witnesses[hidx] = HashWitness { epoch: tab.ro(owner).epoch, index, value: value.cast() };
-            })));
+            let href_init = Residual::ExecWindow(Rc::new(HrefInit::new((index as u64) << 8 | href.0 as u64, lkey.boxed().bits(), &[idx])));
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
             if !appends || vm.compiled(block_id) {

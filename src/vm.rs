@@ -705,6 +705,15 @@ impl<'src, 'intern> LCanon<'src, 'intern> {
         }
     }
 
+    /// The key whose `boxed().bits()` are `bits`.
+    ///
+    /// # Safety
+    /// `bits` must be an `LCanon`'s, and a value it names still live.
+    #[inline(always)]
+    pub unsafe fn from_bits(bits: u64) -> Self {
+        LCanon(LBoxed::from_bits(bits))
+    }
+
     pub fn boxed(self) -> LBoxed<'src, 'intern> {
         self.0
     }
