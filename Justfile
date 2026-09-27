@@ -44,15 +44,15 @@ test-stencils:
 
 # Runs of window residuals in a benchmark (docs/jit-register-cache.md): run it on
 # the LBBV interpreter tier (every block entry counted, none hidden by the JIT)
-# with the `graph` dump, then list each function's blocks with window runs,
-# hottest first.
+# with the `graph` dump (working/func_*.dot), then list each function's blocks
+# with window runs, hottest first.
 window-runs benchmark times='20':
     just _luac {{benchmark}}
-    rm -f func_*.dot func_*.pdf
-    cargo run --release --no-default-features --features graph --bin bench -- {{benchmark}}.bin {{times}}
-    python3 tools/window_runs.py func_*.dot
+    rm -f working/func_*.dot working/func_*.pdf
+    cd working && cargo run --release --no-default-features --features graph --bin bench -- {{benchmark}}.bin {{times}}
+    python3 tools/window_runs.py working/func_*.dot
 
-# The JIT's window allocation for a benchmark, in window_dump.txt: each compiled
+# The JIT's window allocation for a benchmark, in working/window_dump.txt: each compiled
 # block's entry window, then per residual its loads, stores and moves, what each
 # jump transfers, and the window after it.
 # With `ref`, revision `ref`'s (in target/compare/<ref>, as for `hyperfine-vs`)
@@ -62,10 +62,10 @@ window-dump benchmark times='20' ref='':
     set -euo pipefail
     just _luac {{benchmark}}
     if [ -z "{{ref}}" ]; then
-        cargo run --release --features window_dump --bin bench -- {{benchmark}}.bin {{times}}
+        cd working && cargo run --release --features window_dump --bin bench -- {{benchmark}}.bin {{times}}
     else
         just _compare-worktree {{ref}}
-        bin=$(realpath {{benchmark}}.bin)
+        bin=$(realpath working/{{benchmark}}.bin)
         (cd target/compare/{{ref}} && cargo run --release --features window_dump --bin bench -- $bin {{times}})
     fi
 
@@ -79,44 +79,44 @@ stencil-sizes: unsafe-compile
 
 # Cold code in every window op's stencil (see tools/stencil_cold.py), in the
 # release and unsafe builds, and every stencil's assembly in
-# stencils-release.s and stencils-unsafe.s.
+# working/stencils-release.s and working/stencils-unsafe.s.
 stencil-cold: unsafe-compile
     cargo build --release --bin bench
     cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
-    python3 tools/stencil_cold.py target/release/bench --dump stencils-release.s
-    python3 tools/stencil_cold.py target/unsafe/bench --dump stencils-unsafe.s
+    mkdir -p working
+    python3 tools/stencil_cold.py target/release/bench --dump working/stencils-release.s
+    python3 tools/stencil_cold.py target/unsafe/bench --dump working/stencils-unsafe.s
 
 # A benchmark's JIT code, disassembled when the VM drops it and annotated with
 # what emitted it (regions, blocks, residuals, thunk stubs, the blocks and
-# helpers branches go to), in jit_disasm.txt. Built as `unsafe-compile` builds,
-# with `features` (by default the unsafe build's).
+# helpers branches go to), in working/jit_disasm.txt. Built as `unsafe-compile`
+# builds, with `features` (by default the unsafe build's).
 jit-disasm benchmark times='10' features='unsafe':
     just _luac {{benchmark}}
-    cargo run --profile unsafe --no-default-features --features "{{features}} jit_disasm" --bin bench \
-        --target-dir target/jit_disasm -Z build-std="core,std,panic_abort" -- {{benchmark}}.bin {{times}} > /dev/null
-    @echo jit_disasm.txt
+    cd working && cargo run --profile unsafe --no-default-features --features "{{features}} jit_disasm" --bin bench \
+        --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- {{benchmark}}.bin {{times}} > /dev/null
+    @echo working/jit_disasm.txt
 
 # Save a benchmark's window dump as bench/window_dumps/<benchmark>.<name>.txt, a
 # reference to compare window allocators against with `just window-dump-stats`.
 window-dump-save benchmark name times='20':
     just window-dump {{benchmark}} {{times}}
     mkdir -p bench/window_dumps
-    cp window_dump.txt bench/window_dumps/{{benchmark}}.{{name}}.txt
+    cp working/window_dump.txt bench/window_dumps/{{benchmark}}.{{name}}.txt
 
 # A lua_tests program's window allocation under streaming allocation and each
 # trace-building policy, as bench/window_dumps/<name>.<policy>.txt.
-window-dump-policies name:
-    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
+window-dump-policies name: (_luac-test name)
     cargo build --release --features window_dump --bin lunacy
     mkdir -p bench/window_dumps
-    for policy in streaming single unidirectional bidirectional; do LUNACY_TRACES=$policy ./target/release/lunacy {{name}}.bin > /dev/null && cp window_dump.txt bench/window_dumps/{{name}}.$policy.txt; done
+    for policy in streaming single unidirectional bidirectional; do (cd working && LUNACY_TRACES=$policy ../target/release/lunacy {{name}}.bin > /dev/null) && cp working/window_dump.txt bench/window_dumps/{{name}}.$policy.txt; done
 
 # Executed loads, stores and moves of each benchmark, run `times` times, under
 # streaming allocation and unidirectional traces, from their window dumps; a
 # benchmark that fails (lunacy lacks some of Lua) says why.
 window-dump-compare times +benchmarks:
     cargo build --release --features window_dump --bin bench
-    for b in {{benchmarks}}; do just _luac $b || continue; for policy in streaming unidirectional; do if LUNACY_TRACES=$policy timeout 600 ./target/release/bench $b.bin {{times}} > /dev/null 2> target/window-dump-compare.err; then python3 tools/window_dump_stats.py --raw window_dump.txt | tail -1 | sed "s|^window_dump.txt|$b $policy|"; else echo "$b $policy: failed: $(grep -A1 -m1 panicked target/window-dump-compare.err | tail -1)"; fi; done; done
+    for b in {{benchmarks}}; do just _luac $b || continue; for policy in streaming unidirectional; do if (cd working && LUNACY_TRACES=$policy timeout 600 ../target/release/bench $b.bin {{times}} > /dev/null 2> ../target/window-dump-compare.err); then python3 tools/window_dump_stats.py --raw working/window_dump.txt | tail -1 | sed "s|^working/window_dump.txt|$b $policy|"; else echo "$b $policy: failed: $(grep -A1 -m1 panicked target/window-dump-compare.err | tail -1)"; fi; done; done
 
 # The loads, stores and moves in window dumps, over all blocks and hot ones.
 window-dump-stats *dumps='bench/window_dumps/*.txt':
@@ -131,65 +131,73 @@ watch:
     cargo watch -- cargo test
 
 [env("RUST_LOG", "debug")]
-debug name:
-    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
-    time cargo run --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
+debug name: (_luac-test name)
+    cd working && time cargo run --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
 
-debug-jit name:
-    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
-    time cargo run --no-default-features --features "{{TEST_FEATURES}} immediate_jit" --bin lunacy -- {{name}}.bin
+debug-jit name: (_luac-test name)
+    cd working && time cargo run --no-default-features --features "{{TEST_FEATURES}} immediate_jit" --bin lunacy -- {{name}}.bin
 
-release name:
-    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
-    time cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
+release name: (_luac-test name)
+    cd working && time cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
 
-gdb-test name:
-    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
+gdb-test name: (_luac-test name)
     cargo build --release --bin lunacy
-    gdb --args ./target/release/lunacy {{name}}.bin
+    gdb --args ./target/release/lunacy working/{{name}}.bin
+
+# Compile lua_tests/<name>.lua to working/<name>.bin.
+_luac-test name:
+    mkdir -p working
+    luac5.1 -o working/{{name}}.bin lua_tests/{{name}}.lua
 
 # Benchmarks
-# Compile a benchmark to <benchmark>.bin: this repository's
+# Compile a benchmark to working/<benchmark>.bin: this repository's
 # benchmarks/<benchmark>, else lua_benchmarking's.
 _luac benchmark:
     #!/usr/bin/env bash
     set -euo pipefail
+    mkdir -p working
     src=benchmarks/{{benchmark}}/bench.lua
     if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
-    luac5.1 -o {{benchmark}}.bin $src
+    luac5.1 -o working/{{benchmark}}.bin $src
 
-# Compile a benchmark, as `_luac`, to LuaJIT's bytecode in <benchmark>.luajit.bin:
-# LuaJIT can't load luac5.1's.
+# Compile a benchmark, as `_luac`, to LuaJIT's bytecode in
+# working/<benchmark>.luajit.bin: LuaJIT can't load luac5.1's.
 _luajitc benchmark:
     #!/usr/bin/env bash
     set -euo pipefail
+    mkdir -p working
     src=benchmarks/{{benchmark}}/bench.lua
     if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
-    luajit -b $src {{benchmark}}.luajit.bin
+    luajit -b $src working/{{benchmark}}.luajit.bin
 
-# Compile a benchmark, as `_luac`, to Lua 5.5's bytecode in <benchmark>.lua55.bin.
+# Compile a benchmark, as `_luac`, to Lua 5.5's bytecode in
+# working/<benchmark>.lua55.bin.
 _lua55c benchmark:
     #!/usr/bin/env bash
     set -euo pipefail
+    mkdir -p working
     src=benchmarks/{{benchmark}}/bench.lua
     if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
-    luac5.5 -o {{benchmark}}.lua55.bin $src
+    luac5.5 -o working/{{benchmark}}.lua55.bin $src
 
 run benchmark:
     just _luac {{benchmark}}
-    time cargo run --release --bin bench -- {{benchmark}}.bin
+    time cargo run --release --bin bench -- working/{{benchmark}}.bin
 
 [env("RUST_LOG", "debug")]
 run-debug benchmark:
     just _luac {{benchmark}}
-    time cargo run --bin bench -- {{benchmark}}.bin
+    time cargo run --bin bench -- working/{{benchmark}}.bin
 
+# <name>.lua's residual graphs, as working/func_<line>.dot and .pdf.
 graph name:
-    luac5.1 -o {{name}}.bin {{name}}.lua
-    cargo run --features graph --bin lunacy -- {{name}}.bin
+    mkdir -p working
+    luac5.1 -o working/{{name}}.bin {{name}}.lua
+    cd working && cargo run --features graph --bin lunacy -- {{name}}.bin
 graph-release name:
-    luac5.1 -o {{name}}.bin {{name}}.lua
-    cargo run --release --features graph --bin lunacy -- {{name}}.bin
+    mkdir -p working
+    luac5.1 -o working/{{name}}.bin {{name}}.lua
+    cd working && cargo run --release --features graph --bin lunacy -- {{name}}.bin
 # A benchmark's residual graphs with and without dynamic guards (feature
 # `no_dynamic_guards`, Note [Dynamic guards]), in
 # target/graphs/<benchmark>/{guards,no_guards}, and their blocks compared.
@@ -203,7 +211,7 @@ graph-guards benchmark times='10':
         cargo build --release --features "$features" --bin bench --target-dir target/graph-$variant
         dir=target/graphs/{{benchmark}}/$variant
         rm -rf $dir && mkdir -p $dir
-        (cd $dir && ../../../graph-$variant/release/bench ../../../../{{benchmark}}.bin {{times}} > /dev/null)
+        (cd $dir && ../../../graph-$variant/release/bench ../../../../working/{{benchmark}}.bin {{times}} > /dev/null)
     done
     tools/graph_blocks.py target/graphs/{{benchmark}}/guards target/graphs/{{benchmark}}/no_guards
 # A benchmark's residual graphs at this checkout and at revision `ref` (built in
@@ -216,7 +224,7 @@ graph-vs ref benchmark times='10':
     cargo build --release --features graph --bin bench --target-dir target/graph-current
     just _compare-worktree {{ref}}
     (cd target/compare/{{ref}} && cargo build --release --features graph --bin bench --target-dir target/graph)
-    bin=$(realpath {{benchmark}}.bin)
+    bin=$(realpath working/{{benchmark}}.bin)
     for variant in current {{ref}}; do
         exe=$(realpath target/graph-current/release/bench)
         if [ $variant != current ]; then exe=$(realpath target/compare/{{ref}}/target/graph/release/bench); fi
@@ -232,26 +240,28 @@ graphs-vs ref:
     set -euo pipefail
     for run in {{HYPERFINES}}; do echo "== ${run%:*} ${run#*:}"; just graph-vs {{ref}} ${run%:*} ${run#*:} 2>/dev/null | sed -n '/ \/ /,$p'; done
 gdb name:
-    luac5.1 -o {{name}}.bin {{name}}.lua
+    mkdir -p working
+    luac5.1 -o working/{{name}}.bin {{name}}.lua
     cargo build --release --bin lunacy
-    gdb --args ./target/release/lunacy {{name}}.bin
+    gdb --args ./target/release/lunacy working/{{name}}.bin
 
 
 baseline benchmark times='10':
     just _luac {{benchmark}}
-    time lua5.1 bench.lua -- {{benchmark}}.bin {{times}}
+    time lua5.1 bench.lua -- working/{{benchmark}}.bin {{times}}
 
 gdb-benchmark benchmark:
     just _luac {{benchmark}}
     cargo build --release --bin bench
-    gdb --args ./target/release/bench {{benchmark}}.bin
+    gdb --args ./target/release/bench working/{{benchmark}}.bin
 
 # Profile a benchmark, built with the `flamegraph` profile (the unsafe build with
 # frame pointers) and unwound through frame pointers, as perf's default DWARF
 # unwinding can't unwind JIT code, which has no unwind tables (`tools/unwound.py`
-# reports how much of a profile reached `main`): perf.data and flamegraph.svg here, or with `ref`, revision `ref`'s build (in
-# target/compare/<ref>, as for `hyperfine-vs`; it must have the profile) on this
-# checkout's benchmark, its perf.data there and flamegraph-<ref>.svg here.
+# reports how much of a profile reached `main`): perf.data and flamegraph.svg in
+# working/, or with `ref`, revision `ref`'s build (in target/compare/<ref>, as
+# for `hyperfine-vs`; it must have the profile) on this checkout's benchmark,
+# its perf.data there and working/flamegraph-<ref>.svg.
 # `freq` is perf's sampling rate, in Hz.
 flamegraph benchmark times='10' ref='' freq='997':
     #!/usr/bin/env bash
@@ -262,19 +272,19 @@ flamegraph benchmark times='10' ref='' freq='997':
     # `-Z build-std`, which `cargo flamegraph` takes from the environment.
     export CARGO_UNSTABLE_BUILD_STD=core,std,panic_abort
     if [ -z "{{ref}}" ]; then
-        cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -- {{benchmark}}.bin {{times}}
-        firefox -new-tab flamegraph.svg || true
+        (cd working && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -- {{benchmark}}.bin {{times}})
+        firefox -new-tab working/flamegraph.svg || true
     else
         dir=target/compare/{{ref}}
         just _compare-worktree {{ref}}
-        bin=$(realpath {{benchmark}}.bin)
-        svg=$(realpath .)/flamegraph-{{ref}}.svg
+        bin=$(realpath working/{{benchmark}}.bin)
+        svg=$(realpath working)/flamegraph-{{ref}}.svg
         (cd $dir && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o $svg -- $bin {{times}})
     fi
 
 # `flamegraph` of revision `ref` (as for `hyperfine-vs`) and of this checkout on
-# one benchmark, kept side by side: flamegraph-<benchmark>-<ref>.svg and
-# perf-<benchmark>-<ref>.data, flamegraph-<benchmark>.svg and
+# one benchmark, kept side by side in working/: flamegraph-<benchmark>-<ref>.svg
+# and perf-<benchmark>-<ref>.data, flamegraph-<benchmark>.svg and
 # perf-<benchmark>.data, and each one's hottest symbols. Both runs' JIT symbol
 # maps (/tmp/perf-<pid>.map) are kept, so either perf.data reports afterwards.
 flamegraph-vs ref benchmark times='10' freq='997' top='25':
@@ -283,17 +293,17 @@ flamegraph-vs ref benchmark times='10' freq='997' top='25':
     just _luac {{benchmark}}
     rm -f /tmp/perf-*.map
     export CARGO_UNSTABLE_BUILD_STD=core,std,panic_abort
-    here=$(realpath .)
-    bin=$(realpath {{benchmark}}.bin)
+    here=$(realpath working)
+    bin=$(realpath working/{{benchmark}}.bin)
     dir=target/compare/{{ref}}
     just _compare-worktree {{ref}}
     (cd $dir && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o $here/flamegraph-{{benchmark}}-{{ref}}.svg -- $bin {{times}})
-    mv $dir/perf.data perf-{{benchmark}}-{{ref}}.data
-    cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o flamegraph-{{benchmark}}.svg -- {{benchmark}}.bin {{times}}
-    mv perf.data perf-{{benchmark}}.data
+    mv $dir/perf.data working/perf-{{benchmark}}-{{ref}}.data
+    (cd working && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o flamegraph-{{benchmark}}.svg -- {{benchmark}}.bin {{times}})
+    mv working/perf.data working/perf-{{benchmark}}.data
     # `head` closing the pipe early isn't a failure.
     set +o pipefail
-    for data in perf-{{benchmark}}-{{ref}}.data perf-{{benchmark}}.data; do
+    for data in working/perf-{{benchmark}}-{{ref}}.data working/perf-{{benchmark}}.data; do
         echo "== $data"
         perf report -i $data --no-children -g none --sort sym --stdio 2>/dev/null | grep '%' | head -n {{top}}
     done
@@ -306,10 +316,9 @@ interpreter-compile:
     cargo build --release --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin bench --bin lunacy --target-dir ./target/interpreter
 interpreter benchmark: interpreter-compile
     just _luac {{benchmark}}
-    time ./target/interpreter/release/bench {{benchmark}}.bin
-interpreter-test name: interpreter-compile
-    luac5.1 -o {{name}}.bin lua_tests/{{name}}.lua
-    time ./target/interpreter/release/lunacy {{name}}.bin
+    time ./target/interpreter/release/bench working/{{benchmark}}.bin
+interpreter-test name: interpreter-compile (_luac-test name)
+    time ./target/interpreter/release/lunacy working/{{name}}.bin
 
 # Unsafe
 # Disassemble a window op's stencil at SKIP 0 as the `unsafe` profile builds it,
@@ -333,11 +342,11 @@ unsafe-compile:
         -Z build-std="core,std,panic_abort"
 unsafe benchmark: unsafe-compile
     just _luac {{benchmark}}
-    time ./target/unsafe/bench {{benchmark}}.bin
+    time ./target/unsafe/bench working/{{benchmark}}.bin
 
 gdb-unsafe benchmark: unsafe-compile
     just _luac {{benchmark}}
-    gdb --args ./target/unsafe/bench {{benchmark}}.bin
+    gdb --args ./target/unsafe/bench working/{{benchmark}}.bin
 
 
 # Hyperfine reports
@@ -347,13 +356,13 @@ hyperfine benchmark times='10': unsafe-compile
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
     cargo build --release --bin bench
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
-        --export-json hyperfine-{{benchmark}}-{{times}}.json \
-        -n "luajit -joff" "luajit -joff bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
-        -n luajit "luajit bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
-        -n release "./target/release/bench {{benchmark}}.bin {{times}}" \
-        -n unsafe "./target/unsafe/bench {{benchmark}}.bin {{times}}"
-    python3 tools/bench_history.py record hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
+        --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
+        -n "luajit -joff" "luajit -joff bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
+        -n luajit "luajit bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
+        -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
+        -n unsafe "./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
+    python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
 
 # `hyperfine`, with lunacy's interpreter (no JIT), Lua 5.1 and Lua 5.5 too,
 # whose runs take most of its time. Neither Lua has `bit`, so their runs of a
@@ -365,24 +374,24 @@ hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
     cargo build --release --bin bench
     # A command failing (lua5.1 and lua5.5 lack the bit library) is timed, and
     # left out of the history for its exit code.
-    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
-        --export-json hyperfine-{{benchmark}}-{{times}}.json \
-        -n lua5.1 "lua5.1 bench.lua -- {{benchmark}}.bin {{times}}" \
-        -n lua5.5 "lua5.5 bench.lua -- {{benchmark}}.lua55.bin {{times}}" \
-        -n "luajit -joff" "luajit -joff bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
-        -n luajit "luajit bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
-        -n interpreter "./target/interpreter/release/bench {{benchmark}}.bin {{times}}" \
-        -n release "./target/release/bench {{benchmark}}.bin {{times}}" \
-        -n unsafe "./target/unsafe/bench {{benchmark}}.bin {{times}}"
-    python3 tools/bench_history.py record hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
+    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
+        --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
+        -n lua5.1 "lua5.1 bench.lua -- working/{{benchmark}}.bin {{times}}" \
+        -n lua5.5 "lua5.5 bench.lua -- working/{{benchmark}}.lua55.bin {{times}}" \
+        -n "luajit -joff" "luajit -joff bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
+        -n luajit "luajit bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
+        -n interpreter "./target/interpreter/release/bench working/{{benchmark}}.bin {{times}}" \
+        -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
+        -n unsafe "./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
+    python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
 # Compare the trace-building policies of the window allocator, and streaming
 # allocation, on a benchmark
 # (LUNACY_TRACES; see docs/trace-register-allocation.md).
 hyperfine-traces benchmark times='10' policies='streaming,single,unidirectional,bidirectional':
     just _luac {{benchmark}}
     cargo build --release --bin bench
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
-        "LUNACY_TRACES={policy} ./target/release/bench {{benchmark}}.bin {{times}}"
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
+        "LUNACY_TRACES={policy} ./target/release/bench working/{{benchmark}}.bin {{times}}"
 # `hyperfine-traces` over the benchmarks lunacy runs, each run enough times for
 # a stable mean. life runs twice: the difference between its 1000 and 5000 runs
 # is the steady-state cost of the code, the rest the upfront cost (compiling).
@@ -394,7 +403,7 @@ hyperfines-traces policies='streaming,unidirectional,bidirectional': (hyperfine-
 alloc-stats benchmark times='10' policies='streaming unidirectional':
     just _luac {{benchmark}}
     cargo build --release --features alloc_stats --bin bench
-    for policy in {{policies}}; do LUNACY_TRACES=$policy ./target/release/bench {{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-$policy.txt; echo "target/alloc-stats-{{benchmark}}-$policy.txt"; done
+    for policy in {{policies}}; do LUNACY_TRACES=$policy ./target/release/bench working/{{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-$policy.txt; echo "target/alloc-stats-{{benchmark}}-$policy.txt"; done
 
 # Revision `ref` checked out in a detached worktree, target/compare/<ref>, kept
 # for reruns, its submodules linked to this checkout's.
@@ -422,13 +431,13 @@ _build-vs ref:
 # one benchmark (built as `_build-vs` builds them).
 hyperfine-vs ref benchmark times='10': (_build-vs ref)
     just _luac {{benchmark}}
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
-        --export-json hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.json \
-        -n "ref release" "target/compare/{{ref}}/target/release/bench {{benchmark}}.bin {{times}}" \
-        -n release "./target/release/bench {{benchmark}}.bin {{times}}" \
-        -n "ref unsafe" "target/compare/{{ref}}/target/unsafe/bench {{benchmark}}.bin {{times}}" \
-        -n unsafe "./target/unsafe/bench {{benchmark}}.bin {{times}}"
-    python3 tools/bench_history.py record hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.json --benchmark {{benchmark}} --arg {{times}} --ref {{ref}}
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
+        --export-json working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.json \
+        -n "ref release" "target/compare/{{ref}}/target/release/bench working/{{benchmark}}.bin {{times}}" \
+        -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
+        -n "ref unsafe" "target/compare/{{ref}}/target/unsafe/bench working/{{benchmark}}.bin {{times}}" \
+        -n unsafe "./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
+    python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.json --benchmark {{benchmark}} --arg {{times}} --ref {{ref}}
 
 # Revision `ref`'s release and unsafe builds (as `_build-vs` builds them) on
 # every benchmark of HYPERFINES, into the history (tools/bench_history.py): to
@@ -441,24 +450,25 @@ bench-rev ref:
     for run in {{HYPERFINES}}; do
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark
-        taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-json hyperfine-$benchmark-$times-{{ref}}.json \
-            -n "ref release" "target/compare/{{ref}}/target/release/bench $benchmark.bin $times" \
-            -n "ref unsafe" "target/compare/{{ref}}/target/unsafe/bench $benchmark.bin $times"
-        python3 tools/bench_history.py record hyperfine-$benchmark-$times-{{ref}}.json --benchmark $benchmark --arg $times --ref {{ref}}
+        taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-json working/hyperfine-$benchmark-$times-{{ref}}.json \
+            -n "ref release" "target/compare/{{ref}}/target/release/bench working/$benchmark.bin $times" \
+            -n "ref unsafe" "target/compare/{{ref}}/target/unsafe/bench working/$benchmark.bin $times"
+        python3 tools/bench_history.py record working/hyperfine-$benchmark-$times-{{ref}}.json --benchmark $benchmark --arg $times --ref {{ref}}
     done
 
 # The benchmark history (tools/bench_history.py): each benchmark's and build's
 # latest, dirty, best and first times, regressions flagged, and the charts, in
-# bench/history.html.
+# working/history.html.
 bench-history:
     python3 tools/bench_history.py report
     python3 tools/bench_history.py plot
 
 # The latest commit's times from the benchmark history as one grouped bar chart,
-# a group per benchmark, in bench/bars.html (tools/bench_bars.py: `args` picks
-# the implementations, `--builds`, and those not setting the scale, `--clamp`).
-bench-bars *args:
-    python3 tools/bench_bars.py {{args}}
+# a group per benchmark, in working/bars.html (tools/bench_bars.py): `builds`,
+# the implementations, in bar order, and `clamp`, those whose bars don't set
+# the scale past 1.5 times the rest's highest (comma separated).
+bench-bars builds='lua5.1,lua5.5,luajit -joff,luajit,interpreter,release,unsafe' clamp='lua5.1,lua5.5':
+    python3 tools/bench_bars.py --builds "{{builds}}" --clamp "{{clamp}}"
 # Hardware counters (`perf stat`) for this checkout's build of `profile`
 # (`release` or `unsafe`) and revision `ref`'s (built as `_build-vs` builds
 # them) on one benchmark, each pinned as `hyperfine` runs it and repeated `runs`
@@ -466,27 +476,27 @@ bench-bars *args:
 perf-stat-vs ref benchmark times='10' runs='5' profile='unsafe': (_build-vs ref)
     just _luac {{benchmark}}
     taskset -c {{CPU}} perf stat -r {{runs}} -e task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
-        target/compare/{{ref}}/target/{{profile}}/bench {{benchmark}}.bin {{times}} > /dev/null
+        target/compare/{{ref}}/target/{{profile}}/bench working/{{benchmark}}.bin {{times}} > /dev/null
     taskset -c {{CPU}} perf stat -r {{runs}} -e task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
-        ./target/{{profile}}/bench {{benchmark}}.bin {{times}} > /dev/null
+        ./target/{{profile}}/bench working/{{benchmark}}.bin {{times}} > /dev/null
 # Compare this checkout's release build with and without cargo feature
 # `feature` on one benchmark: the feature's build is in target/features/<feature>.
 hyperfine-feature feature benchmark times='10':
     just _luac {{benchmark}}
     cargo build --release --bin bench
     cargo build --release --features {{feature}} --bin bench --target-dir target/features/{{feature}}
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
-        -n default "./target/release/bench {{benchmark}}.bin {{times}}" \
-        -n {{feature}} "target/features/{{feature}}/release/bench {{benchmark}}.bin {{times}}"
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
+        -n default "./target/release/bench working/{{benchmark}}.bin {{times}}" \
+        -n {{feature}} "target/features/{{feature}}/release/bench working/{{benchmark}}.bin {{times}}"
 hyperfine-jit benchmark:
     just _luac {{benchmark}}
     cargo build --release --bin bench
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-jit.md \
-        "./target/release/bench {{benchmark}}.bin"
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-jit.md \
+        "./target/release/bench working/{{benchmark}}.bin"
 hyperfine-unsafe benchmark: unsafe-compile
     just _luac {{benchmark}}
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-unsafe.md \
-        "./target/unsafe/bench {{benchmark}}.bin"
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-unsafe.md \
+        "./target/unsafe/bench working/{{benchmark}}.bin"
 
 
 # The benchmarks lunacy runs, as `benchmark:times`, each run enough times for a
@@ -520,23 +530,23 @@ hyperfine-features benchmark times +sets:
         features=$set; if [ $set = none ]; then features=""; fi
         cargo build --release --bin bench --features "$features"
         mkdir -p target/features/$set && cp target/release/bench target/features/$set/bench
-        commands+=(-n $set "target/features/$set/bench {{benchmark}}.bin {{times}}")
+        commands+=(-n $set "target/features/$set/bench working/{{benchmark}}.bin {{times}}")
     done
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}-features.md "${commands[@]}"
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-features.md "${commands[@]}"
 
 # `hyperfine-features` over HYPERFINES, then every comparison's table.
 hyperfines-features +sets:
     #!/usr/bin/env bash
     set -euo pipefail
     for run in {{HYPERFINES}}; do just hyperfine-features ${run%:*} ${run#*:} {{sets}}; done
-    for run in {{HYPERFINES}}; do echo "${run%:*} ${run#*:}"; tail -n +3 hyperfine-${run%:*}-${run#*:}-features.md; done
+    for run in {{HYPERFINES}}; do echo "${run%:*} ${run#*:}"; tail -n +3 working/hyperfine-${run%:*}-${run#*:}-features.md; done
 
 # `hyperfine-vs ref` over HYPERFINES, then every comparison's table.
 hyperfines-vs ref:
     #!/usr/bin/env bash
     set -euo pipefail
     for run in {{HYPERFINES}}; do just hyperfine-vs {{ref}} ${run%:*} ${run#*:}; done
-    for run in {{HYPERFINES}}; do tail -n 4 hyperfine-${run%:*}-${run#*:}-vs-{{ref}}.md; done
+    for run in {{HYPERFINES}}; do tail -n 4 working/hyperfine-${run%:*}-${run#*:}-vs-{{ref}}.md; done
     python3 tools/bench_history.py report
 
 all: test benchmarks (hyperfine "binarytrees")

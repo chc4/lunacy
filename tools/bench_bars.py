@@ -11,7 +11,7 @@ and lua5.5 lack the bit library some benchmarks use) is marked n/a. `--builds`
 picks the implementations (the interpreter's times, an order of magnitude past
 the rest, set the scale when it's drawn); `--clamp`'s (lua5.1 and lua5.5 by
 default) don't set it past 1.5 times the rest's highest, a bar past the top cut
-under a hat with its time. Writes bench/bars.html.
+under a hat with its time. Writes working/bars.html.
 """
 import argparse
 import html
@@ -117,7 +117,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--builds', default=','.join(ORDER), help='the implementations, comma separated, in bar order')
     ap.add_argument('--clamp', default='lua5.1,lua5.5', help="the implementations, comma separated, whose bars don't set the scale past 1.5 times the rest's highest")
-    ap.add_argument('--out', default='bench/bars.html')
+    ap.add_argument('--out', default='working/bars.html')
     args = ap.parse_args()
     builds = args.builds.split(',')
     data, info = series()
@@ -141,6 +141,7 @@ body {{ background: var(--bg); color: var(--fg); font: 14px system-ui, sans-seri
 <div class="scroll">{table(data, info, builds)}</div>
 </body></html>
 '''
+    os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     with open(args.out, 'w') as f:
         f.write(page)
     print(args.out)

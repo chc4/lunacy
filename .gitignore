@@ -1,14 +1,10 @@
 /target
-*.bin
-*.pdf
-*.dot
+# What the Justfile's recipes make: bytecode, reports, profiles, dumps, charts.
+/working
+# The golden tests' bytecode, left behind by a test that crashed.
+lua_tests/*.bin
 Cargo.lock
 flake.lock
 .gdb_history
 rustc-ice*
-hyperfine*-vs-*
-hyperfine*-traces.md
-window_dump.txt
-hyperfine-*.json
-bench/history.html
-bench/bars.html
+__pycache__/

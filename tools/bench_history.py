@@ -11,7 +11,7 @@ changes to what builds it, its HEAD marked dirty.
 `report` prints, per benchmark and build, the latest commit's time, the
 current dirty one's, the best and the first recorded, flagging a time worse
 than the best or the commit before it by more than noise. `plot` writes the
-same history as an HTML page of charts, one per benchmark (bench/history.html):
+same history as an HTML page of charts, one per benchmark (working/history.html):
 each commit's runs as a box and whiskers per build, in commit order, and the
 dirty ones apart. `attach-times` adds the runs' times to results recorded
 without them, from the hyperfine exports they came from.
@@ -26,7 +26,7 @@ import sys
 from collections import defaultdict
 
 HISTORY = 'bench/history.jsonl'
-PAGE = 'bench/history.html'
+PAGE = 'working/history.html'
 # What builds the benchmarked binaries: a change elsewhere doesn't make a run
 # dirty.
 BUILD_PATHS = ['src', 'Cargo.toml', 'Cargo.lock', 'build.rs']
@@ -112,7 +112,7 @@ def attach_times(args):
             build = r['command'][len('ref '):] if r['command'].startswith('ref ') else r['command']
             for line in lines:
                 if 'times' not in line and line['build'] == build and line['mean'] == r['mean'] \
-                        and path.startswith(f"hyperfine-{line['benchmark']}-{line['arg']}"):
+                        and os.path.basename(path).startswith(f"hyperfine-{line['benchmark']}-{line['arg']}"):
                     line['times'] = r['times']
                     attached += 1
     with open(HISTORY, 'w') as f:
@@ -347,6 +347,7 @@ table {{ border-collapse: collapse; margin: 8px 0 24px; }} td, th {{ padding: 2p
 {"".join(sections)}
 </body></html>
 '''
+    os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     with open(args.out, 'w') as f:
         f.write(page)
     print(args.out)
