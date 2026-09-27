@@ -1590,6 +1590,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LBoxed::NIL);
+        // The global `_G` is the global environment, as Lua's base library sets it.
+        let env = LBoxed::box_lvalue(LValue::Table(_G.clone()));
+        _G.set(owner, LBoxed::box_lvalue(InternString::intern(intern, "_G")), env, intern);
 
         let mut spec = Specializer::new(clos.clone());
         let mut state = {
