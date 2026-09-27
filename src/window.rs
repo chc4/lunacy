@@ -429,18 +429,7 @@ macro_rules! windowed {
             fn arity(&self) -> usize { Self::ARITY }
             fn stencil(&self, skip: usize) -> usize {
                 assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
-                match skip {
-                    0 => Self::__stencil::<0> as *const () as usize,
-                    1 => Self::__stencil::<1> as *const () as usize,
-                    2 => Self::__stencil::<2> as *const () as usize,
-                    3 => Self::__stencil::<3> as *const () as usize,
-                    4 => Self::__stencil::<4> as *const () as usize,
-                    5 => Self::__stencil::<5> as *const () as usize,
-                    6 => Self::__stencil::<6> as *const () as usize,
-                    7 => Self::__stencil::<7> as *const () as usize,
-                    8 => Self::__stencil::<8> as *const () as usize,
-                    _ => unreachable!(),
-                }
+                Self::__stencil_at(skip)
             }
             fn next(&self) -> usize { Self::__next as *const () as usize }
             unsafe fn run<'src, 'intern>(
@@ -469,6 +458,22 @@ macro_rules! windowed {
         }
     };
     (@stencil window, [$($cap:ident : $cty:ty),*]) => {
+            /// The stencil running at `skip`.
+            fn __stencil_at(skip: usize) -> usize {
+                match skip {
+                    0 => Self::__stencil::<0> as *const () as usize,
+                    1 => Self::__stencil::<1> as *const () as usize,
+                    2 => Self::__stencil::<2> as *const () as usize,
+                    3 => Self::__stencil::<3> as *const () as usize,
+                    4 => Self::__stencil::<4> as *const () as usize,
+                    5 => Self::__stencil::<5> as *const () as usize,
+                    6 => Self::__stencil::<6> as *const () as usize,
+                    7 => Self::__stencil::<7> as *const () as usize,
+                    8 => Self::__stencil::<8> as *const () as usize,
+                    _ => unreachable!(),
+                }
+            }
+
             /// The stencil running at `SKIP`.
             pub extern "rust-preserve-none" fn __stencil<'b, 'src, 'intern, const SKIP: usize>(
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
@@ -521,6 +526,12 @@ macro_rules! windowed {
             }
     };
     (@stencil frame, [$($cap:ident : $cty:ty),*]) => {
+            /// The stencil, which only runs at `SKIP` 0.
+            fn __stencil_at(skip: usize) -> usize {
+                assert_eq!(skip, 0, "a frame op runs at SKIP 0");
+                Self::__stencil::<0> as *const () as usize
+            }
+
             /// The stencil, at `SKIP` 0 into an empty window: see `windowed!(frame ..)`.
             pub extern "rust-preserve-none" fn __stencil<'b, 'src, 'intern, const SKIP: usize>(
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,

@@ -389,9 +389,29 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit) {
 /// slot, rather than `PushFrame` with a loop.
 const INLINE_NILS: usize = 16;
 
+/// The frame op `$op`, its const params `$pre` then a `Count` of each of
+/// `$counts` (see Note [Frame ops] in `generator`), made from `$args`.
+macro_rules! frame_op {
+    ($op:ident [$($pre:tt)*] ($($args:expr),*);) => {
+        Rc::new(crate::generator::$op::<$($pre)*>::new($($args,)* &[])) as Rc<dyn Window>
+    };
+    ($op:ident [$($pre:tt)*] ($($args:expr),*); $count:expr $(, $rest:expr)*) => {
+        match crate::generator::Count::of($count) {
+            crate::generator::Count::Zero => frame_op!($op [$($pre)* { crate::generator::Count::Zero },] ($($args),*); $($rest),*),
+            crate::generator::Count::One => frame_op!($op [$($pre)* { crate::generator::Count::One },] ($($args),*); $($rest),*),
+            crate::generator::Count::Many => frame_op!($op [$($pre)* { crate::generator::Count::Many },] ($($args),*); $($rest),*),
+        }
+    };
+}
+
+/// A frame op's stencil, copied at `SKIP` 0, or, in a build that copies none, a
+/// call running its body. See Note [Frame ops] in `generator`.
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
     match stencils.body(&**op, 0) {
         Ok(body) => splat(ops, &body, &op.captures(), pool),
+        // Debug builds' stencils can keep what optimized ones fold away, but an
+        // optimized frame op the copier rejects is a bug to fix.
+        Err(e) if !matches!(e, StencilError::Disabled) && !cfg!(debug_assertions) => panic!("{}: {e}", op.name()),
         Err(_) => {
             let (data, vtable) = (Rc::as_ptr(op) as *const dyn Window).to_raw_parts();
             let vtable: *const () = unsafe { core::mem::transmute(vtable) };
@@ -1672,11 +1692,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // nilled here, a store a slot, but for a big one, which
                             // `PushFrame` nils, as it does past a count up to the top.
                             let packed_ret = ReturnLocation(BlockId(id.0), off + 1).pack();
-                            let (ret, abcs) = (packed_ret.bits() as u64, *a as u64 | (*b as u64) << 16 | (*c as u64) << 32 | (*stack as u64) << 48);
+                            let hold = |count: u16| crate::generator::Count::hold(count) as u64;
+                            let (ret, abcs) = (packed_ret.bits() as u64, hold(*a) | hold(*b) << 16 | hold(*c) << 32 | (*stack as u64) << 48);
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
-                            let push: Rc<dyn Window> = match nils {
-                                Some(_) => Rc::new(crate::generator::PushFrame::<false>::new(ret, abcs, &[])),
-                                None => Rc::new(crate::generator::PushFrame::<true>::new(ret, abcs, &[])),
+                            let push = match nils {
+                                Some(_) => frame_op!(PushFrame [false,] (ret, abcs); *a, *b, *c),
+                                None => frame_op!(PushFrame [true,] (ret, abcs); *a, *b, *c),
                             };
                             jit_note!(self.jctx, ops, "        PushFrame");
                             emit_frame_op(ops, &mut self.jctx.stencils, pool, &push);
@@ -1815,11 +1836,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Ret(pc, a, b, closes) => {
                     // The frame, popped by `PopFrame`, and the JIT code left with
                     // where the caller continues. See Note [Frame ops] in `generator`.
-                    let (at, ab) = (id.0 as u64 | (off as u64) << 32, *a as u64 | (*b as u64) << 16);
-                    let pop: Rc<dyn Window> = if *closes {
-                        Rc::new(crate::generator::PopFrame::<true>::new(at, ab, &[]))
+                    let hold = |count: u16| crate::generator::Count::hold(count) as u64;
+                    let (at, ab) = (id.0 as u64 | (off as u64) << 32, hold(*a as u16) | hold(*b) << 16);
+                    let pop = if *closes {
+                        frame_op!(PopFrame [true,] (at, ab); *a as u16, *b)
                     } else {
-                        Rc::new(crate::generator::PopFrame::<false>::new(at, ab, &[]))
+                        frame_op!(PopFrame [false,] (at, ab); *a as u16, *b)
                     };
                     jit_note!(self.jctx, ops, "        PopFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &pop);

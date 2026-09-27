@@ -1353,7 +1353,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     {
         let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
         let stack = unsafe { (*lclos.ro(owner).prototype).max_stack };
-        self.push_frame(owner, ret, a, b, c, stack, true)
+        self.push_frame(owner, ret, a as usize, b as usize, c as usize, stack, true)
     }
 
     /// `call_lua`, inlined into the window op pushing a frame in JIT code
@@ -1365,13 +1365,13 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// anything reads the stack or marks it. `stack` is the callee's
     /// `max_stack`, which the caller knows.
     #[inline(always)]
-    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: u16, b: u16, c: u16, stack: u8, fills: bool) -> usize {
-        let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
+    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, c: usize, stack: u8, fills: bool) -> usize {
+        let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unreachable!() };
         debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "a call's frame size isn't its callee's");
         let ret_loc = ReturnLocation::unpack(ret);
         // record call stack: we say where to return to and where to put the values
         let next_stack = stack as usize;
-        let next_base = self.base + a as usize + 1;
+        let next_base = self.base + a + 1;
         // The max-extent over the caller and its own ancestors, restored on return so
         // the stack (and the GC's mark range) shrinks back as frames pop. See Note
         // [Stack frames].
@@ -1379,7 +1379,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         // Its arguments are `b - 1` values, or up to the top, in the caller's
         // frame; the rest of its frame is nilled, so the stack only needs to be
         // long enough.
-        let passed = if b == 0 { self.top } else { next_base + b as usize - 1 };
+        let passed = if b == 0 { self.top } else { next_base + b - 1 };
         let end = next_base + next_stack;
         debug_assert!(passed <= self.vals.len(), "arguments past the stack");
         if end > self.vals.len() {
@@ -1395,10 +1395,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             ret: ret_loc,
             frame: self.base,
             limit,
-            rloc: self.base + a as usize,
+            rloc: self.base + a,
             witness_frame: self.witness_base,
             witness_top: self.witness_top,
-            c
+            c: c as u16,
         });
         self.base = next_base;
         // Start `top` at the end of the callee's register file.

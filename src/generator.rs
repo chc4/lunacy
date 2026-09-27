@@ -1793,25 +1793,66 @@ windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
 // `state.callstack` whichever pushed it, so a bailout out of JIT code finds
 // it there. A return leaves its JIT code with where its caller continues,
 // which `PopFrame` writes to `state.exit` for the `Ret` to load.
+//
+// The ops' A, B and C each have a const `Count`: whether it is 0, 1 or more,
+// so that an op's stencil has the branches on them (a count up to the top, one
+// result, none) decided. 0 and 1 are constants, and more is in the op's hole,
+// less 2, so the stencil knows it is more than 1 by adding 2 back
+// (`Count::hold`, `Count::lift`).
+
+/// Which of 0, 1, or more a frame op's A, B or C is (Note [Frame ops]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
+pub enum Count {
+    Zero,
+    One,
+    Many,
+}
+
+impl Count {
+    pub fn of(value: u16) -> Count {
+        match value {
+            0 => Count::Zero,
+            1 => Count::One,
+            _ => Count::Many,
+        }
+    }
+
+    /// What an op's hole holds for `value`: past 1, `value - 2`.
+    pub fn hold(value: u16) -> u16 {
+        value.saturating_sub(2)
+    }
+
+    /// The value, of this count, a hole holding `held` (`hold`) stands for.
+    pub fn lift(self, held: u16) -> usize {
+        match self {
+            Count::Zero => 0,
+            Count::One => 1,
+            Count::Many => held as usize + 2,
+        }
+    }
+}
 
 // `call_lua` for a call of R(A), `abcs` its `a | b << 16 | c << 32 | stack << 48`
-// (`stack` the callee's `max_stack`), returning to `ret` (a `PackedLocation`),
+// (A, B and C as `Count::hold` holds them, `stack` the callee's `max_stack`),
+// returning to `ret` (a `PackedLocation`),
 // nilling the callee's frame if `FILLS` (else the JIT code does). See Note [Frame
 // ops].
-windowed!(frame PushFrame, [ret: u64, abcs: u64], [FILLS: bool], |owner, state, base| () {
-    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), abcs as u16, (abcs >> 16) as u16, (abcs >> 32) as u16, (abcs >> 48) as u8, FILLS);
+windowed!(frame PushFrame, [ret: u64, abcs: u64], [FILLS: bool, A: Count, B: Count, C: Count], |owner, state, base| () {
+    let (a, b, c) = (A.lift(abcs as u16), B.lift((abcs >> 16) as u16), C.lift((abcs >> 32) as u16));
+    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), a, b, c, (abcs >> 48) as u8, FILLS);
 });
 
 // A `Ret` at `off` in `block`, `at` their `block | off << 32` and `ab` its
-// `a | b << 16`, closing upvalues if `CLOSES`: `do_return`, `state.exit` where
+// `a | b << 16` (as `Count::hold` holds them), closing upvalues if `CLOSES`: `do_return`, `state.exit` where
 // the caller continues, or -2 from the entry frame. See Note [Frame ops].
-windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool], |owner, state, base| () {
+windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, A: Count, B: Count], |owner, state, base| () {
     let (block, off) = (at as u32, (at >> 32) as u16);
+    let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
     state.exit = if state.callstack.is_empty() {
         state.current_off = off;
         ((-2i32 as u64) << 32) | block as u64
     } else {
-        match state.do_return(owner, ab as u16 as usize, (ab >> 16) as u16 as usize, CLOSES) {
+        match state.do_return(owner, a, b, CLOSES) {
             Ok(location) => location.pack().bits() as u64,
             // With a caller frame, `do_return` returns to it.
             Err(_) => unreachable!(),

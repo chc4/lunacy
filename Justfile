@@ -375,7 +375,9 @@ interpreter-test name: interpreter-compile (_luac-test name)
 # Disassemble a window op's stencil at SKIP 0 as the `unsafe` profile builds it,
 # in this checkout, or at revision `ref` (built in target/compare/<ref>, its
 # submodules linked to this checkout's, as for `hyperfine-vs`). For example
-# `just stencil-asm SetTableInteger`.
+# `just stencil-asm SetTableInteger`, or with its const params as its demangled
+# symbol names them, `just stencil-asm 'PopFrame<false,
+# {lunacy::generator::Count::Many}, {lunacy::generator::Count::Many}>'`.
 stencil-asm op ref='':
     #!/usr/bin/env bash
     set -euo pipefail
@@ -385,8 +387,12 @@ stencil-asm op ref='':
         just _compare-worktree {{ref}}
     fi
     (cd $dir && cargo build --profile unsafe --no-default-features --features unsafe --bin bench -Z build-std="core,std,panic_abort")
-    read start size < <(objdump -t -C $dir/target/unsafe/bench | awk '/{{op}}>::__stencil::<0>$/ {print $1, $5}')
-    objdump -d -C --no-show-raw-insn --start-address=0x$start --stop-address=$((0x$start + 0x$size)) $dir/target/unsafe/bench | grep -E '^ +[0-9a-f]+:'
+    # Demangled by the `demangle` bin: objdump's -C leaves v0 symbols with enum
+    # const generics mangled.
+    cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
+    demangle=target/jit_disasm/release/demangle
+    read start size < <(objdump -t $dir/target/unsafe/bench | $demangle | awk -v op='{{op}}>::__stencil::<0>' 'substr($0, length($0) - length(op) + 1) == op {print $1, $5}')
+    objdump -d --no-show-raw-insn --start-address=0x$start --stop-address=$((0x$start + 0x$size)) $dir/target/unsafe/bench | $demangle | grep -E '^ +[0-9a-f]+:'
 
 unsafe-compile:
     cargo build --profile unsafe --no-default-features --features unsafe --bin bench \
