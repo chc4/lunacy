@@ -42,6 +42,11 @@ test-stencils:
     cargo test --features check_windows --test golden_tests {{STENCIL_OPT}}
     cargo test --features immediate_jit --test golden_tests {{STENCIL_OPT}}
 
+# Golden tests, each against its expected output, under the default build,
+# immediate_jit, no_dynamic_guards and both (tools/golden_builds.py).
+golden-builds +tests:
+    python3 tools/golden_builds.py {{tests}}
+
 # Runs of window residuals in a benchmark (docs/jit-register-cache.md): run it on
 # the LBBV interpreter tier (every block entry counted, none hidden by the JIT)
 # with the `graph` dump (working/func_*.dot), then list each function's blocks
