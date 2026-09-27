@@ -1406,11 +1406,12 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
         }
         self.clos.mark(owner);
         self._G.mark(owner);
-        for upval in self.upvals.iter() {
-            // We only need to mark closed upvalues, because open ones were marked on the value
-            // stack.
-            if let Upvalue::Closed(o) = &upval.0 {
-                o.mark(owner);
+        // The open upvalues' cells, which `close_upvalues` closes when their frame
+        // returns: a closure capturing one may be garbage before then. Their values
+        // are the stack's, marked above.
+        for (_, cells) in self.upvals.iter() {
+            for cell in cells.iter() {
+                cell.mark(owner);
             }
         }
         // Our callstack isn't actually guaranteed to be accurate, because it could be lagging due
