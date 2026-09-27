@@ -75,6 +75,11 @@ def main():
     print('%-*s' % (width, 'op') + ''.join('%32s' % ('bytes insts copied (%s)' % b.split('/')[-2]) for b in binaries))
     for op in ops:
         print('%-*s' % (width, op) + ''.join('%32s' % ('%d %d %d' % f[op] if op in f else '-') for f in found))
+    # Totals over each binary's stencils, and over those every binary has.
+    common = [op for op in ops if all(op in f for f in found)]
+    for label, among in (('total', None), ('total (in every binary)', common)):
+        sums = [tuple(sum(f[op][i] for op in (among if among is not None else f)) for i in range(3)) for f in found]
+        print('%-*s' % (width, label) + ''.join('%32s' % ('%d %d %d' % s) for s in sums))
 
 
 if __name__ == '__main__':
