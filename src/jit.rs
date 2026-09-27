@@ -8,7 +8,7 @@ use crate::vm::{BlockId, LBoxed, LClosure, LType, LValue, PackedLocation, Return
 use crate::gc::{GcInner, GcCtx};
 use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
-use crate::generator::{Block, CType, Context, Residual, Specializer, SubPc};
+use crate::generator::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
 use crate::window_alloc::{plan_trace, Cache, Emit, Packed, Placement, Step, WindowAlloc};
 use crate::trace::{Block as TraceBlock, Event, Policy, Region, Slots};
@@ -178,6 +178,27 @@ impl JitHelper {
                 }
                 _ => 0,
             }
+        }
+    }
+
+    /// A `LuaCall` from JIT code compiled before its callee's version had code:
+    /// the version's code if it has some now, its frame pushed, else as
+    /// `dynamic_call`, so the call reaches its version's code once that is
+    /// compiled. `ret` names the call, as the residual before it. See Note [Call
+    /// sites].
+    pub unsafe extern "C" fn lua_call(spec: *mut (), state: *mut (), ret: u64, a: u16, b: u16, c: u16) -> usize {
+        unsafe {
+            let specializer = &mut *(spec as *mut Specializer<'static, 'static>);
+            let (block, call) = ((ret & 0xffff_ffff) as usize, (ret >> 32) as usize - 1);
+            if let Residual::LuaCall { entry: CallEntry::Block(entry), .. } = &specializer.blocks[block].instructions[call] {
+                if let Some(code) = specializer.blocks[entry.0].jit_info.entry {
+                    let state = &mut *(state as *mut RunState<'static, 'static>);
+                    let owner = crate::forge_owner();
+                    state.call_lua(owner, ReturnLocation(BlockId(block), call + 1).pack(), a, b, c);
+                    return code as usize;
+                }
+            }
+            Self::dynamic_call(spec, state, ret, a, b, c)
         }
     }
 
@@ -1275,7 +1296,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // A call to whatever slot `a` holds, through `JitHelper::dynamic_call`: a
         // native has run, a Lua function's JIT entry is called with its frame
         // pushed, and anything else bails out for the interpreter to call.
-        let emit_dynamic_call = |ops: &mut Assembler, off: usize, a: u16, b: u16, c: u16| {
+        // `helper` is `dynamic_call`, or `lua_call` for a `LuaCall`, which takes the call's
+        // version if it has code by then.
+        let emit_dynamic_call = |ops: &mut Assembler, off: usize, a: u16, b: u16, c: u16, helper: usize| {
             let ret = ((off as u64 + 1) << 32) | id.0 as u64;
             dynasm!(ops
                 ; .arch x64
@@ -1285,7 +1308,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; mov ecx, a as i32
                 ; mov r8d, b as i32
                 ; mov r9d, c as i32
-                ; call extern (JitHelper::dynamic_call as *const () as usize)
+                ; call extern (helper)
                 ; cmp rax, 1
                 ; je >done
                 ; test rax, rax
@@ -1539,16 +1562,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; no_trap:
                     );
                 },
-                Residual::LuaCall { lclos, a, b, c } => {
-                    // Look up a JIT block for the callee's entrypoint with no known types.
-                    // Any miss (callee never specialized, no matching version, or not yet
-                    // compiled) falls through to a bailout below.
-                    let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack.into() };
-                    let ctx = Rc::new(Context::new(vec![LType::Unknown; next_stack]));
-                    let entry: Option<*const ()> = self.versions
-                        .get(&lclos.ro(owner).prototype)
-                        .and_then(|versions| versions.get(&(SubPc::new(0), ctx)))
-                        .and_then(|block| self.blocks[block.0].jit_info.entry.map(|f| f as *const _));
+                Residual::LuaCall { entry, a, b, c } => {
+                    // The callee's version's code, if the call has found it and it has
+                    // some; else the call goes as one to a function the JIT doesn't
+                    // know. See Note [Call sites].
+                    let entry: Option<*const ()> = match entry {
+                        CallEntry::Block(block) => self.blocks[block.0].jit_info.entry.map(|f| f as *const _),
+                        CallEntry::Context(_) => None,
+                    };
                     match entry {
                         Some(entry) => {
                             // Return location for this call site, packed to a single word.
@@ -1583,8 +1604,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // Reload the correct base ptr for the remainder of our function
                             );
                         },
-                        // Not compiled yet: look again at run time.
-                        None => emit_dynamic_call(ops, off, *a, *b, *c),
+                        // Not found or not compiled yet: look again at run time.
+                        None => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::lua_call as *const () as usize),
                     }
                 },
                 Residual::NativeCall { nf, a, b, c } => {
@@ -1652,7 +1673,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         );
                     }
                 },
-                Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c),
+                Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize),
                 Residual::Jump(target) => {
                     // If the block ends in a jump, and the block hasn't already been emitted, then
                     // we can elide a jump and instead fallthrough. We will use the target as

@@ -271,7 +271,8 @@ impl std::fmt::Display for Residual {
             Residual::Jump(target) => write!(f, "jump({})", target.0),
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
             Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
-            Residual::LuaCall { lclos, a, b, c } => write!(f, "lcall({:p}, {}, {}, {})", lclos, a, b, c),
+            Residual::LuaCall { entry: CallEntry::Block(block), a, b, c } => write!(f, "lcall({}, {}, {}, {})", block.0, a, b, c),
+            Residual::LuaCall { entry: CallEntry::Context(_), a, b, c } => write!(f, "lcall(?, {}, {}, {})", a, b, c),
             Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
             Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
             Residual::Thunk(_) => write!(f, "thunk"),
@@ -1834,9 +1835,79 @@ pub enum Residual {
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
-    LuaCall { lclos: Tc<LClosure<'static, 'static>>, a: u16, b: u16, c: u16 },
+    /// A call to the Lua function in R(A), whose prototype a `LuaGuard` or the
+    /// context knows, entering its version `entry`. See Note [Call sites].
+    LuaCall { entry: CallEntry, a: u16, b: u16, c: u16 },
     LuaGuard { idx: usize, ptr: *const () },
     GC,
+}
+
+/// Where a `LuaCall` enters its callee. See Note [Call sites].
+#[derive(Debug, Clone)]
+pub enum CallEntry {
+    /// Not found yet: the callee's version for this context, found when the
+    /// call first runs.
+    Context(Rc<Context>),
+    /// The callee's version.
+    Block(BlockId),
+}
+
+// Note [Call sites]
+// ~~~~~~~~~~~~~~~~~
+// A call ends its block in a thunk (`make_call_thunk`), the code after it a
+// version of its own, unless the context knows the callee is a native, which
+// runs in the block. Run, the thunk lays out the call for the function it finds
+// in R(A):
+//
+//   a Lua function:  lua_guard(prototype), thunk(next), lcall(entry), jump(after)
+//   a native:        native_guard(function), thunk(next), ncall, gc, jump(after)
+//   past the limit:  call, gc, jump(after)
+//
+// with no guard for a Lua function the context knows. A guard's failure is a
+// thunk for the next function, so the chain guards one more each time a call
+// finds a new one, up to `MAX_VERSIONS`; past that, the call is generic
+// (`Residual::Call`), as it is for what isn't a function. A discovery thunk
+// finding a function in a register, as when a call's callee is unknown, guards
+// the identities of up to `MAX_VERSIONS` of them the same way.
+//
+// `lcall` enters a version of the callee specialized to its arguments
+// (`entry_context`): the parameters have the caller's types of the arguments
+// passed, and nil's where the call passes none, as `call_lua` writes nil there.
+// The callee's other registers are unknown, and it starts with no hash keys and
+// no fragile information: hash keys index the caller's witnesses, which the
+// callee's frame doesn't have, so shapes become tables, and fragile facts name
+// the caller's slots and upvalues. A call passing up to a top the context
+// doesn't know, or to a vararg function, enters the generic version, every
+// register unknown.
+//
+// The version is found when the `lcall` first runs (`CallEntry`), not while
+// specializing, which would compile callees of calls that never run, and a
+// recursive function forever. `version` gives one accepting the context, the
+// generic version at worst, so the call needs no guard of its own. The JIT
+// calls the version's code if it has some when the call is compiled, and
+// otherwise goes through `JitHelper::lua_call`, which takes the version's code
+// once it has some, and until then does as for a function it doesn't know: the
+// generic version's code, or an exit for the interpreter to call it. Any of
+// them accepts the call.
+
+/// The context a call in `caller`, of R(A) with operand B, enters the callee
+/// `proto` with. See Note [Call sites].
+fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize) -> Context {
+    let slots = proto.max_stack as usize;
+    let mut entry = Context::new(vec![LType::Unknown; slots]);
+    let passed = if b != 0 { Some(b - 1) } else { caller.top.map(|top| top.saturating_sub(a + 1)) };
+    let Some(passed) = passed.filter(|_| proto.is_vararg == 0) else { return entry };
+    for param in 0..(proto.param_count as usize).min(slots) {
+        entry.types[param] = if param >= passed {
+            CType::Type(LType::Nil)
+        } else {
+            match caller.slot(a + 1 + param) {
+                CType::Shape(_) => CType::Type(LType::Table),
+                ctype => ctype,
+            }
+        };
+    }
+    entry
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -2801,6 +2872,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
+    /// The context a jump in `ctx` to `dest_pc` carries: it forgets the types of
+    /// every register not holding a local in scope there (`forgotten`), which
+    /// lets paths that differ only in them share the target's version.
+    fn jumping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
+        let in_scope = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(dest_pc);
+        if let Some(in_scope) = in_scope {
+            let dead: Vec<(usize, CType)> = (in_scope..ctx.types.len())
+                .filter(|&idx| forgotten(&ctx.types[idx]))
+                .map(|idx| (idx, CType::Type(LType::Unknown)))
+                .collect();
+            if !dead.is_empty() {
+                Rc::make_mut(&mut ctx).set_types(owner, dead);
+            }
+        }
+        ctx
+    }
+
     /// A new, empty block starting at `pc` (see `Block::pc`).
     pub fn new_block(&mut self, pc: Pc) -> BlockId {
         self.blocks.push(Block::new(pc));
@@ -2880,7 +2968,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// answer it.
     /// With `field`, the slot was just loaded from that hash key's field
     /// (`FieldType`), whose type is the one found too. See Note [Field types].
-    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool) -> ThunkRef {
+    /// A thunk finding out the type of STACK[idx] for a guard of `expected`.
+    /// A function found gets its identity guarded too, unless the chain of
+    /// thunks this one is in guards `identities` of them already, `MAX_VERSIONS`
+    /// (Note [Call sites]).
+    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The thunk was forced, so now we know the runtime value and if it
@@ -2922,21 +3014,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else {
                 vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Guard { idx, known, expected: found.clone() };
             }
-            // Push the same thunk down for the next value that fails the guard
-            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected.clone(), field, pc, thunk_ctx.clone(), false);
-            vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk.clone()));
-            // If we're in the success block and the guarded value is a native function, we can
+            // If we're in the success block and the guarded value is a function, we can
             // also try to emit a guard to specialize the function value as well. This lets us
-            // specialize code like `local print = print; print("xyz");`.
-            let idx_ctype = state.vals[state.base + idx].unbox().ctypeof_();
-            if let CType::NativeFunction(nf) = &idx_ctype {
+            // specialize code like `local print = print; print("xyz");`. Up to MAX_VERSIONS
+            // of them: past that, the value is only a function. See Note [Call sites].
+            let idx_ctype = Some(state.vals[state.base + idx].unbox().ctypeof_())
+                .filter(|ctype| matches!(ctype, CType::NativeFunction(_) | CType::LuaFunction(_)))
+                .filter(|_| identities < MAX_VERSIONS);
+            let identities = identities + idx_ctype.is_some() as usize;
+            // Push the same thunk down for the next value that fails the guard
+            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected.clone(), field, pc, thunk_ctx.clone(), false, identities);
+            vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk.clone()));
+            if let Some(CType::NativeFunction(nf)) = &idx_ctype {
                 // We know this original value has the correct native function, and so can compile
                 // a block for it immediately.
-                forced_mut.types[idx] = idx_ctype.clone();
+                forced_mut.types[idx] = idx_ctype.clone().unwrap();
                 // A slot holding an upvalue's value tells of the upvalue: the native
                 // guard below checks both. See Note [Fragile information].
                 if let Some(upvalue) = forced_mut.holds(idx) {
-                    forced_mut.assume(Fragile::Upvalue { upvalue, ctype: idx_ctype.clone() });
+                    forced_mut.assume(Fragile::Upvalue { upvalue, ctype: idx_ctype.clone().unwrap() });
                 }
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
@@ -2950,9 +3046,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // much.
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
-            } else if let CType::LuaFunction(lclos) = &idx_ctype {
+            } else if let Some(CType::LuaFunction(lclos)) = &idx_ctype {
                 // Likewise we can do the same thing with statically known Lua functions
-                forced_mut.types[idx] = idx_ctype.clone();
+                forced_mut.types[idx] = idx_ctype.clone().unwrap();
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 let proto = lclos.ro(owner).prototype.cast();
                 vm.blocks[block_id.0].instructions.push(Residual::LuaGuard { idx, ptr: proto });
@@ -2964,6 +3060,56 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
 
             debug!("after compiling thunk, blocks look like {:?}", vm.blocks);
+        })))
+    }
+
+    /// The thunk a call to R(A) of the context `calling`, continuing at
+    /// `after`, ends its block in, or, not `appends`, a guard's failure is: run,
+    /// it lays out a call for the function in R(A), guarding its identity and
+    /// chaining a thunk for the next onto the guard's failure, while its chain
+    /// guards fewer than `MAX_VERSIONS` (`identities`); past that, or for what
+    /// isn't a function, a generic call. See Note [Call sites].
+    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, a: usize, b: usize, c: usize, after: BlockId, identities: usize, appends: bool) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            // In place, unless the thunk's JIT code can only be patched to a jump, or it
+            // is a guard's failure, with the rest of the layout after it. See Note
+            // [Thunk patching].
+            let block = if !appends || vm.compiled(block_id) {
+                let block = vm.new_block(vm.blocks[block_id.0].pc);
+                vm.jump_thunk(block_id, thunk_pc, block);
+                block
+            } else {
+                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
+                block_id
+            };
+            let (a16, b16, c16) = (a as u16, b as u16, c as u16);
+            let next = |vm: &Specializer| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), a, b, c, after, identities + 1, false));
+            let mut layout = vec![];
+            match state.vals[state.base + a].unbox() {
+                LValue::LClosure(lclos) if matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS => {
+                    let proto = lclos.ro(owner).prototype;
+                    if !matches!(calling.types[a], CType::LuaFunction(_)) {
+                        layout.push(Residual::LuaGuard { idx: a, ptr: proto.cast() });
+                        layout.push(next(vm));
+                    }
+                    let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
+                    layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16 });
+                },
+                LValue::NClosure(nf) if identities < MAX_VERSIONS => {
+                    layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
+                    layout.push(next(vm));
+                    layout.push(Residual::NativeCall { nf: nf.native(), a: a16, b: b16, c: c16 });
+                    // A native may allocate (a table, a string).
+                    layout.push(Residual::GC);
+                },
+                _ => {
+                    layout.push(Residual::Call { a: a16, b: b16, c: c16 });
+                    // It may call a native, which may allocate.
+                    layout.push(Residual::GC);
+                },
+            }
+            layout.push(Residual::Jump(after));
+            vm.blocks[block.0].instructions.extend(layout);
         })))
     }
 
@@ -3305,7 +3451,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         None => {
-                            let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, CType::Integer, None, pc, ctx.clone(), true));
+                            let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, CType::Integer, None, pc, ctx.clone(), true, 0));
                             self.end_block(block_id);
                             self.blocks[block_id.0].instructions.push(thunk);
                             return None;
@@ -3354,7 +3500,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         debug!("emitting discovery thunk");
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), None, pc, thunk_ctx, true));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), None, pc, thunk_ctx, true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -3384,7 +3530,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Record the type on the hash key too, unless the load overwrote
                         // the table's register and dropped its hash keys.
                         let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Type(LType::Unknown), live.then_some(href), pc, ctx.clone(), true));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Type(LType::Unknown), live.then_some(href), pc, ctx.clone(), true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -3439,6 +3585,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             } else {
                                 vec![]
                             };
+                            let calling = ctx.clone();
+                            let native = matches!(ctx.types[a], CType::NativeFunction(_));
                             if let CType::NativeFunction(nf) = &ctx.types[a] {
                                 if let Some(op) = window {
                                     Rc::make_mut(&mut ctx).effect(Effect::Write(a));
@@ -3454,20 +3602,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     // A native may allocate (a table, a string).
                                     self.blocks[block_id.0].allocates = true;
                                 }
-                            } else if let CType::LuaFunction(lclos) = &ctx.types[a] {
-                                // TODO: we should probably track the number of incoming edges, and
-                                // subtract that count from the initial hotness of the entry block.
-                                // Otherwise we will repeatedly bailout in the JIT as we trigger
-                                // hotness=0 top-down instead of bottom-up.
-                                self.blocks[block_id.0].instructions.push(Residual::LuaCall {
-                                    lclos: lclos.clone(), a: a as u16, b: b as u16, c: c as u16
-                                });
-                            } else {
-                                self.blocks[block_id.0].instructions.push(Residual::Call {
-                                    a: a as u16, b: b as u16, c: c as u16
-                                });
-                                // It may call a native, which may allocate.
-                                self.blocks[block_id.0].allocates = true;
                             }
                             // Any other callee runs code the specializer doesn't see. See
                             // Note [Fragile information].
@@ -3489,7 +3623,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 Rc::make_mut(&mut ctx).types[a] = result.clone();
                             }
                             Rc::make_mut(&mut ctx).top = (result.is_some() && c == 0).then_some(a + 1);
-                            return Some((pc.0 + 1, ctx, ResumeArg::Start));
+                            if native {
+                                return Some((pc.0 + 1, ctx, ResumeArg::Start));
+                            }
+                            // Any other call ends its block in a thunk laying out the call
+                            // for the function it finds, the code after it a version of
+                            // its own. See Note [Call sites].
+                            let after = self.jumping(owner, ctx, pc.0 + 1);
+                            let after = self.version(owner, pc.0 + 1, after);
+                            self.end_block(block_id);
+                            let thunk = self.make_call_thunk(block_id, calling, a, b, c, after, 0, true);
+                            self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                            return None;
                         },
                     }
                 },
@@ -3518,24 +3663,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Rc::make_mut(&mut ctx).set_types(owner, ty_effects)
                 },
                 CoroutineState::Yielded(YieldOp::GetBlock(dest_pc)) => {
-                    // The jump forgets the types of every register not holding a local in
-                    // scope at its target (`forgotten`), which lets paths that differ
-                    // only in them share the target's version.
-                    let mut ctx = ctx.clone();
-                    let in_scope = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(dest_pc);
-                    if let Some(in_scope) = in_scope {
-                        let dead: Vec<(usize, CType)> = (in_scope..ctx.types.len())
-                            .filter(|&idx| forgotten(&ctx.types[idx]))
-                            .map(|idx| (idx, CType::Type(LType::Unknown)))
-                            .collect();
-                        if !dead.is_empty() {
-                            Rc::make_mut(&mut ctx).set_types(owner, dead);
-                        }
-                    }
                     // TODO: compiling the target here recurses, and potentially blows the
                     // stack; this should probably push a thunk which compiles the block
                     // instead of a jump
-                    arg = ResumeArg::BlockId(self.version(owner, dest_pc, ctx));
+                    let jumping = self.jumping(owner, ctx.clone(), dest_pc);
+                    arg = ResumeArg::BlockId(self.version(owner, dest_pc, jumping));
                 },
                 CoroutineState::Yielded(YieldOp::Jump(dest_block)) => {
                     let dest_block = self.edge(owner, &ctx, dest_block);
@@ -3718,20 +3850,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     w.interp(owner, &mut state);
                     off += if state.select == 0 { 2 } else { 1 };
                 },
-                Residual::LuaCall { lclos, a, b, c } => {
+                Residual::LuaCall { entry, a, b, c } => {
+                    let (caller, call) = (id, off);
                     off += 1;
-                    // Safety: transmute the 'static lifetime back down. This is always shorter.
-                    let lclos: Tc<LClosure<'src, 'intern>> = unsafe { core::mem::transmute(lclos) };
-                    let next_stack = state.call_lua(owner, ReturnLocation(id, off).pack(), a, b, c);
-                    // Either use existing block, compile a new one, or use most
-                    // generic.
-                    let types = vec![LType::Unknown; next_stack];
-                    let ctx = Rc::new(Context::new(types));
-                    self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
-                    self.set_current(lclos.clone());
-                    let block = self.version(owner, 0, ctx);
-                    debug!("{:?} {block:?}", self.blocks);
-                    self.set_current(lclos.clone());
+                    state.call_lua(owner, ReturnLocation(id, off).pack(), a, b, c);
+                    // The closure called, which may be another of the prototype the
+                    // guard checked.
+                    let callee = state.clos.clone();
+                    self.set_current(callee.clone());
+                    let block = match entry {
+                        CallEntry::Block(block) => block,
+                        // Found now, once. See Note [Call sites].
+                        CallEntry::Context(ctx) => {
+                            self.versions.entry(callee.ro(owner).prototype).or_insert_with(|| HashMap::default());
+                            let block = self.version(owner, 0, ctx);
+                            self.set_current(callee.clone());
+                            self.blocks[caller.0].instructions[call] = Residual::LuaCall { entry: CallEntry::Block(block), a, b, c };
+                            block
+                        },
+                    };
                     id = block;
                     off = 0;
                     continue;
