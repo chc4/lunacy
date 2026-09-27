@@ -1162,45 +1162,25 @@ impl ReturnLocation {
 
 // Note [Stack frames]
 // ~~~~~~~~~~~~~~~~~~~~
-// A call frame occupies a contiguous span of the register file (`vals`) starting at
+// A call frame occupies `max_stack` slots of the register file (`vals`) from its
 // `base`; `RunState::top` is its dynamic Lua top (the variable-count-span cursor).
-// `call_lua` grows `vals` to fit the callee's `max_stack` and records the caller's
-// state in a `CallstackEntry`; a return pops it and restores that state
+// `call_lua` records the caller's state in a `CallstackEntry` and makes the stack
+// long enough for the callee's frame; a return pops it and restores that state
 // (`leave`), and the caller takes the results (`arrive`). See Note [Returns].
 //
-// The GC marks `0..vals.len()`, so `arrive` shrinks `vals` back down as frames pop,
-// or dead frames would be marked forever. The bound it must never cross is
-// `RunState::natural_max` = `max` over all *live* frames of `base_i + max_stack_i`:
-// truncating below that would strip registers a suspended outer frame still reads. A
-// per-frame `base + max_stack` is only one term of that max (a shallow callee nested
-// in a deeper stack sits below it), so it can't be used directly.
+// The stack's length only grows: it is the most any frame has reached, not what
+// is live. The GC marks the stack up to its live extent (`RunState::live_extent`):
+// the most of each live frame's `base + max_stack`, the running one's and each
+// caller's in the callstack, and of the top, which is past them while results a
+// call returned all of (C = 0) are still to be consumed. It is computed when the
+// GC runs, from the callstack, rather than kept on each call and return.
 //
-// `natural_max` follows call/return stack discipline: `call_lua` saves it as the
-// callee's `limit`, then grows it by the callee's frame; `leave` restores it from
-// `limit`, and `arrive` truncates `vals` to it.
-//
-// MULTRET results are the one thing that can sit *above* `natural_max`: a call
-// returning a variable count writes them from `rloc` up to `rloc + r_count`, which can
-// overshoot the caller's frame, so `arrive` truncates to `limit.max(rloc +
-// r_count)` to keep them. That overshoot is deliberately *not* recorded as any later
-// frame's `limit` (a `limit` is always a `natural_max`), so a subsequent return
-// truncates it away — and that is sound, not a leak of live data, because of a Lua
-// guarantee:
-//
-//   A multi-value expression is only ever consumed *in place* — as the trailing
-//   arguments of a call, the trailing items of a table constructor, or a function's
-//   return list. Lua has no syntax to bind the whole list to a name or to read it
-//   after an intervening call; `local a = f()` keeps only the first value.
-//
-// So consider `foo` doing `t = {multiret()}` (which inflates `vals` with the results
-// above foo's frame) and then calling `bar()`. By the time `bar` is called the results
-// have already been consumed by the `{...}` and are unreachable — nothing in `foo` can
-// name them across the `bar()` call. Hence `bar`'s return truncating `vals` back to
-// foo's `natural_max` cannot drop anything `foo` still uses; it just reclaims the dead
-// overshoot, which is what stops it lingering (and being GC-marked) for the rest of
-// foo's execution.
+// A slot past the live extent may hold what a returned frame left there, which
+// the GC doesn't mark, so it may name something freed. Nothing reads it: a slot
+// comes back within the live extent only in a callee's frame, which a call nils
+// past the arguments the caller wrote (`push_frame`).
 #[derive(Debug)]
-pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub limit: usize, pub witness_frame: usize, pub witness_top: usize }
+pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub witness_frame: usize, pub witness_top: usize }
 
 /// Where a frame's hash key was found in its table's hash part (its entry's
 /// index, and its value's address), and the table's epoch then. See Note
@@ -1239,15 +1219,10 @@ pub struct RunState<'src, 'intern> {
     pub base: usize,
     // Dynamic stack top (à la Lua's `L->top`): delimits variable-count spans
     // (MULTRET call args/results, SETLIST, vararg). Distinct from `vals`'s
-    // length, which is the register-file allocation and is never shrunk below a
-    // live frame. Fixed-register ops index `base + reg`; only the variable-count
+    // length, the most any frame has reached (Note [Stack frames]).
+    // Fixed-register ops index `base + reg`; only the variable-count
     // (`b == 0` / `c == 0`) handlers read up to `top`.
     pub top: usize,
-    // The largest register-file extent (`base + max_stack`) over all live frames.
-    // `vals` must never be truncated below this, or a suspended outer frame would
-    // lose registers it still reads. Maintained by `call_lua`/`leave` (saved as
-    // each frame's `limit`). See Note [Stack frames].
-    pub natural_max: usize,
     pub vals: ValueStack<'src, 'intern>,
     pub pc: usize,
     pub _G: Tc<Table<'src, 'intern>>,
@@ -1281,7 +1256,9 @@ impl<'src, 'intern> Debug for RunState<'src, 'intern> {
         f.debug_struct("RunState")
             .field("base", &self.base)
             .field("pc", &self.pc)
-            .field("vals", &self.vals)
+            // Up to the top, which is within the live extent: past it, a slot
+            // may name something freed. See Note [Stack frames].
+            .field("vals", &&self.vals[..self.top])
             .field("select", &self.select)
             .field("trap", &self.trap)
             .field("gas", &self.gas)
@@ -1379,13 +1356,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         // record call stack: we say where to return to and where to put the values
         let next_stack = stack as usize;
         let next_base = self.base + a + 1;
-        // The max-extent over the caller and its own ancestors, restored on return so
-        // the stack (and the GC's mark range) shrinks back as frames pop. See Note
-        // [Stack frames].
-        let limit = self.natural_max;
-        // Its arguments are `b - 1` values, or up to the top, in the caller's
-        // frame; the rest of its frame is nilled, so the stack only needs to be
-        // long enough.
+        // Its arguments are `b - 1` values, or up to the top, which the caller
+        // wrote; the rest of its frame is nilled, so the stack only needs to be
+        // long enough. See Note [Stack frames].
         let passed = if b == 0 { self.top } else { next_base + b - 1 };
         let end = next_base + next_stack;
         debug_assert!(passed <= self.vals.len(), "arguments past the stack");
@@ -1395,13 +1368,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         if fills && passed < end {
             self.nil_slots(passed, end);
         }
-        // The callee's frame extends the live max-extent while it runs.
-        self.natural_max = self.natural_max.max(next_base + next_stack);
         self.callstack.push(CallstackEntry {
             clos: self.clos.clone(),
             ret: ret_loc,
             frame: self.base,
-            limit,
             witness_frame: self.witness_base,
             witness_top: self.witness_top,
         });
@@ -1458,7 +1428,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let from = self.base + a;
         let count = if b == 0 { self.top - from } else { b - 1 };
         match self.callstack.pop() {
-            Some(CallstackEntry { clos, ret, frame, limit, witness_frame, witness_top }) => {
+            Some(CallstackEntry { clos, ret, frame, witness_frame, witness_top }) => {
                 // The function's slot, just below the frame.
                 let to = self.base - 1;
                 match count {
@@ -1471,8 +1441,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                 self.base = frame;
                 self.witness_base = witness_frame;
                 self.witness_top = witness_top;
-                // The callee frame is gone; the live max-extent is the caller's again.
-                self.natural_max = limit;
                 Ok(ret)
             },
             None => Err(from..from + count),
@@ -1481,9 +1449,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
     /// Take the results of the call of R(A) that returned (`leave`), the
     /// caller's half (Note [Returns]): exactly `c - 1`, padded with nil, or
-    /// with C = 0 all of them, up to the top. Then shrink the stack back to the
-    /// caller's extent, so the callee's frame stops being marked by the GC, but
-    /// for results past it with C = 0. See Note [Stack frames].
+    /// with C = 0 all of them, up to the top.
     ///
     /// Inlined into the window op for a call's results in JIT code (`Arrive`).
     #[inline(always)]
@@ -1499,7 +1465,23 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             }
             self.top = end;
         }
-        self.vals.truncate(if c == 0 { self.natural_max.max(self.top) } else { self.natural_max });
+    }
+
+    /// The stack's live extent, which the GC marks: the most of each live
+    /// frame's `base + max_stack`, the running one's and each caller's, and of
+    /// the top. See Note [Stack frames].
+    pub fn live_extent(&self, owner: &Owner) -> usize {
+        let end = |base: usize, clos: &Tc<LClosure<'src, 'intern>>| base + unsafe { (*clos.ro(owner).prototype).max_stack as usize };
+        let running = end(self.base, &self.clos).max(self.top);
+        let extent = self.callstack.iter().map(|call| end(call.frame, &call.clos)).fold(running, usize::max);
+        debug_assert!(extent <= self.vals.len(), "a live frame past the stack");
+        extent
+    }
+
+    /// The stack up to its live extent (`live_extent`), which, unlike past it,
+    /// names nothing freed.
+    pub fn live(&self, owner: &Owner) -> &[LBoxed<'src, 'intern>] {
+        &self.vals[..self.live_extent(owner)]
     }
 }
 
@@ -1513,7 +1495,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
 impl<'src, 'intern> Mark for RunState<'src, 'intern> {
     fn mark(&self, owner: &Owner) {
-        for val in self.vals.iter() {
+        for val in self.live(owner) {
             val.mark(owner);
         }
         self.clos.mark(owner);
@@ -1734,7 +1716,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             RunState {
                 base,
                 top,
-                natural_max: top,
                 witness_base,
                 witness_top: 0,
                 pc,

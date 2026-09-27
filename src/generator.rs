@@ -682,7 +682,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         if arg != ResumeArg::Matched {
             let have = yield YieldOp::Typeof(b);
             arg = yield YieldOp::Exec(ResidualExec::new("gettable_meta", Rc::new(move |owner, state| {
-                panic!("gettable_meta {:?} {:?} {:?}", &state.vals, &state.vals[state.base + b], have)
+                panic!("gettable_meta {:?} {:?} {:?}", state.live(owner), &state.vals[state.base + b], have)
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
             return arg;
@@ -826,7 +826,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     (LValue::LClosure(lc), LValue::InternedString(key)) if key.as_bytes() == b"__jit" => {
                         state.force_jit.push(lc.ro(owner).prototype);
                     },
-                    _ => panic!("settable_meta {:?}", state.vals),
+                    _ => panic!("settable_meta {:?}", state.live(owner)),
                 }
             })));
             arg = yield YieldOp::SetHazards(None, None);
@@ -1201,7 +1201,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         //panic!("Type mismatch trap");
         arg = yield YieldOp::Typeof(lhs);
         arg = yield YieldOp::Exec(ResidualExec::new("numeric_fail", Rc::new(move |owner, state| {
-            panic!("numeric runtime type mismatch {:?} {:?}", arg, state.vals)
+            panic!("numeric runtime type mismatch {:?} {:?}", arg, state.live(owner))
         })));
         arg
     }
@@ -1893,7 +1893,7 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         if arg != ResumeArg::Matched {
             arg = yield YieldOp::Exec(ResidualExec::new("call_meta", Rc::new(move |owner, state| {
                 debug!("??? {arg:?}");
-                panic!("call metamethod {} {:?} {:?}", a, &state.vals, &state.vals[state.base + a])
+                panic!("call metamethod {} {:?} {:?}", a, state.live(owner), &state.vals[state.base + a])
             })));
             return arg;
         }

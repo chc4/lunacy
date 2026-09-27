@@ -1739,8 +1739,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // so the two `&[LBoxed]` slice views arrive as (rdi=args ptr, rsi=args
                     // len, rdx=returns ptr, rcx=returns len); r13 is `&vals[base]`. `a/b/c`
                     // are compile-time constants, so specialize the lengths per site: a
-                    // fixed count when b/c are non-zero, else `vals.used - base - off` for
-                    // the "to top-of-stack" (0) shape. Then call the native directly.
+                    // fixed count when b/c are non-zero, else up to `RunState.top` for the
+                    // "to top-of-stack" (0) shape. Then call the native directly.
                     let (a, b, c) = (*a as i32, *b as i32, *c as i32);
                     if b == 0 {
                         dynasm!(ops
