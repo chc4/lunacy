@@ -327,10 +327,24 @@ gdb-unsafe benchmark: unsafe-compile
 
 
 # Hyperfine reports
-# lunacy's interpreter (no JIT), JIT and unsafe builds against Lua 5.1 and
-# LuaJIT, its interpreter alone (-joff) and with its JIT. Lua 5.1 has no `bit`, so its run
-# of a benchmark requiring it fails at once, and times nothing.
-hyperfine benchmark times='10': unsafe-compile interpreter-compile
+# lunacy's release and unsafe builds against LuaJIT, its interpreter alone
+# (-joff) and with its JIT, into the benchmark history (tools/bench_history.py).
+hyperfine benchmark times='10': unsafe-compile
+    just _luac {{benchmark}}
+    just _luajitc {{benchmark}}
+    cargo build --release --bin bench
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown hyperfine-{{benchmark}}-{{times}}.md \
+        --export-json hyperfine-{{benchmark}}-{{times}}.json \
+        -n "luajit -joff" "luajit -joff bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
+        -n luajit "luajit bench.lua -- {{benchmark}}.luajit.bin {{times}}" \
+        -n release "./target/release/bench {{benchmark}}.bin {{times}}" \
+        -n unsafe "./target/unsafe/bench {{benchmark}}.bin {{times}}"
+    python3 tools/bench_history.py record hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
+
+# `hyperfine`, with lunacy's interpreter (no JIT) and Lua 5.1 too, whose runs
+# take most of its time. Lua 5.1 has no `bit`, so its run of a benchmark
+# requiring it fails at once, and times nothing.
+hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
     cargo build --release --bin bench
@@ -466,6 +480,13 @@ hyperfines:
     #!/usr/bin/env bash
     set -euo pipefail
     for run in {{HYPERFINES}}; do just hyperfine ${run%:*} ${run#*:}; done
+    python3 tools/bench_history.py report
+
+# `hyperfine-full` over HYPERFINES.
+hyperfines-full:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do just hyperfine-full ${run%:*} ${run#*:}; done
     python3 tools/bench_history.py report
 
 # Compare this checkout's release build under each feature set in `sets`
