@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """The latest benchmark times as one grouped bar chart, as compiler papers draw
 them: a group of bars per benchmark, one per implementation (lua5.1, lua5.5,
-Luau without and with its native code generator, LuaJIT without and with its
-JIT, and this project's interpreter, release and unsafe builds), on one linear
-axis of seconds.
+Luau without and with its code generator (--codegen), LuaJIT without and with
+its JIT, and this project's interpreter, release and unsafe builds), on one
+linear axis of seconds.
 
 Each bar is the median of its runs, with a whisker across their quartiles,
 from the most recent clean commit the history (bench/history.jsonl, see
@@ -25,7 +25,7 @@ from bench_history import box, series, ordered, COLORS  # noqa: E402
 
 ORDER = ['lua5.1', 'lua5.5', 'luau', 'luau --codegen', 'luajit -joff', 'luajit', 'interpreter', 'release', 'unsafe']
 LABELS = {'luajit -joff': 'LuaJIT (interpreter)', 'luajit': 'LuaJIT', 'lua5.1': 'Lua 5.1', 'lua5.5': 'Lua 5.5',
-          'luau': 'Luau', 'luau --codegen': 'Luau (native)',
+          'luau': 'Luau', 'luau --codegen': 'Luau (codegen)',
           'interpreter': 'lunacy interpreter', 'release': 'lunacy release', 'unsafe': 'lunacy unsafe'}
 
 
