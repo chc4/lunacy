@@ -181,11 +181,11 @@ impl JitHelper {
         }
     }
 
-    /// A `LuaCall` from JIT code compiled before its callee's version had code:
-    /// the version's code if it has some now, its frame pushed, else as
-    /// `dynamic_call`, so the call reaches its version's code once that is
-    /// compiled. `ret` names the call, as the residual before it. See Note [Call
-    /// sites].
+    /// A `LuaCall` from JIT code compiled before its callee's version had code,
+    /// until the site is linked to it (Note [Call linking]), or whose version it
+    /// hadn't found: the version's code if it has some now, its frame pushed,
+    /// else as `dynamic_call`. `ret` names the call, as the residual before it.
+    /// See Note [Call sites].
     pub unsafe extern "C" fn lua_call(spec: *mut (), state: *mut (), ret: u64, a: u16, b: u16, c: u16) -> usize {
         unsafe {
             let specializer = &mut *(spec as *mut Specializer<'static, 'static>);
@@ -454,6 +454,13 @@ pub struct JitContext {
     /// The JIT entry of each prototype's all-unknown entry block, by the
     /// prototype's address, once it has one. See `JitHelper::dynamic_call`.
     lua_entries: HashMap<usize, JitExec, FxBuildHasher>,
+    /// The `LuaCall` sites of the region being compiled whose callee's version
+    /// has no code yet: the version, and the site's and its call's offsets in
+    /// the region. See Note [Call linking].
+    region_calls: Vec<(BlockId, usize, usize)>,
+    /// `LuaCall` sites to link once their callee's version has code, by the
+    /// version. See Note [Call linking].
+    call_waiting: HashMap<BlockId, Vec<CallSite>, FxBuildHasher>,
     /// How regions are partitioned into traces (`LUNACY_TRACES`), or `None` to
     /// allocate streaming instead: no plan, each op placing itself in the window
     /// it finds and each block entered with the window of the first jump to it,
@@ -468,6 +475,27 @@ struct JitPtr(*const u8);
 struct ThunkSite {
     at: usize,
     window: Cache,
+}
+
+// Note [Call linking]
+// ~~~~~~~~~~~~~~~~~~~
+// A `LuaCall` whose callee's version has code when the call is compiled calls
+// it directly. One whose version has none yet is compiled twice over: first a
+// `jmp rel32` to the call through `JitHelper::lua_call` (which takes the
+// version's code once it has some, else the generic version's or an exit), then
+// the direct call, pushing the frame with `call_lua` and calling the version with
+// a `call rel32` whose target is a placeholder. Once a region is compiled from
+// the version, and so it has code (`jit_info.entry`), each such site is linked:
+// its call's target becomes the version's code, then its jump the five-byte
+// nop, so it falls into the direct call from then on. Sites of the region being
+// compiled are linked with it, as a recursive call is to its own function.
+
+/// A `LuaCall` site in JIT code waiting for its callee's version to have code:
+/// where its jump to the call through `lua_call` is, and its direct call. See
+/// Note [Call linking].
+struct CallSite {
+    site: usize,
+    call: usize,
 }
 
 /// The window dump ends with how often each counted piece of allocator code
@@ -630,6 +658,8 @@ impl JitContext {
             region_base: 0,
             waiting: HashMap::default(),
             lua_entries: HashMap::default(),
+            region_calls: Vec::new(),
+            call_waiting: HashMap::default(),
             stencils: Stencils::default(),
             used: 0,
             perf_map,
@@ -891,6 +921,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
 
         self.blocks[id.0 as usize].jit_info.entry = Some(entrypoint);
+        // Calls waiting for this block to have code call it now, this region's
+        // too. See Note [Call linking].
+        for (block, site, call) in std::mem::take(&mut self.jctx.region_calls) {
+            let site = CallSite { site: slab as usize + site, call: slab as usize + call };
+            self.jctx.call_waiting.entry(block).or_default().push(site);
+        }
+        for site in self.jctx.call_waiting.remove(&id).unwrap_or_default() {
+            self.link_call(site, entrypoint);
+        }
+    }
+
+    /// Make the call site `site` call `code` directly. See Note [Call linking].
+    fn link_call(&mut self, site: CallSite, code: JitExec) {
+        // Emitted as a `jmp rel32` and a `call rel32`, which the patches replace.
+        assert!(unsafe { *(site.site as *const u8) == 0xe9 && *(site.call as *const u8) == 0xe8 }, "a call site's jump and call");
+        let rel = i32::try_from(code as isize - (site.call as isize + 5)).expect("a version's code within rel32 of a call to it");
+        let mut call = [0xe8, 0, 0, 0, 0];
+        call[1..].copy_from_slice(&rel.to_le_bytes());
+        // The call's target first, so the direct call is complete before the
+        // jump stops skipping it.
+        self.jctx.patch(site.call, &call);
+        self.jctx.patch(site.site, &NOP5);
     }
 
     /// The JIT entry of `lclos`'s all-unknown entry block, if it has one.
@@ -1563,20 +1615,31 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                 },
                 Residual::LuaCall { entry, a, b, c } => {
-                    // The callee's version's code, if the call has found it and it has
-                    // some; else the call goes as one to a function the JIT doesn't
-                    // know. See Note [Call sites].
-                    let entry: Option<*const ()> = match entry {
-                        CallEntry::Block(block) => self.blocks[block.0].jit_info.entry.map(|f| f as *const _),
+                    // The callee's version's code, if the call has found the version
+                    // and it has some; a version with none yet is linked when it has
+                    // some (Note [Call linking]); else the call goes as one to a
+                    // function the JIT doesn't know. See Note [Call sites].
+                    let version = match entry {
+                        CallEntry::Block(block) => Some(*block),
                         CallEntry::Context(_) => None,
                     };
-                    match entry {
-                        Some(entry) => {
+                    let code = version.and_then(|block| self.blocks[block.0].jit_info.entry);
+                    match version {
+                        None => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::lua_call as *const () as usize),
+                        Some(version) => {
+                            let site = ops.offset().0;
+                            if code.is_none() {
+                                dynasm!(ops
+                                    ; .arch x64
+                                    ; jmp >lua_call
+                                );
+                            }
                             // Return location for this call site, packed to a single word.
                             let packed_ret = ReturnLocation(BlockId(id.0), off + 1).pack();
                             // Pin the exact monomorphized address of the extern "C" call_lua.
                             let call_lua: extern "C" fn(&mut RunState<'src, 'intern>, &mut Owner, PackedLocation, u16, u16, u16) -> usize = RunState::call_lua;
                             dynasm!(ops
+                                ; .arch x64
                                 ; mov rdi, r12 // &mut RunState
                                 ; mov rsi, QWORD FORGED_OWNER // owner
                                 ; mov rdx, QWORD (packed_ret.bits() as i64)
@@ -1590,9 +1653,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
                                 ; mov rcx, QWORD r12 => RunState.base
                                 ; lea r13, [rax + rcx * 8]
-
-                                // state is already in r12
-                                ; call extern (entry as usize)
+                            );
+                            // state is already in r12
+                            match code {
+                                Some(code) => dynasm!(ops
+                                    ; .arch x64
+                                    ; call extern (code as usize)
+                                ),
+                                None => {
+                                    // A placeholder target, linked to the version's code.
+                                    self.jctx.region_calls.push((version, site, ops.offset().0));
+                                    dynasm!(ops
+                                        ; .arch x64
+                                        ; call >lua_call
+                                    );
+                                },
+                            }
+                            dynasm!(ops
+                                ; .arch x64
                                 ; mov r13, QWORD [rsp - 0]
 
                                 // Check if the call is trying to bailout: we propagate the bailout
@@ -1600,12 +1678,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // with a suspended ReturnLocation stack.
                                 ; cmp BYTE r12 => RunState.trap, 0
                                 ; jnz ->exit_jit
-
-                                // Reload the correct base ptr for the remainder of our function
                             );
+                            if code.is_none() {
+                                dynasm!(ops
+                                    ; .arch x64
+                                    ; jmp >lua_call_done
+                                    ; lua_call:
+                                );
+                                emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::lua_call as *const () as usize);
+                                dynasm!(ops
+                                    ; .arch x64
+                                    ; lua_call_done:
+                                );
+                            }
                         },
-                        // Not found or not compiled yet: look again at run time.
-                        None => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::lua_call as *const () as usize),
                     }
                 },
                 Residual::NativeCall { nf, a, b, c } => {
