@@ -1138,6 +1138,12 @@ impl PackedLocation {
     pub fn bits(self) -> usize {
         self.0
     }
+
+    /// The location `bits` are, as `bits` gives them.
+    #[inline(always)]
+    pub fn from_bits(bits: usize) -> Self {
+        PackedLocation(bits)
+    }
 }
 
 impl ReturnLocation {
@@ -1255,6 +1261,10 @@ pub struct RunState<'src, 'intern> {
     pub hash_witnesses: FVec<HashWitness>,
     pub trap: bool,
     pub current_off: u16,
+    /// What a return from JIT code leaves the JIT code with: where its caller
+    /// continues, `(off << 32) | block`, or -2 for a return from the entry
+    /// frame. `PopFrame` writes it. See Note [Frame ops] in `generator`.
+    pub exit: u64,
     pub gas: i64,
     /// Prototypes whose entry blocks `closure.__jit = ...` asked to compile, for
     /// `Specializer::run` to force (feature `magic`). See `emit_settable`.
@@ -1341,6 +1351,13 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     pub extern "C" fn call_lua(&mut self, owner: &mut Owner,
         ret: PackedLocation, a: u16, b: u16, c: u16) -> usize
     {
+        self.push_frame(owner, ret, a, b, c)
+    }
+
+    /// `call_lua`, inlined into the window op pushing a frame in JIT code
+    /// (`PushFrame`). See Note [Frame ops] in `generator`.
+    #[inline(always)]
+    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: u16, b: u16, c: u16) -> usize {
         let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
         let ret_loc = ReturnLocation::unpack(ret);
         // record call stack: we say where to return to and where to put the values
@@ -1381,13 +1398,28 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
+    /// Move `count` results from `from` to `wanted` slots from `rloc`, padded
+    /// with nil. Out of line from `do_return`, which moves one itself.
+    #[inline(never)]
+    fn move_results(&mut self, from: usize, count: usize, rloc: usize, wanted: usize) {
+        for i in 0..wanted {
+            self.vals[rloc + i] = if i < count { self.vals[from + i] } else { LBoxed::NIL };
+        }
+    }
+
     /// Return from the running frame to its caller's `ReturnLocation`, the results
     /// moved in place to the call's, or, from the outermost frame, the range of
     /// the stack its results are in, which the caller takes off it.
+    ///
+    /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
+    /// Note [Frame ops] in `generator`.
+    #[inline(always)]
     pub fn do_return(&mut self, owner: &mut Owner, a: usize, b: usize) -> Result<ReturnLocation, std::ops::Range<usize>> {
         // we're going to be removing this frame, so close any open
         // upvalues.
-        self.close_upvalues(owner);
+        if !self.upvals.is_empty() {
+            self.close_upvalues(owner);
+        }
 
         // The results: `b - 1` values from R(A), or every value up to the top.
         let from = self.base + a;
@@ -1403,10 +1435,12 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                 // The results move down to the caller's `rloc`, in place: exactly `c
                 // - 1`, padded with nil, or with C = 0 (MULTRET) all of them.
                 let wanted = if c == 0 { count } else { c as usize - 1 };
-                let moved = wanted.min(count);
-                self.vals.copy_within(from..from + moved, rloc);
-                for slot in rloc + moved..rloc + wanted {
-                    self.vals[slot] = LBoxed::NIL;
+                // No result or one, the usual, moved here; more by `move_results`,
+                // so the window op popping a frame (`PopFrame`) is small.
+                match wanted {
+                    0 => {},
+                    1 => self.vals[rloc] = if count > 0 { self.vals[from] } else { LBoxed::NIL },
+                    _ => self.move_results(from, count, rloc, wanted),
                 }
                 self.top = rloc + wanted;
                 // Shrink the register file back to the caller's extent (`limit`) so the
@@ -1668,6 +1702,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 #[cfg(feature = "magic")]
                 force_jit: vec![].into(),
                 current_off: 0,
+                exit: 0,
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
                 intern,
             }

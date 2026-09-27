@@ -1783,6 +1783,40 @@ windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
     state.top = state.base + slot;
 });
 
+// Note [Frame ops]
+// ~~~~~~~~~~~~~~~~
+// A Lua call's frame is pushed (`call_lua`) and popped (`do_return`) by window
+// ops the JIT copies into its code for the call (`PushFrame`, in a `LuaCall`)
+// and the return (`PopFrame`, in a `Ret`), rather than calling out to them.
+// The window is flushed at a call and a return, so the ops run at `SKIP` 0
+// into an empty window, and read and write only `state`. The frame is in
+// `state.callstack` whichever pushed it, so a bailout out of JIT code finds
+// it there. A return leaves its JIT code with where its caller continues,
+// which `PopFrame` writes to `state.exit` for the `Ret` to load.
+
+// `call_lua` for a call of R(A), `abc` its `a | b << 16 | c << 32`, returning to
+// `ret` (a `PackedLocation`). See Note [Frame ops].
+windowed!(PushFrame, [ret: u64, abc: u64], [], |owner, state, base| () {
+    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), abc as u16, (abc >> 16) as u16, (abc >> 32) as u16);
+});
+
+// A `Ret` at `off` in `block`, `at` their `block | off << 32` and `ab` its
+// `a | b << 16`: `do_return`, `state.exit` where the caller continues, or -2 from
+// the entry frame. See Note [Frame ops].
+windowed!(PopFrame, [at: u64, ab: u64], [], |owner, state, base| () {
+    let (block, off) = (at as u32, (at >> 32) as u16);
+    state.exit = if state.callstack.is_empty() {
+        state.current_off = off;
+        ((-2i32 as u64) << 32) | block as u64
+    } else {
+        match state.do_return(owner, ab as u16 as usize, (ab >> 16) as u16 as usize) {
+            Ok(location) => location.pack().bits() as u64,
+            // With a caller frame, `do_return` returns to it.
+            Err(_) => unreachable!(),
+        }
+    };
+});
+
 pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {

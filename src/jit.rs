@@ -382,6 +382,26 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit) {
 /// the op's captures, references to the op's continuation at the copy's end, and
 /// every other RIP-relative reference at its original target. The body is entered
 /// with the stack aligned as just after a call, as it was compiled to expect.
+/// Copy `op`, a window op with no operands, into the code at `SKIP` 0, the
+/// window empty: its stencil, or else a call of its body. See Note [Frame ops]
+/// in `generator`.
+fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
+    match stencils.body(&**op, 0) {
+        Ok(body) => splat(ops, &body, &op.captures(), pool),
+        Err(_) => {
+            let (data, vtable) = (Rc::as_ptr(op) as *const dyn Window).to_raw_parts();
+            let vtable: *const () = unsafe { core::mem::transmute(vtable) };
+            dynasm!(ops
+                ; .arch x64
+                ; mov rdi, r12 // state
+                ; mov rsi, QWORD (data as i64)
+                ; mov rdx, QWORD (vtable as i64)
+                ; call extern (JitHelper::window_interp as *const () as usize)
+            );
+        }
+    }
+}
+
 fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool) {
     enum Site {
         Value(u64),
@@ -461,6 +481,9 @@ pub struct JitContext {
     /// `LuaCall` sites to link once their callee's version has code, by the
     /// version. See Note [Call linking].
     call_waiting: HashMap<BlockId, Vec<CallSite>, FxBuildHasher>,
+    /// The frame ops the JIT's code has, which a call of an op's body refers to.
+    /// See Note [Frame ops] in `generator`.
+    frame_ops: Vec<Rc<dyn Window>>,
     /// How regions are partitioned into traces (`LUNACY_TRACES`), or `None` to
     /// allocate streaming instead: no plan, each op placing itself in the window
     /// it finds and each block entered with the window of the first jump to it,
@@ -660,6 +683,7 @@ impl JitContext {
             lua_entries: HashMap::default(),
             region_calls: Vec::new(),
             call_waiting: HashMap::default(),
+            frame_ops: Vec::new(),
             stencils: Stencils::default(),
             used: 0,
             perf_map,
@@ -1638,20 +1662,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     ; jmp >lua_call
                                 );
                             }
-                            // Return location for this call site, packed to a single word.
+                            // The frame, pushed by `PushFrame` returning here. See Note
+                            // [Frame ops] in `generator`.
                             let packed_ret = ReturnLocation(BlockId(id.0), off + 1).pack();
-                            // Pin the exact monomorphized address of the extern "C" call_lua.
-                            let call_lua: extern "C" fn(&mut RunState<'src, 'intern>, &mut Owner, PackedLocation, u16, u16, u16) -> usize = RunState::call_lua;
+                            let push: Rc<dyn Window> = Rc::new(crate::generator::PushFrame::new(packed_ret.bits() as u64, *a as u64 | (*b as u64) << 16 | (*c as u64) << 32, &[]));
+                            emit_frame_op(ops, &mut self.jctx.stencils, pool, &push);
+                            self.jctx.frame_ops.push(push);
                             dynasm!(ops
                                 ; .arch x64
-                                ; mov rdi, r12 // &mut RunState
-                                ; mov rsi, QWORD FORGED_OWNER // owner
-                                ; mov rdx, QWORD (packed_ret.bits() as i64)
-                                ; mov rcx, WORD (*a as i32)
-                                ; mov  r8, WORD (*b as i32)
-                                ; mov  r9, WORD (*c as i32)
-                                ; call extern (call_lua as *const () as usize)
-
                                 // Reload r13 = callee base ptr = vals.stack_ptr + base*sizeof(LBoxed)
                                 ; lea rcx, r12 => RunState.vals
                                 ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
@@ -1774,15 +1792,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     successor = Some(*target);
                 },
                 Residual::Ret(pc, a, b) => {
+                    // The frame, popped by `PopFrame`, and the JIT code left with
+                    // where the caller continues. See Note [Frame ops] in `generator`.
+                    let pop: Rc<dyn Window> = Rc::new(crate::generator::PopFrame::new(id.0 as u64 | (off as u64) << 32, *a as u64 | (*b as u64) << 16, &[]));
+                    emit_frame_op(ops, &mut self.jctx.stencils, pool, &pop);
+                    self.jctx.frame_ops.push(pop);
                     dynasm!(ops
                         ; .arch x64
-                        ; mov rdi, r12 // state
-                        ; mov rsi, WORD (*a as i32)
-                        ; mov rdx, WORD (*b as i32)
-                        ; mov rcx, r13 // base_ptr
-                        ; mov r8, QWORD id.0 as i64
-                        ; mov r9, QWORD off as i64
-                        ; call extern (JitHelper::lua_return as *const () as usize)
+                        ; mov rax, QWORD r12 => RunState.exit
                         ; jmp ->exit_jit
                     );
                 },
