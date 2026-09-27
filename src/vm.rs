@@ -1351,7 +1351,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     pub extern "C" fn call_lua(&mut self, owner: &mut Owner,
         ret: PackedLocation, a: u16, b: u16, c: u16) -> usize
     {
-        self.push_frame(owner, ret, a, b, c, true)
+        let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
+        let stack = unsafe { (*lclos.ro(owner).prototype).max_stack };
+        self.push_frame(owner, ret, a, b, c, stack, true)
     }
 
     /// `call_lua`, inlined into the window op pushing a frame in JIT code
@@ -1360,13 +1362,15 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// The callee's frame past its arguments is nil when it starts, as Lua's
     /// is: luac emits no LOADNIL for a local declared at a function's first
     /// instruction. With `fills`, this nils it; without, the caller does, before
-    /// anything reads the stack or marks it.
+    /// anything reads the stack or marks it. `stack` is the callee's
+    /// `max_stack`, which the caller knows.
     #[inline(always)]
-    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: u16, b: u16, c: u16, fills: bool) -> usize {
+    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: u16, b: u16, c: u16, stack: u8, fills: bool) -> usize {
         let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
+        debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "a call's frame size isn't its callee's");
         let ret_loc = ReturnLocation::unpack(ret);
         // record call stack: we say where to return to and where to put the values
-        let next_stack = unsafe { (*lclos.ro(owner).prototype).max_stack as usize };
+        let next_stack = stack as usize;
         let next_base = self.base + a as usize + 1;
         // The max-extent over the caller and its own ancestors, restored on return so
         // the stack (and the GC's mark range) shrinks back as frames pop. See Note

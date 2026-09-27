@@ -1672,11 +1672,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // nilled here, a store a slot, but for a big one, which
                             // `PushFrame` nils, as it does past a count up to the top.
                             let packed_ret = ReturnLocation(BlockId(id.0), off + 1).pack();
-                            let (ret, abc) = (packed_ret.bits() as u64, *a as u64 | (*b as u64) << 16 | (*c as u64) << 32);
+                            let (ret, abcs) = (packed_ret.bits() as u64, *a as u64 | (*b as u64) << 16 | (*c as u64) << 32 | (*stack as u64) << 48);
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
                             let push: Rc<dyn Window> = match nils {
-                                Some(_) => Rc::new(crate::generator::PushFrame::<false>::new(ret, abc, &[])),
-                                None => Rc::new(crate::generator::PushFrame::<true>::new(ret, abc, &[])),
+                                Some(_) => Rc::new(crate::generator::PushFrame::<false>::new(ret, abcs, &[])),
+                                None => Rc::new(crate::generator::PushFrame::<true>::new(ret, abcs, &[])),
                             };
                             jit_note!(self.jctx, ops, "        PushFrame");
                             emit_frame_op(ops, &mut self.jctx.stencils, pool, &push);

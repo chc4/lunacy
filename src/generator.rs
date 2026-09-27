@@ -1794,11 +1794,12 @@ windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
 // it there. A return leaves its JIT code with where its caller continues,
 // which `PopFrame` writes to `state.exit` for the `Ret` to load.
 
-// `call_lua` for a call of R(A), `abc` its `a | b << 16 | c << 32`, returning to
-// `ret` (a `PackedLocation`), nilling the callee's frame if `FILLS` (else the JIT
-// code does). See Note [Frame ops].
-windowed!(frame PushFrame, [ret: u64, abc: u64], [FILLS: bool], |owner, state, base| () {
-    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), abc as u16, (abc >> 16) as u16, (abc >> 32) as u16, FILLS);
+// `call_lua` for a call of R(A), `abcs` its `a | b << 16 | c << 32 | stack << 48`
+// (`stack` the callee's `max_stack`), returning to `ret` (a `PackedLocation`),
+// nilling the callee's frame if `FILLS` (else the JIT code does). See Note [Frame
+// ops].
+windowed!(frame PushFrame, [ret: u64, abcs: u64], [FILLS: bool], |owner, state, base| () {
+    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), abcs as u16, (abcs >> 16) as u16, (abcs >> 32) as u16, (abcs >> 48) as u8, FILLS);
 });
 
 // A `Ret` at `off` in `block`, `at` their `block | off << 32` and `ab` its
