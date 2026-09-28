@@ -95,13 +95,13 @@ const FORGED_OWNER: i64 = core::mem::align_of::<Owner>() as i64;
 
 pub struct JitHelper;
 impl JitHelper {
-    pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: u8) -> bool {
+    pub unsafe extern "C" fn check_guard(state: *mut (), idx: usize, expected: LType) -> bool {
         unsafe {
             //println!("state {:?} idx {} {}", state, idx, expected);
             let state = state as *mut RunState;
             let rs = &*state;
             let val = &rs.vals[rs.base + idx];
-            LType::from_code(expected).accepts(val.unbox().typeof_())
+            expected.accepts(val.unbox().typeof_())
         }
     }
     pub unsafe extern "C" fn check_epoch(state: *mut (), tab: usize, href: u8) -> bool {
@@ -118,7 +118,7 @@ impl JitHelper {
             hwit.epoch == tab.ro(owner).epoch
         }
     }
-    pub unsafe extern "C" fn check_hash_guard(state: *mut (), tab: usize, href: u8, expected: u8, key: u64) -> bool {
+    pub unsafe extern "C" fn check_hash_guard(state: *mut (), tab: usize, href: u8, expected: LType, key: u64) -> bool {
         unsafe {
             let state = state as *mut RunState;
             // Forge an owner
@@ -129,7 +129,7 @@ impl JitHelper {
             let tab = rs.table_at(tab);
             // The witness's index still holds its key, with a value of the type.
             let entry = tab.ro(owner).hash.get_index(hwit.index);
-            entry.is_some_and(|(k, val)| k.boxed().bits() == key && crate::generator::passes_guard_code(*val, expected))
+            entry.is_some_and(|(k, val)| k.boxed().bits() == key && expected.accepts(val.unbox().typeof_()))
         }
     }
 
@@ -588,7 +588,7 @@ type Plans = HashMap<BlockId, BlockPlan, FxBuildHasher>;
 /// A type guard tested inline, in the window register caching its slot.
 fn inline_guard(res: &Residual) -> bool {
     matches!(res, Residual::Guard {
-        expected: CType::Type(LType::Integer) | CType::Type(LType::Double) | CType::Type(LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String),
+        expected: LType::Integer | LType::Double | LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String,
         ..
     })
 }
@@ -1486,25 +1486,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     };
                     match expected {
-                        CType::Type(LType::Number) => dynasm!(ops
+                        LType::Number => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; test Rq(v), Rq(m)
                             ; jnz =>insts[off + 2]
                         ),
-                        CType::Type(LType::Integer) => dynasm!(ops
+                        LType::Integer => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; cmp Rq(v), Rq(m)
                             ; jae =>insts[off + 2]
                         ),
-                        CType::Type(LType::Double) if *known == LType::Number => dynasm!(ops
+                        LType::Double if *known == LType::Number => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; cmp Rq(v), Rq(m)
                             ; jb =>insts[off + 2]
                         ),
-                        CType::Type(LType::Double) => dynasm!(ops
+                        LType::Double => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; cmp Rq(v), Rq(m)
@@ -1513,19 +1513,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; jnz =>insts[off + 2]
                             ; guard_fail:
                         ),
-                        CType::Type(LType::Nil) => dynasm!(ops
+                        LType::Nil => dynasm!(ops
                             ; .arch x64
                             ; cmp Rq(v), (LBoxed::VALUE_NIL as i32)
                             ; jz =>insts[off + 2]
                         ),
-                        CType::Type(LType::Bool) => dynasm!(ops
+                        LType::Bool => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), Rq(v)
                             ; or Rq(m), 1 // false(6) -> 7, true(7) -> 7
                             ; cmp Rq(m), (LBoxed::VALUE_TRUE as i32)
                             ; jz =>insts[off + 2]
                         ),
-                        CType::Type(LType::Table) => dynasm!(ops
+                        LType::Table => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
                             ; test Rq(v), Rq(m)
@@ -1534,7 +1534,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; jz =>insts[off + 2]
                             ; guard_fail:
                         ),
-                        CType::Type(LType::Closure) => dynasm!(ops
+                        LType::Closure => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
                             ; test Rq(v), Rq(m)
@@ -1545,7 +1545,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; jbe =>insts[off + 2]
                             ; guard_fail:
                         ),
-                        CType::Type(LType::String) => dynasm!(ops
+                        LType::String => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
                             ; test Rq(v), Rq(m)
@@ -1562,7 +1562,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Guard { idx, expected, .. } => {
                     // A type with no inline test: ask `check_guard`. The window was
                     // flushed, since the call clobbers it.
-                    let CType::Type(expected) = expected else { unreachable!("{expected} has an inline test") };
                     let expected_u8 = *expected as u8;
                     dynasm!(ops
                         ; .arch x64

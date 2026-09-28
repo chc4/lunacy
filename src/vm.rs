@@ -788,15 +788,6 @@ impl LType {
             LType::Unknown
         }
     }
-
-    /// The type whose `as u8` is `code`.
-    pub fn from_code(code: u8) -> LType {
-        const TYPES: [LType; 9] = [
-            LType::Unknown, LType::Nil, LType::Bool, LType::Number, LType::String,
-            LType::Closure, LType::Table, LType::Integer, LType::Double,
-        ];
-        TYPES[code as usize]
-    }
 }
 
 impl std::fmt::Display for LType {

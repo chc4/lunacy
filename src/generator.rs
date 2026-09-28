@@ -1950,10 +1950,9 @@ impl std::fmt::Debug for ThunkRef {
 
 #[derive(Debug, Clone)]
 pub enum Residual {
-    /// Whether `STACK[idx]`, known to be of type `known` (a number, or
-    /// unknown), has the type `expected`: a `CType::Type`, or a number's
-    /// encoding, `Integer` or `Double`. See Note [Integers].
-    Guard { idx: usize, known: LType, expected: CType },
+    /// Whether `STACK[idx]`, known to be of type `known`, has the type
+    /// `expected`: its type is `expected` or below it.
+    Guard { idx: usize, known: LType, expected: LType },
     Exec(ResidualExec),
     /// A copy&patch window op (see `crate::window`): a trait object, like
     /// `Exec`'s closure, so processing sites never enumerate ops. Its operands
@@ -2173,27 +2172,6 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
         expected if expected.accepts(found) => (pc.next_true(), ResumeArg::Matched),
         _ => (pc.next_false(), ResumeArg::Failed),
     }
-}
-
-/// Whether `value` passes a `Residual::Guard` of `expected`: has its type, or,
-/// for `Integer` or `Double`, is a number in that encoding. See Note [Integers].
-pub fn passes_guard(value: LBoxed, expected: &CType) -> bool {
-    passes_guard_code(value, guard_code(expected))
-}
-
-/// A type a guard tests for, as a byte for code that can't hold a `CType`: its
-/// `LType`'s (`LType::from_code`).
-pub fn guard_code(expected: &CType) -> u8 {
-    match expected {
-        CType::Type(ltype) => *ltype as u8,
-        _ => unreachable!("a type guard tests for a CType::Type, not {expected}"),
-    }
-}
-
-/// `passes_guard` of the type `guard_code` gave `code`.
-#[inline(always)]
-pub fn passes_guard_code(value: LBoxed, code: u8) -> bool {
-    LType::from_code(code).accepts(value.unbox().typeof_())
 }
 
 // Note [Global caches]
@@ -3117,9 +3095,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let old_block = block_id;
                 block_id = vm.new_block(pc.0);
                 vm.jump_thunk(old_block, thunk_pc, block_id);
-                vm.blocks[block_id.0].instructions.push(Residual::Guard { idx, known, expected: found.clone() });
+                vm.blocks[block_id.0].instructions.push(Residual::Guard { idx, known, expected: found_field });
             } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Guard { idx, known, expected: found.clone() };
+                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Guard { idx, known, expected: found_field };
             }
             // If we're in the success block and the guarded value is a function, we can
             // also try to emit a guard to specialize the function value as well. This lets us
@@ -3854,7 +3832,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("RUN {:?}", &res);
             match res {
                 Residual::Guard { idx, expected, .. } => {
-                    if passes_guard(state.vals[state.base + idx], &expected) {
+                    if expected.accepts(state.vals[state.base + idx].unbox().typeof_()) {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -3903,7 +3881,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let tab = state.table_at(tab);
                     let entry = tab.ro(owner).hash.get_index(hwit.index);
-                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && passes_guard(*val, &CType::Type(expected))) {
+                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && expected.accepts(val.unbox().typeof_())) {
                         // Fallthrough
                         off += 2;
                     } else {
