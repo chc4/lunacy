@@ -1,8 +1,9 @@
 -- Numbers in either encoding anywhere (Note [Integer encoding]): integers
 -- stored in tables and upvalues, returned and passed to natives, integer and
 -- double keys that are the same key, a whole double compared with an integer
--- constant, integer ops overflowing into doubles, and a loop whose variable is
--- an integer on one way round and a double on another.
+-- constant, integer ops overflowing into doubles, a loop whose variable is an
+-- integer on one way round and a double on another, and stores through keys
+-- computed as doubles.
 local bit = require("bit")
 
 local captured = 0
@@ -64,6 +65,24 @@ local function stored(n)
   return sum, tostring(t[2]), tostring(t[3])
 end
 
+-- Stores through keys computed as doubles, read back through the integers
+-- they equal, in the array part and the hash part.
+local function stores(n)
+  local half = 0.5
+  local u = {}
+  u[half * 2] = 1
+  local t = {}
+  for i = 1, n do
+    t[i * (half + half)] = i
+  end
+  local h = {}
+  h[1000 * (half + half)] = "big"
+  h[-3 * (half + half)] = "negative"
+  local s = 0
+  for i = 1, n do s = s + t[i] end
+  return u[1], s, #t, h[1000], h[-3]
+end
+
 local function run()
   captured = 0
   print(keys(6))
@@ -72,6 +91,7 @@ local function run()
   print(overflow(10))
   print(mixed(10))
   print(stored(5))
+  print(stores(6))
 end
 
 run()
@@ -80,6 +100,7 @@ compare.__jit = 1
 overflow.__jit = 1
 mixed.__jit = 1
 stored.__jit = 1
+stores.__jit = 1
 run()
 -- EXPECT: 42	zero	zero	minus one	6
 -- EXPECT: 21
@@ -87,9 +108,11 @@ run()
 -- EXPECT: 2147483700	-2147483700	2147488281	5	52
 -- EXPECT: 9.5	57.5
 -- EXPECT: 31	2	3.5
+-- EXPECT: 1	21	6	big	negative
 -- EXPECT: 42	zero	zero	minus one	6
 -- EXPECT: 21
 -- EXPECT: 11	2.25
 -- EXPECT: 2147483700	-2147483700	2147488281	5	52
 -- EXPECT: 9.5	57.5
 -- EXPECT: 31	2	3.5
+-- EXPECT: 1	21	6	big	negative
