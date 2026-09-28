@@ -356,6 +356,26 @@ flamegraph-vs ref benchmark times='10' freq='997' top='25':
         perf report -i $data --no-children -g none --sort sym --stdio 2>/dev/null | grep '%' | head -n {{top}}
     done
 
+# `flamegraph` over HYPERFINES, sampling at `freq` Hz: for each run,
+# working/perf-<benchmark>-<times>.data and flamegraph-<benchmark>-<times>.svg,
+# then each profile's share of time by tier (tools/tiers.py): JIT code, the
+# interpreter, compiling, and GC. perf runs the benchmark itself: under
+# `cargo flamegraph`, samples from the run's start are the pre-exec process's,
+# which perf can't resolve.
+flamegraphs freq='19997':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -Z build-std="core,std,panic_abort"
+    profiles=()
+    for run in {{HYPERFINES}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        just _luac $benchmark
+        (cd working && perf record -F {{freq}} --call-graph fp -g -o perf-$benchmark-$times.data -- ../target/flamegraph/bench $benchmark.bin $times > /dev/null)
+        flamegraph --perfdata working/perf-$benchmark-$times.data -o working/flamegraph-$benchmark-$times.svg > /dev/null
+        profiles+=(working/perf-$benchmark-$times.data)
+    done
+    python3 tools/tiers.py "${profiles[@]}"
+
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
 # Interpreter: no JIT, every closure run by the specializer's interpreter loop.
