@@ -209,6 +209,7 @@ pub enum YieldOp {
     ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op. See Note [Register window].
     Jump(BlockId), // Emit a jump to the given BlockId
     Call(CallTarget), // Call a block target.
+    CallResume(CallTarget), // Call, and then resumed with Start, once the call's results arrive.
     Select(Vec<(&'static str, BlockId)>), // Emit a jump to one of several branches, based on
                                       // `state.select` at runtime
 
@@ -1448,6 +1449,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, _) = crate::vm::AB::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_close(a as usize)), ResumeArg::Start, block_id)
                 },
+                Opcode::TFORLOOP => {
+                    let (a, _, c) = crate::vm::ABC::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_tforloop(a as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
+                },
                 Opcode::JMP => {
                     let sbx = crate::vm::sBx::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
@@ -2257,7 +2262,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(Residual::Select(targets));
                     return None;
                 },
-                CoroutineState::Yielded(YieldOp::Call(target)) => {
+                CoroutineState::Yielded(op @ (YieldOp::Call(_) | YieldOp::CallResume(_))) => {
+                    let (target, resumes) = match op {
+                        YieldOp::Call(target) => (target, false),
+                        YieldOp::CallResume(target) => (target, true),
+                        _ => unreachable!(),
+                    };
                     let id;
                     match target {
                         CallTarget::Concrete(target) => {
@@ -2331,14 +2341,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 Rc::make_mut(&mut ctx).types[a] = result.clone();
                             }
                             Rc::make_mut(&mut ctx).top = (result.is_some() && c == 0).then_some(a + 1);
+                            // The call's results arriving steps the `SubPc`, whichever
+                            // function it calls. See Note [Subblocks].
                             if native {
+                                if resumes {
+                                    pc = pc.next_true();
+                                    break 'machine;
+                                }
                                 return Some((pc.0 + 1, ctx, ResumeArg::Start));
                             }
                             // Any other call ends its block in a thunk laying out the call
                             // for the function it finds, the code after it a version of
                             // its own. See Note [Call sites].
-                            let after = self.jumping(owner, ctx, pc.0 + 1);
-                            let after = self.version(owner, pc.0 + 1, after);
+                            let after = if resumes {
+                                self.subblock(owner, pc.next_true(), ctx, coro.clone(), ResumeArg::Start)
+                            } else {
+                                let after = self.jumping(owner, ctx, pc.0 + 1);
+                                self.version(owner, pc.0 + 1, after)
+                            };
                             self.end_block(block_id);
                             let thunk = self.make_call_thunk(block_id, calling, a, b, c, after, 0, true);
                             self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));

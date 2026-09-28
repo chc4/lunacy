@@ -1473,6 +1473,50 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
     }
 }
 
+/// A generic `for`'s step: `R(A+3), ..., R(A+2+C) := R(A)(R(A+1), R(A+2))`; then
+/// if R(A+3) isn't nil, `R(A+2) := R(A+3)`, else skip the next instruction (the
+/// jump back to the loop's body). `pc` is the next instruction's.
+pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        windowed!(ForInMove, [], [], |owner, state, base| (from, out to) {
+            *to = from;
+        });
+        // The iterator, its state and the control variable, called.
+        let f = a + 3;
+        for i in 0..3 {
+            let ResumeArg::Type(t) = (yield YieldOp::Typeof(a + i)) else { unreachable!() };
+            yield YieldOp::ExecWindow(Rc::new(ForInMove::new(&[a + i, f + i])));
+            yield YieldOp::SetCTypes(vec![(f + i, t)]);
+        }
+        arg = yield YieldOp::Guard(f, LType::Closure);
+        if arg != ResumeArg::Matched {
+            arg = yield YieldOp::Exec(ResidualExec::new("call_meta", Rc::new(move |owner, state| {
+                panic!("call metamethod {} {:?}", f, &state.vals[state.base + f])
+            })));
+            return arg;
+        }
+        // As a call's. See Note [Native windows].
+        if let ResumeArg::WindowArgs(end, args) = (yield YieldOp::NativeWindowArgs(f, 3, c + 1)) {
+            for slot in f + 1..end {
+                yield YieldOp::Guard(slot, args);
+            }
+        }
+        yield YieldOp::CallResume(CallTarget::Dynamic(f, 3, c + 1));
+        arg = yield YieldOp::Guard(f, LType::Nil);
+        if arg == ResumeArg::Matched {
+            arg = yield YieldOp::GetBlock(pc + 1);
+            let ResumeArg::BlockId(done) = arg else { unreachable!() };
+            arg = yield YieldOp::Jump(done);
+            return arg;
+        }
+        let ResumeArg::Type(t) = (yield YieldOp::Typeof(f)) else { unreachable!() };
+        yield YieldOp::ExecWindow(Rc::new(ForInMove::new(&[f, a + 2])));
+        yield YieldOp::SetCTypes(vec![(a + 2, t)]);
+        arg
+    }
+}
+
 /// The array part slot of a `CType::Type(LType::Integer)` key. Keys below 1 wrap past any
 /// array part.
 #[inline(always)]
