@@ -48,7 +48,7 @@ thread_local! {
 // result's slot, the function's, in the register window: no flush and no call.
 // The op assumes the arguments' type, unchecked, and the result has its type.
 // The native picks the op by which arguments the context knows are in the
-// integer encoding (`CType::Integer`, `ints`), which it may read as they are,
+// integer encoding (`CType::Type(LType::Integer)`, `ints`), which it may read as they are,
 // as the bit library's do, whose results are integers too; it reads any other
 // number in either encoding.
 // Any other call to the native is an ordinary `NativeCall`. The bit library's
@@ -226,7 +226,7 @@ fn bit1_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
     } else {
         std::rc::Rc::new(BitUnary::<OP, false>::new(&operands))
     };
-    Some(NativeOp { window, args: LType::Number, result: crate::generator::CType::Integer })
+    Some(NativeOp { window, args: LType::Number, result: crate::generator::CType::Type(LType::Integer) })
 }
 
 /// `bit2::<OP>` as a window op, for a call with two numbers and one result: its
@@ -242,7 +242,7 @@ fn bit2_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
         (true, false) => std::rc::Rc::new(BitBinary::<OP, true, false>::new(&operands)),
         (true, true) => std::rc::Rc::new(BitBinary::<OP, true, true>::new(&operands)),
     };
-    Some(NativeOp { window, args: LType::Number, result: crate::generator::CType::Integer })
+    Some(NativeOp { window, args: LType::Number, result: crate::generator::CType::Type(LType::Integer) })
 }
 
 /// A table of `entries`, keyed by interned names.

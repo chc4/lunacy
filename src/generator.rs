@@ -35,7 +35,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
     /// Get the LType of an observed value
     pub fn typeof_(&self) -> LType {
         match self {
-            LValue::Integer(_) | LValue::Double(_) => LType::Number,
+            LValue::Integer(_) => LType::Integer,
+            LValue::Double(_) => LType::Double,
             LValue::InternedString(_) | LValue::OwnedString(_) => LType::String,
             LValue::Table(t) => LType::Table,
             LValue::LClosure(_) | LValue::NClosure(_) => LType::Closure,
@@ -196,7 +197,7 @@ macro_rules! integer_encoded {
         if ($rk & 0x100) != 0 {
             false
         } else {
-            (yield YieldOp::GuardCType($rk, CType::Integer)) == ResumeArg::Matched
+            (yield YieldOp::GuardCType($rk, CType::Type(LType::Integer))) == ResumeArg::Matched
         }
     }};
 }
@@ -214,7 +215,7 @@ macro_rules! integer_encoded {
 /// for reuse. See Note [Subblocks].
 macro_rules! integer_operands {
     ($lhs:expr, $rhs:expr) => {{
-        let integer = ResumeArg::Type(CType::Integer);
+        let integer = ResumeArg::Type(CType::Type(LType::Integer));
         let lt = (yield YieldOp::TypeofRk($lhs)) == integer;
         let rt = (yield YieldOp::TypeofRk($rhs)) == integer;
         let registers = ($lhs & 0x100) == 0 && ($rhs & 0x100) == 0;
@@ -437,7 +438,7 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
             *dest = LBoxed::from_bits(bits);
         });
         match c {
-            LType::Number => {
+            LType::Integer | LType::Double => {
                 let ResumeArg::Type(t) = (yield YieldOp::TypeofK(bx as usize)) else { unreachable!() };
                 let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
                 yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
@@ -676,7 +677,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             yield YieldOp::FieldType(a, hc);
         } else {
             // An integer key in the array part, potentially from a constant `k`. See Note [Dynamic guards].
-            let integer = match yield YieldOp::GuardCType(c, CType::Integer) {
+            let integer = match yield YieldOp::GuardCType(c, CType::Type(LType::Integer)) {
                 ResumeArg::MatchedConst(k) => {
                     let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };
                     Some(Some(k))
@@ -752,21 +753,12 @@ mod field_type {
 
         /// The type of a field holding a value of type `ctype`.
         pub fn of(ctype: CType) -> Self {
-            match ctype {
-                CType::Integer | CType::Double | CType::Type(_) => FieldType(ctype),
-                ctype => FieldType(CType::Type(ctype.as_ltype())),
-            }
+            FieldType(CType::Type(ctype.as_ltype()))
         }
 
         /// The type of a field holding `value`.
         pub fn of_value(value: LBoxed) -> Self {
-            if value.is_int() {
-                FieldType(CType::Integer)
-            } else if value.is_number() {
-                FieldType(CType::Double)
-            } else {
-                FieldType(CType::Type(value.unbox().typeof_()))
-            }
+            FieldType(CType::Type(value.unbox().typeof_()))
         }
 
         pub fn ctype(&self) -> &CType {
@@ -810,7 +802,7 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
     let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
     debug!("settable_href {:?} {:?}", &val1, expected);
     #[cfg(debug_assertions)]
-    assert!(expected == LType::Unknown || val1.unbox().typeof_() == expected);
+    assert!(expected.accepts(val1.unbox().typeof_()));
     *val1 = value;
     match retype {
         Retype::Same => {}
@@ -858,7 +850,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // An integer key in the array part, in a register or a constant (its
         // value, `k`), with the value in a register, stores into its slot. See
         // Note [Dynamic guards].
-        let integer = match yield YieldOp::GuardCType(b, CType::Integer) {
+        let integer = match yield YieldOp::GuardCType(b, CType::Type(LType::Integer)) {
             ResumeArg::MatchedConst(k) => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };
                 Some(Some(k))
@@ -1122,7 +1114,7 @@ fn numeric_rk(opcode: Opcode, li: bool, k: f64, operands: &[usize]) -> Rc<dyn Wi
 pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        let integer = ResumeArg::Type(CType::Integer);
+        let integer = ResumeArg::Type(CType::Type(LType::Integer));
         // --- Int Path --- See Note [Integers]. First, as finding out whether an
         // unknown operand is an integer finds out its type too.
         if matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::MOD) {
@@ -1154,7 +1146,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             let fits = yield step;
             if let (Some((_, op)), ResumeArg::Matched) = (op, fits) {
                 yield YieldOp::ExecWindow(op);
-                yield YieldOp::SetCTypes(vec![(dest, CType::Integer)]);
+                yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Integer))]);
                 return arg;
             }
         }
@@ -1195,7 +1187,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         };
         if let Some(window) = window {
             yield YieldOp::ExecWindow(window);
-            yield YieldOp::SetCTypes(vec![(dest, CType::Double)]);
+            yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Double))]);
             return arg;
         }
 
@@ -1699,7 +1691,7 @@ pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         // An integer loop's index, limit and step are integers: find out which
         // are. See Note [Integers].
         for slot in a..a + 3 {
-            yield YieldOp::GuardCType(slot, CType::Integer);
+            yield YieldOp::GuardCType(slot, CType::Type(LType::Integer));
         }
         let mut sub = emit_numeric(Opcode::SUB, a, a, a + 2);
         drain!(sub, arg);
@@ -1793,7 +1785,7 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
 fn native_window(ctx: &Context, a: usize, b: usize, c: usize) -> Option<(usize, crate::vm::NativeOp)> {
     let end = if b == 0 { ctx.top? } else { a + b };
     let CType::NativeFunction(nf) = &ctx.types[a] else { return None };
-    let ints: SmallVec<[bool; 4]> = (a + 1..end).map(|slot| ctx.slot(slot) == CType::Integer).collect();
+    let ints: SmallVec<[bool; 4]> = (a + 1..end).map(|slot| ctx.slot(slot) == CType::Type(LType::Integer)).collect();
     // A call taking every result gets the op's one.
     nf.window(a, (end - a) as u16, if c == 0 { 2 } else { c as u16 }, &ints).map(|op| (end, op))
 }
@@ -2109,10 +2101,6 @@ fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum CType {
     Type(LType),
-    /// A number in the integer encoding. See Note [Integers].
-    Integer,
-    /// A number in the double encoding. See Note [Integers].
-    Double,
     Shape(SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
     LuaFunction(Tc<LClosure<'static, 'static>>),
@@ -2134,10 +2122,8 @@ impl CType {
     fn accepts(&self, other: &CType) -> bool {
         match (self, other) {
             (a, b) if a == b => true,
-            (CType::Type(LType::Unknown), _) => true,
-            (CType::Type(LType::Number), CType::Integer | CType::Double) => true,
-            (CType::Type(LType::Table), CType::Shape(_)) => true,
-            (CType::Type(LType::Closure), CType::NativeFunction(_) | CType::LuaFunction(_)) => true,
+            // A shape or a function's identity is below its table or closure.
+            (CType::Type(a), b) => a.accepts(b.as_ltype()),
             _ => false,
         }
     }
@@ -2146,6 +2132,7 @@ impl CType {
     fn depth(&self) -> usize {
         match self {
             CType::Type(LType::Unknown) => 0,
+            CType::Type(LType::Integer | LType::Double) => 2,
             CType::Type(_) => 1,
             _ => 2,
         }
@@ -2157,10 +2144,8 @@ impl CType {
             self.clone()
         } else if other.accepts(self) {
             other.clone()
-        } else if self.as_ltype() == other.as_ltype() {
-            CType::Type(self.as_ltype())
         } else {
-            CType::Type(LType::Unknown)
+            CType::Type(self.as_ltype().join(other.as_ltype()))
         }
     }
 
@@ -2168,7 +2153,6 @@ impl CType {
     fn as_ltype(&self) -> LType {
         match self {
             CType::Type(ty) => ty.clone(),
-            CType::Integer | CType::Double => LType::Number,
             CType::Shape(_) => LType::Table,
             CType::NativeFunction(_) => LType::Closure,
             CType::LuaFunction(_) => LType::Closure,
@@ -2180,8 +2164,6 @@ impl std::fmt::Display for CType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CType::Type(ltype) => ltype.fmt(f),
-            CType::Integer => write!(f, "integer"),
-            CType::Double => write!(f, "double"),
             CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
             CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
             CType::LuaFunction(lclos) => write!(f, "fn({:?})", lclos.as_ptr()),
@@ -2193,7 +2175,7 @@ impl std::fmt::Display for CType {
 // ~~~~~~~~~~~~~~~
 // A number is in the integer or the double encoding (Note [Integer encoding]), and its tag says
 // which. The specialization context tracks its knowledge potentially fuzzier than that:
-// `CType::Integer` is a number in the integer encoding, `CType::Double` one in the double
+// `CType::Type(LType::Integer)` is a number in the integer encoding, `CType::Type(LType::Double)` one in the double
 // encoding, and `CType::Type(Number)` a number in either. As the value carries its encoding, a
 // context knowing less of it needs no code: a jump into a version typing a slot `Number` or
 // `Unknown` enters it as it is, and generic code (a table, an upvalue, a native, a return) reads
@@ -2226,9 +2208,9 @@ impl std::fmt::Display for CType {
 /// `Number`, then the encoding; every `CType::Type` one. See Note [Integers].
 fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
     match expected {
-        CType::Integer if found.as_ltype() != LType::Number => (pc.next_false(), ResumeArg::Failed),
-        CType::Integer if *found == CType::Integer => (pc.next_true().next_true(), ResumeArg::Matched),
-        CType::Integer => (pc.next_true().next_false(), ResumeArg::Failed),
+        CType::Type(LType::Integer) if !LType::Number.accepts(found.as_ltype()) => (pc.next_false(), ResumeArg::Failed),
+        CType::Type(LType::Integer) if *found == CType::Type(LType::Integer) => (pc.next_true().next_true(), ResumeArg::Matched),
+        CType::Type(LType::Integer) => (pc.next_true().next_false(), ResumeArg::Failed),
         expected if expected.accepts(found) => (pc.next_true(), ResumeArg::Matched),
         _ => (pc.next_false(), ResumeArg::Failed),
     }
@@ -2241,27 +2223,18 @@ pub fn passes_guard(value: LBoxed, expected: &CType) -> bool {
 }
 
 /// A type a guard tests for, as a byte for code that can't hold a `CType`: its
-/// `LType`'s, or past them, an encoding's.
+/// `LType`'s (`LType::from_code`).
 pub fn guard_code(expected: &CType) -> u8 {
     match expected {
         CType::Type(ltype) => *ltype as u8,
-        CType::Integer => GUARD_INTEGER,
-        CType::Double => GUARD_DOUBLE,
-        _ => unreachable!("a type guard tests for a CType::Type or an encoding, not {expected}"),
+        _ => unreachable!("a type guard tests for a CType::Type, not {expected}"),
     }
 }
-
-const GUARD_INTEGER: u8 = 0x80;
-const GUARD_DOUBLE: u8 = 0x81;
 
 /// `passes_guard` of the type `guard_code` gave `code`.
 #[inline(always)]
 pub fn passes_guard_code(value: LBoxed, code: u8) -> bool {
-    match code {
-        GUARD_INTEGER => value.is_int(),
-        GUARD_DOUBLE => value.is_number() && !value.is_int(),
-        ltype => value.unbox().typeof_() as u8 == ltype,
-    }
+    LType::from_code(code).accepts(value.unbox().typeof_())
 }
 
 // Note [Global caches]
@@ -2335,14 +2308,14 @@ fn forgotten(ctype: &CType) -> bool {
 // fails statically instead, to measure the blocks the guards cost (`just
 // graph-guards`).
 
-/// The array part slot of a `CType::Integer` key. Keys below 1 wrap past any
+/// The array part slot of a `CType::Type(LType::Integer)` key. Keys below 1 wrap past any
 /// array part.
 #[inline(always)]
 fn integer_slot(i: i32) -> usize {
     (i as i64 - 1) as usize
 }
 
-// `GuardDynamic` tests: whether a `CType::Integer` key, in a register or the
+// `GuardDynamic` tests: whether a `CType::Type(LType::Integer)` key, in a register or the
 // constant `k`, is in a table's array part. See Note [Dynamic guards].
 crate::window::windowed!(InArray, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -2358,8 +2331,8 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
     match k {
         crate::chunk::Constant::Nil => CType::Type(LType::Nil),
         crate::chunk::Constant::Bool(_) => CType::Type(LType::Bool),
-        crate::chunk::Constant::Number(n) if is_integer(n.0) => CType::Integer,
-        crate::chunk::Constant::Number(_) => CType::Double,
+        crate::chunk::Constant::Number(n) if is_integer(n.0) => CType::Type(LType::Integer),
+        crate::chunk::Constant::Number(_) => CType::Type(LType::Double),
         crate::chunk::Constant::String(_) => CType::Type(LType::String),
     }
 }
@@ -3378,11 +3351,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // witness epoch and jump back to the success block.
             let check_block = vm.new_block(pc.0);
             vm.jump_thunk(block_id, thunk_pc, check_block);
-            // A field's type is one `HashGuard` can test. See Note [Field types].
             let expected = thunk_ctx.hkeys[href.0 as usize].known_type.clone();
+            let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
+            // A field whose type isn't known has nothing to check it still has:
+            // its hash key is found again. See Note [Field types].
+            if expected == FieldType::UNKNOWN {
+                vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
+                return;
+            }
             let key = LCanon::constant(&thunk_ctx.hkeys[href.0 as usize].key).boxed().bits();
             vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected });
-            let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
             vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
             vm.blocks[check_block.0].instructions.push(Residual::Exec(ResidualExec::new("epoch_repair", Rc::new(move |owner, state| {
                 // Re-init the witness and jump back to success block
@@ -3553,7 +3531,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         };
                         debug!("GuardRk constant {:?} {:?}", ty, expected);
                         // Constants always have known types
-                        if ty == *expected {
+                        if expected.accepts(ty) {
                             pc = pc.next_true();
                             arg = ResumeArg::MatchedConst(r_const);
                             break 'machine;
@@ -3572,7 +3550,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         continue 'machine;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::GuardCType(_, ref expected)) if *expected != CType::Integer => {
+                CoroutineState::Yielded(YieldOp::GuardCType(_, ref expected)) if *expected != CType::Type(LType::Integer) => {
                     unreachable!("GuardCType tests only for Integer, not {expected}");
                 },
                 CoroutineState::Yielded(YieldOp::GuardCType(rk, _)) => {
@@ -3586,13 +3564,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                     match known {
                         Some(known) => {
-                            (pc, arg) = navigate(pc, &CType::Integer, &known);
+                            (pc, arg) = navigate(pc, &CType::Type(LType::Integer), &known);
                             if (rk & 0x100) != 0 && arg == ResumeArg::Matched {
                                 arg = ResumeArg::MatchedConst(rk & 0xff);
                             }
                         },
                         None => {
-                            let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, CType::Integer, None, pc, ctx.clone(), true, 0));
+                            let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, CType::Type(LType::Integer), None, pc, ctx.clone(), true, 0));
                             self.end_block(block_id);
                             self.blocks[block_id.0].instructions.push(thunk);
                             return None;
@@ -3626,12 +3604,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // Erase any hkeys and say its just a table before checking
                     let ltype = ctype.as_ltype();
 
-                    if ltype == expected {
+                    if expected.accepts(ltype) {
                         // Statically true: pump the success path
                         pc = pc.next_true();
                         arg = ResumeArg::Matched;
                     }
-                    else if ltype != LType::Unknown {
+                    else if !ltype.accepts(expected) {
                         // Statically false: pump the fail path
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
@@ -3717,7 +3695,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // too. See Note [Native windows].
                             let mut result = None;
                             let window = native_window(&ctx, a, b, c)
-                                .filter(|(end, op)| (a + 1..*end).all(|slot| ctx.types[slot].as_ltype() == op.args))
+                                .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(ctx.types[slot].as_ltype())))
                                 .map(|(_, op)| op);
                             // Any other call may run a closure, which reads and writes the
                             // slots it captured. See Note [Captured slots].

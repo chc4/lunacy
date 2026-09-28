@@ -755,10 +755,48 @@ pub enum LType {
     Unknown,
     Nil,
     Bool,
+    /// A number in either encoding: `Integer` or `Double`.
     Number,
     String,
     Closure,
     Table,
+    /// A number in the integer encoding. See Note [Integer encoding] in `lboxed`.
+    Integer,
+    /// A number in the double encoding.
+    Double,
+}
+
+impl LType {
+    /// Whether a value of type `other` is one of type `self`: `other` is
+    /// `self`, or below it (`Unknown` is above every type, `Number` above
+    /// `Integer` and `Double`).
+    pub fn accepts(self, other: LType) -> bool {
+        self == other
+            || self == LType::Unknown
+            || (self == LType::Number && matches!(other, LType::Integer | LType::Double))
+    }
+
+    /// The most specific type accepting both.
+    pub fn join(self, other: LType) -> LType {
+        if self.accepts(other) {
+            self
+        } else if other.accepts(self) {
+            other
+        } else if LType::Number.accepts(self) && LType::Number.accepts(other) {
+            LType::Number
+        } else {
+            LType::Unknown
+        }
+    }
+
+    /// The type whose `as u8` is `code`.
+    pub fn from_code(code: u8) -> LType {
+        const TYPES: [LType; 9] = [
+            LType::Unknown, LType::Nil, LType::Bool, LType::Number, LType::String,
+            LType::Closure, LType::Table, LType::Integer, LType::Double,
+        ];
+        TYPES[code as usize]
+    }
 }
 
 impl std::fmt::Display for LType {
@@ -771,6 +809,8 @@ impl std::fmt::Display for LType {
             LType::String => write!(f, "string"),
             LType::Closure => write!(f, "func"),
             LType::Table => write!(f, "table"),
+            LType::Integer => write!(f, "integer"),
+            LType::Double => write!(f, "double"),
         }
     }
 }

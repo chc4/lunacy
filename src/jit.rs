@@ -101,7 +101,7 @@ impl JitHelper {
             let state = state as *mut RunState;
             let rs = &*state;
             let val = &rs.vals[rs.base + idx];
-            (val.unbox().typeof_() as u8) == expected
+            LType::from_code(expected).accepts(val.unbox().typeof_())
         }
     }
     pub unsafe extern "C" fn check_epoch(state: *mut (), tab: usize, href: u8) -> bool {
@@ -588,7 +588,7 @@ type Plans = HashMap<BlockId, BlockPlan, FxBuildHasher>;
 /// A type guard tested inline, in the window register caching its slot.
 fn inline_guard(res: &Residual) -> bool {
     matches!(res, Residual::Guard {
-        expected: CType::Integer | CType::Double | CType::Type(LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String),
+        expected: CType::Type(LType::Integer) | CType::Type(LType::Double) | CType::Type(LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String),
         ..
     })
 }
@@ -1492,19 +1492,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; test Rq(v), Rq(m)
                             ; jnz =>insts[off + 2]
                         ),
-                        CType::Integer => dynasm!(ops
+                        CType::Type(LType::Integer) => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; cmp Rq(v), Rq(m)
                             ; jae =>insts[off + 2]
                         ),
-                        CType::Double if *known == LType::Number => dynasm!(ops
+                        CType::Type(LType::Double) if *known == LType::Number => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; cmp Rq(v), Rq(m)
                             ; jb =>insts[off + 2]
                         ),
-                        CType::Double => dynasm!(ops
+                        CType::Type(LType::Double) => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; cmp Rq(v), Rq(m)
