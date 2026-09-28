@@ -889,6 +889,21 @@ fn compare_rk(opcode: Opcode, li: bool, a: u8, k: f64, operands: &[usize]) -> Rc
     }
 }
 
+/// Lua's raw equality of two values.
+#[inline(always)]
+fn raw_equal<'s, 'i>(l: LBoxed<'s, 'i>, r: LBoxed<'s, 'i>) -> bool {
+    // A value other than a number is equal to one with the same bits; a NaN is
+    // not, and equal numbers or strings can have different bits.
+    (l.bits() == r.bits() && l.bits() & LBoxed::NUMBER_TAG == 0) || unboxed_equal(l, r)
+}
+
+/// `raw_equal`'s comparison of the values themselves. Out of line: its match is
+/// a jump table, which a stencil can't hold.
+#[inline(never)]
+fn unboxed_equal<'s, 'i>(l: LBoxed<'s, 'i>, r: LBoxed<'s, 'i>) -> bool {
+    l.unbox() == r.unbox()
+}
+
 pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -943,7 +958,40 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                 arg = yield YieldOp::ExecWindow(compare_k(opcode, lint, a, k, false, b));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::MatchedConst(rc)) => {
-                unimplemented!()
+                let ResumeArg::Number(l) = (yield YieldOp::NumberK(rb)) else { unreachable!() };
+                let ResumeArg::Number(r) = (yield YieldOp::NumberK(rc)) else { unreachable!() };
+                let cond = match opcode {
+                    Opcode::EQ => l == r,
+                    Opcode::LT => l < r,
+                    Opcode::LE => l <= r,
+                    _ => unreachable!(),
+                };
+                // Statically decided, as `select` would.
+                yield YieldOp::Jump(if (cond as u8) != a { taken } else { fallthrough });
+            },
+            (larg, rarg) if opcode == Opcode::EQ && !matches!((&lnil, &rnil), (ResumeArg::Matched | ResumeArg::MatchedConst(_), _) | (_, ResumeArg::Matched | ResumeArg::MatchedConst(_))) => {
+                // Raw equality of values of any types, a constant operand's boxed
+                // value a hole.
+                crate::window::windowed!(EqualRR, [a: u8], [], |owner, state, base| (lhs, rhs) {
+                    state.select = if (raw_equal(lhs, rhs) as u8) != a { 0 } else { 1 };
+                });
+                crate::window::windowed!(EqualRK, [a: u8, k: u64], [], |owner, state, base| (lhs) {
+                    state.select = if (raw_equal(lhs, LBoxed::from_bits(k)) as u8) != a { 0 } else { 1 };
+                });
+                const RK: usize = 256;
+                let window: Rc<dyn Window> = match (b >= RK, c >= RK) {
+                    (false, false) => Rc::new(EqualRR::new(a, &[b, c])),
+                    (true, false) => {
+                        let ResumeArg::Boxed(k) = (yield YieldOp::BoxedK(b - RK)) else { unreachable!() };
+                        Rc::new(EqualRK::new(a, k, &[c]))
+                    },
+                    (false, true) => {
+                        let ResumeArg::Boxed(k) = (yield YieldOp::BoxedK(c - RK)) else { unreachable!() };
+                        Rc::new(EqualRK::new(a, k, &[b]))
+                    },
+                    (true, true) => unimplemented!("equality of two constants"),
+                };
+                arg = yield YieldOp::ExecWindow(window);
             },
             (larg, rarg) => {
                 if opcode != Opcode::EQ {

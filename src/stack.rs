@@ -122,6 +122,11 @@ impl<'src, 'intern> ValueStack<'src, 'intern> {
     pub fn len(&self) -> usize {
         self.used.get()
     }
+
+    /// The most slots the stack can have.
+    pub fn capacity(&self) -> usize {
+        self.stack_ptr.len()
+    }
 }
 
 impl<'src, 'intern> std::fmt::Debug for ValueStack<'src, 'intern> {

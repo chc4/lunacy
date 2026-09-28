@@ -37,6 +37,7 @@ sonic = ["unsafe", "skip_rc"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+libc = "0.2"
 bitfield = "0.17.0"
 log = { version = "0.4.22", features = ["release_max_level_off"] }
 nom = "7.1.3"

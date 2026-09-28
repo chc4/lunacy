@@ -180,6 +180,16 @@ impl JitHelper {
         }
     }
 
+    /// A call from JIT code of the native `nf` taking every result, through
+    /// `call_native`: there may be more than the call's slots.
+    pub unsafe extern "C" fn native_call(state: *mut (), nf: usize, a: u16, b: u16) {
+        unsafe {
+            let state = &mut *(state as *mut RunState<'static, 'static>);
+            let nf: crate::vm::NativeFunc = core::mem::transmute(nf);
+            state.call_native(nf, a, b, 0, crate::forge_owner());
+        }
+    }
+
     /// A `LuaCall` from JIT code compiled before its callee's version had code,
     /// until the site is linked to it (Note [Call linking]), or whose version it
     /// hadn't found: the version's code if it has some now, its frame pushed,
@@ -1747,6 +1757,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                     }
+                },
+                Residual::NativeCall { nf, a, b, c } if *c == 0 => {
+                    // Taking every result, which may be more than the call's slots
+                    // (`unpack`): `call_native` makes room for them.
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, r12 // state
+                        ; mov rsi, QWORD (*nf as usize as i64)
+                        ; mov edx, *a as i32
+                        ; mov ecx, *b as i32
+                        ; call extern (JitHelper::native_call as *const () as usize)
+                    );
                 },
                 Residual::NativeCall { nf, a, b, c } => {
                     // Native signature `fn(seq, args, returns, owner)` with ZST seq/owner,

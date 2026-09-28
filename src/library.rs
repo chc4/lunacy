@@ -2,7 +2,7 @@
 //! `table.clear` extensions) that lunacy has, as natives in the global table.
 //! See Note [Library natives].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 
 use indexmap::IndexMap;
@@ -58,6 +58,12 @@ thread_local! {
 // (B = 0) has a fixed arity when the specializer knows the top. See Note [Known
 // top] in `specialize`.
 
+/// `error`'s results: it has none, as it raises `message`, which ends the
+/// program.
+fn raise<'s, 'i>(message: String) -> SmallVec<[LBoxed<'s, 'i>; 4]> {
+    panic!("error: {message}")
+}
+
 /// A native computing its results from its arguments. See Note [Library natives].
 /// With `window:`, also a window op for calls to it, which LBBV runs. See Note
 /// [Native windows].
@@ -75,12 +81,157 @@ macro_rules! native {
             let results: SmallVec<[LBoxed<'_, '_>; 4]> = $body;
             let _ = &$owner;
             let returns = returns.rw(&mut seq);
-            for (i, slot) in returns.iter_mut().enumerate() {
-                *slot = results.get(i).copied().unwrap_or(LBoxed::NIL);
+            for (slot, &result) in returns.iter_mut().zip(results.iter()) {
+                *slot = result;
             }
             results.len().min(returns.len())
         }))
     };
+}
+
+thread_local! {
+    /// `math.random`'s state: xorshift64, which `math.randomseed` reseeds.
+    static RANDOM: Cell<u64> = const { Cell::new(0x2545_f491_4f6c_dd1d) };
+}
+
+/// The next number `math.random` draws on, in [0, 1).
+fn random() -> f64 {
+    RANDOM.with(|state| {
+        let mut x = state.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        state.set(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    })
+}
+
+/// One conversion of `string.format` through C's `snprintf`, as Lua's is:
+/// `spec` its flags, width and precision, `conv` the conversion with any
+/// length modifier.
+fn c_format(spec: &[u8], conv: &str, value: CArg) -> Vec<u8> {
+    let format = std::ffi::CString::new([b"%", spec, conv.as_bytes()].concat()).expect("a format without NUL");
+    let mut buf = vec![0u8; 64];
+    loop {
+        // SAFETY: `format` has the one conversion `value` is the argument of.
+        let n = unsafe {
+            match value {
+                CArg::Int(v) => libc::snprintf(buf.as_mut_ptr().cast(), buf.len(), format.as_ptr(), v as libc::c_longlong),
+                CArg::Char(v) => libc::snprintf(buf.as_mut_ptr().cast(), buf.len(), format.as_ptr(), v as libc::c_int),
+                CArg::Double(v) => libc::snprintf(buf.as_mut_ptr().cast(), buf.len(), format.as_ptr(), v as libc::c_double),
+            }
+        } as usize;
+        if n < buf.len() {
+            buf.truncate(n);
+            return buf;
+        }
+        buf.resize(n + 1, 0);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CArg {
+    Int(i64),
+    Char(i32),
+    Double(f64),
+}
+
+/// `string.format(fmt, ...)`.
+fn format(fmt: &[u8], args: &[LBoxed]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut next = 0;
+    let mut i = 0;
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            out.push(fmt[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if fmt.get(i) == Some(&b'%') {
+            out.push(b'%');
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < fmt.len() && b"-+ #0".contains(&fmt[i]) {
+            i += 1;
+        }
+        while i < fmt.len() && (fmt[i].is_ascii_digit() || fmt[i] == b'.') {
+            i += 1;
+        }
+        let spec = &fmt[start..i];
+        let conv = *fmt.get(i).unwrap_or_else(|| panic!("string.format: a format ending in its conversion's spec"));
+        i += 1;
+        let value = arg(args, next);
+        next += 1;
+        match conv {
+            b'd' | b'i' => out.extend(c_format(spec, "lld", CArg::Int(number(value) as i64))),
+            b'u' | b'o' | b'x' | b'X' => out.extend(c_format(spec, &format!("ll{}", conv as char), CArg::Int(number(value) as i64))),
+            b'c' => out.extend(c_format(spec, "c", CArg::Char(number(value) as i32))),
+            b'e' | b'E' | b'f' | b'g' | b'G' => out.extend(c_format(spec, &(conv as char).to_string(), CArg::Double(number(value)))),
+            b's' => {
+                let mut s = bytes(value);
+                let text = String::from_utf8_lossy(spec).into_owned();
+                let (width, precision) = match text.split_once('.') {
+                    Some((w, p)) => (w, p.parse::<usize>().ok()),
+                    None => (text.as_str(), None),
+                };
+                if let Some(p) = precision {
+                    s.truncate(p);
+                }
+                let left = width.contains('-');
+                let width: usize = width.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0);
+                let pad = width.saturating_sub(s.len());
+                if !left {
+                    out.extend(std::iter::repeat_n(b' ', pad));
+                }
+                out.extend(s);
+                if left {
+                    out.extend(std::iter::repeat_n(b' ', pad));
+                }
+            }
+            b'q' => {
+                out.push(b'"');
+                for b in bytes(value) {
+                    match b {
+                        b'"' | b'\\' | b'\n' => out.extend([b'\\', b]),
+                        b'\r' => out.extend(b"\\r"),
+                        0 => out.extend(b"\\000"),
+                        b => out.push(b),
+                    }
+                }
+                out.push(b'"');
+            }
+            conv => panic!("string.format: no conversion '%{}'", conv as char),
+        }
+    }
+    out
+}
+
+/// `math`'s natives beside those `Vm::global_env` defines.
+pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
+    vec![
+        ("random", native!(|owner, args| {
+            let r = random();
+            let value = match args.len() {
+                0 => r,
+                1 => (r * number(args[0]).floor()).floor() + 1.0,
+                _ => {
+                    let (m, n) = (number(args[0]).floor(), number(args[1]).floor());
+                    m + (r * (n - m + 1.0)).floor()
+                }
+            };
+            smallvec![LBoxed::from_number(value)]
+        })),
+        ("randomseed", native!(|owner, args| {
+            // Never zero, which xorshift stays at.
+            RANDOM.with(|state| state.set(number(arg(&args, 0)).to_bits() ^ 0x9e37_79b9_7f4a_7c15 | 1));
+            smallvec![]
+        })),
+        ("max", native!(|owner, args| smallvec![LBoxed::from_number(args.iter().map(|&v| number(v)).fold(f64::NEG_INFINITY, f64::max))])),
+        ("min", native!(|owner, args| smallvec![LBoxed::from_number(args.iter().map(|&v| number(v)).fold(f64::INFINITY, f64::min))])),
+    ]
 }
 
 fn arg<'s, 'i>(args: &[LBoxed<'s, 'i>], i: usize) -> LBoxed<'s, 'i> {
@@ -303,6 +454,13 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             s[range].iter().map(|&b| LBoxed::from_number(b as f64)).collect()
         })),
         ("char", native!(|owner, args| smallvec![string(args.iter().map(|&b| number(b) as u8).collect())])),
+        ("rep", native!(|owner, args| {
+            let s = bytes(arg(&args, 0));
+            let n = number(arg(&args, 1)).max(0.0) as usize;
+            let out = s.repeat(n);
+            smallvec![string(out)]
+        })),
+        ("format", native!(|owner, args| smallvec![string(format(&bytes(arg(&args, 0)), args.get(1..).unwrap_or(&[])))])),
     ]);
 
     let table_new = native!(|owner, args| {
@@ -380,6 +538,20 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         ("bswap", native!(window: bit1_window::<BSWAP>, |owner, args| bit_result(bit1::<BSWAP>(tobit(arg(&args, 0)))))),
     ]);
 
+    // Every value of `t` from `i` to `j`, by default all of its array part.
+    let unpack = native!(|owner, args| {
+        let t = table(arg(&args, 0));
+        let array = &t.ro(owner).array;
+        let i = number_or(arg(&args, 1), 1.0) as i64;
+        let j = number_or(arg(&args, 2), array.len() as f64) as i64;
+        (i..=j).map(|k| if k >= 1 { array.get(k as usize - 1).copied().unwrap_or(LBoxed::NIL) } else { LBoxed::NIL }).collect()
+    });
+    // Lunacy has no `pcall`: an error ends the run.
+    let error = native!(|owner, args| {
+        let message = arg(&args, 0).unbox().as_string(owner).map(|s| String::from_utf8_lossy(s.as_slice()).into_owned());
+        raise(message.unwrap_or_else(|| format!("{:?}", arg(&args, 0).unbox())))
+    });
+
     let require = native!(|owner, args| {
         let name = bytes(arg(&args, 0));
         let found = MODULES.with_borrow(|modules| modules.iter().find(|(m, _)| m.as_bytes() == name).map(|(_, v)| *v));
@@ -402,6 +574,8 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "tostring"), tostring),
         (InternString::intern(intern, "tonumber"), tonumber),
         (InternString::intern(intern, "require"), require),
+        (InternString::intern(intern, "unpack"), unpack),
+        (InternString::intern(intern, "error"), error),
         (InternString::intern(intern, "string"), string_lib),
         (InternString::intern(intern, "table"), table_lib),
         (InternString::intern(intern, "io"), io_lib),

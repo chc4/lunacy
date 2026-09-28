@@ -814,7 +814,9 @@ impl<'src, 'intern> PartialEq for LValue<'src, 'intern> {
             (LValue::Bool(a), LValue::Bool(b)) => a == b,
             (LValue::Table(a), LValue::Table(b)) => a == b,
             (LValue::InternedString(a), LValue::InternedString(b)) => a == b,
-            (LValue::OwnedString(a), LValue::OwnedString(b)) => a == b,
+            (LValue::OwnedString(a), LValue::OwnedString(b)) => a.as_slice() == b.as_slice(),
+            (LValue::InternedString(a), LValue::OwnedString(b)) | (LValue::OwnedString(b), LValue::InternedString(a)) =>
+                a.as_bytes() == b.as_slice(),
             (LValue::LClosure(a), LValue::LClosure(b)) => a == b,
             (LValue::NClosure(a), LValue::NClosure(b)) => a == b,
             (a, b) => match (a.as_f64(), b.as_f64()) {
@@ -1361,11 +1363,18 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         // The function's slot and its arguments: up to the top when they are
         // all a previous call's results (`B` = 0), else `B - 1` of them.
         let end = if b == 0 { self.top } else { self.base + a as usize + b as usize };
-        let args = &self.vals[self.base + a as usize + 1..end];
+        let at = self.base + a as usize;
+        let len = self.vals.len();
+        if c == 0 {
+            // Every result, from the function's slot on, however many: the
+            // stack is lengthened for them while the native runs (no GC runs
+            // in a native), and back to where they end after.
+            self.vals.lengthen(self.vals.capacity());
+        }
+        let args = &self.vals[at + 1..end];
         debug!("{:?}", args);
         let returns = if c == 0 {
-            // Every result, in the slots the function and its arguments took.
-            &self.vals[self.base + a as usize..end]
+            &self.vals[at..]
         }
         else if c == 1 {
             // nothing saved
@@ -1387,9 +1396,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         });
         // Taking every result, the caller reads up to the top; wanting `c - 1`,
         // the ones it didn't write are nil.
-        let at = self.base + a as usize;
         if c == 0 {
-            self.top = at + count.min(wanted);
+            self.top = at + count;
+            self.vals.truncate(len.max(self.top));
         } else {
             for slot in at + count.min(wanted)..at + wanted {
                 self.vals[slot] = LBoxed::NIL;
@@ -1627,6 +1636,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         math_tab.insert_lvalue(InternString::intern(intern, "sin"), math1!(f64::sin));
         math_tab.insert_lvalue(InternString::intern(intern, "cos"), math1!(f64::cos));
         math_tab.insert_lvalue(InternString::intern(intern, "tan"), math1!(f64::tan));
+        for (name, native) in crate::library::math_natives() {
+            math_tab.insert_lvalue(InternString::intern(intern, name), native);
+        }
 
         let mut os_tab = Table::new(0, 0);
         os_tab.insert_lvalue(InternString::intern(intern, "exit"), LValue::NClosure(NClosure::new(|seq, args, _returns, _owner| {
