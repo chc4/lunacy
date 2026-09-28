@@ -19,7 +19,7 @@ pub trait Mark {
 impl<'src, 'intern> Mark for LValue<'src, 'intern> {
     fn mark(&self, owner: &Owner) {
         match self {
-            LValue::Nil | LValue::Bool(_) | LValue::Number(_) => { },
+            LValue::Nil | LValue::Bool(_) | LValue::Integer(_) | LValue::Double(_) => { },
             LValue::Table(t) => t.mark(owner),
             LValue::InternedString(_) => { },
             LValue::OwnedString(s) => s.mark(owner),

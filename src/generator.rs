@@ -35,7 +35,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
     /// Get the LType of an observed value
     pub fn typeof_(&self) -> LType {
         match self {
-            LValue::Number(_) => LType::Number,
+            LValue::Integer(_) | LValue::Double(_) => LType::Number,
             LValue::InternedString(_) | LValue::OwnedString(_) => LType::String,
             LValue::Table(t) => LType::Table,
             LValue::LClosure(_) | LValue::NClosure(_) => LType::Closure,
@@ -895,13 +895,13 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Ok(b) => LValue::from(b),
                     Err(lv) => lv.unbox(),
                 };
-                let LValue::Number(kb) = kb else { unreachable!() };
+                let Some(kb) = kb.as_f64() else { unreachable!() };
                 let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
                     Ok(c) => LBoxed::from(c),
                     Err(lv) => *lv,
                 };
                 let LValue::Table(mut t) = state.vals[state.base + a].unbox() else { unreachable!() };
-                t.set(owner, LBoxed::from_number(kb.0), kc, state.intern);
+                t.set(owner, LBoxed::from_number(kb), kc, state.intern);
             })));
         } else {
             // Hash part set
@@ -1432,7 +1432,7 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         arg = yield YieldOp::Exec(ResidualExec::new("unm", Rc::new(move |owner, state| {
             let res = match state.vals[state.base + b as usize].unbox() {
                 // TODO: metatables
-                LValue::Number(n) => LValue::Number(Number(-n.0)),
+                LValue::Integer(_) | LValue::Double(_) => LValue::number(-state.vals[state.base + b as usize].as_number().unwrap()),
                 _ => unimplemented!(),
             };
             state.vals[state.base + a as usize] = LBoxed::box_lvalue(res);
@@ -1453,7 +1453,7 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
                     LValue::InternedString(s) => s.as_bytes().len(),
                     _ => unreachable!(),
                 };
-                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::Number(Number(n as _)));
+                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::number(n as _));
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Number)]);
             return arg;
@@ -1464,7 +1464,7 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
             arg = yield YieldOp::Exec(ResidualExec::new("len_tab", Rc::new(move |owner, state| {
                 let LValue::Table(b) = state.vals[state.base + b].unbox() else { unreachable!() };
                 let n = b.ro(owner).array.len();
-                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::Number(Number(n as _)));
+                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::number(n as _));
             })));
             yield YieldOp::SetTypes(vec![(a, LType::Number)]);
             return arg;

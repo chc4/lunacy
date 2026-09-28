@@ -324,7 +324,8 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         match val {
             LValue::Nil => Self::NIL,
             LValue::Bool(b) => Self::from_bool(b),
-            LValue::Number(n) => Self::from_number(n.0),
+            LValue::Integer(i) => Self::from_int(i),
+            LValue::Double(n) => Self::from_double(n.0),
             // Cells box as their raw, untagged pointer; the type lives in the
             // object's offset-0 `kind` header (see gc::CellKind).
             LValue::Table(t) => Self::from_raw(t.0.to_addr()),
@@ -347,8 +348,11 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     #[inline(always)]
     pub fn unbox(&self) -> LValue<'src, 'intern> {
         let bits = self.0;
+        if self.is_int() {
+            return LValue::Integer(unsafe { self.as_int() });
+        }
         if let Some(n) = self.as_number() {
-            return LValue::Number(Number(n));
+            return LValue::Double(Number(n));
         }
         if bits & Self::NOT_CELL_MASK != 0 {
             return match bits {
@@ -413,4 +417,27 @@ impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LBoxed<'src, 'intern> {
 #[inline(always)]
 pub fn is_integer(n: f64) -> bool {
     ((n as i32) as f64).to_bits() == n.to_bits()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unboxing a number and boxing it again gives it back bit for bit, in the
+    /// encoding it had.
+    #[test]
+    fn numbers_round_trip() {
+        let numbers: [LBoxed<'static, 'static>; 7] = [
+            LBoxed::from_int(2),
+            LBoxed::from_double(2.0),
+            LBoxed::from_int(i32::MIN),
+            LBoxed::from_double(-0.0),
+            LBoxed::from_double(1.5),
+            LBoxed::from_double(f64::NAN),
+            LBoxed::from_double(f64::INFINITY),
+        ];
+        for boxed in numbers {
+            assert_eq!(LBoxed::box_lvalue(boxed.unbox()).bits(), boxed.bits(), "{:#x}", boxed.bits());
+        }
+    }
 }

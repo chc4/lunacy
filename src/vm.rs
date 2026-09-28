@@ -608,11 +608,15 @@ impl<'intern, 'src> Deref for InternString<'intern, 'src> {
 }
 
 #[repr(u8)]
-#[derive(Debug, Hash, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum LValue<'src, 'intern> {
     Nil = 0,
     Bool(bool) = 1,
-    Number(Number) = 2,
+    // Numbers, in the encoding their box has: the integer one, or the double
+    // one (Note [Integer encoding] in `lboxed`). Lua can't tell 2 from 2.0:
+    // equality and comparisons are by value.
+    Integer(i32) = 2,
+    Double(Number) = 16,
     Table(Tc<Table<'src, 'intern>>) = 3,
     // Shared variants get mapped so they have a bit we can check
     // Strings
@@ -685,7 +689,8 @@ impl<'src, 'intern> LCanon<'src, 'intern> {
     pub fn new(v: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> Self {
         match v.unbox() {
             LValue::OwnedString(g) => LCanon(LBoxed::interned(intern_bytes(intern, g.as_slice()))),
-            LValue::Number(n) => Self::number(n.0),
+            LValue::Integer(i) => Self::number(i as f64),
+            LValue::Double(n) => Self::number(n.0),
             _ => LCanon(v),
         }
     }
@@ -770,10 +775,45 @@ impl std::fmt::Display for LType {
     }
 }
 
+impl<'src, 'intern> PartialEq for LValue<'src, 'intern> {
+    /// Lua's raw equality: numbers by value, whichever their encodings.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (LValue::Nil, LValue::Nil) => true,
+            (LValue::Bool(a), LValue::Bool(b)) => a == b,
+            (LValue::Table(a), LValue::Table(b)) => a == b,
+            (LValue::InternedString(a), LValue::InternedString(b)) => a == b,
+            (LValue::OwnedString(a), LValue::OwnedString(b)) => a == b,
+            (LValue::LClosure(a), LValue::LClosure(b)) => a == b,
+            (LValue::NClosure(a), LValue::NClosure(b)) => a == b,
+            (a, b) => match (a.as_f64(), b.as_f64()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            },
+        }
+    }
+}
+
 impl<'src, 'intern> LValue<'src, 'intern> {
+    /// A number, in the encoding `LBoxed::from_number` gives it: the integer
+    /// one for a whole i32 (not -0), else the double one.
+    pub fn number(n: f64) -> Self {
+        if crate::lboxed::is_integer(n) { LValue::Integer(n as i32) } else { LValue::Double(Number(n)) }
+    }
+
+    /// A number's value, whichever its encoding.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            LValue::Integer(i) => Some(*i as f64),
+            LValue::Double(n) => Some(n.0),
+            _ => None,
+        }
+    }
+
     pub fn compare(&self, opcode: Opcode, right: Self, owner: &Owner) -> Result<bool, String> {
         // TODO: metamethods
-        if std::mem::discriminant(self) != std::mem::discriminant(&right) {
+        let numbers = self.as_f64().is_some() && right.as_f64().is_some();
+        if !numbers && std::mem::discriminant(self) != std::mem::discriminant(&right) {
             panic!("bad compare");
         }
         match (self, &right) {
@@ -799,7 +839,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             Opcode::LT => {
                 match (self, &right) {
                     (LValue::Bool(left_b), LValue::Bool(right_b)) => Ok(left_b < right_b),
-                    (LValue::Number(left_n), LValue::Number(right_n)) => Ok(left_n < right_n),
+                    (left, right) if numbers => Ok(left.as_f64() < right.as_f64()),
                     (LValue::InternedString(left_s), LValue::InternedString(right_s)) =>
                         Ok(left_s.as_bytes() < right_s.as_bytes()),
                     (LValue::OwnedString(left_s), LValue::OwnedString(right_s)) =>
@@ -810,7 +850,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             Opcode::LE => {
                 match (self, &right) {
                     (LValue::Bool(left_b), LValue::Bool(right_b)) => Ok(left_b <= right_b),
-                    (LValue::Number(left_n), LValue::Number(right_n)) => Ok(left_n <= right_n),
+                    (left, right) if numbers => Ok(left.as_f64() <= right.as_f64()),
                     (LValue::InternedString(left_s), LValue::InternedString(right_s)) =>
                         Ok(left_s.as_bytes() <= right_s.as_bytes()),
                     _ => panic!()
@@ -823,21 +863,15 @@ impl<'src, 'intern> LValue<'src, 'intern> {
 
     #[inline(always)]
     pub fn numeric_op(&self, opcode: Opcode, right: &Self) -> Result<LValue<'src, 'intern>, String> {
-        match (self, right) {
-            (LValue::Number(left_n), LValue::Number(right_n)) => {
+        match (self.as_f64(), right.as_f64()) {
+            (Some(left_n), Some(right_n)) => {
                 match opcode {
-                    Opcode::ADD =>
-                        Ok(LValue::Number(Number(left_n.0 + right_n.0))),
-                    Opcode::SUB =>
-                        Ok(LValue::Number(Number(left_n.0 - right_n.0))),
-                    Opcode::MUL =>
-                        Ok(LValue::Number(Number(left_n.0 * right_n.0))),
-                    Opcode::DIV =>
-                        Ok(LValue::Number(Number(left_n.0 / right_n.0))),
-                    Opcode::MOD =>
-                        Ok(LValue::Number(Number(lua_mod(left_n.0, right_n.0)))),
-                    Opcode::POW =>
-                        Ok(LValue::Number(Number(left_n.0.powf(right_n.0)))),
+                    Opcode::ADD => Ok(LValue::number(left_n + right_n)),
+                    Opcode::SUB => Ok(LValue::number(left_n - right_n)),
+                    Opcode::MUL => Ok(LValue::number(left_n * right_n)),
+                    Opcode::DIV => Ok(LValue::number(left_n / right_n)),
+                    Opcode::MOD => Ok(LValue::number(lua_mod(left_n, right_n))),
+                    Opcode::POW => Ok(LValue::number(left_n.powf(right_n))),
                     _ => unsafe { std::hint::unreachable_unchecked() },
                 }
             },
@@ -849,11 +883,11 @@ impl<'src, 'intern> LValue<'src, 'intern> {
     pub fn len(&self, owner: &Owner) -> Result<LValue<'src, 'intern>, String> {
         // TODO: metamethods
         match self {
-            LValue::InternedString(s) => Ok(LValue::Number(Number(s.as_bytes().len() as _))),
-            LValue::OwnedString(s) => Ok(LValue::Number(Number(s.len() as _))),
+            LValue::InternedString(s) => Ok(LValue::number(s.as_bytes().len() as _)),
+            LValue::OwnedString(s) => Ok(LValue::number(s.len() as _)),
             LValue::Table(t) => {
                 // TODO: sparse arrays
-                Ok(LValue::Number(Number(t.ro(owner).array.len() as _)))
+                Ok(LValue::number(t.ro(owner).array.len() as _))
             },
             _ => unimplemented!(),
         }
@@ -881,7 +915,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         match self {
             LValue::OwnedString(g) => s.extend_from_slice(g.as_slice()),
             LValue::InternedString(i) => s.extend_from_slice(i.as_bytes()),
-            LValue::Number(f) => { write!(s, "{}", f.0); },
+            LValue::Integer(i) => { write!(s, "{}", i); },
+            LValue::Double(f) => { write!(s, "{}", f.0); },
             LValue::Table(tc) => { write!(s, "{:?}", tc); },
             LValue::Nil => { write!(s, "nil"); },
             LValue::Bool(b) => { write!(s, "{b}"); },
@@ -901,7 +936,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         match self {
             LValue::OwnedString(g) => return Some(g.clone()),
             LValue::InternedString(i) => s.extend_from_slice(i.as_bytes()),
-            LValue::Number(f) => { write!(s, "{}", f.0); },
+            LValue::Integer(i) => { write!(s, "{}", i); },
+            LValue::Double(f) => { write!(s, "{}", f.0); },
             LValue::Table(tc) => { write!(s, "{:?}", tc); },
             LValue::Nil => return None,
             LValue::LClosure(l) => { write!(s, "function({:p})", l.as_ptr()); },
@@ -931,7 +967,7 @@ impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LValue<'src, 'intern>
         match value {
             Constant::Nil => LValue::Nil,
             Constant::Bool(b) => LValue::Bool(*b),
-            Constant::Number(i) => LValue::Number(*i),
+            Constant::Number(n) => LValue::number(n.0),
             Constant::String(s) => LValue::InternedString(s.clone()),
         }
     }
@@ -1557,7 +1593,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::from_number(f64::INFINITY));
             1
         })));
-        math_tab.insert_lvalue(InternString::intern(intern, "pi"), LValue::Number(Number(std::f64::consts::PI)));
+        math_tab.insert_lvalue(InternString::intern(intern, "pi"), LValue::number(std::f64::consts::PI));
         math_tab.insert_lvalue(InternString::intern(intern, "sin"), math1!(f64::sin));
         math_tab.insert_lvalue(InternString::intern(intern, "cos"), math1!(f64::cos));
         math_tab.insert_lvalue(InternString::intern(intern, "tan"), math1!(f64::tan));
@@ -1602,15 +1638,15 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     let result: LValue = match opt.as_slice() {
                         // SAFETY: reachable only from a safepoint that just published roots.
                         // See Note [GC roots].
-                        b"collect" | b"" => { unsafe { GcCtx::assume_rooted().full_collect_published(owner); } LValue::Number(Number(0.0)) },
+                        b"collect" | b"" => { unsafe { GcCtx::assume_rooted().full_collect_published(owner); } LValue::number(0.0) },
                         // Live memory in Kbytes, as a (fractional) number.
-                        b"count" => LValue::Number(Number(Heap::live_bytes() as f64 / 1024.0)),
+                        b"count" => LValue::number(Heap::live_bytes() as f64 / 1024.0),
                         // Advance one incremental step.
                         b"step" => { unsafe { GcCtx::assume_rooted().step_published(owner); } LValue::Bool(false) },
-                        b"stop" => { Heap::set_gc_off(true); LValue::Number(Number(0.0)) },
-                        b"restart" => { Heap::set_gc_off(false); LValue::Number(Number(0.0)) },
+                        b"stop" => { Heap::set_gc_off(true); LValue::number(0.0) },
+                        b"restart" => { Heap::set_gc_off(false); LValue::number(0.0) },
                         // Tuning knobs we accept but don't model.
-                        b"setpause" | b"setstepmul" => LValue::Number(Number(0.0)),
+                        b"setpause" | b"setstepmul" => LValue::number(0.0),
                         _ => LValue::Nil,
                     };
                     returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::box_lvalue(result));

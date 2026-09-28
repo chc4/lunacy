@@ -108,7 +108,8 @@ fn bytes(v: LBoxed) -> Vec<u8> {
     match v.unbox() {
         LValue::InternedString(s) => s.as_bytes().to_vec(),
         LValue::OwnedString(s) => s.as_slice().to_vec(),
-        LValue::Number(n) => format!("{}", n.0).into_bytes(),
+        LValue::Integer(i) => format!("{}", i).into_bytes(),
+        LValue::Double(n) => format!("{}", n.0).into_bytes(),
         other => unimplemented!("a string argument, not {other:?}"),
     }
 }
@@ -259,7 +260,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let name: &[u8] = match arg(&args, 0).unbox() {
             LValue::Nil => b"nil",
             LValue::Bool(_) => b"boolean",
-            LValue::Number(_) => b"number",
+            LValue::Integer(_) | LValue::Double(_) => b"number",
             LValue::InternedString(_) | LValue::OwnedString(_) => b"string",
             LValue::Table(_) => b"table",
             LValue::LClosure(_) | LValue::NClosure(_) => b"function",
@@ -274,7 +275,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let v = arg(&args, 0);
         let base = number_or(arg(&args, 1), 10.0) as u32;
         let parsed = match v.unbox() {
-            LValue::Number(_) if base == 10 => v.as_number(),
+            LValue::Integer(_) | LValue::Double(_) if base == 10 => v.as_number(),
             LValue::InternedString(_) | LValue::OwnedString(_) => {
                 let text = String::from_utf8_lossy(&bytes(v)).trim().to_lowercase();
                 match text.strip_prefix("0x") {
