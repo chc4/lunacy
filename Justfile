@@ -192,46 +192,36 @@ _luac-test name:
 
 # Benchmarks
 # Compile a benchmark to working/<benchmark>.bin: this repository's
-# benchmarks/<benchmark>, else lua_benchmarking's.
+# benchmarks/<benchmark>, else lua_benchmarking's, bundled with its modules and
+# benchmarks/prelude.lua (`tools/bundle_bench.py`) in working/<benchmark>.lua.
 _luac benchmark:
-    #!/usr/bin/env bash
-    set -euo pipefail
     mkdir -p working
-    src=benchmarks/{{benchmark}}/bench.lua
-    if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
-    luac5.1 -o working/{{benchmark}}.bin $src
+    python3 tools/bundle_bench.py {{benchmark}} > working/{{benchmark}}.lua
+    luac5.1 -o working/{{benchmark}}.bin working/{{benchmark}}.lua
 
 # Compile a benchmark, as `_luac`, to LuaJIT's bytecode in
 # working/<benchmark>.luajit.bin: LuaJIT can't load luac5.1's.
 _luajitc benchmark:
-    #!/usr/bin/env bash
-    set -euo pipefail
     mkdir -p working
-    src=benchmarks/{{benchmark}}/bench.lua
-    if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
-    luajit -b $src working/{{benchmark}}.luajit.bin
+    python3 tools/bundle_bench.py {{benchmark}} > working/{{benchmark}}.luajit.lua
+    luajit -b working/{{benchmark}}.luajit.lua working/{{benchmark}}.luajit.bin
 
 # Compile a benchmark, as `_luac`, to Lua 5.5's bytecode in
 # working/<benchmark>.lua55.bin.
 _lua55c benchmark:
-    #!/usr/bin/env bash
-    set -euo pipefail
     mkdir -p working
-    src=benchmarks/{{benchmark}}/bench.lua
-    if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
-    luac5.5 -o working/{{benchmark}}.lua55.bin $src
+    python3 tools/bundle_bench.py {{benchmark}} > working/{{benchmark}}.lua55.lua
+    luac5.5 -o working/{{benchmark}}.lua55.bin working/{{benchmark}}.lua55.lua
 
 # Luau's copy of a benchmark, as `_luac`, in working/<benchmark>.luau: its
-# source, then a call of its `run_iter` with the count Luau is given (`-a`).
+# bundle, then a call of its `run_iter` with the count Luau is given (`-a`).
 # Luau has no dofile, and runs each file with its own globals, so it can't run
 # the benchmark as bench.lua does for the other Luas.
 _luauc benchmark:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p working
-    src=benchmarks/{{benchmark}}/bench.lua
-    if [ ! -f $src ]; then src=lua_benchmarking/benchmarks/{{benchmark}}/bench.lua; fi
-    { cat $src; printf '\nrun_iter(tonumber((...)))\n'; } > working/{{benchmark}}.luau
+    { python3 tools/bundle_bench.py {{benchmark}}; printf '\nrun_iter(tonumber((...)))\n'; } > working/{{benchmark}}.luau
 
 run benchmark:
     just _luac {{benchmark}}
