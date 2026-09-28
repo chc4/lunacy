@@ -458,10 +458,17 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             ResumeArg::Matched => Some(None),
             _ => None,
         };
-        let in_array = match (integer, c & 0x100) {
-            (Some(Some(k)), 0) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[a]))),
-            (Some(None), 0) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[a, b]))),
-            _ => yield YieldOp::Decided(false),
+        let in_array = match integer {
+            Some(Some(k)) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[a]))),
+            Some(None) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[a, b]))),
+            None => yield YieldOp::Decided(false),
+        };
+        // A constant value's boxed value is the op's hole.
+        let constant = if c & 0x100 != 0 && matches!(in_array, ResumeArg::Matched) {
+            let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
+            Some(bits)
+        } else {
+            None
         };
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableArray, [k: i32], [], |owner, state, base| (table, value) {
@@ -470,7 +477,17 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            arg = yield YieldOp::ExecWindow(Rc::new(SetTableArray::new(k, &[a, c])));
+            windowed!(SetTableArrayK, [k: i32, value: u64], [], |owner, state, base| (table) {
+                let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
+                // A constant's value lives as long as its prototype.
+                tab.rw(owner).array[integer_slot(k)] = LBoxed::from_bits(value);
+                // Last. See Note [Write barriers].
+                tab.barrier_back();
+            });
+            arg = yield YieldOp::ExecWindow(match constant {
+                None => Rc::new(SetTableArray::new(k, &[a, c])) as Rc<dyn Window>,
+                Some(value) => Rc::new(SetTableArrayK::new(k, value, &[a])),
+            });
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableInteger, [], [], |owner, state, base| (table, key, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
@@ -478,10 +495,19 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            arg = yield YieldOp::ExecWindow(Rc::new(SetTableInteger::new(&[a, b, c])));
+            windowed!(SetTableIntegerK, [value: u64], [], |owner, state, base| (table, key) {
+                let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
+                // A constant's value lives as long as its prototype.
+                tab.rw(owner).array[integer_slot(key.as_int())] = LBoxed::from_bits(value);
+                // Last. See Note [Write barriers].
+                tab.barrier_back();
+            });
+            arg = yield YieldOp::ExecWindow(match constant {
+                None => Rc::new(SetTableInteger::new(&[a, b, c])) as Rc<dyn Window>,
+                Some(value) => Rc::new(SetTableIntegerK::new(value, &[a, b])),
+            });
         } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = (yield YieldOp::GuardRk(b, LType::Number)) {
-            // Any other number key, one past the array part, or a constant value:
-            // through `set`.
+            // Any other number key, or one past the array part: through `set`.
             arg = yield YieldOp::Exec(ResidualExec::new("settable_array", Rc::new(move |owner, state| {
                 let kb: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                     Ok(b) => LValue::from(b),
