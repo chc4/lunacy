@@ -496,6 +496,12 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             }
             smallvec![]
         })),
+        ("remove", native!(|owner, args| {
+            let t = table(arg(&args, 0));
+            let array = &mut t.rw(owner).array;
+            let at = if args.len() > 1 { number(arg(&args, 1)) as usize } else { array.len() };
+            if (1..=array.len()).contains(&at) { smallvec![array.remove(at - 1)] } else { smallvec![] }
+        })),
         ("concat", native!(|owner, args| {
             let t = table(arg(&args, 0));
             let sep = if args.len() > 1 { bytes(arg(&args, 1)) } else { Vec::new() };

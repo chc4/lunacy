@@ -1342,10 +1342,16 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// stay open. See Note [Captured slots] in `specialize`.
     pub fn close_upvalues(&mut self, owner: &mut Owner)
     {
-        let (base, vals) = (self.base, &self.vals);
+        self.close_upvalues_from(owner, self.base)
+    }
+
+    /// Close every upvalue open into a slot from `from` up.
+    pub fn close_upvalues_from(&mut self, owner: &mut Owner, from: usize)
+    {
+        let vals = &self.vals;
         self.upvals.retain(|(upval, uses)| {
             let Upvalue::Open(idx) = upval else { unreachable!("a closed upvalue in the open list") };
-            if *idx < base {
+            if *idx < from {
                 return true;
             }
             let closed = Tc::new(vals[*idx]);

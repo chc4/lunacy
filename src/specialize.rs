@@ -1436,6 +1436,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_test(a as usize, c, pc + 1)), ResumeArg::Start, block_id)
                 },
+                Opcode::TESTSET => {
+                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_testset(a as usize, b as usize, c, pc + 1)), ResumeArg::Start, block_id)
+                },
+                Opcode::NOT => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_not(a as usize, b as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::CLOSE => {
+                    let (a, _) = crate::vm::AB::unpack(inst.0);
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_close(a as usize)), ResumeArg::Start, block_id)
+                },
                 Opcode::JMP => {
                     let sbx = crate::vm::sBx::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)

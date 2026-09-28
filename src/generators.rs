@@ -1151,6 +1151,83 @@ pub fn emit_concat(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yi
     }
 }
 
+/// `R(A) := not R(B)`.
+pub fn emit_not(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        windowed!(Not, [], [], |owner, state, base| (value, out dest) {
+            *dest = LBoxed::from_bool(value.bits() == LBoxed::VALUE_NIL || value.bits() == LBoxed::VALUE_FALSE);
+        });
+        yield YieldOp::ExecWindow(Rc::new(Not::new(&[b, a])));
+        yield YieldOp::SetTypes(vec![(a, LType::Bool)]);
+        arg
+    }
+}
+
+/// `if R(B)'s truthiness is C then R(A) := R(B) else skip the next instruction`
+/// (a jump). `pc` is the next instruction's.
+pub fn emit_testset(a: usize, b: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Guard(b, LType::Bool);
+        if let ResumeArg::Matched = arg {
+            // `select` is 1, the fallthrough, when the guarded bool is `C`, and then
+            // R(A) is it.
+            windowed!(TestSetBool, [], [C: bool], |owner, state, base| (value, inout dest) {
+                let set = (value.bits() == LBoxed::VALUE_TRUE) == C;
+                if set {
+                    *dest = value;
+                }
+                state.select = set as usize;
+            });
+            yield YieldOp::ExecWindow(if c != 0 {
+                Rc::new(TestSetBool::<true>::new(&[b, a]))
+            } else {
+                Rc::new(TestSetBool::<false>::new(&[b, a]))
+            });
+            // R(A) is a bool if it was one before, whichever path is taken.
+            let ResumeArg::Type(before) = (yield YieldOp::Typeof(a)) else { unreachable!() };
+            let after = if before.as_ltype() == LType::Bool { LType::Bool } else { LType::Unknown };
+            yield YieldOp::SetTypes(vec![(a, after)]);
+            arg = yield YieldOp::GetBlock(pc);
+            let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
+            arg = yield YieldOp::GetBlock(pc + 1);
+            let ResumeArg::BlockId(taken) = arg else { unreachable!() };
+            arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
+            return arg
+        }
+        // Nil is false, and everything else is true.
+        arg = yield YieldOp::Guard(b, LType::Nil);
+        let truthy = arg != ResumeArg::Matched;
+        if truthy == (c != 0) {
+            let ResumeArg::Type(t) = (yield YieldOp::Typeof(b)) else { unreachable!() };
+            windowed!(TestSetMove, [], [], |owner, state, base| (from, out to) {
+                *to = from;
+            });
+            yield YieldOp::ExecWindow(Rc::new(TestSetMove::new(&[b, a])));
+            yield YieldOp::SetCTypes(vec![(a, t)]);
+            arg = yield YieldOp::GetBlock(pc);
+        } else {
+            arg = yield YieldOp::GetBlock(pc + 1);
+        }
+        let ResumeArg::BlockId(target) = arg else { unreachable!() };
+        arg = yield YieldOp::Jump(target);
+        arg
+    }
+}
+
+/// Close every upvalue open into a slot from R(A) up.
+pub fn emit_close(a: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Exec(ResidualExec::new("close", Rc::new(move |owner, state| {
+            let from = state.base + a;
+            state.close_upvalues_from(owner, from);
+        })));
+        arg
+    }
+}
+
 pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
