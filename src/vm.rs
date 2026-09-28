@@ -1258,15 +1258,43 @@ impl Location {
 // frame, which starts with a copy of the fixed ones. VARARG reads them from
 // there, and a return puts its results in the function's slot below them.
 //
-// A frame's callstack entry records its function's slot, as Lua's call info
-// does, wherever the frame starts: a vararg frame's extra arguments are the
-// slots past its function's and its fixed arguments' up to its base. The
-// outermost frame, a chunk, has none.
+// A vararg frame's callstack entry records its function's slot, as Lua's call
+// info does: its extra arguments are the slots past its function's and its fixed
+// arguments' up to its base, and its return puts results in that slot. Any other
+// frame's function's slot is just below its base, so its entry needn't record
+// it. Whether a frame's function is vararg is static at its calls (once the
+// callee is known) and at its returns. The outermost frame, a chunk, has no extra
+// arguments.
 
-/// A frame's caller's state, restored when it returns, and its function's slot
-/// (`func`), where its results go. See Note [Stack frames].
+/// A frame's caller's state, restored when it returns, and, for a vararg
+/// function's frame, its function's slot. See Note [Stack frames].
 #[derive(Debug)]
-pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: Location, pub frame: usize, pub func: usize, pub witness_frame: usize, pub witness_top: usize }
+pub struct CallstackEntry<'src, 'intern> {
+    pub clos: Tc<LClosure<'src, 'intern>>,
+    pub ret: Location,
+    pub frame: usize,
+    /// The slot of the frame's function, where its results go: initialized in
+    /// exactly the entries of vararg functions' frames. `call_lua` pushes every
+    /// vararg function's frame, and sets it; `PushFrame` pushes only frames of
+    /// functions that aren't vararg, and leaves it uninitialized. See Note
+    /// [Vararg frames].
+    func: core::mem::MaybeUninit<usize>,
+    pub witness_frame: usize,
+    pub witness_top: usize,
+}
+
+impl<'src, 'intern> CallstackEntry<'src, 'intern> {
+    /// The slot of the function of this entry's frame.
+    ///
+    /// # Safety
+    ///
+    /// The frame's function is vararg: `func` is initialized in exactly those
+    /// frames' entries.
+    unsafe fn vararg_func(&self) -> usize {
+        // SAFETY: the caller's.
+        unsafe { self.func.assume_init() }
+    }
+}
 
 /// Where a frame's hash key was found in its table's hash part (its entry's
 /// index, and its value's address), and the table's epoch then. See Note
@@ -1441,6 +1469,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let passed = if b == 0 { self.top } else { self.base + a + b };
         let stack = self.push_frame(owner, ret, a, b, stack, true);
         if vararg {
+            let func = self.base - 1;
+            self.callstack.last_mut().expect("the frame just pushed").func = core::mem::MaybeUninit::new(func);
             self.move_past_varargs(passed, params, stack);
         }
         stack
@@ -1500,7 +1530,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             clos: self.clos.clone(),
             ret: ret_loc,
             frame: self.base,
-            func: next_base - 1,
+            // Set by `call_lua` if the function is vararg.
+            func: core::mem::MaybeUninit::uninit(),
             witness_frame: self.witness_base,
             witness_top: self.witness_top,
         });
@@ -1516,9 +1547,16 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// fixed parameters: its extra arguments to R(A) on, `b - 1` of them padded
     /// with nil, or with B = 0 all, the top just past them. See Note [Vararg
     /// frames].
-    pub fn vararg(&mut self, a: usize, b: usize, params: usize) {
+    pub fn vararg(&mut self, owner: &Owner, a: usize, b: usize, params: usize) {
+        debug_assert!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, "VARARG in a function that isn't vararg");
         // The outermost frame, a chunk, has none.
-        let extra = self.callstack.last().map_or(0, |entry| (self.base - entry.func - 1).saturating_sub(params));
+        let extra = self.callstack.last().map_or(0, |entry| {
+            // SAFETY: `entry` is the running frame's, and VARARG runs only in a
+            // vararg function (asserted above), so it is a vararg function's
+            // frame's entry, whose `func` `call_lua` set when pushing it.
+            let func = unsafe { entry.vararg_func() };
+            (self.base - func - 1).saturating_sub(params)
+        });
         let (from, to) = (self.base - extra, self.base + a);
         let count = if b == 0 { extra } else { b - 1 };
         if to + count > self.vals.len() {
@@ -1562,7 +1600,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
     /// Note [Frame ops] in `specialize`.
     #[inline(always)]
-    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) -> Result<Location, std::ops::Range<usize>> {
+    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> Result<Location, std::ops::Range<usize>> {
+        debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, vararg, "a return's vararg isn't its function's");
         if closes {
             if !self.upvals.is_empty() {
                 self.close_upvalues(owner);
@@ -1577,8 +1616,18 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let from = self.base + a;
         let count = if b == 0 { self.top - from } else { b - 1 };
         match self.callstack.pop() {
-            Some(CallstackEntry { clos, ret, frame, func, witness_frame, witness_top }) => {
-                let to = func;
+            Some(entry) => {
+                // The function's slot: a vararg function's frame's is recorded,
+                // and any other's is just below its base. See Note [Vararg frames].
+                let to = if vararg {
+                    // SAFETY: `entry` is the returning frame's, whose function is
+                    // vararg (`vararg`, asserted above), so `call_lua` set its
+                    // `func` when pushing it.
+                    unsafe { entry.vararg_func() }
+                } else {
+                    self.base - 1
+                };
+                let CallstackEntry { clos, ret, frame, witness_frame, witness_top, .. } = entry;
                 match count {
                     0 => {},
                     1 => self.vals[to] = self.vals[from],

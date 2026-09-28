@@ -554,23 +554,25 @@ impl Count {
 // `call_lua` for a call of R(A). `abs` is its `a | b << 16 | stack << 32` (A and B as
 // `Count::hold` holds them, `stack` the callee's `max_stack`). The pushed frame returns to `ret`
 // (a `PackedLocation`). Requires nilling the callee's frame if `FILLS`, or else the JIT code does.
+// The callee isn't vararg: its frame's entry records no function slot (Note [Vararg frames]).
 // See Note [Frame ops].
 windowed!(frame PushFrame, [ret: u64, abs: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
     let (a, b) = (A.lift(abs as u16), B.lift((abs >> 16) as u16));
     state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), a, b, (abs >> 32) as u8, FILLS);
+    debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
 
 // A `Ret` at `at` (a `PackedLocation`). `ab` is its `a | b << 16` (as `Count::hold` holds them).
-// Closing upvalues if `CLOSES`.
+// Closing upvalues if `CLOSES`, returning from a vararg function if `VARARG`.
 // See Note [Frame ops].
-windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     let Location(BlockId(block), off) = Location::unpack(crate::vm::PackedLocation::from_bits(at as usize));
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
     state.exit = if state.callstack.is_empty() {
         state.current_off = off as u16;
         ((-2i32 as u64) << 32) | block as u64
     } else {
-        match state.leave(owner, a, b, CLOSES) {
+        match state.leave(owner, a, b, CLOSES, VARARG) {
             Ok(location) => location.pack().bits() as u64,
             // With a caller frame, `leave` returns to it.
             Err(_) => unreachable!(),
@@ -655,8 +657,8 @@ pub enum Residual {
     Thunk(ThunkRef),
     /// A RETURN of `b - 1` values from R(A), or up to the top. Closes the frame's open upvalues.
     /// Functions which statically know they have no open upvalues may set `close = false` as an
-    /// optimization.
-    Ret(Pc, u8, u16, bool),
+    /// optimization. Last, whether the function is vararg. See Note [Vararg frames].
+    Ret(Pc, u8, u16, bool, bool),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
     HashGuard { tab: usize, href: HashRef, key: u64, expected: LType },
@@ -1562,8 +1564,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.end_block(block_id);
-                    let closes = !captured_slots(unsafe { &*self.clos.ro(owner).prototype }).is_empty();
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes)); None
+                    let proto = unsafe { &*self.clos.ro(owner).prototype };
+                    let closes = !captured_slots(proto).is_empty();
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0)); None
                 },
                 x => {
                     #[cfg(debug_assertions)]
@@ -1571,7 +1574,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         unreachable!("{:?}", x)
                     }
                     panic!("{:?}", x);
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true)); None
+                    let vararg = unsafe { (*self.clos.ro(owner).prototype).is_vararg != 0 };
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, vararg)); None
                 },
             } {
                 pc = next;
@@ -2661,9 +2665,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     state.arrive(a as usize, c as usize);
                 },
-                Residual::Ret(pc, a, b, closes) => {
+                Residual::Ret(pc, a, b, closes, vararg) => {
                     debug!("spec final blocks: {:?}", self.blocks);
-                    match state.leave(owner, a as usize, b as usize, closes) {
+                    match state.leave(owner, a as usize, b as usize, closes, vararg) {
                         Ok(Location(block, disp)) => {
                             self.set_current(state.clos.clone());
                             id = block;

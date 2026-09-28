@@ -1224,7 +1224,7 @@ pub fn emit_vararg(a: usize, b: usize, params: usize) -> impl Coroutine<ResumeAr
     #[coroutine]
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Exec(ResidualExec::new("vararg", Rc::new(move |owner, state| {
-            state.vararg(a, b, params);
+            state.vararg(owner, a, b, params);
         })));
         if b == 0 {
             yield YieldOp::Clobber(a);
