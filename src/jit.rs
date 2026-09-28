@@ -1616,7 +1616,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::HashGuard { tab, href, key, expected } => {
                     let href_u8 = href.0;
-                    let expected_u8 = crate::generator::guard_code(expected);
+                    let expected_u8 = crate::generator::guard_code(expected.ctype());
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r12 // state

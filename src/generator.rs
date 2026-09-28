@@ -23,8 +23,7 @@ use crate::chunk::Constant;
 use crate::chunk::Instruction;
 use crate::window::{windowed, Access, Window};
 // The native code generator (`JitContext`) and its per-block `JitInfo` (dynasm
-// buffer + hotness tiering) are only needed with the `jit` feature. LBBV on its
-// own is a second interpreter tier and doesn't touch them.
+// buffer + hotness tiering) are only needed with the `jit` feature.
 #[cfg(feature = "jit")]
 use crate::jit::{JitInfo, JitContext};
 use crate::gc::{Mark, Heap, GcCtx};
@@ -63,8 +62,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
 #[derive(Debug)]
 pub struct Block {
     pub instructions: Vec<Residual>,
-    /// The bytecode PC the block starts at, or the PC of the instruction a
-    /// block starting inside one belongs to.
+    /// The bytecode PC the block starts at, or the PC a
+    /// block starting inside an instruction belongs to.
     pub pc: Pc,
     /// Whether the block may have allocated since its last GC safepoint, which
     /// it then gets at its end. See Note [Block safepoints].
@@ -81,14 +80,15 @@ pub struct Block {
 
 // Note [Block safepoints]
 // ~~~~~~~~~~~~~~~~~~~~~~~
-// The collector steps only at safepoints (`Residual::GC`), so any code that
-// allocates must reach one, or a loop allocating only there never collects.
-// Emitters say an operation allocates with `YieldOp::CollectGarbage`, and a
-// call that may reach a native may allocate too (a call to a Lua function
-// doesn't: its own blocks have safepoints); either marks its block, which gets one
-// safepoint just before the residual ending it (a jump, a select, a thunk, a
-// return). One per block, not per allocation: each safepoint flushes the JIT's
-// register window, and a block's allocations are few enough to wait for its end.
+// The collector steps only at safepoints (`Residual::GC`), so any code that allocates must reach
+// one, or a loop allocating only there never collects. Emitter coroutines say an operation
+// allocates with `YieldOp::CollectGarbage`; native calls are pessimistically considered to
+// allocate as well. Known Lua call target aren't required to be considered allocations, because
+// the target function will itself have ran its own safepoint before returning.
+// Requiring GC doesn't immediately emit a safepoint but instead marks the block, which gets one
+// safepoint before any exit. This allows multiple GC-requiring operations inside one block to only
+// require a single safepoint, which is an optimization as each safepoint requires flushing the
+// JIT's register window, and a block's allocations are few enough to wait for its end.
 
 impl Block {
     fn new(pc: Pc) -> Self {
@@ -105,8 +105,7 @@ impl Block {
     }
 }
 
-// With feature `unreachable`, `unreachable!` is unchecked, its message (as
-// std's takes) unused.
+// With feature `unreachable`, `unreachable!` is unchecked. Its message is unused.
 #[cfg(feature = "unreachable")]
 #[macro_export]
 macro_rules! unreachable {
@@ -114,7 +113,9 @@ macro_rules! unreachable {
 }
 
 macro_rules! define_exec {
-    ($name:ident, [$($cap:ident: $cap_ty:ty),*], [$($const_param:ident: $const_ty:ty),*], |$owner:ident, $state:ident, $($args:ident),*| $body:block) => {
+    ($name:ident, [$($cap:ident: $cap_ty:ty),*], [$($const_param:ident: $const_ty:ty),*],
+        |$owner:ident, $state:ident, $($args:ident),*| $body:block) =>
+    {
         #[derive(Clone)]
         pub struct $name<$(const $const_param: $const_ty),*> {
             $(pub $cap: $cap_ty),*
@@ -148,8 +149,8 @@ macro_rules! define_exec {
     };
 }
 
-/// The arithmetic opcode's `[OP: Opcode, $params]` instance of a `windowed!`
-/// op, constructed with `new($args)`.
+/// An arithmetic operation's instance of a `Window`, specialized for the specific constant `OP:
+/// Opcode`.
 macro_rules! dispatch_numeric_window {
     ($opcode:expr, $name:ident, [$($p:expr),*], ($($arg:expr),*)) => {
         match $opcode {
@@ -188,54 +189,9 @@ macro_rules! dispatch_compare_window {
     };
 }
 
-/// In a generator, the types of an op's two operands, as `TypeofRk` gives
-/// them, for an op computing on integers: with one an integer register, whether
-/// the other register is one is found out (`GuardCType(Integer)`), which tests
-/// its tag if it is unknown or a number of either encoding. See Note
-/// [Integers]. An integer constant finds out nothing: it says nothing of how
-/// the program uses the other operand, and is an integer to an op whose other
-/// operand is one already.
-///
-/// The other register is guarded even when its type is known, statically, so
-/// that a way into the op already holding both integers takes the same guard
-/// as one finding out: the subblocks after the guard are shared by its outcome
-/// and the context, which are then the same, so the op must be at the same
-/// point in each.
-///
-/// Only whether both are integers may be acted on, as the key the macro leaves
-/// the generator at determines it and nothing else it returns (Note
-/// [Subblocks]). Taking no guard leaves the `SubPc` and context as they were,
-/// so the two types are the context's. Taking one, it leaves after `tt` only
-/// if the guarded register was found an integer, with the other known to be
-/// one: both are, in the context too. After `tf` or `f` one isn't. The types
-/// themselves can differ between ways reaching one key: a register read as a
-/// `Number` and found a double meets one known to be a double.
-macro_rules! discover_integers {
-    ($lhs:expr, $rhs:expr) => {{
-        let integer = ResumeArg::Type(CType::Integer);
-        let mut lt = yield YieldOp::TypeofRk($lhs);
-        let mut rt = yield YieldOp::TypeofRk($rhs);
-        let registers = ($lhs & 0x100) == 0 && ($rhs & 0x100) == 0;
-        if registers && lt == integer {
-            if (yield YieldOp::GuardCType($rhs, CType::Integer)) == ResumeArg::Matched {
-                rt = integer.clone();
-            }
-        } else if registers && rt == integer {
-            if (yield YieldOp::GuardCType($lhs, CType::Integer)) == ResumeArg::Matched {
-                lt = integer.clone();
-            }
-        }
-        (lt, rt)
-    }};
-}
-
-/// In a generator, a number operand's encoding: whether a register the op reads
-/// as a number, after its number guard passed, is in the integer encoding, as
-/// `GuardCType(Integer)` finds out: statically if the context knows, else by
-/// testing its tag. It is yielded either way, so the ways knowing and finding
-/// out continue at the same `SubPc`. A constant is read from the prototype, as
-/// a double. See Note [Integers].
-macro_rules! encoding {
+/// Whether an operand is in the integer encoding. A constant operand is always
+/// treated as a double. See Note [Integers].
+macro_rules! integer_encoded {
     ($rk:expr) => {{
         if ($rk & 0x100) != 0 {
             false
@@ -245,6 +201,32 @@ macro_rules! encoding {
     }};
 }
 
+/// Whether a numeric op computes on integers: both its operands are, an
+/// integral constant counting as one. See Note
+/// [Integers].
+///
+/// Only an existing integer register makes the other register's integer-ness worth
+/// asking: asking can transition that slot's static type, modifying the
+/// specialization context and duplicating versions.
+///
+/// The other register is asked about even when its type is already known, so
+/// the path through this macro always results in a stable `SubPc` that allows
+/// for reuse. See Note [Subblocks].
+macro_rules! integer_operands {
+    ($lhs:expr, $rhs:expr) => {{
+        let integer = ResumeArg::Type(CType::Integer);
+        let lt = (yield YieldOp::TypeofRk($lhs)) == integer;
+        let rt = (yield YieldOp::TypeofRk($rhs)) == integer;
+        let registers = ($lhs & 0x100) == 0 && ($rhs & 0x100) == 0;
+        if registers && lt {
+            integer_encoded!($rhs)
+        } else if registers && rt {
+            integer_encoded!($lhs)
+        } else {
+            lt && rt
+        }
+    }};
+}
 
 #[derive(Debug)]
 pub enum ExecEffect {
@@ -316,45 +298,47 @@ pub enum CallTarget {
 pub enum YieldOp {
     Typeof(usize), // Resumed with the type of STACK[idx]
     TypeofRk(usize), // Resumed with the type of STACK[idx] or CONSTANT[idx]
+    TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
+    IntegerK(usize), // Resumed with the value of CONSTANT[idx] as an Integer
+    NumberK(usize), // Resumed with the value of CONSTANT[idx] as a Number
+    BoxedK(usize), // Resumed with the value of CONSTANT[idx], as its Boxed bits
+    GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
+    NativeWindowArgs(usize, usize, usize), // For CALL A B C: resumed with WindowArgs if STACK[A] is
+                                           // a native with a window op for the call, else Failed.
+                                           // See Note [Native windows] in `library`
+
+
     Guard(usize, LType), // Resumed with either Matched or Failed if STACK[idx] is the expected
                          // type
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
                            // is the expected type
-    GuardCType(usize, CType), // GuardRk, for a CType no LType guard tells apart: Integer, a
-                              // number's encoding. See Note [Integers]
-    TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
-    IntegerK(usize), // Resumed with the value of CONSTANT[idx], a `CType::Integer`
-    NumberK(usize), // Resumed with the value of CONSTANT[idx], a number
-    BoxedK(usize), // Resumed with the boxed value of CONSTANT[idx], as its bits
+    GuardCType(usize, CType), // GuardRk, for a CType instead.
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
     Decided(bool), // A guard whose outcome is known, emitting nothing: steps the SubPc as a guard
                    // with that outcome does, for a way meeting ones that take it. Resumed with
                    // Matched or Failed. See Note [Subblocks]
+
     Exec(ResidualExec), // Emit a residual operation that will be executed
     ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op. See Note [Register window].
-    SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
-    SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Jump(BlockId), // Emit a jump to the given BlockId
+    Call(CallTarget), // Call a block target.
     Select(Vec<(&'static str, BlockId)>), // Emit a jump to one of several branches, based on
                                       // `state.select` at runtime
-    GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
-    Call(CallTarget), // Call a block target. Probably need a ResumeArg for returned values later.
-    FieldType(usize, HashRef), // STACK[idx] was just loaded from HREF's field: its type is the
-                               // hash key's, or found out, as a guard of it that always passes.
+
+    SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
+    SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
+    FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
                                // See Note [Field types]
-    LoadUpvalue(usize, usize), // STACK[idx] was just loaded from UPVALUE[b]: what the context knows
-                               // of the upvalue is its type. See Note [Fragile information]
+    LoadUpvalue(usize, usize), // Infrom the executor that STACK[idx]'s type is the same as an UPVALUE[b].
+                               // See Note [Fragile information]
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
                     // Note [Fragile information]
-    NativeWindowArgs(usize, usize, usize), // For CALL A B C: resumed with WindowArgs if STACK[A] is
-                                           // a native with a window op for the call, else Failed.
-                                           // See Note [Native windows] in `library`
 
-    HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key], if key is
-    TryHashKey(usize, usize), // Looks up but does not allocate an HREF..
-    UpdateHashRef(HashRef, CType), // Update the type of HREF to a new type
-    GlobalCache(usize), // Resumed with a new cache for global CONSTANT[k], as its address. See
+    HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key].
+    TryHashKey(usize, usize), // Look up but do not allocate an HREF.
+    UpdateHashRef(HashRef, FieldType), // Update the type of HREF to a new type
+    GlobalCache(usize), // Resumed with a Cache for global CONSTANT[k]. See
                         // Note [Global caches]
     SetKeyHazards(usize), // SetHazards, for the hash keys of CONSTANT[k] only
     SetHazards(Option<usize>, Option<HashRef>), // Set optimization hazards, potentially
@@ -369,7 +353,7 @@ pub struct HashKey<'src, 'intern> {
     /// The slot of the table the key is in.
     pub idx: usize,
     pub key: LConstant<'src, 'intern>,
-    pub known_type: CType,
+    pub known_type: FieldType,
     /// Per slot: whether access through that slot is already checked for
     /// aliasing, so it needs no epoch check.
     pub hazards: SmallVec<[bool; 8]>,
@@ -385,7 +369,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 
     /// A new hash key, its type not yet discovered.
     fn new(idx: usize, key: LConstant<'src, 'intern>) -> Self {
-        HashKey { idx, key, known_type: CType::Type(LType::Unknown), hazards: Default::default() }
+        HashKey { idx, key, known_type: FieldType::UNKNOWN, hazards: Default::default() }
     }
 
     /// Whether access through slot `at` needs no epoch check.
@@ -410,7 +394,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     /// shape lists it. A live hash key can also have an unknown type briefly
     /// (before its field's type is discovered), but then a shape lists it.
     fn orphan(&self, href: HashRef, types: &[CType]) -> bool {
-        self.known_type == CType::Type(LType::Unknown)
+        self.known_type == FieldType::UNKNOWN
             && !types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)))
     }
 
@@ -419,7 +403,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     fn accepts(&self, other: &Self) -> bool {
         self.idx == other.idx
             && self.key == other.key
-            && self.known_type.accepts(&other.known_type)
+            && self.known_type.ctype().accepts(other.known_type.ctype())
             && self.hazards.iter().enumerate().all(|(slot, &checked)| !checked || other.hazards.get(slot) == Some(&true))
     }
 }
@@ -432,12 +416,12 @@ pub enum ResumeArg {
     Failed,
     Type(CType),
     BlockId(BlockId),
-    HashRef(HashRef, CType),
+    HashRef(HashRef, FieldType),
     Integer(i32),
     Number(f64),
     Boxed(u64),
-    /// A global cache's address. See Note [Global caches].
-    Cache(usize),
+    /// See Note [Global caches].
+    Cache(*const GlobalCache),
     /// The end of a call's arguments, and the type its native's window op
     /// assumes they have.
     WindowArgs(usize, LType),
@@ -446,9 +430,8 @@ pub enum ResumeArg {
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // The constant's boxed value is the op's hole, so it is a store; a
-        // number's is canonical, an integer's in the integer encoding. See Note
-        // [Integers].
+        // The constant's boxed value is the op's hole. It is already in canonical
+        // form (an integer if possible). See Note [Integers].
         windowed!(LoadK, [bits: u64], [], |owner, state, base| (out dest) {
             // A constant's value lives as long as its prototype.
             *dest = LBoxed::from_bits(bits);
@@ -518,12 +501,9 @@ windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
     *dest = val1;
 });
 
-// A hash key's `href_init`: the witness of `key` (an `LCanon`'s bits) in the
-// table in its register, for the frame's `href`th witness, `select` 0 if the
-// table has the key and 1 if not. `at` is `index << 8 | href`, two holes being
-// all an op has. Its fast path is the key still at `index`, where the table
-// the thunk was forced with had it, and the witness's slot there already;
-// anything else is `href_init_slow`, out of line. See Note [Hash witnesses].
+// Initialize a hash key. `at` is `index << 8 | href`. Populate the witness `at` with `key`,
+// proving it both exists and is at the correct offset `index` for `tab`. See Note [Hash witnesses].
+// Selects 0 if the table has the key and 1 if not.
 windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
@@ -542,14 +522,15 @@ windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
             state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast() };
             state.select = 0;
         },
+        // The slow path is intentionally out of line, for code size reasons.
         _ => href_init_slow(owner, state, table, href, index, key),
     }
 });
 
-/// `HrefInit` when the key isn't at `index`, or the witness's slot isn't
-/// there yet: the witness vector grown, the key looked up again. `rust-cold`
-/// (LLVM's `preserve_most`), so the callee saves the registers it uses and the
-/// stencil's fast path needn't save its window around the call.
+/// `HrefInit` when the key isn't at `index`, or the witness's slot isn't there yet. Also handles
+/// growing the witness vector, which is also unlikely. `rust-cold` (LLVM's `preserve_most`), so
+/// the callee saves the registers it uses and the stencil's fast path needn't save its window
+/// around the call.
 extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, href: u8, index: usize, key: u64) {
     let hidx = state.witness_base + href as usize;
     if state.hash_witnesses.len() <= hidx {
@@ -633,7 +614,7 @@ windowed!(SetGlobal, [cache: usize], [], |owner, state, base| (value) {
             let entry = &mut *entry.cast::<LBoxed<'_, '_>>();
             // Hash keys of registers holding the environment know a field's type
             // by its epoch. See Note [Field types].
-            if guard_type(*entry) != guard_type(value) {
+            if FieldType::of_value(*entry) != FieldType::of_value(value) {
                 state._G.rw(owner).epoch += 1;
             }
             *entry = value;
@@ -656,7 +637,7 @@ pub fn emit_getglobal(dest: usize, k: usize) -> impl Coroutine<ResumeArg, Yield 
     #[coroutine]
     move |mut arg: ResumeArg| {
         let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
-        arg = yield YieldOp::ExecWindow(Rc::new(GetGlobal::new(cache, &[dest])));
+        arg = yield YieldOp::ExecWindow(Rc::new(GetGlobal::new(cache as usize, &[dest])));
         yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
         arg
     }
@@ -667,7 +648,7 @@ pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield =
     #[coroutine]
     move |mut arg: ResumeArg| {
         let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
-        arg = yield YieldOp::ExecWindow(Rc::new(SetGlobal::new(cache, &[src])));
+        arg = yield YieldOp::ExecWindow(Rc::new(SetGlobal::new(cache as usize, &[src])));
         // A register may hold the environment: its hash keys of this global must
         // check the epoch again.
         yield YieldOp::SetKeyHazards(k);
@@ -694,8 +675,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             // Its type: the hash key's, or found out. See Note [Field types].
             yield YieldOp::FieldType(a, hc);
         } else {
-            // An integer key in the array part, in a register or a constant (its
-            // value, `k`): the array slot. See Note [Dynamic guards].
+            // An integer key in the array part, potentially from a constant `k`. See Note [Dynamic guards].
             let integer = match yield YieldOp::GuardCType(c, CType::Integer) {
                 ResumeArg::MatchedConst(k) => {
                     let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };
@@ -755,23 +735,65 @@ pub enum Retype {
     Unknown,
 }
 
-/// The field type to record after storing a value of type `ctype`: the value's
-/// `guard_type`, since shapes and function identities describe registers, not
-/// fields. See Note [Field types].
-fn field_type(ctype: CType) -> CType {
-    match ctype {
-        CType::Integer | CType::Double | CType::Type(_) => ctype,
-        ctype => CType::Type(ctype.as_ltype()),
+pub use field_type::FieldType;
+
+// Its own module, so its constructors are the only way to make one.
+mod field_type {
+    use super::{CType, LBoxed, LType};
+
+    /// A field's type: a value's `LType`, and a number's encoding, but never a
+    /// table's shape or a function's identity, which describe a register, not a
+    /// field. See Note [Field types].
+    #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+    pub struct FieldType(CType);
+
+    impl FieldType {
+        pub const UNKNOWN: FieldType = FieldType(CType::Type(LType::Unknown));
+
+        /// The type of a field holding a value of type `ctype`.
+        pub fn of(ctype: CType) -> Self {
+            match ctype {
+                CType::Integer | CType::Double | CType::Type(_) => FieldType(ctype),
+                ctype => FieldType(CType::Type(ctype.as_ltype())),
+            }
+        }
+
+        /// The type of a field holding `value`.
+        pub fn of_value(value: LBoxed) -> Self {
+            if value.is_int() {
+                FieldType(CType::Integer)
+            } else if value.is_number() {
+                FieldType(CType::Double)
+            } else {
+                FieldType(CType::Type(value.unbox().typeof_()))
+            }
+        }
+
+        pub fn ctype(&self) -> &CType {
+            &self.0
+        }
+    }
+
+    impl From<FieldType> for CType {
+        fn from(field: FieldType) -> CType {
+            field.0
+        }
+    }
+
+    impl std::fmt::Display for FieldType {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
     }
 }
 
 /// How storing a value of type `new_type` changes a field known as `htype`. A
 /// field whose type isn't known yet is never `Same`: its value may have any
 /// type. See Note [Field types].
-fn retype(new_type: &CType, htype: &CType) -> Retype {
-    if new_type == htype && *htype != CType::Type(LType::Unknown) {
+fn retype(new_type: &FieldType, htype: &FieldType) -> Retype {
+    if new_type == htype && *htype != FieldType::UNKNOWN {
         Retype::Same
-    } else if *new_type == CType::Type(LType::Unknown) {
+    } else if *new_type == FieldType::UNKNOWN {
         Retype::Unknown
     } else {
         Retype::Known
@@ -887,9 +909,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::TryHashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                let new_type = field_type(value_type);
+                let new_type = FieldType::of(value_type);
                 let retype = retype(&new_type, &htype);
-                let expected = htype.as_ltype();
+                let expected = htype.ctype().as_ltype();
                 if c & 0x100 == 0 {
                     arg = yield YieldOp::ExecWindow(match retype {
                         Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
@@ -926,10 +948,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     };
                     let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
                     // A field's type is a number's encoding. See Note [Field types].
-                    let kc_type = guard_type(kc);
+                    let kc_type = FieldType::of_value(kc);
                     if let Some(existing) = t.rw(owner).insert_hash(kb, kc) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
-                        if guard_type(existing) != kc_type {
+                        if FieldType::of_value(existing) != kc_type {
                             t.rw(owner).epoch += 1;
                         }
                     } else {
@@ -1104,10 +1126,10 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         // --- Int Path --- See Note [Integers]. First, as finding out whether an
         // unknown operand is an integer finds out its type too.
         if matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::MOD) {
-            let (lt, rt) = discover_integers!(lhs, rhs);
+            let integers = integer_operands!(lhs, rhs);
             let (lk, rk) = ((lhs & 0x100) != 0, (rhs & 0x100) != 0);
             // A constant operand is its value, as `k`. luac folds two.
-            let op = if lt != integer || rt != integer || (lk && rk) {
+            let op = if !integers || (lk && rk) {
                 None
             } else if lk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(lhs & 0xff)) else { unreachable!() };
@@ -1153,7 +1175,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
         let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
             && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
-        let (lint, rint) = if numbers { (encoding!(lhs), encoding!(rhs)) } else { (false, false) };
+        let (lint, rint) = if numbers { (integer_encoded!(lhs), integer_encoded!(rhs)) } else { (false, false) };
         let window = match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => Some(numeric_rr(opcode, lint, rint, &[lhs, rhs, dest])),
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
@@ -1293,14 +1315,12 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
     move |mut arg: ResumeArg| {
         // Integers compare as integers, and each other register is decoded from
         // the encoding it is in. See Note [Integers].
-        let integer = ResumeArg::Type(CType::Integer);
-        let (lt, rt) = discover_integers!(b, c);
-        let integers = lt == integer && rt == integer;
+        let integers = integer_operands!(b, c);
         let larg = yield YieldOp::GuardRk(b, LType::Number);
         let rarg = yield YieldOp::GuardRk(c, LType::Number);
         let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
             && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
-        let (lint, rint) = if numbers { (encoding!(b), encoding!(c)) } else { (false, false) };
+        let (lint, rint) = if numbers { (integer_encoded!(b), integer_encoded!(c)) } else { (false, false) };
 
         let lnil = yield YieldOp::GuardRk(b, LType::Nil);
         let rnil = yield YieldOp::GuardRk(c, LType::Nil);
@@ -1740,7 +1760,7 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
-                let (ii, li, si) = (encoding!(a), encoding!(a + 1), encoding!(a + 2));
+                let (ii, li, si) = (integer_encoded!(a), integer_encoded!(a + 1), integer_encoded!(a + 2));
                 yield YieldOp::ExecWindow(for_loop(ii, li, si, &[a, a + 1, a + 2, a + 3]));
                 let ResumeArg::Type(t) = (yield YieldOp::Typeof(a)) else { unreachable!() };
                 yield YieldOp::SetCTypes(vec![(a + 3, t)]);
@@ -1916,32 +1936,37 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
 
 // Note [Subblocks]
 // ~~~~~~~~~~~~~~~~
-// An instruction's generator can end its block partway through: at a guard
-// found out at runtime (a thunk), whose outcome picks how the instruction goes
-// on. Forcing the thunk compiles the rest of the instruction, resuming the
-// generator, into a subblock, and each outcome gets its own.
+// An instruction's generator can end its block partway through, at a question
+// answered at runtime (a thunk). Forcing the thunk resumes the generator with
+// the answer it found, and compiles the rest of the instruction into a
+// subblock for that answer.
 //
-// A subblock is keyed, like a version, by where it is and its context. Where
-// is a `SubPc`: the instruction's pc and the outcomes of the guards the
-// generator has taken in it so far, a bit each after a leading 1, 1 passed and
-// 0 failed. Every guard steps it, whether the context decides it or a thunk
-// finds it out (`navigate`), so a way knowing a type and one finding it out
-// share the subblocks after. `subblock` returns the block already compiled for
-// a key and drops the generator it was handed, so:
+// A subblock is keyed, like a version, by its context and a `SubPc`: the
+// instruction's pc and the answers the generator has had in it so far, a bit
+// each after a leading 1, 1 passed and 0 failed. Every question steps the
+// `SubPc`, whether the context answers it or a thunk finds it out
+// (`navigate`), so a way that knows an answer and one that finds it out reach
+// the same key. A way reaching a key that already has a subblock takes that
+// subblock (`subblock`), and its own generator is dropped. So:
 //
-//   Whatever a generator holds that decides what it yields later must be
-//   determined by the key of every subblock it can reach.
+//   Ways reaching the same key must be at the same point in the generator: it
+//   must have yielded the same so far and have the same left to yield.
 //
-// Which guards led to a `SubPc` isn't part of it, only their outcomes: two
-// ways taking different guards could reach one, and only their contexts would
-// tell them apart. So ways through an instruction take the same steps: where
-// one way tests something at runtime and another already knows the outcome,
-// or skips the test, the other yields `Decided` for it, and ways meeting at a
-// key are at the same point in the generator. Nor is what the generator read without guarding: `Typeof` reads
-// the context as it is then, and the guards after it narrow the context, so
-// two ways reading different types can meet in one key. A generator may only
-// act on what it read through a property the key determines, as
-// `discover_integers!` does.
+// A way that knows its answers doesn't stop at the keys it passes: it runs on
+// with its own generator, and can meet other ways at a later key. A `SubPc`
+// records answers, not which questions they answered, so the rule holds only
+// if what a generator yields next is determined by its key:
+//
+// - Ways through an instruction ask the same questions. Where one way tests
+//   something at runtime and another already knows the answer, or skips the
+//   test, the other yields `Decided` for it.
+// - A generator doesn't decide what to yield from what it read at an earlier
+//   key. `Typeof` reads the context as it is then, and later answers narrow
+//   it, so ways can reach one key having read different types: one read a
+//   register as a `Number` and found it a double, another knew it was one.
+//   Such a read may decide what is yielded only through something the key
+//   determines, as `integer_operands!` returns only whether both operands are
+//   integers.
 
 pub type Pc = usize;
 /// Where in an instruction a subblock continues: see Note [Subblocks].
@@ -1998,7 +2023,7 @@ pub enum Residual {
     Ret(Pc, u8, u16, bool),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
-    HashGuard { tab: usize, href: HashRef, key: u64, expected: CType },
+    HashGuard { tab: usize, href: HashRef, key: u64, expected: FieldType },
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
@@ -2166,54 +2191,31 @@ impl std::fmt::Display for CType {
 
 // Note [Integers]
 // ~~~~~~~~~~~~~~~
-// A number is in the integer or the double encoding (Note [Integer encoding] in
-// `lboxed`), anywhere, and its tag says which: `CType::Integer` is a number in
-// the integer encoding, `CType::Double` one in the double encoding, and
-// `CType::Type(Number)` a number in either. As the value carries its encoding, a
-// context knowing less of it needs no code: a jump into a version typing a slot
-// `Number` or `Unknown` enters it as it is, and generic code (a table, an
-// upvalue, a native, a return) reads either.
+// A number is in the integer or the double encoding (Note [Integer encoding]), and its tag says
+// which. The specialization context tracks its knowledge potentially fuzzier than that:
+// `CType::Integer` is a number in the integer encoding, `CType::Double` one in the double
+// encoding, and `CType::Type(Number)` a number in either. As the value carries its encoding, a
+// context knowing less of it needs no code: a jump into a version typing a slot `Number` or
+// `Unknown` enters it as it is, and generic code (a table, an upvalue, a native, a return) reads
+// either.
 //
-// Discovery finds out the encoding with the type: a discovery thunk forced on a
-// number types its slot `Integer` or `Double` and guards that, one residual
-// testing for it from what the context knew (`Guard`'s `known`): an integer has
-// every `NUMBER_TAG` bit set, one compare from anything; a double has some but
-// not all, a compare and a test from an unknown slot, and a compare alone from a
-// number. A guard continues its generator a `SubPc` step for each level of the
-// lattice it tests down to, the context answering it or not (`navigate`), so a
-// way knowing a number and a way finding out from nothing share the blocks
-// after. An op that wants
-// an integer (a table key, FORPREP's operands) yields `GuardCType(slot,
-// Integer)`, answered statically when the context knows the encoding (or that
-// the slot isn't a number), and otherwise ending the block in a discovery
-// thunk: an unknown value, or a `Number` in either encoding. An op reading a
-// number as a double reads each register in the encoding its context says,
-// testing the tag of a `Number` of either (`encoding`), so no op decodes a tag.
-// A field's number is found out with the field, in its encoding (Note [Field
-// types]).
+// Numeric operations should attempt to specialize on their operands' encoding where
+// they can, so they don't require decoding at runtime. The integer encoding can only store small
+// numbers, and so the result of arithmatic operations must be careful to check for overflow or
+// non-integer results, with guards potentially transitioning the static type back to double.
 //
-// Integer ops read and give integers. A whole i32 constant is one. ADD, SUB, MUL
-// and MOD of two `Integer` operands give one, guarded by a `GuardDynamic` test
-// that the exact result fits the encoding, which a failing one computes as
-// doubles instead: that overflow is the only way from one encoding to the other
-// in specialized code. Compares of two compare them as integers. With one
-// operand an integer register, these find out whether another register is one
-// (`GuardCType`), and an integer constant asks nothing of the other operand.
-// The double ops and compares and FORLOOP read an integer operand as a double,
-// and give a `Double`; FORPREP finds out whether its operands are integers, so an
-// integer loop's index and variable stay ones.
-
-/// The type a guard finds `value` has: a number's encoding, or its `LType`.
-/// See Note [Integers].
-pub fn guard_type(value: LBoxed) -> CType {
-    if value.is_int() {
-        CType::Integer
-    } else if value.is_number() {
-        CType::Double
-    } else {
-        CType::Type(value.unbox().typeof_())
-    }
-}
+// Discovery finds out the encoding with the type: a discovery thunk forced on a number types its
+// slot `Integer` or `Double` and guards that, potentially from existing fuzzy information. A guard
+// continues its generator a `SubPc` step for each level of the lattice it tests down to, so that
+// both initial discovery and incremental refinement end at the same SubPc and can potentially
+// reuse existing versions. See Note [Subblocks].
+//
+// Care must be taken with this, because the specializer tracking both encoding as well as the
+// fuzzy "number" means that discovering *which* encoding causes the static type context to
+// transition, potentially causing a new version of a block to be emitted. In practice this
+// translates to eagerly typing FORPREP induction variables as integers, so that they aren't only
+// discovered partway through a loop and cause recompilation, and arithmetic operations discover
+// the types of their operands in a non-eager way that keeps their types stable when not demanded.
 
 /// Where a guard for `expected` continues its generator, with what, when the
 /// value's type is `found` (as precise as a guard finds, or a context knows it
@@ -2303,8 +2305,8 @@ pub fn passes_guard_code(value: LBoxed, code: u8) -> bool {
 // type again; if that fails it falls back to a fresh href, which rediscovers the
 // type and can rejoin the blocks already compiled for it.
 //
-// A field's type is only ever a `guard_type` (an `LType`, or an encoding): a
-// shape or a function's identity describes a register, not a field.
+// A field's type is only ever an `LType`, or a number's encoding: a shape or a
+// function's identity describes a register, not a field.
 
 /// Whether a jump forgets a type of a register holding no local in scope at
 /// its target, which may still be an expression's temporary (`a and b or c`).
@@ -2688,7 +2690,7 @@ impl Context {
                         }
                     }
                     if !migrated {
-                        key.known_type = CType::Type(LType::Unknown);
+                        key.known_type = FieldType::UNKNOWN;
                     }
                 }
                 // We can only remove hkeys at the end of the array for the same
@@ -3163,13 +3165,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A number's type is its encoding, found a step down the lattice at a
             // time: see Note [Integers].
             let mut thunk_coro  = thunk_coro.clone();
-            let found = guard_type(state.vals[state.base + idx]);
+            let found_field = FieldType::of_value(state.vals[state.base + idx]);
+            let found: CType = found_field.clone().into();
             let known = thunk_ctx.types[idx].as_ltype();
             let mut forced_ctx = thunk_ctx.clone();;
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
             forced_mut.types[idx] = found.clone();
             if let Some(href) = field {
-                forced_mut.hkeys[href.0 as usize].known_type = found.clone();
+                forced_mut.hkeys[href.0 as usize].known_type = found_field;
             }
             debug!("forcing thunk with {} == {}", found, expected);
             // Continued as a guard the context answers would be, so the ways
@@ -3308,7 +3311,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("href forced by {tab:?} -> {val:?}");
             // Its type is found out from the value loaded, in each table. See
             // Note [Field types].
-            hkey.known_type = CType::Type(LType::Unknown);
+            hkey.known_type = FieldType::UNKNOWN;
             // Initialize the hkey after discovery with a cleared hazard for the index
             hkey.clear_checks();
             hkey.check(idx);
@@ -3352,7 +3355,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.jump_thunk(missing_key, thunk_pc, fail_block);
             })))));
 
-            let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, CType::Type(LType::Unknown)));
+            let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, FieldType::UNKNOWN));
             vm.blocks[has_key.0].instructions.push(Residual::Jump(guard_block));
         })))
     }
@@ -3375,8 +3378,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // witness epoch and jump back to the success block.
             let check_block = vm.new_block(pc.0);
             vm.jump_thunk(block_id, thunk_pc, check_block);
-            // Hash key types are `guard_type`s, which `HashGuard` can test. See
-            // Note [Field types].
+            // A field's type is one `HashGuard` can test. See Note [Field types].
             let expected = thunk_ctx.hkeys[href.0 as usize].known_type.clone();
             let key = LCanon::constant(&thunk_ctx.hkeys[href.0 as usize].key).boxed().bits();
             vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected });
@@ -3449,7 +3451,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // access's type guard finds it, as the store left the witness at the
                     // old epoch (`Retype::Unknown`).
                     let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
-                    if *ty != CType::Type(LType::Unknown) {
+                    if *ty != FieldType::UNKNOWN {
                         hkey.known_type = ty.clone();
                     }
                     // If we updated an href, then we also need to set optimization hazards for any
@@ -3662,9 +3664,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
                     let known = ctx.hkeys[href.0 as usize].known_type.clone();
-                    Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.clone())]);
-                    if known != CType::Type(LType::Unknown) {
-                        (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &known);
+                    Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.ctype().clone())]);
+                    if known != FieldType::UNKNOWN {
+                        (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), known.ctype());
                     } else {
                         // Record the type on the hash key too, unless the load overwrote
                         // the table's register and dropped its hash keys.
@@ -3787,7 +3789,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // blocks do too.
                     let key: LCanon<'static, 'static> = unsafe { core::mem::transmute(key) };
                     let cache = Box::new(GlobalCache::new(key));
-                    arg = ResumeArg::Cache(&*cache as *const GlobalCache as usize);
+                    arg = ResumeArg::Cache(&*cache as *const GlobalCache);
                     self.global_caches.push(cache);
                 },
                 CoroutineState::Yielded(YieldOp::SetKeyHazards(k)) => {
@@ -3964,7 +3966,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let tab = state.table_at(tab);
                     let entry = tab.ro(owner).hash.get_index(hwit.index);
-                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && passes_guard(*val, &expected)) {
+                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && passes_guard(*val, expected.ctype())) {
                         // Fallthrough
                         off += 2;
                     } else {
