@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 #[cfg(feature = "skip_vec")]
@@ -13,22 +14,22 @@ const VALUE_STACK_DEFAULT: usize = 0x1000 * 0x1000 * 2; // 2mb hugepage
 #[repr(C)]
 pub struct ValueStack<'src, 'intern> {
     pub stack_ptr: core::ptr::NonNull<[LBoxed<'src, 'intern>]>,
-    // `pub(crate)` so the JIT can address the live length with dynasm's typed
-    // offset (`=> ValueStack.used`) when computing native arg/return slices.
-    pub(crate) used: usize,
+    // A `Cell` so the GC can shrink the stack as it marks it, through the
+    // shared reference it has. See Note [Stack frames].
+    used: Cell<usize>,
     mmap: MmapMut,
 }
 
 impl<'src, 'intern> Deref for ValueStack<'src, 'intern> {
     type Target = [LBoxed<'src, 'intern>];
     fn deref(&self) -> &Self::Target {
-        unsafe { self.stack_ptr.get_unchecked_mut(..self.used).as_ref() }
+        unsafe { self.stack_ptr.get_unchecked_mut(..self.used.get()).as_ref() }
     }
 }
 
 impl<'src, 'intern> DerefMut for ValueStack<'src, 'intern> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.stack_ptr.get_unchecked_mut(..self.used).as_mut() }
+        unsafe { self.stack_ptr.get_unchecked_mut(..self.used.get()).as_mut() }
     }
 }
 
@@ -60,7 +61,7 @@ impl<'src, 'intern> ValueStack<'src, 'intern> {
         let stack_ptr = core::ptr::NonNull::new(mmap.as_mut_ptr() as *mut LBoxed<'src, 'intern>).expect("mmap succeeded which means its non-null");
         Self {
             stack_ptr: core::ptr::NonNull::slice_from_raw_parts(stack_ptr, capacity),
-            used: 0,
+            used: Cell::new(0),
             mmap,
         }
     }
@@ -69,20 +70,22 @@ impl<'src, 'intern> ValueStack<'src, 'intern> {
     /// the caller writes them before anything reads them or the GC marks them.
     pub fn lengthen(&mut self, len: usize) {
         assert!(len <= self.stack_ptr.len(), "ValueStack overflow");
-        self.used = len;
+        self.used.set(len);
     }
 
-    pub fn truncate(&mut self, new_len: usize) {
+    /// Shrink the stack to `new_len` slots, if it is longer. Through a shared
+    /// reference, for the GC (`RunState::mark`).
+    pub fn truncate(&self, new_len: usize) {
         // `LBoxed` is `Copy` with no `Drop`, so shrinking is just a length change.
-        if new_len < self.used {
-            self.used = new_len;
+        if new_len < self.used.get() {
+            self.used.set(new_len);
         }
     }
 
     /// The mapping past the live values, as `Vec::spare_capacity_mut`.
     fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<LBoxed<'src, 'intern>>] {
-        let spare = self.stack_ptr.len() - self.used;
-        unsafe { std::slice::from_raw_parts_mut(self.stack_ptr.as_non_null_ptr().add(self.used).as_ptr().cast(), spare) }
+        let spare = self.stack_ptr.len() - self.used.get();
+        unsafe { std::slice::from_raw_parts_mut(self.stack_ptr.as_non_null_ptr().add(self.used.get()).as_ptr().cast(), spare) }
     }
 
     /// The `n` slots past the live values.
@@ -92,39 +95,38 @@ impl<'src, 'intern> ValueStack<'src, 'intern> {
 
     pub fn extend_from_slice(&mut self, slice: &[LBoxed<'src, 'intern>]) {
         self.spare(slice.len()).write_copy_of_slice(slice);
-        self.used += slice.len();
+        self.used.set(self.used.get() + slice.len());
     }
 
     pub fn resize_with<F>(&mut self, new_len: usize, mut f: F)
     where
         F: FnMut() -> LBoxed<'src, 'intern>,
     {
-        if new_len > self.used {
-            for slot in self.spare(new_len - self.used) {
+        if new_len > self.used.get() {
+            for slot in self.spare(new_len - self.used.get()) {
                 slot.write(f());
             }
-            self.used = new_len;
+            self.used.set(new_len);
         } else {
             self.truncate(new_len);
         }
     }
 
     pub fn last(&self) -> Option<&LBoxed<'src, 'intern>> {
-        if self.used == 0 {
-            None
-        } else {
-            Some(&self[self.used - 1])
+        match self.used.get() {
+            0 => None,
+            used => Some(&self[used - 1]),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.used
+        self.used.get()
     }
 }
 
 impl<'src, 'intern> std::fmt::Debug for ValueStack<'src, 'intern> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        unsafe { std::slice::from_raw_parts(self.stack_ptr.as_non_null_ptr().as_ptr(), self.used).fmt(f) }
+        unsafe { std::slice::from_raw_parts(self.stack_ptr.as_non_null_ptr().as_ptr(), self.used.get()).fmt(f) }
     }
 }
 

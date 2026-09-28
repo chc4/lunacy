@@ -1168,17 +1168,20 @@ impl ReturnLocation {
 // long enough for the callee's frame; a return pops it and restores that state
 // (`leave`), and the caller takes the results (`arrive`). See Note [Returns].
 //
-// The stack's length only grows: it is the most any frame has reached, not what
-// is live. The GC marks the stack up to its live extent (`RunState::live_extent`):
-// the most of each live frame's `base + max_stack`, the running one's and each
-// caller's in the callstack, and of the top, which is past them while results a
-// call returned all of (C = 0) are still to be consumed. It is computed when the
-// GC runs, from the callstack, rather than kept on each call and return.
+// The stack's length is the most any frame has reached since the GC last marked
+// it, not what is live. The GC marks the stack up to its live extent
+// (`RunState::live_extent`): the most of each live frame's `base + max_stack`,
+// the running one's and each caller's in the callstack, and of the top, which is
+// past them while results a call returned all of (C = 0) are still to be
+// consumed. It is computed when the GC runs, from the callstack, rather than
+// kept on each call and return.
 //
-// A slot past the live extent may hold what a returned frame left there, which
-// the GC doesn't mark, so it may name something freed. Nothing reads it: a slot
-// comes back within the live extent only in a callee's frame, which a call nils
-// past the arguments the caller wrote (`push_frame`).
+// Marking the stack shrinks it to its live extent (`RunState::mark`), and the
+// GC marks the roots again, the mutator stopped, before it sweeps: so a slot
+// whose value the GC doesn't mark, which it may free, is past the stack's end
+// by then. The stack grows back only by a callee's frame, which a call nils past
+// the arguments the caller wrote (`push_frame`). So every slot of the stack
+// names something live.
 #[derive(Debug)]
 pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub witness_frame: usize, pub witness_top: usize }
 
@@ -1219,7 +1222,8 @@ pub struct RunState<'src, 'intern> {
     pub base: usize,
     // Dynamic stack top (à la Lua's `L->top`): delimits variable-count spans
     // (MULTRET call args/results, SETLIST, vararg). Distinct from `vals`'s
-    // length, the most any frame has reached (Note [Stack frames]).
+    // length, the most any frame has reached since the GC last marked it (Note
+    // [Stack frames]).
     // Fixed-register ops index `base + reg`; only the variable-count
     // (`b == 0` / `c == 0`) handlers read up to `top`.
     pub top: usize,
@@ -1256,9 +1260,7 @@ impl<'src, 'intern> Debug for RunState<'src, 'intern> {
         f.debug_struct("RunState")
             .field("base", &self.base)
             .field("pc", &self.pc)
-            // Up to the top, which is within the live extent: past it, a slot
-            // may name something freed. See Note [Stack frames].
-            .field("vals", &&self.vals[..self.top])
+            .field("vals", &self.vals)
             .field("select", &self.select)
             .field("trap", &self.trap)
             .field("gas", &self.gas)
@@ -1477,12 +1479,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         debug_assert!(extent <= self.vals.len(), "a live frame past the stack");
         extent
     }
-
-    /// The stack up to its live extent (`live_extent`), which, unlike past it,
-    /// names nothing freed.
-    pub fn live(&self, owner: &Owner) -> &[LBoxed<'src, 'intern>] {
-        &self.vals[..self.live_extent(owner)]
-    }
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
@@ -1495,9 +1491,13 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
 impl<'src, 'intern> Mark for RunState<'src, 'intern> {
     fn mark(&self, owner: &Owner) {
-        for val in self.live(owner) {
+        // Past the live extent the stack goes, before the GC can free what its
+        // slots name. See Note [Stack frames].
+        let extent = self.live_extent(owner);
+        for val in &self.vals[..extent] {
             val.mark(owner);
         }
+        self.vals.truncate(extent);
         self.clos.mark(owner);
         self._G.mark(owner);
         // The open upvalues' cells, which `close_upvalues` closes when their frame
