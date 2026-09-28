@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::cell::Cell;
 use std::collections::{HashMap, BTreeMap};
 use crate::{Owner, TLCell, TlcOwner};
-use crate::vm::{BlockId, LBoxed, LClosure, LType, LValue, PackedLocation, ReturnLocation, RunState, Tc, Vm};
+use crate::vm::{BlockId, LBoxed, LClosure, LType, LValue, PackedLocation, Location, RunState, Tc, Vm};
 use crate::gc::{GcInner, GcCtx};
 use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
@@ -172,7 +172,7 @@ impl JitHelper {
                 }
                 LValue::LClosure(lclos) => {
                     let Some(entry) = spec.lua_entry(owner, &lclos) else { return 0 };
-                    let ret = ReturnLocation(BlockId((ret & 0xffff_ffff) as usize), (ret >> 32) as usize).pack();
+                    let ret = PackedLocation::from_bits(ret as usize);
                     state.call_lua(owner, ret, a, b);
                     entry as usize
                 }
@@ -189,12 +189,13 @@ impl JitHelper {
     pub unsafe extern "C" fn lua_call(spec: *mut (), state: *mut (), ret: u64, a: u16, b: u16, c: u16) -> usize {
         unsafe {
             let specializer = &mut *(spec as *mut Specializer<'static, 'static>);
-            let (block, call) = ((ret & 0xffff_ffff) as usize, (ret >> 32) as usize - 1);
+            let Location(BlockId(block), after) = Location::unpack(PackedLocation::from_bits(ret as usize));
+            let call = after - 1;
             if let Residual::LuaCall { entry: CallEntry::Block(entry), .. } = &specializer.blocks[block].instructions[call] {
                 if let Some(code) = specializer.blocks[entry.0].jit_info.entry {
                     let state = &mut *(state as *mut RunState<'static, 'static>);
                     let owner = crate::forge_owner();
-                    state.call_lua(owner, ReturnLocation(BlockId(block), call + 1).pack(), a, b);
+                    state.call_lua(owner, PackedLocation::from_bits(ret as usize), a, b);
                     return code as usize;
                 }
             }
@@ -1342,7 +1343,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // Fallback to interpreter for other residuals
                 dynasm!(ops
                     ; .arch x64
-                    ; mov rax, QWORD (((off as u64) << 32 | (id.0 as u64)) as i64)
+                    ; mov rax, QWORD (Location(BlockId(id.0), off).pack().bits() as i64)
                     ; mov BYTE r12 => RunState.trap, 1
                     ; jmp ->exit_jit
                 );
@@ -1388,7 +1389,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // continues past the `Arrive` after the call (Note [Returns]).
         let emit_dynamic_call = |ops: &mut Assembler, off: usize, a: u16, b: u16, c: u16, helper: usize| {
             assert!(matches!(block.instructions.get(off + 1), Some(Residual::Arrive { .. })), "a call not followed by its `Arrive`");
-            let ret = ((off as u64 + 1) << 32) | id.0 as u64;
+            let ret = Location(BlockId(id.0), off + 1).pack().bits() as u64;
             let past_arrive = insts[off + 2];
             dynasm!(ops
                 ; .arch x64
@@ -1676,7 +1677,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // The callee's frame past a fixed count of arguments is
                             // nilled here, a store a slot, but for a big one, which
                             // `PushFrame` nils, as it does past a count up to the top.
-                            let packed_ret = ReturnLocation(BlockId(id.0), off + 1).pack();
+                            let packed_ret = Location(BlockId(id.0), off + 1).pack();
                             let hold = |count: u16| crate::generator::Count::hold(count) as u64;
                             let (ret, abs) = (packed_ret.bits() as u64, hold(*a) | hold(*b) << 16 | (*stack as u64) << 32);
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
@@ -1724,7 +1725,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
                                 // Check if the call is trying to bailout: we propagate the bailout
                                 // if so, unwinding our native stack but yielding to the generator run loop
-                                // with a suspended ReturnLocation stack.
+                                // with a suspended Location stack.
                                 ; cmp BYTE r12 => RunState.trap, 0
                                 ; jnz ->exit_jit
                             );
@@ -1846,7 +1847,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // The frame, popped by `PopFrame`, and the JIT code left with
                     // where the caller continues. See Note [Frame ops] in `generator`.
                     let hold = |count: u16| crate::generator::Count::hold(count) as u64;
-                    let (at, ab) = (id.0 as u64 | (off as u64) << 32, hold(*a as u16) | hold(*b) << 16);
+                    let (at, ab) = (Location(BlockId(id.0), off).pack().bits() as u64, hold(*a as u16) | hold(*b) << 16);
                     let pop = if *closes {
                         frame_op!(PopFrame [true,] (at, ab); *a as u16, *b)
                     } else {

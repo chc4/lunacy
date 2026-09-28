@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 
-use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, ReturnLocation, Upvalue};
+use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Location, Upvalue};
 use qcell::{LCell, LCellOwner};
 use crate::Owner;
 use crate::vm::{Tc, Vm};
@@ -1832,15 +1832,15 @@ windowed!(frame PushFrame, [ret: u64, abs: u64], [FILLS: bool, A: Count, B: Coun
     state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), a, b, (abs >> 32) as u8, FILLS);
 });
 
-// A `Ret` at `off` in `block`, `at` their `block | off << 32` and `ab` its `a |
-// b << 16` (as `Count::hold` holds them), closing upvalues if `CLOSES`:
+// A `Ret` at `at` (a `PackedLocation`), `ab` its `a | b << 16` (as
+// `Count::hold` holds them), closing upvalues if `CLOSES`:
 // `leave`, `state.exit` where the caller continues, or -2 from the entry frame.
 // See Note [Frame ops].
 windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, A: Count, B: Count], |owner, state, base| () {
-    let (block, off) = (at as u32, (at >> 32) as u16);
+    let Location(BlockId(block), off) = Location::unpack(crate::vm::PackedLocation::from_bits(at as usize));
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
     state.exit = if state.callstack.is_empty() {
-        state.current_off = off;
+        state.current_off = off as u16;
         ((-2i32 as u64) << 32) | block as u64
     } else {
         match state.leave(owner, a, b, CLOSES) {
@@ -3911,7 +3911,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::LuaCall { entry, a, b, c, stack } => {
                     let (caller, call) = (id, off);
                     off += 1;
-                    state.call_lua(owner, ReturnLocation(id, off).pack(), a, b);
+                    state.call_lua(owner, Location(id, off).pack(), a, b);
                     // The closure called, which may be another of the prototype the
                     // guard checked.
                     let callee = state.clos.clone();
@@ -3942,7 +3942,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("{:?}", to_call);
                     // push where to return to once we RETURN
                     if let LValue::LClosure(ref lclos) = to_call {
-                        let next_stack = state.call_lua(owner, ReturnLocation(id, off).pack(), a, b);
+                        let next_stack = state.call_lua(owner, Location(id, off).pack(), a, b);
                         // Either use existing block, compile a new one, or use most
                         // generic.
                         let types = vec![LType::Unknown; next_stack];
@@ -3982,7 +3982,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Ret(pc, a, b, closes) => {
                     debug!("spec final blocks: {:?}", self.blocks);
                     match state.leave(owner, a as usize, b as usize, closes) {
-                        Ok(ReturnLocation(block, disp)) => {
+                        Ok(Location(block, disp)) => {
                             self.set_current(state.clos.clone());
                             id = block;
                             off = disp;

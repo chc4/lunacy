@@ -24,7 +24,7 @@ use crate::{TLCell, TlcOwner, Owner};
 
 use crate::generator::{Specializer, Context, SubPc};
 
-// `BlockId` and `HashRef` are referenced by `ReturnLocation` / `HashWitness`, so they
+// `BlockId` and `HashRef` are referenced by `Location` / `HashWitness`, so they
 // live here rather than in the generator module (which re-imports them).
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Debug)]
 pub struct BlockId(pub usize);
@@ -1187,13 +1187,14 @@ impl Drop for ScopeGuard {
     fn drop(&mut self) { IN_SCOPE.with(|f| f.set(false)); }
 }
 
-/// Where a call returns to: a specializer block and the offset of the residual after the
-/// call in it.
+/// A place in the specializer's code: a block, and the offset of a residual in
+/// it. Where a call returns to, where JIT code exits to the interpreter, and so
+/// on.
 #[derive(Debug)]
-pub struct ReturnLocation(pub BlockId, pub usize);
+pub struct Location(pub BlockId, pub usize);
 
-/// A [`ReturnLocation`] packed into a single register-sized word (see
-/// [`ReturnLocation::pack`]). `#[repr(transparent)]` over `usize`, so it crosses the
+/// A [`Location`] in one register-sized word, `(off << 32) | block` (see
+/// [`Location::pack`]). `#[repr(transparent)]` over `usize`, so it crosses the
 /// JIT/`extern "C"` boundary in one register.
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
@@ -1213,17 +1214,15 @@ impl PackedLocation {
     }
 }
 
-impl ReturnLocation {
-    /// Pack into a `PackedLocation` so it can cross the JIT/`extern "C"` boundary
-    /// without passing a `repr(Rust)` struct by value: `(off << 32) | block`, the
-    /// layout the JIT's `lua_return` uses for its return encoding.
+impl Location {
+    /// This location in one word. See `PackedLocation`.
     pub fn pack(self) -> PackedLocation {
-        let ReturnLocation(BlockId(block), off) = self;
+        let Location(BlockId(block), off) = self;
         PackedLocation((off << 32) | block)
     }
 
     pub fn unpack(p: PackedLocation) -> Self {
-        ReturnLocation(BlockId(p.0 & 0xffff_ffff), p.0 >> 32)
+        Location(BlockId(p.0 & 0xffff_ffff), p.0 >> 32)
     }
 }
 
@@ -1250,7 +1249,7 @@ impl ReturnLocation {
 // the arguments the caller wrote (`push_frame`). So every slot of the stack
 // names something live.
 #[derive(Debug)]
-pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: ReturnLocation, pub frame: usize, pub witness_frame: usize, pub witness_top: usize }
+pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: Location, pub frame: usize, pub witness_frame: usize, pub witness_top: usize }
 
 /// Where a frame's hash key was found in its table's hash part (its entry's
 /// index, and its value's address), and the table's epoch then. See Note
@@ -1309,7 +1308,7 @@ pub struct RunState<'src, 'intern> {
     pub trap: bool,
     pub current_off: u16,
     /// What a return from JIT code leaves the JIT code with: where its caller
-    /// continues, `(off << 32) | block`, or -2 for a return from the entry
+    /// continues (a `PackedLocation`), or -2 for a return from the entry
     /// frame. `PopFrame` writes it. See Note [Frame ops] in `generator`.
     pub exit: u64,
     pub gas: i64,
@@ -1400,7 +1399,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
     // `extern "C"` so the JIT can call it directly. The callee closure is read
     // from slot `a` of the boxed stack, and the return location arrives packed
-    // into a single word (see `ReturnLocation::pack`).
+    // into a single word (a `PackedLocation`).
     pub extern "C" fn call_lua(&mut self, owner: &mut Owner,
         ret: PackedLocation, a: u16, b: u16) -> usize
     {
@@ -1421,7 +1420,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, stack: u8, fills: bool) -> usize {
         let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unreachable!() };
         debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "a call's frame size isn't its callee's");
-        let ret_loc = ReturnLocation::unpack(ret);
+        let ret_loc = Location::unpack(ret);
         // record call stack: we say where to return to and where to put the values
         let next_stack = stack as usize;
         let next_base = self.base + a + 1;
@@ -1482,7 +1481,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
     /// Note [Frame ops] in `generator`.
     #[inline(always)]
-    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) -> Result<ReturnLocation, std::ops::Range<usize>> {
+    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) -> Result<Location, std::ops::Range<usize>> {
         if closes {
             if !self.upvals.is_empty() {
                 self.close_upvalues(owner);
