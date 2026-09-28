@@ -1570,7 +1570,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rsi, WORD (*idx as i32) // idx
                         ; mov rdx, WORD (expected_u8 as i32) // expected
                         ; call extern (JitHelper::check_guard as *const () as usize)
-                        ; test al, al
+                        ; test al, 1 // a returned bool is bit 0: the rest of al may not be zero
                         ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
@@ -1609,7 +1609,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rsi, QWORD (*tab as i64)
                         ; mov rdx, WORD (href_u8 as i32)
                         ; call extern (JitHelper::check_epoch as *const () as usize)
-                        ; test al, al
+                        ; test al, 1 // a returned bool is bit 0: the rest of al may not be zero
                         ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
@@ -1625,7 +1625,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rcx, WORD (expected_u8 as i32)
                         ; mov r8, QWORD (*key as i64)
                         ; call extern (JitHelper::check_hash_guard as *const () as usize)
-                        ; test al, al
+                        ; test al, 1 // a returned bool is bit 0: the rest of al may not be zero
                         ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
