@@ -109,7 +109,7 @@ impl<'src> IStr<'src> {
 // constant, a native's result, the generic paths) boxes it canonically, a
 // whole i32 but -0 as an integer, so equal numbers from there reach code in
 // the same encoding. The specializer's typed ops box the encoding their
-// result's type says. See Note [Integers] in `generator`.
+// result's type says. See Note [Integers] in `specialize`.
 
 // Note [Arithmetic NaNs]
 // ~~~~~~~~~~~~~~~~~~~~~~

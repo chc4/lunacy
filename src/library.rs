@@ -56,7 +56,7 @@ thread_local! {
 // computing it as the native does (`bit1`, `bit2`). A call taking every result
 // (C = 0) gets exactly the one, and a call taking its arguments up to the top
 // (B = 0) has a fixed arity when the specializer knows the top. See Note [Known
-// top] in `generator`.
+// top] in `specialize`.
 
 /// A native computing its results from its arguments. See Note [Library natives].
 /// With `window:`, also a window op for calls to it, which LBBV runs. See Note
@@ -199,14 +199,14 @@ fn bit2<const OP: u8>(x: i32, y: i32) -> i32 {
 
 /// A bit op's window op's argument: in the integer encoding (`INT`), read as it
 /// is, or a number of either encoding the specializer checked. See Note
-/// [Integers] in `generator`.
+/// [Integers] in `specialize`.
 #[inline(always)]
 unsafe fn bit_arg<const INT: bool>(v: LBoxed) -> i32 {
     if INT { unsafe { v.as_int() } } else { to_bit(unsafe { checked_number(v) }) }
 }
 
 // A bit op's result is an i32, so it is in the integer encoding. See Note
-// [Integers] in `generator`.
+// [Integers] in `specialize`.
 crate::window::windowed!(BitUnary, [], [OP: u8, X: bool], |owner, state, base| (x, out r) {
     *r = LBoxed::from_int(bit1::<OP>(bit_arg::<X>(x)));
 });
@@ -226,7 +226,7 @@ fn bit1_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
     } else {
         std::rc::Rc::new(BitUnary::<OP, false>::new(&operands))
     };
-    Some(NativeOp { window, args: LType::Number, result: crate::generator::CType::Type(LType::Integer) })
+    Some(NativeOp { window, args: LType::Number, result: crate::specialize::CType::Type(LType::Integer) })
 }
 
 /// `bit2::<OP>` as a window op, for a call with two numbers and one result: its
@@ -242,7 +242,7 @@ fn bit2_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
         (true, false) => std::rc::Rc::new(BitBinary::<OP, true, false>::new(&operands)),
         (true, true) => std::rc::Rc::new(BitBinary::<OP, true, true>::new(&operands)),
     };
-    Some(NativeOp { window, args: LType::Number, result: crate::generator::CType::Type(LType::Integer) })
+    Some(NativeOp { window, args: LType::Number, result: crate::specialize::CType::Type(LType::Integer) })
 }
 
 /// A table of `entries`, keyed by interned names.

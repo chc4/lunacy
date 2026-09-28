@@ -8,7 +8,7 @@ use crate::vm::{BlockId, LBoxed, LClosure, LType, LValue, PackedLocation, Locati
 use crate::gc::{GcInner, GcCtx};
 use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
-use crate::generator::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
+use crate::specialize::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
 use crate::window_alloc::{plan_trace, Cache, Emit, Packed, Placement, Step, WindowAlloc};
 use crate::trace::{Block as TraceBlock, Event, Policy, Region, Slots};
@@ -366,29 +366,29 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit) {
 /// with the stack aligned as just after a call, as it was compiled to expect.
 /// Copy `op`, a window op with no operands, into the code at `SKIP` 0, the
 /// window empty: its stencil, or else a call of its body. See Note [Frame ops]
-/// in `generator`.
+/// in `specialize`.
 /// The most slots of a callee's frame a call's JIT code nils itself, a store a
 /// slot, rather than `PushFrame` with a loop.
 const INLINE_NILS: usize = 16;
 
 /// The frame op `$op`, its const params `$pre` then a `Count` of each of
-/// `$counts` (see Note [Frame ops] in `generator`), made from `$args`.
+/// `$counts` (see Note [Frame ops] in `specialize`), made from `$args`.
 macro_rules! frame_op {
     ($op:ident [$($pre:tt)*] ($($args:expr),*);) => {
-        Rc::new(crate::generator::$op::<$($pre)*>::new($($args,)* &[])) as Rc<dyn Window>
+        Rc::new(crate::specialize::$op::<$($pre)*>::new($($args,)* &[])) as Rc<dyn Window>
     };
     ($op:ident [$($pre:tt)*] ($($args:expr),*); $count:expr $(, $rest:expr)*) => {
-        match crate::generator::Count::of($count) {
-            crate::generator::Count::Zero => frame_op!($op [$($pre)* { crate::generator::Count::Zero },] ($($args),*); $($rest),*),
-            crate::generator::Count::One => frame_op!($op [$($pre)* { crate::generator::Count::One },] ($($args),*); $($rest),*),
-            crate::generator::Count::Two => frame_op!($op [$($pre)* { crate::generator::Count::Two },] ($($args),*); $($rest),*),
-            crate::generator::Count::Many => frame_op!($op [$($pre)* { crate::generator::Count::Many },] ($($args),*); $($rest),*),
+        match crate::specialize::Count::of($count) {
+            crate::specialize::Count::Zero => frame_op!($op [$($pre)* { crate::specialize::Count::Zero },] ($($args),*); $($rest),*),
+            crate::specialize::Count::One => frame_op!($op [$($pre)* { crate::specialize::Count::One },] ($($args),*); $($rest),*),
+            crate::specialize::Count::Two => frame_op!($op [$($pre)* { crate::specialize::Count::Two },] ($($args),*); $($rest),*),
+            crate::specialize::Count::Many => frame_op!($op [$($pre)* { crate::specialize::Count::Many },] ($($args),*); $($rest),*),
         }
     };
 }
 
 /// A frame op's stencil, copied at `SKIP` 0, or, in a build that copies none, a
-/// call running its body. See Note [Frame ops] in `generator`.
+/// call running its body. See Note [Frame ops] in `specialize`.
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
     match stencils.body(&**op, 0) {
         Ok(body) => splat(ops, &body, &op.captures(), pool),
@@ -489,7 +489,7 @@ pub struct JitContext {
     /// version. See Note [Call linking].
     call_waiting: HashMap<BlockId, Vec<CallSite>, FxBuildHasher>,
     /// The frame ops the JIT's code has, which a call of an op's body refers to.
-    /// See Note [Frame ops] in `generator`.
+    /// See Note [Frame ops] in `specialize`.
     frame_ops: Vec<Rc<dyn Window>>,
     /// How regions are partitioned into traces (`LUNACY_TRACES`), or `None` to
     /// allocate streaming instead: no plan, each op placing itself in the window
@@ -1464,7 +1464,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     //   * Number   : the value has any `NUMBER_TAG` bit set.
                     //   * Integer  : it has all of them: at least `NUMBER_TAG`, unsigned.
                     //   * Double   : some but not all: below `NUMBER_TAG`, and, unless
-                    //     `known` a number, any set. See Note [Integers] in `generator`.
+                    //     `known` a number, any set. See Note [Integers] in `specialize`.
                     //   * Nil/Bool : exact immediate compare (nil = 2, false/true = 6/7).
                     //   * cell types (Table/Closure/String): the value is a raw pointer
                     //     (no `NOT_CELL_MASK` bits) whose offset-0 header byte is the kind.
@@ -1677,12 +1677,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 );
                             }
                             // The frame, pushed by `PushFrame` returning here. See Note
-                            // [Frame ops] in `generator`.
+                            // [Frame ops] in `specialize`.
                             // The callee's frame past a fixed count of arguments is
                             // nilled here, a store a slot, but for a big one, which
                             // `PushFrame` nils, as it does past a count up to the top.
                             let packed_ret = Location(BlockId(id.0), off + 1).pack();
-                            let hold = |count: u16| crate::generator::Count::hold(count) as u64;
+                            let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                             let (ret, abs) = (packed_ret.bits() as u64, hold(*a) | hold(*b) << 16 | (*stack as u64) << 32);
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
                             let push = match nils {
@@ -1828,8 +1828,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Arrive { a, c } => {
                     // The call's results, taken by `Arrive`, which keeps no register
                     // but `state`'s: the base pointer is loaded again. See Note
-                    // [Returns] in `generator`.
-                    let hold = |count: u16| crate::generator::Count::hold(count) as u64;
+                    // [Returns] in `specialize`.
+                    let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     let arrive = frame_op!(Arrive [] (hold(*a) | hold(*c) << 16); *a, *c);
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &arrive);
                     self.jctx.frame_ops.push(arrive);
@@ -1849,8 +1849,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Ret(pc, a, b, closes) => {
                     // The frame, popped by `PopFrame`, and the JIT code left with
-                    // where the caller continues. See Note [Frame ops] in `generator`.
-                    let hold = |count: u16| crate::generator::Count::hold(count) as u64;
+                    // where the caller continues. See Note [Frame ops] in `specialize`.
+                    let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     let (at, ab) = (Location(BlockId(id.0), off).pack().bits() as u64, hold(*a as u16) | hold(*b) << 16);
                     let pop = if *closes {
                         frame_op!(PopFrame [true,] (at, ab); *a as u16, *b)

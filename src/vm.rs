@@ -22,7 +22,7 @@ use indexmap::IndexMap;
 use qcell::{LCell, LCellOwner};
 use crate::{TLCell, TlcOwner, Owner};
 
-use crate::generator::{Specializer, Context, SubPc};
+use crate::specialize::{Specializer, Context, SubPc};
 
 // `BlockId` and `HashRef` are referenced by `Location` / `HashWitness`, so they
 // live here rather than in the generator module (which re-imports them).
@@ -426,7 +426,7 @@ pub struct Table<'src, 'intern> {
 thread_local! {
     /// How many times the global environment's hash entries have moved: global
     /// caches holding an entry's address are valid while it's unchanged. See
-    /// Note [Global caches] in `generator`.
+    /// Note [Global caches] in `specialize`.
     static ENV_MOVES: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -1043,7 +1043,7 @@ pub type NativeWindow = fn(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<Na
 pub struct NativeOp {
     pub window: std::rc::Rc<dyn crate::window::Window>,
     pub args: LType,
-    pub result: crate::generator::CType,
+    pub result: crate::specialize::CType,
 }
 
 #[derive(Clone, Copy)]
@@ -1309,7 +1309,7 @@ pub struct RunState<'src, 'intern> {
     pub current_off: u16,
     /// What a return from JIT code leaves the JIT code with: where its caller
     /// continues (a `PackedLocation`), or -2 for a return from the entry
-    /// frame. `PopFrame` writes it. See Note [Frame ops] in `generator`.
+    /// frame. `PopFrame` writes it. See Note [Frame ops] in `specialize`.
     pub exit: u64,
     pub gas: i64,
     /// Prototypes whose entry blocks `closure.__jit = ...` asked to compile, for
@@ -1337,7 +1337,7 @@ impl<'src, 'intern> Debug for RunState<'src, 'intern> {
 impl<'src, 'intern> RunState<'src, 'intern> {
     /// Close the running frame's open upvalues, the slots from `base` up: each takes the
     /// slot's value into a cell of its own, as it leaves the stack. An enclosing frame's
-    /// stay open. See Note [Captured slots] in `generator`.
+    /// stay open. See Note [Captured slots] in `specialize`.
     pub fn close_upvalues(&mut self, owner: &mut Owner)
     {
         let (base, vals) = (self.base, &self.vals);
@@ -1409,7 +1409,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     }
 
     /// `call_lua`, inlined into the window op pushing a frame in JIT code
-    /// (`PushFrame`). See Note [Frame ops] in `generator`.
+    /// (`PushFrame`). See Note [Frame ops] in `specialize`.
     ///
     /// The callee's frame past its arguments is nil when it starts, as Lua's
     /// is: luac emits no LOADNIL for a local declared at a function's first
@@ -1479,7 +1479,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// stack its results are in, which the caller takes off it.
     ///
     /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
-    /// Note [Frame ops] in `generator`.
+    /// Note [Frame ops] in `specialize`.
     #[inline(always)]
     pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) -> Result<Location, std::ops::Range<usize>> {
         if closes {

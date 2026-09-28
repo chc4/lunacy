@@ -28,9 +28,11 @@ pub mod stack;
 pub mod lboxed;
 pub mod vm;
 pub mod perf;
-// The generator (lazy basic-block versioner / specializer) runs every closure;
-// the native code generator (feature `jit`) compiles its hot blocks.
-pub mod generator;
+// The specializer (lazy basic-block versioning) runs every closure, driving
+// each instruction's generator (`generators`); the native code generator
+// (feature `jit`) compiles its hot blocks.
+pub mod specialize;
+pub mod generators;
 pub mod window;
 #[cfg(feature = "jit")]
 pub mod window_alloc;

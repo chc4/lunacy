@@ -14,7 +14,6 @@ use bitfield::bitfield;
 use crate::vm::{Opcode, Number, IStr};
 
 use internment::Arena;
-use crate::generator;
 
 use log::debug;
 

@@ -384,7 +384,7 @@ interpreter-test name: interpreter-compile (_luac-test name)
 # submodules linked to this checkout's, as for `hyperfine-vs`). For example
 # `just stencil-asm SetTableInteger`, or with its const params as its demangled
 # symbol names them, `just stencil-asm 'PopFrame<false,
-# {lunacy::generator::Count::Many}, {lunacy::generator::Count::Many}>'`.
+# {lunacy::specialize::Count::Many}, {lunacy::specialize::Count::Many}>'`.
 stencil-asm op ref='':
     #!/usr/bin/env bash
     set -euo pipefail
