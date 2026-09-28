@@ -306,7 +306,7 @@ pub enum YieldOp {
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
     NativeWindowArgs(usize, usize, usize), // For CALL A B C: resumed with WindowArgs if STACK[A] is
                                            // a native with a window op for the call, else Failed.
-                                           // See Note [Native windows] in `library`
+                                           // See Note [Native windows]
 
 
     Guard(usize, LType), // Resumed with either Matched or Failed if STACK[idx] is the expected
@@ -659,6 +659,17 @@ pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield =
     }
 }
 
+// `GuardDynamic` tests: whether a `CType::Type(LType::Integer)` key, in a register or the
+// constant `k`, is in a table's array part. See Note [Dynamic guards].
+crate::window::windowed!(InArray, [], [], |owner, state, base| (table, key) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    state.select = (integer_slot(key.as_int()) >= tab.ro(owner).array.len()) as usize;
+});
+crate::window::windowed!(InArrayK, [k: i32], [], |owner, state, base| (table) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    state.select = (integer_slot(k) >= tab.ro(owner).array.len()) as usize;
+});
+
 pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -805,10 +816,8 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::SetHazards(None, None);
             return arg;
         }
-        // TODO: table shape specialization
-        // An integer key in the array part, in a register or a constant (its
-        // value, `k`), with the value in a register, stores into its slot. See
-        // Note [Dynamic guards].
+        // An integer key in the array part. Potentially from a constant (`k`).
+        // See Note [Dynamic guards].
         let integer = match yield YieldOp::GuardCType(b, CType::Type(LType::Integer)) {
             ResumeArg::MatchedConst(k) => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };
@@ -971,8 +980,7 @@ unsafe fn number<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>) -> f6
     }
 }
 
-/// The double op `OP` on `l` and `r`, boxed. See Note [Arithmetic NaNs] in
-/// `lboxed`.
+/// The double op `OP` on `l` and `r`, boxed. See Note [Arithmetic NaNs].
 #[inline(always)]
 unsafe fn arith<'src, 'intern, const OP: Opcode>(l: f64, r: f64) -> LBoxed<'src, 'intern> {
     let n = match OP {
@@ -1005,37 +1013,12 @@ fn integer_op<const OP: Opcode>(l: i32, r: i32) -> Option<i32> {
     }
 }
 
-// The integer ops on registers and constants (`k`, their value), and their
-// `GuardDynamic` tests that the result fits. See Note [Integers].
-crate::window::windowed!(FitsRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs) {
-    state.select = integer_op::<OP>(lhs.as_int(), rhs.as_int()).is_none() as usize;
-});
-crate::window::windowed!(FitsKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs) {
-    state.select = integer_op::<OP>(k, rhs.as_int()).is_none() as usize;
-});
-crate::window::windowed!(FitsRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs) {
-    state.select = integer_op::<OP>(lhs.as_int(), k).is_none() as usize;
-});
-crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
-    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), rhs.as_int())));
-});
-crate::window::windowed!(IntegerKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
-    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(k, rhs.as_int())));
-});
-crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
-    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), k)));
-});
 
 // The double ops on registers, `LI`/`RI` if in the integer encoding, and
 // constants, `k` their value. Unchecked, so that no panic path follows the
 // stencil's `become` and the copy can slice it off.
 crate::window::windowed!(NumericRR, [], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs, out dest) {
     *dest = arith::<OP>(number::<LI>(lhs), number::<RI>(rhs));
-});
-// A constant's NaN is canonicalized when it is captured (`NumberK`), as it
-// came from outside the encoding. See Note [Arithmetic NaNs] in `lboxed`.
-crate::window::windowed!(NumericKK, [kl: f64, kr: f64], [OP: Opcode], |owner, state, base| (out dest) {
-    *dest = arith::<OP>(kl, kr);
 });
 crate::window::windowed!(NumericKR, [k: f64], [OP: Opcode, RI: bool], |owner, state, base| (rhs, out dest) {
     *dest = arith::<OP>(k, number::<RI>(rhs));
@@ -1077,6 +1060,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         // --- Int Path --- See Note [Integers]. First, as finding out whether an
         // unknown operand is an integer finds out its type too.
         if matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::MOD) {
+            // The integer ops on registers and constants (`k`, their value), and their
+            // `GuardDynamic` tests that the result fits. See Note [Integers].
             let integers = integer_operands!(lhs, rhs);
             let (lk, rk) = ((lhs & 0x100) != 0, (rhs & 0x100) != 0);
             // A constant operand is its value, as `k`. luac folds two.
@@ -1084,13 +1069,31 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 None
             } else if lk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(lhs & 0xff)) else { unreachable!() };
+                crate::window::windowed!(IntegerKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
+                    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(k, rhs.as_int())));
+                });
+                crate::window::windowed!(FitsKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs) {
+                    state.select = integer_op::<OP>(k, rhs.as_int()).is_none() as usize;
+                });
                 Some((Some(dispatch_integer_window!(opcode, FitsKR, (k, &[rhs]))), dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest]))))
             } else if rk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rhs & 0xff)) else { unreachable!() };
                 // Only MOD by a zero can fail with a constant divisor.
                 let test = (opcode != Opcode::MOD || k == 0).then(|| dispatch_integer_window!(opcode, FitsRK, (k, &[lhs])));
+                crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
+                    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), k)));
+                });
+                crate::window::windowed!(FitsRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs) {
+                    state.select = integer_op::<OP>(lhs.as_int(), k).is_none() as usize;
+                });
                 Some((test, dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest]))))
             } else {
+                crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
+                    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), rhs.as_int())));
+                });
+                crate::window::windowed!(FitsRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs) {
+                    state.select = integer_op::<OP>(lhs.as_int(), rhs.as_int()).is_none() as usize;
+                });
                 Some((Some(dispatch_integer_window!(opcode, FitsRR, (&[lhs, rhs]))), dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest]))))
             };
             // Whether the result fits, as one step each way: a way skipping the
@@ -1132,6 +1135,11 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
                 let ResumeArg::Number(l) = (yield YieldOp::NumberK(lhsc)) else { unreachable!() };
                 let ResumeArg::Number(r) = (yield YieldOp::NumberK(rhsc)) else { unreachable!() };
+                // A constant's NaN is canonicalized when it is captured (`NumberK`), as it
+                // came from outside the encoding. See Note [Arithmetic NaNs].
+                crate::window::windowed!(NumericKK, [kl: f64, kr: f64], [OP: Opcode], |owner, state, base| (out dest) {
+                    *dest = arith::<OP>(kl, kr);
+                });
                 Some(dispatch_numeric_window!(opcode, NumericKK, [], (l, r, &[dest])))
             },
             (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
@@ -1193,17 +1201,6 @@ unsafe fn select<const OP: Opcode, T: PartialOrd>(state: &mut RunState, a: u8, l
     };
     state.select = if (cond as u8) != a { 0 } else { 1 };
 }
-
-// Compares of integers, a constant one as `k`, its value. See Note [Integers].
-crate::window::windowed!(CompareIntRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
-    select::<OP, i32>(state, a, lhs.as_int(), rhs.as_int());
-});
-crate::window::windowed!(CompareIntKR, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (rhs) {
-    select::<OP, i32>(state, a, k, rhs.as_int());
-});
-crate::window::windowed!(CompareIntRK, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (lhs) {
-    select::<OP, i32>(state, a, lhs.as_int(), k);
-});
 
 // Compares of numbers: registers, `LI`/`RI` if in the integer encoding, and a
 // constant, `k` its value.
@@ -1281,8 +1278,12 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
         arg = yield YieldOp::GetBlock((pc as isize + 1 as isize) as usize);
         let ResumeArg::BlockId(taken) = arg else { unreachable!() };
 
+        // Compares of integers, a constant one its value `k`. See Note [Integers].
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) if integers => {
+                crate::window::windowed!(CompareIntRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
+                    select::<OP, i32>(state, a, lhs.as_int(), rhs.as_int());
+                });
                 arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRR, [], (a, &[b, c])));
             },
             (ResumeArg::Matched, ResumeArg::Matched) => {
@@ -1290,6 +1291,9 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) if integers => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rb)) else { unreachable!() };
+                crate::window::windowed!(CompareIntKR, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (rhs) {
+                    select::<OP, i32>(state, a, k, rhs.as_int());
+                });
                 arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntKR, [], (a, k, &[c])));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) => {
@@ -1298,6 +1302,9 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) if integers => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rc)) else { unreachable!() };
+                crate::window::windowed!(CompareIntRK, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (lhs) {
+                    select::<OP, i32>(state, a, lhs.as_int(), k);
+                });
                 arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRK, [], (a, k, &[b])));
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
@@ -1525,18 +1532,16 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
 
 // Note [Captured slots]
 // ~~~~~~~~~~~~~~~~~~~~~
-// A closure's upvalue is a cell shared by every closure capturing the same
-// variable: while the variable's frame runs, the cell is open, naming its stack
-// slot, and when the frame returns, `close_upvalues` closes it, moving the
-// slot's value into it. A CLOSURE's pseudo-instructions say where each upvalue
-// comes from: a MOVE a slot of the running frame, whose open cell the closure
-// shares with any other capturing it (`RunState::upvals`), and a GETUPVAL the
-// running closure's own upvalue, the same cell.
+// A closure's upvalue is a cell shared by every closure capturing the same variable. While the
+// variable's frame runs, the cell is open, naming its stack slot. When the frame returns,
+// `close_upvalues` closes it, moving the slot's value into it. A CLOSURE's pseudo-instructions say
+// where each upvalue comes from: a MOVE a slot of the running frame, whose open cell the closure
+// shares with any other captures, and a GETUPVAL the running closure's own upvalue.
 //
-// A closure may read or write a slot it captured whenever it runs, which is
-// during a call: so the type of a slot any CLOSURE of a function captures
-// (`captured_slots`) is forgotten after each call, and no context types a
-// captured slot with what a call may have changed.
+// A closure may read or write a slot it captured whenever it runs, which is during a call. For
+// that reason, the type of a slot any CLOSURE of a function captures (`captured_slots`) is
+// forgotten after each call, and no context types a captured slot with what a call may have
+// changed.
 //
 // GETUPVAL and SETUPVAL read and write an open cell's slot in memory, never the
 // register window: it is a slot of an enclosing frame, below the running one's.
@@ -1563,8 +1568,8 @@ pub fn captured_slots<'src, C>(proto: &crate::chunk::FunctionBlock<'src, C>) -> 
 }
 
 /// `R(A) := closure(KPROTO[Bx], R(A), ... ,R(A+n))`: a closure of the function's
-/// prototype `bx`, its upvalues from the `upvalues` pseudo-instructions after it,
-/// continuing at `next`, the instruction after them. See Note [Captured slots].
+/// prototype `bx`, its upvalues from the `upvalues` pseudo-instructions after it.
+/// Continues at `next`, the instruction after them. See Note [Captured slots].
 pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -1737,10 +1742,9 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
     }
 }
 
-/// The window op for `CALL A B C` in `ctx`, if STACK[A] is a native with one for
-/// the call's arity, and the end of its arguments: fixed, or the top the call
-/// before left, if known (Note [Known top]). See Note [Native windows] in
-/// `library`.
+/// The window op for `CALL A B C` in `ctx`, if STACK[A] is a native with fixed arity,
+/// and it has enough arguments. The arguments may either be fixed, or the top the call
+/// before left, if known (Note [Known top]). See Note [Native windows].
 fn native_window(ctx: &Context, a: usize, b: usize, c: usize) -> Option<(usize, crate::vm::NativeOp)> {
     let end = if b == 0 { ctx.top? } else { a + b };
     let CType::NativeFunction(nf) = &ctx.types[a] else { return None };
@@ -1757,36 +1761,44 @@ windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
 
 // Note [Returns]
 // ~~~~~~~~~~~~~~
-// A return is in two halves, each where one of its counts is known. The
-// callee's (`RunState::leave`, at its RETURN, which knows B) pops its frame and
-// moves its results down to the slot the function was called from, the top
-// just past them. The caller's (`RunState::arrive`, in the `Arrive` residual
-// right after the call, which knows C) pads them with nil to the count it
-// wants, and shrinks the stack back to its frame (Note [Stack frames]).
+// A return is in two halves, each where one of its counts is known.
+// The callee's (at its RETURN, which knows B) pops its frame and moves its results down to the
+// slot the function was called from, with the top just past them.
+// The caller's (in the `Arrive` residual right after the call, which knows C) pads them with nil
+// to the count it wants, and shrinks the stack back to its frame (Note [Stack frames]).
 //
-// A call returns to its `Arrive`: its `ReturnLocation` is the `Arrive`'s, so
+// A lua call must returns to its `Arrive`: its `Location` is the `Arrive`, so
 // every way back into the caller takes its results there, whether the callee
 // returns to the caller's JIT code, to the interpreter running the caller, or
-// through a bailout. A generic `Call` that calls a native skips the `Arrive`:
-// `call_native` puts the results in place itself.
+// through a bailout.
+// A native call *must not*; `call_native` puts the results in place by itself, and running
+// `Arrive` additionally would be incorrect. For known native functions we may skip emitting the
+// `Arrive` in the first place. However, for dynamic calls where it is not known until runtime if a
+// callee is a lua or native function, it must dynamically perform a jump.
 
 // Note [Frame ops]
 // ~~~~~~~~~~~~~~~~
-// A Lua call's frame is pushed (`call_lua`) and popped (`leave`), and its
-// results taken (`arrive`), by window ops the JIT copies into its code for the
-// call (`PushFrame`, in a `LuaCall`), the return (`PopFrame`, in a `Ret`), and
-// the call's results (`Arrive`), rather than calling out to them. The window
-// is flushed at a call and a return, so the ops run at `SKIP` 0 into an empty
-// window, and read and write only `state`. The frame is in `state.callstack`
-// whichever pushed it, so a bailout out of JIT code finds it there. A return
-// leaves its JIT code with where its caller continues, which `PopFrame` writes
-// to `state.exit` for the `Ret` to load. See Note [Returns].
+// JIT code and the interpreter share one Lua call stack: `state.callstack`, and the running frame
+// in `state`. Whenever control leaves JIT code, the frames there must be exactly what the
+// interpreter would have.
+// No Lua frame exists only in the native stack, so a bailout just discards
+// JIT code's native frames and resumes the suspended Lua frame in the interpreter.
 //
-// The ops' A, B and C each have a const `Count`: whether it is 0, 1, 2 or more,
-// so that an op's stencil has the branches on them (a count up to the top, no
-// value, one) decided. 0, 1 and 2 are constants, and more is in the op's hole,
-// less 3, so the stencil knows it is more than 2 by adding 3 back
-// (`Count::hold`, `Count::lift`).
+// JIT code keeps the callstack intact by running the interpreter's own frame maintenance
+// functions, not a copy of the logic. Each one is ran as a window op, copied into the JIT code,
+// which means that the size of each function is very size and branch prediction sensitive.
+
+
+// Note [Count case analysis]
+// Callstack maintenance operations (See Note [Frame ops]) have differing behavior based on the
+// arity of both the number of arguments and the number of returned values accepted.
+//
+// In order to avoid useless branches inside the window ops, which are size sensitive and going to
+// have constants in their holes, we can perform case analysis on the dynamic values; this allows
+// us to lift the dynamic choice into a static const parameter, and each monomorphized version of
+// the window can constant fold away the branches it would never perform under each case.
+//
+// `Count` encodes which of {0, 1, 2, many} each argument is a case of.
 
 /// Which of 0, 1, 2, or more a frame op's A, B or C is (Note [Frame ops]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
@@ -1807,8 +1819,10 @@ impl Count {
         }
     }
 
-    /// What an op's hole holds for `value`: past 2, `value - 3`.
+    /// What an op's hole holds for `value`
     pub fn hold(value: u16) -> u16 {
+        // Past 2, `value - 3`, which LLVM requires in order to properly take advantage of
+        // `unreachable` annotations around what `Count::Many` means.
         value.saturating_sub(3)
     }
 
@@ -1823,18 +1837,17 @@ impl Count {
     }
 }
 
-// `call_lua` for a call of R(A), `abs` its `a | b << 16 | stack << 32` (A and B
-// as `Count::hold` holds them, `stack` the callee's `max_stack`), returning to
-// `ret` (a `PackedLocation`), nilling the callee's frame if `FILLS` (else the
-// JIT code does). See Note [Frame ops].
+// `call_lua` for a call of R(A). `abs` is its `a | b << 16 | stack << 32` (A and B as
+// `Count::hold` holds them, `stack` the callee's `max_stack`). The pushed frame returns to `ret`
+// (a `PackedLocation`). Requires nilling the callee's frame if `FILLS`, or else the JIT code does.
+// See Note [Frame ops].
 windowed!(frame PushFrame, [ret: u64, abs: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
     let (a, b) = (A.lift(abs as u16), B.lift((abs >> 16) as u16));
     state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), a, b, (abs >> 32) as u8, FILLS);
 });
 
-// A `Ret` at `at` (a `PackedLocation`), `ab` its `a | b << 16` (as
-// `Count::hold` holds them), closing upvalues if `CLOSES`:
-// `leave`, `state.exit` where the caller continues, or -2 from the entry frame.
+// A `Ret` at `at` (a `PackedLocation`). `ab` is its `a | b << 16` (as `Count::hold` holds them).
+// Closing upvalues if `CLOSES`.
 // See Note [Frame ops].
 windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, A: Count, B: Count], |owner, state, base| () {
     let Location(BlockId(block), off) = Location::unpack(crate::vm::PackedLocation::from_bits(at as usize));
@@ -1851,8 +1864,9 @@ windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, A: Count, B: Count]
     };
 });
 
-// `arrive` for the call of R(A) before it, `ac` its `a | c << 16` (as
-// `Count::hold` holds them). See Note [Frame ops].
+// `arrive` for the call of R(A) before it. `ac` is its `a | c << 16` (as `Count::hold` holds
+// them).
+// See Note [Frame ops].
 windowed!(frame Arrive, [ac: u64], [A: Count, C: Count], |owner, state, base| () {
     state.arrive(A.lift(ac as u16), C.lift((ac >> 16) as u16));
 });
@@ -1870,7 +1884,7 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         }
         // A native's window op assumes its arguments' type: guard them to it, so an
         // argument of unknown type is discovered, and the call can run as the op if
-        // it has it. See Note [Native windows] in `library`.
+        // it has it. See Note [Native windows].
         if let ResumeArg::WindowArgs(end, args) = (yield YieldOp::NativeWindowArgs(a, b, c)) {
             for slot in a + 1..end {
                 yield YieldOp::Guard(slot, args);
@@ -1887,40 +1901,30 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
 
 // Note [Subblocks]
 // ~~~~~~~~~~~~~~~~
-// An instruction's generator can end its block partway through, at a question
-// answered at runtime (a thunk). Forcing the thunk resumes the generator with
-// the answer it found, and compiles the rest of the instruction into a
-// subblock for that answer.
+// A block is a version of the code at a `SubPc`, for a specialized context (Note [Version
+// compatibility]). A `SubPc` is a Lua bytecode PC plus the answers to the questions the
+// instruction's generator has asked so far, so a block can start partway through an instructions:
+// when a question can only be answered at runtime, the block ends in a thunk, and forcing it
+// compiles the rest of the generator from taht answer on in a new block (`subblock`).
 //
-// A subblock is keyed, like a version, by its context and a `SubPc`: the
-// instruction's pc and the answers the generator has had in it so far, a bit
-// each after a leading 1, 1 passed and 0 failed. Every question steps the
-// `SubPc`, whether the context answers it or a thunk finds it out
-// (`navigate`), so a way that knows an answer and one that finds it out reach
-// the same key. A way reaching a key that already has a subblock takes that
-// subblock (`subblock`), and its own generator is dropped. So:
+// An answer steps the `SubPc` the same way whether the specializer answers it immediately or a
+// thunk finds it out at runtime (`navigate`). This means that either case result in the same
+// `SubPc` and context, and they can both reuse an existing block from the other if it already
+// was emitted. This allows for generators that begin in two disparate contexts but that reach
+// the same context after some series of effects can be merged instead of proliferating versions.
 //
-//   Ways reaching the same key must be at the same point in the generator: it
-//   must have yielded the same so far and have the same left to yield.
-//
-// A way that knows its answers doesn't stop at the keys it passes: it runs on
-// with its own generator, and can meet other ways at a later key. A `SubPc`
-// records answers, not which questions they answered, so the rule holds only
-// if what a generator yields next is determined by its key:
-//
-// - Ways through an instruction ask the same questions. Where one way tests
-//   something at runtime and another already knows the answer, or skips the
-//   test, the other yields `Decided` for it.
-// - A generator doesn't decide what to yield from what it read at an earlier
-//   key. `Typeof` reads the context as it is then, and later answers narrow
-//   it, so ways can reach one key having read different types: one read a
-//   register as a `Number` and found it a double, another knew it was one.
-//   Such a read may decide what is yielded only through something the key
-//   determines, as `integer_operands!` returns only whether both operands are
-//   integers.
+// However, this means that a generator must be able to be uniquely identified solely by its
+// `SubPc` and the context it currently has:
+// - Every compilation of an instructions must ask the same questions in the same order. Where one
+// tests something at runtime and another already knows the answer, or doesn't need it, the other
+// yields `Decided` in order to transition the `SubPc` in an equivalent way.
+// - What a generator yields next must only be determined by its `SubPc` and context. A type it
+// read earlier may since have been narrowed by later answers, or it may have deduplicated across a
+// guard and none of the later operations may depend on information from a potentially different
+// starting point.
 
 pub type Pc = usize;
-/// Where in an instruction a subblock continues: see Note [Subblocks].
+/// Where in an instruction a generator is: see Note [Subblocks].
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 pub struct SubPc(usize, usize);
 
@@ -1951,25 +1955,21 @@ impl std::fmt::Debug for ThunkRef {
 #[derive(Debug, Clone)]
 pub enum Residual {
     /// Whether `STACK[idx]`, known to be of type `known`, has the type
-    /// `expected`: its type is `expected` or below it.
+    /// `expected`: either its type is `expected` or below it.
     Guard { idx: usize, known: LType, expected: LType },
     Exec(ResidualExec),
-    /// A copy&patch window op (see `crate::window`): a trait object, like
-    /// `Exec`'s closure, so processing sites never enumerate ops. Its operands
-    /// are whole `LBoxed` values held in the register window.
+    /// A copy&patch window op (see `crate::window`) to execute.
     ExecWindow(Rc<dyn Window>),
-    /// A guard whose test is a window op: it sets `state.select` to 0 to pass,
-    /// taking the success edge (the residual after the next), or 1 to fail,
-    /// falling through to the failure edge, as `Guard` does. See Note [Dynamic
-    /// guards].
+    /// A guard whose test is a window op: it sets `state.select` to 0 if passed, or 1 if failed.
+    /// See Note [Dynamic guards].
     GuardDynamic(Rc<dyn Window>),
     Call { a: u16, b: u16, c: u16 },
     Select(Vec<(&'static str, BlockId)>),
     Jump(BlockId),
     Thunk(ThunkRef),
-    /// A RETURN of `b - 1` values from R(A), or up to the top, which closes
-    /// the frame's open upvalues if its function captures a slot of it
-    /// (`captured_slots`): with none, no upvalue is open into it.
+    /// A RETURN of `b - 1` values from R(A), or up to the top. Closes the frame's open upvalues.
+    /// Functions which statically know they have no open upvalues may set `close = false` as an
+    /// optimization.
     Ret(Pc, u8, u16, bool),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
@@ -1977,9 +1977,9 @@ pub enum Residual {
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
-    /// A call to the Lua function in R(A), whose prototype a `LuaGuard` or the
-    /// context knows, entering its version `entry`, with a frame of `stack`
-    /// slots (the prototype's `max_stack`). See Note [Call sites].
+    /// A call to the Lua function in R(A), The target `entry` is a prototype a `LuaGuard` or the
+    /// context knows. Sizes the newly pushed frame to `stack` slots (the prototype's `max_stack`).
+    /// See Note [Call sites].
     LuaCall { entry: CallEntry, a: u16, b: u16, c: u16, stack: u8 },
     /// The results of the call of R(A) before it, which returns here: `c - 1`
     /// of them, or with C = 0 all. See Note [Returns].
@@ -2000,41 +2000,22 @@ pub enum CallEntry {
 
 // Note [Call sites]
 // ~~~~~~~~~~~~~~~~~
-// A call ends its block in a thunk (`make_call_thunk`), the code after it a
-// version of its own, unless the context knows the callee is a native, which
-// runs in the block. Run, the thunk lays out the call for the function it finds
-// in R(A):
+// A call site is specialized on the function it calls. Each new function it finds is guarded for
+// and called directly, and a function that fails every existing guard is found out like any other
+// type; past `MAX_VERSIONS` functions, the site makes a generic call. A site whose context knows
+// its callee needs no guard.
 //
-//   a Lua function:  lua_guard(prototype), thunk(next), lcall(entry), jump(after)
-//   a native:        native_guard(function), thunk(next), ncall, gc, jump(after)
-//   past the limit:  call, gc, jump(after)
+// The callee is entered in a version specialized to what the caller knows of the arguments: the
+// parameters have the arguments' types, and the unpassed ones are nil. Facts that the caller knows
+// of its own frame (hash keys, fragile facts, etc) says nothing of the callee's, and are not
+// passed along. A call whose argument count isn't known, or to a vararg function, enters the
+// generic version.
 //
-// with no guard for a Lua function the context knows. A guard's failure is a
-// thunk for the next function, so the chain guards one more each time a call
-// finds a new one, up to `MAX_VERSIONS`; past that, the call is generic
-// (`Residual::Call`), as it is for what isn't a function. A discovery thunk
-// finding a function in a register, as when a call's callee is unknown, guards
-// the identities of up to `MAX_VERSIONS` of them the same way.
-//
-// `lcall` enters a version of the callee specialized to its arguments
-// (`entry_context`): the parameters have the caller's types of the arguments
-// passed, and nil's where the call passes none, as `call_lua` writes nil there.
-// The callee's other registers are unknown, and it starts with no hash keys and
-// no fragile information: hash keys index the caller's witnesses, which the
-// callee's frame doesn't have, so shapes become tables, and fragile facts name
-// the caller's slots and upvalues. A call passing up to a top the context
-// doesn't know, or to a vararg function, enters the generic version, every
-// register unknown.
-//
-// The version is found when the `lcall` first runs (`CallEntry`), not while
-// specializing, which would compile callees of calls that never run, and a
-// recursive function forever. `version` gives one accepting the context, the
-// generic version at worst, so the call needs no guard of its own. The JIT
-// calls the version's code if it has some when the call is compiled, and
-// otherwise goes through `JitHelper::lua_call`, which takes the version's code
-// once it has some, and until then does as for a function it doesn't know: the
-// generic version's code, or an exit for the interpreter to call it. Any of
-// them accepts the call.
+// The callee's version is chosen when the call first runs, not while specializing the caller,
+// which would compile callees of calls that never run and attempt to resolve a recursive call
+// target too early. Any version accepting the entry context will do, so the call itself needs no
+// further guard. JIT code calls that version's code directly, once it has some. See Note [Call
+// linking] for how JIT code reaches it.
 
 /// The context a call in `caller`, of R(A) with operand B, enters the callee
 /// `proto` with. See Note [Call sites].
@@ -2133,11 +2114,11 @@ impl std::fmt::Display for CType {
 // ~~~~~~~~~~~~~~~
 // A number is in the integer or the double encoding (Note [Integer encoding]), and its tag says
 // which. The specialization context tracks its knowledge potentially fuzzier than that:
-// `CType::Type(LType::Integer)` is a number in the integer encoding, `CType::Type(LType::Double)` one in the double
-// encoding, and `CType::Type(Number)` a number in either. As the value carries its encoding, a
-// context knowing less of it needs no code: a jump into a version typing a slot `Number` or
-// `Unknown` enters it as it is, and generic code (a table, an upvalue, a native, a return) reads
-// either.
+// `CType::Type(LType::Integer)` is a number in the integer encoding, `CType::Type(LType::Double)`
+// one in the double encoding, and `CType::Type(Number)` a number in either. As the value carries
+// its encoding, a context knowing less of it needs no code: a jump into a version typing a slot
+// `Number` or `Unknown` enters it as it is, and generic code (a table, an upvalue, a native, a
+// return) reads either.
 //
 // Numeric operations should attempt to specialize on their operands' encoding where
 // they can, so they don't require decoding at runtime. The integer encoding can only store small
@@ -2157,15 +2138,13 @@ impl std::fmt::Display for CType {
 // discovered partway through a loop and cause recompilation, and arithmetic operations discover
 // the types of their operands in a non-eager way that keeps their types stable when not demanded.
 
-/// Where a guard for `expected` continues its generator, with what, when the
-/// value's type is `found` (as precise as a guard finds, or a context knows it
-/// to be): a step down the lattice for each level `expected` is below the top,
-/// the right one if `found` is at or below that level's type and else the left
-/// one (and none further), whether the context answers it or a thunk finds it
-/// out, so the ways share the blocks after. `Integer` is two levels, a
-/// `Number`, then the encoding; every `CType::Type` one. See Note [Integers].
+/// Where a guard for `expected` continues its generator, with what, when the value's type is
+/// `found`. Each step down the lattice translates into one SubPc step, so that continuing the
+/// generator at different `found` but to the same `expected` reach the same state and so can be
+/// potentially deduplicated. See Note [Subblock].
 fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
     match expected {
+        // `Integer` is two levels, a `Number`, then the encoding; every `CType::Type` one. See Note [Integers].
         CType::Type(LType::Integer) if !LType::Number.accepts(found.as_ltype()) => (pc.next_false(), ResumeArg::Failed),
         CType::Type(LType::Integer) if *found == CType::Type(LType::Integer) => (pc.next_true().next_true(), ResumeArg::Matched),
         CType::Type(LType::Integer) => (pc.next_true().next_false(), ResumeArg::Failed),
@@ -2175,7 +2154,7 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 }
 
 // Note [Global caches]
-// ~~~~~~~~~~~~~~~~~~~~~
+// ~~~~~~~~~~~~~~~~~~~~
 // Each GETGLOBAL and SETGLOBAL has a cache (`GlobalCache`) of where its global's
 // value is in the global environment, so an access is a compare and a load, not
 // a hash lookup. Nothing about globals goes in the context: which globals a path
@@ -2226,22 +2205,17 @@ fn forgotten(ctype: &CType) -> bool {
 
 // Note [Dynamic guards]
 // ~~~~~~~~~~~~~~~~~~~~~~
-// A `GuardDynamic` residual's test is a window op that reads its operands and
-// sets `state.select`, 0 to pass and 1 to fail, and does nothing else. Its two
-// edges continue the generator at different `SubPc`s, resumed with `Matched` or
-// `Failed`, so their versions are told apart by the outcome and needn't differ
-// in context: a test can speculate on what no ctype names, like whether a key is
-// in a table's array part (`InArray`), for the instruction's next op alone.
-// Nothing records it, so nothing invalidates it: the guard tests it each run.
+// A `GuardDynamic` residual's test is a window op that reads its operands and sets `state.select`,
+// 0 to pass and 1 to fail, and is otherwise pure. Its two edges continue the generator at
+// different `SubPc`s, resumed with `Matched` or `Failed`, so their versions are told apart by the
+// outcome and needn't differ in context: a test can speculate on what no ctype names, like whether
+// a key is in a table's array part (`InArray`), for the instruction's next op alone. Nothing
+// records it, so nothing invalidates it: the guard tests it each run.
 //
-// A generator yields `GuardDynamic(test)`, ending its block in a thunk. Forcing
-// it runs the test on the values at hand, then lays out
+// `GuardDynamic` performs biasing of the branch layout towards the first seen
+// input that forces compilation of the branch, identical to normal guards.
 //
-//   passed: guard(test), thunk(fail side), jump(pass side)
-//   failed: guard(test), jump(fail side), thunk(pass side)
-//
-// compiling the side the values took, and the other when first taken, as a jump
-// in place of its thunk. With feature `no_dynamic_guards`, every such yield
+// With feature `no_dynamic_guards`, every such yield
 // fails statically instead, to measure the blocks the guards cost (`just
 // graph-guards`).
 
@@ -2251,17 +2225,6 @@ fn forgotten(ctype: &CType) -> bool {
 fn integer_slot(i: i32) -> usize {
     (i as i64 - 1) as usize
 }
-
-// `GuardDynamic` tests: whether a `CType::Type(LType::Integer)` key, in a register or the
-// constant `k`, is in a table's array part. See Note [Dynamic guards].
-crate::window::windowed!(InArray, [], [], |owner, state, base| (table, key) {
-    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    state.select = (integer_slot(key.as_int()) >= tab.ro(owner).array.len()) as usize;
-});
-crate::window::windowed!(InArrayK, [k: i32], [], |owner, state, base| (table) {
-    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    state.select = (integer_slot(k) >= tab.ro(owner).array.len()) as usize;
-});
 
 /// The type of a constant.
 fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
@@ -2326,54 +2289,49 @@ pub struct Context {
 
 // Note [Fragile information]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~
-// Fragile information is speculation the specializer assumes under a closed-
-// world model, with no guard to check it: once established, a fact holds until
-// an effect the specializer sees could falsify it, where it is dropped, never
-// repaired. Every effect that could falsify a fact must be visible; where the
-// closed world can't be shown to hold, across code the specializer doesn't see
-// (`Effect::Opaque`: a call that isn't a window op, which may run any Lua
-// code), all of it is dropped. The known top (Note [Known top]) is information
-// of this kind.
+// Fragile information is speculation the specializer assumes under a closed-world model, with no
+// guard to check it: once established, a fact holds until an effect the specializer sees could
+// falsify it, where it is dropped without repair. Every effect that could falsify a fact must be
+// visible; where the closed world can't be shown to hold, such as across code the specializer
+// doesn't see all of it is dropped. The known top (Note [Known top]) is information of this kind.
 //
-// It is in the context (`Context::fragile`), so it is part of every block's
-// key: a block compiled relying on a fact is only entered by paths that
-// established it and kept it since, as any path reaching a block with an equal
-// context shares it. It is per activation: a function's entry block has none,
-// and a call's continuation none either, after the call's effect.
+// It is in the context (`Context::fragile`), so it is part of every block's key. A block compiled
+// relying on a fact is only entered by paths that established it and kept it since, as any path
+// reaching a block with an equal context shares it. It is per activation: a function's entry block
+// has none, and a call's continuation none either, after the call's effect.
 //
-// Effects come from the residuals as they are yielded (`Context::effect`): a
-// window op writes the slots its accesses say it writes (`Effect::Write`), an
-// exec may write any slot (`Effect::WriteAny`; it runs no Lua code), a call
-// that isn't a window op is `Effect::Opaque`, and what a residual can't show a
-// yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A thunk
-// pushes guards, jumps, and conversions of an integer's encoding, none of which
-// changes a value. A kind of fact says which effects it survives
-// (`Fragile::survives`); a new kind is a variant, its `key` and `survives`, and
-// where it is established.
+// Effects come from the residuals as they are yielded (`Context::effect`). A window op writes the
+// slots its accesses say it writes (`Effect::Write`), an exec may write any slot
+// (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op is `Effect::Opaque`,
+// and what a residual can't show a yield says (`YieldOp::Effect`: SETUPVAL's
+// `Effect::SetUpvalue`).
 //
-// Established in a loop's first iteration, which LBBV then peels, a fact the
-// loop body keeps comes back along the back edge, into a version compiled with
-// it; one the body drops, into a version without it. So that the facts
-// different paths bring don't multiply versions (every subset of n facts could
-// arrive), a pc's versions differing only in fragile information are kept a
-// chain of subsets, each version's facts in the next's, a context keeping the
-// most facts that keep it one (`version`): all of its own, if it has every fact
-// of the top version; otherwise those it shares with the version above the
-// highest it has every fact of (or with the bottom), entering that one if they
-// are all its facts. A chain of subsets of n facts has at most n + 1 versions;
-// a loop, typically the peeled first iteration and one with what it found.
+// A kind of fact says which effects it survives (`Fragile::survives`); a new kind is a variant,
+// its `key` and `survives`, and where it is established.
 //
-// Facts:
+// Now that you have background of what a fragile fact is, why do we have them? LBBV naturally
+// peels one interation of loops during compilation; there is no CFG analysis that identifies a
+// loop header as such, and so the body is compiled as a normal block, with an initial static
+// context. The static context *out* of that loop body, if it is different than the initial
+// conditions of the loop, cause a second version of the loop body to be compiled, and this
+// continues to fixpoint (but usually only after a single peel).
 //
-//   * `Holds { slot, upvalue }`: the slot holds the value the upvalue held when
-//     loaded into it (GETUPVAL), until either is written.
-//   * `Upvalue { upvalue, ctype }`: the upvalue holds a native function, its
-//     identity (`CType::NativeFunction`), until it is set or the closed world
-//     breaks. A call's discovery thunk finds it, guarding the slot it calls
-//     (Note [Native windows] in `library`): a slot holding the upvalue's value
-//     tells of the upvalue too. GETUPVAL then types its register with it, so a
-//     call through the upvalue guards nothing. Debug builds check it where it
-//     is used (`CheckNative`).
+// In order to take advantage of information that was discovered in the peeled loop, we want to
+// populate the context with as much information as we can so that the *second* version may take
+// advantage of it. However, we don't want to carry around the information in a way that is
+// sensitive to being individually invalidated: if we had a set of information `N` wide, a loop
+// carrying one invalidation per backwards edge may drop a single fact from the set at a different
+// position each time, and cause `2^n` combination repeatedly compiling the same loop.
+//
+// Instead the versions of a pc that differ only in their facts are kept ordered by inclusion, each
+// one's facts a subset of the next's, and a context reaching the pc forgets whatever facts it has
+// that would break that order. Dropping facts is always sound, since a version relying on fewer
+// facts accepts any context with more, and n facts then give at most n + 1 versions.
+//
+// Which facts a path keeps depends on the order paths are compiled in. Facts established before a
+// loop's paths diverge reach every back edge, and are kept by all of them; a path that establishes
+// more than an existing version keeps them in a version of its own; and a path whose facts are
+// incomparable with one compiled before it keeps only those the two share.
 
 /// Speculation the specializer assumes without a guard. See Note [Fragile
 /// information].
@@ -2422,13 +2380,6 @@ impl Fragile {
     }
 }
 
-// A native function the context assumes a slot holds: debug builds check it
-// does. See Note [Fragile information].
-windowed!(CheckNative, [native: usize], [], |owner, state, base| (value) {
-    let LValue::NClosure(nf) = value.unbox() else { panic!("fragile information: a native was assumed, {:?} found", value) };
-    assert_eq!(nf.get_ptr() as usize, native, "fragile information: another native was assumed");
-});
-
 // Note [Known top]
 // ~~~~~~~~~~~~~~~~
 // A CALL with C = 0 leaves every result from R(A) up, and the frame's top
@@ -2437,7 +2388,7 @@ windowed!(CheckNative, [native: usize], [], |owner, state, base| (value) {
 // such a pair for a call that is another call's last argument, as in
 // `bor(x, band(y, z))`.
 //
-// A call run as a native's window op (Note [Native windows] in `library`)
+// A call run as a native's window op (Note [Native windows])
 // returns exactly one result, so after one with C = 0 the context records the
 // top as the slot past R(A) (`Context::top`), and a CALL with B = 0 after it
 // knows its arguments: it can run as a window op in turn. Every other
@@ -3336,8 +3287,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::NumberK(k)) => {
                     let proto = self.clos.ro(owner).prototype;
                     let crate::chunk::Constant::Number(n) = (unsafe { &(&(*proto).constants.items)[k] }) else { unreachable!() };
-                    // Its NaN canonicalized, as boxing it would. See Note
-                    // [Arithmetic NaNs] in `lboxed`.
+                    // Its NaN canonicalized, as boxing it would.
+                    // See Note [Arithmetic NaNs].
                     arg = ResumeArg::Number(if n.0.is_nan() { f64::NAN } else { n.0 });
                 },
                 CoroutineState::Yielded(YieldOp::BoxedK(k)) => {
@@ -3597,6 +3548,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let known = ctx.upvalue(upvalue).cloned();
                     #[cfg(debug_assertions)]
                     if let Some(CType::NativeFunction(nf)) = &known {
+                        // A native function the context assumes a slot holds: debug builds check it
+                        // does. See Note [Fragile information].
+                        windowed!(CheckNative, [native: usize], [], |owner, state, base| (value) {
+                            let LValue::NClosure(nf) = value.unbox() else { panic!("fragile information: a native was assumed, {:?} found", value) };
+                            assert_eq!(nf.get_ptr() as usize, native, "fragile information: another native was assumed");
+                        });
                         self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckNative::new(nf.get_ptr() as usize, &[slot]))));
                     }
                     let ctx = Rc::make_mut(&mut ctx);
@@ -3627,23 +3584,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
-                            // A native run as a window op, with its arguments of the type it
-                            // assumes, gives its result's type: its one result, with C = 0
-                            // too. See Note [Native windows].
+                            // `result` here not only implies that we know the type of the result,
+                            // but also that the operation is pure; we can treat it as not having
+                            // any effects.
                             let mut result = None;
-                            let window = native_window(&ctx, a, b, c)
-                                .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(ctx.types[slot].as_ltype())))
-                                .map(|(_, op)| op);
-                            // Any other call may run a closure, which reads and writes the
-                            // slots it captured. See Note [Captured slots].
-                            let captured = if window.is_none() {
-                                captured_slots(unsafe { &*self.clos.ro(owner).prototype })
-                            } else {
-                                vec![]
-                            };
                             let calling = ctx.clone();
                             let native = matches!(ctx.types[a], CType::NativeFunction(_));
                             if let CType::NativeFunction(nf) = &ctx.types[a] {
+                                // A native runs as a window op if we have one, and we have all of its
+                                // arguments of the type it assumes. It gives one result, even with
+                                // C = 0.
+                                // See Note [Native windows].
+                                let window = native_window(&ctx, a, b, c)
+                                    .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(ctx.types[slot].as_ltype())))
+                                    .map(|(_, op)| op);
+
                                 if let Some(op) = window {
                                     Rc::make_mut(&mut ctx).effect(Effect::Write(a));
                                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op.window));
@@ -3659,9 +3614,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     self.blocks[block_id.0].allocates = true;
                                 }
                             }
-                            // Any other callee runs code the specializer doesn't see. See
-                            // Note [Fragile information].
+                            // Any other call may run a closure, which reads and writes the
+                            // slots it captured. See Note [Captured slots].
+                            let captured = if result.is_none() {
+                                captured_slots(unsafe { &*self.clos.ro(owner).prototype })
+                            } else {
+                                vec![]
+                            };
                             if result.is_none() {
+                                // An unknown call may invalidate any fragile information.
+                                // See Note [Fragile information].
                                 Rc::make_mut(&mut ctx).effect(Effect::Opaque);
                                 // The callee may write any table, including the
                                 // environment, so every witness must recheck its epoch.
@@ -3676,6 +3638,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 .collect();
                             Rc::make_mut(&mut ctx).set_types(owner, clobbered);
                             if let Some(result) = &result {
+                                // We know the type of the result, so can use it in our static
+                                // context.
                                 Rc::make_mut(&mut ctx).types[a] = result.clone();
                             }
                             Rc::make_mut(&mut ctx).top = (result.is_some() && c == 0).then_some(a + 1);

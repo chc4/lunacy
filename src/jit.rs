@@ -154,12 +154,11 @@ impl JitHelper {
         }
     }
 
-    /// A call from JIT code to whatever slot `a` holds: a native runs (the
-    /// interpreter's `call_native`), returning 1; a Lua function whose entry
-    /// has JIT code gets its frame pushed (`call_lua`, returning to `ret`,
-    /// `(off << 32) | block`), returning that entry for the JIT code to call;
-    /// anything else (a function not compiled yet, a `__call`) returns 0,
-    /// having done nothing, for the interpreter to call.
+    /// A call from JIT code to whatever slot `a` holds.
+    /// * A native is called and returns `1`.
+    /// * A Lua function who has JIT code has a frame pushed, and returns the function pointer.
+    /// * Anything else (a function not compiled yet, a `__call`) returns 0 and should cause a
+    ///   bailout for the interpreter to call.
     pub unsafe extern "C" fn dynamic_call(spec: *mut (), state: *mut (), ret: u64, a: u16, b: u16, c: u16) -> usize {
         unsafe {
             let spec = &mut *(spec as *mut Specializer<'static, 'static>);
@@ -1401,9 +1400,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; mov r9d, c as i32
                 ; call extern (helper)
                 ; cmp rax, 1
+                // One, we just fully called a native function and we need to skip the Arrive
+                // operation immediately after this.
                 ; je =>past_arrive
                 ; test rax, rax
+                // Zero, so need to bailout so the interpreter can do the call instead.
                 ; jz >bail
+                // Function pointer to more JIT code, and the helper pushed a frame for us.
+                // Do the call.
                 ; mov r10, rax
                 // The callee's base: vals.stack_ptr + base * sizeof(LBoxed)
                 ; lea rcx, r12 => RunState.vals
