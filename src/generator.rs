@@ -338,7 +338,7 @@ pub enum YieldOp {
 
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key].
     TryHashKey(usize, usize), // Look up but do not allocate an HREF.
-    UpdateHashRef(HashRef, FieldType), // Update the type of HREF to a new type
+    UpdateHashRef(HashRef, LType), // Update the type of HREF to a new type
     GlobalCache(usize), // Resumed with a Cache for global CONSTANT[k]. See
                         // Note [Global caches]
     SetKeyHazards(usize), // SetHazards, for the hash keys of CONSTANT[k] only
@@ -354,7 +354,9 @@ pub struct HashKey<'src, 'intern> {
     /// The slot of the table the key is in.
     pub idx: usize,
     pub key: LConstant<'src, 'intern>,
-    pub known_type: FieldType,
+    /// Its field's type. A shape or a function's identity describes a register,
+    /// not a field, so a field's type is an `LType`. See Note [Field types].
+    pub known_type: LType,
     /// Per slot: whether access through that slot is already checked for
     /// aliasing, so it needs no epoch check.
     pub hazards: SmallVec<[bool; 8]>,
@@ -370,7 +372,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 
     /// A new hash key, its type not yet discovered.
     fn new(idx: usize, key: LConstant<'src, 'intern>) -> Self {
-        HashKey { idx, key, known_type: FieldType::UNKNOWN, hazards: Default::default() }
+        HashKey { idx, key, known_type: LType::Unknown, hazards: Default::default() }
     }
 
     /// Whether access through slot `at` needs no epoch check.
@@ -395,7 +397,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     /// shape lists it. A live hash key can also have an unknown type briefly
     /// (before its field's type is discovered), but then a shape lists it.
     fn orphan(&self, href: HashRef, types: &[CType]) -> bool {
-        self.known_type == FieldType::UNKNOWN
+        self.known_type == LType::Unknown
             && !types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)))
     }
 
@@ -404,7 +406,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     fn accepts(&self, other: &Self) -> bool {
         self.idx == other.idx
             && self.key == other.key
-            && self.known_type.ctype().accepts(other.known_type.ctype())
+            && self.known_type.accepts(other.known_type)
             && self.hazards.iter().enumerate().all(|(slot, &checked)| !checked || other.hazards.get(slot) == Some(&true))
     }
 }
@@ -417,7 +419,7 @@ pub enum ResumeArg {
     Failed,
     Type(CType),
     BlockId(BlockId),
-    HashRef(HashRef, FieldType),
+    HashRef(HashRef, LType),
     Integer(i32),
     Number(f64),
     Boxed(u64),
@@ -615,7 +617,7 @@ windowed!(SetGlobal, [cache: usize], [], |owner, state, base| (value) {
             let entry = &mut *entry.cast::<LBoxed<'_, '_>>();
             // Hash keys of registers holding the environment know a field's type
             // by its epoch. See Note [Field types].
-            if FieldType::of_value(*entry) != FieldType::of_value(value) {
+            if entry.unbox().typeof_() != value.unbox().typeof_() {
                 state._G.rw(owner).epoch += 1;
             }
             *entry = value;
@@ -736,56 +738,13 @@ pub enum Retype {
     Unknown,
 }
 
-pub use field_type::FieldType;
-
-// Its own module, so its constructors are the only way to make one.
-mod field_type {
-    use super::{CType, LBoxed, LType};
-
-    /// A field's type: a value's `LType`, and a number's encoding, but never a
-    /// table's shape or a function's identity, which describe a register, not a
-    /// field. See Note [Field types].
-    #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-    pub struct FieldType(CType);
-
-    impl FieldType {
-        pub const UNKNOWN: FieldType = FieldType(CType::Type(LType::Unknown));
-
-        /// The type of a field holding a value of type `ctype`.
-        pub fn of(ctype: CType) -> Self {
-            FieldType(CType::Type(ctype.as_ltype()))
-        }
-
-        /// The type of a field holding `value`.
-        pub fn of_value(value: LBoxed) -> Self {
-            FieldType(CType::Type(value.unbox().typeof_()))
-        }
-
-        pub fn ctype(&self) -> &CType {
-            &self.0
-        }
-    }
-
-    impl From<FieldType> for CType {
-        fn from(field: FieldType) -> CType {
-            field.0
-        }
-    }
-
-    impl std::fmt::Display for FieldType {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            self.0.fmt(f)
-        }
-    }
-}
-
 /// How storing a value of type `new_type` changes a field known as `htype`. A
 /// field whose type isn't known yet is never `Same`: its value may have any
 /// type. See Note [Field types].
-fn retype(new_type: &FieldType, htype: &FieldType) -> Retype {
-    if new_type == htype && *htype != FieldType::UNKNOWN {
+fn retype(new_type: LType, htype: LType) -> Retype {
+    if new_type == htype && htype != LType::Unknown {
         Retype::Same
-    } else if *new_type == FieldType::UNKNOWN {
+    } else if new_type == LType::Unknown {
         Retype::Unknown
     } else {
         Retype::Known
@@ -901,9 +860,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::TryHashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                let new_type = FieldType::of(value_type);
-                let retype = retype(&new_type, &htype);
-                let expected = htype.ctype().as_ltype();
+                let new_type = value_type.as_ltype();
+                let retype = retype(new_type, htype);
+                let expected = htype;
                 if c & 0x100 == 0 {
                     arg = yield YieldOp::ExecWindow(match retype {
                         Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
@@ -940,10 +899,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     };
                     let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
                     // A field's type is a number's encoding. See Note [Field types].
-                    let kc_type = FieldType::of_value(kc);
+                    let kc_type = kc.unbox().typeof_();
                     if let Some(existing) = t.rw(owner).insert_hash(kb, kc) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
-                        if FieldType::of_value(existing) != kc_type {
+                        if existing.unbox().typeof_() != kc_type {
                             t.rw(owner).epoch += 1;
                         }
                     } else {
@@ -2015,7 +1974,7 @@ pub enum Residual {
     Ret(Pc, u8, u16, bool),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
-    HashGuard { tab: usize, href: HashRef, key: u64, expected: FieldType },
+    HashGuard { tab: usize, href: HashRef, key: u64, expected: LType },
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
@@ -2278,8 +2237,8 @@ pub fn passes_guard_code(value: LBoxed, code: u8) -> bool {
 // type again; if that fails it falls back to a fresh href, which rediscovers the
 // type and can rejoin the blocks already compiled for it.
 //
-// A field's type is only ever an `LType`, or a number's encoding: a shape or a
-// function's identity describes a register, not a field.
+// A field's type is only ever an `LType`: a shape or a function's identity
+// describes a register, not a field.
 
 /// Whether a jump forgets a type of a register holding no local in scope at
 /// its target, which may still be an expression's temporary (`a and b or c`).
@@ -2663,7 +2622,7 @@ impl Context {
                         }
                     }
                     if !migrated {
-                        key.known_type = FieldType::UNKNOWN;
+                        key.known_type = LType::Unknown;
                     }
                 }
                 // We can only remove hkeys at the end of the array for the same
@@ -3138,8 +3097,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A number's type is its encoding, found a step down the lattice at a
             // time: see Note [Integers].
             let mut thunk_coro  = thunk_coro.clone();
-            let found_field = FieldType::of_value(state.vals[state.base + idx]);
-            let found: CType = found_field.clone().into();
+            let found_field = state.vals[state.base + idx].unbox().typeof_();
+            let found = CType::Type(found_field);
             let known = thunk_ctx.types[idx].as_ltype();
             let mut forced_ctx = thunk_ctx.clone();;
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
@@ -3284,7 +3243,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("href forced by {tab:?} -> {val:?}");
             // Its type is found out from the value loaded, in each table. See
             // Note [Field types].
-            hkey.known_type = FieldType::UNKNOWN;
+            hkey.known_type = LType::Unknown;
             // Initialize the hkey after discovery with a cleared hazard for the index
             hkey.clear_checks();
             hkey.check(idx);
@@ -3328,7 +3287,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.jump_thunk(missing_key, thunk_pc, fail_block);
             })))));
 
-            let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, FieldType::UNKNOWN));
+            let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, LType::Unknown));
             vm.blocks[has_key.0].instructions.push(Residual::Jump(guard_block));
         })))
     }
@@ -3355,7 +3314,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
             // A field whose type isn't known has nothing to check it still has:
             // its hash key is found again. See Note [Field types].
-            if expected == FieldType::UNKNOWN {
+            if expected == LType::Unknown {
                 vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
                 return;
             }
@@ -3429,8 +3388,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // access's type guard finds it, as the store left the witness at the
                     // old epoch (`Retype::Unknown`).
                     let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
-                    if *ty != FieldType::UNKNOWN {
-                        hkey.known_type = ty.clone();
+                    if *ty != LType::Unknown {
+                        hkey.known_type = *ty;
                     }
                     // If we updated an href, then we also need to set optimization hazards for any
                     // potentially aliased ones. We also need to invalidate this stack slot as
@@ -3642,9 +3601,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
                     let known = ctx.hkeys[href.0 as usize].known_type.clone();
-                    Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.ctype().clone())]);
-                    if known != FieldType::UNKNOWN {
-                        (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), known.ctype());
+                    Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, CType::Type(known))]);
+                    if known != LType::Unknown {
+                        (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &CType::Type(known));
                     } else {
                         // Record the type on the hash key too, unless the load overwrote
                         // the table's register and dropped its hash keys.
@@ -3944,7 +3903,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let tab = state.table_at(tab);
                     let entry = tab.ro(owner).hash.get_index(hwit.index);
-                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && passes_guard(*val, expected.ctype())) {
+                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && passes_guard(*val, &CType::Type(expected))) {
                         // Fallthrough
                         off += 2;
                     } else {
