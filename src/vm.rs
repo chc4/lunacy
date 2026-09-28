@@ -1250,6 +1250,20 @@ impl Location {
 // by then. The stack grows back only by a callee's frame, which a call nils past
 // the arguments the caller wrote (`push_frame`). So every slot of the stack
 // names something live.
+
+// Note [Vararg frames]
+// ~~~~~~~~~~~~~~~~~~~~
+// A vararg function's frame starts past all of its arguments: the extra ones,
+// past its fixed parameters, stay where its caller wrote them, just below the
+// frame, which starts with a copy of the fixed ones. VARARG reads them from
+// there, and a return puts its results in the function's slot below them.
+//
+// How many argument slots are below a frame is kept for each live vararg frame
+// (`RunState::varargs`), pushed with the frame and popped by its return: none
+// when it has no extra arguments, as it then starts at its arguments as any
+// frame does. The outermost frame, a chunk, has none. Whether a function is vararg is known
+// statically at each of its returns, and at a call once its callee is known, so
+// no other frame's call or return does anything for it.
 #[derive(Debug)]
 pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: Location, pub frame: usize, pub witness_frame: usize, pub witness_top: usize }
 
@@ -1307,6 +1321,9 @@ pub struct RunState<'src, 'intern> {
     /// The end of the innermost frame's hash witnesses. See Note [Hash witnesses].
     pub witness_top: usize,
     pub hash_witnesses: FVec<HashWitness>,
+    /// Per live frame of a vararg function, innermost last, how many of its
+    /// arguments' slots are below it. See Note [Vararg frames].
+    pub varargs: FVec<usize>,
     pub trap: bool,
     pub current_off: u16,
     /// What a return from JIT code leaves the JIT code with: where its caller
@@ -1419,8 +1436,40 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         ret: PackedLocation, a: u16, b: u16) -> usize
     {
         let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
-        let stack = unsafe { (*lclos.ro(owner).prototype).max_stack };
-        self.push_frame(owner, ret, a as usize, b as usize, stack, true)
+        let proto = unsafe { &*lclos.ro(owner).prototype };
+        let (stack, vararg, params) = (proto.max_stack, proto.is_vararg != 0, proto.param_count as usize);
+        let (a, b) = (a as usize, b as usize);
+        // The arguments' end, before the frame is pushed.
+        let passed = if b == 0 { self.top } else { self.base + a + b };
+        let stack = self.push_frame(owner, ret, a, b, stack, true);
+        if vararg {
+            self.move_past_varargs(passed, params, stack);
+        }
+        stack
+    }
+
+    /// Make the frame just pushed for a vararg function, whose arguments end at
+    /// `passed`, start past them: the extra ones, past its `params` fixed ones,
+    /// stay below it, and it starts with a copy of the fixed ones. See Note
+    /// [Vararg frames].
+    fn move_past_varargs(&mut self, passed: usize, params: usize, stack: usize) {
+        let args = passed - self.base;
+        if args <= params {
+            self.varargs.push(0);
+            return;
+        }
+        self.varargs.push(args);
+        let base = passed;
+        let end = base + stack;
+        if end > self.vals.len() {
+            self.vals.lengthen(end);
+        }
+        for i in 0..params {
+            self.vals[base + i] = self.vals[self.base + i];
+        }
+        self.nil_slots(base + params, end);
+        self.base = base;
+        self.top = end;
     }
 
     /// `call_lua`, inlined into the window op pushing a frame in JIT code
@@ -1466,6 +1515,27 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
+    /// VARARG A B in the running frame, of a vararg function with `params`
+    /// fixed parameters: its extra arguments to R(A) on, `b - 1` of them padded
+    /// with nil, or with B = 0 all, the top just past them. See Note [Vararg
+    /// frames].
+    pub fn vararg(&mut self, a: usize, b: usize, params: usize) {
+        // The outermost frame, a chunk, has no arguments below it.
+        let below = self.varargs.last().copied().unwrap_or(0);
+        let extra = below.saturating_sub(params);
+        let (from, to) = (self.base - extra, self.base + a);
+        let count = if b == 0 { extra } else { b - 1 };
+        if to + count > self.vals.len() {
+            self.vals.lengthen(to + count);
+        }
+        for i in 0..count {
+            self.vals[to + i] = if i < extra { self.vals[from + i] } else { LBoxed::NIL };
+        }
+        if b == 0 {
+            self.top = to + count;
+        }
+    }
+
     /// Nil the slots `from..to`. Out of line from `push_frame`: inlined, LLVM
     /// vectorizes the loop, and the window op pushing a frame (`PushFrame`)
     /// then ends in a `vzeroupper` on every call.
@@ -1496,7 +1566,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
     /// Note [Frame ops] in `specialize`.
     #[inline(always)]
-    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) -> Result<Location, std::ops::Range<usize>> {
+    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> Result<Location, std::ops::Range<usize>> {
         if closes {
             if !self.upvals.is_empty() {
                 self.close_upvalues(owner);
@@ -1512,8 +1582,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let count = if b == 0 { self.top - from } else { b - 1 };
         match self.callstack.pop() {
             Some(CallstackEntry { clos, ret, frame, witness_frame, witness_top }) => {
-                // The function's slot, just below the frame.
-                let to = self.base - 1;
+                // The function's slot, just below the frame and any argument
+                // slots below it.
+                let below = if vararg { self.varargs.pop().expect("a vararg frame's count") } else { 0 };
+                let to = self.base - 1 - below;
                 match count {
                     0 => {},
                     1 => self.vals[to] = self.vals[from],
@@ -1810,6 +1882,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 callstack,
                 counters: Default::default(),
                 hash_witnesses: vec![].into(),
+                varargs: vec![].into(),
                 select: 0,
                 trap: false,
                 #[cfg(feature = "magic")]

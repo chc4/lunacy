@@ -1666,14 +1666,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; no_trap:
                     );
                 },
-                Residual::LuaCall { entry, a, b, c, stack } => {
+                Residual::LuaCall { entry, a, b, c, stack, vararg } => {
                     // The callee's version's code, if the call has found the version
                     // and it has some; a version with none yet is linked when it has
                     // some (Note [Call linking]); else the call goes as one to a
                     // function the JIT doesn't know. See Note [Call sites].
+                    // `PushFrame` pushes the frame of a function that isn't vararg
+                    // only: a call of a vararg one goes as one to a function the JIT
+                    // doesn't know. See Note [Vararg frames] in `vm`.
                     let version = match entry {
-                        CallEntry::Block(block) => Some(*block),
-                        CallEntry::Context(_) => None,
+                        CallEntry::Block(block) if !*vararg => Some(*block),
+                        _ => None,
                     };
                     let code = version.and_then(|block| self.blocks[block.0].jit_info.entry);
                     match version {
@@ -1869,15 +1872,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none());
                     successor = Some(*target);
                 },
-                Residual::Ret(pc, a, b, closes) => {
+                Residual::Ret(pc, a, b, closes, vararg) => {
                     // The frame, popped by `PopFrame`, and the JIT code left with
                     // where the caller continues. See Note [Frame ops] in `specialize`.
                     let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     let (at, ab) = (Location(BlockId(id.0), off).pack().bits() as u64, hold(*a as u16) | hold(*b) << 16);
-                    let pop = if *closes {
-                        frame_op!(PopFrame [true,] (at, ab); *a as u16, *b)
-                    } else {
-                        frame_op!(PopFrame [false,] (at, ab); *a as u16, *b)
+                    let pop = match (*closes, *vararg) {
+                        (false, false) => frame_op!(PopFrame [false, false,] (at, ab); *a as u16, *b),
+                        (false, true) => frame_op!(PopFrame [false, true,] (at, ab); *a as u16, *b),
+                        (true, false) => frame_op!(PopFrame [true, false,] (at, ab); *a as u16, *b),
+                        (true, true) => frame_op!(PopFrame [true, true,] (at, ab); *a as u16, *b),
                     };
                     jit_note!(self.jctx, ops, "        PopFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &pop);

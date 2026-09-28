@@ -1216,6 +1216,25 @@ pub fn emit_testset(a: usize, b: usize, c: u16, pc: usize) -> impl Coroutine<Res
     }
 }
 
+/// `R(A), ..., R(A+B-2) := the running vararg function's extra arguments`, or
+/// with B = 0 all of them, the top just past them. `params` is how many fixed
+/// parameters it has. See Note [Vararg frames] in
+/// `vm`.
+pub fn emit_vararg(a: usize, b: usize, params: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        arg = yield YieldOp::Exec(ResidualExec::new("vararg", Rc::new(move |owner, state| {
+            state.vararg(a, b, params);
+        })));
+        if b == 0 {
+            yield YieldOp::Clobber(a);
+        } else {
+            yield YieldOp::SetTypes((a..a + b - 1).map(|slot| (slot, LType::Unknown)).collect());
+        }
+        arg
+    }
+}
+
 /// Close every upvalue open into a slot from R(A) up.
 pub fn emit_close(a: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]

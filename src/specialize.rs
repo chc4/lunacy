@@ -215,6 +215,7 @@ pub enum YieldOp {
 
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
+    Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
                                // See Note [Field types]
     LoadUpvalue(usize, usize), // Infrom the executor that STACK[idx]'s type is the same as an UPVALUE[b].
@@ -560,16 +561,16 @@ windowed!(frame PushFrame, [ret: u64, abs: u64], [FILLS: bool, A: Count, B: Coun
 });
 
 // A `Ret` at `at` (a `PackedLocation`). `ab` is its `a | b << 16` (as `Count::hold` holds them).
-// Closing upvalues if `CLOSES`.
+// Closing upvalues if `CLOSES`, from a vararg function's frame if `VARARG`.
 // See Note [Frame ops].
-windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     let Location(BlockId(block), off) = Location::unpack(crate::vm::PackedLocation::from_bits(at as usize));
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
     state.exit = if state.callstack.is_empty() {
         state.current_off = off as u16;
         ((-2i32 as u64) << 32) | block as u64
     } else {
-        match state.leave(owner, a, b, CLOSES) {
+        match state.leave(owner, a, b, CLOSES, VARARG) {
             Ok(location) => location.pack().bits() as u64,
             // With a caller frame, `leave` returns to it.
             Err(_) => unreachable!(),
@@ -654,8 +655,8 @@ pub enum Residual {
     Thunk(ThunkRef),
     /// A RETURN of `b - 1` values from R(A), or up to the top. Closes the frame's open upvalues.
     /// Functions which statically know they have no open upvalues may set `close = false` as an
-    /// optimization.
-    Ret(Pc, u8, u16, bool),
+    /// optimization. Last, whether the function is vararg. See Note [Vararg frames].
+    Ret(Pc, u8, u16, bool, bool),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
     HashGuard { tab: usize, href: HashRef, key: u64, expected: LType },
@@ -664,8 +665,8 @@ pub enum Residual {
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
     /// A call to the Lua function in R(A), The target `entry` is a prototype a `LuaGuard` or the
     /// context knows. Sizes the newly pushed frame to `stack` slots (the prototype's `max_stack`).
-    /// See Note [Call sites].
-    LuaCall { entry: CallEntry, a: u16, b: u16, c: u16, stack: u8 },
+    /// `vararg` if the prototype is vararg (Note [Vararg frames]). See Note [Call sites].
+    LuaCall { entry: CallEntry, a: u16, b: u16, c: u16, stack: u8, vararg: bool },
     /// The results of the call of R(A) before it, which returns here: `c - 1`
     /// of them, or with C = 0 all. See Note [Returns].
     Arrive { a: u16, c: u16 },
@@ -1453,6 +1454,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (a, _, c) = crate::vm::ABC::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_tforloop(a as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
                 },
+                Opcode::VARARG => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    let params = unsafe { (*self.clos.ro(owner).prototype).param_count as usize };
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_vararg(a as usize, b as usize, params)), ResumeArg::Start, block_id)
+                },
                 Opcode::JMP => {
                     let sbx = crate::vm::sBx::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
@@ -1556,8 +1562,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.end_block(block_id);
-                    let closes = !captured_slots(unsafe { &*self.clos.ro(owner).prototype }).is_empty();
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes)); None
+                    let proto = unsafe { &*self.clos.ro(owner).prototype };
+                    let closes = !captured_slots(proto).is_empty();
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0)); None
                 },
                 x => {
                     #[cfg(debug_assertions)]
@@ -1565,7 +1572,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         unreachable!("{:?}", x)
                     }
                     panic!("{:?}", x);
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true)); None
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, true)); None
                 },
             } {
                 pc = next;
@@ -1822,8 +1829,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         layout.push(next(vm));
                     }
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
-                    let stack = unsafe { (*proto).max_stack };
-                    layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack });
+                    let (stack, vararg) = unsafe { ((*proto).max_stack, (*proto).is_vararg != 0) };
+                    layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg });
                     layout.push(Residual::Arrive { a: a16, c: c16 });
                 },
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
@@ -2387,6 +2394,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::SetHazards(idx, href)) => {
                     Rc::make_mut(&mut ctx).set_hazards(idx, href)
                 },
+                CoroutineState::Yielded(YieldOp::Clobber(from)) => {
+                    let clobbered = (from..ctx.types.len()).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
+                    Rc::make_mut(&mut ctx).set_types(owner, clobbered)
+                },
                 CoroutineState::Yielded(YieldOp::SetCTypes(ty_effects)) => {
                     Rc::make_mut(&mut ctx).set_types(owner, ty_effects)
                 },
@@ -2580,7 +2591,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     w.interp(owner, &mut state);
                     off += if state.select == 0 { 2 } else { 1 };
                 },
-                Residual::LuaCall { entry, a, b, c, stack } => {
+                Residual::LuaCall { entry, a, b, c, stack, vararg } => {
                     let (caller, call) = (id, off);
                     off += 1;
                     state.call_lua(owner, Location(id, off).pack(), a, b);
@@ -2595,7 +2606,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             self.versions.entry(callee.ro(owner).prototype).or_insert_with(|| HashMap::default());
                             let block = self.version(owner, 0, ctx);
                             self.set_current(callee.clone());
-                            self.blocks[caller.0].instructions[call] = Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, stack };
+                            self.blocks[caller.0].instructions[call] = Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, stack, vararg };
                             block
                         },
                     };
@@ -2651,9 +2662,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     state.arrive(a as usize, c as usize);
                 },
-                Residual::Ret(pc, a, b, closes) => {
+                Residual::Ret(pc, a, b, closes, vararg) => {
                     debug!("spec final blocks: {:?}", self.blocks);
-                    match state.leave(owner, a as usize, b as usize, closes) {
+                    match state.leave(owner, a as usize, b as usize, closes, vararg) {
                         Ok(Location(block, disp)) => {
                             self.set_current(state.clos.clone());
                             id = block;
