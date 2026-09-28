@@ -18,11 +18,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRE = re.compile(r"""\brequire\s*\(?\s*["']([\w.]+)["']""")
 
+# A Lua's `table` library may be read-only (Luau's): a function added to it goes
+# in a copy, which the global `table` becomes.
+def table_module(name, fallback):
+    return (f'if jit then local m = __require("table.{name}") return m end\n'
+            f"if not table.{name} then\n"
+            "  local copy = {}\n"
+            "  for k, v in pairs(table) do copy[k] = v end\n"
+            f"  copy.{name} = {fallback}\n"
+            "  table = copy\n"
+            "end\n"
+            f"return table.{name}")
+
+
 TABLE_MODULES = {
-    "table.new": 'if jit then local m = __require("table.new") return m end\n'
-                 "table.new = table.new or function() return {} end\nreturn table.new",
-    "table.clear": 'if jit then local m = __require("table.clear") return m end\n'
-                   "table.clear = table.clear or function(t) for k in pairs(t) do t[k] = nil end end\nreturn table.clear",
+    "table.new": table_module("new", "function() return {} end"),
+    "table.clear": table_module("clear", "function(t) for k in pairs(t) do t[k] = nil end end"),
 }
 
 

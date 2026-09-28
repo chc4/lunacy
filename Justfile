@@ -560,7 +560,12 @@ hyperfine-unsafe benchmark: unsafe-compile
 # The benchmarks lunacy runs, as `benchmark:times`, each run enough times for a
 # stable mean; life twice, as for `hyperfines-traces`. euler14's count is the
 # bound of its search.
-HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10"
+HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10 nsieve:9 binarytrees:2 partialsums:2000000 series:2 mandelbrot:1000 mandelbrot_bit:1000 array3d:120 quicksort:300000 table_cmpsort:100000 recursive_fib:35"
+
+# Which benchmarks lunacy runs (tools/bench_runs.py): each of lua_benchmarking's,
+# or those named, at `fraction` of its benchinfo.json scaling, against LuaJIT.
+bench-runs fraction='0.1' *benchmarks:
+    python3 tools/bench_runs.py --fraction {{fraction}} {{benchmarks}}
 
 # `hyperfine` over HYPERFINES.
 hyperfines:
