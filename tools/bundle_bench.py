@@ -19,9 +19,9 @@ ROOT = Path(__file__).resolve().parent.parent
 REQUIRE = re.compile(r"""\brequire\s*\(?\s*["']([\w.]+)["']""")
 
 TABLE_MODULES = {
-    "table.new": 'if jit then return __require("table.new") end\n'
+    "table.new": 'if jit then local m = __require("table.new") return m end\n'
                  "table.new = table.new or function() return {} end\nreturn table.new",
-    "table.clear": 'if jit then return __require("table.clear") end\n'
+    "table.clear": 'if jit then local m = __require("table.clear") return m end\n'
                    "table.clear = table.clear or function(t) for k in pairs(t) do t[k] = nil end end\nreturn table.clear",
 }
 
@@ -48,7 +48,7 @@ def main():
 
     here = bench_dir(args.benchmark)
     dirs = [here, ROOT / "lua_benchmarking" / "lualibs"]
-    main_src = (here / "bench.lua").read_text()
+    main_src = (here / "bench.lua").read_text(encoding="latin-1")
 
     # Every module the benchmark reaches, depth first, each once.
     modules = dict(TABLE_MODULES)
@@ -60,11 +60,11 @@ def main():
         path = module_file(name, dirs)
         if path is None:
             continue
-        src = path.read_text()
+        src = path.read_text(encoding="latin-1")
         modules[name] = src
         pending.extend(REQUIRE.findall(src))
 
-    out = [(ROOT / "benchmarks" / "prelude.lua").read_text()]
+    out = [(ROOT / "benchmarks" / "prelude.lua").read_text(encoding="latin-1")]
     out.append(
         "local __require, __loaded, __loaders = require, {}, {}\n"
         "local function require(name)\n"
@@ -81,7 +81,8 @@ def main():
     for name, src in modules.items():
         out.append(f"__loaders[{name!r}] = function()\n{src}\nend\n")
     out.append(main_src)
-    sys.stdout.write("\n".join(out))
+    # Sources are bytes, not always UTF-8: latin-1 passes each through.
+    sys.stdout.buffer.write("\n".join(out).encode("latin-1"))
 
 
 if __name__ == "__main__":
