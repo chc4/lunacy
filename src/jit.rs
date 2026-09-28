@@ -306,11 +306,12 @@ impl Pool {
 /// copier rejects does.
 const COPIES: bool = !cfg!(debug_assertions) && !cfg!(feature = "immediate_jit");
 
-/// Window-op stencils copied out of this executable, by stencil address.
+/// Window-op stencils copied out of this executable, by stencil address, with
+/// the `SKIP` each runs at.
 #[derive(Default)]
 pub struct Stencils {
     image: Option<Result<Image, StencilError>>,
-    bodies: HashMap<usize, Result<Rc<Body>, StencilError>, FxBuildHasher>,
+    bodies: HashMap<usize, (usize, Result<Rc<Body>, StencilError>), FxBuildHasher>,
 }
 
 impl Stencils {
@@ -322,11 +323,19 @@ impl Stencils {
         self.bodies
             .entry(op.stencil(skip))
             .or_insert_with(|| {
-                unsafe { stencil_body(image, op, skip) }
+                let body = unsafe { stencil_body(image, op, skip) }
                     .map(Rc::new)
-                    .inspect_err(|e| warn!("window op not copied, calling its body instead: {e}"))
+                    .inspect_err(|e| warn!("window op not copied, calling its body instead: {e}"));
+                (skip, body)
             })
+            .1
             .clone()
+    }
+
+    /// Each stencil copied: its address, `SKIP`, and the body splatted.
+    #[cfg(feature = "jit_disasm")]
+    fn copied(&self) -> impl Iterator<Item = (usize, usize, &Body)> {
+        self.bodies.iter().filter_map(|(&addr, (skip, body))| Some((addr, *skip, &**body.as_ref().ok()?)))
     }
 }
 
@@ -418,7 +427,6 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
 
     let rel32 = |kind| dynasmrt::x64::X64Relocation::from_size(kind, RelocationSize::DWord);
     let fall = ops.new_dynamic_label();
-    dynasm!(ops ; .arch x64 ; sub rsp, 8);
     let mut at = 0;
     for (end, field, site) in sites {
         ops.extend(&body.code[at..end]);
@@ -437,8 +445,9 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
             }
         }
     }
-    ops.extend(&body.code[at..]);
-    dynasm!(ops ; .arch x64 ; =>fall ; add rsp, 8);
+    ops.extend(&body.code[at..body.fall]);
+    dynasm!(ops ; .arch x64 ; =>fall);
+    ops.extend(&body.code[body.fall..]);
 }
 
 const JIT_SIZE: usize = 0x1000 * 16;
@@ -541,6 +550,7 @@ impl Drop for JitContext {
             ];
             symbols.extend(helpers.iter().map(|&(addr, name)| (addr, name.to_string())));
             self.disasm.write("jit_disasm.txt", &symbols);
+            crate::disasm::write_stencils("stencil_sizes.txt", self.stencils.copied());
         }
     }
 }

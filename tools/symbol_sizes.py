@@ -2,11 +2,11 @@
 """The size of every function in a binary whose demangled name matches a
 regex: its bytes (from the symbol table), the instructions in them, and the
 functions it calls. A library native's closure, for one, to compare with its
-window op's stencil (`tools/stencil_sizes.py`).
+window op's stencil (`just stencil-sizes`).
 
     tools/symbol_sizes.py target/unsafe/bench 'library::globals::\\{closure#17\\}'
 
-(after building target/jit_disasm/release/demangle, as `just stencil-sizes` does)
+(after building target/jit_disasm/release/demangle, as `just stencil-asm` does)
 """
 import re
 import subprocess

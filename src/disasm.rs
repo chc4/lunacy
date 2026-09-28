@@ -109,6 +109,45 @@ impl Disasm {
     }
 }
 
+/// Each stencil the JIT copied, from its address, `SKIP` and the body it
+/// splats (`window::stencil_body`), written to `path`: the stencil function's
+/// bytes and instructions, and the body's, biggest body first. For `just
+/// stencil-sizes`.
+pub fn write_stencils<'a>(path: &str, copied: impl Iterator<Item = (usize, usize, &'a crate::window::Body)>) {
+    let functions = functions();
+    let function = |addr: usize| functions.iter().find(|f| f.0 == addr);
+    let mut rows: Vec<(usize, usize, usize, usize, String)> = copied
+        .map(|(addr, skip, body)| {
+            let (size, name) = function(addr).map(|(_, size, name)| (*size, name.clone())).unwrap_or((0, format!("{addr:#x}")));
+            // Safety: the stencil is a function of this executable, `size` long.
+            let code = unsafe { std::slice::from_raw_parts(addr as *const u8, size) };
+            (instructions(&body.code), body.code.len(), instructions(code), size, format!("{name} at SKIP {skip}"))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.cmp(a));
+    let Ok(file) = std::fs::File::create(path) else { return };
+    let mut out = std::io::BufWriter::new(file);
+    writeln!(out, "{:>13} {:>13}", "copied body", "function").ok();
+    writeln!(out, "{:>6} {:>6} {:>6} {:>6}  stencil", "insts", "bytes", "insts", "bytes").ok();
+    for (insts, bytes, fn_insts, fn_bytes, name) in rows {
+        writeln!(out, "{insts:>6} {bytes:>6} {fn_insts:>6} {fn_bytes:>6}  {name}").ok();
+    }
+}
+
+/// How many instructions `code` decodes to.
+fn instructions(code: &[u8]) -> usize {
+    let decoder = InstDecoder::default();
+    let (mut off, mut count) = (0, 0);
+    while let Ok(inst) = decoder.decode_slice(&code[off..]) {
+        off += inst.len().to_const() as usize;
+        count += 1;
+        if off >= code.len() {
+            break;
+        }
+    }
+    count
+}
+
 /// Whether the opcode's first operand is a relative branch target.
 fn relative(opcode: Opcode) -> bool {
     crate::window::RELATIVE_BRANCHES.contains(&opcode)

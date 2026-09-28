@@ -88,13 +88,20 @@ window-dump benchmark times='20' ref='':
         (cd target/compare/{{ref}} && cargo run --release --features window_dump --bin bench -- $bin {{times}})
     fi
 
-# The size of every window op's stencil (bytes and instructions) in the release
-# build (as `hyperfine` times it, with frame pointers) and the unsafe one, and
-# how many instructions of it the copier copies.
-stencil-sizes: unsafe-compile
-    cargo build --release --bin bench
-    cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
-    python3 tools/stencil_sizes.py target/release/bench target/unsafe/bench
+# The size of each window op's stencil a benchmark's JIT code copies, in the
+# release build and the unsafe one, as the copier reports them (feature
+# `jit_disasm`): the body it splats (bytes and instructions) and the stencil
+# function it copied it from, in working/stencil_sizes-release.txt and
+# working/stencil_sizes-unsafe.txt.
+stencil-sizes benchmark='queens' times='10':
+    just _luac {{benchmark}}
+    cd working && cargo run --release --features jit_disasm --bin bench --target-dir ../target/jit_disasm \
+        -- {{benchmark}}.bin {{times}} > /dev/null
+    mv working/stencil_sizes.txt working/stencil_sizes-release.txt
+    cd working && cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
+        --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- {{benchmark}}.bin {{times}} > /dev/null
+    mv working/stencil_sizes.txt working/stencil_sizes-unsafe.txt
+    head -25 working/stencil_sizes-unsafe.txt
 
 # Cold code in every window op's stencil (see tools/stencil_cold.py), in the
 # release and unsafe builds, and every stencil's assembly in

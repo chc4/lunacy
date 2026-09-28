@@ -711,9 +711,12 @@ pub struct Body {
     /// References to the op's continuation besides the sliced trailing
     /// `become` — e.g. a tail the compiler duplicated onto another path. Every
     /// `become` means "fall through to the next stencil", so each must reach the
-    /// copy's fall-through point (its end); the JIT relocates them against a
+    /// copy's fall-through point (`fall`); the JIT relocates them against a
     /// label there.
     pub nexts: Vec<NextRef>,
+    /// Where in `code` its `become`s go: its end, or the `add rsp, 8` before
+    /// it in a body that restores the stack. See Note [Stencil alignment].
+    pub fall: usize,
 }
 
 /// A reference to the continuation inside a stencil body.
@@ -857,9 +860,9 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let kept = if sliced { insts.len() - 1 } else { insts.len() };
     let body_len = if sliced { insts[kept].0 } else { size };
 
-    let mut holes = SmallVec::new();
-    let mut relocs = Vec::new();
-    let mut nexts = Vec::new();
+    let mut holes: SmallVec<[(RipRel, usize); MAX_HOLES]> = SmallVec::new();
+    let mut relocs: Vec<RipRel> = Vec::new();
+    let mut nexts: Vec<NextRef> = Vec::new();
     for (i, (off, end, inst)) in insts[..kept].iter().enumerate() {
         let (off, end) = (*off, *end);
         // Relative branches: operand 0 is the displacement from `end`.
@@ -910,19 +913,79 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
             }
         }
     }
-    let mut code = code[..body_len].to_vec();
-    if !sliced {
-        if nexts.is_empty() {
-            return Err(StencilError::NoBecome { op: name });
-        }
-        code.extend_from_slice(&UD2);
+    if !sliced && nexts.is_empty() {
+        return Err(StencilError::NoBecome { op: name });
     }
-    Ok(Body { code, holes, relocs, nexts })
+    // Between `sub rsp, 8` and `add rsp, 8` if it uses the stack. See Note
+    // [Stencil alignment].
+    let aligned = insts[..kept].iter().any(|(_, _, inst)| uses_stack(inst));
+    let prefix: &[u8] = if aligned { &SUB_RSP_8 } else { &[] };
+    let shift = |r: RipRel| RipRel { field: r.field + prefix.len(), end: r.end + prefix.len(), ..r };
+    let holes = holes.into_iter().map(|(r, i)| (shift(r), i)).collect();
+    let relocs = relocs.into_iter().map(shift).collect();
+    let nexts = nexts
+        .into_iter()
+        .map(|n| match n {
+            NextRef::Direct(r) => NextRef::Direct(shift(r)),
+            NextRef::Indirect(r) => NextRef::Indirect(shift(r)),
+        })
+        .collect();
+    let mut copy = prefix.to_vec();
+    copy.extend_from_slice(&code[..body_len]);
+    if !sliced {
+        copy.extend_from_slice(&UD2);
+    }
+    let fall = copy.len();
+    if aligned {
+        copy.extend_from_slice(&ADD_RSP_8);
+    }
+    Ok(Body { code: copy, holes, relocs, nexts, fall })
 }
 
 /// `ud2`, which traps: placed after a copied body that doesn't end in its
 /// `become`, which must never be reached.
 const UD2: [u8; 2] = [0x0f, 0x0b];
+
+// Note [Stencil alignment]
+// ~~~~~~~~~~~~~~~~~~~~~~~~
+// A stencil is compiled as a function, so its code assumes it was called: the
+// stack is 8 past 16-aligned when it starts, a return address below it, and
+// its own pushes and stack adjustments align it from there for the calls it
+// makes (a cold path's out-of-line helper) and its aligned spills. Copied into
+// JIT code, it starts where the stack is 16-aligned, and no call pushes a
+// return address. So a body that uses the stack (`uses_stack`: it names `rsp`,
+// or pushes, pops or calls) is copied between `sub rsp, 8` and `add rsp, 8`,
+// which recreate the alignment it assumes; its `become`s go to the `add rsp, 8`
+// (`Body::fall`). A body that doesn't use the stack doesn't depend on its
+// alignment, and is copied as it is.
+
+/// `sub rsp, 8` and `add rsp, 8`, around a body that uses the stack. See Note
+/// [Stencil alignment].
+const SUB_RSP_8: [u8; 4] = [0x48, 0x83, 0xec, 0x08];
+const ADD_RSP_8: [u8; 4] = [0x48, 0x83, 0xc4, 0x08];
+
+/// Whether `inst` uses the stack: names `rsp` (as a register or a memory
+/// operand's base, as it can't be an index), or pushes, pops or calls. See Note
+/// [Stencil alignment].
+fn uses_stack(inst: &yaxpeax_x86::long_mode::Instruction) -> bool {
+    use yaxpeax_x86::long_mode::{Opcode::*, Operand, RegSpec};
+    if matches!(inst.opcode(), PUSH | POP | PUSHF | POPF | CALL | CALLF | ENTER | LEAVE | RETURN | RETF | IRET) {
+        return true;
+    }
+    let sp = |r: RegSpec| [RegSpec::rsp(), RegSpec::esp(), RegSpec::sp(), RegSpec::spl()].contains(&r);
+    (0..inst.operand_count()).any(|i| match inst.operand(i) {
+        Operand::Register { reg } => sp(reg),
+        Operand::MemDeref { base }
+        | Operand::Disp { base, .. }
+        | Operand::MemBaseIndexScale { base, .. }
+        | Operand::MemBaseIndexScaleDisp { base, .. }
+        | Operand::MemDerefMasked { base, .. }
+        | Operand::DispMasked { base, .. }
+        | Operand::MemBaseIndexScaleMasked { base, .. }
+        | Operand::MemBaseIndexScaleDispMasked { base, .. } => sp(base),
+        _ => false,
+    })
+}
 
 /// A buffer of `len` bytes within ±2GiB of this binary, so rel32 references in
 /// copied stencils still reach their targets (the same placement the JIT's code
@@ -982,7 +1045,7 @@ pub unsafe fn assemble(
         let at = code.len();
         let shift = |r: RipRel| RipRel { field: r.field + at, end: r.end + at, ..r };
         code.extend_from_slice(&body.code);
-        let fall = code.len();
+        let fall = at + body.fall;
         holes.extend(body.holes.iter().map(|&(r, i)| (shift(r), captures[i])));
         relocs.extend(body.relocs.iter().map(|&r| shift(r)));
         nexts.extend(body.nexts.iter().map(|n| match *n {
