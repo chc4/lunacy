@@ -1232,8 +1232,8 @@ impl Location {
 // ~~~~~~~~~~~~~~~~~~~~
 // A call frame occupies `max_stack` slots of the register file (`vals`) from its
 // `base`; `RunState::top` is its dynamic Lua top (the variable-count-span cursor).
-// `call_lua` records the caller's state in a `CallstackEntry` and makes the stack
-// long enough for the callee's frame; a return pops it and restores that state
+// `call_lua` records the caller's state and the callee's function slot in a
+// `CallstackEntry` and makes the stack long enough for the callee's frame; a return pops it and restores that state
 // (`leave`), and the caller takes the results (`arrive`). See Note [Returns].
 //
 // The stack's length is the most any frame has reached since the GC last marked
@@ -1258,14 +1258,15 @@ impl Location {
 // frame, which starts with a copy of the fixed ones. VARARG reads them from
 // there, and a return puts its results in the function's slot below them.
 //
-// How many argument slots are below a frame is kept for each live vararg frame
-// (`RunState::varargs`), pushed with the frame and popped by its return: none
-// when it has no extra arguments, as it then starts at its arguments as any
-// frame does. The outermost frame, a chunk, has none. Whether a function is vararg is known
-// statically at each of its returns, and at a call once its callee is known, so
-// no other frame's call or return does anything for it.
+// A frame's callstack entry records its function's slot, as Lua's call info
+// does, wherever the frame starts: a vararg frame's extra arguments are the
+// slots past its function's and its fixed arguments' up to its base. The
+// outermost frame, a chunk, has none.
+
+/// A frame's caller's state, restored when it returns, and its function's slot
+/// (`func`), where its results go. See Note [Stack frames].
 #[derive(Debug)]
-pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: Location, pub frame: usize, pub witness_frame: usize, pub witness_top: usize }
+pub struct CallstackEntry<'src, 'intern> { pub clos: Tc<LClosure<'src, 'intern>>, pub ret: Location, pub frame: usize, pub func: usize, pub witness_frame: usize, pub witness_top: usize }
 
 /// Where a frame's hash key was found in its table's hash part (its entry's
 /// index, and its value's address), and the table's epoch then. See Note
@@ -1321,9 +1322,6 @@ pub struct RunState<'src, 'intern> {
     /// The end of the innermost frame's hash witnesses. See Note [Hash witnesses].
     pub witness_top: usize,
     pub hash_witnesses: FVec<HashWitness>,
-    /// Per live frame of a vararg function, innermost last, how many of its
-    /// arguments' slots are below it. See Note [Vararg frames].
-    pub varargs: FVec<usize>,
     pub trap: bool,
     pub current_off: u16,
     /// What a return from JIT code leaves the JIT code with: where its caller
@@ -1455,10 +1453,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     fn move_past_varargs(&mut self, passed: usize, params: usize, stack: usize) {
         let args = passed - self.base;
         if args <= params {
-            self.varargs.push(0);
             return;
         }
-        self.varargs.push(args);
         let base = passed;
         let end = base + stack;
         if end > self.vals.len() {
@@ -1504,6 +1500,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             clos: self.clos.clone(),
             ret: ret_loc,
             frame: self.base,
+            func: next_base - 1,
             witness_frame: self.witness_base,
             witness_top: self.witness_top,
         });
@@ -1520,9 +1517,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// with nil, or with B = 0 all, the top just past them. See Note [Vararg
     /// frames].
     pub fn vararg(&mut self, a: usize, b: usize, params: usize) {
-        // The outermost frame, a chunk, has no arguments below it.
-        let below = self.varargs.last().copied().unwrap_or(0);
-        let extra = below.saturating_sub(params);
+        // The outermost frame, a chunk, has none.
+        let extra = self.callstack.last().map_or(0, |entry| (self.base - entry.func - 1).saturating_sub(params));
         let (from, to) = (self.base - extra, self.base + a);
         let count = if b == 0 { extra } else { b - 1 };
         if to + count > self.vals.len() {
@@ -1566,7 +1562,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
     /// Note [Frame ops] in `specialize`.
     #[inline(always)]
-    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> Result<Location, std::ops::Range<usize>> {
+    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) -> Result<Location, std::ops::Range<usize>> {
         if closes {
             if !self.upvals.is_empty() {
                 self.close_upvalues(owner);
@@ -1581,11 +1577,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let from = self.base + a;
         let count = if b == 0 { self.top - from } else { b - 1 };
         match self.callstack.pop() {
-            Some(CallstackEntry { clos, ret, frame, witness_frame, witness_top }) => {
-                // The function's slot, just below the frame and any argument
-                // slots below it.
-                let below = if vararg { self.varargs.pop().expect("a vararg frame's count") } else { 0 };
-                let to = self.base - 1 - below;
+            Some(CallstackEntry { clos, ret, frame, func, witness_frame, witness_top }) => {
+                let to = func;
                 match count {
                     0 => {},
                     1 => self.vals[to] = self.vals[from],
@@ -1882,7 +1875,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 callstack,
                 counters: Default::default(),
                 hash_witnesses: vec![].into(),
-                varargs: vec![].into(),
                 select: 0,
                 trap: false,
                 #[cfg(feature = "magic")]

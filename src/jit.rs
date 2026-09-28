@@ -1872,16 +1872,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none());
                     successor = Some(*target);
                 },
-                Residual::Ret(pc, a, b, closes, vararg) => {
+                Residual::Ret(pc, a, b, closes) => {
                     // The frame, popped by `PopFrame`, and the JIT code left with
                     // where the caller continues. See Note [Frame ops] in `specialize`.
                     let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     let (at, ab) = (Location(BlockId(id.0), off).pack().bits() as u64, hold(*a as u16) | hold(*b) << 16);
-                    let pop = match (*closes, *vararg) {
-                        (false, false) => frame_op!(PopFrame [false, false,] (at, ab); *a as u16, *b),
-                        (false, true) => frame_op!(PopFrame [false, true,] (at, ab); *a as u16, *b),
-                        (true, false) => frame_op!(PopFrame [true, false,] (at, ab); *a as u16, *b),
-                        (true, true) => frame_op!(PopFrame [true, true,] (at, ab); *a as u16, *b),
+                    let pop = if *closes {
+                        frame_op!(PopFrame [true,] (at, ab); *a as u16, *b)
+                    } else {
+                        frame_op!(PopFrame [false,] (at, ab); *a as u16, *b)
                     };
                     jit_note!(self.jctx, ops, "        PopFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &pop);
