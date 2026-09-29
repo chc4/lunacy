@@ -1550,7 +1550,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; test Rq(v), Rq(m)
                             ; jnz >guard_fail // not a cell
                             ; movzx Rd(m), BYTE [Rq(v)]
-                            ; sub Rd(m), (LBoxed::KIND_LCLOSURE as i32) // LClosure(2)/NClosure(3)
+                            ; sub Rd(m), (LBoxed::KIND_LCLOSURE as i32) // LClosure/NClosure, adjacent
                             ; cmp Rd(m), 1
                             ; jbe =>insts[off + 2]
                             ; guard_fail:
@@ -1561,7 +1561,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; test Rq(v), Rq(m)
                             ; jnz >guard_fail // not a cell
                             ; movzx Rd(m), BYTE [Rq(v)]
-                            ; sub Rd(m), (LBoxed::KIND_OWNED as i32) // Owned(4)/Interned(5)
+                            ; sub Rd(m), (LBoxed::KIND_OWNED as i32) // Owned/Interned, adjacent
                             ; cmp Rd(m), 1
                             ; jbe =>insts[off + 2]
                             ; guard_fail:

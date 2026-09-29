@@ -390,21 +390,38 @@ pub enum Retype {
 pub enum Widen {
     /// The kind has the value's representation already.
     No,
-    /// By the value's representation's bit, known when compiling.
-    Bit,
+    /// By the value's representation, known when compiling.
+    Bit(LType),
     /// By the value's representation, found out from its tag.
     Decode,
 }
 
-/// Widen `tab`'s kind for a store of `value`, as `W` says (`bit` its
-/// representation's bit, for `Widen::Bit`).
+/// Widen `tab`'s kind for a store of `value`, as `W` says.
 #[inline(always)]
-fn store_kind<'src, 'intern, const W: Widen>(owner: &mut Owner, tab: &Tc<Table<'src, 'intern>>, bit: u8, value: LBoxed<'src, 'intern>) {
+fn store_kind<'src, 'intern, const W: Widen>(owner: &mut Owner, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>) {
     match W {
         Widen::No => {}
-        Widen::Bit => tab.rw(owner).kind |= bit,
+        Widen::Bit(t) => tab.rw(owner).kind |= t.bit(),
         Widen::Decode => tab.rw(owner).widen_kind(value.representation()),
     }
+}
+
+/// `$make!` of the const `Widen` that `$how` is.
+macro_rules! with_widen {
+    ($how:expr, $make:ident) => {
+        match $how {
+            Widen::No => $make!({ Widen::No }),
+            Widen::Decode => $make!({ Widen::Decode }),
+            Widen::Bit(LType::Nil) => $make!({ Widen::Bit(LType::Nil) }),
+            Widen::Bit(LType::Bool) => $make!({ Widen::Bit(LType::Bool) }),
+            Widen::Bit(LType::String) => $make!({ Widen::Bit(LType::String) }),
+            Widen::Bit(LType::Closure) => $make!({ Widen::Bit(LType::Closure) }),
+            Widen::Bit(LType::Table) => $make!({ Widen::Bit(LType::Table) }),
+            Widen::Bit(LType::Integer) => $make!({ Widen::Bit(LType::Integer) }),
+            Widen::Bit(LType::Double) => $make!({ Widen::Bit(LType::Double) }),
+            Widen::Bit(LType::Unknown) => unreachable!("a store of a known value of unknown representation"),
+        }
+    };
 }
 
 /// How storing a value of type `new_type` changes a field known as `htype`. A
@@ -534,18 +551,17 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 && stored != LType::Unknown
                 && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(stored))));
         // How the store widens the array's kind: not at all, by the value's
-        // representation's bit, known here, or by the value's found out.
+        // representation, known here, or by the value's found out.
         let how = match (widen, stored) {
             (false, _) => Widen::No,
             (true, LType::Unknown) => Widen::Decode,
-            (true, _) => Widen::Bit,
+            (true, stored) => Widen::Bit(stored),
         };
-        let bit = if how == Widen::Bit { stored.bit() } else { 0 };
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableArray, [k: i32, bit: u8], [W: Widen], |owner, state, base| (table, value) {
+            windowed!(SetTableArray, [k: i32], [W: Widen], |owner, state, base| (table, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
                 tab.rw(owner).array[integer_slot(k)] = value;
-                store_kind::<W>(owner, &tab, bit, value);
+                store_kind::<W>(owner, &tab, value);
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
@@ -554,45 +570,49 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // A constant's value lives as long as its prototype.
                 let value = LBoxed::from_bits(value);
                 tab.rw(owner).array[integer_slot(k)] = value;
-                // With no room for the bit, the constant's is found out.
-                store_kind::<W>(owner, &tab, 0, value);
+                store_kind::<W>(owner, &tab, value);
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            arg = yield YieldOp::ExecWindow(match (constant, how) {
-                (None, Widen::No) => Rc::new(SetTableArray::<{ Widen::No }>::new(k, bit, &[a, c])) as Rc<dyn Window>,
-                (None, Widen::Bit) => Rc::new(SetTableArray::<{ Widen::Bit }>::new(k, bit, &[a, c])),
-                (None, Widen::Decode) => Rc::new(SetTableArray::<{ Widen::Decode }>::new(k, bit, &[a, c])),
-                (Some(value), Widen::No) => Rc::new(SetTableArrayK::<{ Widen::No }>::new(k, value, &[a])),
-                (Some(value), _) => Rc::new(SetTableArrayK::<{ Widen::Decode }>::new(k, value, &[a])),
+            arg = yield YieldOp::ExecWindow(match constant {
+                None => {
+                    macro_rules! make { ($W:tt) => { Rc::new(SetTableArray::<$W>::new(k, &[a, c])) as Rc<dyn Window> } }
+                    with_widen!(how, make)
+                }
+                Some(value) => {
+                    macro_rules! make { ($W:tt) => { Rc::new(SetTableArrayK::<$W>::new(k, value, &[a])) as Rc<dyn Window> } }
+                    with_widen!(how, make)
+                }
             });
             if !own {
                 yield YieldOp::Effect(Effect::ArrayStore(stored));
             }
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableInteger, [bit: u8], [W: Widen], |owner, state, base| (table, key, value) {
+            windowed!(SetTableInteger, [], [W: Widen], |owner, state, base| (table, key, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
                 tab.rw(owner).array[integer_slot(key.as_int())] = value;
-                store_kind::<W>(owner, &tab, bit, value);
+                store_kind::<W>(owner, &tab, value);
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            windowed!(SetTableIntegerK, [value: u64, bit: u8], [W: Widen], |owner, state, base| (table, key) {
+            windowed!(SetTableIntegerK, [value: u64], [W: Widen], |owner, state, base| (table, key) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
                 // A constant's value lives as long as its prototype.
                 let value = LBoxed::from_bits(value);
                 tab.rw(owner).array[integer_slot(key.as_int())] = value;
-                store_kind::<W>(owner, &tab, bit, value);
+                store_kind::<W>(owner, &tab, value);
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            arg = yield YieldOp::ExecWindow(match (constant, how) {
-                (None, Widen::No) => Rc::new(SetTableInteger::<{ Widen::No }>::new(bit, &[a, b, c])) as Rc<dyn Window>,
-                (None, Widen::Bit) => Rc::new(SetTableInteger::<{ Widen::Bit }>::new(bit, &[a, b, c])),
-                (None, Widen::Decode) => Rc::new(SetTableInteger::<{ Widen::Decode }>::new(bit, &[a, b, c])),
-                (Some(value), Widen::No) => Rc::new(SetTableIntegerK::<{ Widen::No }>::new(value, bit, &[a, b])),
-                (Some(value), Widen::Bit) => Rc::new(SetTableIntegerK::<{ Widen::Bit }>::new(value, bit, &[a, b])),
-                (Some(value), Widen::Decode) => Rc::new(SetTableIntegerK::<{ Widen::Decode }>::new(value, bit, &[a, b])),
+            arg = yield YieldOp::ExecWindow(match constant {
+                None => {
+                    macro_rules! make { ($W:tt) => { Rc::new(SetTableInteger::<$W>::new(&[a, b, c])) as Rc<dyn Window> } }
+                    with_widen!(how, make)
+                }
+                Some(value) => {
+                    macro_rules! make { ($W:tt) => { Rc::new(SetTableIntegerK::<$W>::new(value, &[a, b])) as Rc<dyn Window> } }
+                    with_widen!(how, make)
+                }
             });
             if !own {
                 yield YieldOp::Effect(Effect::ArrayStore(stored));

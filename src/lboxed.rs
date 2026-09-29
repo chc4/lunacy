@@ -143,12 +143,15 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     pub const NOT_CELL_MASK: u64 = Self::NUMBER_TAG | Self::OTHER_TAG;
 
     // Object-header type tags (one byte at offset 0 of every cell, via
-    // `gc::CellKind` / `IStr::kind` / `NClosureCell::kind`). `0` = non-cell.
-    pub const KIND_TABLE: u8 = 1;
-    pub const KIND_LCLOSURE: u8 = 2;
-    pub const KIND_NCLOSURE: u8 = 3;
-    pub const KIND_OWNED: u8 = 4;
-    pub const KIND_INTERNED: u8 = 5;
+    // `gc::CellKind` / `IStr::kind` / `NClosureCell::kind`). `0` = non-cell. A
+    // kind is its cell's representation shifted up a bit, the low bit telling
+    // two layouts of one representation apart, so `kind >> 1` is the
+    // representation (`representation`).
+    pub const KIND_TABLE: u8 = (LType::Table as u8) << 1;
+    pub const KIND_LCLOSURE: u8 = (LType::Closure as u8) << 1;
+    pub const KIND_NCLOSURE: u8 = (LType::Closure as u8) << 1 | 1;
+    pub const KIND_OWNED: u8 = (LType::String as u8) << 1;
+    pub const KIND_INTERNED: u8 = (LType::String as u8) << 1 | 1;
 
     /// Canonical quiet NaN, so `+ DOUBLE_ENCODE_OFFSET` never wraps a NaN into
     /// the pointer/immediate range.
@@ -270,9 +273,8 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         (self.0 & Self::NUMBER_TAG) != 0
     }
 
-    /// This value's representation, from its bits and a cell's kind, with
-    /// comparisons only: a window op's stencil can't hold the jump table a match
-    /// on the kind compiles to.
+    /// This value's representation, from its bits and a cell's kind: a window
+    /// op's stencil can't hold the jump table a match on the kind compiles to.
     #[inline(always)]
     pub fn representation(&self) -> LType {
         let bits = self.0;
@@ -288,13 +290,10 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
             // SAFETY: `bits` is a live cell pointer (upheld by the sealed
             // constructors).
             let kind = unsafe { crate::gc::read_cell_kind(bits) };
-            if kind == Self::KIND_TABLE {
-                LType::Table
-            } else if kind <= Self::KIND_NCLOSURE {
-                LType::Closure
-            } else {
-                LType::String
-            }
+            debug_assert!(matches!(kind, Self::KIND_TABLE | Self::KIND_LCLOSURE | Self::KIND_NCLOSURE | Self::KIND_OWNED | Self::KIND_INTERNED), "a cell of kind {kind}");
+            // SAFETY: a cell's kind is one of the `KIND_*`, each a representation
+            // shifted up a bit.
+            unsafe { core::mem::transmute::<u8, LType>(kind >> 1) }
         }
     }
 

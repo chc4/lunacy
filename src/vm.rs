@@ -767,7 +767,7 @@ impl Debug for LCanon<'_, '_> {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, core::marker::ConstParamTy)]
 pub enum LType {
     Unknown,
     Nil,
@@ -785,7 +785,7 @@ impl LType {
     /// This representation's bit in an array part's kind. See Note [Array
     /// kinds] in `specialize`.
     #[inline(always)]
-    pub fn bit(self) -> u8 {
+    pub const fn bit(self) -> u8 {
         1 << self as u8
     }
 
