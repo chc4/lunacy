@@ -687,8 +687,9 @@ jit-size-vs ref: (jit-size-rev ref) jit-sizes
     python3 tools/bench_history.py sizes-vs {{ref}}
 
 # The benchmark history of this checkout: times (`hyperfines`), JIT code sizes
-# (`jit-sizes`), and the charts of both (`bench-history`).
-bench: hyperfines jit-sizes bench-history
+# (`jit-sizes`), the charts of both (`bench-history`), and the latest times as
+# bars (`bench-bars`).
+bench: hyperfines jit-sizes bench-history bench-bars
 
 # `hyperfine-full` over HYPERFINES.
 hyperfines-full:
