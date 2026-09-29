@@ -13,19 +13,30 @@ current dirty one's, the best and the first recorded, flagging a time worse
 than the best or the commit before it by more than noise. `plot` writes the
 same history as an HTML page of charts, one per benchmark (working/history.html):
 each commit's runs as a box and whiskers per build, in commit order, and the
-dirty ones apart. `attach-times` adds the runs' times to results recorded
-without them, from the hyperfine exports they came from.
+dirty ones apart, with the JIT code size of each commit on a second axis.
+`attach-times` adds the runs' times to results recorded without them, from the
+hyperfine exports they came from.
+
+`record-size` appends the JIT code size of a benchmark's run to the size history
+(bench/jit_sizes.jsonl), keyed as the times are: every byte of code the JIT
+committed, from the section headers of the run's annotated disassembly (`just
+jit-disasm`, working/jit_disasm.txt), which the unsafe build commits the same.
 """
 import argparse
 import datetime
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import defaultdict
 
 HISTORY = 'bench/history.jsonl'
+SIZES = 'bench/jit_sizes.jsonl'
+# A section of committed code in an annotated disassembly, and its bytes.
+SECTION = re.compile(r'^==== .* @ 0x[0-9a-f]+, (\d+) bytes$')
+SIZE_COLOR = '#ff7f0e'
 PAGE = 'working/history.html'
 # What builds the benchmarked binaries: a change elsewhere doesn't make a run
 # dirty.
@@ -61,10 +72,10 @@ def commit_info(rev):
     return sha, int(when), subject
 
 
-def load():
-    if not os.path.exists(HISTORY):
+def load(path=HISTORY):
+    if not os.path.exists(path):
         return []
-    with open(HISTORY) as f:
+    with open(path) as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
@@ -100,6 +111,55 @@ def record(args):
     for line in lines:
         mark = ' (dirty)' if line['dirty'] else ''
         print(f"recorded {line['benchmark']} {line['arg']} {line['build']} @ {line['commit'][:8]}{mark}: {line['mean']:.4f} s")
+
+
+def record_size(args):
+    head, dirty = (commit_info(args.ref)[0], False) if args.ref else head_state()
+    sections = [int(m.group(1)) for line in open(args.disasm) if (m := SECTION.match(line.rstrip('\n')))]
+    if not sections:
+        sys.exit(f'{args.disasm}: no committed code')
+    line = {
+        'date': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'commit': head, 'dirty': dirty, 'benchmark': args.benchmark, 'arg': args.arg,
+        'build': 'unsafe', 'bytes': sum(sections), 'sections': len(sections),
+    }
+    os.makedirs(os.path.dirname(SIZES), exist_ok=True)
+    with open(SIZES, 'a') as f:
+        f.write(json.dumps(line, sort_keys=True) + '\n')
+    mark = ' (dirty)' if dirty else ''
+    print(f"recorded {args.benchmark} {args.arg} JIT code @ {head[:8]}{mark}: {line['bytes']} bytes")
+
+
+def sizes(info):
+    """(benchmark, arg) -> commit -> its newest clean code size, and the newest
+    dirty size of HEAD, keyed 'dirty'. Adds the commits' info to `info`."""
+    head, _ = head_state()
+    out = defaultdict(dict)
+    for r in load(SIZES):
+        key = (r['benchmark'], r['arg'])
+        if r['dirty']:
+            if r['commit'] == head:
+                out[key]['dirty'] = r
+            continue
+        if r['commit'] not in info and (i := commit_info(r['commit'])) is not None:
+            info[r['commit']] = i
+        out[key][r['commit']] = r
+    return out
+
+
+def sizes_vs(args):
+    """Each benchmark's latest JIT code size for revision `ref` and for this
+    checkout (its dirty size, else HEAD's)."""
+    ref = commit_info(args.ref)[0]
+    head, _ = head_state()
+    by_key = sizes({})
+    print(f"{'benchmark':24} {args.ref[:10]:>10} {'this':>10} {'change':>8}")
+    for (bench, arg) in sorted(by_key):
+        at = by_key[(bench, arg)]
+        old, new = at.get(ref), at.get('dirty', at.get(head))
+        cells = [f"{r['bytes']:>10}" if r else f"{'-':>10}" for r in (old, new)]
+        change = f"{(new['bytes'] / old['bytes'] - 1) * 100:+7.1f}%" if old and new else ''
+        print(f"{bench + ' ' + arg:24} {cells[0]} {cells[1]} {change:>8}")
 
 
 def attach_times(args):
@@ -235,11 +295,12 @@ def table(args):
         print(f"{'dirty' if c == 'dirty' else c[:8]:9}{cells}  {subject}")
 
 
-def chart(bench, arg, runs_by_build, info):
+def chart(bench, arg, runs_by_build, sizes_by_commit, info):
     """One benchmark's chart, as SVG: commits left to right, dirty last, each
-    column a box and whiskers per charted build, their medians joined."""
-    commits = ordered({c for runs in runs_by_build.values() for c in runs if c != 'dirty'}, info)
-    has_dirty = any('dirty' in runs for runs in runs_by_build.values())
+    column a box and whiskers per charted build, their medians joined, and the
+    JIT code size, on the right axis, as points joined."""
+    commits = ordered({c for runs in [*runs_by_build.values(), sizes_by_commit] for c in runs if c != 'dirty'}, info)
+    has_dirty = any('dirty' in runs for runs in [*runs_by_build.values(), sizes_by_commit])
     columns = commits + (['dirty'] if has_dirty else [])
     if not columns:
         return ''
@@ -249,10 +310,12 @@ def chart(bench, arg, runs_by_build, info):
         return ''
     lo, hi = min(values), max(values)
     lo, hi = lo - 0.05 * (hi - lo or hi), hi + 0.05 * (hi - lo or hi)
-    width, height, left, right, top, bottom = 900, 320, 70, 170, 20, 90
+    width, height, left, right, top, bottom = 900, 320, 70, 230, 20, 90
     step = (width - left - right) / max(len(columns) - 1, 1)
     x = lambda i: left + i * step if len(columns) > 1 else left + (width - left - right) / 2
     y = lambda v: top + (hi - v) / (hi - lo) * (height - top - bottom)
+    # The legend, right of the code size axis.
+    legend_x = width - right + 72
     half = min(5.0, step / (2 * len(CHARTED) + 1))
     offset = {build: (k - (len(CHARTED) - 1) / 2) * 2.4 * half for k, build in enumerate(CHARTED)}
     parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" aria-label="{html.escape(bench)} {arg}">']
@@ -291,8 +354,8 @@ def chart(bench, arg, runs_by_build, info):
                          f'<rect x="{cx - half:.1f}" y="{y(b["q3"]):.1f}" width="{2 * half:.1f}" height="{max(y(b["q1"]) - y(b["q3"]), 1):.1f}" '
                          f'fill="{fill}" fill-opacity="0.35" stroke="{color}" stroke-width="{2 if dirty else 1}"/>'
                          f'<line x1="{cx - half:.1f}" x2="{cx + half:.1f}" y1="{y(b["median"]):.1f}" y2="{y(b["median"]):.1f}" stroke="{color}" stroke-width="2"/></g>')
-        parts.append(f'<rect x="{width - right + 12}" y="{top + legend * 18}" width="10" height="10" fill="{color}"/>')
-        parts.append(f'<text x="{width - right + 28}" y="{top + legend * 18 + 9}" class="axis">{html.escape(build)}</text>')
+        parts.append(f'<rect x="{legend_x}" y="{top + legend * 18}" width="10" height="10" fill="{color}"/>')
+        parts.append(f'<text x="{legend_x + 16}" y="{top + legend * 18 + 9}" class="axis">{html.escape(build)}</text>')
         legend += 1
     for build in sorted(set(runs_by_build) - set(CHARTED), key=lambda b: (b not in BUILDS, b)):
         runs = runs_by_build[build]
@@ -307,8 +370,31 @@ def chart(bench, arg, runs_by_build, info):
             parts.append(f'<line x1="{left}" x2="{width - right}" y1="{y(median):.1f}" y2="{y(median):.1f}" stroke="{color}" stroke-dasharray="4 3"><title>{build} median {median:.4f} s</title></line>')
         else:
             label += ' ↑' if median > hi else ' ↓'
-        parts.append(f'<rect x="{width - right + 12}" y="{top + legend * 18}" width="10" height="10" fill="{color}"/>')
-        parts.append(f'<text x="{width - right + 28}" y="{top + legend * 18 + 9}" class="axis">{html.escape(label)}</text>')
+        parts.append(f'<rect x="{legend_x}" y="{top + legend * 18}" width="10" height="10" fill="{color}"/>')
+        parts.append(f'<text x="{legend_x + 16}" y="{top + legend * 18 + 9}" class="axis">{html.escape(label)}</text>')
+        legend += 1
+    if sizes_by_commit:
+        size_values = [r['bytes'] for r in sizes_by_commit.values()]
+        size_lo, size_hi = min(size_values), max(size_values)
+        pad = 0.05 * (size_hi - size_lo or size_hi)
+        size_lo, size_hi = max(size_lo - pad, 0), size_hi + pad
+        size_y = lambda v: top + (size_hi - v) / (size_hi - size_lo) * (height - top - bottom)
+        for k in range(5):
+            v = size_lo + (size_hi - size_lo) * k / 4
+            parts.append(f'<text x="{width - right + 6}" y="{size_y(v) + 4:.1f}" class="axis size">{v / 1024:.1f} KiB</text>')
+        points = [(x(i), size_y(sizes_by_commit[c]['bytes'])) for i, c in enumerate(commits) if c in sizes_by_commit]
+        if len(points) > 1:
+            path = ' '.join(f'{px:.1f},{py:.1f}' for px, py in points)
+            parts.append(f'<polyline points="{path}" fill="none" stroke="{SIZE_COLOR}" stroke-opacity="0.6" stroke-dasharray="2 2"/>')
+        for i, c in enumerate(columns):
+            if c not in sizes_by_commit:
+                continue
+            r = sizes_by_commit[c]
+            tip = f"JIT code{' dirty' if c == 'dirty' else ''}: {r['bytes']} bytes in {r['sections']} sections"
+            fill = 'none' if c == 'dirty' else SIZE_COLOR
+            parts.append(f'<circle cx="{x(i):.1f}" cy="{size_y(r["bytes"]):.1f}" r="3.5" fill="{fill}" stroke="{SIZE_COLOR}"><title>{html.escape(tip)}</title></circle>')
+        parts.append(f'<rect x="{legend_x}" y="{top + legend * 18}" width="10" height="10" fill="{SIZE_COLOR}"/>')
+        parts.append(f'<text x="{legend_x + 16}" y="{top + legend * 18 + 9}" class="axis">JIT code (right)</text>')
         legend += 1
     parts.append('</svg>')
     return '\n'.join(parts)
@@ -316,6 +402,7 @@ def chart(bench, arg, runs_by_build, info):
 
 def plot(args):
     data, info = series()
+    code = sizes(info)
     sections = []
     for (bench, arg) in sorted(data):
         rows = []
@@ -328,7 +415,7 @@ def plot(args):
                 where = 'dirty' if at == 'dirty' else at[:8]
                 status = '<span class="bad">' + html.escape('; '.join(flags)) + '</span>' if flags else 'ok'
                 rows.append(f'<tr><td>{build}</td><td>{label} ({where})</td><td>{r["mean"]:.4f} ± {r["stddev"]:.4f}</td><td>{status}</td></tr>')
-        sections.append(f'<section><h2>{html.escape(bench)} {html.escape(arg)}</h2>{chart(bench, arg, data[(bench, arg)], info)}'
+        sections.append(f'<section><h2>{html.escape(bench)} {html.escape(arg)}</h2>{chart(bench, arg, data[(bench, arg)], code.get((bench, arg), {}), info)}'
                         f'<table><tr><th>build</th><th>at</th><th>mean (s)</th><th>vs best, vs previous</th></tr>{"".join(rows)}</table></section>')
     page = f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -340,10 +427,10 @@ def plot(args):
 body {{ background: var(--bg); color: var(--fg); font: 14px system-ui, sans-serif; margin: 0 auto; max-width: 960px; padding: 0 16px; }}
 .grid {{ stroke: var(--grid); }} .axis {{ fill: var(--fg); font-size: 11px; }}
 table {{ border-collapse: collapse; margin: 8px 0 24px; }} td, th {{ padding: 2px 10px; text-align: left; }}
-.bad {{ color: var(--bad); font-weight: 600; }}
+.bad {{ color: var(--bad); font-weight: 600; }} .size {{ fill: {SIZE_COLOR}; }}
 </style></head><body>
 <h1>Benchmark history</h1>
-<p>Each commit's runs of the unsafe and release builds, in commit order: the box spans the quartiles, the bar in it is the median, and the whiskers reach the furthest runs within 1.5 interquartile ranges (runs past them are left out, and counted in the tooltip); a line joins the medians. The hollow box is HEAD with uncommitted changes. Unsafe is the build that matters. The interpreter and other Luas are dashed lines of their latest medians, or in the legend alone, marked ↑ or ↓, off the chart's scale.</p>
+<p>Each commit's runs of the unsafe and release builds, in commit order: the box spans the quartiles, the bar in it is the median, and the whiskers reach the furthest runs within 1.5 interquartile ranges (runs past them are left out, and counted in the tooltip); a line joins the medians. The hollow box is HEAD with uncommitted changes. Unsafe is the build that matters. The interpreter and other Luas are dashed lines of their latest medians, or in the legend alone, marked ↑ or ↓, off the chart's scale. The orange points, on the right axis, are each commit's JIT code size for the benchmark (the hollow one HEAD with uncommitted changes).</p>
 {"".join(sections)}
 </body></html>
 '''
@@ -365,6 +452,15 @@ def main():
     p = sub.add_parser('report', help='print each benchmark and build, flagging regressions')
     p.add_argument('--strict', action='store_true', help='exit 1 on a regression')
     p.set_defaults(func=report)
+    z = sub.add_parser('record-size', help="append a run's JIT code size to the size history")
+    z.add_argument('disasm', help="the run's annotated disassembly (`just jit-disasm`)")
+    z.add_argument('--benchmark', required=True)
+    z.add_argument('--arg', required=True, help="the benchmark's argument (`times`)")
+    z.add_argument('--ref', help='the revision that ran, if not this checkout')
+    z.set_defaults(func=record_size)
+    v = sub.add_parser('sizes-vs', help="this checkout's JIT code sizes against a revision's")
+    v.add_argument('ref')
+    v.set_defaults(func=sizes_vs)
     a = sub.add_parser('attach-times', help='add the runs\' times to results recorded without them')
     a.add_argument('json', nargs='+', help='the hyperfine exports they were recorded from')
     a.set_defaults(func=attach_times)

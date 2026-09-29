@@ -86,6 +86,25 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
 // and all, and its region is planned into it: the link then stores and moves
 // nothing.
 
+// Note [Snapshots]
+// ~~~~~~~~~~~~~~~~
+// Flushing the window, storing its dirty registers to their slots, is data:
+// which registers go to which slots. A snapshot is that data, and the location
+// of the flush, as an entry of the region's pool; a flush through one is a call
+// with the snapshot's address in rax to the `flush_snapshot` all regions share,
+// which does the stores, sets `current_off` to the location's offset, and
+// returns with every register as it was. It is code only to find its data, but
+// slower than the stores inline: saving the window and looping over the stores
+// costs more than the stores do, so a flush on a path that runs often stays
+// inline.
+//
+// An exit, which runs rarely, flushes through a snapshot: a thunk is only its
+// `NOP5` and a jump, with its snapshot's address in rax, to the shared
+// `exit_snapshot`, which flushes through the snapshot and exits the region
+// trapping at the snapshot's location.
+//
+// rax is free for the address: as `SCRATCH` it holds no value between moves.
+
 /// A five-byte nop: the room a thunk site leaves for a `jmp rel32`.
 const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
 
@@ -277,11 +296,37 @@ const WINDOW_REGS: [u8; WINDOW + 1] = [
     8, /* r8 */ 9, /* r9 */ 11, /* r11 */ 0, /* rax */
 ];
 
-/// An 8-byte entry of the pool emitted after a compiled region's code.
+/// An entry of the pool emitted after a compiled region's code, a multiple of 8
+/// bytes.
 enum PoolEntry {
     Value(u64),
     /// The absolute address of a label.
     Address(DynamicLabel),
+    /// A window flush. See Note [Snapshots].
+    Snapshot(Snapshot),
+}
+
+/// A window flush, which `flush_snapshot` does. See Note [Snapshots].
+struct Snapshot {
+    /// Where the flush is.
+    location: PackedLocation,
+    /// The window register index and slot of each store.
+    stores: Vec<(usize, usize)>,
+}
+
+impl Snapshot {
+    /// Its pool bytes: `location`, the store count as a `u32`, then a `u16`
+    /// slot and `u16` register index for each store, padded to 8 bytes.
+    fn bytes(&self) -> Vec<u8> {
+        let mut bytes = (self.location.bits() as u64).to_le_bytes().to_vec();
+        bytes.extend(u32::try_from(self.stores.len()).unwrap().to_le_bytes());
+        for &(reg, slot) in &self.stores {
+            bytes.extend(u16::try_from(slot).expect("a slot in a u16").to_le_bytes());
+            bytes.extend(u16::try_from(reg).unwrap().to_le_bytes());
+        }
+        bytes.resize(bytes.len().next_multiple_of(8), 0);
+        bytes
+    }
 }
 
 /// The pool of a compiled region: its entries in order, each equal value once.
@@ -305,6 +350,18 @@ impl Pool {
     fn address(&mut self, ops: &mut Assembler, target: DynamicLabel) -> DynamicLabel {
         let label = ops.new_dynamic_label();
         self.entries.push((label, PoolEntry::Address(target)));
+        label
+    }
+
+    /// The label of a new entry holding the snapshot of `stores` at
+    /// `location`. See Note [Snapshots].
+    fn snapshot(&mut self, ops: &mut Assembler, location: Location, stores: impl IntoIterator<Item = Emit>) -> DynamicLabel {
+        let stores = stores.into_iter().map(|emit| match emit {
+            Emit::Store { slot, reg } => (reg, slot),
+            emit => unreachable!("a flush only stores, not {emit:?}"),
+        }).collect();
+        let label = ops.new_dynamic_label();
+        self.entries.push((label, PoolEntry::Snapshot(Snapshot { location: location.pack(), stores })));
         label
     }
 }
@@ -467,6 +524,8 @@ pub struct JitContext {
     pub pending: BTreeMap<BlockId, Pending>,
     pub stencils: Stencils,
     pub used: usize,
+    /// The shared code of an exit through a snapshot. See Note [Snapshots].
+    exit_snapshot: usize,
     pub perf_map: Option<std::cell::RefCell<std::fs::File>>,
     pub window_dump: Option<std::cell::RefCell<std::fs::File>>,
     /// How often each counted piece of allocator code ran (`window_count!`).
@@ -688,7 +747,7 @@ impl JitContext {
         {
             window_dump = std::fs::File::create("window_dump.txt").ok().map(std::cell::RefCell::new);
         }
-        Self {
+        let mut jctx = Self {
             memory: Cell::new(memory.make_exec().unwrap()),
             blocks: HashMap::default(),
             pending: BTreeMap::new(),
@@ -703,6 +762,7 @@ impl JitContext {
             frame_ops: Vec::new(),
             stencils: Stencils::default(),
             used: 0,
+            exit_snapshot: 0,
             perf_map,
             window_dump,
             #[cfg(feature = "window_dump")]
@@ -713,7 +773,68 @@ impl JitContext {
                 Ok("streaming") => None,
                 _ => Some(Policy::from_env()),
             },
+        };
+        jctx.emit_snapshot_code();
+        jctx
+    }
+
+    /// Commit `flush_snapshot` and `exit_snapshot`, with rax a snapshot's
+    /// address. See Note [Snapshots].
+    fn emit_snapshot_code(&mut self) {
+        let base = self.end();
+        let mut ops = Assembler::new(base.0 as usize);
+        let flush = ops.offset();
+        jit_note!(self, ops, "flush_snapshot");
+        // Window register `i` at `[rsp + i * 8]`.
+        for &reg in WINDOW_REGS[..WINDOW].iter().rev() {
+            dynasm!(ops ; .arch x64 ; push Rq(reg));
         }
+        dynasm!(ops
+            ; .arch x64
+            ; mov ecx, DWORD [rax + 8]
+            ; lea rdx, [rax + 12]
+            ; test ecx, ecx
+            ; jz >done
+            ; store:
+            ; movzx esi, WORD [rdx]
+            ; movzx edi, WORD [rdx + 2]
+            ; mov r8, QWORD [rsp + rdi * 8]
+            ; mov QWORD [r13 + rsi * 8], r8
+            ; add rdx, 4
+            ; dec ecx
+            ; jnz <store
+            ; done:
+            // The offset of the `PackedLocation`.
+            ; movzx ecx, WORD [rax + 4]
+            ; mov WORD r12 => RunState.current_off, cx
+        );
+        for &reg in &WINDOW_REGS[..WINDOW] {
+            dynasm!(ops ; .arch x64 ; pop Rq(reg));
+        }
+        dynasm!(ops ; .arch x64 ; ret);
+        let exit = ops.offset();
+        jit_note!(self, ops, "exit_snapshot");
+        // A trap at the snapshot's block and `current_off`, what a region
+        // returns for one: see `Specializer::run`.
+        dynasm!(ops
+            ; .arch x64
+            ; call extern base.0 as usize + flush.0
+            ; mov BYTE r12 => RunState.trap, 1
+            ; mov eax, DWORD [rax]
+            ; mov rcx, QWORD ((-4i32 as u64) << 32) as i64
+            ; or rax, rcx
+            ; pop r13
+            ; pop rbx
+            ; pop rbp
+            ; ret
+        );
+        let buf = ops.finalize().unwrap();
+        self.reserve(buf.len());
+        let code = self.commit(base, &buf).expect("committed snapshot code") as usize;
+        #[cfg(feature = "jit_disasm")]
+        self.disasm.committed(code, buf.len(), "snapshot code".to_string());
+        self.add_to_perf_map(code, buf.len(), "jit_snapshot_code");
+        self.exit_snapshot = code + exit.0;
     }
 
     pub fn add_to_perf_map(&self, addr: usize, size: usize, name: &str) {
@@ -915,15 +1036,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         ops.align(8, 0xcc);
         jit_note!(self.jctx, ops, "{}", crate::disasm::POOL);
         for (label, entry) in pool.entries {
-            let value = match entry {
-                PoolEntry::Value(value) => value,
+            let bytes = match entry {
+                PoolEntry::Value(value) => value.to_le_bytes().to_vec(),
                 PoolEntry::Address(target) => {
                     let offset = ops.labels().resolve_dynamic(target).expect("pool entry for a placed label");
-                    (base.0 as usize + offset.0) as u64
+                    ((base.0 as usize + offset.0) as u64).to_le_bytes().to_vec()
                 }
+                PoolEntry::Snapshot(snapshot) => snapshot.bytes(),
             };
             dynasm!(ops ; =>label);
-            ops.extend(&value.to_le_bytes());
+            ops.extend(&bytes);
         }
         self.jctx.reserve(ops.offset().0 - pool_start.0);
 
@@ -2005,14 +2127,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let stores = alloc.stores();
                     let counted = window_count!(self.jctx, ops, stores);
                     window_dump!(self.jctx, "      exit after {}{counted}", emits_line(&stores));
-                    for emit in stores {
-                        emit_window_move(ops, emit);
-                    }
+                    // See Note [Snapshots].
+                    let snapshot = pool.snapshot(ops, Location(id, off), stores);
                     dynasm!(ops
-                        ; mov WORD r12 => RunState.current_off, (off as i16)
-                        ; mov rax, QWORD (((-4i32 as u64) << 32 | (id.0 as u64)) as i64)
-                        ; mov BYTE r12 => RunState.trap, 1
-                        ; jmp ->exit_jit
+                        ; .arch x64
+                        ; lea rax, [=>snapshot]
+                        ; jmp extern self.jctx.exit_snapshot
                     );
                 },
                 _ => {

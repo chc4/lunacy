@@ -626,6 +626,55 @@ hyperfines:
     for run in {{HYPERFINES}}; do just hyperfine ${run%:*} ${run#*:}; done
     python3 tools/bench_history.py report
 
+# The JIT code size of each benchmark of HYPERFINES run by checkout `dir`
+# (this one, or revision `ref`'s compare worktree), from its annotated
+# disassembly (as `jit-disasm` makes it), into the size history
+# (tools/bench_history.py record-size). A benchmark whose run fails is left
+# out, its output in working/jit-size-<benchmark>.log.
+_jit-sizes dir ref='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{dir}}/working
+    for run in {{HYPERFINES}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        just _luac $benchmark > /dev/null
+        [ {{dir}} = . ] || cp working/$benchmark.bin {{dir}}/working/
+        rm -f {{dir}}/working/jit_disasm.txt
+        if (cd {{dir}}/working && cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
+                --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- $benchmark.bin $times) \
+                > working/jit-size-$benchmark.log 2>&1; then
+            python3 tools/bench_history.py record-size {{dir}}/working/jit_disasm.txt --benchmark $benchmark --arg $times {{ if ref == "" { "" } else { "--ref " + ref } }}
+        else
+            echo "skipped $benchmark $times: its run failed (working/jit-size-$benchmark.log)"
+        fi
+    done
+
+# The JIT code size of each benchmark of HYPERFINES, into the size history
+# (see `_jit-sizes`).
+jit-sizes: (_jit-sizes ".")
+
+# Revision `ref`'s JIT code size on each benchmark of HYPERFINES, into the size
+# history (see `_jit-sizes`), from its compare worktree: to fill in commits
+# before sizes were kept. A revision without the `jit_disasm` feature has none.
+jit-size-rev ref:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _compare-worktree {{ref}}
+    if ! grep -q '^jit_disasm' target/compare/{{ref}}/Cargo.toml; then
+        echo "{{ref}}: no jit_disasm feature, so no JIT code sizes"
+        exit 1
+    fi
+    just _jit-sizes target/compare/{{ref}} {{ref}}
+
+# This checkout's JIT code size on each benchmark of HYPERFINES against revision
+# `ref`'s, both into the size history.
+jit-size-vs ref: (jit-size-rev ref) jit-sizes
+    python3 tools/bench_history.py sizes-vs {{ref}}
+
+# The benchmark history of this checkout: times (`hyperfines`), JIT code sizes
+# (`jit-sizes`), and the charts of both (`bench-history`).
+bench: hyperfines jit-sizes bench-history
+
 # `hyperfine-full` over HYPERFINES.
 hyperfines-full:
     #!/usr/bin/env bash

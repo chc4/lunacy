@@ -11,6 +11,8 @@ import re
 from collections import Counter
 
 REGION = re.compile(r'^==== region entered at block \d+, function :(\d+) @ \S+, (\d+) bytes')
+# Other committed code (thunk stubs, the shared snapshot code), by its title.
+OTHER = re.compile(r'^==== (.*?)(?: into block \d+)? @ ')
 BLOCK = re.compile(r'^\s*; block (\d+) \(pc (\d+)')
 RESIDUAL = re.compile(r'^\s*;\s+\d+ (\w+)(?:\((\w+))?')
 COMMENT = re.compile(r'^\s*;\s*(.*)')
@@ -30,6 +32,9 @@ def main():
         if m := REGION.match(line):
             function, block, kind = m.group(1), None, 'region prologue'
             region_total += int(m.group(2))
+            continue
+        if m := OTHER.match(line):
+            function, block, kind = m.group(1), None, m.group(1)
             continue
         if m := BLOCK.match(line):
             block, kind = (function, int(m.group(1)), int(m.group(2))), 'block entry'
@@ -56,7 +61,7 @@ def main():
     print(f'{total} bytes of code ({region_total} in the regions, with their constant pools), {sum(len(b) for b in blocks_of.values())} blocks')
     print('\nby function (line):')
     for f, n in by_function.most_common():
-        print(f'  :{f:<6} {n:>7} bytes {100 * n / total:5.1f}%  {len(blocks_of.get(f, ()))} blocks')
+        print(f'  {":" + f if f.isdigit() else f:<7} {n:>7} bytes {100 * n / total:5.1f}%  {len(blocks_of.get(f, ()))} blocks')
     print('\nby kind:')
     for k, n in by_kind.most_common(args.top):
         each = f'  {uses[k]} uses, {n / uses[k]:.0f} bytes each' if uses[k] else ''
