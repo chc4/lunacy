@@ -600,9 +600,9 @@ windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, VARARG: bool, A: Co
 
 // Whether a table's array part has kind `kind`, testing an element loaded from it in place of
 // the element's own tag. See Note [Array kinds].
-windowed!(KindIs, [kind: LType], [], |owner, state, base| (table) {
+windowed!(guard KindIs, [kind: LType], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    state.select = (tab.ro(owner).kind != kind.bit()) as usize;
+    tab.ro(owner).kind == kind.bit()
 });
 
 // `arrive` for the call of R(A) before it. `ac` is its `a | c << 16` (as `Count::hold` holds

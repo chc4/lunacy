@@ -472,7 +472,9 @@ macro_rules! frame_op {
 /// call running its body. See Note [Frame ops] in `specialize`.
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
     match stencils.body(&**op, 0) {
-        Ok(body) => splat(ops, &body, op.name(), &op.captures(), pool),
+        Ok(body) => {
+            splat(ops, &body, op.name(), &op.captures(), pool, None);
+        }
         // Debug builds' stencils can keep what optimized ones fold away, but an
         // optimized frame op the copier rejects is a bug to fix.
         Err(e) if !matches!(e, StencilError::Disabled) && !cfg!(debug_assertions) => panic!("{}: {e}", op.name()),
@@ -490,7 +492,9 @@ fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, 
     }
 }
 
-fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool) {
+/// Copy `body`, a guard's jumps to its second continuation going to `pass`:
+/// whether it has any. See Note [Guard stencils] in `window`.
+fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool, pass: Option<DynamicLabel>) -> bool {
     enum Site {
         Value(u64),
         Absolute(usize),
@@ -499,6 +503,8 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
         /// The site's record, which its site hole's `lea` gives. See Note
         /// [Cold stencils] in `window`.
         Record,
+        /// The guard's pass edge.
+        Pass,
     }
     let fall = ops.new_dynamic_label();
     // The site's record, if the op has a cold path.
@@ -509,6 +515,13 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
         i => (r.end, r.field, Site::Value(captures[i])),
     }));
     sites.extend(body.relocations().iter().map(|r| (r.end, r.field, Site::Absolute(r.target))));
+    sites.extend(body.passes.iter().map(|r| (r.end, r.field, Site::Pass)));
+    // A body copied between `sub rsp, 8` and `add rsp, 8` passes through an
+    // `add rsp, 8` of its own, after it.
+    let passing = (!body.passes.is_empty()).then(|| {
+        let pass = pass.expect("a guard's copy has a pass edge");
+        if body.aligned { (ops.new_dynamic_label(), Some(pass)) } else { (pass, None) }
+    });
     sites.extend(body.nexts.iter().map(|n| match *n {
         NextRef::Direct(r) => (r.end, r.field, Site::Fall),
         NextRef::Indirect(r) => (r.end, r.field, Site::FallAddress),
@@ -536,11 +549,27 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
                 let record = record.expect("a record for a body with a site hole");
                 ops.dynamic_relocation(record, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
+            Site::Pass => {
+                let (target, _) = passing.expect("a guard's pass site");
+                ops.dynamic_relocation(target, 0, field_offset, 0, rel32(RelocationKind::Relative));
+            }
         }
     }
     ops.extend(&body.code[at..body.fall]);
     dynasm!(ops ; .arch x64 ; =>fall);
     ops.extend(&body.code[body.fall..]);
+    if let Some((stub, Some(pass))) = passing {
+        let after = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch x64
+            ; jmp =>after
+            ; =>stub
+            ; add rsp, 8
+            ; jmp =>pass
+            ; =>after
+        );
+    }
+    passing.is_some()
 }
 
 const JIT_SIZE: usize = 0x1000 * 16;
@@ -2126,6 +2155,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             alloc.op(&**w, usable_skips(stencils, &**w))
                         }
                     };
+                    // A guard's copy that jumps to its pass edge itself. See Note
+                    // [Guard stencils] in `window`.
+                    let pass = matches!(res, Residual::GuardDynamic(_)).then(|| insts[off + 2]);
+                    let mut passes = false;
                     match emits {
                         Some(emits) => {
                             let counted = window_count!(self.jctx, ops, emits);
@@ -2134,7 +2167,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 match emit {
                                     Emit::Op { skip } => {
                                         let body = stencils.body(&**w, skip).expect("a usable skip");
-                                        splat(ops, &body, w.name(), &w.captures(), pool);
+                                        passes = splat(ops, &body, w.name(), &w.captures(), pool, pass);
                                     }
                                     emit => emit_window_move(ops, emit),
                                 }
@@ -2159,7 +2192,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             );
                         }
                     }
-                    if let Residual::GuardDynamic(_) = res {
+                    if let (Residual::GuardDynamic(_), false) = (res, passes) {
                         // As an inline guard: a pass jumps to `off + 2`, a failure
                         // falls through to `off + 1`, both with the window live.
                         #[cfg(feature = "align_selects")]

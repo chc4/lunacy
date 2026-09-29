@@ -293,13 +293,13 @@ pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield =
 
 // `GuardDynamic` tests: whether a `CType::Type(LType::Integer)` key, in a register or the
 // constant `k`, is in a table's array part. See Note [Dynamic guards].
-crate::window::windowed!(InArray, [], [], |owner, state, base| (table, key) {
+crate::window::windowed!(guard InArray, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    state.select = (integer_slot(key.as_int()) >= tab.ro(owner).array.len()) as usize;
+    integer_slot(key.as_int()) < tab.ro(owner).array.len()
 });
-crate::window::windowed!(InArrayK, [k: i32], [], |owner, state, base| (table) {
+crate::window::windowed!(guard InArrayK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    state.select = (integer_slot(k) >= tab.ro(owner).array.len()) as usize;
+    integer_slot(k) < tab.ro(owner).array.len()
 });
 
 
@@ -834,8 +834,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 crate::window::windowed!(IntegerKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
                     *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(k, rhs.as_int())));
                 });
-                crate::window::windowed!(FitsKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs) {
-                    state.select = integer_op::<OP>(k, rhs.as_int()).is_none() as usize;
+                crate::window::windowed!(guard FitsKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs) {
+                    integer_op::<OP>(k, rhs.as_int()).is_some()
                 });
                 Some((Some(dispatch_integer_window!(opcode, FitsKR, (k, &[rhs]))), dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest]))))
             } else if rk {
@@ -845,16 +845,16 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
                     *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), k)));
                 });
-                crate::window::windowed!(FitsRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs) {
-                    state.select = integer_op::<OP>(lhs.as_int(), k).is_none() as usize;
+                crate::window::windowed!(guard FitsRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs) {
+                    integer_op::<OP>(lhs.as_int(), k).is_some()
                 });
                 Some((test, dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest]))))
             } else {
                 crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
                     *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), rhs.as_int())));
                 });
-                crate::window::windowed!(FitsRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs) {
-                    state.select = integer_op::<OP>(lhs.as_int(), rhs.as_int()).is_none() as usize;
+                crate::window::windowed!(guard FitsRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs) {
+                    integer_op::<OP>(lhs.as_int(), rhs.as_int()).is_some()
                 });
                 Some((Some(dispatch_integer_window!(opcode, FitsRR, (&[lhs, rhs]))), dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest]))))
             };

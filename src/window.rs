@@ -257,6 +257,11 @@ pub trait Window: std::fmt::Debug {
     fn cold(&self, _skip: usize) -> Option<usize> {
         None
     }
+    /// Address of a guard op's second continuation, which its stencils jump to
+    /// when it passes. See Note [Guard stencils].
+    fn pass(&self) -> Option<usize> {
+        None
+    }
     /// Run the body on the window `w` at `skip`, with the captures from `self`.
     unsafe fn run<'src, 'intern>(
         &self,
@@ -360,6 +365,10 @@ pub(crate) use bind_record;
 /// runs after it when it does, in a stencil of its own. See Note [Cold
 /// stencils].
 ///
+/// `windowed!(guard Name, ...)` declares a dynamic guard's op, whose body
+/// evaluates to whether it passes: the op selects 0 when it does, and its
+/// stencils jump to a second continuation instead. See Note [Guard stencils].
+///
 /// `windowed!(frame Name, ...)`, with no operands, declares an op that only
 /// runs at `SKIP` 0 into an empty window, and after which the JIT code loads
 /// `base` again, if it needs it: its stencil takes only `state`, and passes on
@@ -375,8 +384,21 @@ macro_rules! windowed {
         $body:block
     ) => {
         $crate::window::windowed!(@sort
-            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body []]
+            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] []]
             [] [] [] (0usize)
+        );
+    };
+    (
+        $(#[$meta:meta])*
+        guard $name:ident,
+        [$($cap:ident : $cty:ty),* $(,)?],
+        [$($cp:ident : $cpt:ty),* $(,)?],
+        |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
+        $body:block
+    ) => {
+        $crate::window::windowed!(@sort
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [guard]]
+            [] [] [] (0usize) $($operands)*
         );
     };
     (
@@ -389,15 +411,24 @@ macro_rules! windowed {
         $(cold $cold:block)?
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [$($cold)?]]
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [$($cold)?] []]
             [] [] [] (0usize) $($operands)*
         );
     };
-    // The body of an op with no cold path, which never takes it.
-    (@hot $body:block) => {
+    // `code`, if the op is a guard's.
+    (@if_guard [] $($code:tt)*) => {};
+    (@if_guard [$guard:ident] $($code:tt)*) => {
+        $($code)*
+    };
+    // The body of an op with no cold path, which never takes it; of one with
+    // a cold path, whether to take it; of a guard, whether it passes.
+    (@run [] $body:block) => {
         { let () = unsafe { $body }; false }
     };
-    (@hot $body:block, $cold:block) => {
+    (@run [] $body:block, $cold:block) => {
+        unsafe { $body }
+    };
+    (@run [$guard:ident] $body:block) => {
         unsafe { $body }
     };
     (@cold_body []) => {
@@ -423,7 +454,7 @@ macro_rules! windowed {
         $crate::window::windowed!(@sort $decl [$($in)* ($op, $i)] [$($out)*] [$($acc)* Read] ($i + 1) $($($rest)*)?);
     };
     (@sort
-        [$kind:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block [$($cold:block)?]]
+        [$kind:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block [$($cold:block)?] [$($guard:ident)?]]
         [$(($in:ident, $ii:expr))*] [$(($out:ident, $oi:expr))*] [$($acc:ident)*] ($arity:expr)
     ) => {
         $(#[$meta])*
@@ -448,7 +479,7 @@ macro_rules! windowed {
             }
 
             /// The body, shared by the interpreter and the stencil: whether to
-            /// take the cold path.
+            /// take the cold path, or a guard's whether it passes.
             #[inline(always)]
             unsafe fn __run<'a, 'b, 'src, 'intern>(
                 $($cap: $cty,)*
@@ -458,7 +489,7 @@ macro_rules! windowed {
                 $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
                 $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
             ) -> bool {
-                $crate::window::windowed!(@hot $body $(, $cold)?)
+                $crate::window::windowed!(@run [$($guard)?] $body $(, $cold)?)
             }
 
             /// The cold path's body, shared by the interpreter and the cold
@@ -505,12 +536,12 @@ macro_rules! windowed {
             ) -> bool {
                 $( let $in = w[skip + $ii]; )*
                 $( let mut $out = w[skip + $oi]; )*
-                let cold = unsafe { Self::__run($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let taken = unsafe { Self::__run($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
                 $( w[skip + $oi] = $out; )*
-                cold
+                taken
             }
 
-            $crate::window::windowed!(@stencil $kind, [$($cap : $cty),*] [$($cold)?]);
+            $crate::window::windowed!(@stencil $kind, [$($cap : $cty),*] [$($cold)?] [$($guard)?]);
         }
 
         impl<$(const $cp: $cpt),*> $crate::window::Window for $name<$($cp),*> {
@@ -526,6 +557,9 @@ macro_rules! windowed {
                 Self::__stencil_at(skip)
             }
             fn next(&self) -> usize { Self::__next as *const () as usize }
+            $crate::window::windowed!(@if_guard [$($guard)?]
+                fn pass(&self) -> Option<usize> { Some(Self::__pass as *const () as usize) }
+            );
             $crate::window::windowed!(@if_cold [$($cold)?]
                 fn cold(&self, skip: usize) -> Option<usize> {
                     assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
@@ -541,9 +575,11 @@ macro_rules! windowed {
                 skip: usize,
             ) {
                 assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
-                let cold = unsafe { Self::__window($(self.$cap,)* owner, state, base, w, skip) };
+                let taken = unsafe { Self::__window($(self.$cap,)* owner, state, base, w, skip) };
+                // A guard selects 0 when it passes. See Note [Guard stencils].
+                $crate::window::windowed!(@if_guard [$($guard)?] state.select = (!taken) as usize;);
                 $crate::window::windowed!(@if_cold [$($cold)?]
-                    if cold {
+                    if taken {
                         unsafe { Self::__window_cold($(self.$cap,)* owner, state, base, w, skip) }
                     }
                 );
@@ -557,10 +593,11 @@ macro_rules! windowed {
                 let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(at).as_ptr() };
                 $( let $in = state.vals[at + self.operands[$ii]]; )*
                 $( let mut $out = state.vals[at + self.operands[$oi]]; )*
-                let cold = unsafe { Self::__run($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let taken = unsafe { Self::__run($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
                 $( state.vals[at + self.operands[$oi]] = $out; )*
+                $crate::window::windowed!(@if_guard [$($guard)?] state.select = (!taken) as usize;);
                 $crate::window::windowed!(@if_cold [$($cold)?]
-                    if cold {
+                    if taken {
                         $( let $in = state.vals[at + self.operands[$ii]]; )*
                         $( let mut $out = state.vals[at + self.operands[$oi]]; )*
                         unsafe { Self::__run_cold($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
@@ -570,7 +607,7 @@ macro_rules! windowed {
             }
         }
     };
-    (@stencil window, [$($cap:ident : $cty:ty),*] [$($cold:block)?]) => {
+    (@stencil window, [$($cap:ident : $cty:ty),*] [$($cold:block)?] [$($guard:ident)?]) => {
             /// The stencil running at `skip`.
             fn __stencil_at(skip: usize) -> usize {
                 match skip {
@@ -608,16 +645,46 @@ macro_rules! windowed {
                 let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
-                let cold = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                let taken = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
                 // The window where it is, into the cold stencil. See Note [Cold stencils].
                 $crate::window::windowed!(@if_cold [$($cold)?]
-                    if cold {
+                    if taken {
                         state.cold_site = unsafe { $crate::window::hole::<{ $crate::window::SITE_HOLE }>() } as *const u64;
                         become Self::__cold::<SKIP>(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
                     }
                 );
+                // A guard's pass, into its second continuation. See Note [Guard stencils].
+                $crate::window::windowed!(@if_guard [$($guard)?]
+                    if taken {
+                        become Self::__pass(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                    }
+                );
                 become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
             }
+
+            $crate::window::windowed!(@if_guard [$($guard)?]
+                /// A guard's second continuation, as `__next` is its first: the
+                /// copier points jumps to it at the guard's pass edge. See Note
+                /// [Guard stencils].
+                #[inline(never)]
+                extern "rust-preserve-none" fn __pass<'b, 'src, 'intern>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+                base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                w0: $crate::lboxed::LBoxed<'src, 'intern>,
+                w1: $crate::lboxed::LBoxed<'src, 'intern>,
+                w2: $crate::lboxed::LBoxed<'src, 'intern>,
+                w3: $crate::lboxed::LBoxed<'src, 'intern>,
+                w4: $crate::lboxed::LBoxed<'src, 'intern>,
+                w5: $crate::lboxed::LBoxed<'src, 'intern>,
+                w6: $crate::lboxed::LBoxed<'src, 'intern>,
+                w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                w8: $crate::lboxed::LBoxed<'src, 'intern>,
+                ) {
+                    // Unlike `__next`'s body, or LLVM merges the two, and the
+                    // guard's branch between them with them.
+                    core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8, 1u8));
+                }
+            );
 
             $crate::window::windowed!(@if_cold [$($cold)?]
                 /// The cold stencil at `skip`.
@@ -703,7 +770,7 @@ macro_rules! windowed {
                 core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8));
             }
     };
-    (@stencil frame, [$($cap:ident : $cty:ty),*] []) => {
+    (@stencil frame, [$($cap:ident : $cty:ty),*] [] []) => {
             /// The stencil, which only runs at `SKIP` 0.
             fn __stencil_at(skip: usize) -> usize {
                 assert_eq!(skip, 0, "a frame op runs at SKIP 0");
@@ -905,6 +972,12 @@ pub struct Body {
     /// Where in `code` its `become`s go: its end, or the `add rsp, 8` before
     /// it in a body that restores the stack. See Note [Stencil alignment].
     pub fall: usize,
+    /// A guard's jumps to its second continuation, re-targeted at its pass
+    /// edge. See Note [Guard stencils].
+    pub passes: Vec<RipRel>,
+    /// Whether it's copied between `sub rsp, 8` and `add rsp, 8`: a jump out
+    /// of its middle must first undo the `sub`. See Note [Stencil alignment].
+    pub aligned: bool,
 }
 
 /// A reference to the continuation inside a stencil body.
@@ -958,6 +1031,8 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let addr = op.stencil(skip);
     // Its cold stencil, which it may jump to. See Note [Cold stencils].
     let cold = op.cold(skip);
+    // A guard's second continuation. See Note [Guard stencils].
+    let pass = op.pass();
     let &size = image.sizes.get(&addr).ok_or(StencilError::NotInSymtab { op: name })?;
     let code = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
 
@@ -1049,8 +1124,23 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     };
     let jumps_to_next = |i: usize| -> Result<bool, StencilError> { Ok(jump_target(i)? == Some(next)) };
 
-    // A final `become` is sliced off; otherwise the whole body is kept.
-    let sliced = jumps_to_next(insts.len() - 1)?;
+    // A guard's body ending `jcc __next; jmp __pass` is copied ending `j!cc
+    // __pass`, falling through to its `become` (see Note [Guard stencils]):
+    // the index of that `jcc`, a two-byte `0F 8x` with a rel32.
+    let last = insts.len() - 1;
+    let inverted = (last > 0 && pass.is_some() && jump_target(last)? == pass).then_some(last - 1).filter(|&i| {
+        let (off, end, inst) = &insts[i];
+        inst.opcode() != Opcode::JMP
+            && RELATIVE_BRANCHES.contains(&inst.opcode())
+            && end - off == 6
+            && code[*off] == 0x0f
+            && code[off + 1] & 0xf0 == 0x80
+            && matches!(inst.operand(0), Operand::ImmediateI32 { imm } if (addr + end).wrapping_add(imm as isize as usize) == next)
+    });
+
+    // A final `become` is sliced off, and a guard's final jump to `__pass` it
+    // inverts into its `jcc`; otherwise the whole body is kept.
+    let sliced = inverted.is_some() || jumps_to_next(last)?;
     let kept = if sliced { insts.len() - 1 } else { insts.len() };
     let body_len = if sliced { insts[kept].0 } else { size };
 
@@ -1059,6 +1149,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let mut nexts: Vec<NextRef> = Vec::new();
     // Whether it jumps to its cold stencil, directly.
     let mut jumps_cold = false;
+    let mut passes: Vec<RipRel> = Vec::new();
     // The opcode bytes of its site hole loads, to make `lea`s.
     let mut leas: SmallVec<[usize; 1]> = SmallVec::new();
     for (i, (off, end, inst)) in insts[..kept].iter().enumerate() {
@@ -1074,9 +1165,13 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
                 let target = (addr + end).wrapping_add(rel as isize as usize);
                 if !(addr..=addr + body_len).contains(&target) {
                     let rel = RipRel { field: end - 4, end, target };
-                    if width == 4 && target == next {
+                    if Some(i) == inverted {
+                        passes.push(rel);
+                    } else if width == 4 && target == next {
                         // Another `become` (e.g. a duplicated tail).
                         nexts.push(NextRef::Direct(rel));
+                    } else if width == 4 && Some(target) == pass && inst.opcode() != Opcode::CALL {
+                        passes.push(rel);
                     } else if width == 4 && Some(target) == cold && inst.opcode() != Opcode::CALL {
                         // Out to the cold stencil, which isn't copied.
                         jumps_cold = true;
@@ -1139,6 +1234,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let shift = |r: RipRel| RipRel { field: r.field + prefix.len(), end: r.end + prefix.len(), ..r };
     let holes = holes.into_iter().map(|(r, i)| (shift(r), i)).collect();
     let relocs = relocs.into_iter().map(shift).collect();
+    let passes = passes.into_iter().map(shift).collect();
     let nexts = nexts
         .into_iter()
         .map(|n| match n {
@@ -1151,6 +1247,9 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     for at in leas {
         copy[prefix.len() + at] = 0x8d;
     }
+    if let Some(i) = inverted {
+        copy[prefix.len() + insts[i].0 + 1] ^= 1;
+    }
     if !sliced {
         copy.extend_from_slice(&UD2);
     }
@@ -1158,7 +1257,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     if aligned {
         copy.extend_from_slice(&ADD_RSP_8);
     }
-    Ok(Body { code: copy, holes, relocs, nexts, fall })
+    Ok(Body { code: copy, holes, relocs, nexts, fall, passes, aligned })
 }
 
 /// `ud2`, which traps: placed after a copied body that doesn't end in its
@@ -1194,6 +1293,19 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 // stack: a body that jumps to its cold stencil is always copied between `sub
 // rsp, 8` and `add rsp, 8` (Note [Stencil alignment]), which leaves the stack
 // as a call would, and its fall-through point is the `add rsp, 8`.
+
+// Note [Guard stencils]
+// ~~~~~~~~~~~~~~~~~~~~~
+// A dynamic guard's op (`windowed!(guard ..)`) has a body that evaluates to
+// whether the guard passes. Run by the interpreter, the op selects 0 when it
+// does. Its stencils instead end in a second continuation, `__pass`, when it
+// does, and in `__next` when it doesn't: the choice is a branch on what the
+// body computed, and the copy's jump to `__pass` goes straight to the guard's
+// pass edge, rather than the JIT code testing `select` in memory after it,
+// which nothing then writes. A body ending `jcc __next; jmp __pass` is copied
+// ending in the inverted `jcc` to the pass edge, falling through where its
+// `become` would go. A copy between `sub rsp, 8` and `add rsp, 8` jumps to its
+// pass edge through an `add rsp, 8` of its own (Note [Stencil alignment]).
 
 // Note [Stencil alignment]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1313,6 +1425,8 @@ pub unsafe fn assemble(
             NextRef::Direct(r) => (NextRef::Direct(shift(r)), fall),
             NextRef::Indirect(r) => (NextRef::Indirect(shift(r)), fall),
         }));
+        // Either way a guard goes, the checked code continues.
+        nexts.extend(body.passes.iter().map(|&r| (NextRef::Direct(shift(r)), fall)));
     }
     code.extend_from_slice(tail);
     while code.len() % 8 != 0 {
