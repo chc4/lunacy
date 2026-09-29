@@ -304,6 +304,9 @@ enum PoolEntry {
     Address(DynamicLabel),
     /// A window flush. See Note [Snapshots].
     Snapshot(Snapshot),
+    /// A site's record: the absolute address of its fall-through label, then
+    /// its captures. See Note [Cold stencils] in `window`.
+    Record(DynamicLabel, Captures),
 }
 
 /// A window flush, which `flush_snapshot` does. See Note [Snapshots].
@@ -350,6 +353,14 @@ impl Pool {
     fn address(&mut self, ops: &mut Assembler, target: DynamicLabel) -> DynamicLabel {
         let label = ops.new_dynamic_label();
         self.entries.push((label, PoolEntry::Address(target)));
+        label
+    }
+
+    /// The label of a new entry holding the record of a site continuing at
+    /// `fall` with `captures`. See Note [Cold stencils] in `window`.
+    fn record(&mut self, ops: &mut Assembler, fall: DynamicLabel, captures: &Captures) -> DynamicLabel {
+        let label = ops.new_dynamic_label();
+        self.entries.push((label, PoolEntry::Record(fall, captures.clone())));
         label
     }
 
@@ -482,9 +493,14 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
         Absolute(usize),
         Fall,
         FallAddress,
+        /// The address of the site's record. See Note [Cold stencils] in `window`.
+        Record,
     }
     let mut sites: SmallVec<[(usize, usize, Site); 8]> = SmallVec::new();
-    sites.extend(body.holes.iter().map(|&(r, i)| (r.end, r.field, Site::Value(captures[i]))));
+    sites.extend(body.holes.iter().map(|&(r, i)| match i {
+        crate::window::SITE_HOLE => (r.end, r.field, Site::Record),
+        i => (r.end, r.field, Site::Value(captures[i])),
+    }));
     sites.extend(body.relocations().iter().map(|r| (r.end, r.field, Site::Absolute(r.target))));
     sites.extend(body.nexts.iter().map(|n| match *n {
         NextRef::Direct(r) => (r.end, r.field, Site::Fall),
@@ -508,6 +524,11 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
             }
             Site::FallAddress => {
                 let entry = pool.address(ops, fall);
+                ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
+            }
+            Site::Record => {
+                let record = pool.record(ops, fall, captures);
+                let entry = pool.address(ops, record);
                 ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
         }
@@ -1056,6 +1077,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ((base.0 as usize + offset.0) as u64).to_le_bytes().to_vec()
                 }
                 PoolEntry::Snapshot(snapshot) => snapshot.bytes(),
+                PoolEntry::Record(fall, captures) => {
+                    let offset = ops.labels().resolve_dynamic(fall).expect("a record for a placed site");
+                    let mut bytes = ((base.0 as usize + offset.0) as u64).to_le_bytes().to_vec();
+                    captures.iter().for_each(|value| bytes.extend(value.to_le_bytes()));
+                    bytes
+                }
             };
             dynasm!(ops ; =>label);
             ops.extend(&bytes);

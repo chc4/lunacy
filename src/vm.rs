@@ -1384,6 +1384,9 @@ pub struct RunState<'src, 'intern> {
     pub callstack: FVec<CallstackEntry<'src, 'intern>>,
     pub counters: PerfCounters,
     pub select: usize,
+    /// The record of the site whose window op's cold stencil is running. See
+    /// Note [Cold stencils] in `window`.
+    pub cold_site: *const u64,
     pub witness_base: usize,
     /// The end of the innermost frame's hash witnesses. See Note [Hash witnesses].
     pub witness_top: usize,
@@ -1934,6 +1937,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             RunState {
                 base,
                 top,
+                cold_site: core::ptr::null(),
                 witness_base,
                 witness_top: 0,
                 pc,

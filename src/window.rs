@@ -95,6 +95,9 @@ use crate::Owner;
 pub const WINDOW: usize = 9;
 /// Number of hole statics available to captures.
 pub const MAX_HOLES: usize = 4;
+/// The hole past the captures' holes, whose value is the address of the site's
+/// record. See Note [Cold stencils].
+pub const SITE_HOLE: usize = MAX_HOLES;
 // `Captures` and `Regs` use literal lengths: with `generic_const_exprs` on, a named
 // const in a trait method signature makes `Window` dyn-incompatible.
 /// A window op's hole values.
@@ -114,6 +117,10 @@ unsafe extern "C" {
     static __lunacy_hole2: *const ();
     #[linkage = "extern_weak"]
     static __lunacy_hole3: *const ();
+    /// The site hole: the address of the site's record, for its op's cold
+    /// stencil. See Note [Cold stencils].
+    #[linkage = "extern_weak"]
+    static __lunacy_site: *const ();
     /// Deliberately never defined, and *not* weak: it is only referenced by a
     /// window op that declares more captures than there are holes
     /// (`MAX_HOLES`), so that mistake fails loudly at link time.
@@ -132,6 +139,7 @@ pub unsafe fn hole<const I: usize>() -> u64 {
             1 => __lunacy_hole1 as u64,
             2 => __lunacy_hole2 as u64,
             3 => __lunacy_hole3 as u64,
+            SITE_HOLE => __lunacy_site as u64,
             _ => unresolved_window_hole__too_many_captures as u64,
         }
     };
@@ -243,6 +251,12 @@ pub trait Window: std::fmt::Debug {
     /// Address of this op's `become` continuation (what every one of its
     /// stencils ends by jumping to, and what the copier slices off).
     fn next(&self) -> usize;
+    /// Address of the op's cold stencil at `skip`, which its stencil at `skip`
+    /// jumps to off its hot path, if it has a cold path. See Note [Cold
+    /// stencils].
+    fn cold(&self, _skip: usize) -> Option<usize> {
+        None
+    }
     /// Run the body on the window `w` at `skip`, with the captures from `self`.
     unsafe fn run<'src, 'intern>(
         &self,
@@ -302,6 +316,19 @@ macro_rules! bind_holes {
 #[doc(hidden)]
 pub(crate) use bind_holes;
 
+/// Bind each capture from a site's record, `I` counting up from its first
+/// capture. See Note [Cold stencils].
+#[doc(hidden)]
+macro_rules! bind_record {
+    ($site:ident, $idx:expr;) => {};
+    ($site:ident, $idx:expr; $cap:ident : $cty:ty $(, $rcap:ident : $rcty:ty)*) => {
+        let $cap: $cty = unsafe { <$cty as $crate::window::Capture>::from_bits(*$site.add($idx)) };
+        $crate::window::bind_record!($site, $idx + 1; $($rcap : $rcty),*);
+    };
+}
+#[doc(hidden)]
+pub(crate) use bind_record;
+
 /// Declare a window op, usable at any emit site (like `define_exec!`):
 ///
 /// ```ignore
@@ -324,6 +351,11 @@ pub(crate) use bind_holes;
 /// `new(captures.., operands)` takes the operands' stack slots in the same
 /// order. See Note [Register window].
 ///
+/// A `cold { .. }` block after the body is the op's cold path: the body then
+/// evaluates to whether to take it, and the cold block, with the same bindings,
+/// runs after it when it does, in a stencil of its own. See Note [Cold
+/// stencils].
+///
 /// `windowed!(frame Name, ...)`, with no operands, declares an op that only
 /// runs at `SKIP` 0 into an empty window, and after which the JIT code loads
 /// `base` again, if it needs it: its stencil takes only `state`, and passes on
@@ -339,7 +371,7 @@ macro_rules! windowed {
         $body:block
     ) => {
         $crate::window::windowed!(@sort
-            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body]
+            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body []]
             [] [] [] (0usize)
         );
     };
@@ -350,11 +382,30 @@ macro_rules! windowed {
         [$($cp:ident : $cpt:ty),* $(,)?],
         |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
         $body:block
+        $(cold $cold:block)?
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body]
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [$($cold)?]]
             [] [] [] (0usize) $($operands)*
         );
+    };
+    // The body of an op with no cold path, which never takes it.
+    (@hot $body:block) => {
+        { let () = unsafe { $body }; false }
+    };
+    (@hot $body:block, $cold:block) => {
+        unsafe { $body }
+    };
+    (@cold_body []) => {
+        {}
+    };
+    (@cold_body [$cold:block]) => {
+        $cold
+    };
+    // `code`, if the op has a cold path.
+    (@if_cold [] $($code:tt)*) => {};
+    (@if_cold [$cold:block] $($code:tt)*) => {
+        $($code)*
     };
     // Sort the operands into inputs and outputs, each with its window offset,
     // and their accesses in window order.
@@ -368,7 +419,7 @@ macro_rules! windowed {
         $crate::window::windowed!(@sort $decl [$($in)* ($op, $i)] [$($out)*] [$($acc)* Read] ($i + 1) $($($rest)*)?);
     };
     (@sort
-        [$kind:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block]
+        [$kind:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block [$($cold:block)?]]
         [$(($in:ident, $ii:expr))*] [$(($out:ident, $oi:expr))*] [$($acc:ident)*] ($arity:expr)
     ) => {
         $(#[$meta])*
@@ -378,7 +429,7 @@ macro_rules! windowed {
             operands: ::smallvec::SmallVec<[usize; $crate::window::WINDOW]>,
         }
 
-        #[allow(unused_variables, unused_mut, unused_assignments, unused_unsafe, clippy::too_many_arguments)]
+        #[allow(dead_code, unused_variables, unused_mut, unused_assignments, unused_unsafe, clippy::too_many_arguments)]
         impl<$(const $cp: $cpt),*> $name<$($cp),*> {
             pub const ARITY: usize = $arity;
             const ACCESSES: &'static [$crate::window::Access] = &[$($crate::window::Access::$acc),*];
@@ -392,7 +443,8 @@ macro_rules! windowed {
                 Self { $($cap,)* operands: operands.into() }
             }
 
-            /// The body, shared by the interpreter and the stencil.
+            /// The body, shared by the interpreter and the stencil: whether to
+            /// take the cold path.
             #[inline(always)]
             unsafe fn __run<'a, 'b, 'src, 'intern>(
                 $($cap: $cty,)*
@@ -401,8 +453,39 @@ macro_rules! windowed {
                 $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
                 $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
+            ) -> bool {
+                $crate::window::windowed!(@hot $body $(, $cold)?)
+            }
+
+            /// The cold path's body, shared by the interpreter and the cold
+            /// stencil: empty for an op with no cold path, which never runs it.
+            #[inline(always)]
+            unsafe fn __run_cold<'a, 'b, 'src, 'intern>(
+                $($cap: $cty,)*
+                $owner: &'a mut $crate::Owner,
+                $state: &'b mut $crate::vm::RunState<'src, 'intern>,
+                $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
+                $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
             ) {
-                unsafe { $body }
+                unsafe { $crate::window::windowed!(@cold_body [$($cold)?]) }
+            }
+
+            /// Run the cold path's body on the window `w` at `skip`, as
+            /// `__window` runs the body.
+            #[inline(always)]
+            unsafe fn __window_cold<'a, 'b, 'src, 'intern>(
+                $($cap: $cty,)*
+                owner: &'a mut $crate::Owner,
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+                base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
+                skip: usize,
+            ) {
+                $( let $in = w[skip + $ii]; )*
+                $( let mut $out = w[skip + $oi]; )*
+                unsafe { Self::__run_cold($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                $( w[skip + $oi] = $out; )*
             }
 
             /// Run the body on the window `w` at `skip`: read the inputs, write
@@ -415,14 +498,15 @@ macro_rules! windowed {
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
                 skip: usize,
-            ) {
+            ) -> bool {
                 $( let $in = w[skip + $ii]; )*
                 $( let mut $out = w[skip + $oi]; )*
-                unsafe { Self::__run($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let cold = unsafe { Self::__run($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
                 $( w[skip + $oi] = $out; )*
+                cold
             }
 
-            $crate::window::windowed!(@stencil $kind, [$($cap : $cty),*]);
+            $crate::window::windowed!(@stencil $kind, [$($cap : $cty),*] [$($cold)?]);
         }
 
         impl<$(const $cp: $cpt),*> $crate::window::Window for $name<$($cp),*> {
@@ -438,6 +522,12 @@ macro_rules! windowed {
                 Self::__stencil_at(skip)
             }
             fn next(&self) -> usize { Self::__next as *const () as usize }
+            $crate::window::windowed!(@if_cold [$($cold)?]
+                fn cold(&self, skip: usize) -> Option<usize> {
+                    assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
+                    Some(Self::__cold_at(skip))
+                }
+            );
             unsafe fn run<'src, 'intern>(
                 &self,
                 owner: &mut $crate::Owner,
@@ -447,7 +537,12 @@ macro_rules! windowed {
                 skip: usize,
             ) {
                 assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
-                unsafe { Self::__window($(self.$cap,)* owner, state, base, w, skip) }
+                let cold = unsafe { Self::__window($(self.$cap,)* owner, state, base, w, skip) };
+                $crate::window::windowed!(@if_cold [$($cold)?]
+                    if cold {
+                        unsafe { Self::__window_cold($(self.$cap,)* owner, state, base, w, skip) }
+                    }
+                );
             }
             fn on_stack<'src, 'intern>(
                 &self,
@@ -458,12 +553,20 @@ macro_rules! windowed {
                 let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(at).as_ptr() };
                 $( let $in = state.vals[at + self.operands[$ii]]; )*
                 $( let mut $out = state.vals[at + self.operands[$oi]]; )*
-                unsafe { Self::__run($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let cold = unsafe { Self::__run($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
                 $( state.vals[at + self.operands[$oi]] = $out; )*
+                $crate::window::windowed!(@if_cold [$($cold)?]
+                    if cold {
+                        $( let $in = state.vals[at + self.operands[$ii]]; )*
+                        $( let mut $out = state.vals[at + self.operands[$oi]]; )*
+                        unsafe { Self::__run_cold($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                        $( state.vals[at + self.operands[$oi]] = $out; )*
+                    }
+                );
             }
         }
     };
-    (@stencil window, [$($cap:ident : $cty:ty),*]) => {
+    (@stencil window, [$($cap:ident : $cty:ty),*] [$($cold:block)?]) => {
             /// The stencil running at `skip`.
             fn __stencil_at(skip: usize) -> usize {
                 match skip {
@@ -501,9 +604,73 @@ macro_rules! windowed {
                 let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
-                unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                let cold = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                // The window where it is, into the cold stencil. See Note [Cold stencils].
+                $crate::window::windowed!(@if_cold [$($cold)?]
+                    if cold {
+                        state.cold_site = unsafe { $crate::window::hole::<{ $crate::window::SITE_HOLE }>() } as *const u64;
+                        become Self::__cold::<SKIP>(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                    }
+                );
                 become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
             }
+
+            $crate::window::windowed!(@if_cold [$($cold)?]
+                /// The cold stencil at `skip`.
+                fn __cold_at(skip: usize) -> usize {
+                    match skip {
+                        0 => Self::__cold::<0> as *const () as usize,
+                        1 => Self::__cold::<1> as *const () as usize,
+                        2 => Self::__cold::<2> as *const () as usize,
+                        3 => Self::__cold::<3> as *const () as usize,
+                        4 => Self::__cold::<4> as *const () as usize,
+                        5 => Self::__cold::<5> as *const () as usize,
+                        6 => Self::__cold::<6> as *const () as usize,
+                        7 => Self::__cold::<7> as *const () as usize,
+                        8 => Self::__cold::<8> as *const () as usize,
+                        _ => unreachable!(),
+                    }
+                }
+
+                /// The cold stencil at `SKIP`: the cold path of every copy of the
+                /// stencil at `SKIP`, which jumps here with the window. Private,
+                /// as `__next` is, so the stencil's jump to it is a direct `jmp
+                /// rel32`, and never inlined into it, which would copy it. See
+                /// Note [Cold stencils].
+                #[inline(never)]
+                extern "rust-preserve-none" fn __cold<'b, 'src, 'intern, const SKIP: usize>(
+                    state: &'b mut $crate::vm::RunState<'src, 'intern>,
+                    base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                w0: $crate::lboxed::LBoxed<'src, 'intern>,
+                w1: $crate::lboxed::LBoxed<'src, 'intern>,
+                w2: $crate::lboxed::LBoxed<'src, 'intern>,
+                w3: $crate::lboxed::LBoxed<'src, 'intern>,
+                w4: $crate::lboxed::LBoxed<'src, 'intern>,
+                w5: $crate::lboxed::LBoxed<'src, 'intern>,
+                w6: $crate::lboxed::LBoxed<'src, 'intern>,
+                w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                w8: $crate::lboxed::LBoxed<'src, 'intern>,
+                ) {
+                    if SKIP + Self::ARITY > $crate::window::WINDOW {
+                        unsafe { core::hint::unreachable_unchecked() }
+                    }
+                    let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
+                    // The site's record: its fall-through, then its captures.
+                    let site = state.cold_site;
+                    $crate::window::bind_record!(site, 1; $($cap : $cty),*);
+                    unsafe { Self::__window_cold($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                    // SAFETY: the site's fall-through point, in JIT code, where
+                    // its copy's window continues, at the stack it jumped from.
+                    let fall: extern "rust-preserve-none" fn(
+                        &'b mut $crate::vm::RunState<'src, 'intern>,
+                        *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                        $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
+                        $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
+                        $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
+                    ) = unsafe { core::mem::transmute(*site) };
+                    become fall(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                }
+            );
 
             /// This op's `become` target; the `jmp` to it is sliced off when
             /// copying, so it never runs. Per-op and private (and generic over
@@ -531,7 +698,7 @@ macro_rules! windowed {
                 core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8));
             }
     };
-    (@stencil frame, [$($cap:ident : $cty:ty),*]) => {
+    (@stencil frame, [$($cap:ident : $cty:ty),*] []) => {
             /// The stencil, which only runs at `SKIP` 0.
             fn __stencil_at(skip: usize) -> usize {
                 assert_eq!(skip, 0, "a frame op runs at SKIP 0");
@@ -546,7 +713,7 @@ macro_rules! windowed {
                 let mut w = [$crate::lboxed::LBoxed::NIL; $crate::window::WINDOW];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
-                unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                let _ = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
                 become Self::__next(state)
             }
 
@@ -630,7 +797,8 @@ impl std::error::Error for StencilError {}
 /// slot and each function's size (to find the trailing `become`), at runtime
 /// addresses.
 pub struct Image {
-    holes: [Option<usize>; MAX_HOLES],
+    /// The GOT slot of each hole, the site hole last.
+    holes: [Option<usize>; MAX_HOLES + 1],
     sizes: HashMap<usize, usize>,
 }
 
@@ -657,9 +825,10 @@ impl Image {
             "__lunacy_hole1" => Some(1),
             "__lunacy_hole2" => Some(2),
             "__lunacy_hole3" => Some(3),
+            "__lunacy_site" => Some(SITE_HOLE),
             _ => None,
         };
-        let mut holes = [None; MAX_HOLES];
+        let mut holes = [None; MAX_HOLES + 1];
         // The GLOB_DAT relocation for a weak hole gives its GOT slot.
         for r in elf.dynrelas.iter() {
             let name = elf
@@ -776,6 +945,8 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
 
     let name = op.name();
     let addr = op.stencil(skip);
+    // Its cold stencil, which it may jump to. See Note [Cold stencils].
+    let cold = op.cold(skip);
     let &size = image.sizes.get(&addr).ok_or(StencilError::NotInSymtab { op: name })?;
     let code = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
 
@@ -830,13 +1001,16 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     // holds the loader-relocated address, so read it to check.
     let next = op.next();
     let got = |slot: usize| unsafe { core::ptr::read_unaligned(slot as *const usize) };
-    let jumps_to_next = |i: usize| -> Result<bool, StencilError> {
+    // Where the jump at `i` goes, as far as the body says: a direct jump's
+    // target, or the value in the GOT slot an indirect one's target is loaded
+    // from.
+    let jump_target = |i: usize| -> Result<Option<usize>, StencilError> {
         let (off, end, inst) = &insts[i];
         if inst.opcode() != Opcode::JMP {
-            return Ok(false);
+            return Ok(None);
         }
         Ok(match inst.operand(0) {
-            Operand::ImmediateI32 { imm } => (addr + end).wrapping_add(imm as isize as usize) == next,
+            Operand::ImmediateI32 { imm } => Some((addr + end).wrapping_add(imm as isize as usize)),
             Operand::Register { reg } => {
                 // The register's last writer, back through register-to-register
                 // moves, is the GOT load.
@@ -853,24 +1027,41 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
                     match feeder {
                         Some((j, (o, e, i))) if i.opcode() == Opcode::MOV => match i.operand(1) {
                             Operand::Register { reg: from } => (reg, before) = (from, j),
-                            _ => break rip_operand(*o, *e, i)?.is_some_and(|(_, t)| got(t) == next),
+                            _ => break rip_operand(*o, *e, i)?.map(|(_, t)| got(t)),
                         },
-                        _ => break false,
+                        _ => break None,
                     }
                 }
             }
-            _ => rip_operand(*off, *end, inst)?.is_some_and(|(_, t)| got(t) == next),
+            _ => rip_operand(*off, *end, inst)?.map(|(_, t)| got(t)),
         })
+    };
+    let jumps_to_next = |i: usize| -> Result<bool, StencilError> { Ok(jump_target(i)? == Some(next)) };
+    // Whether the body loads the cold stencil's address from its GOT slot: its
+    // jump there can then share an indirect jump with its `become`, which
+    // mustn't be sliced off, as the cold path goes through it too.
+    let loads_cold = match cold {
+        Some(cold) => insts
+            .iter()
+            .map(|(off, end, inst)| Ok(inst.opcode() != Opcode::LEA && rip_operand(*off, *end, inst)?.is_some_and(|(_, t)| got(t) == cold)))
+            .collect::<Result<Vec<bool>, StencilError>>()?
+            .into_iter()
+            .any(|loads| loads),
+        None => false,
     };
 
     // A final `become` is sliced off; otherwise the whole body is kept.
-    let sliced = jumps_to_next(insts.len() - 1)?;
+    let last = insts.len() - 1;
+    let indirect = !matches!(insts[last].2.operand(0), Operand::ImmediateI32 { .. });
+    let sliced = jumps_to_next(last)? && !(indirect && loads_cold);
     let kept = if sliced { insts.len() - 1 } else { insts.len() };
     let body_len = if sliced { insts[kept].0 } else { size };
 
     let mut holes: SmallVec<[(RipRel, usize); MAX_HOLES]> = SmallVec::new();
     let mut relocs: Vec<RipRel> = Vec::new();
     let mut nexts: Vec<NextRef> = Vec::new();
+    // Whether it jumps to its cold stencil, directly.
+    let mut jumps_cold = false;
     for (i, (off, end, inst)) in insts[..kept].iter().enumerate() {
         let (off, end) = (*off, *end);
         // Relative branches: operand 0 is the displacement from `end`.
@@ -887,6 +1078,10 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
                     if width == 4 && target == next {
                         // Another `become` (e.g. a duplicated tail).
                         nexts.push(NextRef::Direct(rel));
+                    } else if width == 4 && Some(target) == cold && inst.opcode() != Opcode::CALL {
+                        // Out to the cold stencil, which isn't copied.
+                        jumps_cold = true;
+                        relocs.push(rel);
                     } else if width == 4 && inst.opcode() == Opcode::CALL {
                         relocs.push(rel);
                     } else {
@@ -899,7 +1094,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
             // An indirect jump that isn't a `become` (e.g. through a jump table,
             // whose entries lead back into the original function) can't be
             // followed, so the copy would leave the chain.
-            _ if inst.opcode() == Opcode::JMP && !jumps_to_next(i)? => {
+            _ if inst.opcode() == Opcode::JMP && !jump_target(i)?.is_some_and(|t| t == next || Some(t) == cold) => {
                 return Err(StencilError::IndirectJump { op: name, at: off });
             }
             _ => {}
@@ -924,9 +1119,10 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     if !sliced && nexts.is_empty() {
         return Err(StencilError::NoBecome { op: name });
     }
-    // Between `sub rsp, 8` and `add rsp, 8` if it uses the stack. See Note
-    // [Stencil alignment].
-    let aligned = insts[..kept].iter().any(|(_, _, inst)| uses_stack(inst));
+    // Between `sub rsp, 8` and `add rsp, 8` if it uses the stack, or jumps to
+    // its cold stencil, a function, which starts where it jumps from. See Notes
+    // [Stencil alignment] and [Cold stencils].
+    let aligned = jumps_cold || loads_cold || insts[..kept].iter().any(|(_, _, inst)| uses_stack(inst));
     let prefix: &[u8] = if aligned { &SUB_RSP_8 } else { &[] };
     let shift = |r: RipRel| RipRel { field: r.field + prefix.len(), end: r.end + prefix.len(), ..r };
     let holes = holes.into_iter().map(|(r, i)| (shift(r), i)).collect();
@@ -953,6 +1149,30 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
 /// `ud2`, which traps: placed after a copied body that doesn't end in its
 /// `become`, which must never be reached.
 const UD2: [u8; 2] = [0x0f, 0x0b];
+
+// Note [Cold stencils]
+// ~~~~~~~~~~~~~~~~~~~~
+// A window op with a cold path (`windowed!`'s `cold` block) has a second
+// stencil per `SKIP`, `__cold::<SKIP>`, with the same parameters: its stencil
+// ends its hot path in a tail jump to it, with the window where it was, so the
+// hot path needs no call, and so saves nothing around one and moves no
+// arguments into place.
+//
+// The cold stencil isn't copied: every copy of the op at that `SKIP` shares the
+// one in this executable, and reaches it with a jump relocated like a call.
+// What differs between copies, their captures and where each continues, is the
+// site's record, `[fall-through address, captures...]`, which the JIT lays in
+// the region's pool: before the jump, the copy stores the record's address,
+// its site hole (`SITE_HOLE`), to `RunState::cold_site` (`become` wants the
+// callee's signature to be the caller's, so it can't be an argument). The cold
+// stencil binds the captures from the record, runs the cold block, and ends
+// in a tail jump to the record's fall-through address, the window where the
+// cold block left it.
+//
+// The cold stencil starts where its copy jumped from, so at the copied body's
+// stack: a body that jumps to its cold stencil is always copied between `sub
+// rsp, 8` and `add rsp, 8` (Note [Stencil alignment]), which leaves the stack
+// as a call would, and its fall-through point is the `add rsp, 8`.
 
 // Note [Stencil alignment]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1047,6 +1267,9 @@ pub unsafe fn assemble(
     let mut relocs: Vec<RipRel> = Vec::new();
     // Each continuation reference, with its copy's fall-through offset.
     let mut nexts: Vec<(NextRef, usize)> = Vec::new();
+    // Each site hole load, with its copy's captures and fall-through offset.
+    // See Note [Cold stencils].
+    let mut sites: Vec<(RipRel, Captures, usize)> = Vec::new();
     for &(op, skip) in ops {
         let body = unsafe { stencil_body(image, op, skip) }?;
         let captures = op.captures();
@@ -1054,7 +1277,12 @@ pub unsafe fn assemble(
         let shift = |r: RipRel| RipRel { field: r.field + at, end: r.end + at, ..r };
         code.extend_from_slice(&body.code);
         let fall = at + body.fall;
-        holes.extend(body.holes.iter().map(|&(r, i)| (shift(r), captures[i])));
+        for &(r, i) in &body.holes {
+            match i {
+                SITE_HOLE => sites.push((shift(r), captures.clone(), fall)),
+                i => holes.push((shift(r), captures[i])),
+            }
+        }
         relocs.extend(body.relocs.iter().map(|&r| shift(r)));
         nexts.extend(body.nexts.iter().map(|n| match *n {
             NextRef::Direct(r) => (NextRef::Direct(shift(r)), fall),
@@ -1073,6 +1301,12 @@ pub unsafe fn assemble(
     }
     let indirect = nexts.iter().filter(|(n, _)| matches!(n, NextRef::Indirect(_))).count();
     code.resize(code.len() + indirect * 8, 0);
+    // Then, per site hole load, a slot holding its record's address, and the
+    // record.
+    let records = code.len();
+    for (_, captures, _) in &sites {
+        code.resize(code.len() + (2 + captures.len()) * 8, 0);
+    }
 
     let map_err = |e: std::io::Error| StencilError::Map(e.to_string());
     let mut buf = map_near(code.len())?;
@@ -1094,6 +1328,17 @@ pub unsafe fn assemble(
     }
     for r in &relocs {
         r.patch(&mut code, base, r.target)?;
+    }
+    let mut at = records;
+    for (r, captures, fall) in &sites {
+        let record = at + 8;
+        code[at..at + 8].copy_from_slice(&((base + record) as u64).to_le_bytes());
+        r.patch(&mut code, base, base + at)?;
+        code[record..record + 8].copy_from_slice(&((base + fall) as u64).to_le_bytes());
+        for (i, value) in captures.iter().enumerate() {
+            code[record + 8 * (i + 1)..record + 8 * (i + 2)].copy_from_slice(&value.to_le_bytes());
+        }
+        at = record + 8 * (1 + captures.len());
     }
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), buf.as_mut_ptr(), code.len()) };
     buf.make_exec().map_err(map_err)

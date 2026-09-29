@@ -329,7 +329,8 @@ pub enum ResumeArg {
 
 // Initialize a hash key. `at` is `index << 8 | href`. Populate the witness `at` with `key`,
 // proving it both exists and is at the correct offset `index` for `tab`. See Note [Hash witnesses].
-// Selects 0 if the table has the key and 1 if not.
+// Selects 0 if the table has the key and 1 if not. The key found at `index`, with the witness's
+// slot there, is the hot path; the rest is its cold stencil (Note [Cold stencils] in `window`).
 windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
@@ -347,16 +348,18 @@ windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
             state.witness_top = state.witness_top.max(hidx + 1);
             state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast() };
             state.select = 0;
+            false
         },
-        // The slow path is intentionally out of line, for code size reasons.
-        _ => href_init_slow(owner, state, table, href, index, key),
+        _ => true,
     }
+} cold {
+    let (href, index) = (at as u8, (at >> 8) as usize);
+    href_init_slow(owner, state, table, href, index, key);
 });
 
 /// `HrefInit` when the key isn't at `index`, or the witness's slot isn't there yet. Also handles
 /// growing the witness vector, which is also unlikely. `rust-cold` (LLVM's `preserve_most`), so
-/// the callee saves the registers it uses and the stencil's fast path needn't save its window
-/// around the call.
+/// the cold stencil calling it with its window live needn't save the window around the call.
 extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, href: u8, index: usize, key: u64) {
     let hidx = state.witness_base + href as usize;
     if state.hash_witnesses.len() <= hidx {
