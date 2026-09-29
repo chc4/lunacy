@@ -1713,12 +1713,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// The context a jump in `ctx` to `dest_pc` carries: it forgets the types of
     /// every register not holding a local in scope there (`forgotten`), and the
-    /// fragile facts about them, which lets paths that differ only in them share
-    /// the target's version.
+    /// fragile facts about them, and which array a value of known type was
+    /// loaded from, which lets paths that differ only in them share the target's
+    /// version.
     fn jumping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
         let in_scope = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(dest_pc);
         if let Some(in_scope) = in_scope.filter(|&in_scope| forgets(&ctx, in_scope)) {
             forget_dead(owner, Rc::make_mut(&mut ctx), in_scope);
+        }
+        // An element of a known type was guarded, or its array's kind is known:
+        // what it was loaded from tells no more. Only the version jumped to is
+        // found without it, so it still accepts the jump. See Note [Array kinds].
+        let typed = |fact: &Fragile| matches!(fact, Fragile::ElementOf { slot, .. } if ctx.slot(*slot) != CType::Type(LType::Unknown));
+        if ctx.fragile.iter().any(typed) {
+            let forgotten: Vec<Fragile> = ctx.fragile.iter().filter(|fact| typed(fact)).cloned().collect();
+            Rc::make_mut(&mut ctx).fragile.retain(|fact| !forgotten.contains(fact));
         }
         ctx
     }
@@ -1848,9 +1857,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let Some(table) = kind_of {
                 forced_mut.assume(Fragile::Kind { table, kind: found_field });
             }
-            // What the element's provenance was for is found out, so the paths
-            // continuing from here are alike whatever the element's origin.
-            forced_mut.fragile.retain(|fact| !matches!(fact, Fragile::ElementOf { slot, .. } if *slot == idx));
             if let Some(href) = field {
                 forced_mut.hkeys[href.0 as usize].known_type = found_field;
             }
