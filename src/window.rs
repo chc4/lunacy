@@ -1037,23 +1037,9 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
         })
     };
     let jumps_to_next = |i: usize| -> Result<bool, StencilError> { Ok(jump_target(i)? == Some(next)) };
-    // Whether the body loads the cold stencil's address from its GOT slot: its
-    // jump there can then share an indirect jump with its `become`, which
-    // mustn't be sliced off, as the cold path goes through it too.
-    let loads_cold = match cold {
-        Some(cold) => insts
-            .iter()
-            .map(|(off, end, inst)| Ok(inst.opcode() != Opcode::LEA && rip_operand(*off, *end, inst)?.is_some_and(|(_, t)| got(t) == cold)))
-            .collect::<Result<Vec<bool>, StencilError>>()?
-            .into_iter()
-            .any(|loads| loads),
-        None => false,
-    };
 
     // A final `become` is sliced off; otherwise the whole body is kept.
-    let last = insts.len() - 1;
-    let indirect = !matches!(insts[last].2.operand(0), Operand::ImmediateI32 { .. });
-    let sliced = jumps_to_next(last)? && !(indirect && loads_cold);
+    let sliced = jumps_to_next(insts.len() - 1)?;
     let kept = if sliced { insts.len() - 1 } else { insts.len() };
     let body_len = if sliced { insts[kept].0 } else { size };
 
@@ -1094,7 +1080,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
             // An indirect jump that isn't a `become` (e.g. through a jump table,
             // whose entries lead back into the original function) can't be
             // followed, so the copy would leave the chain.
-            _ if inst.opcode() == Opcode::JMP && !jump_target(i)?.is_some_and(|t| t == next || Some(t) == cold) => {
+            _ if inst.opcode() == Opcode::JMP && !jumps_to_next(i)? => {
                 return Err(StencilError::IndirectJump { op: name, at: off });
             }
             _ => {}
@@ -1122,7 +1108,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     // Between `sub rsp, 8` and `add rsp, 8` if it uses the stack, or jumps to
     // its cold stencil, a function, which starts where it jumps from. See Notes
     // [Stencil alignment] and [Cold stencils].
-    let aligned = jumps_cold || loads_cold || insts[..kept].iter().any(|(_, _, inst)| uses_stack(inst));
+    let aligned = jumps_cold || insts[..kept].iter().any(|(_, _, inst)| uses_stack(inst));
     let prefix: &[u8] = if aligned { &SUB_RSP_8 } else { &[] };
     let shift = |r: RipRel| RipRel { field: r.field + prefix.len(), end: r.end + prefix.len(), ..r };
     let holes = holes.into_iter().map(|(r, i)| (shift(r), i)).collect();

@@ -26,7 +26,9 @@ test:
     cargo test --test gc_reset_frees
 
 # Copy&patch window stencils (src/window.rs) as the JIT will use them: built
-# with the `stencils` profile, optimized like release. The window unit
+# in release, so the stencils checked are the ones the JIT copies (a build
+# with any other optimization, codegen units or LTO compiles them to different
+# code: `tools/stencil_diff.py` compares two builds'). The window unit
 # tests also run in `just test` (debug); this runs them against optimized
 # stencils, then the golden suite with `check_windows`: every window op the
 # interpreter executes is also copy&patched and run natively, and the results
@@ -35,7 +37,7 @@ test:
 # interpreter path under the JIT's register allocation). (At opt-level 0,
 # `NumericRR` keeps a jump table from the unfolded `match OP`, which the
 # copier rejects: the check skips it and the JIT calls into the interpreter.)
-STENCIL_OPT := "--profile stencils"
+STENCIL_OPT := "--release"
 [env("RUST_BACKTRACE","1")]
 test-stencils:
     cargo test --features check_windows --lib window:: {{STENCIL_OPT}}
