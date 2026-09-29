@@ -427,6 +427,18 @@ pub struct Table<'src, 'intern> {
     pub kind: u8,
 }
 
+/// How a store into an array part widens its kind. See Note [Array kinds] in
+/// `specialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
+pub enum Widen {
+    /// The kind has the value's representation already.
+    No,
+    /// By the value's representation, known when compiling.
+    Bit(LType),
+    /// By the value's representation, found out from its tag.
+    Decode,
+}
+
 thread_local! {
     /// How many times the global environment's hash entries have moved: global
     /// caches holding an entry's address are valid while it's unchanged. See
@@ -455,6 +467,16 @@ impl<'src, 'intern> Table<'src, 'intern> {
     #[inline(always)]
     pub fn widen_kind(&mut self, t: LType) {
         self.kind |= t.bit();
+    }
+
+    /// Note `value` stored in the array part, as `how` says.
+    #[inline(always)]
+    pub fn widen_by(&mut self, how: Widen, value: LBoxed<'src, 'intern>) {
+        match how {
+            Widen::No => {}
+            Widen::Bit(t) => self.widen_kind(t),
+            Widen::Decode => self.widen_kind(value.representation()),
+        }
     }
 
     /// Insert into the hash part. A new key may reallocate the entries, moving
@@ -523,6 +545,12 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
 
     #[inline]
     pub fn set(&mut self, owner: &mut Owner, key: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) {
+        self.set_widening(owner, key, value, intern, Widen::Decode)
+    }
+
+    /// `set`, a value stored in the array part widening its kind as `how` says.
+    #[inline]
+    pub fn set_widening(&mut self, owner: &mut Owner, key: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>, how: Widen) {
         self.barrier_back();
         if let Some(slot) = key.as_number().and_then(array_slot) {
             // TODO: sparse arrays
@@ -534,7 +562,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
                 self.rw(owner).array.resize_with(slot + 1, || LBoxed::NIL);
             }
             self.rw(owner).array[slot] = value;
-            self.rw(owner).widen_kind(value.representation());
+            self.rw(owner).widen_by(how, value);
             return;
         }
         let k = LCanon::new(key, intern);

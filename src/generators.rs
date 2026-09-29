@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Location, Upvalue};
 use qcell::{LCell, LCellOwner};
 use crate::Owner;
-use crate::vm::{Tc, Vm};
+use crate::vm::{Tc, Vm, Widen};
 use crate::vm::{BlockId, HashRef};
 use crate::vm::{LClosure, LProto};
 use crate::vm::{LValue, LType, Number, Table, FVec, LBoxed, LCanon, IStr};
@@ -384,26 +384,10 @@ pub enum Retype {
     Unknown,
 }
 
-/// How a store into an array part widens its kind. See Note [Array kinds] in
-/// `specialize`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
-pub enum Widen {
-    /// The kind has the value's representation already.
-    No,
-    /// By the value's representation, known when compiling.
-    Bit(LType),
-    /// By the value's representation, found out from its tag.
-    Decode,
-}
-
 /// Widen `tab`'s kind for a store of `value`, as `W` says.
 #[inline(always)]
 fn store_kind<'src, 'intern, const W: Widen>(owner: &mut Owner, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>) {
-    match W {
-        Widen::No => {}
-        Widen::Bit(t) => tab.rw(owner).kind |= t.bit(),
-        Widen::Decode => tab.rw(owner).widen_kind(value.representation()),
-    }
+    tab.rw(owner).widen_by(W, value);
 }
 
 /// `$make!` of the const `Widen` that `$how` is.
@@ -535,20 +519,13 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // The stored value's representation, which widens the array's kind: found
         // out by the store if the context doesn't know it (`Unknown`). See Note
         // [Array kinds].
-        let stored = if matches!(in_array, ResumeArg::Matched) {
-            let ResumeArg::Type(t) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-            t.as_ltype()
-        } else {
-            LType::Unknown
-        };
+        let ResumeArg::Type(stored) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
+        let stored = stored.as_ltype();
         // A value of the array's known kind keeps it, and so does one of its
         // elements: the store needn't widen it, and an element changes no kind.
-        let own = matches!(in_array, ResumeArg::Matched)
-            && c & 0x100 == 0
-            && (yield YieldOp::IsElementOf(c, a)) == ResumeArg::Matched;
+        let own = c & 0x100 == 0 && (yield YieldOp::IsElementOf(c, a)) == ResumeArg::Matched;
         let widen = !(own
-            || (matches!(in_array, ResumeArg::Matched)
-                && stored != LType::Unknown
+            || (stored != LType::Unknown
                 && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(stored))));
         // How the store widens the array's kind: not at all, by the value's
         // representation, known here, or by the value's found out.
@@ -631,7 +608,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Err(lv) => *lv,
                 };
                 let LValue::Table(mut t) = state.vals[state.base + a].unbox() else { unreachable!() };
-                t.set(owner, LBoxed::from_number(kb), kc, state.intern);
+                t.set_widening(owner, LBoxed::from_number(kb), kc, state.intern, how);
             })));
         } else {
             // Hash part set
