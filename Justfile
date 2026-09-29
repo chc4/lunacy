@@ -653,7 +653,8 @@ _jit-sizes dir ref='':
         if (cd {{dir}}/working && cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
                 --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- $benchmark.bin $times) \
                 > working/jit-size-$benchmark.log 2>&1; then
-            python3 tools/bench_history.py record-size {{dir}}/working/jit_disasm.txt --benchmark $benchmark --arg $times {{ if ref == "" { "" } else { "--ref " + ref } }}
+            python3 tools/bench_history.py record-size {{dir}}/working/jit_disasm.txt --benchmark $benchmark --arg $times {{ if ref == "" { "" } else { "--ref " + ref } }} \
+                || echo "skipped $benchmark $times: no size recorded"
         else
             echo "skipped $benchmark $times: its run failed (working/jit-size-$benchmark.log)"
         fi
