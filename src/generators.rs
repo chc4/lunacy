@@ -470,24 +470,24 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         } else {
             None
         };
-        // Counts the array part store about to be emitted by what's known of the
-        // value's type (`PerfCounters::array_stores`).
+        // Counts the store about to be emitted in `PerfCounters::$counters` by
+        // what's known of the value's type.
         #[cfg(feature = "store_types")]
-        macro_rules! count_array_store {
-            () => {
+        macro_rules! count_store {
+            ($counters:ident) => {
                 let ResumeArg::Type(t) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
                 let known = match t { CType::Type(LType::Unknown) => 0, CType::Number => 1, _ => 2 };
-                yield YieldOp::Exec(ResidualExec::new("count_array_store", Rc::new(move |owner, state| {
-                    state.counters.array_stores[known].increment();
+                yield YieldOp::Exec(ResidualExec::new("count_store", Rc::new(move |owner, state| {
+                    state.counters.$counters[known].increment();
                 })));
             };
         }
         #[cfg(not(feature = "store_types"))]
-        macro_rules! count_array_store {
-            () => {};
+        macro_rules! count_store {
+            ($counters:ident) => {};
         }
         if let (Some(_), ResumeArg::Matched) = (integer, &in_array) {
-            count_array_store!();
+            count_store!(array_stores);
         }
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableArray, [k: i32], [], |owner, state, base| (table, value) {
@@ -527,7 +527,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             });
         } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = (yield YieldOp::GuardCType(b, CType::Number)) {
             // Any other number key, or one past the array part: through `set`.
-            count_array_store!();
+            count_store!(array_stores);
             arg = yield YieldOp::Exec(ResidualExec::new("settable_array", Rc::new(move |owner, state| {
                 let kb: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                     Ok(b) => LValue::from(b),
@@ -546,6 +546,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = ResumeArg::Failed;
             arg = yield YieldOp::TryHashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
+                count_store!(field_stores);
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
                 let new_type = value_type.as_ltype();
                 let retype = retype(new_type, htype);

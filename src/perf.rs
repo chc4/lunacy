@@ -45,6 +45,8 @@ pub struct PerfCounters {
     /// past it) run, by what the specializer knew of the value's type: nothing,
     /// that it's a number, or its type. Feature `store_types`.
     pub array_stores: [Counter; 3],
+    /// Hash field stores through a hash key's witness run, by the same.
+    pub field_stores: [Counter; 3],
 }
 
 impl std::fmt::Debug for PerfCounters {
@@ -53,6 +55,8 @@ impl std::fmt::Debug for PerfCounters {
         write!(f, " versioned_count({})", self.versioned_count)?;
         #[cfg(feature = "store_types")]
         write!(f, " array_stores(unknown {}, number {}, typed {})", self.array_stores[0], self.array_stores[1], self.array_stores[2])?;
+        #[cfg(feature = "store_types")]
+        write!(f, " field_stores(unknown {}, number {}, typed {})", self.field_stores[0], self.field_stores[1], self.field_stores[2])?;
         write!(f, " }}")
     }
 }

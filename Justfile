@@ -587,9 +587,9 @@ HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler
 bench-runs fraction='0.1' *benchmarks:
     python3 tools/bench_runs.py --fraction {{fraction}} {{benchmarks}}
 
-# The array part stores each run of HYPERFINES does, by what the specializer
-# knew of each stored value's type: nothing, that it's a number, or its type
-# (feature `store_types`), from the run's counters.
+# The array part stores and hash field stores each run of HYPERFINES does, by
+# what the specializer knew of each stored value's type: nothing, that it's a
+# number, or its type (feature `store_types`), from the run's counters.
 store-types:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -597,7 +597,7 @@ store-types:
     for run in {{HYPERFINES}}; do
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark > /dev/null
-        echo "$benchmark $times: $(cd working && ../target/store_types/release/bench $benchmark.bin $times | grep -o 'array_stores([^)]*)' | tail -1)"
+        echo "$benchmark $times: $(cd working && ../target/store_types/release/bench $benchmark.bin $times | grep -o 'array_stores([^)]*) field_stores([^)]*)' | tail -1)"
     done
 
 # `hyperfine` over HYPERFINES.
