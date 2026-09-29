@@ -76,6 +76,11 @@ window-runs benchmark times='20':
 # jump transfers, and the window after it.
 # With `ref`, revision `ref`'s (in target/compare/<ref>, as for `hyperfine-vs`)
 # on this checkout's benchmark, in target/compare/<ref>/window_dump.txt.
+# The allocator code a benchmark's run executed most, from its window dump
+# (tools/window_hot.py): `args` as the tool takes them (`--blocks`, `--top N`).
+window-hot benchmark times='20' *args: (window-dump benchmark times)
+    python3 tools/window_hot.py working/window_dump.txt {{args}}
+
 window-dump benchmark times='20' ref='':
     #!/usr/bin/env bash
     set -euo pipefail
@@ -627,7 +632,8 @@ hyperfines:
     python3 tools/bench_history.py report
 
 # The JIT code size of each benchmark of HYPERFINES run by checkout `dir`
-# (this one, or revision `ref`'s compare worktree), from its annotated
+# (this one, or revision `ref`'s compare worktree) on the benchmark as that
+# checkout compiles it, from its annotated
 # disassembly (as `jit-disasm` makes it), into the size history
 # (tools/bench_history.py record-size). A benchmark whose run fails is left
 # out, its output in working/jit-size-<benchmark>.log.
@@ -637,8 +643,12 @@ _jit-sizes dir ref='':
     mkdir -p {{dir}}/working
     for run in {{HYPERFINES}}; do
         benchmark=${run%:*}; times=${run#*:}
-        just _luac $benchmark > /dev/null
-        [ {{dir}} = . ] || cp working/$benchmark.bin {{dir}}/working/
+        # The benchmark as the checkout itself compiles it: an older one can't
+        # run a newer one's bytecode. Before its recipes made their artifacts
+        # in working/, `_luac` wrote <benchmark>.bin at the top.
+        rm -f {{dir}}/working/$benchmark.bin {{dir}}/$benchmark.bin
+        (cd {{dir}} && just _luac $benchmark > /dev/null)
+        [ -f {{dir}}/working/$benchmark.bin ] || mv {{dir}}/$benchmark.bin {{dir}}/working/
         rm -f {{dir}}/working/jit_disasm.txt
         if (cd {{dir}}/working && cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
                 --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- $benchmark.bin $times) \
