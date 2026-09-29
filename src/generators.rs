@@ -524,9 +524,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // A value of the array's known kind keeps it, and so does one of its
         // elements: the store needn't widen it, and an element changes no kind.
         let own = c & 0x100 == 0 && (yield YieldOp::IsElementOf(c, a)) == ResumeArg::Matched;
+        // A mixed array stays mixed whatever is stored into it.
+        let known = yield YieldOp::ArrayKind(a);
         let widen = !(own
-            || (stored != LType::Unknown
-                && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(stored))));
+            || known == ResumeArg::Type(CType::Type(LType::Unknown))
+            || (stored != LType::Unknown && known == ResumeArg::Type(CType::Type(stored))));
         // How the store widens the array's kind: not at all, by the value's
         // representation, known here, or by the value's found out.
         let how = match (widen, stored) {
@@ -1145,11 +1147,9 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
     #[coroutine]
     move |mut arg: ResumeArg| {
         // TODO: __eq metatable?
-        arg = yield YieldOp::GetBlock(pc);
-        let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
-        arg = yield YieldOp::GetBlock((pc as isize + 1 as isize) as usize);
-        let ResumeArg::BlockId(taken) = arg else { unreachable!() };
-
+        // The targets are found after the guards, so they're versioned for what
+        // the guards found out.
+        let (fallthrough, taken) = (pc, pc + 1);
         arg = yield YieldOp::Guard(a, LType::Bool);
         if let ResumeArg::Matched = arg {
             // `select` is 1, the fallthrough, when the guarded bool is `C`.
@@ -1161,18 +1161,17 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
             } else {
                 Rc::new(TestBool::<false>::new(&[a]))
             });
+            let ResumeArg::BlockId(fallthrough) = (yield YieldOp::GetBlock(fallthrough)) else { unreachable!() };
+            let ResumeArg::BlockId(taken) = (yield YieldOp::GetBlock(taken)) else { unreachable!() };
             arg = yield YieldOp::Select(vec![("taken", taken), ("fallthrough", fallthrough)]);
             return arg
         }
         // The next instruction (a jump) runs when R(A)'s truthiness is C, else it
-        // is skipped. Nil is false.
+        // is skipped. Nil is false, and everything else true.
         arg = yield YieldOp::Guard(a, LType::Nil);
-        if let ResumeArg::Matched = arg {
-            arg = yield YieldOp::Jump(if c == 0 { fallthrough } else { taken });
-            return arg;
-        }
-        // Everything else is true.
-        arg = yield YieldOp::Jump(if c != 0 { fallthrough } else { taken });
+        let truthy = arg != ResumeArg::Matched;
+        let ResumeArg::BlockId(target) = (yield YieldOp::GetBlock(if truthy == (c != 0) { fallthrough } else { taken })) else { unreachable!() };
+        arg = yield YieldOp::Jump(target);
         arg
     }
 }

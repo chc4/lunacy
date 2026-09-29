@@ -1027,6 +1027,10 @@ pub struct Context {
 // of the arrays it reads elements of, so its later iterations, versioned for what the back edges
 // carry, read them unguarded.
 //
+// A guard finding out the representation of an element of a mixed array knows that too
+// (`Kind` of `Unknown`): it stays mixed however it is stored into, and a store into it needn't
+// widen its kind, which no guard then tests.
+//
 // Every store into an array part widens its kind, but for a value of a kind the context knows the
 // array has, or an element of the same array, which its kind covers. A store may be into any table
 // the context knows the kind of, through another slot, so it keeps only the known kinds of the
@@ -1091,8 +1095,8 @@ pub enum Fragile {
     /// Stack slot `slot` holds a value loaded from the array part of the table
     /// in slot `table`. See Note [Array kinds].
     ElementOf { slot: usize, table: usize },
-    /// The array part of the table in slot `table` has kind `kind`. See Note
-    /// [Array kinds].
+    /// The array part of the table in slot `table` has kind `kind`: `Unknown`
+    /// if mixed. See Note [Array kinds].
     Kind { table: usize, kind: LType },
 }
 
@@ -1140,8 +1144,8 @@ impl Fragile {
             // The value stays where it was loaded from.
             (Fragile::ElementOf { .. }, Effect::ArrayStore(_)) => true,
             // Any table may be the one stored into: one of kind `kind` keeps it
-            // only for a value of that kind.
-            (Fragile::Kind { kind, .. }, Effect::ArrayStore(stored)) => stored == *kind,
+            // only for a value of that kind, and a mixed one stays mixed.
+            (Fragile::Kind { kind, .. }, Effect::ArrayStore(stored)) => *kind == LType::Unknown || stored == *kind,
         }
     }
 }
@@ -1840,10 +1844,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // An element of an array part whose kind is the element's
             // representation: the array's kind is tested in place of the
             // element's, and is known after. See Note [Array kinds].
-            let kind_of = thunk_ctx.element_of(idx).filter(|&table| {
+            // The runtime kind of the array the element was loaded from.
+            let array = thunk_ctx.element_of(idx).map(|table| {
                 let LValue::Table(tab) = state.vals[state.base + table].unbox() else { unreachable!("an element of a slot not holding a table") };
-                tab.ro(owner).kind == found_field.bit()
+                (table, tab.ro(owner).kind)
             });
+            let kind_of = array.filter(|&(_, kind)| kind == found_field.bit()).map(|(table, _)| table);
             // A value the context knows is a number only has its encoding tested.
             let guard = if let Some(table) = kind_of {
                 Residual::GuardDynamic(Rc::new(KindIs::new(found_field, &[table])))
@@ -1857,6 +1863,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             forced_mut.types[idx] = found.clone();
             if let Some(table) = kind_of {
                 forced_mut.assume(Fragile::Kind { table, kind: found_field });
+            }
+            // An array of two representations or more stays mixed.
+            if let Some((table, _)) = array.filter(|&(_, kind)| kind.count_ones() > 1) {
+                forced_mut.assume(Fragile::Kind { table, kind: LType::Unknown });
             }
             if let Some(href) = field {
                 forced_mut.hkeys[href.0 as usize].known_type = found_field;
