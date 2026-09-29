@@ -449,7 +449,9 @@ hyperfine benchmark times='10': unsafe-compile
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
     cargo build --release --bin bench
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
+    # A build whose run fails (e.g. past the JIT buffer's end) is still timed,
+    # and left out of the history for its exit code.
+    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
         -n "luajit -joff" "luajit -joff bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
         -n luajit "luajit bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
