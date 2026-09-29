@@ -557,6 +557,12 @@ perf-stat-vs ref benchmark times='10' runs='5' profile='unsafe': (_build-vs ref)
         target/compare/{{ref}}/target/{{profile}}/bench working/{{benchmark}}.bin {{times}} > /dev/null
     taskset -c {{CPU}} perf stat -r {{runs}} -e task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
         ./target/{{profile}}/bench working/{{benchmark}}.bin {{times}} > /dev/null
+# `perf-stat-vs` over HYPERFINES (tools/perf_stat_vs.py): instructions, branches
+# and cycles of revision `ref`'s build of `profile` and this checkout's on each
+# run, `runs` times each: the work done, apart from layout.
+perf-stats-vs ref runs='3' profile='unsafe': (_build-vs ref)
+    python3 tools/perf_stat_vs.py --cpu {{CPU}} --runs {{runs}} target/compare/{{ref}}/target/{{profile}}/bench ./target/{{profile}}/bench {{HYPERFINES}}
+
 # Compare this checkout's release build with and without cargo feature
 # `feature` on one benchmark: the feature's build is in target/features/<feature>.
 hyperfine-feature feature benchmark times='10':
