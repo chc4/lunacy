@@ -591,7 +591,7 @@ windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, VARARG: bool, A: Co
 // the element's own tag. See Note [Array kinds].
 windowed!(KindIs, [kind: LType], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    state.select = (tab.ro(owner).kind != Some(kind)) as usize;
+    state.select = (tab.ro(owner).kind != kind.bit()) as usize;
 });
 
 // `arrive` for the call of R(A) before it. `ac` is its `a | c << 16` (as `Count::hold` holds
@@ -1013,9 +1013,10 @@ pub struct Context {
 
 // Note [Array kinds]
 // ~~~~~~~~~~~~~~~~~~
-// A table's array part has a kind: the representation of every value stored in it since it was
-// last emptied, `Unknown` (mixed) once two differ. A kind only widens while the array holds
-// values, so a table whose kind is a representation holds only values of it.
+// A table's array part has a kind: the representations of the values stored in it since it was
+// last emptied, one bit each, which every store sets with no test. It is of a single kind when one
+// bit is set, and mixed once two are. A kind only widens while the array holds values, so a table
+// of a single kind holds only values of it.
 //
 // The context learns kinds as fragile information. A load from an array part of known kind has
 // that type with no test. Any other load's slot is an element of its table (`ElementOf`), and a
@@ -1841,7 +1842,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // element's, and is known after. See Note [Array kinds].
             let kind_of = thunk_ctx.element_of(idx).filter(|&table| {
                 let LValue::Table(tab) = state.vals[state.base + table].unbox() else { unreachable!("an element of a slot not holding a table") };
-                tab.ro(owner).kind == Some(found_field)
+                tab.ro(owner).kind == found_field.bit()
             });
             // A value the context knows is a number only has its encoding tested.
             let guard = if let Some(table) = kind_of {

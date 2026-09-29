@@ -678,12 +678,18 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
                     tab.barrier_back();
                     let start = state.base + a as usize + 1;
                     let end = if b == 0 { state.top } else { start + b as usize };
-                    let src = state.vals[start..end].iter().cloned();
+                    // The first batch replaces the whole array part: its kind is
+                    // its values', as are a later batch's added.
+                    let mut kind = if c == 1 { 0 } else { tab.ro(owner).kind };
+                    let src = state.vals[start..end].iter().map(|v| {
+                        kind |= v.representation().bit();
+                        *v
+                    });
                     tab.rw(owner).array.splice(
                         (c as usize-1)*50..,
                         src
                     ).for_each(drop);
-                    tab.rw(owner).reset_kind();
+                    tab.rw(owner).kind = kind;
                 },
                 _ => unreachable!(),
             };

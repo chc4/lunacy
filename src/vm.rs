@@ -421,10 +421,10 @@ pub struct Table<'src, 'intern> {
     /// Whether this is the global environment. See Note [Global caches] in
     /// `generator`.
     pub environment: bool,
-    /// The array part's kind: the representation of every value stored in it
-    /// since it was last emptied, `Unknown` if they differ, `None` if none was.
-    /// See Note [Array kinds] in `specialize`.
-    pub kind: Option<LType>,
+    /// The array part's kind: the representations of the values stored in it
+    /// since it was last emptied, a bit each (`LType::bit`). It is of a single
+    /// kind when one bit is set. See Note [Array kinds] in `specialize`.
+    pub kind: u8,
 }
 
 thread_local! {
@@ -446,7 +446,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
             hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
             epoch: 0,
             environment: false,
-            kind: (array > 0).then_some(LType::Nil),
+            kind: if array > 0 { LType::Nil.bit() } else { 0 },
         }
     }
 
@@ -454,21 +454,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
     /// [Array kinds] in `specialize`.
     #[inline(always)]
     pub fn widen_kind(&mut self, t: LType) {
-        match self.kind {
-            Some(k) if k == t || k == LType::Unknown => {}
-            None => self.kind = Some(t),
-            Some(_) => self.kind = Some(LType::Unknown),
-        }
-    }
-
-    /// The array part's kind computed again from its values, for an array part
-    /// replaced whole.
-    pub fn reset_kind(&mut self) {
-        self.kind = None;
-        for i in 0..self.array.len() {
-            let t = self.array[i].representation();
-            self.widen_kind(t);
-        }
+        self.kind |= t.bit();
     }
 
     /// Insert into the hash part. A new key may reallocate the entries, moving
@@ -796,6 +782,13 @@ pub enum LType {
 }
 
 impl LType {
+    /// This representation's bit in an array part's kind. See Note [Array
+    /// kinds] in `specialize`.
+    #[inline(always)]
+    pub fn bit(self) -> u8 {
+        1 << self as u8
+    }
+
     /// Whether a value of type `other` is one of type `self`: `other` is
     /// `self`, or `self` is `Unknown`.
     pub fn accepts(self, other: LType) -> bool {
@@ -1837,7 +1830,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             ),
             epoch: 0,
             environment: true,
-            kind: None,
+            kind: 0,
         });
         // `_g` needs no explicit root: it lives in the `RunState` (`RunState::mark` shades it)
         // for the whole run, which is the only time a collection can see it. See Note [GC roots].

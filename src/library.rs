@@ -469,7 +469,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             hash: IndexMap::with_capacity_and_hasher(number_or(arg(&args, 1), 0.0) as usize, InternedHasher::default()),
             epoch: 0,
             environment: false,
-            kind: None,
+            kind: 0,
         };
         smallvec![LBoxed::box_lvalue(LValue::Table(Tc::new(t)))]
     });
@@ -477,7 +477,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let t = table(arg(&args, 0));
         let t = t.rw(owner);
         t.array.clear();
-        t.kind = None;
+        t.kind = 0;
         t.clear_hash();
         t.epoch += 1;
         smallvec![]
