@@ -217,8 +217,9 @@ pub enum YieldOp {
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
-    ArrayKind(usize), // Resumed with Matched if the context knows the kind of STACK[idx]'s array part,
-                      // or that it has a single kind, else Failed. See Note [Array kinds]
+    ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
+                      // knows it, Matched if it knows only that it has a single kind, else Failed.
+                      // See Note [Array kinds]
     Homogeneous(usize), // Inform the executor that STACK[idx]'s array part has a single kind.
                         // See Note [Array kinds]
     ArrayType(usize, usize), // Inform the executor that STACK[a] was loaded from STACK[b]'s array
@@ -2313,7 +2314,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Rc::make_mut(&mut ctx).effect(effect);
                 },
                 CoroutineState::Yielded(YieldOp::ArrayKind(table)) => {
-                    arg = if ctx.array_kind(table).is_some() || ctx.homogeneous(table) { ResumeArg::Matched } else { ResumeArg::Failed };
+                    arg = match ctx.array_kind(table) {
+                        Some(kind) => ResumeArg::Type(CType::Type(kind)),
+                        None if ctx.homogeneous(table) => ResumeArg::Matched,
+                        None => ResumeArg::Failed,
+                    };
                 },
                 CoroutineState::Yielded(YieldOp::Homogeneous(table)) => {
                     Rc::make_mut(&mut ctx).assume(Fragile::Homogeneous { table });

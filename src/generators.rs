@@ -311,7 +311,7 @@ crate::window::windowed!(Homogeneous, [], [], |owner, state, base| (table) {
 /// single kind, unless the context knows. See Note [Array kinds].
 macro_rules! array_kind {
     ($table:expr) => {
-        if (yield YieldOp::ArrayKind($table)) != ResumeArg::Matched
+        if (yield YieldOp::ArrayKind($table)) == ResumeArg::Failed
             && (yield YieldOp::GuardDynamic(Rc::new(Homogeneous::new(&[$table])))) == ResumeArg::Matched
         {
             yield YieldOp::Homogeneous($table);
@@ -519,47 +519,63 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         } else {
             LType::Unknown
         };
+        // A value of the array's known kind keeps it: the store needn't widen it.
+        let widen = !(matches!(in_array, ResumeArg::Matched)
+            && stored != LType::Unknown
+            && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(stored)));
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableArray, [k: i32, stored: LType], [], |owner, state, base| (table, value) {
+            windowed!(SetTableArray, [k: i32, stored: LType], [WIDEN: bool], |owner, state, base| (table, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
                 tab.rw(owner).array[integer_slot(k)] = value;
-                tab.rw(owner).widen_kind(if stored == LType::Unknown { value.representation() } else { stored });
+                if WIDEN {
+                    tab.rw(owner).widen_kind(if stored == LType::Unknown { value.representation() } else { stored });
+                }
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            windowed!(SetTableArrayK, [k: i32, value: u64], [], |owner, state, base| (table) {
+            windowed!(SetTableArrayK, [k: i32, value: u64], [WIDEN: bool], |owner, state, base| (table) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
                 // A constant's value lives as long as its prototype.
                 let value = LBoxed::from_bits(value);
                 tab.rw(owner).array[integer_slot(k)] = value;
-                tab.rw(owner).widen_kind(value.representation());
+                if WIDEN {
+                    tab.rw(owner).widen_kind(value.representation());
+                }
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            arg = yield YieldOp::ExecWindow(match constant {
-                None => Rc::new(SetTableArray::new(k, stored, &[a, c])) as Rc<dyn Window>,
-                Some(value) => Rc::new(SetTableArrayK::new(k, value, &[a])),
+            arg = yield YieldOp::ExecWindow(match (constant, widen) {
+                (None, true) => Rc::new(SetTableArray::<true>::new(k, stored, &[a, c])) as Rc<dyn Window>,
+                (None, false) => Rc::new(SetTableArray::<false>::new(k, stored, &[a, c])),
+                (Some(value), true) => Rc::new(SetTableArrayK::<true>::new(k, value, &[a])),
+                (Some(value), false) => Rc::new(SetTableArrayK::<false>::new(k, value, &[a])),
             });
             yield YieldOp::Effect(Effect::ArrayStore(stored));
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableInteger, [stored: LType], [], |owner, state, base| (table, key, value) {
+            windowed!(SetTableInteger, [stored: LType], [WIDEN: bool], |owner, state, base| (table, key, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
                 tab.rw(owner).array[integer_slot(key.as_int())] = value;
-                tab.rw(owner).widen_kind(if stored == LType::Unknown { value.representation() } else { stored });
+                if WIDEN {
+                    tab.rw(owner).widen_kind(if stored == LType::Unknown { value.representation() } else { stored });
+                }
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            windowed!(SetTableIntegerK, [value: u64, stored: LType], [], |owner, state, base| (table, key) {
+            windowed!(SetTableIntegerK, [value: u64, stored: LType], [WIDEN: bool], |owner, state, base| (table, key) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
                 // A constant's value lives as long as its prototype.
                 tab.rw(owner).array[integer_slot(key.as_int())] = LBoxed::from_bits(value);
-                tab.rw(owner).widen_kind(stored);
+                if WIDEN {
+                    tab.rw(owner).widen_kind(stored);
+                }
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            arg = yield YieldOp::ExecWindow(match constant {
-                None => Rc::new(SetTableInteger::new(stored, &[a, b, c])) as Rc<dyn Window>,
-                Some(value) => Rc::new(SetTableIntegerK::new(value, stored, &[a, b])),
+            arg = yield YieldOp::ExecWindow(match (constant, widen) {
+                (None, true) => Rc::new(SetTableInteger::<true>::new(stored, &[a, b, c])) as Rc<dyn Window>,
+                (None, false) => Rc::new(SetTableInteger::<false>::new(stored, &[a, b, c])),
+                (Some(value), true) => Rc::new(SetTableIntegerK::<true>::new(value, stored, &[a, b])),
+                (Some(value), false) => Rc::new(SetTableIntegerK::<false>::new(value, stored, &[a, b])),
             });
             yield YieldOp::Effect(Effect::ArrayStore(stored));
         } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = (yield YieldOp::GuardCType(b, CType::Number)) {

@@ -455,7 +455,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
     #[inline(always)]
     pub fn widen_kind(&mut self, t: LType) {
         match self.kind {
-            Some(k) if k == t => {}
+            Some(k) if k == t || k == LType::Unknown => {}
             None => self.kind = Some(t),
             Some(_) => self.kind = Some(LType::Unknown),
         }
