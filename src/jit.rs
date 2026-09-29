@@ -644,15 +644,28 @@ pub struct BlockPlan {
     /// The registers of its entry window: the slots it and its successors read
     /// before writing, where they read them.
     entry: Packed,
-    /// The slots its entry window has dirty whichever jump into it is compiled
-    /// first: at a loop's header, those the loop writes.
+    /// At a loop's header, the slots its entry window has dirty: those the loop
+    /// writes, whichever jump into it is compiled first. Elsewhere, none.
     dirty: Slots,
+    /// Whether it is a loop's header, whose entry window has only `dirty`
+    /// dirty; any other block's also has what the first jump into it compiled
+    /// has dirty.
+    header: bool,
     /// Per residual, for a window op with a stencil, its `SKIP` and the placement
     /// planned before it.
     placed: Vec<Option<(u8, Packed)>>,
 }
 
 type Plans = HashMap<BlockId, BlockPlan, FxBuildHasher>;
+
+impl BlockPlan {
+    /// Its entry window, when `from` is the window of the first jump into it
+    /// compiled.
+    fn entry_window(&self, from: &Cache) -> Cache {
+        let none = Cache::default();
+        Cache::entry(self.entry.unpack(), if self.header { &none } else { from }, &self.dirty)
+    }
+}
 
 /// A type guard tested inline, in the window register caching its slot.
 fn inline_guard(res: &Residual) -> bool {
@@ -960,7 +973,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let window = match self.jctx.trace_policy {
                 Some(policy) => {
                     plans = self.plan_region(id, policy, linked.as_ref());
-                    Cache::entry(plans[&id].entry.unpack(), linked.as_ref().unwrap_or(&Cache::default()), &plans[&id].dirty)
+                    plans[&id].entry_window(linked.as_ref().unwrap_or(&Cache::default()))
                 }
                 None => linked.clone().unwrap_or_default(),
             };
@@ -1392,7 +1405,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .enumerate()
             .map(|(pos, &b)| {
                 let start = starts[pos];
-                (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), dirty: plan.dirty[start], placed: placed(&step_of[pos]) })
+                let header = matches!(steps[start], Step::Header);
+                (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), dirty: plan.dirty[start], header, placed: placed(&step_of[pos]) })
             })
             .collect()
     }
@@ -1439,7 +1453,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let pending = self.jctx.pending.entry(*target).or_insert_with(|| Pending {
                     label: ops.new_dynamic_label(),
                     window: match plans.get(target) {
-                        Some(plan) => Cache::entry(plan.entry.unpack(), alloc.cache(), &plan.dirty),
+                        Some(plan) => plan.entry_window(alloc.cache()),
                         // Streaming: entered with the window of the first jump to it.
                         None => alloc.cache().clone(),
                     },

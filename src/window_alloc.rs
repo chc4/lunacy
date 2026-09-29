@@ -492,7 +492,8 @@ pub enum Step<'a> {
 /// A planned trace: per step, the placement wanted before it (an op's, or a
 /// block's entry window at its `Start`), an op's `SKIP`, and at a loop's
 /// `Header`, the slots its entry window has dirty: those the loop writes,
-/// which its back edge brings dirty (see Note [Trace allocation]).
+/// which its back edge brings dirty, and no others (see Note [Trace
+/// allocation]).
 pub struct TracePlan {
     pub windows: Vec<Placement>,
     pub skips: Vec<usize>,
@@ -746,7 +747,10 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
     let mut written = Slots::default();
     // Per slot written since the last flush, the registers its writer can put it in.
     let mut writer: SmallVec<[(usize, u16); 16]> = SmallVec::new();
-    for s in steps {
+    // Per loop header, the slots written since it and since the last flush:
+    // those its back edge can bring dirty.
+    let mut looped: SmallVec<[(usize, Slots); 2]> = SmallVec::new();
+    for (step, s) in steps.iter().enumerate() {
         dirty.push(written);
         let mut inputs: SmallVec<[u16; 5]> = SmallVec::new();
         match s {
@@ -762,6 +766,7 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
                 let good = fits.filter(|&skip| misses(skip) == fewest).fold(0u16, |mask, skip| mask | 1 << skip);
                 for (index, (&slot, _)) in operands.filter(|(_, (_, a))| a.writes()) {
                     written.insert(slot);
+                    looped.iter_mut().for_each(|(_, slots)| slots.insert(slot));
                     writer.retain(|w| w.0 != slot);
                     writer.push((slot, good << index));
                 }
@@ -769,7 +774,9 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
             Step::Flush => {
                 written = Slots::default();
                 writer.clear();
+                looped.iter_mut().for_each(|(_, slots)| *slots = Slots::default());
             }
+            Step::Header => looped.push((step, Slots::default())),
             _ => {}
         }
         in_place.push(inputs);
@@ -877,21 +884,15 @@ pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
             }
         }
     }
-    // A loop header's entry window has the slots the trace leaves dirty
-    // dirty, as its back edge brings them: whichever jump into it is compiled
-    // first, or the entry stub, would otherwise fix them clean, and every
-    // iteration would store them.
-    let dirty = steps
-        .iter()
-        .zip(&windows)
-        .map(|(s, window)| {
-            let mut dirty = Slots::default();
-            if let Step::Header = s {
-                window.iter().flatten().filter(|&&slot| written.contains(slot)).for_each(|&slot| dirty.insert(slot));
-            }
-            dirty
-        })
-        .collect();
+    // A loop header's entry window has the slots the loop writes dirty, as its
+    // back edge brings them, and no others: whichever jump into it is compiled
+    // first, or the entry stub, would otherwise fix them, and every iteration
+    // would store the loop's writes, or its invariants whenever the body
+    // evicts them.
+    let mut dirty = vec![Slots::default(); steps.len()];
+    for (step, slots) in looped {
+        windows[step].iter().flatten().filter(|&&slot| slots.contains(slot)).for_each(|&slot| dirty[step].insert(slot));
+    }
     TracePlan { windows, skips, dirty, demotions }
 }
 

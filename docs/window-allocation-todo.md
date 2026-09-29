@@ -5,16 +5,25 @@ Issues found reviewing the hot loops of queens, nbody and fannkuch_redux with
 3, fannkuch_redux 20 and queens 200 (release, `window_dump`); "per iteration"
 is per iteration of the loop named.
 
-- [ ] **A loop header's dirty slots are the preheader's, not the loop's.**
-  Note [Window allocation] says a loop header's entry window has dirty the
-  slots the loop writes, which its back edge brings dirty. Its dirty slots come
-  from the first jump to it that is compiled instead, the preheader's, so a
-  slot the loop never writes stays dirty for the whole loop and every eviction
-  of it in the body stores a value that hasn't changed.
-  nbody's inner loop stores bix `[8]`, biz `[10]`, and the loop's limit and
-  step `[16]`, `[17]` every iteration (1.8M times each), and its latch loads
-  them back. The preheader should store what the loop doesn't write once, and
-  the header's window hold it clean.
+- [x] **A loop header's dirty slots were the trace's, not the loop's.** The
+  plan marked dirty every slot of the header's window written since the last
+  flush anywhere in the trace, the code before the loop included, and the entry
+  window added what the first jump into it compiled had dirty. Now a header's
+  entry window has dirty only the slots written after it since the last flush.
+  nbody's inner loop no longer stores bix, biz and the loop's limit and step
+  every iteration: 12% fewer stores executed in nbody 3, 40M fewer
+  instructions in nbody 10 (0.3%), and no change in its cycles; no other
+  benchmark's instructions changed.
+
+- [ ] **A loop's latch delivers the first pass's header window, not the one the
+  header is compiled with.** The second pass plans the latch to continue into
+  the header's window from the first pass and recomputes the header's window,
+  and the two differ (docs/trace-register-allocation.md, Loops, "Not yet
+  handled"). nbody's inner header is `{w0=[8] w2=[15] w3=[17] w5=[16]}` in the
+  first pass and `{w0=[10] w2=[16] w5=[8] w6=[15] w7=[17]}` in the second; the
+  latch delivers the index and step in w2 and w3, so every iteration's back
+  edge moves them into w6 and w7 and reloads biz, bix and the limit, which the
+  body evicted.
 
 - [ ] **Dead values are stored.** A dirty value is stored when its register is
   overwritten, at a transfer into a block that doesn't carry it, and at a
