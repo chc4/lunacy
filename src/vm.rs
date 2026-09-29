@@ -421,6 +421,10 @@ pub struct Table<'src, 'intern> {
     /// Whether this is the global environment. See Note [Global caches] in
     /// `generator`.
     pub environment: bool,
+    /// The array part's kind: the representation of every value stored in it
+    /// since it was last emptied, `Unknown` if they differ, `None` if none was.
+    /// See Note [Array kinds] in `specialize`.
+    pub kind: Option<LType>,
 }
 
 thread_local! {
@@ -442,6 +446,28 @@ impl<'src, 'intern> Table<'src, 'intern> {
             hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
             epoch: 0,
             environment: false,
+            kind: (array > 0).then_some(LType::Nil),
+        }
+    }
+
+    /// Note a value of representation `t` stored in the array part. See Note
+    /// [Array kinds] in `specialize`.
+    #[inline(always)]
+    pub fn widen_kind(&mut self, t: LType) {
+        match self.kind {
+            Some(k) if k == t => {}
+            None => self.kind = Some(t),
+            Some(_) => self.kind = Some(LType::Unknown),
+        }
+    }
+
+    /// The array part's kind computed again from its values, for an array part
+    /// replaced whole.
+    pub fn reset_kind(&mut self) {
+        self.kind = None;
+        for i in 0..self.array.len() {
+            let t = self.array[i].representation();
+            self.widen_kind(t);
         }
     }
 
@@ -515,9 +541,14 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
         if let Some(slot) = key.as_number().and_then(array_slot) {
             // TODO: sparse arrays
             if self.rw(owner).array.len() <= slot {
+                if self.rw(owner).array.len() < slot {
+                    // The hole past the end, filled with nil.
+                    self.rw(owner).widen_kind(LType::Nil);
+                }
                 self.rw(owner).array.resize_with(slot + 1, || LBoxed::NIL);
             }
             self.rw(owner).array[slot] = value;
+            self.rw(owner).widen_kind(value.representation());
             return;
         }
         let k = LCanon::new(key, intern);
@@ -1806,6 +1837,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             ),
             epoch: 0,
             environment: true,
+            kind: None,
         });
         // `_g` needs no explicit root: it lives in the `RunState` (`RunState::mark` shades it)
         // for the whole run, which is the only time a collection can see it. See Note [GC roots].

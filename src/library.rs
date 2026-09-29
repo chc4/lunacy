@@ -469,6 +469,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             hash: IndexMap::with_capacity_and_hasher(number_or(arg(&args, 1), 0.0) as usize, InternedHasher::default()),
             epoch: 0,
             environment: false,
+            kind: None,
         };
         smallvec![LBoxed::box_lvalue(LValue::Table(Tc::new(t)))]
     });
@@ -476,6 +477,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let t = table(arg(&args, 0));
         let t = t.rw(owner);
         t.array.clear();
+        t.kind = None;
         t.clear_hash();
         t.epoch += 1;
         smallvec![]
@@ -486,14 +488,16 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         ("insert", native!(|owner, args| {
             let t = table(arg(&args, 0));
             t.barrier_back();
-            let array = &mut t.rw(owner).array;
+            let tab = t.rw(owner);
+            let value = arg(&args, args.len() - 1);
             match args.len() {
-                2 => array.push(arg(&args, 1)),
+                2 => tab.array.push(value),
                 _ => {
-                    let at = (number(arg(&args, 1)) as usize).clamp(1, array.len() + 1) - 1;
-                    array.insert(at, arg(&args, 2));
+                    let at = (number(arg(&args, 1)) as usize).clamp(1, tab.array.len() + 1) - 1;
+                    tab.array.insert(at, value);
                 }
             }
+            tab.widen_kind(value.representation());
             smallvec![]
         })),
         ("remove", native!(|owner, args| {

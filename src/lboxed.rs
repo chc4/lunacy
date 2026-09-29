@@ -16,7 +16,7 @@ use internment::ArenaIntern;
 use crate::chunk::Constant;
 use crate::gc::Gc;
 use crate::vm::{
-    LClosure, LConstant, LValue, NClosure, NativeFunc, Number, Table, Tc, FVec,
+    LClosure, LConstant, LType, LValue, NClosure, NativeFunc, Number, Table, Tc, FVec,
 };
 
 /// A NuN-boxed Lua value (JavaScriptCore `JSValue` encoding). 8 bytes:
@@ -268,6 +268,34 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     #[inline(always)]
     pub fn is_number(&self) -> bool {
         (self.0 & Self::NUMBER_TAG) != 0
+    }
+
+    /// This value's representation, from its bits and a cell's kind, with
+    /// comparisons only: a window op's stencil can't hold the jump table a match
+    /// on the kind compiles to.
+    #[inline(always)]
+    pub fn representation(&self) -> LType {
+        let bits = self.0;
+        if bits & Self::NUMBER_TAG == Self::NUMBER_TAG {
+            LType::Integer
+        } else if bits & Self::NUMBER_TAG != 0 {
+            LType::Double
+        } else if bits == Self::VALUE_NIL {
+            LType::Nil
+        } else if bits & Self::NOT_CELL_MASK != 0 {
+            LType::Bool
+        } else {
+            // SAFETY: `bits` is a live cell pointer (upheld by the sealed
+            // constructors).
+            let kind = unsafe { crate::gc::read_cell_kind(bits) };
+            if kind == Self::KIND_TABLE {
+                LType::Table
+            } else if kind <= Self::KIND_NCLOSURE {
+                LType::Closure
+            } else {
+                LType::String
+            }
+        }
     }
 
     /// Whether this value is a number in the integer encoding. See Note
