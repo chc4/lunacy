@@ -493,13 +493,18 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
         Absolute(usize),
         Fall,
         FallAddress,
-        /// The address of the site's record. See Note [Cold stencils] in `window`.
-        Record,
+        /// A word of the site's record: its site hole's `lea` its first, a
+        /// capture's load the capture's. See Note [Cold stencils] in `window`.
+        Record(usize),
     }
+    let fall = ops.new_dynamic_label();
+    // The site's record, if the op has a cold path.
+    let record = body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE).then(|| pool.record(ops, fall, captures));
     let mut sites: SmallVec<[(usize, usize, Site); 8]> = SmallVec::new();
-    sites.extend(body.holes.iter().map(|&(r, i)| match i {
-        crate::window::SITE_HOLE => (r.end, r.field, Site::Record),
-        i => (r.end, r.field, Site::Value(captures[i])),
+    sites.extend(body.holes.iter().map(|&(r, i)| match (i, record) {
+        (crate::window::SITE_HOLE, _) => (r.end, r.field, Site::Record(0)),
+        (i, Some(_)) => (r.end, r.field, Site::Record(8 * (1 + i))),
+        (i, None) => (r.end, r.field, Site::Value(captures[i])),
     }));
     sites.extend(body.relocations().iter().map(|r| (r.end, r.field, Site::Absolute(r.target))));
     sites.extend(body.nexts.iter().map(|n| match *n {
@@ -509,7 +514,6 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
     sites.sort_by_key(|&(end, ..)| end);
 
     let rel32 = |kind| dynasmrt::x64::X64Relocation::from_size(kind, RelocationSize::DWord);
-    let fall = ops.new_dynamic_label();
     let mut at = 0;
     for (end, field, site) in sites {
         ops.extend(&body.code[at..end]);
@@ -526,10 +530,9 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
                 let entry = pool.address(ops, fall);
                 ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
-            Site::Record => {
-                let record = pool.record(ops, fall, captures);
-                let entry = pool.address(ops, record);
-                ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
+            Site::Record(word) => {
+                let record = record.expect("a record for a body with a site hole");
+                ops.dynamic_relocation(record, word as isize, field_offset, 0, rel32(RelocationKind::Relative));
             }
         }
     }

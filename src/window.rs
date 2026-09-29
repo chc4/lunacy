@@ -757,6 +757,9 @@ pub enum StencilError {
     /// A load of part of a hole's GOT slot, which the copy can't point at the
     /// hole (see `hole`).
     PartialHole { op: &'static str, at: usize },
+    /// A load of the site hole other than a whole register's, which the copy
+    /// can't make the record's address (see Note [Cold stencils]).
+    SiteLoad { op: &'static str, at: usize },
     /// No executable mapping within rel32 range of the binary.
     Map(String),
 }
@@ -785,6 +788,9 @@ impl std::fmt::Display for StencilError {
             }
             Self::PartialHole { op, at } => {
                 write!(f, "{op} stencil loads part of a hole's GOT slot at +{at:#x}")
+            }
+            Self::SiteLoad { op, at } => {
+                write!(f, "{op} stencil loads its site hole other than into a whole register at +{at:#x}")
             }
             Self::Map(e) => write!(f, "no executable mapping near the binary: {e}"),
         }
@@ -1048,6 +1054,8 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let mut nexts: Vec<NextRef> = Vec::new();
     // Whether it jumps to its cold stencil, directly.
     let mut jumps_cold = false;
+    // The opcode bytes of its site hole loads, to make `lea`s.
+    let mut leas: SmallVec<[usize; 1]> = SmallVec::new();
     for (i, (off, end, inst)) in insts[..kept].iter().enumerate() {
         let (off, end) = (*off, *end);
         // Relative branches: operand 0 is the displacement from `end`.
@@ -1090,6 +1098,19 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
         if let Some((field, target)) = rip_operand(off, end, inst)? {
             let rel = RipRel { field, end, target };
             if let Some(i) = image.holes.iter().position(|h| *h == Some(target)) {
+                if i == SITE_HOLE {
+                    // `mov r64, [rip+slot]` (REX.W 8B /r), made `lea r64,
+                    // [rip+record]` (REX.W 8D /r). See Note [Cold stencils].
+                    let whole = inst.opcode() == Opcode::MOV
+                        && matches!(inst.operand(0), Operand::Register { reg } if reg.width() == 8)
+                        && field >= 3
+                        && code[field - 2] == 0x8b
+                        && code[field - 3] & 0xf8 == 0x48;
+                    if !whole {
+                        return Err(StencilError::SiteLoad { op: name, at: off });
+                    }
+                    leas.push(field - 2);
+                }
                 holes.push((rel, i));
             } else if image.holes.iter().flatten().any(|&slot| slot < target && target < slot + 8) {
                 return Err(StencilError::PartialHole { op: name, at: off });
@@ -1122,6 +1143,9 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
         .collect();
     let mut copy = prefix.to_vec();
     copy.extend_from_slice(&code[..body_len]);
+    for at in leas {
+        copy[prefix.len() + at] = 0x8d;
+    }
     if !sliced {
         copy.extend_from_slice(&UD2);
     }
@@ -1154,6 +1178,11 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 // stencil binds the captures from the record, runs the cold block, and ends
 // in a tail jump to the record's fall-through address, the window where the
 // cold block left it.
+//
+// A site costs the record's first word: the copy loads its captures from the
+// record too, rather than from the pool's values, and its load of the site
+// hole, a `mov` from the hole's slot, is copied as an `lea` of the record
+// itself, so no slot holds the record's address.
 //
 // The cold stencil starts where its copy jumped from, so at the copied body's
 // stack: a body that jumps to its cold stencil is always copied between `sub
@@ -1253,9 +1282,11 @@ pub unsafe fn assemble(
     let mut relocs: Vec<RipRel> = Vec::new();
     // Each continuation reference, with its copy's fall-through offset.
     let mut nexts: Vec<(NextRef, usize)> = Vec::new();
-    // Each site hole load, with its copy's captures and fall-through offset.
-    // See Note [Cold stencils].
-    let mut sites: Vec<(RipRel, Captures, usize)> = Vec::new();
+    // Each site's record's fall-through offset and captures, and each
+    // reference into a record: its record and the word it reads (the site
+    // hole's `lea` the record's first). See Note [Cold stencils].
+    let mut records: Vec<(usize, Captures)> = Vec::new();
+    let mut record_refs: Vec<(RipRel, usize, usize)> = Vec::new();
     for &(op, skip) in ops {
         let body = unsafe { stencil_body(image, op, skip) }?;
         let captures = op.captures();
@@ -1263,11 +1294,13 @@ pub unsafe fn assemble(
         let shift = |r: RipRel| RipRel { field: r.field + at, end: r.end + at, ..r };
         code.extend_from_slice(&body.code);
         let fall = at + body.fall;
-        for &(r, i) in &body.holes {
-            match i {
-                SITE_HOLE => sites.push((shift(r), captures.clone(), fall)),
-                i => holes.push((shift(r), captures[i])),
+        if body.holes.iter().any(|&(_, i)| i == SITE_HOLE) {
+            for &(r, i) in &body.holes {
+                record_refs.push((shift(r), records.len(), if i == SITE_HOLE { 0 } else { 1 + i }));
             }
+            records.push((fall, captures));
+        } else {
+            holes.extend(body.holes.iter().map(|&(r, i)| (shift(r), captures[i])));
         }
         relocs.extend(body.relocs.iter().map(|&r| shift(r)));
         nexts.extend(body.nexts.iter().map(|n| match *n {
@@ -1287,11 +1320,11 @@ pub unsafe fn assemble(
     }
     let indirect = nexts.iter().filter(|(n, _)| matches!(n, NextRef::Indirect(_))).count();
     code.resize(code.len() + indirect * 8, 0);
-    // Then, per site hole load, a slot holding its record's address, and the
-    // record.
-    let records = code.len();
-    for (_, captures, _) in &sites {
-        code.resize(code.len() + (2 + captures.len()) * 8, 0);
+    // Then the records.
+    let mut record_at = Vec::with_capacity(records.len());
+    for (_, captures) in &records {
+        record_at.push(code.len());
+        code.resize(code.len() + (1 + captures.len()) * 8, 0);
     }
 
     let map_err = |e: std::io::Error| StencilError::Map(e.to_string());
@@ -1315,16 +1348,14 @@ pub unsafe fn assemble(
     for r in &relocs {
         r.patch(&mut code, base, r.target)?;
     }
-    let mut at = records;
-    for (r, captures, fall) in &sites {
-        let record = at + 8;
-        code[at..at + 8].copy_from_slice(&((base + record) as u64).to_le_bytes());
-        r.patch(&mut code, base, base + at)?;
-        code[record..record + 8].copy_from_slice(&((base + fall) as u64).to_le_bytes());
+    for ((fall, captures), &at) in records.iter().zip(&record_at) {
+        code[at..at + 8].copy_from_slice(&((base + fall) as u64).to_le_bytes());
         for (i, value) in captures.iter().enumerate() {
-            code[record + 8 * (i + 1)..record + 8 * (i + 2)].copy_from_slice(&value.to_le_bytes());
+            code[at + 8 * (i + 1)..at + 8 * (i + 2)].copy_from_slice(&value.to_le_bytes());
         }
-        at = record + 8 * (1 + captures.len());
+    }
+    for &(r, record, word) in &record_refs {
+        r.patch(&mut code, base, base + record_at[record] + 8 * word)?;
     }
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), buf.as_mut_ptr(), code.len()) };
     buf.make_exec().map_err(map_err)
