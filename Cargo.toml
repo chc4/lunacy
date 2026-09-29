@@ -28,6 +28,7 @@ align_loops = ["jit"] # Loop headers' JIT code starts LOOP_ALIGN-aligned
 align_selects = ["jit"] # A branch on `select` never crosses a cache line
 jit_disasm = ["jit", "yaxpeax-x86/fmt", "dep:rustc-demangle"] # Disassemble the JIT's code, annotated, to jit_disasm.txt when it's dropped
 no_dynamic_guards = [] # GuardDynamic yields fail statically (Note [Dynamic guards])
+store_types = ["counters"] # Count array part stores by what's known of the value's type
 gc_sanitize = []
 gc_stress = []
 gc_test = []
