@@ -94,14 +94,14 @@ use crate::Owner;
 /// into rax even when rax carries an argument, and that load stays in the copy.
 pub const WINDOW: usize = 9;
 /// Number of hole statics available to captures.
-pub const MAX_HOLES: usize = 2;
+pub const MAX_HOLES: usize = 4;
 // `Captures` and `Regs` use literal lengths: with `generic_const_exprs` on, a named
 // const in a trait method signature makes `Window` dyn-incompatible.
 /// A window op's hole values.
-pub type Captures = SmallVec<[u64; 2]>;
+pub type Captures = SmallVec<[u64; 4]>;
 /// The register window's values.
 pub type Regs<'src, 'intern> = [LBoxed<'src, 'intern>; 9];
-const _: () = assert!(MAX_HOLES == 2 && WINDOW == 9);
+const _: () = assert!(MAX_HOLES == 4 && WINDOW == 9);
 
 // ---- holes / continuation / anchor ---------------------------------------
 
@@ -110,6 +110,10 @@ unsafe extern "C" {
     static __lunacy_hole0: *const ();
     #[linkage = "extern_weak"]
     static __lunacy_hole1: *const ();
+    #[linkage = "extern_weak"]
+    static __lunacy_hole2: *const ();
+    #[linkage = "extern_weak"]
+    static __lunacy_hole3: *const ();
     /// Deliberately never defined, and *not* weak: it is only referenced by a
     /// window op that declares more captures than there are holes
     /// (`MAX_HOLES`), so that mistake fails loudly at link time.
@@ -126,6 +130,8 @@ pub unsafe fn hole<const I: usize>() -> u64 {
         match I {
             0 => __lunacy_hole0 as u64,
             1 => __lunacy_hole1 as u64,
+            2 => __lunacy_hole2 as u64,
+            3 => __lunacy_hole3 as u64,
             _ => unresolved_window_hole__too_many_captures as u64,
         }
     };
@@ -649,6 +655,8 @@ impl Image {
         let hole_index = |name: &str| match name {
             "__lunacy_hole0" => Some(0),
             "__lunacy_hole1" => Some(1),
+            "__lunacy_hole2" => Some(2),
+            "__lunacy_hole3" => Some(3),
             _ => None,
         };
         let mut holes = [None; MAX_HOLES];
