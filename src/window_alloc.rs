@@ -43,9 +43,11 @@ use crate::window::{Access, Window, WINDOW};
 // where they read them), and any jump to it transfers the window to that one
 // ([`WindowAlloc::transfer`]): dirty values the target doesn't carry dirty are
 // stored, then its registers are filled as one parallel move. A block's entry
-// window takes its dirty slots from the first jump to it that is compiled, and
-// from its plan: a loop header's has the slots the loop writes dirty, as its
-// back edge brings them, so the back edge doesn't store them every iteration.
+// window takes its dirty slots from the first jump to it that is compiled,
+// except a loop header's, which has dirty exactly the slots the loop writes, as
+// its back edge brings them: the back edge doesn't store them every iteration,
+// and the jump into the loop stores the rest once, rather than the body
+// whenever it evicts them.
 // The entry stub, for a block entered from the interpreter, loads its window
 // from the stack.
 
