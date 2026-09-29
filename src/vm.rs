@@ -755,8 +755,6 @@ pub enum LType {
     Unknown,
     Nil,
     Bool,
-    /// A number in either encoding: `Integer` or `Double`.
-    Number,
     String,
     Closure,
     Table,
@@ -768,25 +766,14 @@ pub enum LType {
 
 impl LType {
     /// Whether a value of type `other` is one of type `self`: `other` is
-    /// `self`, or below it (`Unknown` is above every type, `Number` above
-    /// `Integer` and `Double`).
+    /// `self`, or `self` is `Unknown`.
     pub fn accepts(self, other: LType) -> bool {
-        self == other
-            || self == LType::Unknown
-            || (self == LType::Number && matches!(other, LType::Integer | LType::Double))
+        self == other || self == LType::Unknown
     }
 
     /// The most specific type accepting both.
     pub fn join(self, other: LType) -> LType {
-        if self.accepts(other) {
-            self
-        } else if other.accepts(self) {
-            other
-        } else if LType::Number.accepts(self) && LType::Number.accepts(other) {
-            LType::Number
-        } else {
-            LType::Unknown
-        }
+        if self == other { self } else { LType::Unknown }
     }
 }
 
@@ -796,7 +783,6 @@ impl std::fmt::Display for LType {
             LType::Unknown => write!(f, "?"),
             LType::Nil => write!(f, "nil"),
             LType::Bool => write!(f, "bool"),
-            LType::Number => write!(f, "number"),
             LType::String => write!(f, "string"),
             LType::Closure => write!(f, "func"),
             LType::Table => write!(f, "table"),
@@ -1044,7 +1030,7 @@ pub type NativeWindow = fn(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<Na
 /// have for it (the op assumes it), and its result's type.
 pub struct NativeOp {
     pub window: std::rc::Rc<dyn crate::window::Window>,
-    pub args: LType,
+    pub args: crate::specialize::CType,
     pub result: crate::specialize::CType,
 }
 

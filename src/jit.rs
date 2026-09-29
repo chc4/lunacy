@@ -598,9 +598,9 @@ type Plans = HashMap<BlockId, BlockPlan, FxBuildHasher>;
 /// A type guard tested inline, in the window register caching its slot.
 fn inline_guard(res: &Residual) -> bool {
     matches!(res, Residual::Guard {
-        expected: LType::Integer | LType::Double | LType::Number | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String,
+        expected: LType::Integer | LType::Double | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String,
         ..
-    })
+    } | Residual::NumericGuard { .. })
 }
 
 /// The `SKIP`s a window op's stencil can be copied at: none where stencils
@@ -1105,7 +1105,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot)));
                                 events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot)));
                             }
-                            Residual::Guard { idx, .. } if inline_guard(res) => events.push(Event::Read(*idx)),
+                            Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => events.push(Event::Read(*idx)),
                             Residual::Jump(_) | Residual::Select(_) => {
                                 for target in jump_targets(res) {
                                     events.push(match index.get(&target) {
@@ -1221,7 +1221,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         of[off] = Some(steps.len());
                         steps.push(Step::Op(&**w, skips[b][off].clone()));
                     }
-                    Residual::Guard { .. } if inline_guard(res) => {}
+                    Residual::Guard { .. } | Residual::NumericGuard { .. } if inline_guard(res) => {}
                     Residual::Jump(_) | Residual::Select(_) => {
                         let targets = jump_targets(res);
                         for &target in &targets {
@@ -1464,17 +1464,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1), &alloc.stores());
             }
             loop { match res {
-                Residual::Guard { idx, known, expected } if inline_guard(res) => {
+                Residual::Guard { idx, expected } | Residual::NumericGuard { idx, expected } if inline_guard(res) => {
+                    let numeric = matches!(res, Residual::NumericGuard { .. });
                     // NuN-boxed type check of the value in `STACK[idx]`: in the window
                     // register caching it, or else loaded from its stack home. A
                     // *match* jumps to the success continuation at `off + 2`, a
                     // *mismatch* falls through to the failure edge at `off + 1`,
                     // both with the window live.
                     //
-                    //   * Number   : the value has any `NUMBER_TAG` bit set.
-                    //   * Integer  : it has all of them: at least `NUMBER_TAG`, unsigned.
+                    //   * Integer  : it has all `NUMBER_TAG` bits: at least `NUMBER_TAG`, unsigned.
                     //   * Double   : some but not all: below `NUMBER_TAG`, and, unless
-                    //     `known` a number, any set. See Note [Integers] in `specialize`.
+                    //     the guard is numeric (the value a number), any set. See Note
+                    //     [Integers] in `specialize`.
                     //   * Nil/Bool : exact immediate compare (nil = 2, false/true = 6/7).
                     //   * cell types (Table/Closure/String): the value is a raw pointer
                     //     (no `NOT_CELL_MASK` bits) whose offset-0 header byte is the kind.
@@ -1501,19 +1502,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     };
                     match expected {
-                        LType::Number => dynasm!(ops
-                            ; .arch x64
-                            ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
-                            ; test Rq(v), Rq(m)
-                            ; jnz =>insts[off + 2]
-                        ),
                         LType::Integer => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; cmp Rq(v), Rq(m)
                             ; jae =>insts[off + 2]
                         ),
-                        LType::Double if *known == LType::Number => dynasm!(ops
+                        LType::Double if numeric => dynasm!(ops
                             ; .arch x64
                             ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
                             ; cmp Rq(v), Rq(m)

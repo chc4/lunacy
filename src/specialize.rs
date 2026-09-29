@@ -44,7 +44,6 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             LValue::LClosure(_) | LValue::NClosure(_) => LType::Closure,
             LValue::Nil => LType::Nil,
             LValue::Bool(_) => LType::Bool,
-            _ => LType::Unknown,
         }
     }
 
@@ -131,7 +130,8 @@ pub struct ResidualExec {
 impl std::fmt::Display for Residual {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Residual::Guard { idx, expected, .. } => write!(f, "guard({}, {})", idx, expected),
+            Residual::Guard { idx, expected } => write!(f, "guard({}, {})", idx, expected),
+            Residual::NumericGuard { idx, expected } => write!(f, "numeric_guard({}, {})", idx, expected),
             Residual::NativeGuard { idx, ptr } => write!(f, "native_guard({}, {:p})", idx, *ptr),
             Residual::LuaGuard { idx, ptr } => write!(f, "lua_guard({}, {:p})", idx, *ptr),
             Residual::Exec(ResidualExec { name, .. }) => write!(f, "exec({})", name),
@@ -194,11 +194,12 @@ pub enum YieldOp {
                                            // a native with a window op for the call, else Failed.
                                            // See Note [Native windows]
 
-    Guard(usize, LType), // Resumed with either Matched or Failed if STACK[idx] is the expected
-                         // type
+    Guard(usize, LType), // Resumed with either Matched or Failed if STACK[idx] has the expected
+                         // representation
     GuardRk(usize, LType), // Resumed with either Matched or Failed if STACK[idx] or CONSTANT[idx]
-                           // is the expected type
-    GuardCType(usize, CType), // GuardRk, for a CType instead.
+                           // has the expected representation
+    GuardCType(usize, CType), // Resumed with either Matched or Failed if STACK[idx] or
+                              // CONSTANT[idx] is of the expected CType
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
     Decided(bool), // A guard whose outcome is known, emitting nothing: steps the SubPc as a guard
@@ -314,7 +315,7 @@ pub enum ResumeArg {
     Cache(*const GlobalCache),
     /// The end of a call's arguments, and the type its native's window op
     /// assumes they have.
-    WindowArgs(usize, LType),
+    WindowArgs(usize, CType),
 }
 
 // Initialize a hash key. `at` is `index << 8 | href`. Populate the witness `at` with `key`,
@@ -644,7 +645,11 @@ impl std::fmt::Debug for ThunkRef {
 pub enum Residual {
     /// Whether `STACK[idx]`, known to be of type `known`, has the type
     /// `expected`: either its type is `expected` or below it.
-    Guard { idx: usize, known: LType, expected: LType },
+    /// Whether STACK[idx]'s representation is `expected`.
+    Guard { idx: usize, expected: LType },
+    /// Whether STACK[idx], a number, is in the encoding `expected` (`Integer` or
+    /// `Double`).
+    NumericGuard { idx: usize, expected: LType },
     Exec(ResidualExec),
     /// A copy&patch window op (see `crate::window`) to execute.
     ExecWindow(Rc<dyn Window>),
@@ -728,6 +733,8 @@ fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum CType {
     Type(LType),
+    /// A number in either encoding, `Integer` or `Double`.
+    Number,
     Shape(SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
     LuaFunction(Tc<LClosure<'static, 'static>>),
@@ -746,9 +753,10 @@ impl CType {
     /// Whether a block specialized to `self` is correct for a value of type
     /// `other`: `self` is `other`, or above it in the lattice. See Note
     /// [Version compatibility].
-    fn accepts(&self, other: &CType) -> bool {
+    pub(crate) fn accepts(&self, other: &CType) -> bool {
         match (self, other) {
             (a, b) if a == b => true,
+            (CType::Number, CType::Type(LType::Integer | LType::Double)) => true,
             // A shape or a function's identity is below its table or closure.
             (CType::Type(a), b) => a.accepts(b.as_ltype()),
             _ => false,
@@ -759,6 +767,7 @@ impl CType {
     fn depth(&self) -> usize {
         match self {
             CType::Type(LType::Unknown) => 0,
+            CType::Number => 1,
             CType::Type(LType::Integer | LType::Double) => 2,
             CType::Type(_) => 1,
             _ => 2,
@@ -771,6 +780,8 @@ impl CType {
             self.clone()
         } else if other.accepts(self) {
             other.clone()
+        } else if CType::Number.accepts(self) && CType::Number.accepts(other) {
+            CType::Number
         } else {
             CType::Type(self.as_ltype().join(other.as_ltype()))
         }
@@ -780,6 +791,7 @@ impl CType {
     pub(crate) fn as_ltype(&self) -> LType {
         match self {
             CType::Type(ty) => ty.clone(),
+            CType::Number => LType::Unknown,
             CType::Shape(_) => LType::Table,
             CType::NativeFunction(_) => LType::Closure,
             CType::LuaFunction(_) => LType::Closure,
@@ -791,6 +803,7 @@ impl std::fmt::Display for CType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CType::Type(ltype) => ltype.fmt(f),
+            CType::Number => write!(f, "number"),
             CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
             CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
             CType::LuaFunction(lclos) => write!(f, "fn({:?})", lclos.as_ptr()),
@@ -803,10 +816,10 @@ impl std::fmt::Display for CType {
 // A number is in the integer or the double encoding (Note [Integer encoding]), and its tag says
 // which. The specialization context tracks its knowledge potentially fuzzier than that:
 // `CType::Type(LType::Integer)` is a number in the integer encoding, `CType::Type(LType::Double)`
-// one in the double encoding, and `CType::Type(Number)` a number in either. As the value carries
-// its encoding, a context knowing less of it needs no code: a jump into a version typing a slot
-// `Number` or `Unknown` enters it as it is, and generic code (a table, an upvalue, a native, a
-// return) reads either.
+// one in the double encoding, and `CType::Number` a number in either, which no value's
+// representation is. As the value carries its encoding, a context knowing less of it needs no
+// code: a jump into a version typing a slot `Number` or `Unknown` enters it as it is, and generic
+// code (a table, an upvalue, a native, a return) reads either.
 //
 // Numeric operations should attempt to specialize on their operands' encoding where
 // they can, so they don't require decoding at runtime. The integer encoding can only store small
@@ -833,7 +846,7 @@ impl std::fmt::Display for CType {
 fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
     match expected {
         // `Integer` is two levels, a `Number`, then the encoding; every `CType::Type` one. See Note [Integers].
-        CType::Type(LType::Integer) if !LType::Number.accepts(found.as_ltype()) => (pc.next_false(), ResumeArg::Failed),
+        CType::Type(LType::Integer) if !CType::Number.accepts(found) => (pc.next_false(), ResumeArg::Failed),
         CType::Type(LType::Integer) if *found == CType::Type(LType::Integer) => (pc.next_true().next_true(), ResumeArg::Matched),
         CType::Type(LType::Integer) => (pc.next_true().next_false(), ResumeArg::Failed),
         expected if expected.accepts(found) => (pc.next_true(), ResumeArg::Matched),
@@ -924,8 +937,8 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
 // describe, so a jump may enter a version whose context *accepts* its own:
 // slot by slot the same type or one above it in the lattice
 //
-//   Unknown  >  each LType  >  Number > Integer or Double, Table > a shape,
-//                              Closure > a known function
+//   Unknown  >  Number  >  Integer or Double
+//   Unknown  >  each other LType,  Table > a shape,  Closure > a known function
 //
 // (a shape accepts only itself). A version for a table in a slot is correct for
 // a shape there: the jump's hash keys on it are extra keys the version doesn't
@@ -1702,7 +1715,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// The thunk a `Guard(idx, t)` (`expected` `CType::Type(t)`) or a
-    /// `GuardCType(idx, Integer)` ends its block in when the context can't
+    /// `GuardCType(idx, expected)` ends its block in when the context can't
     /// answer it.
     /// With `field`, the slot was just loaded from that hash key's field
     /// (`FieldType`), whose type is the one found too. See Note [Field types].
@@ -1731,7 +1744,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut thunk_coro  = thunk_coro.clone();
             let found_field = state.vals[state.base + idx].unbox().typeof_();
             let found = CType::Type(found_field);
-            let known = thunk_ctx.types[idx].as_ltype();
+            // A value the context knows is a number only has its encoding tested.
+            let guard = if thunk_ctx.types[idx] == CType::Number {
+                Residual::NumericGuard { idx, expected: found_field }
+            } else {
+                Residual::Guard { idx, expected: found_field }
+            };
             let mut forced_ctx = thunk_ctx.clone();;
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
             forced_mut.types[idx] = found.clone();
@@ -1749,9 +1767,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let old_block = block_id;
                 block_id = vm.new_block(pc.0);
                 vm.jump_thunk(old_block, thunk_pc, block_id);
-                vm.blocks[block_id.0].instructions.push(Residual::Guard { idx, known, expected: found_field });
+                vm.blocks[block_id.0].instructions.push(guard);
             } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::Guard { idx, known, expected: found_field };
+                vm.blocks[block_id.0].instructions[thunk_pc] = guard;
             }
             // If we're in the success block and the guarded value is a function, we can
             // also try to emit a guard to specialize the function value as well. This lets us
@@ -2114,63 +2132,47 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let proto = self.clos.ro(owner).prototype;
                     if (rk & 0x100)!=0 {
                         let r_const = rk & (0xff);
-                        let ty = match unsafe { &(&(*proto).constants.items)[r_const as usize] } {
-                            crate::chunk::Constant::Nil => LType::Nil,
-                            crate::chunk::Constant::Bool(_) => LType::Bool,
-                            crate::chunk::Constant::Number(_) => LType::Number,
-                            crate::chunk::Constant::String(_) => LType::String,
-                        };
+                        let ty = constant_ctype(unsafe { &(&(*proto).constants.items)[r_const as usize] });
                         debug!("GuardRk constant {:?} {:?}", ty, expected);
                         // Constants always have known types
-                        if expected.accepts(ty) {
+                        if CType::Type(*expected).accepts(&ty) {
                             pc = pc.next_true();
                             arg = ResumeArg::MatchedConst(r_const);
-                            break 'machine;
-                        } else if ty != LType::Unknown {
+                        } else {
                             pc = pc.next_false();
                             arg = ResumeArg::Failed;
-                            break 'machine;
-                        } else {
-                            panic!();
-                            state = CoroutineState::Yielded(YieldOp::Guard(rk as usize, expected.clone()));
-                            continue 'machine;
                         }
+                        break 'machine;
                     } else {
                         debug!("GuardRk dynamic {:?} {:?}", rk, expected);
                         state = CoroutineState::Yielded(YieldOp::Guard(rk as usize, expected.clone()));
                         continue 'machine;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::GuardCType(_, ref expected)) if *expected != CType::Type(LType::Integer) => {
-                    unreachable!("GuardCType tests only for Integer, not {expected}");
-                },
-                CoroutineState::Yielded(YieldOp::GuardCType(rk, _)) => {
+                CoroutineState::Yielded(YieldOp::GuardCType(rk, ref expected)) => {
                     let known = if (rk & 0x100) != 0 {
                         let proto = self.clos.ro(owner).prototype;
-                        Some(constant_ctype(unsafe { &(&(*proto).constants.items)[rk & 0xff] }))
+                        constant_ctype(unsafe { &(&(*proto).constants.items)[rk & 0xff] })
                     } else {
-                        // A number of either encoding, or unknown, is tested at
-                        // runtime. See Note [Integers].
-                        Some(ctx.types[rk].clone()).filter(|ctype| !matches!(ctype, CType::Type(LType::Number | LType::Unknown)))
+                        ctx.types[rk].clone()
                     };
-                    match known {
-                        Some(known) => {
-                            (pc, arg) = navigate(pc, &CType::Type(LType::Integer), &known);
-                            if (rk & 0x100) != 0 && arg == ResumeArg::Matched {
-                                arg = ResumeArg::MatchedConst(rk & 0xff);
-                            }
-                        },
-                        None => {
-                            let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, CType::Type(LType::Integer), None, pc, ctx.clone(), true, 0));
-                            self.end_block(block_id);
-                            self.blocks[block_id.0].instructions.push(thunk);
-                            return None;
-                        },
+                    // Known if `known` is `expected` or below it, or can't be: else
+                    // found out at runtime.
+                    if expected.accepts(&known) || !known.accepts(expected) {
+                        (pc, arg) = navigate(pc, expected, &known);
+                        if (rk & 0x100) != 0 && arg == ResumeArg::Matched {
+                            arg = ResumeArg::MatchedConst(rk & 0xff);
+                        }
+                    } else {
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, expected.clone(), None, pc, ctx.clone(), true, 0));
+                        self.end_block(block_id);
+                        self.blocks[block_id.0].instructions.push(thunk);
+                        return None;
                     }
                 },
                 CoroutineState::Yielded(YieldOp::NativeWindowArgs(a, b, c)) => {
                     arg = match native_window(&ctx, a, b, c) {
-                        Some((end, op)) => ResumeArg::WindowArgs(end, op.args),
+                        Some((end, op)) => ResumeArg::WindowArgs(end, op.args.clone()),
                         None => ResumeArg::Failed,
                     };
                 },
@@ -2192,15 +2194,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Guard(idx, expected)) => {
                     debug!("guard {:?} == {:?}", ctx.types[idx], expected);
                     let ctype = &ctx.types[idx];
-                    // Erase any hkeys and say its just a table before checking
-                    let ltype = ctype.as_ltype();
+                    let expected_ctype = CType::Type(expected);
 
-                    if expected.accepts(ltype) {
+                    if expected_ctype.accepts(ctype) {
                         // Statically true: pump the success path
                         pc = pc.next_true();
                         arg = ResumeArg::Matched;
                     }
-                    else if !ltype.accepts(expected) {
+                    else if !ctype.accepts(&expected_ctype) {
                         // Statically false: pump the fail path
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
@@ -2304,7 +2305,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // C = 0.
                                 // See Note [Native windows].
                                 let window = native_window(&ctx, a, b, c)
-                                    .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(ctx.types[slot].as_ltype())))
+                                    .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(&ctx.types[slot])))
                                     .map(|(_, op)| op);
 
                                 if let Some(op) = window {
@@ -2517,7 +2518,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             state.counters.versioned_count.increment();
             debug!("RUN {:?}", &res);
             match res {
-                Residual::Guard { idx, expected, .. } => {
+                Residual::Guard { idx, expected } | Residual::NumericGuard { idx, expected } => {
                     if expected.accepts(state.vals[state.base + idx].unbox().typeof_()) {
                         // Fallthrough
                         off += 2;
@@ -2790,7 +2791,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::NativeCall { nf, a, b, c }  => {
                             edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("\"{:p}\"", nf)); attr!("label", "ncall"))));
                         },
-                        Residual::Guard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
+                        Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
                             if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
                                 edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "pass"))));
                             }

@@ -377,7 +377,7 @@ fn bit1_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
     } else {
         std::rc::Rc::new(BitUnary::<OP, false>::new(&operands))
     };
-    Some(NativeOp { window, args: LType::Number, result: crate::specialize::CType::Type(LType::Integer) })
+    Some(NativeOp { window, args: crate::specialize::CType::Number, result: crate::specialize::CType::Type(LType::Integer) })
 }
 
 /// `bit2::<OP>` as a window op, for a call with two numbers and one result: its
@@ -393,7 +393,7 @@ fn bit2_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
         (true, false) => std::rc::Rc::new(BitBinary::<OP, true, false>::new(&operands)),
         (true, true) => std::rc::Rc::new(BitBinary::<OP, true, true>::new(&operands)),
     };
-    Some(NativeOp { window, args: LType::Number, result: crate::specialize::CType::Type(LType::Integer) })
+    Some(NativeOp { window, args: crate::specialize::CType::Number, result: crate::specialize::CType::Type(LType::Integer) })
 }
 
 /// A table of `entries`, keyed by interned names.

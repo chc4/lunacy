@@ -476,7 +476,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         macro_rules! count_array_store {
             () => {
                 let ResumeArg::Type(t) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                let known = match t.as_ltype() { LType::Unknown => 0, LType::Number => 1, _ => 2 };
+                let known = match t { CType::Type(LType::Unknown) => 0, CType::Number => 1, _ => 2 };
                 yield YieldOp::Exec(ResidualExec::new("count_array_store", Rc::new(move |owner, state| {
                     state.counters.array_stores[known].increment();
                 })));
@@ -525,7 +525,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 None => Rc::new(SetTableInteger::new(&[a, b, c])) as Rc<dyn Window>,
                 Some(value) => Rc::new(SetTableIntegerK::new(value, &[a, b])),
             });
-        } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = (yield YieldOp::GuardRk(b, LType::Number)) {
+        } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = (yield YieldOp::GuardCType(b, CType::Number)) {
             // Any other number key, or one past the array part: through `set`.
             count_array_store!();
             arg = yield YieldOp::Exec(ResidualExec::new("settable_array", Rc::new(move |owner, state| {
@@ -802,8 +802,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         }
         // --- Number Path ---
         // Each register decoded from the encoding it is in. See Note [Integers].
-        let larg = yield YieldOp::GuardRk(lhs, LType::Number);
-        let rarg = yield YieldOp::GuardRk(rhs, LType::Number);
+        let larg = yield YieldOp::GuardCType(lhs, CType::Number);
+        let rarg = yield YieldOp::GuardCType(rhs, CType::Number);
         let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
             && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
         let (lint, rint) = if numbers { (integer_encoded!(lhs), integer_encoded!(rhs)) } else { (false, false) };
@@ -956,8 +956,8 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
         // Integers compare as integers, and each other register is decoded from
         // the encoding it is in. See Note [Integers].
         let integers = integer_operands!(b, c);
-        let larg = yield YieldOp::GuardRk(b, LType::Number);
-        let rarg = yield YieldOp::GuardRk(c, LType::Number);
+        let larg = yield YieldOp::GuardCType(b, CType::Number);
+        let rarg = yield YieldOp::GuardCType(c, CType::Number);
         let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
             && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
         let (lint, rint) = if numbers { (integer_encoded!(b), integer_encoded!(c)) } else { (false, false) };
@@ -1107,7 +1107,7 @@ pub fn emit_jmp(sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldO
 pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        arg = yield YieldOp::GuardRk(b, LType::Number);
+        arg = yield YieldOp::GuardCType(b, CType::Number);
         let (ResumeArg::Matched | ResumeArg::MatchedConst(_)) = arg else {
             unimplemented!("__unm metatable");
         };
@@ -1119,7 +1119,7 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
             };
             state.vals[state.base + a as usize] = LBoxed::box_lvalue(res);
         })));
-        yield YieldOp::SetTypes(vec![(a, LType::Number)]);
+        yield YieldOp::SetCTypes(vec![(a, CType::Number)]);
         arg
     }
 }
@@ -1137,7 +1137,7 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
                 };
                 state.vals[state.base + a] = LBoxed::box_lvalue(LValue::number(n as _));
             })));
-            yield YieldOp::SetTypes(vec![(a, LType::Number)]);
+            yield YieldOp::SetCTypes(vec![(a, CType::Number)]);
             return arg;
         }
         arg = yield YieldOp::Guard(b, LType::Table);
@@ -1148,7 +1148,7 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
                 let n = b.ro(owner).array.len();
                 state.vals[state.base + a] = LBoxed::box_lvalue(LValue::number(n as _));
             })));
-            yield YieldOp::SetTypes(vec![(a, LType::Number)]);
+            yield YieldOp::SetCTypes(vec![(a, CType::Number)]);
             return arg;
         } else {
             unimplemented!("__len metamethod")
@@ -1478,9 +1478,9 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         drain!(add, arg);
 
         // Each decoded from the encoding it is in. See Note [Integers].
-        let idx_number = yield YieldOp::Guard(a, LType::Number);
-        let limit_number = yield YieldOp::Guard(a + 1, LType::Number);
-        let step_number = yield YieldOp::Guard(a + 2, LType::Number);
+        let idx_number = yield YieldOp::GuardCType(a, CType::Number);
+        let limit_number = yield YieldOp::GuardCType(a + 1, CType::Number);
+        let step_number = yield YieldOp::GuardCType(a + 2, CType::Number);
 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
@@ -1526,7 +1526,7 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         // it has it. See Note [Native windows].
         if let ResumeArg::WindowArgs(end, args) = (yield YieldOp::NativeWindowArgs(a, b, c)) {
             for slot in a + 1..end {
-                yield YieldOp::Guard(slot, args);
+                yield YieldOp::GuardCType(slot, args.clone());
             }
         }
         // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch
@@ -1564,7 +1564,7 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
         // As a call's. See Note [Native windows].
         if let ResumeArg::WindowArgs(end, args) = (yield YieldOp::NativeWindowArgs(f, 3, c + 1)) {
             for slot in f + 1..end {
-                yield YieldOp::Guard(slot, args);
+                yield YieldOp::GuardCType(slot, args.clone());
             }
         }
         yield YieldOp::CallResume(CallTarget::Dynamic(f, 3, c + 1));
