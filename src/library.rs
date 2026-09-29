@@ -211,7 +211,19 @@ fn format(fmt: &[u8], args: &[LBoxed]) -> Vec<u8> {
 
 /// `math`'s natives beside those `Vm::global_env` defines.
 pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
+    macro_rules! math1 {
+        ($op:ident) => {
+            native!(window: math1_window::<$op>, |owner, args| smallvec![LBoxed::from_number(math1::<$op>(number(arg(&args, 0))))])
+        };
+    }
     vec![
+        ("floor", math1!(FLOOR)),
+        ("ceil", math1!(CEIL)),
+        ("sqrt", math1!(SQRT)),
+        ("abs", math1!(ABS)),
+        ("sin", math1!(SIN)),
+        ("cos", math1!(COS)),
+        ("tan", math1!(TAN)),
         ("random", native!(|owner, args| {
             let r = random();
             let value = match args.len() {
@@ -293,6 +305,51 @@ fn tobit(v: LBoxed) -> i32 {
 #[inline(always)]
 fn to_bit(n: f64) -> i32 {
     (n + 6755399441055744.0).to_bits() as u32 as i32
+}
+
+const FLOOR: u8 = 0;
+const CEIL: u8 = 1;
+const SQRT: u8 = 2;
+const ABS: u8 = 3;
+const SIN: u8 = 4;
+const COS: u8 = 5;
+const TAN: u8 = 6;
+
+/// A one-number function of the math library.
+#[inline(always)]
+fn math1<const OP: u8>(x: f64) -> f64 {
+    match OP {
+        FLOOR => x.floor(),
+        CEIL => x.ceil(),
+        SQRT => x.sqrt(),
+        ABS => x.abs(),
+        SIN => x.sin(),
+        COS => x.cos(),
+        TAN => x.tan(),
+        _ => unreachable!(),
+    }
+}
+
+// A math function's result, a number, is boxed canonically: its type is a
+// number of either encoding. See Note [Integers] in `specialize`.
+crate::window::windowed!(MathUnary, [], [OP: u8, X: bool], |owner, state, base| (x, out r) {
+    let x = if X { (unsafe { x.as_int() }) as f64 } else { unsafe { checked_number(x) } };
+    *r = LBoxed::from_number(math1::<OP>(x));
+});
+
+/// `math1::<OP>` as a window op, for a call with one number and one result: its
+/// argument in the encoding it has (`ints`).
+fn math1_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<NativeOp> {
+    if !(b == 2 && c == 2) {
+        return None;
+    }
+    let operands = [a + 1, a];
+    let window: std::rc::Rc<dyn crate::window::Window> = if ints[0] {
+        std::rc::Rc::new(MathUnary::<OP, true>::new(&operands))
+    } else {
+        std::rc::Rc::new(MathUnary::<OP, false>::new(&operands))
+    };
+    Some(NativeOp { window, args: crate::specialize::CType::Number, result: crate::specialize::CType::Number })
 }
 
 /// A number argument of a window op, which the specializer checked. See Note

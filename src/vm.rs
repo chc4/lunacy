@@ -1770,30 +1770,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let mut math_tab = Table::new(0, 0);
         // Unary float builtins consume the boxed stack directly: decode the one
         // argument with `as_number()` and write the result back as a boxed double.
-        macro_rules! math1 {
-            ($f:expr) => {
-                LValue::NClosure(NClosure::new(|mut seq, args, returns, _owner| {
-                    let r = match args.ro(&seq) {
-                        [b] => LBoxed::from_number(($f)(b.as_number().unwrap_or_else(|| unimplemented!()))),
-                        _ => unimplemented!(),
-                    };
-                    returns.rw(&mut seq).into_iter().zip([r]).for_each(|(slot, o)| *slot = o);
-                    1
-                }))
-            };
-        }
-        math_tab.insert_lvalue(InternString::intern(intern, "floor"), math1!(f64::floor));
-        math_tab.insert_lvalue(InternString::intern(intern, "ceil"), math1!(f64::ceil));
-        math_tab.insert_lvalue(InternString::intern(intern, "sqrt"), math1!(f64::sqrt));
-        math_tab.insert_lvalue(InternString::intern(intern, "abs"), math1!(f64::abs));
         math_tab.insert_lvalue(InternString::intern(intern, "huge"), LValue::NClosure(NClosure::new(|mut seq, args, returns, _owner|{
             returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::from_number(f64::INFINITY));
             1
         })));
         math_tab.insert_lvalue(InternString::intern(intern, "pi"), LValue::number(std::f64::consts::PI));
-        math_tab.insert_lvalue(InternString::intern(intern, "sin"), math1!(f64::sin));
-        math_tab.insert_lvalue(InternString::intern(intern, "cos"), math1!(f64::cos));
-        math_tab.insert_lvalue(InternString::intern(intern, "tan"), math1!(f64::tan));
         for (name, native) in crate::library::math_natives() {
             math_tab.insert_lvalue(InternString::intern(intern, name), native);
         }

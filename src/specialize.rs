@@ -468,8 +468,13 @@ pub fn captured_slots<'src, C>(proto: &crate::chunk::FunctionBlock<'src, C>) -> 
 /// and it has enough arguments. The arguments may either be fixed, or the top the call
 /// before left, if known (Note [Known top]). See Note [Native windows].
 fn native_window(ctx: &Context, a: usize, b: usize, c: usize) -> Option<(usize, crate::vm::NativeOp)> {
-    let end = if b == 0 { ctx.top? } else { a + b };
     let CType::NativeFunction(nf) = &ctx.types[a] else { return None };
+    native_op(ctx, nf, a, b, c)
+}
+
+/// `native_window`, for the native `nf` in R(A) however it is known.
+fn native_op(ctx: &Context, nf: &NClosure, a: usize, b: usize, c: usize) -> Option<(usize, crate::vm::NativeOp)> {
+    let end = if b == 0 { ctx.top? } else { a + b };
     let ints: SmallVec<[bool; 4]> = (a + 1..end).map(|slot| ctx.slot(slot) == CType::Type(LType::Integer)).collect();
     // A call taking every result gets the op's one.
     nf.window(a, (end - a) as u16, if c == 0 { 2 } else { c as u16 }, &ints).map(|op| (end, op))
@@ -1972,9 +1977,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
                     layout.push(next(vm));
-                    layout.push(Residual::NativeCall { nf: nf.native(), a: a16, b: b16, c: c16 });
-                    // A native may allocate (a table, a string).
-                    layout.push(Residual::GC);
+                    // Past the guard the native is known: it runs as its window op if
+                    // the call's arguments have the types the op assumes. See Note
+                    // [Native windows].
+                    let window = native_op(&calling, &nf, a, b, c)
+                        .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(&calling.slot(slot))));
+                    if let Some((_, op)) = window {
+                        layout.push(Residual::ExecWindow(op.window));
+                        if c == 0 {
+                            layout.push(Residual::ExecWindow(Rc::new(SetTop::new(a + 1, &[]))));
+                        }
+                    } else {
+                        layout.push(Residual::NativeCall { nf: nf.native(), a: a16, b: b16, c: c16 });
+                        // A native may allocate (a table, a string).
+                        layout.push(Residual::GC);
+                    }
                 },
                 _ => {
                     layout.push(Residual::Call { a: a16, b: b16, c: c16 });
