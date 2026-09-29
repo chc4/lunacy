@@ -545,12 +545,12 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
 
     #[inline]
     pub fn set(&mut self, owner: &mut Owner, key: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) {
-        self.set_widening(owner, key, value, intern, Widen::Decode)
+        self.set_widening::<{ Widen::Decode }>(owner, key, value, intern)
     }
 
-    /// `set`, a value stored in the array part widening its kind as `how` says.
+    /// `set`, a value stored in the array part widening its kind as `W` says.
     #[inline]
-    pub fn set_widening(&mut self, owner: &mut Owner, key: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>, how: Widen) {
+    pub fn set_widening<const W: Widen>(&mut self, owner: &mut Owner, key: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) {
         self.barrier_back();
         if let Some(slot) = key.as_number().and_then(array_slot) {
             // TODO: sparse arrays
@@ -562,7 +562,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
                 self.rw(owner).array.resize_with(slot + 1, || LBoxed::NIL);
             }
             self.rw(owner).array[slot] = value;
-            self.rw(owner).widen_by(how, value);
+            self.rw(owner).widen_by(W, value);
             return;
         }
         let k = LCanon::new(key, intern);

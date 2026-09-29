@@ -597,19 +597,25 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = (yield YieldOp::GuardCType(b, CType::Number)) {
             // Any other number key, or one past the array part: through `set`.
             count_store!(array_stores);
-            arg = yield YieldOp::Exec(ResidualExec::new("settable_array", Rc::new(move |owner, state| {
-                let kb: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
-                    Ok(b) => LValue::from(b),
-                    Err(lv) => lv.unbox(),
+            // A closure for each way of widening, which it knows as a constant.
+            macro_rules! make {
+                ($W:tt) => {
+                    ResidualExec::new("settable_array", Rc::new(move |owner, state| {
+                        let kb: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
+                            Ok(b) => LValue::from(b),
+                            Err(lv) => lv.unbox(),
+                        };
+                        let Some(kb) = kb.as_f64() else { unreachable!() };
+                        let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+                            Ok(c) => LBoxed::from(c),
+                            Err(lv) => *lv,
+                        };
+                        let LValue::Table(mut t) = state.vals[state.base + a].unbox() else { unreachable!() };
+                        t.set_widening::<$W>(owner, LBoxed::from_number(kb), kc, state.intern);
+                    }))
                 };
-                let Some(kb) = kb.as_f64() else { unreachable!() };
-                let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                    Ok(c) => LBoxed::from(c),
-                    Err(lv) => *lv,
-                };
-                let LValue::Table(mut t) = state.vals[state.base + a].unbox() else { unreachable!() };
-                t.set_widening(owner, LBoxed::from_number(kb), kc, state.intern, how);
-            })));
+            }
+            arg = yield YieldOp::Exec(with_widen!(how, make));
         } else {
             // Hash part set
             arg = ResumeArg::Failed;
