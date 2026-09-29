@@ -218,10 +218,7 @@ pub enum YieldOp {
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
-                      // knows it, Matched if it knows only that it has a single kind, else Failed.
-                      // See Note [Array kinds]
-    Homogeneous(usize), // Inform the executor that STACK[idx]'s array part has a single kind.
-                        // See Note [Array kinds]
+                      // knows it, else Failed. See Note [Array kinds]
     ArrayType(usize, usize), // Inform the executor that STACK[a] was loaded from STACK[b]'s array
                              // part: its type is the array's kind, if known. See Note [Array kinds]
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
@@ -586,6 +583,13 @@ windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, VARARG: bool, A: Co
             Err(_) => unreachable!(),
         }
     };
+});
+
+// Whether a table's array part has kind `kind`, testing an element loaded from it in place of
+// the element's own tag. See Note [Array kinds].
+windowed!(KindIs, [kind: LType], [], |owner, state, base| (table) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    state.select = (tab.ro(owner).kind != Some(kind)) as usize;
 });
 
 // `arrive` for the call of R(A) before it. `ac` is its `a | c << 16` (as `Count::hold` holds
@@ -994,17 +998,18 @@ pub struct Context {
 // last emptied, `Unknown` (mixed) once two differ. A kind only widens while the array holds
 // values, so a table whose kind is a representation holds only values of it.
 //
-// The context learns kinds as fragile information. A load from an array part whose kind isn't
-// known first tests whether the array has a single kind; if it does, the loaded slot is an element
-// of that table (`ElementOf`), and the first guard finding out the element's representation has
-// found out the array's kind too, which the context then knows (`Kind`). A load from an array part
-// of known kind has that type with no test. A loop's first iteration learns the kinds of the
-// arrays it reads elements of, so its later iterations, versioned for what the back edges carry,
-// read them unguarded.
+// The context learns kinds as fragile information. A load from an array part of known kind has
+// that type with no test. Any other load's slot is an element of its table (`ElementOf`), and a
+// guard finding out its representation, if the array's kind is that representation, tests the
+// array's kind in place of the element's: an element loaded before is covered, as the kind only
+// widened since, and the kind is known after (`Kind`). An array that isn't of the element's
+// representation has the element tested, as any value. A loop's first iteration learns the kinds
+// of the arrays it reads elements of, so its later iterations, versioned for what the back edges
+// carry, read them unguarded.
 //
-// Every store into an array part widens its kind. A store may be into any table the context
-// knows the kind of, through another slot, so it keeps only the known kinds of the value's
-// representation, and forgets which tables have a single kind.
+// Every store into an array part widens its kind, but for a value of a kind the context knows the
+// array has. A store may be into any table the context knows the kind of, through another slot,
+// so it keeps only the known kinds of the value's representation.
 
 // Note [Fragile information]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1065,9 +1070,6 @@ pub enum Fragile {
     /// Stack slot `slot` holds a value loaded from the array part of the table
     /// in slot `table`. See Note [Array kinds].
     ElementOf { slot: usize, table: usize },
-    /// The array part of the table in slot `table` has a single kind, not yet
-    /// known. See Note [Array kinds].
-    Homogeneous { table: usize },
     /// The array part of the table in slot `table` has kind `kind`. See Note
     /// [Array kinds].
     Kind { table: usize, kind: LType },
@@ -1097,8 +1099,7 @@ impl Fragile {
             Fragile::Holds { slot, .. } => (0, *slot),
             Fragile::Upvalue { upvalue, .. } => (1, *upvalue),
             Fragile::ElementOf { slot, .. } => (2, *slot),
-            Fragile::Homogeneous { table } => (3, *table),
-            Fragile::Kind { table, .. } => (4, *table),
+            Fragile::Kind { table, .. } => (3, *table),
         }
     }
 
@@ -1112,15 +1113,13 @@ impl Fragile {
             (Fragile::Upvalue { .. }, Effect::Write(_) | Effect::WriteAny) => true,
             (Fragile::Holds { .. } | Fragile::Upvalue { .. }, Effect::ArrayStore(_)) => true,
             (Fragile::ElementOf { slot, table }, Effect::Write(written)) => written != *slot && written != *table,
-            (Fragile::Homogeneous { table } | Fragile::Kind { table, .. }, Effect::Write(written)) => written != *table,
-            (Fragile::ElementOf { .. } | Fragile::Homogeneous { .. } | Fragile::Kind { .. }, Effect::WriteAny) => false,
-            (Fragile::ElementOf { .. } | Fragile::Homogeneous { .. } | Fragile::Kind { .. }, Effect::SetUpvalue(_)) => true,
+            (Fragile::Kind { table, .. }, Effect::Write(written)) => written != *table,
+            (Fragile::ElementOf { .. } | Fragile::Kind { .. }, Effect::WriteAny) => false,
+            (Fragile::ElementOf { .. } | Fragile::Kind { .. }, Effect::SetUpvalue(_)) => true,
             // The value stays where it was loaded from.
             (Fragile::ElementOf { .. }, Effect::ArrayStore(_)) => true,
-            // Any table may be the one stored into: one of a single, unknown
-            // kind may no longer be, and one of kind `kind` keeps it only for a
-            // value of that kind.
-            (Fragile::Homogeneous { .. }, Effect::ArrayStore(_)) => false,
+            // Any table may be the one stored into: one of kind `kind` keeps it
+            // only for a value of that kind.
             (Fragile::Kind { kind, .. }, Effect::ArrayStore(stored)) => stored == *kind,
         }
     }
@@ -1193,12 +1192,6 @@ impl Context {
             Fragile::Kind { table: known, kind } if *known == table => Some(*kind),
             _ => None,
         })
-    }
-
-    /// Whether the array part of the table in slot `table` has a single kind,
-    /// not yet known. See Note [Array kinds].
-    fn homogeneous(&self, table: usize) -> bool {
-        self.fragile.contains(&Fragile::Homogeneous { table })
     }
 
     /// The slot of the table whose array part slot `slot`'s value was loaded
@@ -1820,8 +1813,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut thunk_coro  = thunk_coro.clone();
             let found_field = state.vals[state.base + idx].unbox().typeof_();
             let found = CType::Type(found_field);
+            // An element of an array part whose kind is the element's
+            // representation: the array's kind is tested in place of the
+            // element's, and is known after. See Note [Array kinds].
+            let kind_of = thunk_ctx.element_of(idx).filter(|&table| {
+                let LValue::Table(tab) = state.vals[state.base + table].unbox() else { unreachable!("an element of a slot not holding a table") };
+                tab.ro(owner).kind == Some(found_field)
+            });
             // A value the context knows is a number only has its encoding tested.
-            let guard = if thunk_ctx.types[idx] == CType::Number {
+            let guard = if let Some(table) = kind_of {
+                Residual::GuardDynamic(Rc::new(KindIs::new(found_field, &[table])))
+            } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
             } else {
                 Residual::Guard { idx, expected: found_field }
@@ -1829,9 +1831,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut forced_ctx = thunk_ctx.clone();;
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
             forced_mut.types[idx] = found.clone();
-            // The element of an array part of a single kind has that kind, the
-            // array's. See Note [Array kinds].
-            if let Some(table) = thunk_ctx.element_of(idx).filter(|&table| thunk_ctx.homogeneous(table)) {
+            if let Some(table) = kind_of {
                 forced_mut.assume(Fragile::Kind { table, kind: found_field });
             }
             if let Some(href) = field {
@@ -2316,19 +2316,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::ArrayKind(table)) => {
                     arg = match ctx.array_kind(table) {
                         Some(kind) => ResumeArg::Type(CType::Type(kind)),
-                        None if ctx.homogeneous(table) => ResumeArg::Matched,
                         None => ResumeArg::Failed,
                     };
                 },
-                CoroutineState::Yielded(YieldOp::Homogeneous(table)) => {
-                    Rc::make_mut(&mut ctx).assume(Fragile::Homogeneous { table });
-                },
                 CoroutineState::Yielded(YieldOp::ArrayType(slot, table)) => {
                     let kind = ctx.array_kind(table);
-                    let homogeneous = ctx.homogeneous(table);
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, CType::Type(kind.unwrap_or(LType::Unknown)))]);
-                    if kind.is_none() && homogeneous {
+                    if kind.is_none() && slot != table {
                         ctx.assume(Fragile::ElementOf { slot, table });
                     }
                 },

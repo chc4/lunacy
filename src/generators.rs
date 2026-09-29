@@ -301,23 +301,7 @@ crate::window::windowed!(InArrayK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     state.select = (integer_slot(k) >= tab.ro(owner).array.len()) as usize;
 });
-// A `GuardDynamic` test: whether a table's array part has a single kind. See Note [Array kinds].
-crate::window::windowed!(Homogeneous, [], [], |owner, state, base| (table) {
-    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    state.select = matches!(tab.ro(owner).kind, None | Some(LType::Unknown)) as usize;
-});
 
-/// An array element's load's first step: whether the table's array part has a
-/// single kind, unless the context knows. See Note [Array kinds].
-macro_rules! array_kind {
-    ($table:expr) => {
-        if (yield YieldOp::ArrayKind($table)) == ResumeArg::Failed
-            && (yield YieldOp::GuardDynamic(Rc::new(Homogeneous::new(&[$table])))) == ResumeArg::Matched
-        {
-            yield YieldOp::Homogeneous($table);
-        }
-    };
-}
 
 pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
@@ -357,7 +341,6 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     *dest = tab.ro(owner).array[integer_slot(k)];
                 });
-                array_kind!(b);
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableArray::new(k, &[b, a])));
                 yield YieldOp::ArrayType(a, b);
             } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
@@ -365,7 +348,6 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     *dest = tab.ro(owner).array[integer_slot(key.as_int())];
                 });
-                array_kind!(b);
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableInteger::new(&[b, c, a])));
                 yield YieldOp::ArrayType(a, b);
             } else {
