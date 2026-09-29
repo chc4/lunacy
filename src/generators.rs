@@ -501,10 +501,15 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         } else {
             LType::Unknown
         };
-        // A value of the array's known kind keeps it: the store needn't widen it.
-        let widen = !(matches!(in_array, ResumeArg::Matched)
-            && stored != LType::Unknown
-            && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(stored)));
+        // A value of the array's known kind keeps it, and so does one of its
+        // elements: the store needn't widen it, and an element changes no kind.
+        let own = matches!(in_array, ResumeArg::Matched)
+            && c & 0x100 == 0
+            && (yield YieldOp::IsElementOf(c, a)) == ResumeArg::Matched;
+        let widen = !(own
+            || (matches!(in_array, ResumeArg::Matched)
+                && stored != LType::Unknown
+                && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(stored))));
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableArray, [k: i32, stored: LType], [WIDEN: bool], |owner, state, base| (table, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
@@ -532,7 +537,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 (Some(value), true) => Rc::new(SetTableArrayK::<true>::new(k, value, &[a])),
                 (Some(value), false) => Rc::new(SetTableArrayK::<false>::new(k, value, &[a])),
             });
-            yield YieldOp::Effect(Effect::ArrayStore(stored));
+            if !own {
+                yield YieldOp::Effect(Effect::ArrayStore(stored));
+            }
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableInteger, [stored: LType], [WIDEN: bool], |owner, state, base| (table, key, value) {
                 let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
@@ -559,7 +566,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 (Some(value), true) => Rc::new(SetTableIntegerK::<true>::new(value, stored, &[a, b])),
                 (Some(value), false) => Rc::new(SetTableIntegerK::<false>::new(value, stored, &[a, b])),
             });
-            yield YieldOp::Effect(Effect::ArrayStore(stored));
+            if !own {
+                yield YieldOp::Effect(Effect::ArrayStore(stored));
+            }
         } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = (yield YieldOp::GuardCType(b, CType::Number)) {
             // Any other number key, or one past the array part: through `set`.
             count_store!(array_stores);

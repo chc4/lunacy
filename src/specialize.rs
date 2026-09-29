@@ -219,6 +219,8 @@ pub enum YieldOp {
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
                       // knows it, else Failed. See Note [Array kinds]
+    IsElementOf(usize, usize), // Resumed with Matched if STACK[a] was loaded from STACK[b]'s array
+                               // part, else Failed. See Note [Array kinds]
     ArrayType(usize, usize), // Inform the executor that STACK[a] was loaded from STACK[b]'s array
                              // part: its type is the array's kind, if known. See Note [Array kinds]
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
@@ -915,6 +917,23 @@ fn forgotten(ctype: &CType) -> bool {
     *ctype != CType::Type(LType::Unknown)
 }
 
+/// Whether a jump to a target where the registers from `live` on hold no local
+/// forgets anything of `ctx`: those registers' types (`forgotten`), and the
+/// fragile facts about them.
+fn forgets(ctx: &Context, live: usize) -> bool {
+    (live..ctx.types.len()).any(|idx| forgotten(&ctx.types[idx]) || ctx.fragile.iter().any(|fact| !fact.survives(Effect::Write(idx))))
+}
+
+/// Forget, for a jump to a target where the registers from `live` on hold no
+/// local, those registers' types and the fragile facts about them.
+fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
+    let dead = (live..ctx.types.len()).filter(|&idx| forgotten(&ctx.types[idx])).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
+    ctx.set_types(owner, dead);
+    for idx in live..ctx.types.len() {
+        ctx.effect(Effect::Write(idx));
+    }
+}
+
 // Note [Dynamic guards]
 // ~~~~~~~~~~~~~~~~~~~~~~
 // A `GuardDynamic` residual's test is a window op that reads its operands and sets `state.select`,
@@ -1008,8 +1027,9 @@ pub struct Context {
 // carry, read them unguarded.
 //
 // Every store into an array part widens its kind, but for a value of a kind the context knows the
-// array has. A store may be into any table the context knows the kind of, through another slot,
-// so it keeps only the known kinds of the value's representation.
+// array has, or an element of the same array, which its kind covers. A store may be into any table
+// the context knows the kind of, through another slot, so it keeps only the known kinds of the
+// value's representation; an element stored back into its own array changes no kind.
 
 // Note [Fragile information]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1677,8 +1697,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let pc = self.blocks[target.0].pc;
         let live = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
         let mut jumping = ctx.clone();
-        let dead = (live..jumping.types.len()).filter(|&idx| forgotten(&jumping.types[idx])).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
-        jumping.set_types(owner, dead);
+        forget_dead(owner, &mut jumping, live);
         assert!(entered.accepts(&jumping), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
         target
     }
@@ -1693,18 +1712,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// The context a jump in `ctx` to `dest_pc` carries: it forgets the types of
-    /// every register not holding a local in scope there (`forgotten`), which
-    /// lets paths that differ only in them share the target's version.
+    /// every register not holding a local in scope there (`forgotten`), and the
+    /// fragile facts about them, which lets paths that differ only in them share
+    /// the target's version.
     fn jumping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
         let in_scope = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(dest_pc);
-        if let Some(in_scope) = in_scope {
-            let dead: Vec<(usize, CType)> = (in_scope..ctx.types.len())
-                .filter(|&idx| forgotten(&ctx.types[idx]))
-                .map(|idx| (idx, CType::Type(LType::Unknown)))
-                .collect();
-            if !dead.is_empty() {
-                Rc::make_mut(&mut ctx).set_types(owner, dead);
-            }
+        if let Some(in_scope) = in_scope.filter(|&in_scope| forgets(&ctx, in_scope)) {
+            forget_dead(owner, Rc::make_mut(&mut ctx), in_scope);
         }
         ctx
     }
@@ -1834,6 +1848,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let Some(table) = kind_of {
                 forced_mut.assume(Fragile::Kind { table, kind: found_field });
             }
+            // What the element's provenance was for is found out, so the paths
+            // continuing from here are alike whatever the element's origin.
+            forced_mut.fragile.retain(|fact| !matches!(fact, Fragile::ElementOf { slot, .. } if *slot == idx));
             if let Some(href) = field {
                 forced_mut.hkeys[href.0 as usize].known_type = found_field;
             }
@@ -2318,6 +2335,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Some(kind) => ResumeArg::Type(CType::Type(kind)),
                         None => ResumeArg::Failed,
                     };
+                },
+                CoroutineState::Yielded(YieldOp::IsElementOf(slot, table)) => {
+                    arg = if ctx.element_of(slot) == Some(table) { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
                 CoroutineState::Yielded(YieldOp::ArrayType(slot, table)) => {
                     let kind = ctx.array_kind(table);

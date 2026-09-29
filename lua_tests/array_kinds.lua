@@ -1,6 +1,7 @@
 -- Array kinds: loops reading an array of one kind; one whose kind changes
 -- partway through the loop by a store through another name, by table.insert,
--- and by emptying it and refilling it; arrays mixed from the start, of integers
+-- and by emptying it and refilling it; elements swapped within their array,
+-- and one stored into another; arrays mixed from the start, of integers
 -- and doubles, with a nil hole; nested arrays; and constructors. Each read
 -- value's type decides what the loop does with it, so a read typed with a kind
 -- the array no longer has would go wrong. Once, and in a loop run often enough
@@ -52,6 +53,15 @@ local function nested(n)
   return total .. "/" .. strs
 end
 
+local function swaps(n)
+  local t, s = {}, {}
+  for i = 1, n do t[i] = i end
+  for i = 1, n do s[i] = "s" end
+  for i = 1, n - 1 do t[i], t[i + 1] = t[i + 1], t[i] end
+  s[1] = t[1]
+  return classify(t, n) .. "," .. classify(s, n)
+end
+
 local function run(n)
   local out = {}
   local ints = {}
@@ -74,6 +84,7 @@ local function run(n)
   for i = 1, n do refill[i] = "s" end
   out[#out + 1] = classify(refill, n)
   out[#out + 1] = nested(4)
+  out[#out + 1] = swaps(n)
   local joined = table.concat(out, " ")
   return joined
 end
@@ -86,6 +97,6 @@ end
 print(first)
 print(run(3))
 print(same)
--- EXPECT: 36/0/0 28/1 6/2/0 11/0/0 4/0/1 6/1/0 36/0/0 0/8/0 96/1
--- EXPECT: 6/0/0 6/0 6/2/0 11/0/0 4/0/1 6/1/0 6/0/0 0/3/0 96/1
+-- EXPECT: 36/0/0 28/1 6/2/0 11/0/0 4/0/1 6/1/0 36/0/0 0/8/0 96/1 36/0/0,2/7/0
+-- EXPECT: 6/0/0 6/0 6/2/0 11/0/0 4/0/1 6/1/0 6/0/0 0/3/0 96/1 6/0/0,2/2/0
 -- EXPECT: true
