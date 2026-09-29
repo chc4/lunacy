@@ -305,8 +305,10 @@ enum PoolEntry {
     /// A window flush. See Note [Snapshots].
     Snapshot(Snapshot),
     /// A site's record: the absolute address of its fall-through label, then
-    /// its captures. See Note [Cold stencils] in `window`.
-    Record(DynamicLabel, Captures),
+    /// the displacement from the record to each capture's value entry, as an
+    /// `i32`. See Note [Cold stencils] in `window`.
+    /// With the op's name and captures, for disassembly.
+    Record(DynamicLabel, SmallVec<[DynamicLabel; 4]>, &'static str, Captures),
 }
 
 /// A window flush, which `flush_snapshot` does. See Note [Snapshots].
@@ -358,9 +360,10 @@ impl Pool {
 
     /// The label of a new entry holding the record of a site continuing at
     /// `fall` with `captures`. See Note [Cold stencils] in `window`.
-    fn record(&mut self, ops: &mut Assembler, fall: DynamicLabel, captures: &Captures) -> DynamicLabel {
+    fn record(&mut self, ops: &mut Assembler, fall: DynamicLabel, name: &'static str, captures: &Captures) -> DynamicLabel {
+        let values = captures.iter().map(|&value| self.value(ops, value)).collect();
         let label = ops.new_dynamic_label();
-        self.entries.push((label, PoolEntry::Record(fall, captures.clone())));
+        self.entries.push((label, PoolEntry::Record(fall, values, name, captures.clone())));
         label
     }
 
@@ -469,7 +472,7 @@ macro_rules! frame_op {
 /// call running its body. See Note [Frame ops] in `specialize`.
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
     match stencils.body(&**op, 0) {
-        Ok(body) => splat(ops, &body, &op.captures(), pool),
+        Ok(body) => splat(ops, &body, op.name(), &op.captures(), pool),
         // Debug builds' stencils can keep what optimized ones fold away, but an
         // optimized frame op the copier rejects is a bug to fix.
         Err(e) if !matches!(e, StencilError::Disabled) && !cfg!(debug_assertions) => panic!("{}: {e}", op.name()),
@@ -487,24 +490,23 @@ fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, 
     }
 }
 
-fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool) {
+fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool) {
     enum Site {
         Value(u64),
         Absolute(usize),
         Fall,
         FallAddress,
-        /// A word of the site's record: its site hole's `lea` its first, a
-        /// capture's load the capture's. See Note [Cold stencils] in `window`.
-        Record(usize),
+        /// The site's record, which its site hole's `lea` gives. See Note
+        /// [Cold stencils] in `window`.
+        Record,
     }
     let fall = ops.new_dynamic_label();
     // The site's record, if the op has a cold path.
-    let record = body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE).then(|| pool.record(ops, fall, captures));
+    let record = body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE).then(|| pool.record(ops, fall, name, captures));
     let mut sites: SmallVec<[(usize, usize, Site); 8]> = SmallVec::new();
-    sites.extend(body.holes.iter().map(|&(r, i)| match (i, record) {
-        (crate::window::SITE_HOLE, _) => (r.end, r.field, Site::Record(0)),
-        (i, Some(_)) => (r.end, r.field, Site::Record(8 * (1 + i))),
-        (i, None) => (r.end, r.field, Site::Value(captures[i])),
+    sites.extend(body.holes.iter().map(|&(r, i)| match i {
+        crate::window::SITE_HOLE => (r.end, r.field, Site::Record),
+        i => (r.end, r.field, Site::Value(captures[i])),
     }));
     sites.extend(body.relocations().iter().map(|r| (r.end, r.field, Site::Absolute(r.target))));
     sites.extend(body.nexts.iter().map(|n| match *n {
@@ -530,9 +532,9 @@ fn splat(ops: &mut Assembler, body: &Body, captures: &Captures, pool: &mut Pool)
                 let entry = pool.address(ops, fall);
                 ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
-            Site::Record(word) => {
+            Site::Record => {
                 let record = record.expect("a record for a body with a site hole");
-                ops.dynamic_relocation(record, word as isize, field_offset, 0, rel32(RelocationKind::Relative));
+                ops.dynamic_relocation(record, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
         }
     }
@@ -1072,7 +1074,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let pool_start = ops.offset();
         ops.align(8, 0xcc);
         jit_note!(self.jctx, ops, "{}", crate::disasm::POOL);
-        for (label, entry) in pool.entries {
+        // Records last: their displacements are to value entries, which are
+        // then placed.
+        let (records, entries): (Vec<_>, Vec<_>) = pool.entries.into_iter().partition(|(_, entry)| matches!(entry, PoolEntry::Record(..)));
+        for (label, entry) in entries.into_iter().chain(records) {
             let bytes = match entry {
                 PoolEntry::Value(value) => value.to_le_bytes().to_vec(),
                 PoolEntry::Address(target) => {
@@ -1080,10 +1085,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ((base.0 as usize + offset.0) as u64).to_le_bytes().to_vec()
                 }
                 PoolEntry::Snapshot(snapshot) => snapshot.bytes(),
-                PoolEntry::Record(fall, captures) => {
+                PoolEntry::Record(fall, values, _name, _captures) => {
+                    jit_note!(self.jctx, ops, "site record of {_name}: captures {:x?}", _captures.as_slice());
                     let offset = ops.labels().resolve_dynamic(fall).expect("a record for a placed site");
                     let mut bytes = ((base.0 as usize + offset.0) as u64).to_le_bytes().to_vec();
-                    captures.iter().for_each(|value| bytes.extend(value.to_le_bytes()));
+                    // Placed here, as every entry is 8 bytes aligned.
+                    let here = ops.offset().0 as isize;
+                    for value in values {
+                        let at = ops.labels().resolve_dynamic(value).expect("a record's value placed before it").0 as isize;
+                        bytes.extend(i32::try_from(at - here).expect("a pool within i32 of its records").to_le_bytes());
+                    }
+                    bytes.resize(bytes.len().next_multiple_of(8), 0);
                     bytes
                 }
             };
@@ -2122,7 +2134,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 match emit {
                                     Emit::Op { skip } => {
                                         let body = stencils.body(&**w, skip).expect("a usable skip");
-                                        splat(ops, &body, &w.captures(), pool);
+                                        splat(ops, &body, w.name(), &w.captures(), pool);
                                     }
                                     emit => emit_window_move(ops, emit),
                                 }

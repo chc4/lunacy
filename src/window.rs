@@ -316,13 +316,17 @@ macro_rules! bind_holes {
 #[doc(hidden)]
 pub(crate) use bind_holes;
 
-/// Bind each capture from a site's record, `I` counting up from its first
-/// capture. See Note [Cold stencils].
+/// Bind each capture through a site's record, `I` counting up from 0: the
+/// record's `I`th displacement, after its fall-through address, is from the
+/// record to the capture's value. See Note [Cold stencils].
 #[doc(hidden)]
 macro_rules! bind_record {
     ($site:ident, $idx:expr;) => {};
     ($site:ident, $idx:expr; $cap:ident : $cty:ty $(, $rcap:ident : $rcty:ty)*) => {
-        let $cap: $cty = unsafe { <$cty as $crate::window::Capture>::from_bits(*$site.add($idx)) };
+        let $cap: $cty = unsafe {
+            let displacement = *($site.add(1) as *const i32).add($idx);
+            <$cty as $crate::window::Capture>::from_bits(*($site as *const u8).offset(displacement as isize).cast::<u64>())
+        };
         $crate::window::bind_record!($site, $idx + 1; $($rcap : $rcty),*);
     };
 }
@@ -655,9 +659,10 @@ macro_rules! windowed {
                         unsafe { core::hint::unreachable_unchecked() }
                     }
                     let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
-                    // The site's record: its fall-through, then its captures.
+                    // The site's record: its fall-through, then where its
+                    // captures are.
                     let site = state.cold_site;
-                    $crate::window::bind_record!(site, 1; $($cap : $cty),*);
+                    $crate::window::bind_record!(site, 0; $($cap : $cty),*);
                     unsafe { Self::__window_cold($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
                     // SAFETY: the site's fall-through point, in JIT code, where
                     // its copy's window continues, at the stack it jumped from.
@@ -1171,17 +1176,18 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 // The cold stencil isn't copied: every copy of the op at that `SKIP` shares the
 // one in this executable, and reaches it with a jump relocated like a call.
 // What differs between copies, their captures and where each continues, is the
-// site's record, `[fall-through address, captures...]`, which the JIT lays in
-// the region's pool: before the jump, the copy stores the record's address,
+// site's record, `[fall-through address, displacement to each capture's value
+// (i32)...]`, which the JIT lays in the region's pool, whose values the copy
+// loads its captures from too: before the jump, the copy stores the record's address,
 // its site hole (`SITE_HOLE`), to `RunState::cold_site` (`become` wants the
 // callee's signature to be the caller's, so it can't be an argument). The cold
 // stencil binds the captures from the record, runs the cold block, and ends
 // in a tail jump to the record's fall-through address, the window where the
 // cold block left it.
 //
-// A site costs the record's first word: the copy loads its captures from the
-// record too, rather than from the pool's values, and its load of the site
-// hole, a `mov` from the hole's slot, is copied as an `lea` of the record
+// A site costs its record, and no more of the pool: its capture values are
+// the pool's, shared with every copy capturing the same, and its load of the
+// site hole, a `mov` from the hole's slot, is copied as an `lea` of the record
 // itself, so no slot holds the record's address.
 //
 // The cold stencil starts where its copy jumped from, so at the copied body's
@@ -1282,11 +1288,10 @@ pub unsafe fn assemble(
     let mut relocs: Vec<RipRel> = Vec::new();
     // Each continuation reference, with its copy's fall-through offset.
     let mut nexts: Vec<(NextRef, usize)> = Vec::new();
-    // Each site's record's fall-through offset and captures, and each
-    // reference into a record: its record and the word it reads (the site
-    // hole's `lea` the record's first). See Note [Cold stencils].
+    // Each site's record's fall-through offset and captures, and each site
+    // hole's `lea` of its record. See Note [Cold stencils].
     let mut records: Vec<(usize, Captures)> = Vec::new();
-    let mut record_refs: Vec<(RipRel, usize, usize)> = Vec::new();
+    let mut record_refs: Vec<(RipRel, usize)> = Vec::new();
     for &(op, skip) in ops {
         let body = unsafe { stencil_body(image, op, skip) }?;
         let captures = op.captures();
@@ -1294,13 +1299,14 @@ pub unsafe fn assemble(
         let shift = |r: RipRel| RipRel { field: r.field + at, end: r.end + at, ..r };
         code.extend_from_slice(&body.code);
         let fall = at + body.fall;
-        if body.holes.iter().any(|&(_, i)| i == SITE_HOLE) {
-            for &(r, i) in &body.holes {
-                record_refs.push((shift(r), records.len(), if i == SITE_HOLE { 0 } else { 1 + i }));
+        for &(r, i) in &body.holes {
+            match i {
+                SITE_HOLE => record_refs.push((shift(r), records.len())),
+                i => holes.push((shift(r), captures[i])),
             }
+        }
+        if body.holes.iter().any(|&(_, i)| i == SITE_HOLE) {
             records.push((fall, captures));
-        } else {
-            holes.extend(body.holes.iter().map(|&(r, i)| (shift(r), captures[i])));
         }
         relocs.extend(body.relocs.iter().map(|&r| shift(r)));
         nexts.extend(body.nexts.iter().map(|n| match *n {
@@ -1320,11 +1326,12 @@ pub unsafe fn assemble(
     }
     let indirect = nexts.iter().filter(|(n, _)| matches!(n, NextRef::Indirect(_))).count();
     code.resize(code.len() + indirect * 8, 0);
-    // Then the records.
+    // Then the records, each followed by its captures' values.
     let mut record_at = Vec::with_capacity(records.len());
     for (_, captures) in &records {
         record_at.push(code.len());
-        code.resize(code.len() + (1 + captures.len()) * 8, 0);
+        let displacements = (4 * captures.len()).next_multiple_of(8);
+        code.resize(code.len() + 8 + displacements + 8 * captures.len(), 0);
     }
 
     let map_err = |e: std::io::Error| StencilError::Map(e.to_string());
@@ -1350,12 +1357,16 @@ pub unsafe fn assemble(
     }
     for ((fall, captures), &at) in records.iter().zip(&record_at) {
         code[at..at + 8].copy_from_slice(&((base + fall) as u64).to_le_bytes());
+        let values = at + 8 + (4 * captures.len()).next_multiple_of(8);
         for (i, value) in captures.iter().enumerate() {
-            code[at + 8 * (i + 1)..at + 8 * (i + 2)].copy_from_slice(&value.to_le_bytes());
+            let slot = values + 8 * i;
+            code[slot..slot + 8].copy_from_slice(&value.to_le_bytes());
+            let displacement = i32::try_from(slot - at).unwrap();
+            code[at + 8 + 4 * i..at + 12 + 4 * i].copy_from_slice(&displacement.to_le_bytes());
         }
     }
-    for &(r, record, word) in &record_refs {
-        r.patch(&mut code, base, base + record_at[record] + 8 * word)?;
+    for &(r, record) in &record_refs {
+        r.patch(&mut code, base, base + record_at[record])?;
     }
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), buf.as_mut_ptr(), code.len()) };
     buf.make_exec().map_err(map_err)
