@@ -259,9 +259,12 @@ pub struct HashKey<'src, 'intern> {
 impl<'src, 'intern> HashKey<'src, 'intern> {
     fn tostring(&self, owner: &Owner) -> String {
         let lv: LValue = (&self.key).into();
-        format!("hkey({}, {})",
+        // The slots accesses through which are checked, if any.
+        let checked: Vec<String> = self.hazards.iter().enumerate().filter(|(_, checked)| **checked).map(|(slot, _)| slot.to_string()).collect();
+        format!("hkey({}, {}{})",
             String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
-            self.known_type)
+            self.known_type,
+            if checked.is_empty() { String::new() } else { format!(", checked {}", checked.join(" ")) })
     }
 
     /// A new hash key, its type not yet discovered.

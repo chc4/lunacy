@@ -123,6 +123,18 @@ jit-disasm benchmark times='10' features='unsafe':
         --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- {{benchmark}}.bin {{times}} > /dev/null
     @echo working/jit_disasm.txt
 
+# Where a benchmark's JIT code goes, in bytes (tools/jit_code_size.py): by
+# function, by kind of residual, and the largest blocks, from its annotated
+# disassembly (`jit-disasm`).
+jit-code-size benchmark times='10': (jit-disasm benchmark times)
+    python3 tools/jit_code_size.py working/jit_disasm.txt
+
+# How much machine code LuaJIT's JIT generates for a benchmark
+# (tools/luajit_mcode.lua), to compare with `jit-code-size`.
+luajit-mcode benchmark times='10':
+    just _luajitc {{benchmark}}
+    luajit tools/luajit_mcode.lua working/{{benchmark}}.luajit.bin {{times}}
+
 # Profile a benchmark with IBS (AMD's precise sampling: a sample is the
 # instruction that ran, with no skid), every `period` cycles, built as
 # `jit-disasm` builds with the perf map too, and join the samples on the JIT's

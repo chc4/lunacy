@@ -213,7 +213,7 @@ fn format(fmt: &[u8], args: &[LBoxed]) -> Vec<u8> {
 pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
     macro_rules! math1 {
         ($op:ident) => {
-            native!(window: math1_window::<$op>, |owner, args| smallvec![LBoxed::from_number(math1::<$op>(number(arg(&args, 0))))])
+            native!(window: math1_window::<$op>, |owner, args| smallvec![math1_boxed::<$op>(number(arg(&args, 0)))])
         };
     }
     vec![
@@ -330,11 +330,24 @@ fn math1<const OP: u8>(x: f64) -> f64 {
     }
 }
 
-// A math function's result, a number, is boxed canonically: its type is a
-// number of either encoding. See Note [Integers] in `specialize`.
+/// Whether `math1::<OP>`'s result is boxed in the double encoding, its type
+/// `Double`: a function whose results are seldom whole. The rest box theirs
+/// canonically, a number of either encoding. See Note [Integers] in
+/// `specialize`.
+const fn math1_double(op: u8) -> bool {
+    matches!(op, SQRT | SIN | COS | TAN)
+}
+
+/// `math1::<OP>`'s result, boxed as `math1_double` says.
+#[inline(always)]
+fn math1_boxed<'s, 'i, const OP: u8>(x: f64) -> LBoxed<'s, 'i> {
+    let r = math1::<OP>(x);
+    if math1_double(OP) { LBoxed::from_double(r) } else { LBoxed::from_number(r) }
+}
+
 crate::window::windowed!(MathUnary, [], [OP: u8, X: bool], |owner, state, base| (x, out r) {
     let x = if X { (unsafe { x.as_int() }) as f64 } else { unsafe { checked_number(x) } };
-    *r = LBoxed::from_number(math1::<OP>(x));
+    *r = math1_boxed::<OP>(x);
 });
 
 /// `math1::<OP>` as a window op, for a call with one number and one result: its
@@ -349,7 +362,8 @@ fn math1_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option
     } else {
         std::rc::Rc::new(MathUnary::<OP, false>::new(&operands))
     };
-    Some(NativeOp { window, args: crate::specialize::CType::Number, result: crate::specialize::CType::Number })
+    let result = if math1_double(OP) { crate::specialize::CType::Type(LType::Double) } else { crate::specialize::CType::Number };
+    Some(NativeOp { window, args: crate::specialize::CType::Number, result })
 }
 
 /// A number argument of a window op, which the specializer checked. See Note
