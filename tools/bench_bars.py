@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""The latest benchmark times as one grouped bar chart, as compiler papers draw
+"""The latest benchmark times as a grouped bar chart, as compiler papers draw
 them: a group of bars per benchmark, one per implementation (lua5.1, lua5.5,
 Luau without and with its code generator (--codegen), LuaJIT without and with
-its JIT, and this project's interpreter, release and unsafe builds), on one
-linear axis of seconds.
+its JIT, and this project's interpreter, release and unsafe builds), on a linear
+axis of seconds, in rows of `--per-row` benchmarks, each row on its own axis.
 
 Each bar is the median of its runs, with a whisker across their quartiles,
 from the most recent clean commit the history (bench/history.jsonl, see
@@ -11,8 +11,8 @@ tools/bench_history.py) has that build's time at; a build without one (lua5.1
 and lua5.5 lack the bit library some benchmarks use) is marked n/a. `--builds`
 picks the implementations; `--clamp`'s (lua5.1, lua5.5 and lunacy's
 interpreter, an order of magnitude past the rest, by default) don't set the
-scale past 1.5 times the rest's highest, a bar past the top cut under a hat
-with its time. Writes working/bars.html.
+scale past 1.5 times the rest's highest in their row, a bar past the top cut
+under a hat with its time. Writes working/bars.html.
 """
 import argparse
 import html
@@ -43,7 +43,8 @@ def nice_step(span):
     return next(m * magnitude for m in (1, 2, 2.5, 5, 10) if raw <= m * magnitude)
 
 
-def chart(data, info, builds, clamp):
+def groups_of(data, info, builds):
+    """Per benchmark run, in order, its bars: each build's latest result."""
     groups = []
     for bench, arg in sorted(data):
         bars = []
@@ -51,6 +52,13 @@ def chart(data, info, builds, clamp):
             r, commit = latest(data[(bench, arg)].get(build, {}), info)
             bars.append((build, r, commit, box(r) if r else None))
         groups.append((bench, arg, bars))
+    return groups
+
+
+def chart(groups, builds, clamp, slots, legend):
+    """One row of the chart: `groups` on a scale of their own, laid out as wide
+    as `slots` groups, so rows line up; the builds' legend under it if
+    `legend`."""
     # The clamped implementations' bars don't set the scale past 1.5 times the
     # highest of the rest: one past the chart's top is cut there, under a hat
     # with its time.
@@ -61,8 +69,8 @@ def chart(data, info, builds, clamp):
     hi = step * (int(top_value / step) + 1)
     bar_w, gap, left, right, top, bottom = 14, 22, 56, 16, 30, 58
     group_w = bar_w * len(builds)
-    width = left + len(groups) * group_w + (len(groups) - 1) * gap + right
-    height = 360
+    width = left + slots * group_w + (slots - 1) * gap + right
+    height = 360 if legend else 340
     y = lambda v: top + (hi - v) / hi * (height - top - bottom)
     parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" aria-label="benchmark times">']
     for k in range(round(hi / step) + 1):
@@ -94,7 +102,7 @@ def chart(data, info, builds, clamp):
     parts.append(f'<line x1="{left}" x2="{width - right}" y1="{y(0):.1f}" y2="{y(0):.1f}" class="baseline"/>')
     legend_y = height - 12
     x = left
-    for build in builds:
+    for build in (builds if legend else []):
         parts.append(f'<rect x="{x}" y="{legend_y - 9}" width="10" height="10" fill="{COLORS.get(build, "#555")}"/>')
         label = LABELS.get(build, build)
         parts.append(f'<text x="{x + 14}" y="{legend_y}" class="axis">{html.escape(label)}</text>')
@@ -119,12 +127,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--builds', default=','.join(ORDER), help='the implementations, comma separated, in bar order')
     ap.add_argument('--clamp', default='lua5.1,lua5.5,interpreter', help="the implementations, comma separated, whose bars don't set the scale past 1.5 times the rest's highest")
+    ap.add_argument('--per-row', type=int, default=5, help='benchmark runs per row of the chart, each row on its own scale')
     ap.add_argument('--out', default='working/bars.html')
     args = ap.parse_args()
     builds = args.builds.split(',')
     data, info = series()
     commits = sorted({latest(data[k].get(b, {}), info)[1] for k in data for b in builds} - {None}, key=lambda c: info[c][1])
     at = ', '.join(f'{c[:8]} ({html.escape(info[c][2])})' for c in commits)
+    clamp = set(filter(None, args.clamp.split(',')))
+    groups = groups_of(data, info, builds)
+    rows = [groups[i:i + args.per_row] for i in range(0, len(groups), args.per_row)]
+    charts = '\n'.join(f'<div class="scroll">{chart(row, builds, clamp, args.per_row, i == len(rows) - 1)}</div>' for i, row in enumerate(rows))
     page = f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmark Times</title>
@@ -138,8 +151,8 @@ body {{ background: var(--bg); color: var(--fg); font: 14px system-ui, sans-seri
 .scroll {{ overflow-x: auto; }} table {{ border-collapse: collapse; margin: 16px 0; }} td, th {{ padding: 2px 8px; text-align: right; }}
 </style></head><body>
 <h1>Benchmark times</h1>
-<p>Median time per implementation, in seconds; whiskers span the quartiles. Each build's latest clean commit: {at}.</p>
-<div class="scroll">{chart(data, info, builds, set(filter(None, args.clamp.split(','))))}</div>
+<p>Median time per implementation, in seconds; whiskers span the quartiles. Each row has its own scale. Each build's latest clean commit: {at}.</p>
+{charts}
 <div class="scroll">{table(data, info, builds)}</div>
 </body></html>
 '''

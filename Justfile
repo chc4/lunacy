@@ -541,12 +541,13 @@ bench-history:
     python3 tools/bench_history.py report
     python3 tools/bench_history.py plot
 
-# The latest commit's times from the benchmark history as one grouped bar chart,
-# a group per benchmark, in working/bars.html (tools/bench_bars.py): `builds`,
-# the implementations, in bar order, and `clamp`, those whose bars don't set
-# the scale past 1.5 times the rest's highest (comma separated).
-bench-bars builds='lua5.1,lua5.5,luau,luau --codegen,luajit -joff,luajit,interpreter,release,unsafe' clamp='lua5.1,lua5.5,interpreter':
-    python3 tools/bench_bars.py --builds "{{builds}}" --clamp "{{clamp}}"
+# The latest commit's times from the benchmark history as a grouped bar chart,
+# a group per benchmark, in rows of `per_row` each on its own scale, in
+# working/bars.html (tools/bench_bars.py): `builds`, the implementations, in bar
+# order, and `clamp`, those whose bars don't set a row's scale past 1.5 times
+# the rest's highest (comma separated).
+bench-bars builds='lua5.1,lua5.5,luau,luau --codegen,luajit -joff,luajit,interpreter,release,unsafe' clamp='lua5.1,lua5.5,interpreter' per_row='5':
+    python3 tools/bench_bars.py --builds "{{builds}}" --clamp "{{clamp}}" --per-row {{per_row}}
 # Hardware counters (`perf stat`) for this checkout's build of `profile`
 # (`release` or `unsafe`) and revision `ref`'s (built as `_build-vs` builds
 # them) on one benchmark, each pinned as `hyperfine` runs it and repeated `runs`
