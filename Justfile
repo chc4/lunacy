@@ -337,8 +337,9 @@ gdb-benchmark benchmark:
 # working/, or with `ref`, revision `ref`'s build (in target/compare/<ref>, as
 # for `hyperfine-vs`; it must have the profile) on this checkout's benchmark,
 # its perf.data there and working/flamegraph-<ref>.svg.
-# `freq` is perf's sampling rate, in Hz.
-flamegraph benchmark times='10' ref='' freq='997':
+# `freq` is perf's sampling rate, in Hz; `features` the build's (`magic perf`
+# for the interpreter alone, without the JIT).
+flamegraph benchmark times='10' ref='' freq='997' features='unsafe perf':
     #!/usr/bin/env bash
     set -euo pipefail
     just _luac {{benchmark}}
@@ -346,14 +347,14 @@ flamegraph benchmark times='10' ref='' freq='997':
     # `-Z build-std`, which `cargo flamegraph` takes from the environment.
     export CARGO_UNSTABLE_BUILD_STD=core,std,panic_abort
     if [ -z "{{ref}}" ]; then
-        (cd working && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -- {{benchmark}}.bin {{times}})
+        (cd working && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "{{features}}" --bin bench -- {{benchmark}}.bin {{times}})
         firefox -new-tab working/flamegraph.svg || true
     else
         dir=target/compare/{{ref}}
         just _compare-worktree {{ref}}
         bin=$(realpath working/{{benchmark}}.bin)
         svg=$(realpath working)/flamegraph-{{ref}}.svg
-        (cd $dir && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o $svg -- $bin {{times}})
+        (cd $dir && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "{{features}}" --bin bench -o $svg -- $bin {{times}})
     fi
 
 # `flamegraph` of revision `ref` (as for `hyperfine-vs`) and of this checkout on
@@ -634,6 +635,21 @@ store-types:
         just _luac $benchmark > /dev/null
         echo "$benchmark $times: $(cd working && ../target/store_types/release/bench $benchmark.bin $times | grep -o 'array_stores([^)]*) field_stores([^)]*)' | tail -1)"
     done
+
+# lunacy's interpreter alone (no JIT) on a benchmark, into the history as
+# `hyperfine-full` records it: for a change to the interpreter, without timing
+# every other implementation again.
+hyperfine-interpreter benchmark times='10': interpreter-compile
+    just _luac {{benchmark}}
+    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-json working/hyperfine-{{benchmark}}-{{times}}-interpreter.json \
+        -n interpreter "./target/interpreter/release/bench working/{{benchmark}}.bin {{times}}"
+    python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}-interpreter.json --benchmark {{benchmark}} --arg {{times}}
+
+# `hyperfine-interpreter` over HYPERFINES.
+hyperfines-interpreter:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do just hyperfine-interpreter ${run%:*} ${run#*:}; done
 
 # `hyperfine` over HYPERFINES.
 hyperfines:
