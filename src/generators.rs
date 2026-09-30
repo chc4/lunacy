@@ -128,9 +128,13 @@ macro_rules! integer_encoded {
 /// integral constant counting as one. See Note
 /// [Integers].
 ///
-/// Only an existing integer register makes the other register's integer-ness worth
-/// asking: asking can transition that slot's static type, modifying the
-/// specialization context and duplicating versions.
+/// Only an operand already known to be an integer (a register typed so, or an
+/// integral constant) makes the other register's integer-ness worth asking:
+/// asking can transition that slot's static type, modifying the specialization
+/// context and duplicating versions. Not asking when the other operand is an
+/// integral constant would compute an integer register plus a constant as a
+/// double, changing its encoding, so a counter the context can't type (an
+/// upvalue, a field) would alternate between encodings.
 ///
 /// The other register is asked about even when its type is already known, so
 /// the path through this macro always results in a stable `SubPc` that allows
@@ -140,10 +144,9 @@ macro_rules! integer_operands {
         let integer = ResumeArg::Type(CType::Type(LType::Integer));
         let lt = (yield YieldOp::TypeofRk($lhs)) == integer;
         let rt = (yield YieldOp::TypeofRk($rhs)) == integer;
-        let registers = ($lhs & 0x100) == 0 && ($rhs & 0x100) == 0;
-        if registers && lt {
+        if lt && ($rhs & 0x100) == 0 {
             integer_encoded!($rhs)
-        } else if registers && rt {
+        } else if rt && ($lhs & 0x100) == 0 {
             integer_encoded!($lhs)
         } else {
             lt && rt
