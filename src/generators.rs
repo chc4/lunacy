@@ -627,7 +627,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         } else {
             // Hash part set
             arg = ResumeArg::Failed;
-            arg = yield YieldOp::HashKey(a, b);
+            // Only a hash key a load already made: making one costs a lookup (`HrefInit`)
+            // each activation, which a field only stored once repays nothing.
+            arg = yield YieldOp::TryHashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 count_store!(field_stores);
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
