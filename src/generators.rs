@@ -627,7 +627,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         } else {
             // Hash part set
             arg = ResumeArg::Failed;
-            arg = yield YieldOp::TryHashKey(a, b);
+            arg = yield YieldOp::HashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 count_store!(field_stores);
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
