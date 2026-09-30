@@ -534,7 +534,28 @@ pub const UNKNOWN_RETURN: u32 = (1 << crate::vm::EFFECTS_SHIFT) - 1;
 // types (and with C = 0, the top), and what of the caller's context before the call the callee's
 // effects keep. A return whose results aren't known (B = 0), or one past `MAX_VERSIONS`, continues
 // as a call without: `Arrive` and the version knowing nothing of the results or of the callee's
-// effects. A native call doesn't return this way, and never reaches such a guard.
+// effects. That version is only found, and compiled, when a layout jumps to it (`After`): one
+// made up front would take one of the pc's versions whether or not anything ever enters it, and
+// once the pc has `MAX_VERSIONS`, accept the contexts its continuations reach it with, knowing
+// nothing of them. A native call doesn't return this way, and never reaches such a guard.
+
+/// Where a call continues when nothing specializes its continuation: a block,
+/// or the version of a pc for a context, found (and compiled) only when a
+/// layout jumps to it. See Note [Call continuations].
+#[derive(Clone)]
+enum After {
+    Block(BlockId),
+    Version(Pc, Rc<Context>),
+}
+
+impl After {
+    fn block(&self, vm: &mut Specializer, owner: &mut Owner) -> BlockId {
+        match self {
+            After::Block(block) => *block,
+            After::Version(pc, ctx) => vm.version(owner, *pc, ctx.clone()),
+        }
+    }
+}
 
 // Note [Frame ops]
 // ~~~~~~~~~~~~~~~~
@@ -2234,7 +2255,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// The thunk a call to R(A) of the context `calling`, continuing at
-    /// `after`, ends its block in, or, not `appends`, a guard's failure is: run,
+    /// `after` (as `After::block`), ends its block in, or, not `appends`, a guard's failure is: run,
     /// it lays out a call for the function in R(A), guarding its identity and
     /// chaining a thunk for the next onto the guard's failure, while its chain
     /// guards fewer than `MAX_VERSIONS` (`identities`); past that, or for what
@@ -2243,7 +2264,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// below it, and the pc after it, a Lua function's call continues at a thunk
     /// specializing it to the return. See Notes [Call sites], [Call
     /// continuations] and [Call effects].
-    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, a: usize, b: usize, c: usize, after: BlockId, continuation: Option<(Rc<Context>, Rc<[usize]>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
             // is a guard's failure, with the rest of the layout after it. See Note
@@ -2257,7 +2278,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 block_id
             };
             let (a16, b16, c16) = (a as u16, b as u16, c as u16);
-            let next = |vm: &Specializer| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), a, b, c, after, continuation.clone(), identities + 1, false));
+            let next = |vm: &Specializer| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), a, b, c, after.clone(), continuation.clone(), identities + 1, false));
             let mut layout = vec![];
             match state.vals[state.base + a].unbox() {
                 LValue::LClosure(lclos) if matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS => {
@@ -2271,7 +2292,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg });
                     if let Some((ctx, captured, pc)) = &continuation {
                         // See Note [Call continuations].
-                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), *pc, a, c, after, 0, true)));
+                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), *pc, a, c, after.clone(), 0, true)));
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -2309,7 +2330,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     vm.join_effects(owner, Effects::OPAQUE);
                 },
             }
-            layout.push(Residual::Jump(after));
+            layout.push(Residual::Jump(after.block(vm, owner)));
             vm.blocks[block.0].instructions.extend(layout);
         })))
     }
@@ -2323,9 +2344,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// call less the callee's frame (`captured` its slots below the call's that
     /// its closures captured); while its chain guards fewer than `MAX_VERSIONS`
     /// (`identities`). Past that, or for a return that doesn't know what it
-    /// returns, the results, and `after`. See Notes [Call continuations] and
+    /// returns, the results, and `after` (as `After::block`). See Notes [Call continuations] and
     /// [Call effects].
-    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, pc: Pc, a: usize, c: usize, after: BlockId, identities: usize, appends: bool) -> ThunkRef {
+    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, pc: Pc, a: usize, c: usize, after: After, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, as for a call thunk. See Note [Thunk patching].
             let block = if !appends || vm.compiled(block_id) {
@@ -2361,13 +2382,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let known = vm.jumping(owner, Rc::new(known), pc);
                     let version = vm.version(owner, pc, known);
                     layout.push(Residual::ReturnedFrom(returned));
-                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), pc, a, c, after, identities + 1, false)));
+                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), pc, a, c, after.clone(), identities + 1, false)));
                     layout.push(Residual::Arrived { a: a16, c: c16, returned: results.len() as u16 });
                     layout.push(Residual::Jump(version));
                 },
                 None => {
                     layout.push(Residual::Arrive { a: a16, c: c16 });
-                    layout.push(Residual::Jump(after));
+                    layout.push(Residual::Jump(after.block(vm, owner)));
                     // See Note [Call effects].
                     vm.join_effects(owner, Effects::OPAQUE);
                 },
@@ -2902,13 +2923,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // for the function it finds, the code after it a version of
                             // its own. See Note [Call sites].
                             let (after, continuation) = if resumes {
-                                (self.subblock(owner, pc.next_true(), ctx, coro.clone(), ResumeArg::Start), None)
+                                (After::Block(self.subblock(owner, pc.next_true(), ctx, coro.clone(), ResumeArg::Start)), None)
                             } else {
                                 // A Lua callee's return also chooses a version of its own. See
                                 // Note [Call continuations].
                                 let continuation = before.map(|(before, captured)| (before, captured, pc.0 + 1));
                                 let after = self.jumping(owner, ctx, pc.0 + 1);
-                                (self.version(owner, pc.0 + 1, after), continuation)
+                                (After::Version(pc.0 + 1, after), continuation)
                             };
                             self.end_block(block_id);
                             let thunk = self.make_call_thunk(block_id, calling, a, b, c, after, continuation, 0, true);
