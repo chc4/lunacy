@@ -572,7 +572,9 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
     passing.is_some()
 }
 
-const JIT_SIZE: usize = 0x1000 * 16;
+/// The JIT code buffer's size. `immediate_jit` compiles every block that runs,
+/// each as its own region, so it gets twice as much.
+const JIT_SIZE: usize = 0x1000 * 16 * if cfg!(feature = "immediate_jit") { 2 } else { 1 };
 pub struct JitContext {
     pub memory: std::cell::Cell<dynasmrt::mmap::ExecutableBuffer>,
     pub blocks: HashMap<BlockId, JitBlock, FxBuildHasher>,
