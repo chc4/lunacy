@@ -1267,9 +1267,13 @@ impl Location {
 }
 
 /// What a return leaves JIT code with, or last sets `RunState::returned` to:
-/// `RETURNED | id`, `id` naming what it returned. See Note [Call
-/// continuations] in `specialize`.
+/// `RETURNED | effects << EFFECTS_SHIFT | id`, `id` naming what it returned
+/// and `effects` its function's. See Notes [Call continuations] and [Call
+/// effects] in `specialize`.
 pub const RETURNED: u64 = (-5i32 as u64) << 32;
+/// Where a return's effects are in what it returns, above its id. See
+/// `RETURNED`.
+pub const EFFECTS_SHIFT: u32 = 20;
 
 // Note [Stack frames]
 // ~~~~~~~~~~~~~~~~~~~~
@@ -1392,7 +1396,8 @@ pub struct RunState<'src, 'intern> {
     /// The record of the site whose window op's cold stencil is running. See
     /// Note [Cold stencils] in `window`.
     pub cold_site: *const u64,
-    /// The last return's `RETURNED | id`, `id` naming what it returned, which
+    /// The last return's `RETURNED | effects << EFFECTS_SHIFT | id`, `id`
+    /// naming what it returned and `effects` its function's, which
     /// the continuation of the call it returned from guards on. See Note [Call
     /// continuations] in `specialize`.
     pub returned: u64,

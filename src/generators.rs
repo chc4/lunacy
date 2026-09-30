@@ -621,6 +621,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 };
             }
             arg = yield YieldOp::Exec(with_widen!(how, make));
+            // The exec writing any slot drops the kinds this function knows, but its
+            // callers see only this. See Note [Call effects] in `specialize`.
+            yield YieldOp::Effect(Effect::ArrayStore(stored));
         } else {
             // Hash part set
             arg = ResumeArg::Failed;

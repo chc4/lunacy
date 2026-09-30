@@ -2131,18 +2131,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none());
                     successor = Some(*target);
                 },
-                Residual::Ret(pc, a, b, closes, vararg, returns) => {
+                Residual::Ret(pc, a, b, closes, vararg, returns, effects) => {
                     // The frame, popped by `PopFrame`, and the JIT code left with the
-                    // return (`RETURNED | id`), or for the outermost frame's, the
-                    // exit. See Notes [Frame ops] and [Call continuations] in `specialize`.
+                    // return (`RETURNED | effects << EFFECTS_SHIFT | id`), or for the
+                    // outermost frame's, the exit. See Notes [Frame ops], [Call
+                    // continuations] and [Call effects] in `specialize`.
                     let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     // With the id of what it returns. See Note [Call continuations] in `specialize`.
                     let (at, ab) = (Location(BlockId(id.0), off).pack().bits() as u64, hold(*a as u16) | hold(*b) << 16 | (*returns as u64) << 32);
+                    let effects = *effects as u64;
                     let pop = match (*closes, *vararg) {
-                        (false, false) => frame_op!(PopFrame [false, false,] (at, ab); *a as u16, *b),
-                        (false, true) => frame_op!(PopFrame [false, true,] (at, ab); *a as u16, *b),
-                        (true, false) => frame_op!(PopFrame [true, false,] (at, ab); *a as u16, *b),
-                        (true, true) => frame_op!(PopFrame [true, true,] (at, ab); *a as u16, *b),
+                        (false, false) => frame_op!(PopFrame [false, false,] (at, ab, effects); *a as u16, *b),
+                        (false, true) => frame_op!(PopFrame [false, true,] (at, ab, effects); *a as u16, *b),
+                        (true, false) => frame_op!(PopFrame [true, false,] (at, ab, effects); *a as u16, *b),
+                        (true, true) => frame_op!(PopFrame [true, true,] (at, ab, effects); *a as u16, *b),
                     };
                     jit_note!(self.jctx, ops, "        PopFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &pop);

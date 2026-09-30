@@ -140,7 +140,7 @@ impl std::fmt::Display for Residual {
             Residual::Jump(target) => write!(f, "jump({})", target.0),
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
             Residual::Arrive { a, c } => write!(f, "arrive({}, {})", a, c),
-            Residual::ReturnedFrom(from) => write!(f, "returned({})", from & 0xffff_ffff),
+            Residual::ReturnedFrom(from) => write!(f, "returned({}, {:#x})", from & UNKNOWN_RETURN as u64, (from & 0xffff_ffff) >> crate::vm::EFFECTS_SHIFT),
             Residual::Arrived { a, c, returned } => write!(f, "arrived({}, {}, {})", a, c, returned),
             Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
             Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, .. } => write!(f, "lcall({}, {}, {}, {})", block.0, a, b, c),
@@ -513,7 +513,7 @@ windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
 
 /// The id of a return whose results aren't known (B = 0). See Note [Call
 /// continuations].
-pub const UNKNOWN_RETURN: u32 = u32::MAX;
+pub const UNKNOWN_RETURN: u32 = (1 << crate::vm::EFFECTS_SHIFT) - 1;
 
 // Note [Call continuations]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -522,18 +522,19 @@ pub const UNKNOWN_RETURN: u32 = u32::MAX;
 // on the return rather than on the types of the results. A `Ret`'s context at compile time says
 // what it returns: the types of its results, and, with B, how many. Those are interned into an id,
 // the same for every return of the same (`Specializer::returns`), or with B = 0, unknown
-// (`UNKNOWN_RETURN`). A return leaves JIT code with `RETURNED | id` (the call's return value, where
-// the call is in JIT code), and sets `RunState::returned` to the same, from JIT code or the
-// interpreter.
+// (`UNKNOWN_RETURN`). A return leaves JIT code with `RETURNED | effects << EFFECTS_SHIFT | id`, its
+// function's effects with the id (Note [Call effects]; the call's return value, where the call is
+// in JIT code), and sets `RunState::returned` to the same, from JIT code or the interpreter.
 //
 // After a call to a Lua function (a `LuaCall`), the caller continues at a thunk, not an `Arrive`.
 // Forced just after a return, it lays out a guard on that return (`ReturnedFrom`), comparing the
 // call's return value (`returned` where the interpreter runs it, or where JIT code is entered at
 // the guard), the thunk for the next return on its failure, and on its success an `Arrive` knowing
 // the count (`Arrived`) and a jump to a version of the code after the call knowing the results'
-// types (and with C = 0, the top). A return whose results aren't known (B = 0), or one past
-// `MAX_VERSIONS`, continues as a call without: `Arrive` and the version knowing nothing of the
-// results. A native call doesn't return this way, and never reaches such a guard.
+// types (and with C = 0, the top), and what of the caller's context before the call the callee's
+// effects keep. A return whose results aren't known (B = 0), or one past `MAX_VERSIONS`, continues
+// as a call without: `Arrive` and the version knowing nothing of the results or of the callee's
+// effects. A native call doesn't return this way, and never reaches such a guard.
 
 // Note [Frame ops]
 // ~~~~~~~~~~~~~~~~
@@ -607,10 +608,11 @@ windowed!(frame PushFrame, [ret: u64, abs: u64], [FILLS: bool, A: Count, B: Coun
 });
 
 // A `Ret` at `at` (a `PackedLocation`). `ab` is its `a | b << 16` (as `Count::hold` holds them),
-// and in the upper half, the id of what it returns (Note [Call continuations]).
+// and in the upper half, the id of what it returns (Note [Call continuations]); `effects` the
+// address of its function's effects, which it returns with the id (Note [Call effects]).
 // Closing upvalues if `CLOSES`, returning from a vararg function if `VARARG`.
 // See Note [Frame ops].
-windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(frame PopFrame, [at: u64, ab: u64, effects: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     let Location(BlockId(block), off) = Location::unpack(crate::vm::PackedLocation::from_bits(at as usize));
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
     state.exit = if state.callstack.is_empty() {
@@ -621,7 +623,8 @@ windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, VARARG: bool, A: Co
             // See Note [Call continuations].
             Ok(location) => {
                 state.resume = location.pack().bits() as u64;
-                state.returned = crate::vm::RETURNED | ab >> 32;
+                let effects = unsafe { *(effects as *const u16) } as u64;
+                state.returned = crate::vm::RETURNED | effects << crate::vm::EFFECTS_SHIFT | ab >> 32;
                 state.returned
             },
             // With a caller frame, `leave` returns to it.
@@ -718,9 +721,10 @@ pub enum Residual {
     Thunk(ThunkRef),
     /// A RETURN of `b - 1` values from R(A), or up to the top. Closes the frame's open upvalues.
     /// Functions which statically know they have no open upvalues may set `close = false` as an
-    /// optimization. Then, whether the function is vararg (Note [Vararg frames]). Last, the id of
-    /// what it returns, or `UNKNOWN_RETURN` (Note [Call continuations]).
-    Ret(Pc, u8, u16, bool, bool, u32),
+    /// optimization. Then, whether the function is vararg (Note [Vararg frames]), the id of what
+    /// it returns, or `UNKNOWN_RETURN` (Note [Call continuations]), and last its function's
+    /// effects, which it returns with the id (Note [Call effects]).
+    Ret(Pc, u8, u16, bool, bool, u32, *const Cell<Effects>),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
     HashGuard { tab: usize, href: HashRef, key: u64, expected: LType },
@@ -735,7 +739,8 @@ pub enum Residual {
     /// of them, or with C = 0 all. See Note [Returns].
     Arrive { a: u16, c: u16 },
     /// A call's continuation guard: whether the call's return returned what the
-    /// id names, as `RETURNED | id`. See Note [Call continuations].
+    /// id names, with the effects, as `RETURNED | effects << EFFECTS_SHIFT |
+    /// id`. See Notes [Call continuations] and [Call effects].
     ReturnedFrom(u64),
     /// `Arrive`, for a return of `returned` results. See Note [Call
     /// continuations].
@@ -1097,13 +1102,15 @@ pub struct Context {
 // It is in the context (`Context::fragile`), so it is part of every block's key. A block compiled
 // relying on a fact is only entered by paths that established it and kept it since, as any path
 // reaching a block with an equal context shares it. It is per activation: a function's entry block
-// has none, and a call's continuation none either, after the call's effect.
+// has none, and a call's continuation only what the callee's effects keep (Note [Call effects]).
 //
 // Effects come from the residuals as they are yielded (`Context::effect`). A window op writes the
 // slots its accesses say it writes (`Effect::Write`), an exec may write any slot
 // (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op is `Effect::Opaque`,
 // and what a residual can't show a yield says (`YieldOp::Effect`: SETUPVAL's
-// `Effect::SetUpvalue`).
+// `Effect::SetUpvalue`). A store into a table is always yielded as one, `Effect::ArrayStore` or
+// the hash hazards it sets, even where `WriteAny` already drops what it falsifies: an exec's
+// `WriteAny` is of its own frame, and a caller sees only the store (Note [Call effects]).
 //
 // A kind of fact says which effects it survives (`Fragile::survives`); a new kind is a variant,
 // its `key` and `survives`, and where it is established.
@@ -1160,6 +1167,8 @@ pub enum Effect {
     WriteAny,
     /// The upvalue is set.
     SetUpvalue(usize),
+    /// Some upvalue, of any closure, is set.
+    AnyUpvalue,
     /// Code the specializer doesn't see runs: every fact is dropped.
     Opaque,
     /// A value of representation `LType` (`Unknown` if not known) is stored in
@@ -1185,6 +1194,8 @@ impl Fragile {
             (Fragile::Holds { slot, .. }, Effect::Write(written)) => written != *slot,
             (Fragile::Holds { .. }, Effect::WriteAny) => false,
             (Fragile::Holds { upvalue, .. } | Fragile::Upvalue { upvalue, .. }, Effect::SetUpvalue(set)) => set != *upvalue,
+            (Fragile::Holds { .. } | Fragile::Upvalue { .. }, Effect::AnyUpvalue) => false,
+            (Fragile::ElementOf { .. } | Fragile::Kind { .. }, Effect::AnyUpvalue) => true,
             (Fragile::Upvalue { .. }, Effect::Write(_) | Effect::WriteAny) => true,
             (Fragile::Holds { .. } | Fragile::Upvalue { .. }, Effect::ArrayStore(_)) => true,
             (Fragile::ElementOf { slot, table }, Effect::Write(written)) => written != *slot && written != *table,
@@ -1196,6 +1207,86 @@ impl Fragile {
             // Any table may be the one stored into: one of kind `kind` keeps it
             // only for a value of that kind, and a mixed one stays mixed.
             (Fragile::Kind { kind, .. }, Effect::ArrayStore(stored)) => *kind == LType::Unknown || stored == *kind,
+        }
+    }
+}
+
+// Note [Call effects]
+// ~~~~~~~~~~~~~~~~~~~
+// What a callee did that its caller can see is a join of effects (`Effects`): the representations
+// it stored into some table's array part, whether it set some upvalue, whether it stored into some
+// table's hash part (the environment's included), and at the top, opaque: code the specializer
+// never saw ran. The callee's own frame is its own, and nothing it does there is seen.
+//
+// Each prototype has the join of the effects of every residual compiled for it so far
+// (`Specializer::effects`), which only grows. It is kept out of the context, so it never makes a
+// version of its own: whatever path code for the prototype is compiled on adds to the one join. A
+// call adds its callee's effects once its continuation knows them (Note [Call continuations]),
+// and opaque where nothing does: a native's call that isn't a window op, a call the call site
+// doesn't specialize, and a continuation that doesn't know the return.
+//
+// A return reads its prototype's join when it runs, and returns it with the id of what it returns
+// (`RETURNED | effects << EFFECTS_SHIFT | id`). Code only runs once compiled, so the join then
+// covers everything the returning activation did. A continuation guarding on that value knows the
+// callee's effects: it continues from the caller's context before the call, less what they may
+// have falsified (`Effects::apply`). Once a prototype's join grows, its returns fail the guards of
+// continuations compiled for the smaller one, and fall through to new ones.
+
+/// What a callee did that its caller can see, a join as a set of bits. See
+/// Note [Call effects].
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Effects(pub u16);
+
+impl Effects {
+    pub const NONE: Effects = Effects(0);
+    /// Some upvalue is set.
+    pub const UPVALUE: Effects = Effects(1 << 8);
+    /// Some table's hash part is stored into.
+    pub const HASH: Effects = Effects(1 << 9);
+    /// Code the specializer never saw ran: every other effect too.
+    pub const OPAQUE: Effects = Effects(0x7fe);
+    /// The representations stored into some table's array part, as `LType::bit`s.
+    const ARRAYS: u16 = 0xfe;
+    const OPAQUE_BIT: u16 = 1 << 10;
+    /// Every representation a value has, each's bit in `ARRAYS`.
+    const REPRESENTATIONS: [LType; 7] = [LType::Nil, LType::Bool, LType::String, LType::Closure, LType::Table, LType::Integer, LType::Double];
+
+    pub fn join(self, other: Effects) -> Effects {
+        Effects(self.0 | other.0)
+    }
+
+    /// `effect` as its function's caller sees it: nothing, for one on the
+    /// function's own frame.
+    fn of(effect: Effect) -> Effects {
+        match effect {
+            Effect::Write(_) | Effect::WriteAny => Effects::NONE,
+            Effect::SetUpvalue(_) | Effect::AnyUpvalue => Effects::UPVALUE,
+            Effect::Opaque => Effects::OPAQUE,
+            Effect::ArrayStore(LType::Unknown) => Effects(Self::ARRAYS),
+            Effect::ArrayStore(stored) => Effects(stored.bit() as u16),
+        }
+    }
+
+    /// Drop from `ctx`, a caller's context before a call, what the callee's
+    /// effects may have falsified. `captured` are the caller's slots below the
+    /// call's its closures captured, which a set upvalue may be.
+    fn apply(self, owner: &mut Owner, ctx: &mut Context, captured: &[usize]) {
+        if self.0 & Self::OPAQUE_BIT != 0 {
+            ctx.effect(Effect::Opaque);
+        }
+        if self.0 & Self::UPVALUE.0 != 0 {
+            ctx.effect(Effect::AnyUpvalue);
+            for &slot in captured {
+                ctx.effect(Effect::Write(slot));
+            }
+            ctx.set_types(owner, captured.iter().map(|&slot| (slot, CType::Type(LType::Unknown))).collect());
+        }
+        if self.0 & Self::HASH.0 != 0 {
+            ctx.set_hazards(None, None);
+        }
+        for stored in Self::REPRESENTATIONS.into_iter().filter(|stored| self.0 & stored.bit() as u16 != 0) {
+            ctx.effect(Effect::ArrayStore(stored));
         }
     }
 }
@@ -1470,6 +1561,9 @@ pub struct Specializer<'src, 'intern> {
     /// and the id of each. See Note [Call continuations].
     pub returns: Vec<Vec<CType>>,
     return_ids: HashMap<Vec<CType>, u32, rustc_hash::FxBuildHasher>,
+    /// The join of the effects of the code compiled for each prototype, at a
+    /// stable address its returns read. See Note [Call effects].
+    effects: std::collections::HashMap<LProto<'src, 'intern>, Box<Cell<Effects>>, InternedHasher>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -1495,6 +1589,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             versions: HashMap::default(),
             returns: Vec::new(),
             return_ids: HashMap::default(),
+            effects: HashMap::default(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             clos,
@@ -1503,11 +1598,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// The id of a return of `results`, the same for every return of them. See
     /// Note [Call continuations].
+    /// The join of the effects of the code compiled for `proto`. See Note
+    /// [Call effects].
+    fn effects_of(&mut self, proto: LProto<'src, 'intern>) -> &Cell<Effects> {
+        self.effects.entry(proto).or_insert_with(|| Box::new(Cell::new(Effects::NONE)))
+    }
+
+    /// Add `effects` to those of the function being specialized. See Note
+    /// [Call effects].
+    fn join_effects(&mut self, owner: &Owner, effects: Effects) {
+        let cell = self.effects_of(self.clos.ro(owner).prototype);
+        cell.set(cell.get().join(effects));
+    }
+
     fn return_id(&mut self, results: Vec<CType>) -> u32 {
         if let Some(&id) = self.return_ids.get(&results) {
             return id;
         }
-        let id = u32::try_from(self.returns.len()).ok().filter(|&id| id != UNKNOWN_RETURN).expect("too many returns");
+        let id = u32::try_from(self.returns.len()).ok().filter(|&id| id < UNKNOWN_RETURN).expect("too many returns");
         self.returns.push(results.clone());
         self.return_ids.insert(results, id);
         id
@@ -1860,7 +1968,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             self.return_id(results.collect())
                         },
                     };
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0, returns)); None
+                    let effects: *const Cell<Effects> = self.effects_of(proto);
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0, returns, effects)); None
                 },
                 x => {
                     #[cfg(debug_assertions)]
@@ -1868,8 +1977,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         unreachable!("{:?}", x)
                     }
                     panic!("{:?}", x);
-                    let vararg = unsafe { (*self.clos.ro(owner).prototype).is_vararg != 0 };
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, vararg, UNKNOWN_RETURN)); None
+                    let proto = self.clos.ro(owner).prototype;
+                    let vararg = unsafe { (*proto).is_vararg != 0 };
+                    let effects: *const Cell<Effects> = self.effects_of(proto);
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, vararg, UNKNOWN_RETURN, effects)); None
                 },
             } {
                 pc = next;
@@ -2128,10 +2239,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// chaining a thunk for the next onto the guard's failure, while its chain
     /// guards fewer than `MAX_VERSIONS` (`identities`); past that, or for what
     /// isn't a function, a generic call. With a `continuation`, the context
-    /// after the call and its pc, a Lua function's call continues at a thunk
-    /// specializing it to the return. See Notes [Call sites] and [Call
-    /// continuations].
-    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, a: usize, b: usize, c: usize, after: BlockId, continuation: Option<(Rc<Context>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
+    /// before the call less the callee's frame, the caller's captured slots
+    /// below it, and the pc after it, a Lua function's call continues at a thunk
+    /// specializing it to the return. See Notes [Call sites], [Call
+    /// continuations] and [Call effects].
+    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, a: usize, b: usize, c: usize, after: BlockId, continuation: Option<(Rc<Context>, Rc<[usize]>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
             // is a guard's failure, with the rest of the layout after it. See Note
@@ -2157,13 +2269,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let (stack, vararg) = unsafe { ((*proto).max_stack, (*proto).is_vararg != 0) };
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg });
-                    if let Some((ctx, pc)) = &continuation {
+                    if let Some((ctx, captured, pc)) = &continuation {
                         // See Note [Call continuations].
-                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), *pc, a, c, after, 0, true)));
+                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), *pc, a, c, after, 0, true)));
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
                     layout.push(Residual::Arrive { a: a16, c: c16 });
+                    // See Note [Call effects].
+                    vm.join_effects(owner, Effects::OPAQUE);
                 },
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
@@ -2182,6 +2296,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         layout.push(Residual::NativeCall { nf: nf.native(), a: a16, b: b16, c: c16 });
                         // A native may allocate (a table, a string).
                         layout.push(Residual::GC);
+                        // See Note [Call effects].
+                        vm.join_effects(owner, Effects::OPAQUE);
                     }
                 },
                 _ => {
@@ -2189,6 +2305,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     layout.push(Residual::Arrive { a: a16, c: c16 });
                     // It may call a native, which may allocate.
                     layout.push(Residual::GC);
+                    // See Note [Call effects].
+                    vm.join_effects(owner, Effects::OPAQUE);
                 },
             }
             layout.push(Residual::Jump(after));
@@ -2201,11 +2319,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// it lays out a guard on that return, chaining a thunk for the next onto
     /// its failure, and on its success the call's results, of the count the
     /// return gives, and a version of the code after the call at `pc` knowing
-    /// their types, from `ctx`, the context after the call; while its chain
-    /// guards fewer than `MAX_VERSIONS` (`identities`). Past that, or for a
-    /// return that doesn't know what it returns, the results, and `after`. See
-    /// Note [Call continuations].
-    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, pc: Pc, a: usize, c: usize, after: BlockId, identities: usize, appends: bool) -> ThunkRef {
+    /// their types and the callee's effects, from `ctx`, the context before the
+    /// call less the callee's frame (`captured` its slots below the call's that
+    /// its closures captured); while its chain guards fewer than `MAX_VERSIONS`
+    /// (`identities`). Past that, or for a return that doesn't know what it
+    /// returns, the results, and `after`. See Notes [Call continuations] and
+    /// [Call effects].
+    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, pc: Pc, a: usize, c: usize, after: BlockId, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, as for a call thunk. See Note [Thunk patching].
             let block = if !appends || vm.compiled(block_id) {
@@ -2219,12 +2339,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let (a16, c16) = (a as u16, c as u16);
             let returned = state.returned;
             let results = (returned & !0xffff_ffff == crate::vm::RETURNED && identities < MAX_VERSIONS)
-                .then(|| vm.returns.get((returned & 0xffff_ffff) as usize).cloned())
+                .then(|| vm.returns.get((returned & UNKNOWN_RETURN as u64) as usize).cloned())
                 .flatten();
             let mut layout = vec![];
             match results {
                 Some(results) => {
+                    // What the callee did, which the caller's code after the call does
+                    // too. See Note [Call effects].
+                    let effects = Effects(((returned & 0xffff_ffff) >> crate::vm::EFFECTS_SHIFT) as u16);
+                    vm.join_effects(owner, effects);
                     let mut known = (*ctx).clone();
+                    effects.apply(owner, &mut known, &captured);
                     let count = if c == 0 { results.len() } else { c - 1 };
                     let slots = known.types.len();
                     for i in (0..count).filter(|i| a + i < slots) {
@@ -2236,13 +2361,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let known = vm.jumping(owner, Rc::new(known), pc);
                     let version = vm.version(owner, pc, known);
                     layout.push(Residual::ReturnedFrom(returned));
-                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), pc, a, c, after, identities + 1, false)));
+                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), pc, a, c, after, identities + 1, false)));
                     layout.push(Residual::Arrived { a: a16, c: c16, returned: results.len() as u16 });
                     layout.push(Residual::Jump(version));
                 },
                 None => {
                     layout.push(Residual::Arrive { a: a16, c: c16 });
                     layout.push(Residual::Jump(after));
+                    // See Note [Call effects].
+                    vm.join_effects(owner, Effects::OPAQUE);
                 },
             }
             vm.blocks[block.0].instructions.extend(layout);
@@ -2607,6 +2734,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Effect(effect)) => {
                     Rc::make_mut(&mut ctx).effect(effect);
+                    // See Note [Call effects].
+                    self.join_effects(owner, Effects::of(effect));
                 },
                 CoroutineState::Yielded(YieldOp::ArrayKind(table)) => {
                     arg = match ctx.array_kind(table) {
@@ -2714,6 +2843,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     });
                                     // A native may allocate (a table, a string).
                                     self.blocks[block_id.0].allocates = true;
+                                    // See Note [Call effects].
+                                    self.join_effects(owner, Effects::OPAQUE);
                                 }
                             }
                             // Any other call may run a closure, which reads and writes the
@@ -2723,6 +2854,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             } else {
                                 vec![]
                             };
+                            // For a Lua callee's continuation, which applies only what the
+                            // callee's effects falsify: the context before the call, but for
+                            // the callee's frame, from `a` on. See Note [Call effects].
+                            let before = (!native).then(|| {
+                                let mut before = (*ctx).clone();
+                                for idx in a..before.types.len() {
+                                    before.effect(Effect::Write(idx));
+                                }
+                                let frame = (a..before.types.len()).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
+                                before.set_types(owner, frame);
+                                let captured: Rc<[usize]> = captured.iter().copied().filter(|&slot| slot < a).collect();
+                                (Rc::new(before), captured)
+                            });
                             if result.is_none() {
                                 // An unknown call may invalidate any fragile information.
                                 // See Note [Fragile information].
@@ -2762,9 +2906,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             } else {
                                 // A Lua callee's return also chooses a version of its own. See
                                 // Note [Call continuations].
-                                let continuation = (ctx.clone(), pc.0 + 1);
+                                let continuation = before.map(|(before, captured)| (before, captured, pc.0 + 1));
                                 let after = self.jumping(owner, ctx, pc.0 + 1);
-                                (self.version(owner, pc.0 + 1, after), Some(continuation))
+                                (self.version(owner, pc.0 + 1, after), continuation)
                             };
                             self.end_block(block_id);
                             let thunk = self.make_call_thunk(block_id, calling, a, b, c, after, continuation, 0, true);
@@ -2790,9 +2934,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let proto = self.clos.ro(owner).prototype;
                     let key: &LConstant<'static, 'static> = unsafe { core::mem::transmute(&(&(*proto).constants.items)[k]) };
                     Rc::make_mut(&mut ctx).set_key_hazards(key);
+                    // A store into the environment's hash part. See Note [Call effects].
+                    self.join_effects(owner, Effects::HASH);
                 },
                 CoroutineState::Yielded(YieldOp::SetHazards(idx, href)) => {
-                    Rc::make_mut(&mut ctx).set_hazards(idx, href)
+                    Rc::make_mut(&mut ctx).set_hazards(idx, href);
+                    // A store into a table's hash part. See Note [Call effects].
+                    self.join_effects(owner, Effects::HASH);
                 },
                 CoroutineState::Yielded(YieldOp::Clobber(from)) => {
                     let clobbered = (from..ctx.types.len()).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
@@ -3079,12 +3227,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 &Residual::ReturnedFrom(from) => {
                     off += if state.returned == from { 2 } else { 1 };
                 },
-                &Residual::Ret(_, a, b, closes, vararg, returns) => {
+                &Residual::Ret(_, a, b, closes, vararg, returns, effects) => {
                     debug!("spec final blocks: {:?}", self.blocks);
                     match state.leave(owner, a as usize, b as usize, closes, vararg) {
                         Ok(Location(block, disp)) => {
                             // See Note [Call continuations].
-                            state.returned = crate::vm::RETURNED | returns as u64;
+                            let effects = unsafe { (*effects).get() }.0 as u64;
+                            state.returned = crate::vm::RETURNED | effects << crate::vm::EFFECTS_SHIFT | returns as u64;
                             self.set_current(state.clos.clone());
                             id = block;
                             off = disp;
