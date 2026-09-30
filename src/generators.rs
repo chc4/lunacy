@@ -1061,9 +1061,11 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
         arg = yield YieldOp::GetBlock((pc as isize + 1 as isize) as usize);
         let ResumeArg::BlockId(taken) = arg else { unreachable!() };
 
-        // Compares of integers, a constant one its value `k`. See Note [Integers].
+        // Compares of integers, a constant one its value `k`: known to be before, or
+        // both registers found in the integer encoding by the guards above. See Note
+        // [Integers].
         match (larg, rarg) {
-            (ResumeArg::Matched, ResumeArg::Matched) if integers => {
+            (ResumeArg::Matched, ResumeArg::Matched) if integers || (lint && rint) => {
                 crate::window::windowed!(CompareIntRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
                     select::<OP, i32>(state, a, lhs.as_int(), rhs.as_int());
                 });
