@@ -570,6 +570,14 @@ bench-history:
     python3 tools/bench_history.py report
     python3 tools/bench_history.py plot
 
+# What stops each benchmark of lua_benchmarking that HYPERFINES doesn't run:
+# each run once at its scaling under LuaJIT and lunacy's release build (the
+# unsafe build's panics have no message), with how each ended and its error
+# (tools/bench_blockers.py).
+bench-blockers:
+    cargo build --release --bin bench
+    python3 tools/bench_blockers.py --exclude "{{HYPERFINES}}"
+
 # The latest commit's times from the benchmark history as a grouped bar chart,
 # a group per benchmark, in rows of `per_row` each on its own scale, in
 # working/bars.html (tools/bench_bars.py): `builds`, the implementations, in bar
