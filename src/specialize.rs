@@ -2387,8 +2387,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     if c == 0 {
                         known.top = Some(a + results.len());
                     }
-                    let known = vm.jumping(owner, Rc::new(known), pc);
-                    let version = vm.version(owner, pc, known);
+                    // Not `jumping`: the code after the call is reached by falling through,
+                    // and the results are usually in temporaries it reads.
+                    let version = vm.version(owner, pc, Rc::new(known));
                     layout.push(Residual::ReturnedFrom(returned));
                     layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), pc, a, c, after.clone(), identities + 1, false)));
                     layout.push(Residual::Arrived { a: a16, c: c16, returned: results.len() as u16 });
