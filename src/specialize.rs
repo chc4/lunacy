@@ -1044,7 +1044,7 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
 // `HARD_MAX_VERSIONS` enforces it.
 
 /// The versions of a pc before jumps to it reuse one. See Note [Version compatibility].
-const MAX_VERSIONS: usize = 5;
+const MAX_VERSIONS: usize = 3;
 /// The versions of a pc, or of a point in its instruction, past which
 /// specialization panics. See Note [Version compatibility].
 const HARD_MAX_VERSIONS: usize = 16;
