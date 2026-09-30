@@ -1015,6 +1015,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             for emit in loads {
                 emit_window_move(&mut ops, emit);
             }
+            self.load_returned(&mut ops, id);
             dynasm!(ops
             ; jmp extern block.ptr.0 as usize
             );
@@ -1039,6 +1040,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             for emit in loads {
                 emit_window_move(&mut ops, emit);
             }
+            self.load_returned(&mut ops, id);
             // A loop header starts aligned. The entry's code is reserved as a
             // whole below, padding and all.
             #[cfg(feature = "align_loops")]
@@ -1180,6 +1182,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         for site in self.jctx.call_waiting.remove(&id).unwrap_or_default() {
             self.link_call(site, entrypoint);
+        }
+    }
+
+    /// Where a region is entered at `id` from the interpreter, and `id` starts
+    /// with a continuation guard, the call's return value it compares, from
+    /// `RunState::returned`. See Note [Call continuations] in `specialize`.
+    fn load_returned(&self, ops: &mut Assembler, id: BlockId) {
+        if let Some(Residual::ReturnedFrom(_)) = self.blocks[id.0].instructions.first() {
+            jit_note!(self.jctx, ops, "the return the entry's continuation guard compares");
+            dynasm!(ops
+                ; .arch x64
+                ; mov rax, QWORD r12 => RunState.returned
+            );
         }
     }
 
@@ -1603,10 +1618,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // `helper` is `dynamic_call`, or `lua_call` for a `LuaCall`, which takes the call's
         // version if it has code by then. A native's results are in place, so it
         // continues past the `Arrive` after the call (Note [Returns]).
-        let emit_dynamic_call = |ops: &mut Assembler, off: usize, a: u16, b: u16, c: u16, helper: usize| {
-            assert!(matches!(block.instructions.get(off + 1), Some(Residual::Arrive { .. })), "a call not followed by its `Arrive`");
+        // `natives`: whether the callee may be a native, after which the code skips the call's
+        // `Arrive` (a `LuaCall`'s is a Lua function's, which returns to the residual after it).
+        let emit_dynamic_call = |ops: &mut Assembler, off: usize, a: u16, b: u16, c: u16, helper: usize, natives: bool| {
             let ret = Location(BlockId(id.0), off + 1).pack().bits() as u64;
-            let past_arrive = insts[off + 2];
             dynasm!(ops
                 ; .arch x64
                 ; mov rdi, QWORD spec
@@ -1616,10 +1631,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; mov r8d, b as i32
                 ; mov r9d, c as i32
                 ; call extern (helper)
-                ; cmp rax, 1
-                // One, we just fully called a native function and we need to skip the Arrive
-                // operation immediately after this.
-                ; je =>past_arrive
+            );
+            if natives {
+                assert!(matches!(block.instructions.get(off + 1), Some(Residual::Arrive { .. })), "a call not followed by its `Arrive`");
+                let past_arrive = insts[off + 2];
+                dynasm!(ops
+                    ; .arch x64
+                    ; cmp rax, 1
+                    // One, we just fully called a native function and we need to skip the Arrive
+                    // operation immediately after this.
+                    ; je =>past_arrive
+                );
+            }
+            dynasm!(ops
+                ; .arch x64
                 ; test rax, rax
                 // Zero, so need to bailout so the interpreter can do the call instead.
                 ; jz >bail
@@ -1882,7 +1907,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                     let code = version.and_then(|block| self.blocks[block.0].jit_info.entry);
                     match version {
-                        None => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::lua_call as *const () as usize),
+                        None => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::lua_call as *const () as usize, false),
                         Some(version) => {
                             let site = ops.offset().0;
                             if code.is_none() {
@@ -1954,7 +1979,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     ; jmp >lua_call_done
                                     ; lua_call:
                                 );
-                                emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::lua_call as *const () as usize);
+                                emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::lua_call as *const () as usize, false);
                                 dynasm!(ops
                                     ; .arch x64
                                     ; lua_call_done:
@@ -2051,7 +2076,38 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         );
                     }
                 },
-                Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize),
+                Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize, true),
+                Residual::ReturnedFrom(from) => {
+                    // The call's return value, still in rax, from the `Ret` expected: its
+                    // continuation goes on to `off + 2`, else falls through to the thunk for the
+                    // next return. See Note [Call continuations] in `specialize`.
+                    let from = pool.value(ops, *from);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; cmp rax, QWORD [=>from]
+                        ; je =>insts[off + 2]
+                    );
+                },
+                Residual::Arrived { a, c, returned } => {
+                    // The results, as `Arrive` takes them, of a return of `returned`: the
+                    // missing ones nil. See Note [Call continuations] in `specialize`.
+                    if *c != 0 {
+                        let (at, end) = (*a as usize, *a as usize + *c as usize - 1);
+                        let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
+                        for slot in (at + *returned as usize)..end {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov QWORD [r13 + (slot * 8) as i32], nil
+                            );
+                        }
+                        dynasm!(ops
+                            ; .arch x64
+                            ; mov rax, QWORD r12 => RunState.base
+                            ; add rax, end as i32
+                            ; mov QWORD r12 => RunState.top, rax
+                        );
+                    }
+                },
                 Residual::Arrive { a, c } => {
                     // The call's results, taken by `Arrive`, which keeps no register
                     // but `state`'s: the base pointer is loaded again. See Note
@@ -2074,11 +2130,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none());
                     successor = Some(*target);
                 },
-                Residual::Ret(pc, a, b, closes, vararg) => {
-                    // The frame, popped by `PopFrame`, and the JIT code left with
-                    // where the caller continues. See Note [Frame ops] in `specialize`.
+                Residual::Ret(pc, a, b, closes, vararg, returns) => {
+                    // The frame, popped by `PopFrame`, and the JIT code left with the
+                    // return (`RETURNED | id`), or for the outermost frame's, the
+                    // exit. See Notes [Frame ops] and [Call continuations] in `specialize`.
                     let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
-                    let (at, ab) = (Location(BlockId(id.0), off).pack().bits() as u64, hold(*a as u16) | hold(*b) << 16);
+                    // With the id of what it returns. See Note [Call continuations] in `specialize`.
+                    let (at, ab) = (Location(BlockId(id.0), off).pack().bits() as u64, hold(*a as u16) | hold(*b) << 16 | (*returns as u64) << 32);
                     let pop = match (*closes, *vararg) {
                         (false, false) => frame_op!(PopFrame [false, false,] (at, ab); *a as u16, *b),
                         (false, true) => frame_op!(PopFrame [false, true,] (at, ab); *a as u16, *b),
@@ -2088,7 +2146,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     jit_note!(self.jctx, ops, "        PopFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &pop);
                     self.jctx.frame_ops.push(pop);
-                    jit_note!(self.jctx, ops, "        leave for where the caller continues");
+                    jit_note!(self.jctx, ops, "        leave, with what it returned");
                     dynasm!(ops
                         ; .arch x64
                         ; mov rax, QWORD r12 => RunState.exit

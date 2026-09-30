@@ -1266,6 +1266,11 @@ impl Location {
     }
 }
 
+/// What a return leaves JIT code with, or last sets `RunState::returned` to:
+/// `RETURNED | id`, `id` naming what it returned. See Note [Call
+/// continuations] in `specialize`.
+pub const RETURNED: u64 = (-5i32 as u64) << 32;
+
 // Note [Stack frames]
 // ~~~~~~~~~~~~~~~~~~~~
 // A call frame occupies `max_stack` slots of the register file (`vals`) from its
@@ -1387,6 +1392,14 @@ pub struct RunState<'src, 'intern> {
     /// The record of the site whose window op's cold stencil is running. See
     /// Note [Cold stencils] in `window`.
     pub cold_site: *const u64,
+    /// The last return's `RETURNED | id`, `id` naming what it returned, which
+    /// the continuation of the call it returned from guards on. See Note [Call
+    /// continuations] in `specialize`.
+    pub returned: u64,
+    /// Where the caller of the last return from JIT code continues, a
+    /// `PackedLocation`, for the run loop: the return itself leaves the code
+    /// with `returned`.
+    pub resume: u64,
     pub witness_base: usize,
     /// The end of the innermost frame's hash witnesses. See Note [Hash witnesses].
     pub witness_top: usize,
@@ -1938,6 +1951,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 base,
                 top,
                 cold_site: core::ptr::null(),
+                returned: 0,
+                resume: 0,
                 witness_base,
                 witness_top: 0,
                 pc,

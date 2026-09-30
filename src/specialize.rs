@@ -140,6 +140,8 @@ impl std::fmt::Display for Residual {
             Residual::Jump(target) => write!(f, "jump({})", target.0),
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
             Residual::Arrive { a, c } => write!(f, "arrive({}, {})", a, c),
+            Residual::ReturnedFrom(from) => write!(f, "returned({})", from & 0xffff_ffff),
+            Residual::Arrived { a, c, returned } => write!(f, "arrived({}, {}, {})", a, c, returned),
             Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
             Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, .. } => write!(f, "lcall({}, {}, {}, {})", block.0, a, b, c),
             Residual::LuaCall { entry: CallEntry::Context(_), a, b, c, .. } => write!(f, "lcall(?, {}, {}, {})", a, b, c),
@@ -500,14 +502,38 @@ windowed!(SetTop, [slot: usize], [], |owner, state, base| () {
 // The caller's (in the `Arrive` residual right after the call, which knows C) pads them with nil
 // to the count it wants, and shrinks the stack back to its frame (Note [Stack frames]).
 //
-// A lua call must returns to its `Arrive`: its `Location` is the `Arrive`, so
-// every way back into the caller takes its results there, whether the callee
-// returns to the caller's JIT code, to the interpreter running the caller, or
-// through a bailout.
+// A lua call must return to the residual after it: its `Arrive`, or its continuation's guard, before
+// an `Arrive` of its own (Note [Call continuations]). Its `Location` is that residual, so every way
+// back into the caller takes its results there, whether the callee returns to the caller's JIT
+// code, to the interpreter running the caller, or through a bailout.
 // A native call *must not*; `call_native` puts the results in place by itself, and running
 // `Arrive` additionally would be incorrect. For known native functions we may skip emitting the
 // `Arrive` in the first place. However, for dynamic calls where it is not known until runtime if a
 // callee is a lua or native function, it must dynamically perform a jump.
+
+/// The id of a return whose results aren't known (B = 0). See Note [Call
+/// continuations].
+pub const UNKNOWN_RETURN: u32 = u32::MAX;
+
+// Note [Call continuations]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~
+// A call's continuation is specialized on what the callee returned (Chevalier-Boisvert & Feeley,
+// "Interprocedural Type Specialization of JavaScript Programs Without Type Analysis"), by guarding
+// on the return rather than on the types of the results. A `Ret`'s context at compile time says
+// what it returns: the types of its results, and, with B, how many. Those are interned into an id,
+// the same for every return of the same (`Specializer::returns`), or with B = 0, unknown
+// (`UNKNOWN_RETURN`). A return leaves JIT code with `RETURNED | id` (the call's return value, where
+// the call is in JIT code), and sets `RunState::returned` to the same, from JIT code or the
+// interpreter.
+//
+// After a call to a Lua function (a `LuaCall`), the caller continues at a thunk, not an `Arrive`.
+// Forced just after a return, it lays out a guard on that return (`ReturnedFrom`), comparing the
+// call's return value (`returned` where the interpreter runs it, or where JIT code is entered at
+// the guard), the thunk for the next return on its failure, and on its success an `Arrive` knowing
+// the count (`Arrived`) and a jump to a version of the code after the call knowing the results'
+// types (and with C = 0, the top). A return whose results aren't known (B = 0), or one past
+// `MAX_VERSIONS`, continues as a call without: `Arrive` and the version knowing nothing of the
+// results. A native call doesn't return this way, and never reaches such a guard.
 
 // Note [Frame ops]
 // ~~~~~~~~~~~~~~~~
@@ -580,7 +606,8 @@ windowed!(frame PushFrame, [ret: u64, abs: u64], [FILLS: bool, A: Count, B: Coun
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
 
-// A `Ret` at `at` (a `PackedLocation`). `ab` is its `a | b << 16` (as `Count::hold` holds them).
+// A `Ret` at `at` (a `PackedLocation`). `ab` is its `a | b << 16` (as `Count::hold` holds them),
+// and in the upper half, the id of what it returns (Note [Call continuations]).
 // Closing upvalues if `CLOSES`, returning from a vararg function if `VARARG`.
 // See Note [Frame ops].
 windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
@@ -591,7 +618,12 @@ windowed!(frame PopFrame, [at: u64, ab: u64], [CLOSES: bool, VARARG: bool, A: Co
         ((-2i32 as u64) << 32) | block as u64
     } else {
         match state.leave(owner, a, b, CLOSES, VARARG) {
-            Ok(location) => location.pack().bits() as u64,
+            // See Note [Call continuations].
+            Ok(location) => {
+                state.resume = location.pack().bits() as u64;
+                state.returned = crate::vm::RETURNED | ab >> 32;
+                state.returned
+            },
             // With a caller frame, `leave` returns to it.
             Err(_) => unreachable!(),
         }
@@ -686,8 +718,9 @@ pub enum Residual {
     Thunk(ThunkRef),
     /// A RETURN of `b - 1` values from R(A), or up to the top. Closes the frame's open upvalues.
     /// Functions which statically know they have no open upvalues may set `close = false` as an
-    /// optimization. Last, whether the function is vararg. See Note [Vararg frames].
-    Ret(Pc, u8, u16, bool, bool),
+    /// optimization. Then, whether the function is vararg (Note [Vararg frames]). Last, the id of
+    /// what it returns, or `UNKNOWN_RETURN` (Note [Call continuations]).
+    Ret(Pc, u8, u16, bool, bool, u32),
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
     HashGuard { tab: usize, href: HashRef, key: u64, expected: LType },
@@ -701,6 +734,12 @@ pub enum Residual {
     /// The results of the call of R(A) before it, which returns here: `c - 1`
     /// of them, or with C = 0 all. See Note [Returns].
     Arrive { a: u16, c: u16 },
+    /// A call's continuation guard: whether the call's return returned what the
+    /// id names, as `RETURNED | id`. See Note [Call continuations].
+    ReturnedFrom(u64),
+    /// `Arrive`, for a return of `returned` results. See Note [Call
+    /// continuations].
+    Arrived { a: u16, c: u16, returned: u16 },
     LuaGuard { idx: usize, ptr: *const () },
     GC,
 }
@@ -1427,6 +1466,10 @@ pub struct Specializer<'src, 'intern> {
     pub versions: std::collections::HashMap<
         LProto<'src, 'intern>,
         std::collections::HashMap<(SubPc, Rc<Context>), BlockId, rustc_hash::FxBuildHasher>, InternedHasher>,
+    /// The types of the results of each return that knows them, by its id,
+    /// and the id of each. See Note [Call continuations].
+    pub returns: Vec<Vec<CType>>,
+    return_ids: HashMap<Vec<CType>, u32, rustc_hash::FxBuildHasher>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -1438,6 +1481,9 @@ impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
                 (*context).mark(owner);
             }
         }
+        for types in &self.returns {
+            types.iter().for_each(|ty| ty.mark(owner));
+        }
     }
 }
 
@@ -1447,10 +1493,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             blocks: Vec::new(),
             global_caches: Vec::new(),
             versions: HashMap::default(),
+            returns: Vec::new(),
+            return_ids: HashMap::default(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             clos,
         }
+    }
+
+    /// The id of a return of `results`, the same for every return of them. See
+    /// Note [Call continuations].
+    fn return_id(&mut self, results: Vec<CType>) -> u32 {
+        if let Some(&id) = self.return_ids.get(&results) {
+            return id;
+        }
+        let id = u32::try_from(self.returns.len()).ok().filter(|&id| id != UNKNOWN_RETURN).expect("too many returns");
+        self.returns.push(results.clone());
+        self.return_ids.insert(results, id);
+        id
     }
 
     /// Create a new block at a Lua bytecode PC
@@ -1787,7 +1847,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.end_block(block_id);
                     let proto = unsafe { &*self.clos.ro(owner).prototype };
                     let closes = !captured_slots(proto).is_empty();
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0)); None
+                    // What it returns, for the continuations of the calls it returns to. Of the
+                    // callee's frame, a table's shape means nothing to them. See Note [Call
+                    // continuations].
+                    let returns = match b {
+                        0 => UNKNOWN_RETURN,
+                        b => {
+                            let results = (a as usize..a as usize + b as usize - 1).map(|slot| match ctx.slot(slot) {
+                                CType::Shape(_) => CType::Type(LType::Table),
+                                ctype => ctype,
+                            });
+                            self.return_id(results.collect())
+                        },
+                    };
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0, returns)); None
                 },
                 x => {
                     #[cfg(debug_assertions)]
@@ -1796,7 +1869,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     panic!("{:?}", x);
                     let vararg = unsafe { (*self.clos.ro(owner).prototype).is_vararg != 0 };
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, vararg)); None
+                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, vararg, UNKNOWN_RETURN)); None
                 },
             } {
                 pc = next;
@@ -2054,8 +2127,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// it lays out a call for the function in R(A), guarding its identity and
     /// chaining a thunk for the next onto the guard's failure, while its chain
     /// guards fewer than `MAX_VERSIONS` (`identities`); past that, or for what
-    /// isn't a function, a generic call. See Note [Call sites].
-    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, a: usize, b: usize, c: usize, after: BlockId, identities: usize, appends: bool) -> ThunkRef {
+    /// isn't a function, a generic call. With a `continuation`, the context
+    /// after the call and its pc, a Lua function's call continues at a thunk
+    /// specializing it to the return. See Notes [Call sites] and [Call
+    /// continuations].
+    #[allow(clippy::too_many_arguments)]
+    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, a: usize, b: usize, c: usize, after: BlockId, continuation: Option<(Rc<Context>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
             // is a guard's failure, with the rest of the layout after it. See Note
@@ -2069,7 +2146,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 block_id
             };
             let (a16, b16, c16) = (a as u16, b as u16, c as u16);
-            let next = |vm: &Specializer| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), a, b, c, after, identities + 1, false));
+            let next = |vm: &Specializer| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), a, b, c, after, continuation.clone(), identities + 1, false));
             let mut layout = vec![];
             match state.vals[state.base + a].unbox() {
                 LValue::LClosure(lclos) if matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS => {
@@ -2081,6 +2158,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let (stack, vararg) = unsafe { ((*proto).max_stack, (*proto).is_vararg != 0) };
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg });
+                    if let Some((ctx, pc)) = &continuation {
+                        // See Note [Call continuations].
+                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), *pc, a, c, after, 0, true)));
+                        vm.blocks[block.0].instructions.extend(layout);
+                        return;
+                    }
                     layout.push(Residual::Arrive { a: a16, c: c16 });
                 },
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
@@ -2110,6 +2193,60 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
             }
             layout.push(Residual::Jump(after));
+            vm.blocks[block.0].instructions.extend(layout);
+        })))
+    }
+
+    /// The thunk a Lua function's call continues at, in `block_id`, or, not
+    /// `appends`, a continuation guard's failure is: run, just after a return,
+    /// it lays out a guard on that return, chaining a thunk for the next onto
+    /// its failure, and on its success the call's results, of the count the
+    /// return gives, and a version of the code after the call at `pc` knowing
+    /// their types, from `ctx`, the context after the call; while its chain
+    /// guards fewer than `MAX_VERSIONS` (`identities`). Past that, or for a
+    /// return that doesn't know what it returns, the results, and `after`. See
+    /// Note [Call continuations].
+    #[allow(clippy::too_many_arguments)]
+    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, pc: Pc, a: usize, c: usize, after: BlockId, identities: usize, appends: bool) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            // In place, as for a call thunk. See Note [Thunk patching].
+            let block = if !appends || vm.compiled(block_id) {
+                let block = vm.new_block(vm.blocks[block_id.0].pc);
+                vm.jump_thunk(block_id, thunk_pc, block);
+                block
+            } else {
+                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
+                block_id
+            };
+            let (a16, c16) = (a as u16, c as u16);
+            let returned = state.returned;
+            let results = (returned & !0xffff_ffff == crate::vm::RETURNED && identities < MAX_VERSIONS)
+                .then(|| vm.returns.get((returned & 0xffff_ffff) as usize).cloned())
+                .flatten();
+            let mut layout = vec![];
+            match results {
+                Some(results) => {
+                    let mut known = (*ctx).clone();
+                    let count = if c == 0 { results.len() } else { c - 1 };
+                    let slots = known.types.len();
+                    for i in (0..count).filter(|i| a + i < slots) {
+                        known.types[a + i] = results.get(i).cloned().unwrap_or(CType::Type(LType::Nil));
+                    }
+                    if c == 0 {
+                        known.top = Some(a + results.len());
+                    }
+                    let known = vm.jumping(owner, Rc::new(known), pc);
+                    let version = vm.version(owner, pc, known);
+                    layout.push(Residual::ReturnedFrom(returned));
+                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), pc, a, c, after, identities + 1, false)));
+                    layout.push(Residual::Arrived { a: a16, c: c16, returned: results.len() as u16 });
+                    layout.push(Residual::Jump(version));
+                },
+                None => {
+                    layout.push(Residual::Arrive { a: a16, c: c16 });
+                    layout.push(Residual::Jump(after));
+                },
+            }
             vm.blocks[block.0].instructions.extend(layout);
         })))
     }
@@ -2622,14 +2759,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // Any other call ends its block in a thunk laying out the call
                             // for the function it finds, the code after it a version of
                             // its own. See Note [Call sites].
-                            let after = if resumes {
-                                self.subblock(owner, pc.next_true(), ctx, coro.clone(), ResumeArg::Start)
+                            let (after, continuation) = if resumes {
+                                (self.subblock(owner, pc.next_true(), ctx, coro.clone(), ResumeArg::Start), None)
                             } else {
+                                // A Lua callee's return also chooses a version of its own. See
+                                // Note [Call continuations].
+                                let continuation = (ctx.clone(), pc.0 + 1);
                                 let after = self.jumping(owner, ctx, pc.0 + 1);
-                                self.version(owner, pc.0 + 1, after)
+                                (self.version(owner, pc.0 + 1, after), Some(continuation))
                             };
                             self.end_block(block_id);
-                            let thunk = self.make_call_thunk(block_id, calling, a, b, c, after, 0, true);
+                            let thunk = self.make_call_thunk(block_id, calling, a, b, c, after, continuation, 0, true);
                             self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
                             return None;
                         },
@@ -2750,6 +2890,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let Residual::Select(ref paths) = self.blocks[id.0].instructions[off] else { panic!() };
                         id = paths[state.select].1;
                         off = 0;
+                        continue;
+                    } else if next_off == -5 {
+                        // A return: the caller continues where `resume` says, and its
+                        // continuation guards on `returned`. See Note [Call continuations].
+                        debug!("jit return from {next_id}");
+                        let Location(block, at) = Location::unpack(crate::vm::PackedLocation::from_bits(state.resume as usize));
+                        id = block;
+                        off = at;
                         continue;
                     } else if next_off == -4 {
                         debug!("jit bail 4 from {next_id}");
@@ -2920,14 +3068,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("thunk {:?}", &thunk);
                     (thunk.0.borrow_mut())(self, owner, &mut state, off)
                 },
-                Residual::Arrive { a, c } => {
+                Residual::Arrive { a, c } | Residual::Arrived { a, c, .. } => {
                     off += 1;
                     state.arrive(a as usize, c as usize);
                 },
-                Residual::Ret(pc, a, b, closes, vararg) => {
+                Residual::ReturnedFrom(from) => {
+                    off += if state.returned == from { 2 } else { 1 };
+                },
+                Residual::Ret(pc, a, b, closes, vararg, returns) => {
                     debug!("spec final blocks: {:?}", self.blocks);
                     match state.leave(owner, a as usize, b as usize, closes, vararg) {
                         Ok(Location(block, disp)) => {
+                            // See Note [Call continuations].
+                            state.returned = crate::vm::RETURNED | returns as u64;
                             self.set_current(state.clos.clone());
                             id = block;
                             off = disp;
@@ -2987,6 +3140,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             -2 => "return from the entry frame".to_string(),
             -3 => "select".to_string(),
             -4 => "thunk".to_string(),
+            -5 => "return".to_string(),
             // A residual the JIT code doesn't run there, as a call to a function
             // with no code.
             off => format!("{}", self.blocks[block].instructions[off as usize]),
