@@ -1287,8 +1287,11 @@ impl Context {
             + (other.fragile.len() - self.fragile.len())
     }
 
-    /// Widen `self` to also accept `other`. Differing hash keys can't be merged,
-    /// so then every shape and hash key is dropped.
+    /// Widen `self` to also accept `other`. Hash keys are joined one by one: a
+    /// key both have at the same `HashRef`, of the same slot, stays, its field's
+    /// type widened to both and checked only for the slots both check (a hazard
+    /// either has, the join has). Any other is dropped: left an orphan, which
+    /// `accepts` ignores, and forgotten by every shape listing it.
     fn join(&mut self, owner: &mut Owner, other: &Context) {
         let widened: Vec<(usize, CType)> = (0..self.types.len())
             .filter_map(|idx| {
@@ -1301,16 +1304,32 @@ impl Context {
             self.top = None;
         }
         self.fragile.retain(|fact| other.fragile.contains(fact));
-        if self.hkeys != other.hkeys {
-            let shapes: Vec<(usize, CType)> = (0..self.types.len())
-                .filter(|&idx| matches!(self.types[idx], CType::Shape(_)))
-                .map(|idx| (idx, CType::Type(LType::Table)))
-                .collect();
-            self.set_types(owner, shapes);
-            // What's left are orphans: with none, the joined version accepts any
-            // hash keys.
-            self.hkeys.clear();
+        let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
+        for (i, mine) in self.hkeys.iter_mut().enumerate() {
+            match other.hkeys.get(i) {
+                Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key => {
+                    mine.known_type = mine.known_type.join(theirs.known_type);
+                    for (slot, checked) in mine.hazards.iter_mut().enumerate() {
+                        *checked &= theirs.hazards.get(slot) == Some(&true);
+                    }
+                },
+                _ => {
+                    mine.known_type = LType::Unknown;
+                    mine.clear_checks();
+                    dropped.push(HashRef(i as u8));
+                },
+            }
         }
+        let shapes: Vec<(usize, CType)> = (0..self.types.len())
+            .filter_map(|idx| match &self.types[idx] {
+                CType::Shape(hrefs) if hrefs.iter().any(|href| dropped.contains(href)) => {
+                    let kept: SmallVec<[HashRef; 4]> = hrefs.iter().filter(|href| !dropped.contains(href)).cloned().collect();
+                    Some((idx, if kept.is_empty() { CType::Type(LType::Table) } else { CType::Shape(kept) }))
+                },
+                _ => None,
+            })
+            .collect();
+        self.set_types(owner, shapes);
     }
 
     fn set_types(&mut self, owner: &mut Owner, ty_effects: Vec<(usize, CType)>) {
