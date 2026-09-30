@@ -145,6 +145,8 @@ impl std::fmt::Display for Residual {
             Residual::NativeCall { nf, a, b, c } => write!(f, "ncall({:p}, {}, {}, {})", nf, a, b, c),
             Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, .. } => write!(f, "lcall({}, {}, {}, {})", block.0, a, b, c),
             Residual::LuaCall { entry: CallEntry::Context(_), a, b, c, .. } => write!(f, "lcall(?, {}, {}, {})", a, b, c),
+            Residual::TailCall { entry: CallEntry::Block(block), a, b, .. } => write!(f, "tcall({}, {}, {})", block.0, a, b),
+            Residual::TailCall { entry: CallEntry::Context(_), a, b, .. } => write!(f, "tcall(?, {}, {})", a, b),
             Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
             Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
             Residual::Thunk(_) => write!(f, "thunk"),
@@ -539,6 +541,19 @@ pub const UNKNOWN_RETURN: u32 = (1 << crate::vm::EFFECTS_SHIFT) - 1;
 // once the pc has `MAX_VERSIONS`, accept the contexts its continuations reach it with, knowing
 // nothing of them. A native call doesn't return this way, and never reaches such a guard.
 
+/// A TAILCALL's site: the context it is laid out from, its pc, A and B,
+/// whether its function closes upvalues and is vararg, and that function's
+/// effects. See Note [Tail calls].
+struct TailSite {
+    calling: Rc<Context>,
+    pc: Pc,
+    a: usize,
+    b: usize,
+    closes: bool,
+    vararg: bool,
+    effects: *const Cell<Effects>,
+}
+
 /// Where a call continues when nothing specializes its continuation: a block,
 /// or the version of a pc for a context, found (and compiled) only when a
 /// layout jumps to it. See Note [Call continuations].
@@ -556,6 +571,22 @@ impl After {
         }
     }
 }
+
+// Note [Tail calls]
+// ~~~~~~~~~~~~~~~~~
+// A TAILCALL of a Lua function replaces the running function's frame with the callee's
+// (`RunState::tail_call`), which returns where the running one would have: the stack doesn't grow
+// however many tail calls follow one another. Its call site is specialized as a call's (Note
+// [Call sites]): each Lua function it finds, up to `MAX_VERSIONS`, behind an identity guard, and
+// the callee's version for the context the arguments have. Nothing continues after it.
+//
+// The return the caller's continuation guards on is the callee's (Note [Call continuations]), so
+// its effects must cover what the tail caller did too (Note [Call effects]): each tail call joins
+// the tail caller's effects into the callee's prototype's, as it runs. The tail caller's may grow
+// after the tail call is laid out, by a path compiled later, so it is joined each time.
+//
+// A native in tail position, or what the site doesn't specialize, is called, and its results
+// returned, as a RETURN of every result after a CALL would; its effects are unknown.
 
 // Note [Frame ops]
 // ~~~~~~~~~~~~~~~~
@@ -756,6 +787,11 @@ pub enum Residual {
     /// context knows. Sizes the newly pushed frame to `stack` slots (the prototype's `max_stack`).
     /// `vararg` if the prototype is vararg (Note [Vararg frames]). See Note [Call sites].
     LuaCall { entry: CallEntry, a: u16, b: u16, c: u16, stack: u8, vararg: bool },
+    /// A tail call of the Lua function in R(A), `entry` as a `LuaCall`'s: its frame replaces the
+    /// running function's, which closes its open upvalues if `closes` (as `Ret`) and is vararg if
+    /// `vararg`. The running function's `effects` are joined into the callee's
+    /// (`callee_effects`) first. See Note [Tail calls].
+    TailCall { entry: CallEntry, a: u16, b: u16, closes: bool, vararg: bool, effects: *const Cell<Effects>, callee_effects: *const Cell<Effects> },
     /// The results of the call of R(A) before it, which returns here: `c - 1`
     /// of them, or with C = 0 all. See Note [Returns].
     Arrive { a: u16, c: u16 },
@@ -1830,8 +1866,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn compile(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
         loop {
             let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
-            // Only a CALL uses the top the instruction before left. See Note [Known top].
-            if ctx.top.is_some() && inst.0.Opcode() != Opcode::CALL {
+            // Only a call uses the top the instruction before left. See Note [Known top].
+            if ctx.top.is_some() && !matches!(inst.0.Opcode(), Opcode::CALL | Opcode::TAILCALL) {
                 Rc::make_mut(&mut ctx).top = None;
             }
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
@@ -1970,6 +2006,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::SETLIST => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                },
+                Opcode::TAILCALL => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    self.end_block(block_id);
+                    let proto = self.clos.ro(owner).prototype;
+                    let closes = !captured_slots(unsafe { &*proto }).is_empty();
+                    let vararg = unsafe { (*proto).is_vararg != 0 };
+                    let effects: *const Cell<Effects> = self.effects_of(proto);
+                    // See Note [Tail calls].
+                    let site = TailSite { calling: ctx.clone(), pc, a: a as usize, b: b as usize, closes, vararg, effects };
+                    let thunk = self.make_tail_call_thunk(block_id, Rc::new(site), 0, true);
+                    self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk)); None
                 },
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
@@ -2399,6 +2447,63 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     layout.push(Residual::Arrive { a: a16, c: c16 });
                     layout.push(Residual::Jump(after.block(vm, owner)));
                     // See Note [Call effects].
+                    vm.join_effects(owner, Effects::OPAQUE);
+                },
+            }
+            vm.blocks[block.0].instructions.extend(layout);
+        })))
+    }
+
+    /// The thunk a TAILCALL ends its block in, or, not `appends`, a guard's
+    /// failure is: run, it lays out a tail call of the Lua function in R(A),
+    /// guarding its identity and chaining a thunk for the next onto the guard's
+    /// failure, while its chain guards fewer than `MAX_VERSIONS`
+    /// (`identities`); a call of a native, guarded likewise, and a return of its
+    /// results; past that, or for what isn't a function, a generic call and a
+    /// return of its results. See Note [Tail calls].
+    fn make_tail_call_thunk(&self, block_id: BlockId, site: Rc<TailSite>, identities: usize, appends: bool) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            // In place, as for a call thunk. See Note [Thunk patching].
+            let block = if !appends || vm.compiled(block_id) {
+                let block = vm.new_block(vm.blocks[block_id.0].pc);
+                vm.jump_thunk(block_id, thunk_pc, block);
+                block
+            } else {
+                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
+                block_id
+            };
+            let TailSite { ref calling, pc, a, b, closes, vararg, effects } = *site;
+            let (a16, b16) = (a as u16, b as u16);
+            let next = |vm: &Specializer| Residual::Thunk(vm.make_tail_call_thunk(block, site.clone(), identities + 1, false));
+            // The results of what it calls, every one, returned.
+            let ret = Residual::Ret(pc, a as u8, 0, closes, vararg, UNKNOWN_RETURN, effects);
+            let mut layout = vec![];
+            match state.vals[state.base + a].unbox() {
+                LValue::LClosure(lclos) if matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS => {
+                    let proto = lclos.ro(owner).prototype;
+                    if !matches!(calling.types[a], CType::LuaFunction(_)) {
+                        layout.push(Residual::LuaGuard { idx: a, ptr: proto.cast() });
+                        layout.push(next(vm));
+                    }
+                    let entry = Rc::new(entry_context(calling, unsafe { &*proto }, a, b));
+                    let callee_effects: *const Cell<Effects> = vm.effects_of(proto.cast());
+                    layout.push(Residual::TailCall { entry: CallEntry::Context(entry), a: a16, b: b16, closes, vararg, effects, callee_effects });
+                },
+                LValue::NClosure(nf) if identities < MAX_VERSIONS => {
+                    layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
+                    layout.push(next(vm));
+                    layout.push(Residual::NativeCall { nf: nf.native(), a: a16, b: b16, c: 0 });
+                    // A native may allocate (a table, a string).
+                    layout.push(Residual::GC);
+                    layout.push(ret);
+                    vm.join_effects(owner, Effects::OPAQUE);
+                },
+                _ => {
+                    layout.push(Residual::Call { a: a16, b: b16, c: 0 });
+                    layout.push(Residual::Arrive { a: a16, c: 0 });
+                    // It may call a native, which may allocate.
+                    layout.push(Residual::GC);
+                    layout.push(ret);
                     vm.join_effects(owner, Effects::OPAQUE);
                 },
             }
@@ -3214,6 +3319,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let block = self.version(owner, 0, ctx);
                             self.set_current(callee.clone());
                             self.blocks[caller.0].instructions[call] = Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, stack, vararg };
+                            block
+                        },
+                    };
+                    id = block;
+                    off = 0;
+                    continue;
+                },
+                &Residual::TailCall { ref entry, a, b, closes, vararg, effects, callee_effects } => {
+                    let entry = entry.clone();
+                    let (caller, call) = (id, off);
+                    // What the tail caller did, the callee's return must tell. See Note
+                    // [Tail calls].
+                    unsafe { (*callee_effects).set((*callee_effects).get().join((*effects).get())) };
+                    state.tail_call(owner, a as usize, b as usize, closes, vararg);
+                    let callee = state.clos.clone();
+                    self.set_current(callee.clone());
+                    let block = match entry {
+                        CallEntry::Block(block) => block,
+                        // Found now, once. See Note [Call sites].
+                        CallEntry::Context(ctx) => {
+                            self.versions.entry(callee.ro(owner).prototype).or_insert_with(|| HashMap::default());
+                            let block = self.version(owner, 0, ctx);
+                            self.set_current(callee.clone());
+                            self.blocks[caller.0].instructions[call] = Residual::TailCall { entry: CallEntry::Block(block), a, b, closes, vararg, effects, callee_effects };
                             block
                         },
                     };

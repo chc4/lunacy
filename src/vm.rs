@@ -1703,6 +1703,75 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         }
     }
 
+    /// TAILCALL A B in the running frame: close the frame's open upvalues, if
+    /// its function can have opened any, and replace the frame with one for the
+    /// Lua function in R(A), called with `b - 1` arguments, or every one up to
+    /// the top. The new frame starts where the running one's function was, and
+    /// returns where it would have; from the outermost frame, which has no slot
+    /// for its function, the callee's arguments start at its base. `vararg` is
+    /// whether the running function is vararg. The callee's `max_stack`. See
+    /// Note [Tail calls] in `specialize`.
+    pub fn tail_call(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> usize {
+        debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, vararg, "a tail call's vararg isn't its function's");
+        if closes {
+            if !self.upvals.is_empty() {
+                self.close_upvalues(owner);
+            }
+        } else {
+            debug_assert!(
+                self.upvals.iter().all(|(upval, _)| matches!(upval, Upvalue::Open(idx) if *idx < self.base)),
+                "an upvalue open into a frame whose function captures none of it"
+            );
+        }
+        let from = self.base + a;
+        // The function and its arguments.
+        let count = if b == 0 { self.top - from } else { b };
+        let LValue::LClosure(lclos) = self.vals[from].unbox() else { unreachable!("a tail call of what isn't a Lua function") };
+        let proto = unsafe { &*lclos.ro(owner).prototype };
+        let (stack, callee_vararg, params) = (proto.max_stack as usize, proto.is_vararg != 0, proto.param_count as usize);
+        let next_base = match self.callstack.last() {
+            Some(entry) => {
+                // The function's slot, as `leave` finds it. See Note [Vararg frames].
+                let func = if vararg {
+                    // SAFETY: `entry` is the running frame's, whose function is vararg
+                    // (asserted above), so `call_lua` set its `func` when pushing it.
+                    unsafe { entry.vararg_func() }
+                } else {
+                    self.base - 1
+                };
+                self.move_down(from, count, func);
+                func + 1
+            },
+            None => {
+                assert!(!callee_vararg, "not implemented: a tail call of a vararg function from the outermost frame");
+                self.move_down(from + 1, count - 1, self.base);
+                self.base
+            },
+        };
+        let passed = next_base + count - 1;
+        let end = next_base + stack;
+        if end > self.vals.len() {
+            self.vals.lengthen(end);
+        }
+        if passed < end {
+            self.nil_slots(passed, end);
+        }
+        self.base = next_base;
+        self.top = end;
+        // The running frame's hash witnesses are the callee's to reuse.
+        self.witness_top = self.witness_base;
+        self.clos = lclos.clone();
+        // The frame's entry records its function's slot if it is vararg. See Note
+        // [Vararg frames].
+        if let Some(entry) = self.callstack.last_mut() {
+            entry.func = if callee_vararg { core::mem::MaybeUninit::new(next_base - 1) } else { core::mem::MaybeUninit::uninit() };
+        }
+        if callee_vararg {
+            self.move_past_varargs(passed, params, stack);
+        }
+        stack
+    }
+
     /// Take the results of the call of R(A) that returned (`leave`), the
     /// caller's half (Note [Returns]): exactly `c - 1`, padded with nil, or
     /// with C = 0 all of them, up to the top.
