@@ -1167,8 +1167,8 @@ pub enum Fragile {
     /// Stack slot `slot` holds the value upvalue `upvalue` held when loaded
     /// into it.
     Holds { slot: usize, upvalue: usize },
-    /// Upvalue `upvalue` holds a value of `ctype`: a native function's, which
-    /// is its identity.
+    /// Upvalue `upvalue` holds a value of `ctype`, which a guard found in a
+    /// slot holding its value: for a function past its identity guard, which.
     Upvalue { upvalue: usize, ctype: CType },
     /// Stack slot `slot` holds a value loaded from the array part of the table
     /// in slot `table`. See Note [Array kinds].
@@ -2190,6 +2190,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let Some(href) = field {
                 forced_mut.hkeys[href.0 as usize].known_type = found_field;
             }
+            // A slot holding an upvalue's value tells of the upvalue: the type the
+            // guard found, and past a function's identity guard below, which
+            // function. See Note [Fragile information].
+            let holds = forced_mut.holds(idx);
+            if let Some(upvalue) = holds {
+                forced_mut.assume(Fragile::Upvalue { upvalue, ctype: found.clone() });
+            }
             debug!("forcing thunk with {} == {}", found, expected);
             // Continued as a guard the context answers would be, so the ways
             // finding out and knowing share the subblock.
@@ -2220,9 +2227,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // We know this original value has the correct native function, and so can compile
                 // a block for it immediately.
                 forced_mut.types[idx] = idx_ctype.clone().unwrap();
-                // A slot holding an upvalue's value tells of the upvalue: the native
-                // guard below checks both. See Note [Fragile information].
-                if let Some(upvalue) = forced_mut.holds(idx) {
+                if let Some(upvalue) = holds {
                     forced_mut.assume(Fragile::Upvalue { upvalue, ctype: idx_ctype.clone().unwrap() });
                 }
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
@@ -2240,6 +2245,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else if let Some(CType::LuaFunction(lclos)) = &idx_ctype {
                 // Likewise we can do the same thing with statically known Lua functions
                 forced_mut.types[idx] = idx_ctype.clone().unwrap();
+                if let Some(upvalue) = holds {
+                    forced_mut.assume(Fragile::Upvalue { upvalue, ctype: idx_ctype.clone().unwrap() });
+                }
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 let proto = lclos.ro(owner).prototype.cast();
                 vm.blocks[block_id.0].instructions.push(Residual::LuaGuard { idx, ptr: proto });
@@ -2793,15 +2801,32 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::LoadUpvalue(slot, upvalue)) => {
                     // See Note [Fragile information].
                     let known = ctx.upvalue(upvalue).cloned();
+                    // What the context assumes the slot holds: debug builds check it does. See
+                    // Note [Fragile information].
                     #[cfg(debug_assertions)]
-                    if let Some(CType::NativeFunction(nf)) = &known {
-                        // A native function the context assumes a slot holds: debug builds check it
-                        // does. See Note [Fragile information].
-                        windowed!(CheckNative, [native: usize], [], |owner, state, base| (value) {
-                            let LValue::NClosure(nf) = value.unbox() else { panic!("fragile information: a native was assumed, {:?} found", value) };
-                            assert_eq!(nf.get_ptr() as usize, native, "fragile information: another native was assumed");
-                        });
-                        self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckNative::new(nf.get_ptr() as usize, &[slot]))));
+                    match &known {
+                        Some(CType::NativeFunction(nf)) => {
+                            windowed!(CheckNative, [native: usize], [], |owner, state, base| (value) {
+                                let LValue::NClosure(nf) = value.unbox() else { panic!("fragile information: a native was assumed, {:?} found", value) };
+                                assert_eq!(nf.get_ptr() as usize, native, "fragile information: another native was assumed");
+                            });
+                            self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckNative::new(nf.get_ptr() as usize, &[slot]))));
+                        },
+                        Some(CType::LuaFunction(lclos)) => {
+                            windowed!(CheckLua, [proto: usize], [], |owner, state, base| (value) {
+                                let LValue::LClosure(clos) = value.unbox() else { panic!("fragile information: a Lua function was assumed, {:?} found", value) };
+                                assert_eq!(clos.ro(owner).prototype as usize, proto, "fragile information: another Lua function was assumed");
+                            });
+                            let proto = lclos.ro(owner).prototype as usize;
+                            self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckLua::new(proto, &[slot]))));
+                        },
+                        Some(CType::Type(ty)) => {
+                            windowed!(CheckType, [ty: LType], [], |owner, state, base| (value) {
+                                assert_eq!(value.unbox().typeof_(), ty, "fragile information: another type was assumed");
+                            });
+                            self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckType::new(*ty, &[slot]))));
+                        },
+                        _ => {},
                     }
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, known.unwrap_or(CType::Type(LType::Unknown)))]);
