@@ -2910,21 +2910,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
             if state.gas > 0 && state.gas < 100 {
-                let res = self.blocks[id.0].instructions[off].clone();
+                let res = &self.blocks[id.0].instructions[off];
                 println!("low gas {} at {id:?} {off} {res:?}", state.gas);
             }
             if state.gas == 0 {
-                let res = self.blocks[id.0].instructions[off].clone();
+                let res = &self.blocks[id.0].instructions[off];
                 println!("out of gas at {id:?} {off} {res:?}");
                 println!("out of gas run state: base={:?}", state.base);
                 println!("out of gas return stack: {:?}", state.callstack);
                 state.gas -= 1;
             }
-            let res = self.blocks[id.0].instructions[off].clone();
+            // Borrowed, not cloned: an arm that needs `self` mutably (a thunk forcing, a call
+            // finding its callee's version) first copies out what it uses, so no residual is
+            // replaced while borrowed.
+            let res = &self.blocks[id.0].instructions[off];
             state.counters.versioned_count.increment();
-            debug!("RUN {:?}", &res);
+            debug!("RUN {:?}", res);
             match res {
-                Residual::Guard { idx, expected } | Residual::NumericGuard { idx, expected } => {
+                &Residual::Guard { idx, expected } | &Residual::NumericGuard { idx, expected } => {
                     if expected.accepts(state.vals[state.base + idx].unbox().typeof_()) {
                         // Fallthrough
                         off += 2;
@@ -2932,7 +2935,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
-                Residual::NativeGuard { idx, ptr } => {
+                &Residual::NativeGuard { idx, ptr } => {
                     if let LValue::NClosure(nf) = state.vals[state.base + idx].unbox() {
 
                         let call = nf.get_ptr();
@@ -2946,7 +2949,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
-                Residual::LuaGuard { idx, ptr } => {
+                &Residual::LuaGuard { idx, ptr } => {
                     if let LValue::LClosure(clos) = state.vals[state.base + idx].unbox() {
                         let call = clos.ro(owner).prototype.cast();
                         if call == ptr {
@@ -2959,7 +2962,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
-                Residual::EpochCheck { tab, href } => {
+                &Residual::EpochCheck { tab, href } => {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let tab = state.table_at(tab);
                     warn!("epochcheck sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
@@ -2970,7 +2973,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
-                Residual::HashGuard { tab, href, key, expected } => {
+                &Residual::HashGuard { tab, href, key, expected } => {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let tab = state.table_at(tab);
                     let entry = tab.ro(owner).hash.get_index(hwit.index);
@@ -3001,7 +3004,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     w.interp(owner, &mut state);
                     off += if state.select == 0 { 2 } else { 1 };
                 },
-                Residual::LuaCall { entry, a, b, c, stack, vararg } => {
+                &Residual::LuaCall { ref entry, a, b, c, stack, vararg } => {
+                    let entry = entry.clone();
                     let (caller, call) = (id, off);
                     off += 1;
                     state.call_lua(owner, Location(id, off).pack(), a, b);
@@ -3024,12 +3028,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off = 0;
                     continue;
                 },
-                Residual::NativeCall { nf, a, b, c } => {
+                &Residual::NativeCall { nf, a, b, c } => {
                     off += 1;
                     gc.publish(&state, &*self);
                     state.call_native(nf, a, b, c, owner);
                 },
-                Residual::Call { a, b, c } => {
+                &Residual::Call { a, b, c } => {
                     off += 1;
                     let to_call = state.vals[state.base + a as usize].unbox();
                     debug!("{:?}", to_call);
@@ -3060,22 +3064,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         panic!("cant call {:?}", to_call);
                     }
                 },
-                Residual::Jump(target) => {
+                &Residual::Jump(target) => {
                     id = target;
                     off = 0;
                 },
                 Residual::Thunk(thunk) => {
-                    debug!("thunk {:?}", &thunk);
+                    debug!("thunk {:?}", thunk);
+                    // Forcing it replaces it: it runs from its own reference.
+                    let thunk = thunk.clone();
                     (thunk.0.borrow_mut())(self, owner, &mut state, off)
                 },
-                Residual::Arrive { a, c } | Residual::Arrived { a, c, .. } => {
+                &Residual::Arrive { a, c } | &Residual::Arrived { a, c, .. } => {
                     off += 1;
                     state.arrive(a as usize, c as usize);
                 },
-                Residual::ReturnedFrom(from) => {
+                &Residual::ReturnedFrom(from) => {
                     off += if state.returned == from { 2 } else { 1 };
                 },
-                Residual::Ret(pc, a, b, closes, vararg, returns) => {
+                &Residual::Ret(_, a, b, closes, vararg, returns) => {
                     debug!("spec final blocks: {:?}", self.blocks);
                     match state.leave(owner, a as usize, b as usize, closes, vararg) {
                         Ok(Location(block, disp)) => {
