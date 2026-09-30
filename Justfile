@@ -47,16 +47,23 @@ test-stencils:
 # A benchmark's run traced (feature `tracing`) to working/lunacy.fxt, a
 # Perfetto trace (https://ui.perfetto.dev opens it), and summarized with
 # Perfetto's trace processor: its JIT compiles, and its bailouts by reason and
-# by where they are.
-trace benchmark times='10':
+# by where they are. Built as the benchmarks are timed: the unsafe profile.
+trace benchmark times='10' features='unsafe':
     just _luac {{benchmark}}
-    cargo build --release --features tracing --bin bench --target-dir target/tracing
-    cd working && ../target/tracing/release/bench {{benchmark}}.bin {{times}} > /dev/null
+    cargo build --profile unsafe --no-default-features --features "{{features}} tracing" --bin bench \
+        --target-dir target/tracing -Z build-std="core,std,panic_abort"
+    cd working && ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
     python3 tools/perfetto_summary.py working/lunacy.fxt
 
 # `trace`'s summary of working/lunacy.fxt again.
 show-trace:
     python3 tools/perfetto_summary.py working/lunacy.fxt
+
+# SQL against `trace`'s working/lunacy.fxt (tools/trace_sql.py): the
+# specializer's version choices, compiled versions and blocks are the views
+# spec_version, spec_block and block_summary.
+trace-sql query:
+    python3 tools/trace_sql.py "{{query}}"
 
 # Golden tests, each against its expected output, under the default build,
 # immediate_jit, no_dynamic_guards and both (tools/golden_builds.py).

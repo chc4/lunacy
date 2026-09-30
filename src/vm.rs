@@ -1975,6 +1975,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
         #[cfg(feature = "tracing")]
         {
+            spec.trace_blocks(owner);
             crate::tracing::end("interpreter", "run", &[]);
             crate::tracing::flush();
         }

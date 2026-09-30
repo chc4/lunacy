@@ -1442,6 +1442,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block_id.0].context = Some(ctx.clone());
         let subpc: SubPc = SubPc::new(entry);
         self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().insert((subpc, ctx.clone()), block_id);
+        #[cfg(feature = "tracing")]
+        {
+            let context = ctx.tostring(owner);
+            crate::tracing::instant("spec", "block", &[
+                ("block", block_id.0.into()),
+                ("line", self.traced_line(owner).into()),
+                ("pc", entry.into()),
+                ("context", context.as_str().into()),
+            ]);
+        }
         self.compile(owner, entry, ctx, block_id);
         return block_id;
     }
@@ -1468,10 +1478,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The block a jump to `pc` in `ctx` enters: a version for `ctx`, or one
     /// accepting it, compiled if need be. See Note [Version compatibility].
     pub fn version(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>) -> BlockId {
+        #[cfg(feature = "tracing")]
+        let requested = ctx.clone();
+        let (block, outcome, joined) = self.choose_version(owner, pc, ctx);
+        #[cfg(feature = "tracing")]
+        self.trace_version(owner, pc, &requested, block, outcome, joined.as_deref());
+        let _ = (outcome, joined);
+        block
+    }
+
+    /// `version`'s block, how it was chosen, and the context joined for it, if
+    /// one was: `exact`, a version for the context; `fragile`, one with fewer
+    /// fragile facts; `new`, compiled, under `MAX_VERSIONS`; `accepting`, one
+    /// accepting it; `joined`, one accepting the join of it and every version;
+    /// `joined-new`, that join compiled.
+    fn choose_version(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>) -> (BlockId, &'static str, Option<Rc<Context>>) {
         let subpc = SubPc::new(pc);
         let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
         if let Some(&exists) = versions.get(&(subpc, ctx.clone())) {
-            return exists;
+            return (exists, "exact", None);
         }
         let existing: Vec<(Rc<Context>, BlockId)> = versions
             .iter()
@@ -1496,7 +1521,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 lowered.fragile.retain(|fact| above.fragile.contains(fact));
                 if let Some((under, block)) = below.map(|below| chain[below]) {
                     if under.fragile == lowered.fragile {
-                        return *block;
+                        return (*block, "fragile", None);
                     }
                 }
                 Rc::new(lowered)
@@ -1504,7 +1529,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             None => ctx,
         };
         if existing.len() < MAX_VERSIONS {
-            return self.block(owner, pc, ctx);
+            return (self.block(owner, pc, ctx), "new", None);
         }
         let accepting = |ctx: &Context| {
             existing
@@ -1514,19 +1539,78 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .map(|(_, block)| *block)
         };
         if let Some(block) = accepting(&ctx) {
-            return block;
+            return (block, "accepting", None);
         }
         let mut joined = (*ctx).clone();
         for (ectx, _) in &existing {
             joined.join(owner, ectx);
         }
+        let joined = Rc::new(joined);
         if let Some(block) = accepting(&joined) {
-            return block;
+            return (block, "joined", Some(joined));
         }
         if existing.len() >= HARD_MAX_VERSIONS {
             panic!("too many versions at {pc}: {:#?}", existing.iter().map(|(ectx, _)| ectx).collect::<Vec<_>>());
         }
-        self.block(owner, pc, Rc::new(joined))
+        (self.block(owner, pc, joined.clone()), "joined-new", Some(joined))
+    }
+
+    /// The source line of the function being specialized, for traces.
+    #[cfg(feature = "tracing")]
+    fn traced_line(&self, owner: &Owner) -> u64 {
+        Vm::info(self.clos.ro(owner).prototype).1 as u64
+    }
+
+    /// `version`'s choice, for the trace (`spec`/`version`, see
+    /// `tools/trace_sql.py`): with how many versions `pc` has after it, and
+    /// how many of the requested context's shapes the join lost.
+    #[cfg(feature = "tracing")]
+    fn trace_version(&self, owner: &Owner, pc: Pc, requested: &Context, block: BlockId, outcome: &str, joined: Option<&Context>) {
+        let versions = self.versions.get(&self.clos.ro(owner).prototype).map_or(0, |v| v.keys().filter(|(epc, _)| *epc == SubPc::new(pc)).count());
+        let context = requested.tostring(owner);
+        let joined_context = joined.map(|j| j.tostring(owner)).unwrap_or_default();
+        let shapes_dropped = joined.map_or(0, |j| {
+            (0..requested.types.len()).filter(|&i| matches!(requested.types[i], CType::Shape(_)) && !matches!(j.slot(i), CType::Shape(_))).count()
+        });
+        crate::tracing::instant("spec", "version", &[
+            ("line", self.traced_line(owner).into()),
+            ("pc", pc.into()),
+            ("outcome", outcome.into()),
+            ("block", block.0.into()),
+            ("versions", versions.into()),
+            ("context", context.as_str().into()),
+            ("joined", joined_context.as_str().into()),
+            ("shapes_dropped", shapes_dropped.into()),
+        ]);
+    }
+
+    /// Every block, for the trace (`spec`/`block_summary`, see
+    /// `tools/trace_sql.py`): its function's line (0 for a block no version
+    /// names, as a thunk's layout), pc, context, residuals and, with the JIT,
+    /// hotness left and whether it has code.
+    #[cfg(feature = "tracing")]
+    pub fn trace_blocks(&self, owner: &Owner) {
+        let mut lines: HashMap<BlockId, u64, rustc_hash::FxBuildHasher> = HashMap::default();
+        for (proto, versions) in &self.versions {
+            let line = Vm::info(*proto).1 as u64;
+            lines.extend(versions.values().map(|&block| (block, line)));
+        }
+        for (id, block) in self.blocks.iter().enumerate() {
+            let context = block.context.as_ref().map(|c| c.tostring(owner)).unwrap_or_default();
+            let mut args: Vec<(&str, crate::tracing::TraceValue)> = vec![
+                ("block", id.into()),
+                ("line", lines.get(&BlockId(id)).copied().unwrap_or(0).into()),
+                ("pc", block.pc.into()),
+                ("residuals", block.instructions.len().into()),
+                ("context", context.as_str().into()),
+            ];
+            #[cfg(feature = "jit")]
+            {
+                args.push(("hotness", block.jit_info.hotness.get().into()));
+                args.push(("jitted", (block.jit_info.entry.is_some() as u64).into()));
+            }
+            crate::tracing::instant("spec", "block_summary", &args);
+        }
     }
 
     /// Return a specialized block for a given PC and context, compiling a new one if necessary
