@@ -1398,7 +1398,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// in `seed`: the trace's own entry windows from a first pass). Every other
     /// edge is a pseudo-use: of its target's entry window, or of the slots live
     /// into it. With `dump`, the requests its ops demote go to the window dump.
-    #[allow(clippy::too_many_arguments)]
     fn plan_trace(
         &self,
         trace: &[usize],

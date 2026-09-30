@@ -464,7 +464,7 @@ macro_rules! windowed {
             operands: ::smallvec::SmallVec<[usize; $crate::window::WINDOW]>,
         }
 
-        #[allow(dead_code, unused_variables, unused_mut, unused_assignments, unused_unsafe, clippy::too_many_arguments)]
+        #[allow(dead_code, unused_variables, unused_mut, unused_assignments, unused_unsafe)]
         impl<$(const $cp: $cpt),*> $name<$($cp),*> {
             pub const ARITY: usize = $arity;
             const ACCESSES: &'static [$crate::window::Access] = &[$($crate::window::Access::$acc),*];

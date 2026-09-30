@@ -2131,7 +2131,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// after the call and its pc, a Lua function's call continues at a thunk
     /// specializing it to the return. See Notes [Call sites] and [Call
     /// continuations].
-    #[allow(clippy::too_many_arguments)]
     fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, a: usize, b: usize, c: usize, after: BlockId, continuation: Option<(Rc<Context>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
@@ -2206,7 +2205,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// guards fewer than `MAX_VERSIONS` (`identities`). Past that, or for a
     /// return that doesn't know what it returns, the results, and `after`. See
     /// Note [Call continuations].
-    #[allow(clippy::too_many_arguments)]
     fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, pc: Pc, a: usize, c: usize, after: BlockId, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, as for a call thunk. See Note [Thunk patching].
