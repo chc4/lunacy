@@ -585,6 +585,10 @@ impl After {
 // the tail caller's effects into the callee's prototype's, as it runs. The tail caller's may grow
 // after the tail call is laid out, by a path compiled later, so it is joined each time.
 //
+// JIT code does the same (`TailFrame`), then leaves its own native frame and jumps to the callee's
+// code, so the callee's return is to what called the tail caller's code: the native stack
+// doesn't grow either.
+//
 // A native in tail position, or what the site doesn't specialize, is called, and its results
 // returned, as a RETURN of every result after a CALL would; its effects are unknown.
 
@@ -657,6 +661,16 @@ windowed!(frame PushFrame, [ret: u64, abs: u64], [FILLS: bool, A: Count, B: Coun
     let (a, b) = (A.lift(abs as u16), B.lift((abs >> 16) as u16));
     state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), a, b, (abs >> 32) as u8, FILLS);
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
+});
+
+// `tail_call` for a tail call of R(A). `ab` is its `a | b << 16` (as `Count::hold` holds them);
+// `effects` and `callee` the addresses of the running function's effects and the callee's, which
+// the first is joined into (Note [Tail calls]). Closing upvalues if `CLOSES`, from a vararg
+// function if `VARARG`. See Note [Frame ops].
+windowed!(frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+    let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
+    unsafe { *(callee as *mut u16) |= *(effects as *const u16) };
+    state.tail_call(owner, a, b, CLOSES, VARARG);
 });
 
 // A `Ret` at `at` (a `PackedLocation`). `ab` is its `a | b << 16` (as `Count::hold` holds them),

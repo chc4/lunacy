@@ -614,6 +614,13 @@ pub struct JitContext {
     /// `LuaCall` sites to link once their callee's version has code, by the
     /// version. See Note [Call linking].
     call_waiting: HashMap<BlockId, Vec<CallSite>, FxBuildHasher>,
+    /// The `TailCall` sites of the region being compiled whose callee's version
+    /// has no code yet: the version, and the offset of the site's jump in the
+    /// region. See Note [Call linking].
+    region_tail_calls: Vec<(BlockId, usize)>,
+    /// The jumps of `TailCall` sites to link once their callee's version has
+    /// code, by the version. See Note [Call linking].
+    tail_waiting: HashMap<BlockId, Vec<usize>, FxBuildHasher>,
     /// The frame ops the JIT's code has, which a call of an op's body refers to.
     /// See Note [Frame ops] in `specialize`.
     frame_ops: Vec<Rc<dyn Window>>,
@@ -645,6 +652,10 @@ struct ThunkSite {
 // its call's target becomes the version's code, then its jump the five-byte
 // nop, so it falls into the direct call from then on. Sites of the region being
 // compiled are linked with it, as a recursive call is to its own function.
+//
+// A `TailCall` whose callee's version has no code yet jumps, with a `jmp rel32`, to an exit
+// that has the interpreter run the version; once the version has code, the jump's target
+// becomes the version's code.
 
 /// A `LuaCall` site in JIT code waiting for its callee's version to have code:
 /// where its jump to the call through `lua_call` is, and its direct call. See
@@ -829,6 +840,8 @@ impl JitContext {
             lua_entries: HashMap::default(),
             region_calls: Vec::new(),
             call_waiting: HashMap::default(),
+            region_tail_calls: Vec::new(),
+            tail_waiting: HashMap::default(),
             frame_ops: Vec::new(),
             stencils: Stencils::default(),
             used: 0,
@@ -1185,6 +1198,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for site in self.jctx.call_waiting.remove(&id).unwrap_or_default() {
             self.link_call(site, entrypoint);
         }
+        for (block, jump) in std::mem::take(&mut self.jctx.region_tail_calls) {
+            self.jctx.tail_waiting.entry(block).or_default().push(slab as usize + jump);
+        }
+        for jump in self.jctx.tail_waiting.remove(&id).unwrap_or_default() {
+            self.link_tail_call(jump, entrypoint);
+        }
+    }
+
+    /// Make the `TailCall` site whose jump is at `jump` jump to `code`. See
+    /// Note [Call linking].
+    fn link_tail_call(&mut self, jump: usize, code: JitExec) {
+        assert!(unsafe { *(jump as *const u8) == 0xe9 }, "a tail call site's jump");
+        let rel = i32::try_from(code as isize - (jump as isize + 5)).expect("a version's code within rel32 of a tail call to it");
+        let mut bytes = [0xe9, 0, 0, 0, 0];
+        bytes[1..].copy_from_slice(&rel.to_le_bytes());
+        self.jctx.patch(jump, &bytes);
     }
 
     /// Where a region is entered at `id` from the interpreter, and `id` starts
@@ -1986,6 +2015,57 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     ; lua_call_done:
                                 );
                             }
+                        },
+                    }
+                },
+                Residual::TailCall { entry: CallEntry::Block(version), a, b, closes, vararg, effects, callee_effects } => {
+                    // The frame, replaced by `TailFrame`; then this code's own native
+                    // frame is left, as the region's epilogue leaves it, and the callee's
+                    // version's code entered with a jump, so its return is to what called
+                    // this code. See Note [Tail calls] in `specialize`.
+                    let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
+                    let (ab, effects, callee) = (hold(*a) | hold(*b) << 16, *effects as u64, *callee_effects as u64);
+                    let tail = match (*closes, *vararg) {
+                        (false, false) => frame_op!(TailFrame [false, false,] (ab, effects, callee); *a, *b),
+                        (false, true) => frame_op!(TailFrame [false, true,] (ab, effects, callee); *a, *b),
+                        (true, false) => frame_op!(TailFrame [true, false,] (ab, effects, callee); *a, *b),
+                        (true, true) => frame_op!(TailFrame [true, true,] (ab, effects, callee); *a, *b),
+                    };
+                    jit_note!(self.jctx, ops, "        TailFrame");
+                    emit_frame_op(ops, &mut self.jctx.stencils, pool, &tail);
+                    self.jctx.frame_ops.push(tail);
+                    jit_note!(self.jctx, ops, "        leave this code's frame, and enter the callee");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; pop r13
+                        ; pop rbx
+                        ; pop rbp
+                        // The callee's base: vals.stack_ptr + base * sizeof(LBoxed)
+                        ; lea rcx, r12 => RunState.vals
+                        ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
+                        ; mov rcx, QWORD r12 => RunState.base
+                        ; lea r13, [rax + rcx * 8]
+                    );
+                    match self.blocks[version.0].jit_info.entry {
+                        Some(code) => dynasm!(ops
+                            ; .arch x64
+                            ; jmp extern (code as usize)
+                        ),
+                        None => {
+                            // Linked to the version's code once it has some. See Note [Call
+                            // linking].
+                            self.jctx.region_tail_calls.push((*version, ops.offset().0));
+                            dynasm!(ops
+                                ; .arch x64
+                                ; jmp >no_code
+                                ; no_code:
+                                // The interpreter runs the version's first residual, as a
+                                // bailout from a block's first one does.
+                                ; mov WORD r12 => RunState.current_off, 0
+                                ; mov rax, QWORD (((-1i32 as u64) << 32 | (version.0 as u64)) as i64)
+                                ; mov BYTE r12 => RunState.trap, 1
+                                ; ret
+                            );
                         },
                     }
                 },

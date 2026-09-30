@@ -1711,6 +1711,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// for its function, the callee's arguments start at its base. `vararg` is
     /// whether the running function is vararg. The callee's `max_stack`. See
     /// Note [Tail calls] in `specialize`.
+    ///
+    /// Inlined into the window op replacing a frame in JIT code (`TailFrame`).
+    /// See Note [Frame ops] in `specialize`.
+    #[inline(always)]
     pub fn tail_call(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> usize {
         debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, vararg, "a tail call's vararg isn't its function's");
         if closes {
