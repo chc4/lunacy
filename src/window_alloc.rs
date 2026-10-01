@@ -441,6 +441,13 @@ impl WindowAlloc {
 // thesis's inter-trace hints: the window an edge from a trace planned earlier
 // leaves into it, or the window of a thunk linked into the region's entry.
 //
+// A trace none of whose steps touches the window, a block of only a thunk or
+// only jumps, is the thesis's trivial trace: its blocks are entered with the
+// hint as it is, dirty slots and all, and its exits leave it. So a thunk keeps
+// the window of the edge into it, for the code compiled once it is forced to
+// start from. (The thesis forwards only the values live into the block; what a
+// forced thunk's code reads isn't known, so the whole window is forwarded.)
+//
 // Loads and stores belong where they run least (the thesis's spill and split
 // positions, in the least frequent block), and every edge into a block pays
 // for its entry window. So where the edge into a block enters more frequent
@@ -490,6 +497,8 @@ pub struct TracePlan {
     pub dirty: Vec<Slots>,
     /// Per `Exit`, the window the trace leaves along it.
     pub exits: Vec<Option<Cache>>,
+    /// Whether it is a trivial trace, its blocks entered with the hint as it is.
+    pub trivial: bool,
 }
 
 /// What lies ahead of each step of a trace, for the worth of keeping a value.
@@ -573,11 +582,13 @@ impl Ahead {
 pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
     assert!(width <= WINDOW);
     let mut ahead = Ahead::new(steps);
+    let trivial = steps.iter().all(|s| matches!(s, Step::Start(_) | Step::Back(_) | Step::Exit { .. }));
     let mut plan = TracePlan {
         windows: vec![[None; WINDOW]; steps.len()],
         skips: vec![0; steps.len()],
         dirty: vec![Slots::default(); steps.len()],
         exits: vec![None; steps.len()],
+        trivial,
     };
     let mut alloc = WindowAlloc { width, cache: hint.clone() };
     for (step, s) in steps.iter().enumerate() {
@@ -588,6 +599,14 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
                 let mut regs = [None; WINDOW];
                 let mut dirty = Slots::default();
                 match rise {
+                    _ if trivial => {
+                        for (reg, slot) in now.slots() {
+                            regs[reg] = Some(slot);
+                            if now.dirty.contains(&slot) {
+                                dirty.insert(slot);
+                            }
+                        }
+                    }
                     Some(Rise { reads, writes }) => {
                         // The values worth most, those the trace brings in
                         // place. One it doesn't bring is loaded only for an
@@ -1139,6 +1158,27 @@ mod tests {
                     let current = Machine::version(&machine.current, slot);
                     assert_eq!(Machine::version(&machine.memory, slot), current, "{from:?} to {to:?}: slot {slot}");
                 }
+            }
+        }
+    }
+
+    /// A trivial trace, a block of only a thunk or only a jump, is entered with
+    /// the hint as it is and leaves it along its exit, whether or not the edge
+    /// into it enters more frequent code.
+    #[test]
+    fn trivial_trace_forwards_its_hint() {
+        let mut hint = Cache::default();
+        hint.regs[1] = Some(4);
+        hint.regs[3] = Some(2);
+        hint.dirty.push(2);
+        let rise = || Some(Rise { reads: Slots::default(), writes: Slots::default() });
+        for steps in [vec![Step::Start(None)], vec![Step::Start(rise())], vec![Step::Start(None), Step::Exit { hot: true, reads: Slots::default() }]] {
+            let plan = plan_trace(&steps, WINDOW, &hint);
+            assert!(plan.trivial);
+            assert_eq!(plan.windows[0], hint.regs);
+            assert_eq!(plan.dirty[0].iter().collect::<Vec<_>>(), vec![2]);
+            if steps.len() > 1 {
+                assert_eq!(plan.exits[1].as_ref(), Some(&hint));
             }
         }
     }

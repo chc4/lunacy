@@ -1605,7 +1605,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .enumerate()
             .map(|(pos, &b)| {
                 let start = starts[pos];
-                let rises = matches!(steps[start], Step::Start(Some(_)));
+                let rises = !plan.trivial && matches!(steps[start], Step::Start(Some(_)));
                 (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), dirty: plan.dirty[start], rises, placed: placed(&step_of[pos]) })
             })
             .collect();
