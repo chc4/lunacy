@@ -273,18 +273,47 @@ macro_rules! window_count {
     }};
 }
 
+/// For code laid out elsewhere, `window_count!` without the count: its id in
+/// the dump, and the counter's address for that code's `emit_count`.
+macro_rules! window_deferred {
+    ($jctx:expr, $emits:expr) => {{
+        #[cfg(feature = "window_dump")]
+        let counted = if $emits.is_empty() {
+            (String::new(), None)
+        } else {
+            let (id, at) = window_counter(&$jctx.window_counts);
+            (format!(" #{id}"), Some(at))
+        };
+        #[cfg(not(feature = "window_dump"))]
+        let counted: (&str, Option<i64>) = ("", None);
+        counted
+    }};
+}
+
+/// A new window dump counter: its id, and its address.
 #[cfg(feature = "window_dump")]
-fn window_count(counts: &std::cell::RefCell<Vec<Box<std::sync::atomic::AtomicU64>>>, ops: &mut Assembler) -> usize {
+fn window_counter(counts: &std::cell::RefCell<Vec<Box<std::sync::atomic::AtomicU64>>>) -> (usize, i64) {
     let mut counts = counts.borrow_mut();
     let counter = Box::new(std::sync::atomic::AtomicU64::new(0));
     let at = counter.as_ptr() as i64;
     counts.push(counter);
+    (counts.len() - 1, at)
+}
+
+#[cfg(feature = "window_dump")]
+fn window_count(counts: &std::cell::RefCell<Vec<Box<std::sync::atomic::AtomicU64>>>, ops: &mut Assembler) -> usize {
+    let (id, at) = window_counter(counts);
+    emit_count(ops, at);
+    id
+}
+
+/// Count one more run of the code here on the window dump counter at `at`.
+fn emit_count(ops: &mut Assembler, at: i64) {
     dynasm!(ops
         ; .arch x64
         ; mov rax, QWORD at
         ; inc QWORD [rax]
     );
-    counts.len() - 1
 }
 
 /// The window registers `w0..w8` in the order the stencil ABI passes them (the
@@ -350,8 +379,9 @@ enum Stub {
     ColdEntry { record: DynamicLabel, cold: usize },
     /// The cold way after an optimistic op, where its cold stencil continues:
     /// back from the copy's alignment if `aligned`, the window's moves, then the
-    /// jump. See Note [Optimistic ops] in `specialize`.
-    ColdWay { aligned: bool, moves: SmallVec<[Emit; 16]>, to: JumpTo },
+    /// jump. See Note [Optimistic ops] in `specialize`. With `count`, the
+    /// window dump's counter of its moves.
+    ColdWay { aligned: bool, moves: SmallVec<[Emit; 16]>, to: JumpTo, count: Option<i64> },
 }
 
 /// Where a jump to a block goes: its code, or a label it will have.
@@ -1154,10 +1184,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp extern cold
                     );
                 }
-                Stub::ColdWay { aligned, moves, to } => {
+                Stub::ColdWay { aligned, moves, to, count } => {
                     jit_note!(self.jctx, ops, "an optimistic op's cold way");
                     if aligned {
                         dynasm!(ops ; .arch x64 ; add rsp, 8);
+                    }
+                    if let Some(at) = count {
+                        emit_count(&mut ops, at);
                     }
                     for emit in moves {
                         emit_window_move(&mut ops, emit);
@@ -1620,14 +1653,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // first jump to it compiled delivers it dirty.
         // With `defer`, its moves and target, for code laid out elsewhere, in
         // place of emitting it.
-        let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool, defer: bool| -> Option<(SmallVec<[Emit; 16]>, JumpTo)> {
+        let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool, defer: bool| -> Option<(SmallVec<[Emit; 16]>, JumpTo, Option<i64>)> {
             if let Some(target_block) = self.jctx.blocks.get(target) {
                 // We already JIT compiled the block, and can jump to it directly.
                 let transfer = alloc.transfer(&target_block.window);
-                let counted = window_count!(self.jctx, ops, transfer);
+                let (counted, count) = if defer { window_deferred!(self.jctx, transfer) } else { (window_count!(self.jctx, ops, transfer), None) };
                 window_dump!(self.jctx, "      to block {} (compiled, entered with {}): {}{counted}", target.0, target_block.window, emits_line(&transfer));
                 if defer {
-                    return Some((transfer, JumpTo::Code(target_block.ptr.0 as usize)));
+                    return Some((transfer, JumpTo::Code(target_block.ptr.0 as usize), count));
                 }
                 for emit in transfer {
                     emit_window_move(ops, emit);
@@ -1650,10 +1683,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     },
                 });
                 let transfer = alloc.transfer(&pending.window);
-                let counted = window_count!(self.jctx, ops, transfer);
+                let (counted, count) = if defer { window_deferred!(self.jctx, transfer) } else { (window_count!(self.jctx, ops, transfer), None) };
                 window_dump!(self.jctx, "      to block {} (entered with {}): {}{counted}", target.0, pending.window, emits_line(&transfer));
                 if defer {
-                    return Some((transfer, JumpTo::Label(pending.label)));
+                    return Some((transfer, JumpTo::Label(pending.label), count));
                 }
                 for emit in transfer {
                     emit_window_move(ops, emit);
@@ -2320,8 +2353,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // The op's cold path continues here, at its copy's stack. See Note
                         // [Optimistic ops] in `specialize`.
                         Some((label, aligned)) => {
-                            let (moves, to) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
-                            pool.stubs.push((label, Stub::ColdWay { aligned, moves, to }));
+                            let (moves, to, count) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
+                            pool.stubs.push((label, Stub::ColdWay { aligned, moves, to, count }));
                             emit_jump(ops, &alloc, hot, self.jctx.blocks.get(hot).is_none(), false);
                         },
                         // An op run by its body on the stack, which selected.
