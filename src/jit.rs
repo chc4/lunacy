@@ -10,8 +10,8 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::specialize::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
-use crate::window_alloc::{plan_trace, Cache, Emit, Packed, Placement, Step, WindowAlloc};
-use crate::trace::{Block as TraceBlock, Event, Policy, Region, Slots};
+use crate::window_alloc::{plan_trace, Cache, Emit, Packed, Placement, Rise, Step, WindowAlloc};
+use crate::trace::{Block as TraceBlock, Event, Loops, Policy, Region, Slots};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use smallvec::SmallVec;
@@ -775,13 +775,13 @@ pub struct Pending {
 pub struct BlockPlan {
     /// The registers of its entry window.
     entry: Packed,
-    /// The slots its entry window has dirty: at a loop's header, those the loop
-    /// writes, whichever jump into it is compiled first.
+    /// The slots its entry window has dirty, whichever jump into it is
+    /// compiled first.
     dirty: Slots,
-    /// Whether it is a loop's header, whose entry window has only `dirty`
-    /// dirty; any other block's also has what the first jump into it compiled
-    /// has dirty.
-    header: bool,
+    /// Whether the trace's edge into it enters more frequent code: its entry
+    /// window then has only `dirty` dirty; any other block's also has what the
+    /// first jump into it compiled has dirty.
+    rises: bool,
     /// Per residual, for a window op with a stencil, its `SKIP` and the placement
     /// planned before it.
     placed: Vec<Option<(u8, Packed)>>,
@@ -794,7 +794,7 @@ impl BlockPlan {
     /// compiled.
     fn entry_window(&self, from: &Cache) -> Cache {
         let none = Cache::default();
-        Cache::entry(self.entry.unpack(), if self.header { &none } else { from }, &self.dirty)
+        Cache::entry(self.entry.unpack(), if self.rises { &none } else { from }, &self.dirty)
     }
 }
 
@@ -1481,30 +1481,32 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .collect(),
         );
         let live_in = region.liveness();
+        let loops = region.loops();
         self.jctx.region_headers = region.loop_headers().map(|header| ids[header]).collect();
         let traces = region.traces(policy);
         window_dump!(self.jctx, "traces {}", traces.iter().map(|trace| trace.iter().map(|&b| ids[b].0.to_string()).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" | "));
         for (b, live) in live_in.iter().enumerate() {
             window_dump!(self.jctx, "live into block {}: {:?}", ids[b].0, live.iter().collect::<Vec<_>>());
         }
-        // The window each trace's head starts from: the region's entry, the
-        // window of the thunk linked into it; another head, the window the
-        // hottest edge into it from a trace planned earlier leaves. See Note
-        // [Trace allocation].
-        let mut hints: HashMap<BlockId, (usize, Cache), FxBuildHasher> = HashMap::default();
+        // The window each trace's head starts from, and the block it comes
+        // from: the region's entry, the window of the thunk linked into it,
+        // from outside the region; another head, the window the hottest edge
+        // into it from a trace planned earlier leaves. See Note [Trace
+        // allocation].
+        let mut hints: HashMap<BlockId, (usize, Cache, Option<usize>), FxBuildHasher> = HashMap::default();
         if let Some(window) = entered {
-            hints.insert(entry, (0, window.clone()));
+            hints.insert(entry, (0, window.clone(), None));
         }
         let mut plans = Plans::default();
         for trace in &traces {
             let head = ids[trace[0]];
-            let hint = hints.get(&head).map(|(_, window)| window.clone()).unwrap_or_default();
+            let (hint, from) = hints.get(&head).map(|(_, window, from)| (window.clone(), *from)).unwrap_or_default();
             window_dump!(self.jctx, "trace from block {} starts from {}", head.0, hint);
-            let (planned, exits) = self.plan_trace(trace, &ids, &skips, &index, &live_in, &plans, &hint);
+            let (planned, exits) = self.plan_trace(trace, &ids, &skips, &index, &live_in, &loops, &plans, &hint, from);
             for (from, target, window) in exits {
                 let hotness = self.blocks[from.0].jit_info.hotness.get();
-                if hints.get(&target).is_none_or(|&(hottest, _)| hotness < hottest) {
-                    hints.insert(target, (hotness, window));
+                if hints.get(&target).is_none_or(|&(hottest, ..)| hotness < hottest) {
+                    hints.insert(target, (hotness, window, Some(index[&from])));
                 }
             }
             plans.extend(planned);
@@ -1512,7 +1514,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         plans
     }
 
-    /// Plan one trace's window ops from `hint` (see Note [Trace allocation]):
+    /// Plan one trace's window ops from `hint`, the window of an edge from the
+    /// region's block `from` or from outside it (see Note [Trace allocation]):
     /// its blocks' residuals as steps, each block continuing into the next,
     /// the last into its hottest target unless it jumps back into the trace.
     /// Returns its blocks' plans and, per edge leaving the trace, its source,
@@ -1524,8 +1527,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         skips: &[Vec<SmallVec<[usize; WINDOW]>>],
         index: &HashMap<BlockId, usize, FxBuildHasher>,
         live_in: &[Slots],
+        loops: &Loops,
         plans: &Plans,
         hint: &Cache,
+        from: Option<usize>,
     ) -> (Vec<(BlockId, BlockPlan)>, Vec<(BlockId, BlockId, Cache)>) {
         let slots_of = |placement: &Placement| {
             let mut slots = Slots::default();
@@ -1556,10 +1561,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else {
                 None
             };
-            // A loop's header: a block of the trace at or after it jumps back to it.
-            let header = trace[pos..].iter().any(|&l| self.blocks[ids[l].0].instructions.iter().flat_map(jump_targets).any(|t| t == ids[b]));
+            // Whether the edge into the block enters more frequent code.
+            let rise = loops.entered(if pos == 0 { from } else { Some(trace[pos - 1]) }, b);
             starts.push(steps.len());
-            steps.push(if header { Step::Header(live_in[b]) } else { Step::Start });
+            steps.push(Step::Start(rise.map(|(mut reads, writes)| {
+                reads.intersect(&live_in[b]);
+                Rise { reads, writes }
+            })));
             let mut of = vec![None; block.instructions.len()];
             for (off, res) in block.instructions.iter().enumerate() {
                 match res {
@@ -1597,8 +1605,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .enumerate()
             .map(|(pos, &b)| {
                 let start = starts[pos];
-                let header = matches!(steps[start], Step::Header(_));
-                (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), dirty: plan.dirty[start], header, placed: placed(&step_of[pos]) })
+                let rises = matches!(steps[start], Step::Start(Some(_)));
+                (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), dirty: plan.dirty[start], rises, placed: placed(&step_of[pos]) })
             })
             .collect();
         (planned, exits)

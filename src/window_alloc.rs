@@ -424,50 +424,60 @@ impl WindowAlloc {
 //
 // A value is worth its register until its next beneficial event: a read,
 // which keeping it saves a load, or, while it is dirty, an overwrite, which
-// keeping it saves a store. A flush ends every value's worth. Looking ahead
-// from inside a loop sees past the jump back to its header, to the reads
-// after it: the back edge stores a dirty value its header doesn't carry. A
-// value with no such event is still worth a register, after every value that
-// has one, while it is live along a side exit into a block that has run (the
-// thesis's pseudo-uses): the exit's own trace starts from the window it
-// leaves. At each window op the window keeps the op's operands in its run
-// and as many other values as fit outside the run, those with the nearest
-// next events first (Belady); the op runs at the `SKIP` needing the fewest
-// moves. A value not kept stays where it is, unnamed, until something needs
-// its register.
+// keeping it saves a store. A flush ends every value's worth. An edge leaving
+// the trace reads what its target does first (the thesis's pseudo-uses): the
+// trace's own continuation, and a jump back to a block of the trace, read
+// their target's entry window as the trace's ops read their operands. A value
+// with no such event is still worth a register, after every value that has
+// one, while it is live along a side exit into a block that has run: the
+// exit's own trace starts from the window it leaves. At each window op the
+// window keeps the op's operands in its run and as many other values as fit
+// outside the run, those with the nearest next events first (Belady); the op
+// runs at the `SKIP` needing the fewest moves. A value not kept stays where
+// it is, unnamed, until something needs its register.
 //
 // A block's entry window is the window the trace reaches it with, less the
 // values of no further worth. The trace's head starts from a hint, as the
 // thesis's inter-trace hints: the window an edge from a trace planned earlier
-// leaves into it, or the window of a thunk linked into the region's entry. A
-// loop's header defines the values live into it, as the thesis's
-// pseudo-definitions: its entry window holds the values with the nearest next
-// events among those the trace brings and those live into the header, which
-// are loaded on the way into the loop rather than in it. It has dirty exactly
-// the slots the loop writes, which its back edge brings dirty: a value dirty
-// on the way in otherwise is stored there once, rather than by the loop
-// whenever it drops it.
+// leaves into it, or the window of a thunk linked into the region's entry.
+//
+// Loads and stores belong where they run least (the thesis's spill and split
+// positions, in the least frequent block), and every edge into a block pays
+// for its entry window. So where the edge into a block enters more frequent
+// code, the block's entry window holds only values live into it that the
+// code it enters reads: those the trace brings, and those with events that
+// pay, loaded on that edge rather than in the code it enters. It has dirty
+// only the slots that code writes, which its own edges into the block bring
+// dirty: any other value dirty on the way in is stored on that edge once,
+// rather than by the more frequent code whenever it drops it.
 
 /// A step of a trace, for [`plan_trace`]: its blocks' residuals, as planning
 /// sees them.
 pub enum Step<'a> {
-    /// A block's start, continuing the trace from the step before it.
-    Start,
-    /// The start of a loop's header, which a later `Back` jumps to, with the
-    /// slots live into it.
-    Header(Slots),
+    /// A block's start, continuing the trace from the step before it, with
+    /// its `Rise` if the edge into it enters more frequent code.
+    Start(Option<Rise>),
     /// A window op, and the `SKIP`s it can run at.
     Op(&'a dyn Window, SmallVec<[usize; WINDOW]>),
     /// An inline guard testing `slot` in its register, if the window has one.
     Read(usize),
     /// A residual that flushes the window.
     Flush,
-    /// A jump back to the loop header at step `header`.
+    /// A jump to the block starting at step `start`, earlier in the trace:
+    /// an edge into it, reading its entry window.
     Back(usize),
     /// An edge leaving the trace into a block `reads` are live into, or that
     /// is entered with them: the trace's own continuation if `hot`, else a
     /// side exit (with none, into a block that never ran).
     Exit { hot: bool, reads: Slots },
+}
+
+/// An edge into more frequent code than it leaves: the slots live into the
+/// block it enters that the more frequent code reads, and those that code
+/// writes. See Note [Trace allocation].
+pub struct Rise {
+    pub reads: Slots,
+    pub writes: Slots,
 }
 
 /// A planned trace. See Note [Trace allocation].
@@ -490,7 +500,7 @@ struct Ahead {
     /// Per slot, the side exits it is live along, in order.
     leaves: Vec<Vec<usize>>,
     flushes: Vec<usize>,
-    /// Each jump back to a loop's header, `(back, header)`, in order.
+    /// Each jump back into the trace, `(back, start)`.
     backs: Vec<(usize, usize)>,
 }
 
@@ -513,19 +523,22 @@ impl Ahead {
                 Step::Exit { hot: true, reads } => reads.iter().for_each(|slot| ahead.events[slot].push((step, true))),
                 Step::Exit { hot: false, reads } => reads.iter().for_each(|slot| ahead.leaves[slot].push(step)),
                 Step::Flush => ahead.flushes.push(step),
-                Step::Back(header) => ahead.backs.push((step, *header)),
-                Step::Start | Step::Header(_) => {}
+                Step::Back(start) => ahead.backs.push((step, *start)),
+                Step::Start(_) => {}
             }
         }
         ahead
     }
 
-    /// The first event of `slot` in `from..to`, unless a flush comes first.
-    fn first(&self, slot: usize, from: usize, to: usize) -> Option<(usize, bool)> {
-        let events = &self.events[slot];
-        let event = events.get(events.partition_point(|e| e.0 < from)).copied().filter(|e| e.0 < to)?;
-        let flush = self.flushes.get(self.flushes.partition_point(|&f| f < from)).copied();
-        flush.is_none_or(|flush| flush > event.0).then_some(event)
+    /// The block starting at step `start` is entered with `window`: each jump
+    /// back to it reads that.
+    fn entered(&mut self, start: usize, window: &Placement) {
+        for &(back, _) in self.backs.iter().filter(|&&(_, s)| s == start) {
+            for &slot in window.iter().flatten() {
+                let events = &mut self.events[slot];
+                events.insert(events.partition_point(|e| e.0 < back), (back, true));
+            }
+        }
     }
 
     /// The worth of keeping `slot` in a register after step `at`, `dirty` or
@@ -545,23 +558,13 @@ impl Ahead {
     }
 
     /// How far after step `at` keeping `slot` in a register next pays off,
-    /// `dirty` or not, if it does.
+    /// `dirty` or not, if it does: its next event, unless a flush comes first,
+    /// if that is a read, or an overwrite of a dirty value.
     fn pays(&self, slot: usize, at: usize, dirty: bool) -> Option<usize> {
-        let pays = |(step, read): (usize, bool)| (read || dirty).then_some(step - at);
-        // The innermost loop around `at`, whose back edge comes first.
-        let back = self.backs.iter().find(|&&(back, header)| header <= at && at < back);
-        let Some(&(back, header)) = back else { return self.first(slot, at + 1, usize::MAX).and_then(pays) };
-        match self.first(slot, at + 1, back + 1) {
-            Some(event) => pays(event),
-            None => {
-                let flushed = self.flushes.iter().any(|&f| at < f && f < back);
-                // Around the loop only a read pays: the back edge stores a
-                // dirty value its header doesn't carry.
-                let around = self.first(slot, header, back).filter(|&(_, read)| read && !flushed).map(|(step, _)| back - at + step - header);
-                let on = self.first(slot, back + 1, usize::MAX).and_then(pays);
-                around.into_iter().chain(on).min()
-            }
-        }
+        let events = &self.events[slot];
+        let &(step, read) = events.get(events.partition_point(|e| e.0 <= at))?;
+        let flush = self.flushes.get(self.flushes.partition_point(|&f| f <= at)).copied();
+        (flush.is_none_or(|flush| flush > step) && (read || dirty)).then_some(step - at)
     }
 }
 
@@ -569,16 +572,7 @@ impl Ahead {
 /// entered from `hint`. See Note [Trace allocation].
 pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
     assert!(width <= WINDOW);
-    let ahead = Ahead::new(steps);
-    // Per loop header, the slots the loop writes.
-    let mut looped = vec![Slots::default(); steps.len()];
-    for &(back, header) in &ahead.backs {
-        for s in &steps[header..back] {
-            if let Step::Op(op, _) = s {
-                op.operands().iter().zip(op.accesses()).filter(|(_, a)| a.writes()).for_each(|(&slot, _)| looped[header].insert(slot));
-            }
-        }
-    }
+    let mut ahead = Ahead::new(steps);
     let mut plan = TracePlan {
         windows: vec![[None; WINDOW]; steps.len()],
         skips: vec![0; steps.len()],
@@ -588,44 +582,48 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
     let mut alloc = WindowAlloc { width, cache: hint.clone() };
     for (step, s) in steps.iter().enumerate() {
         match s {
-            Step::Start | Step::Header(_) => {
+            Step::Start(rise) => {
                 let now = alloc.cache();
                 let worth = |slot: usize| ahead.worth(slot, step, now.dirty.contains(&slot));
                 let mut regs = [None; WINDOW];
                 let mut dirty = Slots::default();
-                if let Step::Header(live) = s {
-                    // The values worth most, those the trace brings in place.
-                    // One it doesn't bring is loaded only for an event that
-                    // pays, not to be live along a side exit.
-                    let brought = now.slots().map(|(_, slot)| slot);
-                    let fresh = live.iter().filter(|&slot| now.position(slot).is_none() && ahead.pays(slot, step, false).is_some());
-                    let mut values: SmallVec<[((bool, usize), usize); 16]> = brought.chain(fresh).filter_map(|slot| Some((worth(slot)?, slot))).collect();
-                    values.sort_unstable();
-                    values.truncate(width);
-                    for &(_, slot) in &values {
-                        if let Some(reg) = now.position(slot) {
-                            regs[reg] = Some(slot);
+                match rise {
+                    Some(Rise { reads, writes }) => {
+                        // The values worth most, those the trace brings in
+                        // place. One it doesn't bring is loaded only for an
+                        // event that pays, not to be live along a side exit.
+                        let brought = now.slots().map(|(_, slot)| slot).filter(|&slot| reads.contains(slot));
+                        let fresh = reads.iter().filter(|&slot| now.position(slot).is_none() && ahead.pays(slot, step, false).is_some());
+                        let mut values: SmallVec<[((bool, usize), usize); 16]> = brought.chain(fresh).filter_map(|slot| Some((worth(slot)?, slot))).collect();
+                        values.sort_unstable();
+                        values.truncate(width);
+                        for &(_, slot) in &values {
+                            if let Some(reg) = now.position(slot) {
+                                regs[reg] = Some(slot);
+                            }
                         }
-                    }
-                    for &(_, slot) in &values {
-                        if now.position(slot).is_none() {
-                            let reg = (0..width).find(|&reg| regs[reg].is_none()).expect("a free register");
-                            regs[reg] = Some(slot);
+                        for &(_, slot) in &values {
+                            if now.position(slot).is_none() {
+                                let reg = (0..width).find(|&reg| regs[reg].is_none()).expect("a free register");
+                                regs[reg] = Some(slot);
+                            }
                         }
+                        regs.iter().flatten().filter(|&&slot| writes.contains(slot)).for_each(|&slot| dirty.insert(slot));
                     }
-                    regs.iter().flatten().filter(|&&slot| looped[step].contains(slot)).for_each(|&slot| dirty.insert(slot));
-                } else {
-                    for (reg, slot) in now.slots() {
-                        if worth(slot).is_some() {
-                            regs[reg] = Some(slot);
-                            if now.dirty.contains(&slot) {
-                                dirty.insert(slot);
+                    None => {
+                        for (reg, slot) in now.slots() {
+                            if worth(slot).is_some() {
+                                regs[reg] = Some(slot);
+                                if now.dirty.contains(&slot) {
+                                    dirty.insert(slot);
+                                }
                             }
                         }
                     }
                 }
                 let entry = Cache { regs, dirty: dirty.iter().collect() };
                 alloc = WindowAlloc { width, cache: entry };
+                ahead.entered(step, &regs);
                 plan.windows[step] = regs;
                 plan.dirty[step] = dirty;
             }
@@ -855,7 +853,7 @@ mod tests {
     fn run_planned(width: usize, ops: &[TestOp]) {
         let windows = windows(ops);
         let steps: Vec<Step> =
-            std::iter::once(Step::Start).chain(windows.iter().map(|w| Step::Op(&**w, (0..WINDOW).collect()))).collect();
+            std::iter::once(Step::Start(None)).chain(windows.iter().map(|w| Step::Op(&**w, (0..WINDOW).collect()))).collect();
         let plan = plan_trace(&steps, width, &Cache::default());
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
@@ -965,12 +963,13 @@ mod tests {
         }
     }
 
-    /// Random traces of ops over up to six slots, with block starts, loops,
-    /// flushes, inline guards and exits, in windows of 5 to 8 registers, run as
-    /// the JIT runs a planned trace: each op reconciled to its planned window,
-    /// each block entered through a transfer into its entry window, each back
-    /// edge's transfer into its header's checked, and each exit's stores. Every
-    /// op reads current values and the stack ends current.
+    /// Random traces of ops over up to six slots, with block starts (some
+    /// entered by a rising edge), jumps back to them, flushes, inline guards
+    /// and exits, in windows of 5 to 8 registers, run as the JIT runs a planned
+    /// trace: each op reconciled to its planned window, each block entered
+    /// through a transfer into its entry window, each jump back's transfer
+    /// into its target's checked, and each exit's stores. Every op reads
+    /// current values and the stack ends current.
     #[test]
     fn random_traces() {
         let mut rng = Rng(0x2545f4914f6cdd1d);
@@ -978,24 +977,23 @@ mod tests {
             let width = 5 + rng.below(5);
             let mut ops = Vec::new();
             let mut kinds = Vec::new();
-            let mut headers = Vec::new();
+            let mut starts = vec![0];
             for _ in 0..1 + rng.below(24) {
                 let step = kinds.len() + 1;
                 let k = rng.below(14);
                 let mut slot = || rng.below(6);
                 match k {
-                    0 => kinds.push((1, 0)),
+                    0 | 4 => {
+                        starts.push(step);
+                        kinds.push((if k == 0 { 1 } else { 5 }, 0));
+                    }
                     1 => kinds.push((2, 0)),
                     2 => kinds.push((3, 0)),
                     3 => kinds.push((4, slot())),
-                    4 => {
-                        headers.push(step);
-                        kinds.push((5, 0));
-                    }
-                    5 if !headers.is_empty() => kinds.push((6, headers[slot() % headers.len()])),
+                    5 => kinds.push((6, starts[slot() % starts.len()])),
                     k => {
                         ops.push(match k {
-                            5..=8 => B(slot(), slot(), slot()),
+                            6..=8 => B(slot(), slot(), slot()),
                             9 => TestOp::BinFirst(slot(), slot(), slot()),
                             10 => G(slot(), slot()),
                             11 => S(slot(), slot()),
@@ -1013,14 +1011,14 @@ mod tests {
                 (0..rng.below(4)).for_each(|_| slots.insert(rng.below(6)));
                 slots
             };
-            let steps: Vec<Step> = std::iter::once(Step::Start)
+            let steps: Vec<Step> = std::iter::once(Step::Start(None))
                 .chain(kinds.iter().map(|&(kind, arg)| match kind {
                     0 => Step::Op(&**next_op.next().unwrap(), (0..WINDOW).collect()),
-                    1 => Step::Start,
+                    1 => Step::Start(None),
                     2 => Step::Flush,
                     3 => Step::Exit { hot: rng.below(2) == 0, reads: some_slots(&mut rng) },
                     4 => Step::Read(arg),
-                    5 => Step::Header(some_slots(&mut rng)),
+                    5 => Step::Start(Some(Rise { reads: some_slots(&mut rng), writes: some_slots(&mut rng) })),
                     _ => Step::Back(arg),
                 }))
                 .collect();
@@ -1040,8 +1038,8 @@ mod tests {
             let mut entries = HashMap::new();
             for (step, s) in steps.iter().enumerate() {
                 match s {
-                    Step::Start | Step::Header(_) => {
-                        let from = if matches!(s, Step::Header(_)) { Cache::default() } else { alloc.cache().clone() };
+                    Step::Start(rise) => {
+                        let from = if rise.is_some() { Cache::default() } else { alloc.cache().clone() };
                         let entry = Cache::entry(plan.windows[step], &from, &plan.dirty[step]);
                         for emit in alloc.transfer(&entry) {
                             machine.exec(emit, None);
@@ -1062,8 +1060,8 @@ mod tests {
                             machine.exec(emit, None);
                         }
                     }
-                    Step::Back(header) => {
-                        let entry = &entries[header];
+                    Step::Back(start) => {
+                        let entry = &entries[start];
                         let mut taken = Machine { memory: machine.memory.clone(), current: machine.current.clone(), regs: machine.regs };
                         for emit in alloc.transfer(entry) {
                             taken.exec(emit, None);
