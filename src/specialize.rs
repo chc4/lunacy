@@ -151,6 +151,7 @@ impl std::fmt::Display for Residual {
             Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Select(targets) => write!(f, "select"),
+            Residual::Branch { .. } => write!(f, "branch"),
             Residual::Ret(..) => write!(f, "ret"),
             Residual::GC => write!(f, "gc"),
         }
@@ -786,6 +787,10 @@ pub enum Residual {
     GuardDynamic(Rc<dyn Window>),
     Call { a: u16, b: u16, c: u16 },
     Select(Vec<(&'static str, BlockId)>),
+    /// The way on after an optimistic op, as the op selects: 0 to `hot`, 1 to `cold`. JIT code
+    /// takes it with no `select`: the op's cold path continues at `cold` itself. See Note
+    /// [Optimistic ops].
+    Branch { hot: BlockId, cold: BlockId },
     Jump(BlockId),
     Thunk(ThunkRef),
     /// A RETURN of `b - 1` values from R(A), or up to the top. Closes the frame's open upvalues.
@@ -1083,12 +1088,17 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // ~~~~~~~~~~~~~~~~~~~~~
 // An op can do its common case on its hot path and the rest on its cold path (Note [Cold
 // stencils] in `window`), and select which it took, 0 or 1. Yielded as `OptimisticExec`, the op
-// is followed by a `Select` of two ways on: its generator continues on the hot one, resumed with
+// is followed by a `Branch` to two ways on: its generator continues on the hot one, resumed with
 // `Matched`, and on the cold one, behind a thunk, only once it is taken, resumed with `Failed`. So
 // the code after the op can know what its common case gives, as an integer op's result in the
 // integer encoding (Note [Integers]), while the rarer case still has its result, from the cold
 // path, and a way on knowing that instead. Unlike a dynamic guard's test (Note [Dynamic
 // guards]), the op is an op: it writes its outputs either way.
+//
+// In JIT code the `Branch` tests no `select`: the op's hot path falls through to the jump to
+// the hot way, and its cold stencil, which ends in a jump to its site record's address (Note
+// [Cold stencils] in `window`), continues at the jump to the cold way, the record's address
+// for such an op.
 
 /// The type of a constant.
 fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
@@ -2849,7 +2859,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let cold = self.new_block(pc.0);
                     let side = self.make_side_thunk(cold, coro.clone(), pc.next_false(), ctx.clone(), ResumeArg::Failed);
                     self.blocks[cold.0].instructions.push(Residual::Thunk(side));
-                    self.blocks[block_id.0].instructions.push(Residual::Select(vec![("hot", hot), ("cold", cold)]));
+                    self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
                     return None;
                 },
                 CoroutineState::Yielded(YieldOp::NativeWindowArgs(a, b, c)) => {
@@ -3330,6 +3340,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     id = targets[state.select].1;
                     off = 0;
                 },
+                &Residual::Branch { hot, cold } => {
+                    id = if state.select == 0 { hot } else { cold };
+                    off = 0;
+                },
                 Residual::Exec(f) => {
                     off += 1;
                     (f.body)(owner, &mut state);
@@ -3589,6 +3603,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 edges.push(Stmt::Edge(
                                     edge!(node_id!(block_id) => node_id!(target.0); attr!("label", name))));
                             }
+                        },
+                        Residual::Branch { hot, cold } => {
+                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(hot.0); attr!("label", "hot"))));
+                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(cold.0); attr!("label", "cold"))));
                         },
                         _ => {}
                     }

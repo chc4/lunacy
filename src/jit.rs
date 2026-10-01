@@ -473,7 +473,7 @@ macro_rules! frame_op {
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
     match stencils.body(&**op, 0) {
         Ok(body) => {
-            splat(ops, &body, op.name(), &op.captures(), pool, None);
+            splat(ops, &body, op.name(), &op.captures(), pool, None, None);
         }
         // Debug builds' stencils can keep what optimized ones fold away, but an
         // optimized frame op the copier rejects is a bug to fix.
@@ -493,8 +493,10 @@ fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, 
 }
 
 /// Copy `body`, a guard's jumps to its second continuation going to `pass`:
-/// whether it has any. See Note [Guard stencils] in `window`.
-fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool, pass: Option<DynamicLabel>) -> bool {
+/// whether it has any. See Note [Guard stencils] in `window`. Its cold path, if
+/// it has one, continues at `cold`, else where its copy does. See Note
+/// [Optimistic ops] in `specialize`.
+fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool, pass: Option<DynamicLabel>, cold: Option<DynamicLabel>) -> bool {
     enum Site {
         Value(u64),
         Absolute(usize),
@@ -508,7 +510,7 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
     }
     let fall = ops.new_dynamic_label();
     // The site's record, if the op has a cold path.
-    let record = body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE).then(|| pool.record(ops, fall, name, captures));
+    let record = body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE).then(|| pool.record(ops, cold.unwrap_or(fall), name, captures));
     let mut sites: SmallVec<[(usize, usize, Site); 8]> = SmallVec::new();
     sites.extend(body.holes.iter().map(|&(r, i)| match i {
         crate::window::SITE_HOLE => (r.end, r.field, Site::Record),
@@ -801,6 +803,7 @@ fn jump_targets(res: &Residual) -> SmallVec<[BlockId; 2]> {
     match res {
         Residual::Jump(target) => smallvec::smallvec![*target],
         Residual::Select(targets) => targets.iter().map(|target| target.1).collect(),
+        Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
         _ => SmallVec::new(),
     }
 }
@@ -1358,7 +1361,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot)));
                             }
                             Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => events.push(Event::Read(*idx)),
-                            Residual::Jump(_) | Residual::Select(_) => {
+                            Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. } => {
                                 for target in jump_targets(res) {
                                     events.push(match index.get(&target) {
                                         Some(&i) => Event::Edge(i),
@@ -1473,7 +1476,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         steps.push(Step::Op(&**w, skips[b][off].clone()));
                     }
                     Residual::Guard { .. } | Residual::NumericGuard { .. } if inline_guard(res) => {}
-                    Residual::Jump(_) | Residual::Select(_) => {
+                    Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. } => {
                         let targets = jump_targets(res);
                         for &target in &targets {
                             if (Some(off) == flow && Some(target) == next) || Some(target) == continues {
@@ -1537,6 +1540,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // and doesn't affect correctness; `GUARD; JMP failure; RET;` for example may say that
         // `failure` is the "next block" despite not quite being correct.
         let mut successor = None;
+        // The cold way's label of the optimistic op just copied, and whether its
+        // copy is aligned, for the `Branch` after it. See Note [Optimistic ops] in
+        // `specialize`.
+        let mut cold_edge: Option<(DynamicLabel, bool)> = None;
         let entry = ops.offset();
         let x = self.jctx.memory.get_mut().as_ptr();
         let block = &self.blocks[id.0];
@@ -1700,7 +1707,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             );
         };
         let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_));
-        let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_));
+        let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. });
         for (off, res) in block.instructions.iter().enumerate() {
             debug!("JIT operation {res:?}");
             window_dump!(self.jctx, "  {off:3} {res}");
@@ -2236,6 +2243,31 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp ->exit_jit
                     );
                 },
+                Residual::Branch { hot, cold } => {
+                    match cold_edge.take() {
+                        // The op's cold path continues here, at its copy's stack. See Note
+                        // [Optimistic ops] in `specialize`.
+                        Some((label, aligned)) => {
+                            emit_jump(ops, &alloc, hot, false);
+                            dynasm!(ops ; =>label);
+                            if aligned {
+                                dynasm!(ops ; add rsp, 8);
+                            }
+                            emit_jump(ops, &alloc, cold, false);
+                        },
+                        // An op run by its body on the stack, which selected.
+                        None => {
+                            dynasm!(ops
+                                ; cmp QWORD r12 => RunState.select, 0
+                                ; jnz >cold_way
+                            );
+                            emit_jump(ops, &alloc, hot, false);
+                            dynasm!(ops ; cold_way:);
+                            emit_jump(ops, &alloc, cold, false);
+                        },
+                    }
+                    successor = Some(*hot);
+                },
                 Residual::Select(targets) => {
                     dynasm!(ops
                         ; mov rax, QWORD r12 => RunState.select
@@ -2299,6 +2331,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // A guard's copy that jumps to its pass edge itself. See Note
                     // [Guard stencils] in `window`.
                     let pass = matches!(res, Residual::GuardDynamic(_)).then(|| insts[off + 2]);
+                    // An optimistic op's cold path, which continues at the `Branch`'s
+                    // cold way. See Note [Optimistic ops] in `specialize`.
+                    let cold = (matches!(res, Residual::ExecWindow(_)) && matches!(block.instructions.get(off + 1), Some(Residual::Branch { .. })))
+                        .then(|| ops.new_dynamic_label());
                     let mut passes = false;
                     match emits {
                         Some(emits) => {
@@ -2308,7 +2344,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 match emit {
                                     Emit::Op { skip } => {
                                         let body = stencils.body(&**w, skip).expect("a usable skip");
-                                        passes = splat(ops, &body, w.name(), &w.captures(), pool, pass);
+                                        passes = splat(ops, &body, w.name(), &w.captures(), pool, pass, cold);
+                                        if let (Some(label), true) = (cold, w.cold(skip).is_some()) {
+                                            cold_edge = Some((label, body.aligned));
+                                        }
                                     }
                                     emit => emit_window_move(ops, emit),
                                 }
