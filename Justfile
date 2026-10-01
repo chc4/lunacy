@@ -598,11 +598,11 @@ bench-bars builds='lua5.1,lua5.5,luau,luau --codegen,luajit -joff,luajit,interpr
 # (`release` or `unsafe`) and revision `ref`'s (built as `_build-vs` builds
 # them) on one benchmark, each pinned as `hyperfine` runs it and repeated `runs`
 # times.
-perf-stat-vs ref benchmark times='10' runs='5' profile='unsafe': (_build-vs ref)
+perf-stat-vs ref benchmark times='10' runs='5' profile='unsafe' events='task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses': (_build-vs ref)
     just _luac {{benchmark}}
-    taskset -c {{CPU}} perf stat -r {{runs}} -e task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
+    taskset -c {{CPU}} perf stat -r {{runs}} -e {{events}} \
         target/compare/{{ref}}/target/{{profile}}/bench working/{{benchmark}}.bin {{times}} > /dev/null
-    taskset -c {{CPU}} perf stat -r {{runs}} -e task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
+    taskset -c {{CPU}} perf stat -r {{runs}} -e {{events}} \
         ./target/{{profile}}/bench working/{{benchmark}}.bin {{times}} > /dev/null
 # `perf-stat-vs` over HYPERFINES (tools/perf_stat_vs.py): instructions, branches
 # and cycles of revision `ref`'s build of `profile` and this checkout's on each
@@ -763,20 +763,31 @@ hyperfines-features +sets:
 
 # This checkout's unsafe build on one benchmark with `LUNACY_JIT_PADDING` at
 # each of `paddings` bytes: the same JIT code at other places in its cache
-# lines, to tell a change in the code from a change in where it lands.
-hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16': unsafe-compile
-    just _luac {{benchmark}}
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-padding.md \
-        --export-json working/hyperfine-{{benchmark}}-{{times}}-padding.json \
-        --parameter-list padding {{paddings}} \
-        "LUNACY_JIT_PADDING={padding} ./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
-
-# `hyperfine-padding` over HYPERFINES, then every table.
-hyperfines-padding paddings='0,1,2,4,8,16':
+# lines, to tell a change in the code from a change in where it lands. With
+# `ref`, revision `ref`'s unsafe build too (it must read the variable), each at
+# every padding in the one run.
+hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
     #!/usr/bin/env bash
     set -euo pipefail
-    for run in {{HYPERFINES}}; do just hyperfine-padding ${run%:*} ${run#*:} {{paddings}}; done
-    for run in {{HYPERFINES}}; do echo "${run%:*} ${run#*:}"; tail -n +3 working/hyperfine-${run%:*}-${run#*:}-padding.md; done
+    just unsafe-compile
+    just _luac {{benchmark}}
+    builds=./target/unsafe/bench
+    out=working/hyperfine-{{benchmark}}-{{times}}-padding
+    if [ -n "{{ref}}" ]; then
+        just _compare-worktree {{ref}}
+        (cd target/compare/{{ref}} && just unsafe-compile)
+        builds=target/compare/{{ref}}/target/unsafe/bench,$builds
+        out=$out-vs-{{ref}}
+    fi
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown $out.md --export-json $out.json \
+        --parameter-list padding {{paddings}} --parameter-list build $builds \
+        "LUNACY_JIT_PADDING={padding} {build} working/{{benchmark}}.bin {{times}}"
+
+# `hyperfine-padding` over HYPERFINES.
+hyperfines-padding paddings='0,1,2,4,8,16' ref='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do just hyperfine-padding ${run%:*} ${run#*:} {{paddings}} {{ref}}; done
 
 # `hyperfine-vs ref` over HYPERFINES, then every comparison's table.
 hyperfines-vs ref:
