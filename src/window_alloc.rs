@@ -420,7 +420,7 @@ impl WindowAlloc {
 // Note [Trace allocation]
 // ~~~~~~~~~~~~~~~~~~~~~~~
 // A trace is planned by one backward pass over its steps, destination-driven
-// (docs/trace-register-allocation.md, Allocating a trace). The window is
+// (docs/trace-register-allocation.md). The window is
 // positional: an op reads `w[SKIP..]` and writes above its inputs, so a value
 // is worth a register only where it sits in place for its next use, and a load
 // into that place costs what a move does. Rather than pinning every value some

@@ -1461,7 +1461,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for trace in &traces {
             // A trace with an edge back into itself plans that edge blind:
             // plan it again, continuing into its entry windows from the first
-            // pass. See Loops in docs/trace-register-allocation.md.
+            // pass. See Note [Trace allocation].
             let loops = trace.iter().enumerate().any(|(pos, &b)| {
                 self.blocks[ids[b].0].instructions.iter().flat_map(jump_targets).any(|target| {
                     trace.iter().position(|&t| ids[t] == target).is_some_and(|at| at <= pos)
