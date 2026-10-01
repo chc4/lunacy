@@ -313,8 +313,8 @@ pub enum Policy {
 
 impl Policy {
     /// The policy named by `LUNACY_TRACES` (`single`, `unidirectional` or
-    /// `bidirectional`), unidirectional if unset. (The JIT also takes
-    /// `streaming`, allocating without traces.)
+    /// `bidirectional`), unidirectional if unset. (The JIT allocates without
+    /// traces, streaming, unless it names one.)
     pub fn from_env() -> Policy {
         match std::env::var("LUNACY_TRACES").as_deref() {
             Ok("single") => Policy::SingleBlock,
