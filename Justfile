@@ -761,6 +761,23 @@ hyperfines-features +sets:
     for run in {{HYPERFINES}}; do just hyperfine-features ${run%:*} ${run#*:} {{sets}}; done
     for run in {{HYPERFINES}}; do echo "${run%:*} ${run#*:}"; tail -n +3 working/hyperfine-${run%:*}-${run#*:}-features.md; done
 
+# This checkout's unsafe build on one benchmark with `LUNACY_JIT_PADDING` at
+# each of `paddings` bytes: the same JIT code at other places in its cache
+# lines, to tell a change in the code from a change in where it lands.
+hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16': unsafe-compile
+    just _luac {{benchmark}}
+    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-padding.md \
+        --export-json working/hyperfine-{{benchmark}}-{{times}}-padding.json \
+        --parameter-list padding {{paddings}} \
+        "LUNACY_JIT_PADDING={padding} ./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
+
+# `hyperfine-padding` over HYPERFINES, then every table.
+hyperfines-padding paddings='0,1,2,4,8,16':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do just hyperfine-padding ${run%:*} ${run#*:} {{paddings}}; done
+    for run in {{HYPERFINES}}; do echo "${run%:*} ${run#*:}"; tail -n +3 working/hyperfine-${run%:*}-${run#*:}-padding.md; done
+
 # `hyperfine-vs ref` over HYPERFINES, then every comparison's table.
 hyperfines-vs ref:
     #!/usr/bin/env bash

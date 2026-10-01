@@ -908,7 +908,9 @@ impl JitContext {
             tail_waiting: HashMap::default(),
             frame_ops: Vec::new(),
             stencils: Stencils::default(),
-            used: 0,
+            // `LUNACY_JIT_PADDING` bytes are left unused at the buffer's start,
+            // to time the same code at other places in its cache lines.
+            used: std::env::var("LUNACY_JIT_PADDING").map_or(0, |bytes| bytes.parse().expect("LUNACY_JIT_PADDING: a number of bytes")),
             exit_snapshot: 0,
             perf_map,
             window_dump,
