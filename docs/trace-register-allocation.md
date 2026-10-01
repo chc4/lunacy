@@ -43,8 +43,8 @@ evaluates two and names a third.
   locations of an already allocated successor. It deliberately doesn't try
   harder (furthest-first eviction, delayed spill stores, round-robin registers
   were all tried and dropped for compile time). Its premise, that a value in
-  any register is a free operand, doesn't hold for the window (see The window is
-  positional).
+  any register is a free operand, holds for the window up to a move into the
+  op's position, which is cheap (see Moves are cheap).
 - **Resolution.** Each trace records where its boundary values are; every edge
   between traces gets the parallel moves between the two, and a loop's back
   edge, which is always the end of a trace, is resolved the same way.
@@ -74,6 +74,11 @@ loop has two entries. Liveness has to stay sound for such regions.
 `w[s..s+k]` in declared order and writes its output directly above its inputs,
 so where an op runs decides which registers it touches, and a value serves an
 op only in the register the op reads it from.
+
+**Moves are cheap.** A move between registers is close to free: register
+renaming executes it in the pipeline. What the allocator minimizes is the
+loads and stores on hot paths, so keeping a value in a register and moving it
+into place beats dropping it and loading it at its use.
 
 **Cost.** Planning a trace is linear, or close to it, in the trace's length;
 no part of the approach may be quadratic.

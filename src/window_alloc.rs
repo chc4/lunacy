@@ -1,6 +1,6 @@
 //! Register allocation for window ops in the JIT: which window register caches
-//! which stack slot. Placements are decided bottom-up over a compiled region,
-//! then code is generated top-down. See Note [Register window] and Note [Window
+//! which stack slot. Placements are planned over a compiled region, trace by
+//! trace, then code is generated doing what they say. See Note [Register window] and Note [Window
 //! allocation].
 
 use smallvec::SmallVec;
@@ -14,22 +14,20 @@ use crate::window::{Access, Window, WINDOW};
 // dirty while its stack home is stale. Allocation has two passes over a
 // compiled region, trace by trace (see Note [Trace register allocation]):
 //
-// * Backward, deciding placements, one trace at a time ([`plan_trace`], Note
-//   [Trace allocation]). A `Placement` says which slot's current value the
-//   code wants in each register before a window op, and at a block's start
-//   (its entry window); each op gets its `SKIP`.
+// * Planning placements, one trace at a time ([`plan_trace`], Note [Trace
+//   allocation]). A `Placement` says which slot's current value the code
+//   wants in each register before a window op, and at a block's start (its
+//   entry window); each op gets its `SKIP`.
 //
-// * Forward, generating code, doing exactly what the backward pass decided.
+// * Generating code, doing exactly what planning decided.
 //   Before each window op, the window is reconciled with the placement planned
 //   before it ([`WindowAlloc::reconcile`]): the dirty values it overwrites that
 //   survive nowhere else and that the op doesn't rewrite are stored, then its
 //   wanted registers are filled as one parallel move (see Note [Parallel
 //   moves]). The op then runs at its planned `SKIP` ([`WindowAlloc::op`]).
 //   Registers a placement doesn't care about keep their values. Each op's
-//   `SKIP` and placement, and each block's entry window, are kept from the
-//   backward pass, packed ([`Packed`]). Only `SKIP`s would not do: the forward
-//   pass would drop or store what the plan moves aside, and every edge would
-//   pay to reconcile the difference.
+//   `SKIP` and placement, and each block's entry window, are kept from
+//   planning, packed ([`Packed`]).
 //
 // Any other residual ends a run of window ops and flushes every dirty
 // register, except an inline type guard: it tests the register caching its
@@ -39,15 +37,15 @@ use crate::window::{Access, Window, WINDOW};
 // run ([`WindowAlloc::stores`]).
 //
 // Jumps carry the window across block edges. Each block is entered with a
-// window planned for it (the slots it and its successors read before writing,
-// where they read them), and any jump to it transfers the window to that one
-// ([`WindowAlloc::transfer`]): dirty values the target doesn't carry dirty are
-// stored, then its registers are filled as one parallel move. A block's entry
-// window takes its dirty slots from the first jump to it that is compiled,
-// except a loop header's, which has dirty exactly the slots the loop writes, as
-// its back edge brings them: the back edge doesn't store them every iteration,
-// and the jump into the loop stores the rest once, rather than the body
-// whenever it evicts them.
+// window planned for it (see Note [Trace allocation]), and any jump to it
+// transfers the window to that one ([`WindowAlloc::transfer`]): dirty values
+// the target doesn't carry dirty are stored, then its registers are filled as
+// one parallel move. A block's entry window has dirty the slots planned dirty
+// and those the first jump to it that is compiled brings dirty, except a loop
+// header's, which has dirty exactly the slots the loop writes, as its back edge
+// brings them: the back edge doesn't store them every iteration, and the jump
+// into the loop stores the rest once, rather than the body whenever it drops
+// them.
 // The entry stub, for a block entered from the interpreter, loads its window
 // from the stack.
 
@@ -71,14 +69,6 @@ pub const SCRATCH: usize = WINDOW;
 
 const MEMORY_COST: u32 = 4;
 const MOVE_COST: u32 = 1;
-
-// What planning a trace charges for the code a placement implies (Note [Trace
-// allocation]). A move between registers is renamed away and costs only its
-// bytes; a load of an L1-resident stack slot is cheap out of order; a store
-// is dearest, and one reloaded soon after waits on store forwarding.
-const PLAN_MOVE: u32 = 1;
-const PLAN_LOAD: u32 = 2;
-const PLAN_STORE: u32 = 5;
 
 /// Code the JIT emits for window ops, over [`SCRATCH`] and the window registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +169,9 @@ impl Cache {
     /// the window of the first jump to the block, or planned dirty in `dirty`.
     /// A clean value marked dirty is only stored again, so any slot can be.
     pub fn entry(regs: Placement, from: &Cache, dirty: &Slots) -> Cache {
-        let dirty = regs.iter().flatten().copied().filter(|slot| from.dirty.contains(slot) || dirty.contains(*slot)).collect();
+        let mut dirty: SmallVec<[usize; WINDOW]> = regs.iter().flatten().copied().filter(|slot| from.dirty.contains(slot) || dirty.contains(*slot)).collect();
+        dirty.sort_unstable();
+        dirty.dedup();
         Cache { regs, dirty }
     }
 
@@ -190,6 +182,11 @@ impl Cache {
 
     fn position(&self, slot: usize) -> Option<usize> {
         self.regs.iter().position(|&s| s == Some(slot))
+    }
+
+    /// Each slot it caches, once, in the first register caching it.
+    fn slots(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        (0..WINDOW).filter_map(|reg| self.regs[reg].filter(|&slot| self.position(slot) == Some(reg)).map(|slot| (reg, slot)))
     }
 }
 
@@ -419,483 +416,253 @@ impl WindowAlloc {
 
 // Note [Trace allocation]
 // ~~~~~~~~~~~~~~~~~~~~~~~
-// A trace is planned by one backward pass over its steps, destination-driven
-// (docs/trace-register-allocation.md). The window is
-// positional: an op reads `w[SKIP..]` and writes above its inputs, so a value
-// is worth a register only where it sits in place for its next use, and a load
-// into that place costs what a move does. Rather than pinning every value some
-// later op wants, the pass keeps a request per pending use: in a register (the
-// operand position of a placed op, or any register, moved into place at the
-// use), or dropped to its stack home (loaded at the use).
+// A trace is planned by one forward pass over its steps, running a
+// `WindowAlloc` exactly as code generation will, so the window the plan
+// expects at each step is the one the code has. What it minimizes is the
+// loads and stores on the trace; moves between registers are close to free
+// (docs/trace-register-allocation.md).
 //
-// Walking up, each op is placed at the usable `SKIP` cheapest against the
-// pending requests: a request of another slot in its run is demoted (a move or
-// a load at its use, and a store if its value is dirty), never moved aside and
-// back; an output or input in another register than a request of its slot
-// wants is a move, and so is an input its producer in the trace can't write in
-// place. A forward pre-pass finds where each op's output can be produced: the
-// registers it lands in at the usable `SKIP`s where the fewest of the op's own
-// inputs miss the places their producers can write them. Ties go to demoting
-// the requests used furthest down, then to the lowest `SKIP`: the pre-pass has
-// kept room below it for its producers, and a chain placed low leaves the
-// registers above it to values kept between their uses (an accumulator, a
-// value read by every repetition of an op shape). Its outputs, then its
-// inputs, are the sources of their slots' pending requests: those keep their
-// register from here to their use, or, wanting any register, keep the source's
-// if it is free that long, else are dropped. Its inputs then request their
-// places from the code above.
+// A value is worth its register until its next beneficial event: a read,
+// which keeping it saves a load, or, while it is dirty, an overwrite, which
+// keeping it saves a store. A flush ends every value's worth. Looking ahead
+// from inside a loop sees past the jump back to its header, to the reads
+// after it: the back edge stores a dirty value its header doesn't carry. At each window op the window keeps the op's operands in its run
+// and as many other values as fit outside the run, those with the nearest
+// next events first (Belady); the op runs at the `SKIP` needing the fewest
+// moves. A value not kept stays where it is, unnamed, until something needs
+// its register.
 //
-// A register is free for a value from the current step to its use if no request
-// holds it and nothing occupies it before the use: every run and every kept
-// value between was placed on the way up, so each register records the
-// earliest step occupying it, and checking is constant time. Requests wanting
-// any register are capped at the window's width, dropping the furthest used.
-// Flush points drop every request; at the top of the trace, requests for a
-// register are its entry window and the others are dropped. So they are at a
-// loop header's start, where the code above is then asked for that window:
-// requests from the loop's body end at its header, rather than reaching up to
-// sources above the loop, where the code before it would drop them and the
-// loop would reload them every iteration. (A trace with a loop is planned
-// twice, the latch continuing into the header's window from the first pass.)
-//
-// Exits to blocks outside the trace are the thesis's pseudo-uses, and so is a
-// thunk's exit to the interpreter, which reads the stack, of every slot dirty
-// there. They are the cold edges: moving a value into place for one, or
-// loading it there, costs nothing. But a dirty value that loses its register
-// before the exit is stored on the way, on the hot path, and that store is
-// costed, whichever exit needs the value: an op writing over the register it
-// sits in otherwise evicts it for free, and codegen stores it anyway. Capping
-// drops them before the trace's own requests. The windows wanted before each
-// step are read off the kept intervals afterwards.
+// A block's entry window is the window the trace reaches it with, less the
+// values of no further worth. The trace's head starts from a hint, as the
+// thesis's inter-trace hints: the window an edge from a trace planned earlier
+// leaves into it, or the window of a thunk linked into the region's entry. A
+// loop's header defines the values live into it, as the thesis's
+// pseudo-definitions: its entry window holds the values with the nearest next
+// events among those the trace brings and those live into the header, which
+// are loaded on the way into the loop rather than in it. It has dirty exactly
+// the slots the loop writes, which its back edge brings dirty: a value dirty
+// on the way in otherwise is stored there once, rather than by the loop
+// whenever it drops it.
 
 /// A step of a trace, for [`plan_trace`]: its blocks' residuals, as planning
 /// sees them.
 pub enum Step<'a> {
-    /// A block's start: the window planned here is its entry window.
+    /// A block's start, continuing the trace from the step before it.
     Start,
-    /// The start of a loop's header, the target of a back edge in the trace.
-    /// See Note [Trace allocation].
-    Header,
+    /// The start of a loop's header, which a later `Back` jumps to, with the
+    /// slots live into it.
+    Header(Slots),
     /// A window op, and the `SKIP`s it can run at.
     Op(&'a dyn Window, SmallVec<[usize; WINDOW]>),
+    /// An inline guard testing `slot` in its register, if the window has one.
+    Read(usize),
     /// A residual that flushes the window.
     Flush,
-    /// An edge leaving the trace into a block entered with `window`: the
-    /// trace's continuation if `own`, else a pseudo-use.
-    Exit { window: Placement, own: bool },
-    /// An edge leaving the trace into a block with no window yet, which these
-    /// slots are live into: pseudo-uses that may stay in memory.
-    ExitLive(SmallVec<[usize; 16]>),
-    /// A thunk: an exit to the interpreter, which reads the stack, so the
-    /// slots dirty there are pseudo-uses.
-    Thunk,
+    /// A jump back to the loop header at step `header`.
+    Back(usize),
+    /// An edge leaving the trace into a block that reads `reads` first: the
+    /// trace's own continuation if `hot`, else a side exit (reading none).
+    Exit { hot: bool, reads: Slots },
 }
 
-/// A planned trace: per step, the placement wanted before it (an op's, or a
-/// block's entry window at its `Start`), an op's `SKIP`, and at a loop's
-/// `Header`, the slots its entry window has dirty: those the loop writes,
-/// which its back edge brings dirty, and no others (see Note [Trace
-/// allocation]).
+/// A planned trace. See Note [Trace allocation].
 pub struct TracePlan {
+    /// Per step: at a block's start its entry window, before an op the window
+    /// the op wants.
     pub windows: Vec<Placement>,
     pub skips: Vec<usize>,
+    /// Per block start, the slots its entry window has dirty.
     pub dirty: Vec<Slots>,
-    /// Every request an op demoted, for window dumps.
-    pub demotions: Vec<Demotion>,
+    /// Per `Exit`, the window the trace leaves along it.
+    pub exits: Vec<Option<Cache>>,
 }
 
-/// A request for `slot` in `reg`, used at step `used`, demoted by the op at
-/// `step` placed at `skip` for `cost`; `kept` is the cheapest `SKIP` of that
-/// op that would have kept it, and its cost, if any.
-#[derive(Debug, Clone, Copy)]
-pub struct Demotion {
-    pub step: usize,
-    pub slot: usize,
-    pub reg: usize,
-    pub used: usize,
-    pub skip: usize,
-    pub cost: u32,
-    pub kept: Option<(usize, u32)>,
+/// What lies ahead of each step of a trace, for the worth of keeping a value.
+/// See Note [Trace allocation].
+struct Ahead {
+    /// Per slot, the steps reading (`true`) or writing it, in order.
+    events: Vec<Vec<(usize, bool)>>,
+    flushes: Vec<usize>,
+    /// Each jump back to a loop's header, `(back, header)`, in order.
+    backs: Vec<(usize, usize)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Fate {
-    Pending,
-    /// In `reg` from step `from` (the top of the trace if `None`) to the use.
-    Kept { reg: usize, from: Option<usize> },
-    /// Loaded at the use.
-    Home,
-}
-
-/// A use's request for its slot. See Note [Trace allocation].
-#[derive(Debug)]
-struct Request {
-    slot: usize,
-    /// The step using it.
-    at: usize,
-    /// Whether the trace's own code uses it, rather than a pseudo-use.
-    own: bool,
-    /// The register it wants the value in, or any.
-    wants: Option<usize>,
-    fate: Fate,
-}
-
-struct Planner {
-    width: usize,
-    requests: Vec<Request>,
-    /// The pending request wanting each register.
-    holds: [Option<usize>; WINDOW],
-    /// Pending requests wanting any register.
-    any: SmallVec<[usize; WINDOW]>,
-    /// The earliest step at or below the walk that occupies each register.
-    occupied: [usize; WINDOW],
-}
-
-/// The op at `skip`: its operands and where they are.
-struct Run<'a> {
-    slots: &'a [usize],
-    accesses: &'a [Access],
-    skip: usize,
-}
-
-impl Run<'_> {
-    fn contains(&self, reg: usize) -> bool {
-        (self.skip..self.skip + self.slots.len()).contains(&reg)
-    }
-
-    /// The register the op writes `slot` to, if it writes it.
-    fn writes(&self, slot: usize) -> Option<usize> {
-        self.operands().find(|&(_, s, a)| s == slot && a.writes()).map(|(reg, ..)| reg)
-    }
-
-    /// Whether the op reads `slot` in `reg`.
-    fn reads_at(&self, slot: usize, reg: usize) -> bool {
-        self.contains(reg) && self.slots[reg - self.skip] == slot && self.accesses[reg - self.skip].reads()
-    }
-
-    fn operands(&self) -> impl Iterator<Item = (usize, usize, Access)> + '_ {
-        self.slots.iter().zip(self.accesses).enumerate().map(|(i, (&slot, &access))| (self.skip + i, slot, access))
-    }
-}
-
-impl Planner {
-    fn pending(&self, slot: usize) -> SmallVec<[usize; WINDOW]> {
-        self.holds.iter().flatten().chain(&self.any).copied().filter(|&id| self.requests[id].slot == slot).collect()
-    }
-
-    /// Whether `reg` can keep a value until step `until`, once the op `run`
-    /// is placed (its run's requests are demoted or its own).
-    fn free(&self, reg: usize, until: usize, run: &Run) -> bool {
-        self.occupied[reg] >= until && (self.holds[reg].is_none() || run.contains(reg))
-    }
-
-    fn keep(&mut self, id: usize, reg: usize, from: Option<usize>) {
-        self.requests[id].fate = Fate::Kept { reg, from };
-        if let Some(from) = from {
-            self.occupied[reg] = self.occupied[reg].min(from);
-        }
-    }
-
-    fn request(&mut self, slot: usize, at: usize, own: bool, wants: Option<usize>) {
-        let id = self.requests.len();
-        self.requests.push(Request { slot, at, own, wants, fate: Fate::Pending });
-        match wants {
-            Some(reg) => self.holds[reg] = Some(id),
-            None => self.any.push(id),
-        }
-    }
-
-    /// The cost of the op `run` against the pending requests, and the nearest
-    /// use among the requests it demotes. `dirty` has the slots written in the
-    /// trace since the last flush.
-    fn cost(&self, run: &Run, dirty: &Slots) -> (u32, usize) {
-        let weight = |id: usize| u32::from(self.requests[id].own);
-        // A demoted value is reloaded at its use (a pseudo-use's, on its cold
-        // edge, is free), and stored first if dirty, on the hot path.
-        let dropped = |id: usize| {
-            let q = &self.requests[id];
-            weight(id) * PLAN_LOAD + if dirty.contains(q.slot) { PLAN_STORE } else { 0 }
-        };
-        let mut cost = 0;
-        let mut nearest = usize::MAX;
-        for reg in run.skip..run.skip + run.slots.len() {
-            let Some(id) = self.holds[reg] else { continue };
-            let q = &self.requests[id];
-            match run.writes(q.slot) {
-                Some(out) if out != reg => cost += weight(id) * PLAN_MOVE,
-                Some(_) => {}
-                None if run.reads_at(q.slot, reg) => {}
-                None => {
-                    cost += dropped(id);
-                    if q.own {
-                        nearest = nearest.min(q.at);
+impl Ahead {
+    fn new(steps: &[Step]) -> Ahead {
+        let mut ahead = Ahead { events: vec![Vec::new(); 256], flushes: Vec::new(), backs: Vec::new() };
+        for (step, s) in steps.iter().enumerate() {
+            match s {
+                Step::Op(op, _) => {
+                    for (&slot, &access) in op.operands().iter().zip(op.accesses()) {
+                        if access.reads() {
+                            ahead.events[slot].push((step, true));
+                        }
+                        if access.writes() {
+                            ahead.events[slot].push((step, false));
+                        }
                     }
                 }
+                Step::Read(slot) => ahead.events[*slot].push((step, true)),
+                Step::Exit { reads, .. } => reads.iter().for_each(|slot| ahead.events[slot].push((step, true))),
+                Step::Flush => ahead.flushes.push(step),
+                Step::Back(header) => ahead.backs.push((step, *header)),
+                Step::Start | Step::Header(_) => {}
             }
         }
-        for (reg, slot, access) in run.operands() {
-            for id in self.pending(slot) {
-                let q = &self.requests[id];
-                // A later use of a slot the op writes wants its new value.
-                match (access.writes(), q.wants) {
-                    (true, Some(r)) if !run.contains(r) => cost += weight(id) * PLAN_MOVE,
-                    // Kept in its register until the use, a move there; else
-                    // the new value is stored, on the hot path, and reloaded.
-                    (true, None) => {
-                        cost += if self.free(reg, q.at, run) { weight(id) * PLAN_MOVE } else { PLAN_STORE + weight(id) * PLAN_LOAD }
-                    }
-                    (false, Some(r)) if !run.contains(r) && r != reg => cost += weight(id) * PLAN_MOVE,
-                    _ => {}
-                }
-            }
-        }
-        (cost, nearest)
+        ahead
     }
 
-    /// Place the op `run` at step `step`.
-    fn place(&mut self, step: usize, run: &Run) {
-        // Requests the run overwrites are demoted.
-        for reg in run.skip..run.skip + run.slots.len() {
-            if let Some(id) = self.holds[reg] {
-                let slot = self.requests[id].slot;
-                if run.writes(slot).is_none() && !run.reads_at(slot, reg) {
-                    self.holds[reg] = None;
-                    self.requests[id].wants = None;
-                    self.any.push(id);
-                }
-            }
-        }
-        // Outputs, then inputs, are their slots' sources. Requests for any
-        // register need a free one, so go before those holding theirs.
-        let outputs = run.operands().filter(|&(.., a)| a.writes());
-        let inputs = run.operands().filter(|&(.., a)| a == Access::Read);
-        for (reg, slot, _) in outputs.chain(inputs) {
-            for id in self.pending(slot) {
-                if self.requests[id].wants.is_none() {
-                    self.any.retain(|&mut a| a != id);
-                    if self.free(reg, self.requests[id].at, run) {
-                        self.keep(id, reg, Some(step));
-                    } else {
-                        self.requests[id].fate = Fate::Home;
-                    }
-                }
-            }
-            for id in self.pending(slot) {
-                if let Some(r) = self.requests[id].wants {
-                    self.holds[r] = None;
-                    self.keep(id, r, Some(step));
-                }
-            }
-        }
-        for reg in run.skip..run.skip + run.slots.len() {
-            self.occupied[reg] = self.occupied[reg].min(step);
-        }
-        for (reg, slot, access) in run.operands() {
-            if access.reads() {
-                self.request(slot, step, true, Some(reg));
-            }
-        }
+    /// The first event of `slot` in `from..to`, unless a flush comes first.
+    fn first(&self, slot: usize, from: usize, to: usize) -> Option<(usize, bool)> {
+        let events = &self.events[slot];
+        let event = events.get(events.partition_point(|e| e.0 < from)).copied().filter(|e| e.0 < to)?;
+        let flush = self.flushes.get(self.flushes.partition_point(|&f| f < from)).copied();
+        flush.is_none_or(|flush| flush > event.0).then_some(event)
     }
 
-    /// Drop the requests for any register used furthest down, beyond what the
-    /// window can hold.
-    fn cap(&mut self) {
-        while self.holds.iter().flatten().count() + self.any.len() > self.width {
-            let (i, &id) = self
-                .any
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, &id)| (!self.requests[id].own, self.requests[id].at))
-                .expect("a request for any register");
-            self.any.remove(i);
-            self.requests[id].fate = Fate::Home;
-        }
-    }
-
-    /// At a loop header's start `step`: the requests for a register are its
-    /// entry window, which the code above is asked for in turn, as it would
-    /// be for a jump into it; the others are dropped.
-    fn anchor(&mut self, step: usize) {
-        for reg in 0..WINDOW {
-            if let Some(id) = self.holds[reg].take() {
-                self.keep(id, reg, step.checked_sub(1));
-                let Request { slot, own, .. } = self.requests[id];
-                self.request(slot, step, own, Some(reg));
+    /// How far after step `at` keeping `slot` in a register next pays off,
+    /// `dirty` or not, if it does.
+    fn worth(&self, slot: usize, at: usize, dirty: bool) -> Option<usize> {
+        let pays = |(step, read): (usize, bool)| (read || dirty).then_some(step - at);
+        // The innermost loop around `at`, whose back edge comes first.
+        let back = self.backs.iter().find(|&&(back, header)| header <= at && at < back);
+        let Some(&(back, header)) = back else { return self.first(slot, at + 1, usize::MAX).and_then(pays) };
+        match self.first(slot, at + 1, back + 1) {
+            Some(event) => pays(event),
+            None => {
+                let flushed = self.flushes.iter().any(|&f| at < f && f < back);
+                // Around the loop only a read pays: the back edge stores a
+                // dirty value its header doesn't carry.
+                let around = self.first(slot, header, back).filter(|&(_, read)| read && !flushed).map(|(step, _)| back - at + step - header);
+                let on = self.first(slot, back + 1, usize::MAX).and_then(pays);
+                around.into_iter().chain(on).min()
             }
-        }
-        for id in self.any.drain(..) {
-            self.requests[id].fate = Fate::Home;
-        }
-    }
-
-    fn drop_pending(&mut self) {
-        for id in self.holds.iter_mut().filter_map(Option::take).chain(self.any.drain(..)) {
-            self.requests[id].fate = Fate::Home;
         }
     }
 }
 
-/// Plan a trace's window ops, walking its `steps` backward, in a window of
-/// `width` registers. See Note [Trace allocation].
-pub fn plan_trace(steps: &[Step], width: usize) -> TracePlan {
+/// Plan a trace's window ops in a window of `width` registers, its head
+/// entered from `hint`. See Note [Trace allocation].
+pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
     assert!(width <= WINDOW);
-    // The slots each step finds written in the trace since the last flush, and
-    // where each op's inputs can be produced in place: the registers their
-    // producer in the trace writes them to at the `SKIP`s where its own
-    // inputs' producers can (or most can) write those in place in turn, as a
-    // mask; any register for an input with no producer in the trace.
-    let mut dirty = Vec::with_capacity(steps.len());
-    let mut in_place: Vec<SmallVec<[u16; 5]>> = Vec::with_capacity(steps.len());
-    let mut written = Slots::default();
-    // Per slot written since the last flush, the registers its writer can put it in.
-    let mut writer: SmallVec<[(usize, u16); 16]> = SmallVec::new();
-    // Per loop header, the slots written since it and since the last flush:
-    // those its back edge can bring dirty.
-    let mut looped: SmallVec<[(usize, Slots); 2]> = SmallVec::new();
+    let ahead = Ahead::new(steps);
+    // Per loop header, the slots the loop writes.
+    let mut looped = vec![Slots::default(); steps.len()];
+    for &(back, header) in &ahead.backs {
+        for s in &steps[header..back] {
+            if let Step::Op(op, _) = s {
+                op.operands().iter().zip(op.accesses()).filter(|(_, a)| a.writes()).for_each(|(&slot, _)| looped[header].insert(slot));
+            }
+        }
+    }
+    let mut plan = TracePlan {
+        windows: vec![[None; WINDOW]; steps.len()],
+        skips: vec![0; steps.len()],
+        dirty: vec![Slots::default(); steps.len()],
+        exits: vec![None; steps.len()],
+    };
+    let mut alloc = WindowAlloc { width, cache: hint.clone() };
     for (step, s) in steps.iter().enumerate() {
-        dirty.push(written);
-        let mut inputs: SmallVec<[u16; 5]> = SmallVec::new();
         match s {
+            Step::Start | Step::Header(_) => {
+                let now = alloc.cache();
+                let worth = |slot: usize| ahead.worth(slot, step, now.dirty.contains(&slot));
+                let mut regs = [None; WINDOW];
+                let mut dirty = Slots::default();
+                if let Step::Header(live) = s {
+                    // The values worth most, those the trace brings in place.
+                    let brought = now.slots().map(|(_, slot)| slot);
+                    let fresh = live.iter().filter(|&slot| now.position(slot).is_none());
+                    let mut values: SmallVec<[(usize, usize); 16]> = brought.chain(fresh).filter_map(|slot| Some((worth(slot)?, slot))).collect();
+                    values.sort_unstable();
+                    values.truncate(width);
+                    for &(_, slot) in &values {
+                        if let Some(reg) = now.position(slot) {
+                            regs[reg] = Some(slot);
+                        }
+                    }
+                    for &(_, slot) in &values {
+                        if now.position(slot).is_none() {
+                            let reg = (0..width).find(|&reg| regs[reg].is_none()).expect("a free register");
+                            regs[reg] = Some(slot);
+                        }
+                    }
+                    regs.iter().flatten().filter(|&&slot| looped[step].contains(slot)).for_each(|&slot| dirty.insert(slot));
+                } else {
+                    for (reg, slot) in now.slots() {
+                        if worth(slot).is_some() {
+                            regs[reg] = Some(slot);
+                            if now.dirty.contains(&slot) {
+                                dirty.insert(slot);
+                            }
+                        }
+                    }
+                }
+                let entry = Cache { regs, dirty: dirty.iter().collect() };
+                alloc = WindowAlloc { width, cache: entry };
+                plan.windows[step] = regs;
+                plan.dirty[step] = dirty;
+            }
             Step::Op(op, usable) => {
-                let operands = op.operands().iter().zip(op.accesses()).enumerate();
-                for (_, (&slot, _)) in operands.clone().filter(|(_, (_, a))| a.reads()) {
-                    inputs.push(writer.iter().find(|w| w.0 == slot).map_or(u16::MAX, |w| w.1));
-                }
-                let reads = |skip: usize| (skip..).zip(op.accesses()).filter(|(_, a)| a.reads()).map(|(reg, _)| reg);
-                let misses = |skip: usize| reads(skip).zip(&inputs).filter(|&(reg, mask)| mask & 1 << reg == 0).count();
-                let fits = usable.iter().copied().filter(|&skip| skip + op.operands().len() <= width);
-                let fewest = fits.clone().map(misses).min().unwrap_or(0);
-                let good = fits.filter(|&skip| misses(skip) == fewest).fold(0u16, |mask, skip| mask | 1 << skip);
-                for (index, (&slot, _)) in operands.filter(|(_, (_, a))| a.writes()) {
-                    written.insert(slot);
-                    looped.iter_mut().for_each(|(_, slots)| slots.insert(slot));
-                    writer.retain(|w| w.0 != slot);
-                    writer.push((slot, good << index));
-                }
+                let (want, skip) = place(&alloc, &ahead, step, *op, usable);
+                alloc.reconcile(&want, *op);
+                alloc.op(*op, [skip]).expect("a placed op runs at its SKIP");
+                plan.windows[step] = want;
+                plan.skips[step] = skip;
             }
             Step::Flush => {
-                written = Slots::default();
-                writer.clear();
-                looped.iter_mut().for_each(|(_, slots)| *slots = Slots::default());
+                alloc.flush();
             }
-            Step::Header => looped.push((step, Slots::default())),
-            _ => {}
-        }
-        in_place.push(inputs);
-    }
-    let mut planner = Planner { width, requests: Vec::new(), holds: [None; WINDOW], any: SmallVec::new(), occupied: [usize::MAX; WINDOW] };
-    let mut skips = vec![0; steps.len()];
-    let mut demotions = Vec::new();
-    for (step, s) in steps.iter().enumerate().rev() {
-        match s {
-            Step::Start => {}
-            Step::Header => planner.anchor(step),
-            Step::Op(op, usable) => {
-                let (slots, accesses) = (op.operands(), op.accesses());
-                let costed: SmallVec<[(usize, u32, usize); WINDOW]> = usable
-                    .iter()
-                    .copied()
-                    .filter(|&skip| skip + slots.len() <= width)
-                    .map(|skip| {
-                        let (mut cost, nearest) = planner.cost(&Run { slots, accesses, skip }, &dirty[step]);
-                        // An input its producer can't write in place is a move.
-                        let inputs = (skip..).zip(accesses).filter(|(_, a)| a.reads()).map(|(reg, _)| reg);
-                        for (reg, mask) in inputs.zip(&in_place[step]) {
-                            cost += u32::from(mask & 1 << reg == 0) * PLAN_MOVE;
-                        }
-                        (skip, cost, nearest)
-                    })
-                    .collect();
-                let &(skip, cost, _) =
-                    costed.iter().min_by_key(|&&(skip, cost, nearest)| (cost, std::cmp::Reverse(nearest), skip)).expect("a usable SKIP");
-                let run = Run { slots, accesses, skip };
-                for reg in skip..skip + slots.len() {
-                    let Some(id) = planner.holds[reg] else { continue };
-                    let q = &planner.requests[id];
-                    if run.writes(q.slot).is_none() && !run.reads_at(q.slot, reg) {
-                        let keeps = |other: usize| {
-                            let run = Run { slots, accesses, skip: other };
-                            !run.contains(reg) || run.writes(q.slot).is_some() || run.reads_at(q.slot, reg)
-                        };
-                        let kept = costed.iter().filter(|&&(other, ..)| keeps(other)).min_by_key(|&&(_, cost, _)| cost).map(|&(other, cost, _)| (other, cost));
-                        demotions.push(Demotion { step, slot: q.slot, reg, used: q.at, skip, cost, kept });
-                    }
-                }
-                planner.place(step, &run);
-                skips[step] = skip;
-            }
-            Step::Flush => planner.drop_pending(),
-            Step::Exit { window, own } => {
-                for (reg, slot) in window.iter().enumerate().take(width) {
-                    if let Some(slot) = *slot {
-                        if planner.holds[reg].is_none() {
-                            planner.request(slot, step, *own, Some(reg));
-                        }
-                    }
-                }
-            }
-            Step::ExitLive(slots) => {
-                for &slot in slots {
-                    if planner.pending(slot).is_empty() {
-                        planner.request(slot, step, false, None);
-                    }
-                }
-            }
-            Step::Thunk => {
-                for slot in dirty[step].iter() {
-                    if planner.pending(slot).is_empty() {
-                        planner.request(slot, step, false, None);
-                    }
-                }
-            }
-        }
-        planner.cap();
-    }
-    // At the top, requests for a register are the entry window.
-    for reg in 0..WINDOW {
-        if let Some(id) = planner.holds[reg].take() {
-            planner.keep(id, reg, None);
+            Step::Exit { .. } => plan.exits[step] = Some(alloc.cache().clone()),
+            Step::Read(_) | Step::Back(_) => {}
         }
     }
-    planner.drop_pending();
+    plan
+}
 
-    let mut windows = vec![[None; WINDOW]; steps.len()];
-    fn want(windows: &mut [Placement], step: usize, reg: usize, slot: usize) {
-        let entry = &mut windows[step][reg];
-        assert!(entry.is_none_or(|s| s == slot), "register {reg} wanted for slots {entry:?} and {slot} before step {step}");
-        *entry = Some(slot);
+/// Where the op at `step` runs, and the window it wants: its inputs in its
+/// run, and the values worth most of the others, as many as fit outside it.
+/// See Note [Trace allocation].
+fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &dyn Window, usable: &[usize]) -> (Placement, usize) {
+    let (slots, accesses) = (op.operands(), op.accesses());
+    let now = alloc.cache();
+    let width = alloc.width;
+    let mut kept: SmallVec<[(usize, usize); WINDOW]> = now
+        .slots()
+        .filter(|(_, slot)| !slots.contains(slot))
+        .filter_map(|(_, slot)| Some((ahead.worth(slot, step, now.dirty.contains(&slot))?, slot)))
+        .collect();
+    kept.sort_unstable();
+    kept.truncate(width - slots.len());
+    // A kept value stays in a register outside the run caching it, if any.
+    let outside = |slot: usize, run: &std::ops::Range<usize>| (0..width).find(|reg| !run.contains(reg) && now.regs[*reg] == Some(slot));
+    let inputs = |skip: usize| (skip..).zip(slots.iter().zip(accesses)).filter(|(_, (_, a))| a.reads()).map(|(reg, (&slot, _))| (reg, slot));
+    let moves = |skip: usize| {
+        let run = skip..skip + slots.len();
+        let misplaced = inputs(skip).filter(|&(reg, slot)| now.regs[reg] != Some(slot) && now.position(slot).is_some()).count();
+        misplaced + kept.iter().filter(|&&(_, slot)| outside(slot, &run).is_none()).count()
+    };
+    let skip = usable.iter().copied().filter(|&skip| skip + slots.len() <= width).min_by_key(|&skip| (moves(skip), skip)).expect("a usable SKIP");
+    let run = skip..skip + slots.len();
+    let mut want = [None; WINDOW];
+    for (reg, slot) in inputs(skip) {
+        want[reg] = Some(slot);
     }
-    for q in &planner.requests {
-        match q.fate {
-            Fate::Kept { reg, from } => {
-                for step in from.map_or(0, |from| from + 1)..q.at {
-                    want(&mut windows, step, reg, q.slot);
-                }
-            }
-            Fate::Home => {}
-            Fate::Pending => unreachable!("a request left pending"),
+    for &(_, slot) in &kept {
+        if let Some(reg) = outside(slot, &run) {
+            want[reg] = Some(slot);
         }
     }
-    for (step, s) in steps.iter().enumerate() {
-        if let Step::Op(op, _) = s {
-            let run = Run { slots: op.operands(), accesses: op.accesses(), skip: skips[step] };
-            for (reg, slot, access) in run.operands() {
-                if access.reads() {
-                    want(&mut windows, step, reg, slot);
-                }
-            }
-        }
+    // A kept value only in the run moves out, to an empty register if there
+    // is one, else over a clean value, else over a dirty one, which is stored.
+    for &(_, slot) in kept.iter().filter(|&&(_, slot)| outside(slot, &run).is_none()) {
+        let reg = (0..width)
+            .filter(|&reg| !run.contains(&reg) && want[reg].is_none())
+            .min_by_key(|&reg| (now.regs[reg].map(|s| 1 + usize::from(now.dirty.contains(&s))), reg))
+            .expect("room outside the run");
+        want[reg] = Some(slot);
     }
-    // A loop header's entry window has the slots the loop writes dirty, as its
-    // back edge brings them, and no others: whichever jump into it is compiled
-    // first, or the entry stub, would otherwise fix them, and every iteration
-    // would store the loop's writes, or its invariants whenever the body
-    // evicts them.
-    let mut dirty = vec![Slots::default(); steps.len()];
-    for (step, slots) in looped {
-        windows[step].iter().flatten().filter(|&&slot| slots.contains(slot)).for_each(|&slot| dirty[step].insert(slot));
-    }
-    TracePlan { windows, skips, dirty, demotions }
+    (want, skip)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1059,11 +826,11 @@ mod tests {
 
     /// Plan a run as a trace of one block, then execute it as planned in a
     /// window of `width` registers.
-    fn run_backward(width: usize, ops: &[TestOp]) {
+    fn run_planned(width: usize, ops: &[TestOp]) {
         let windows = windows(ops);
         let steps: Vec<Step> =
             std::iter::once(Step::Start).chain(windows.iter().map(|w| Step::Op(&**w, (0..WINDOW).collect()))).collect();
-        let plan = plan_trace(&steps, width);
+        let plan = plan_trace(&steps, width, &Cache::default());
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
         for (i, w) in windows.iter().enumerate() {
@@ -1114,7 +881,7 @@ mod tests {
     /// between them, over up to four slots (up to renaming, which the allocator
     /// is indifferent to), is allocated correctly in 4 registers (or as many as
     /// its widest op), so that the runs overwrite dirty values, both streaming
-    /// and bottom-up.
+    /// and planned.
     #[test]
     fn exhaustive_small_runs() {
         let arity = |op: &TestOp| match op {
@@ -1155,7 +922,7 @@ mod tests {
                     .collect();
                 let width = ops.iter().map(arity).max().unwrap().max(4);
                 run(width, &ops);
-                run_backward(width, &ops);
+                run_planned(width, &ops);
             }
         }
     }
@@ -1172,12 +939,12 @@ mod tests {
         }
     }
 
-    /// Random traces of ops over up to six slots, with block and loop starts,
-    /// flushes and exits, in windows of 5 to 8 registers, run as the JIT runs
-    /// a planned trace: each op reconciled to its planned window, each block
-    /// entered through a transfer into its entry window, each exit's transfer
-    /// into its target's window checked. Every op reads current values, every
-    /// exit delivers its window, and the stack ends current.
+    /// Random traces of ops over up to six slots, with block starts, loops,
+    /// flushes, inline guards and exits, in windows of 5 to 8 registers, run as
+    /// the JIT runs a planned trace: each op reconciled to its planned window,
+    /// each block entered through a transfer into its entry window, each back
+    /// edge's transfer into its header's checked, and each exit's stores. Every
+    /// op reads current values and the stack ends current.
     #[test]
     fn random_traces() {
         let mut rng = Rng(0x2545f4914f6cdd1d);
@@ -1185,65 +952,78 @@ mod tests {
             let width = 5 + rng.below(5);
             let mut ops = Vec::new();
             let mut kinds = Vec::new();
+            let mut headers = Vec::new();
             for _ in 0..1 + rng.below(24) {
-                let k = rng.below(12);
-                let header = rng.below(2) == 0;
+                let step = kinds.len() + 1;
+                let k = rng.below(14);
                 let mut slot = || rng.below(6);
                 match k {
-                    0 if header => kinds.push(5),
-                    0 => kinds.push(1),
-                    1 => kinds.push(2),
-                    2 => kinds.push(3),
-                    3 if header => kinds.push(6),
-                    3 => kinds.push(4),
+                    0 => kinds.push((1, 0)),
+                    1 => kinds.push((2, 0)),
+                    2 => kinds.push((3, 0)),
+                    3 => kinds.push((4, slot())),
+                    4 => {
+                        headers.push(step);
+                        kinds.push((5, 0));
+                    }
+                    5 if !headers.is_empty() => kinds.push((6, headers[slot() % headers.len()])),
                     k => {
                         ops.push(match k {
-                            4..=6 => B(slot(), slot(), slot()),
-                            7 => TestOp::BinFirst(slot(), slot(), slot()),
-                            8 => G(slot(), slot()),
-                            9 => S(slot(), slot()),
-                            10 => U(slot()),
+                            5..=8 => B(slot(), slot(), slot()),
+                            9 => TestOp::BinFirst(slot(), slot(), slot()),
+                            10 => G(slot(), slot()),
+                            11 => S(slot(), slot()),
+                            12 => U(slot()),
                             _ => L(slot(), slot(), slot(), slot()),
                         });
-                        kinds.push(0);
+                        kinds.push((0, 0));
                     }
                 }
             }
             let windows = windows(&ops);
             let mut next_op = windows.iter();
+            let some_slots = |rng: &mut Rng| {
+                let mut slots = Slots::default();
+                (0..rng.below(4)).for_each(|_| slots.insert(rng.below(6)));
+                slots
+            };
             let steps: Vec<Step> = std::iter::once(Step::Start)
-                .chain(kinds.iter().map(|kind| match kind {
+                .chain(kinds.iter().map(|&(kind, arg)| match kind {
                     0 => Step::Op(&**next_op.next().unwrap(), (0..WINDOW).collect()),
                     1 => Step::Start,
-                    5 => Step::Header,
-                    6 => Step::Thunk,
                     2 => Step::Flush,
                     3 => {
-                        let mut window = [None; WINDOW];
-                        for reg in window.iter_mut().take(width) {
-                            *reg = if rng.below(2) == 1 { Some(rng.below(6)) } else { None };
-                        }
-                        // A register per slot, as in any window.
-                        for reg in 0..WINDOW {
-                            if window[..reg].contains(&window[reg]) {
-                                window[reg] = None;
-                            }
-                        }
-                        Step::Exit { window, own: rng.below(2) == 0 }
+                        let hot = rng.below(2) == 0;
+                        Step::Exit { hot, reads: if hot { some_slots(&mut rng) } else { Slots::default() } }
                     }
-                    _ => Step::ExitLive((0..rng.below(4)).map(|_| rng.below(6)).collect()),
+                    4 => Step::Read(arg),
+                    5 => Step::Header(some_slots(&mut rng)),
+                    _ => Step::Back(arg),
                 }))
                 .collect();
-            let plan = plan_trace(&steps, width);
-            let mut alloc = WindowAlloc::with_width(width);
+            let mut hint = Cache::default();
+            for reg in 0..rng.below(width) {
+                let slot = rng.below(6);
+                if hint.position(slot).is_none() {
+                    hint.regs[reg] = Some(slot);
+                }
+            }
+            let plan = plan_trace(&steps, width, &hint);
             let mut machine = Machine::default();
+            for (reg, slot) in hint.regs.iter().enumerate() {
+                machine.regs[reg] = slot.map(|slot| (slot, 0));
+            }
+            let mut alloc = WindowAlloc { width, cache: hint };
+            let mut entries = HashMap::new();
             for (step, s) in steps.iter().enumerate() {
                 match s {
-                    Step::Start | Step::Header => {
-                        let entry = Cache::entry(plan.windows[step], alloc.cache(), &plan.dirty[step]);
+                    Step::Start | Step::Header(_) => {
+                        let from = if matches!(s, Step::Header(_)) { Cache::default() } else { alloc.cache().clone() };
+                        let entry = Cache::entry(plan.windows[step], &from, &plan.dirty[step]);
                         for emit in alloc.transfer(&entry) {
                             machine.exec(emit, None);
                         }
+                        entries.insert(step, entry.clone());
                         alloc = WindowAlloc { width, cache: entry };
                     }
                     Step::Op(op, _) => {
@@ -1259,28 +1039,32 @@ mod tests {
                             machine.exec(emit, None);
                         }
                     }
-                    Step::Exit { window, .. } => {
+                    Step::Back(header) => {
+                        let entry = &entries[header];
                         let mut taken = Machine { memory: machine.memory.clone(), current: machine.current.clone(), regs: machine.regs };
-                        for emit in alloc.transfer(&Cache::entry(*window, alloc.cache(), &Slots::default())) {
+                        for emit in alloc.transfer(entry) {
                             taken.exec(emit, None);
                         }
-                        for (reg, slot) in window.iter().enumerate() {
+                        for (reg, slot) in entry.regs.iter().enumerate() {
                             if let Some(slot) = *slot {
                                 let current = Machine::version(&taken.current, slot);
-                                assert_eq!(taken.regs[reg], Some((slot, current)), "exit at step {step} of {ops:?}");
+                                assert_eq!(taken.regs[reg], Some((slot, current)), "back edge at step {step} of {ops:?}");
                             }
                         }
+                        for (&slot, &version) in taken.current.iter().filter(|(slot, _)| !entry.dirty.contains(slot)) {
+                            assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the back edge at step {step} of {ops:?}");
+                        }
                     }
-                    Step::ExitLive(_) => {}
-                    Step::Thunk => {
+                    Step::Exit { .. } => {
                         let mut taken = Machine { memory: machine.memory.clone(), current: machine.current.clone(), regs: machine.regs };
                         for emit in alloc.stores() {
                             taken.exec(emit, None);
                         }
                         for (&slot, &version) in &taken.current {
-                            assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the thunk at step {step} of {ops:?}");
+                            assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the exit at step {step} of {ops:?}");
                         }
                     }
+                    Step::Read(_) => {}
                 }
             }
             finish(alloc, machine, &ops);
