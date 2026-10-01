@@ -765,13 +765,16 @@ hyperfines-features +sets:
 # each of `paddings` bytes: the same JIT code at other places in its cache
 # lines, to tell a change in the code from a change in where it lands. With
 # `ref`, revision `ref`'s unsafe build too (it must read the variable), each at
-# every padding in the one run.
+# every padding in the one run. Into the benchmark history as the build
+# `unsafe padded`: every padding's runs pooled, and each padding's kept
+# (tools/bench_history.py).
 hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
     #!/usr/bin/env bash
     set -euo pipefail
     just unsafe-compile
     just _luac {{benchmark}}
     builds=./target/unsafe/bench
+    ref="{{ref}}"
     out=working/hyperfine-{{benchmark}}-{{times}}-padding
     if [ -n "{{ref}}" ]; then
         just _compare-worktree {{ref}}
@@ -782,6 +785,7 @@ hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
     taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown $out.md --export-json $out.json \
         --parameter-list padding {{paddings}} --parameter-list build $builds \
         "LUNACY_JIT_PADDING={padding} {build} working/{{benchmark}}.bin {{times}}"
+    python3 tools/bench_history.py record $out.json --benchmark {{benchmark}} --arg {{times}} ${ref:+--ref $ref}
 
 # `hyperfine-padding` over HYPERFINES.
 hyperfines-padding paddings='0,1,2,4,8,16' ref='':

@@ -6,7 +6,11 @@
 build the command ran (named by the command's hyperfine name: `release`,
 `unsafe`, `interpreter`, `lua5.1`, ...; a `ref ` prefix is revision `--ref`'s)
 and the commit it was built from, or, for this checkout with uncommitted
-changes to what builds it, its HEAD marked dirty.
+changes to what builds it, its HEAD marked dirty. A run over a `padding`
+parameter (`just hyperfine-padding`: the build at each `LUNACY_JIT_PADDING`) is
+one line per build, named `<build> padded`: its times are every padding's,
+pooled, so its box and whiskers span where the JIT's code lands, and
+`paddings` keeps each padding's own.
 
 `report` prints, per benchmark and build, the latest commit's time, the
 current dirty one's, the best and the first recorded, flagging a time worse
@@ -28,6 +32,7 @@ import html
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 from collections import defaultdict
@@ -42,12 +47,12 @@ PAGE = 'working/history.html'
 # dirty.
 BUILD_PATHS = ['src', 'Cargo.toml', 'Cargo.lock', 'build.rs']
 # Builds of this project, in the order reports list them.
-BUILDS = ['unsafe', 'release', 'interpreter']
+BUILDS = ['unsafe', 'unsafe padded', 'release', 'interpreter']
 # The builds a chart is scaled to and draws across commits; the rest (the
 # interpreter, other Luas), an order of magnitude apart, as reference lines of
 # their latest times where they fit.
-CHARTED = ['unsafe', 'release']
-COLORS = {'unsafe': '#d62728', 'release': '#1f77b4', 'interpreter': '#7f7f7f',
+CHARTED = ['unsafe', 'unsafe padded', 'release']
+COLORS = {'unsafe': '#d62728', 'unsafe padded': '#ff9896', 'release': '#1f77b4', 'interpreter': '#7f7f7f',
           'lua5.1': '#2ca02c', 'lua5.5': '#17becf', 'luau': '#bcbd22', 'luau --codegen': '#e377c2', 'luajit -joff': '#9467bd', 'luajit': '#8c564b'}
 
 
@@ -85,11 +90,23 @@ def record(args):
     results = json.load(open(args.json))['results']
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
     lines = []
+    # (commit, dirty, build) -> padding -> its times, of a run over paddings.
+    padded = defaultdict(dict)
     for r in results:
         name = r['command']
         failed = [code for code in r.get('exit_codes', []) if code != 0]
         if failed:
             print(f'skipped {args.benchmark} {args.arg} {name}: exit code {failed[0]}', file=sys.stderr)
+            continue
+        if 'padding' in r.get('parameters', {}):
+            # The build is the binary's directory; revision `--ref`'s is under
+            # target/compare.
+            exe = r['parameters'].get('build', './target/unsafe/bench')
+            of_ref = exe.startswith('target/compare/')
+            if of_ref and ref is None:
+                sys.exit(f'{name}: a ref command, but no --ref')
+            at = (ref, False) if of_ref else (head, dirty)
+            padded[(*at, os.path.basename(os.path.dirname(exe)) + ' padded')][r['parameters']['padding']] = r['times']
             continue
         if name.startswith('ref '):
             if ref is None:
@@ -103,6 +120,14 @@ def record(args):
             'benchmark': args.benchmark, 'arg': args.arg, 'build': build,
             'mean': r['mean'], 'stddev': r['stddev'], 'median': r['median'],
             'min': r['min'], 'max': r['max'], 'runs': len(times), 'times': times,
+        })
+    for (commit, is_dirty, build), paddings in padded.items():
+        times = [t for runs in paddings.values() for t in runs]
+        lines.append({
+            'date': now, 'commit': commit, 'dirty': is_dirty,
+            'benchmark': args.benchmark, 'arg': args.arg, 'build': build,
+            'mean': statistics.mean(times), 'stddev': statistics.stdev(times), 'median': statistics.median(times),
+            'min': min(times), 'max': max(times), 'runs': len(times), 'times': times, 'paddings': paddings,
         })
     os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
     with open(HISTORY, 'a') as f:
@@ -430,7 +455,7 @@ table {{ border-collapse: collapse; margin: 8px 0 24px; }} td, th {{ padding: 2p
 .bad {{ color: var(--bad); font-weight: 600; }} .size {{ fill: {SIZE_COLOR}; }}
 </style></head><body>
 <h1>Benchmark history</h1>
-<p>Each commit's runs of the unsafe and release builds, in commit order: the box spans the quartiles, the bar in it is the median, and the whiskers reach the furthest runs within 1.5 interquartile ranges (runs past them are left out, and counted in the tooltip); a line joins the medians. The hollow box is HEAD with uncommitted changes. Unsafe is the build that matters. The interpreter and other Luas are dashed lines of their latest medians, or in the legend alone, marked ↑ or ↓, off the chart's scale. The orange points, on the right axis, are each commit's JIT code size for the benchmark (the hollow one HEAD with uncommitted changes).</p>
+<p>Each commit's runs of the unsafe and release builds, in commit order, and of the unsafe build over JIT paddings (its runs at every <code>LUNACY_JIT_PADDING</code> pooled, so its spread is what the code's placement alone does): the box spans the quartiles, the bar in it is the median, and the whiskers reach the furthest runs within 1.5 interquartile ranges (runs past them are left out, and counted in the tooltip); a line joins the medians. The hollow box is HEAD with uncommitted changes. Unsafe is the build that matters. The interpreter and other Luas are dashed lines of their latest medians, or in the legend alone, marked ↑ or ↓, off the chart's scale. The orange points, on the right axis, are each commit's JIT code size for the benchmark (the hollow one HEAD with uncommitted changes).</p>
 {"".join(sections)}
 </body></html>
 '''
