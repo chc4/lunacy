@@ -545,7 +545,8 @@ _build-vs ref:
 # one benchmark (built as `_build-vs` builds them).
 hyperfine-vs ref benchmark times='10': (_build-vs ref)
     just _luac {{benchmark}}
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
+    # As `hyperfine`: a build whose run fails is left out of the history.
+    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.json \
         -n "ref release" "target/compare/{{ref}}/target/release/bench working/{{benchmark}}.bin {{times}}" \
         -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
