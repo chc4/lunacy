@@ -426,7 +426,11 @@ impl WindowAlloc {
 // which keeping it saves a load, or, while it is dirty, an overwrite, which
 // keeping it saves a store. A flush ends every value's worth. Looking ahead
 // from inside a loop sees past the jump back to its header, to the reads
-// after it: the back edge stores a dirty value its header doesn't carry. At each window op the window keeps the op's operands in its run
+// after it: the back edge stores a dirty value its header doesn't carry. A
+// value with no such event is still worth a register, after every value that
+// has one, while it is live along a side exit into a block that has run (the
+// thesis's pseudo-uses): the exit's own trace starts from the window it
+// leaves. At each window op the window keeps the op's operands in its run
 // and as many other values as fit outside the run, those with the nearest
 // next events first (Belady); the op runs at the `SKIP` needing the fewest
 // moves. A value not kept stays where it is, unnamed, until something needs
@@ -460,8 +464,9 @@ pub enum Step<'a> {
     Flush,
     /// A jump back to the loop header at step `header`.
     Back(usize),
-    /// An edge leaving the trace into a block that reads `reads` first: the
-    /// trace's own continuation if `hot`, else a side exit (reading none).
+    /// An edge leaving the trace into a block `reads` are live into, or that
+    /// is entered with them: the trace's own continuation if `hot`, else a
+    /// side exit (with none, into a block that never ran).
     Exit { hot: bool, reads: Slots },
 }
 
@@ -482,6 +487,8 @@ pub struct TracePlan {
 struct Ahead {
     /// Per slot, the steps reading (`true`) or writing it, in order.
     events: Vec<Vec<(usize, bool)>>,
+    /// Per slot, the side exits it is live along, in order.
+    leaves: Vec<Vec<usize>>,
     flushes: Vec<usize>,
     /// Each jump back to a loop's header, `(back, header)`, in order.
     backs: Vec<(usize, usize)>,
@@ -489,7 +496,7 @@ struct Ahead {
 
 impl Ahead {
     fn new(steps: &[Step]) -> Ahead {
-        let mut ahead = Ahead { events: vec![Vec::new(); 256], flushes: Vec::new(), backs: Vec::new() };
+        let mut ahead = Ahead { events: vec![Vec::new(); 256], leaves: vec![Vec::new(); 256], flushes: Vec::new(), backs: Vec::new() };
         for (step, s) in steps.iter().enumerate() {
             match s {
                 Step::Op(op, _) => {
@@ -503,7 +510,8 @@ impl Ahead {
                     }
                 }
                 Step::Read(slot) => ahead.events[*slot].push((step, true)),
-                Step::Exit { reads, .. } => reads.iter().for_each(|slot| ahead.events[slot].push((step, true))),
+                Step::Exit { hot: true, reads } => reads.iter().for_each(|slot| ahead.events[slot].push((step, true))),
+                Step::Exit { hot: false, reads } => reads.iter().for_each(|slot| ahead.leaves[slot].push(step)),
                 Step::Flush => ahead.flushes.push(step),
                 Step::Back(header) => ahead.backs.push((step, *header)),
                 Step::Start | Step::Header(_) => {}
@@ -520,9 +528,25 @@ impl Ahead {
         flush.is_none_or(|flush| flush > event.0).then_some(event)
     }
 
+    /// The worth of keeping `slot` in a register after step `at`, `dirty` or
+    /// not, if it has any, least first: how far off its next event that pays
+    /// is, or failing one (`true`), the next side exit it is live along.
+    fn worth(&self, slot: usize, at: usize, dirty: bool) -> Option<(bool, usize)> {
+        if let Some(far) = self.pays(slot, at, dirty) {
+            return Some((false, far));
+        }
+        // Live until its slot is next written, or a flush.
+        let written = self.events[slot].get(self.events[slot].partition_point(|e| e.0 <= at)).map(|e| e.0);
+        let flushed = self.flushes.get(self.flushes.partition_point(|&f| f <= at)).copied();
+        let until = written.into_iter().chain(flushed).min().unwrap_or(usize::MAX);
+        let leaves = &self.leaves[slot];
+        let leave = leaves.get(leaves.partition_point(|&l| l <= at)).copied().filter(|&l| l < until)?;
+        Some((true, leave - at))
+    }
+
     /// How far after step `at` keeping `slot` in a register next pays off,
     /// `dirty` or not, if it does.
-    fn worth(&self, slot: usize, at: usize, dirty: bool) -> Option<usize> {
+    fn pays(&self, slot: usize, at: usize, dirty: bool) -> Option<usize> {
         let pays = |(step, read): (usize, bool)| (read || dirty).then_some(step - at);
         // The innermost loop around `at`, whose back edge comes first.
         let back = self.backs.iter().find(|&&(back, header)| header <= at && at < back);
@@ -571,9 +595,11 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
                 let mut dirty = Slots::default();
                 if let Step::Header(live) = s {
                     // The values worth most, those the trace brings in place.
+                    // One it doesn't bring is loaded only for an event that
+                    // pays, not to be live along a side exit.
                     let brought = now.slots().map(|(_, slot)| slot);
-                    let fresh = live.iter().filter(|&slot| now.position(slot).is_none());
-                    let mut values: SmallVec<[(usize, usize); 16]> = brought.chain(fresh).filter_map(|slot| Some((worth(slot)?, slot))).collect();
+                    let fresh = live.iter().filter(|&slot| now.position(slot).is_none() && ahead.pays(slot, step, false).is_some());
+                    let mut values: SmallVec<[((bool, usize), usize); 16]> = brought.chain(fresh).filter_map(|slot| Some((worth(slot)?, slot))).collect();
                     values.sort_unstable();
                     values.truncate(width);
                     for &(_, slot) in &values {
@@ -627,7 +653,7 @@ fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &dyn Window, usabl
     let (slots, accesses) = (op.operands(), op.accesses());
     let now = alloc.cache();
     let width = alloc.width;
-    let mut kept: SmallVec<[(usize, usize); WINDOW]> = now
+    let mut kept: SmallVec<[((bool, usize), usize); WINDOW]> = now
         .slots()
         .filter(|(_, slot)| !slots.contains(slot))
         .filter_map(|(_, slot)| Some((ahead.worth(slot, step, now.dirty.contains(&slot))?, slot)))
@@ -992,10 +1018,7 @@ mod tests {
                     0 => Step::Op(&**next_op.next().unwrap(), (0..WINDOW).collect()),
                     1 => Step::Start,
                     2 => Step::Flush,
-                    3 => {
-                        let hot = rng.below(2) == 0;
-                        Step::Exit { hot, reads: if hot { some_slots(&mut rng) } else { Slots::default() } }
-                    }
+                    3 => Step::Exit { hot: rng.below(2) == 0, reads: some_slots(&mut rng) },
                     4 => Step::Read(arg),
                     5 => Step::Header(some_slots(&mut rng)),
                     _ => Step::Back(arg),

@@ -1532,10 +1532,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             placement.iter().flatten().for_each(|&slot| slots.insert(slot));
             slots
         };
-        // What a block the trace continues into reads first: its entry
-        // window's slots, or those live into it.
-        let reads = |target: BlockId| match self.jctx.blocks.get(&target) {
+        // What a block the trace leaves into reads first: its entry window's
+        // slots, or those live into it; none for a side exit that never ran.
+        let reads = |target: BlockId, hot: bool| match self.jctx.blocks.get(&target) {
             Some(done) => slots_of(done.window.regs()),
+            None if !hot && !cfg!(feature = "immediate_jit") && self.blocks[target.0].jit_info.hotness.get() >= INITIAL_HOTNESS => Slots::default(),
             None => plans.get(&target).map_or(live_in[index[&target]], |plan| slots_of(&plan.entry.unpack())),
         };
         let position = |target: BlockId| trace.iter().position(|&t| ids[t] == target);
@@ -1577,7 +1578,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 None => {
                                     let hot = Some(target) == continues;
                                     leaving.push((steps.len(), ids[b], target));
-                                    steps.push(Step::Exit { hot, reads: if hot { reads(target) } else { Slots::default() } });
+                                    steps.push(Step::Exit { hot, reads: reads(target, hot) });
                                 }
                             }
                         }
