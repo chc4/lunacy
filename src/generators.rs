@@ -858,24 +858,22 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(lhs & 0xff)) else { unreachable!() };
                 crate::window::windowed!(IntegerKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
                     match integer_op::<OP>(k, rhs.as_int()) {
-                        Some(n) => { *dest = LBoxed::from_int(n); state.select = 0; false },
-                        None => true,
+                        Some(n) => { *dest = LBoxed::from_int(n); false },
+                        None => { core::intrinsics::cold_path(); true },
                     }
                 } cold {
                     *dest = overflowed::<OP>(k, rhs.as_int());
-                    state.select = 1;
                 });
                 Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true))
             } else if rk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rhs & 0xff)) else { unreachable!() };
                 crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
                     match integer_op::<OP>(lhs.as_int(), k) {
-                        Some(n) => { *dest = LBoxed::from_int(n); state.select = 0; false },
-                        None => true,
+                        Some(n) => { *dest = LBoxed::from_int(n); false },
+                        None => { core::intrinsics::cold_path(); true },
                     }
                 } cold {
                     *dest = overflowed::<OP>(lhs.as_int(), k);
-                    state.select = 1;
                 });
                 // MOD by a constant other than zero always fits.
                 crate::window::windowed!(ModRK, [k: i32], [], |owner, state, base| (lhs, out dest) {
@@ -888,12 +886,11 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             } else {
                 crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
                     match integer_op::<OP>(lhs.as_int(), rhs.as_int()) {
-                        Some(n) => { *dest = LBoxed::from_int(n); state.select = 0; false },
-                        None => true,
+                        Some(n) => { *dest = LBoxed::from_int(n); false },
+                        None => { core::intrinsics::cold_path(); true },
                     }
                 } cold {
                     *dest = overflowed::<OP>(lhs.as_int(), rhs.as_int());
-                    state.select = 1;
                 });
                 Some((dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest])), true))
             };

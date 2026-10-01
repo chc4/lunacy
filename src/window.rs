@@ -578,7 +578,10 @@ macro_rules! windowed {
                 let taken = unsafe { Self::__window($(self.$cap,)* owner, state, base, w, skip) };
                 // A guard selects 0 when it passes. See Note [Guard stencils].
                 $crate::window::windowed!(@if_guard [$($guard)?] state.select = (!taken) as usize;);
+                // An op with a cold path selects 1 when it takes it, which the cold path
+                // may change. See Note [Cold stencils].
                 $crate::window::windowed!(@if_cold [$($cold)?]
+                    state.select = taken as usize;
                     if taken {
                         unsafe { Self::__window_cold($(self.$cap,)* owner, state, base, w, skip) }
                     }
@@ -597,6 +600,7 @@ macro_rules! windowed {
                 $( state.vals[at + self.operands[$oi]] = $out; )*
                 $crate::window::windowed!(@if_guard [$($guard)?] state.select = (!taken) as usize;);
                 $crate::window::windowed!(@if_cold [$($cold)?]
+                    state.select = taken as usize;
                     if taken {
                         $( let $in = state.vals[at + self.operands[$ii]]; )*
                         $( let mut $out = state.vals[at + self.operands[$oi]]; )*
@@ -1227,9 +1231,13 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
         return Err(StencilError::NoBecome { op: name });
     }
     // Between `sub rsp, 8` and `add rsp, 8` if it uses the stack, or jumps to
-    // its cold stencil, a function, which starts where it jumps from. See Notes
+    // a cold stencil that does, which starts where it jumps from. See Notes
     // [Stencil alignment] and [Cold stencils].
-    let aligned = jumps_cold || insts[..kept].iter().any(|(_, _, inst)| uses_stack(inst));
+    let cold_uses_stack = match cold {
+        Some(cold) if jumps_cold => unsafe { stencil_uses_stack(image, cold, name)? },
+        _ => false,
+    };
+    let aligned = cold_uses_stack || insts[..kept].iter().any(|(_, _, inst)| uses_stack(inst));
     let prefix: &[u8] = if aligned { &SUB_RSP_8 } else { &[] };
     let shift = |r: RipRel| RipRel { field: r.field + prefix.len(), end: r.end + prefix.len(), ..r };
     let holes = holes.into_iter().map(|(r, i)| (shift(r), i)).collect();
@@ -1258,6 +1266,24 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
         copy.extend_from_slice(&ADD_RSP_8);
     }
     Ok(Body { code: copy, holes, relocs, nexts, fall, passes, aligned })
+}
+
+/// Whether the stencil at `addr` uses the stack anywhere (`uses_stack`).
+unsafe fn stencil_uses_stack(image: &Image, addr: usize, op: &'static str) -> Result<bool, StencilError> {
+    use yaxpeax_arch::LengthedInstruction;
+    use yaxpeax_x86::long_mode::InstDecoder;
+    let &size = image.sizes.get(&addr).ok_or(StencilError::NotInSymtab { op })?;
+    let code = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
+    let decoder = InstDecoder::default();
+    let mut off = 0;
+    while off < size {
+        let inst = decoder.decode_slice(&code[off..]).map_err(|_| StencilError::Undecodable { op, at: off })?;
+        if uses_stack(&inst) {
+            return Ok(true);
+        }
+        off += inst.len().to_const() as usize;
+    }
+    Ok(false)
 }
 
 /// `ud2`, which traps: placed after a copied body that doesn't end in its
@@ -1290,9 +1316,16 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 // itself, so no slot holds the record's address.
 //
 // The cold stencil starts where its copy jumped from, so at the copied body's
-// stack: a body that jumps to its cold stencil is always copied between `sub
-// rsp, 8` and `add rsp, 8` (Note [Stencil alignment]), which leaves the stack
-// as a call would, and its fall-through point is the `add rsp, 8`.
+// stack: a body that jumps to a cold stencil that uses the stack (for a call
+// out of line, or an aligned spill) is copied between `sub rsp, 8` and `add
+// rsp, 8` (Note [Stencil alignment]), which leaves the stack as a call would,
+// and its fall-through point is the `add rsp, 8`. One whose cold stencil
+// doesn't use the stack needs neither.
+//
+// Run by the interpreter, an op with a cold path selects 1 if it takes it and 0
+// if not, which its cold path may change; its stencils select nothing they don't
+// themselves, as JIT code taking the way on after an optimistic op needs no
+// `select` (Note [Optimistic ops] in `specialize`).
 
 // Note [Guard stencils]
 // ~~~~~~~~~~~~~~~~~~~~~
