@@ -206,6 +206,9 @@ pub enum YieldOp {
                               // CONSTANT[idx] is of the expected CType
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
+    OptimisticExec(Rc<dyn Window>), // An op with a cold path, which selects 0 on its hot path and
+                                    // 1 on its cold. Resumed with Matched on the hot path, and
+                                    // Failed on the cold. See Note [Optimistic ops]
     Decided(bool), // A guard whose outcome is known, emitting nothing: steps the SubPc as a guard
                    // with that outcome does, for a way meeting ones that take it. Resumed with
                    // Matched or Failed. See Note [Subblocks]
@@ -1075,6 +1078,17 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // With feature `no_dynamic_guards`, every such yield
 // fails statically instead, to measure the blocks the guards cost (`just
 // graph-guards`).
+
+// Note [Optimistic ops]
+// ~~~~~~~~~~~~~~~~~~~~~
+// An op can do its common case on its hot path and the rest on its cold path (Note [Cold
+// stencils] in `window`), and select which it took, 0 or 1. Yielded as `OptimisticExec`, the op
+// is followed by a `Select` of two ways on: its generator continues on the hot one, resumed with
+// `Matched`, and on the cold one, behind a thunk, only once it is taken, resumed with `Failed`. So
+// the code after the op can know what its common case gives, as an integer op's result in the
+// integer encoding (Note [Integers]), while the rarer case still has its result, from the cold
+// path, and a way on knowing that instead. Unlike a dynamic guard's test (Note [Dynamic
+// guards]), the op is an op: it writes its outputs either way.
 
 /// The type of a constant.
 fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
@@ -2821,6 +2835,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
                     }
+                },
+                CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
+                    // Its outputs are written whichever path it takes. See Note [Optimistic ops].
+                    for (&slot, access) in op.operands().iter().zip(op.accesses()) {
+                        if access.writes() {
+                            Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
+                        }
+                    }
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op));
+                    let hot = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
+                    let cold = self.new_block(pc.0);
+                    let side = self.make_side_thunk(cold, coro.clone(), pc.next_false(), ctx.clone(), ResumeArg::Failed);
+                    self.blocks[cold.0].instructions.push(Residual::Thunk(side));
+                    self.blocks[block_id.0].instructions.push(Residual::Select(vec![("hot", hot), ("cold", cold)]));
+                    return None;
                 },
                 CoroutineState::Yielded(YieldOp::NativeWindowArgs(a, b, c)) => {
                     arg = match native_window(&ctx, a, b, c) {

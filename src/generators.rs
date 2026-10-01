@@ -751,10 +751,10 @@ unsafe fn number<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>) -> f6
     }
 }
 
-/// The double op `OP` on `l` and `r`, boxed. See Note [Arithmetic NaNs].
+/// The double op `OP` on `l` and `r`.
 #[inline(always)]
-unsafe fn arith<'src, 'intern, const OP: Opcode>(l: f64, r: f64) -> LBoxed<'src, 'intern> {
-    let n = match OP {
+unsafe fn arith_value<const OP: Opcode>(l: f64, r: f64) -> f64 {
+    match OP {
         Opcode::ADD => l + r,
         Opcode::SUB => l - r,
         Opcode::MUL => l * r,
@@ -762,8 +762,22 @@ unsafe fn arith<'src, 'intern, const OP: Opcode>(l: f64, r: f64) -> LBoxed<'src,
         Opcode::MOD => crate::vm::lua_mod(l, r),
         Opcode::POW => l.powf(r),
         _ => unsafe { core::hint::unreachable_unchecked() },
-    };
-    unsafe { LBoxed::from_arith(n) }
+    }
+}
+
+/// The double op `OP` on `l` and `r`, boxed. See Note [Arithmetic NaNs].
+#[inline(always)]
+unsafe fn arith<'src, 'intern, const OP: Opcode>(l: f64, r: f64) -> LBoxed<'src, 'intern> {
+    unsafe { LBoxed::from_arith(arith_value::<OP>(l, r)) }
+}
+
+/// An integer op's result that doesn't fit the integer encoding, from its cold
+/// path: the double op's, with a NaN canonical. Run by the interpreter, the cold
+/// path is inlined after the test that failed, and LLVM may fold a NaN result
+/// to its own constant, where the cold stencil computes x86's default NaN.
+#[inline(always)]
+unsafe fn overflowed<'src, 'intern, const OP: Opcode>(l: i32, r: i32) -> LBoxed<'src, 'intern> {
+    LBoxed::from_double(unsafe { arith_value::<OP>(l as f64, r as f64) })
 }
 
 /// The integer op `OP`'s result, if it fits the integer encoding: it must be in
@@ -830,56 +844,77 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         // --- Int Path --- See Note [Integers]. First, as finding out whether an
         // unknown operand is an integer finds out its type too.
         if matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::MOD) {
-            // The integer ops on registers and constants (`k`, their value), and their
-            // `GuardDynamic` tests that the result fits. See Note [Integers].
+            // The integer ops on registers and constants (`k`, their value), each with
+            // its result in the integer encoding on its hot path, and in the double one,
+            // as the double op would have it, on its cold path if it doesn't fit. See
+            // Notes [Integers] and [Optimistic ops].
             let integers = integer_operands!(lhs, rhs);
             let (lk, rk) = ((lhs & 0x100) != 0, (rhs & 0x100) != 0);
-            // A constant operand is its value, as `k`. luac folds two.
+            // The op, and whether its result can fail to fit. A constant operand is its
+            // value, as `k`. luac folds two.
             let op = if !integers || (lk && rk) {
                 None
             } else if lk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(lhs & 0xff)) else { unreachable!() };
                 crate::window::windowed!(IntegerKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
-                    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(k, rhs.as_int())));
+                    match integer_op::<OP>(k, rhs.as_int()) {
+                        Some(n) => { *dest = LBoxed::from_int(n); state.select = 0; false },
+                        None => true,
+                    }
+                } cold {
+                    *dest = overflowed::<OP>(k, rhs.as_int());
+                    state.select = 1;
                 });
-                crate::window::windowed!(guard FitsKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs) {
-                    integer_op::<OP>(k, rhs.as_int()).is_some()
-                });
-                Some((Some(dispatch_integer_window!(opcode, FitsKR, (k, &[rhs]))), dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest]))))
+                Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true))
             } else if rk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rhs & 0xff)) else { unreachable!() };
-                // Only MOD by a zero can fail with a constant divisor.
-                let test = (opcode != Opcode::MOD || k == 0).then(|| dispatch_integer_window!(opcode, FitsRK, (k, &[lhs])));
                 crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
-                    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), k)));
+                    match integer_op::<OP>(lhs.as_int(), k) {
+                        Some(n) => { *dest = LBoxed::from_int(n); state.select = 0; false },
+                        None => true,
+                    }
+                } cold {
+                    *dest = overflowed::<OP>(lhs.as_int(), k);
+                    state.select = 1;
                 });
-                crate::window::windowed!(guard FitsRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs) {
-                    integer_op::<OP>(lhs.as_int(), k).is_some()
+                // MOD by a constant other than zero always fits.
+                crate::window::windowed!(ModRK, [k: i32], [], |owner, state, base| (lhs, out dest) {
+                    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<{ Opcode::MOD }>(lhs.as_int(), k)));
                 });
-                Some((test, dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest]))))
+                Some(match opcode == Opcode::MOD && k != 0 {
+                    true => (Rc::new(ModRK::new(k, &[lhs, dest])) as Rc<dyn Window>, false),
+                    false => (dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest])), true),
+                })
             } else {
                 crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
-                    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<OP>(lhs.as_int(), rhs.as_int())));
+                    match integer_op::<OP>(lhs.as_int(), rhs.as_int()) {
+                        Some(n) => { *dest = LBoxed::from_int(n); state.select = 0; false },
+                        None => true,
+                    }
+                } cold {
+                    *dest = overflowed::<OP>(lhs.as_int(), rhs.as_int());
+                    state.select = 1;
                 });
-                crate::window::windowed!(guard FitsRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs) {
-                    integer_op::<OP>(lhs.as_int(), rhs.as_int()).is_some()
-                });
-                Some((Some(dispatch_integer_window!(opcode, FitsRR, (&[lhs, rhs]))), dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest]))))
+                Some((dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest])), true))
             };
-            // Whether the result fits, as one step each way: a way skipping the
-            // integer path fails it where a way taking it fails its test, and
-            // continues at the same point in the generator from the same key
+            // As one step each way, as a guard of whether the result fits is
             // (Note [Subblocks]).
-            let step = match &op {
-                Some((Some(test), _)) => YieldOp::GuardDynamic(test.clone()),
-                Some((None, _)) => YieldOp::Decided(true),
-                None => YieldOp::Decided(false),
-            };
-            let fits = yield step;
-            if let (Some((_, op)), ResumeArg::Matched) = (op, fits) {
-                yield YieldOp::ExecWindow(op);
-                yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Integer))]);
-                return arg;
+            match op {
+                Some((op, true)) => {
+                    let fits = yield YieldOp::OptimisticExec(op);
+                    let ty = if fits == ResumeArg::Matched { LType::Integer } else { LType::Double };
+                    yield YieldOp::SetCTypes(vec![(dest, CType::Type(ty))]);
+                    return arg;
+                },
+                Some((op, false)) => {
+                    yield YieldOp::Decided(true);
+                    yield YieldOp::ExecWindow(op);
+                    yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Integer))]);
+                    return arg;
+                },
+                None => {
+                    yield YieldOp::Decided(false);
+                },
             }
         }
         arg = yield YieldOp::GuardRk(lhs, LType::Table);
