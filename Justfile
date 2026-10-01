@@ -85,21 +85,28 @@ window-runs benchmark times='20':
 # jump transfers, and the window after it.
 # With `ref`, revision `ref`'s (in target/compare/<ref>, as for `hyperfine-vs`)
 # on this checkout's benchmark, in target/compare/<ref>/window_dump.txt.
+# `build` is the release build or the unsafe one, which compile different
+# regions: their stencils and what runs before a block gets hot differ.
 # The allocator code a benchmark's run executed most, from its window dump
 # (tools/window_hot.py): `args` as the tool takes them (`--blocks`, `--top N`).
 window-hot benchmark times='20' *args: (window-dump benchmark times)
     python3 tools/window_hot.py working/window_dump.txt {{args}}
 
-window-dump benchmark times='20' ref='':
+window-dump benchmark times='20' ref='' build='release':
     #!/usr/bin/env bash
     set -euo pipefail
     just _luac {{benchmark}}
+    if [ "{{build}}" = unsafe ]; then
+        flags=(--profile unsafe --no-default-features --features "unsafe window_dump" --target-dir target/window_dump -Z build-std=core,std,panic_abort)
+    else
+        flags=(--release --features window_dump)
+    fi
     if [ -z "{{ref}}" ]; then
-        cd working && cargo run --release --features window_dump --bin bench -- {{benchmark}}.bin {{times}}
+        cd working && cargo run "${flags[@]}" --bin bench -- {{benchmark}}.bin {{times}}
     else
         just _compare-worktree {{ref}}
         bin=$(realpath working/{{benchmark}}.bin)
-        (cd target/compare/{{ref}} && cargo run --release --features window_dump --bin bench -- $bin {{times}})
+        (cd target/compare/{{ref}} && cargo run "${flags[@]}" --bin bench -- $bin {{times}})
     fi
 
 # The size of each window op's stencil a benchmark's JIT code copies, in the
@@ -557,7 +564,8 @@ bench-rev ref:
     for run in {{HYPERFINES}}; do
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark
-        taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-json working/hyperfine-$benchmark-$times-{{ref}}.json \
+        # As `hyperfine`: a build whose run fails is left out of the history.
+        taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-json working/hyperfine-$benchmark-$times-{{ref}}.json \
             -n "ref release" "target/compare/{{ref}}/target/release/bench working/$benchmark.bin $times" \
             -n "ref unsafe" "target/compare/{{ref}}/target/unsafe/bench working/$benchmark.bin $times"
         python3 tools/bench_history.py record working/hyperfine-$benchmark-$times-{{ref}}.json --benchmark $benchmark --arg $times --ref {{ref}}
