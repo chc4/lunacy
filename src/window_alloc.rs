@@ -987,8 +987,11 @@ mod tests {
     /// and exits, in windows of 5 to 8 registers, run as the JIT runs a planned
     /// trace: each op reconciled to its planned window, each block entered
     /// through a transfer into its entry window, each jump back's transfer
-    /// into its target's checked, and each exit's stores. Every op reads
-    /// current values and the stack ends current.
+    /// into its target's checked, and each exit's stores. The trace starts
+    /// from a window with dirty slots, and each exit is also followed through
+    /// a trivial trace, to its thunk's exit and to a block the thunk is linked
+    /// into. Every op reads current values, no write is lost, and the stack
+    /// ends current.
     #[test]
     fn random_traces() {
         let mut rng = Rng(0x2545f4914f6cdd1d);
@@ -1041,17 +1044,28 @@ mod tests {
                     _ => Step::Back(arg),
                 }))
                 .collect();
-            let mut hint = Cache::default();
-            for reg in 0..rng.below(width) {
-                let slot = rng.below(6);
-                if hint.position(slot).is_none() {
-                    hint.regs[reg] = Some(slot);
+            // Any window over `width` registers, some of its slots dirty.
+            let some_window = |rng: &mut Rng| {
+                let mut window = Cache::default();
+                for reg in 0..rng.below(width + 1) {
+                    let slot = rng.below(6);
+                    if window.position(slot).is_none() {
+                        window.regs[reg] = Some(slot);
+                        if rng.below(2) == 0 {
+                            window.dirty.push(slot);
+                        }
+                    }
                 }
-            }
+                window
+            };
+            let hint = some_window(&mut rng);
             let plan = plan_trace(&steps, width, &hint);
             let mut machine = Machine::default();
+            for &slot in &hint.dirty {
+                machine.current.insert(slot, 1);
+            }
             for (reg, slot) in hint.regs.iter().enumerate() {
-                machine.regs[reg] = slot.map(|slot| (slot, 0));
+                machine.regs[reg] = slot.map(|slot| (slot, Machine::version(&machine.current, slot)));
             }
             let mut alloc = WindowAlloc { width, cache: hint };
             let mut entries = HashMap::new();
@@ -1102,6 +1116,37 @@ mod tests {
                         }
                         for (&slot, &version) in &taken.current {
                             assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the exit at step {step} of {ops:?}");
+                        }
+                        // The exit into a thunk-only block, a trivial trace
+                        // planned from the window the plan leaves here: its
+                        // thunk's exit, and the thunk linked into a block
+                        // entered with any window, lose no write.
+                        let trivial = plan_trace(&[Step::Start(None)], width, plan.exits[step].as_ref().unwrap());
+                        let entry = Cache::entry(trivial.windows[0], alloc.cache(), &trivial.dirty[0]);
+                        let mut linked = Machine { memory: machine.memory.clone(), current: machine.current.clone(), regs: machine.regs };
+                        for emit in alloc.transfer(&entry) {
+                            linked.exec(emit, None);
+                        }
+                        let thunk = WindowAlloc { width, cache: entry };
+                        let mut exited = Machine { memory: linked.memory.clone(), current: linked.current.clone(), regs: linked.regs };
+                        for emit in thunk.stores() {
+                            exited.exec(emit, None);
+                        }
+                        for (&slot, &version) in &exited.current {
+                            assert_eq!(Machine::version(&exited.memory, slot), version, "slot {slot} stale at the thunk after step {step} of {ops:?}");
+                        }
+                        let target = some_window(&mut rng);
+                        for emit in thunk.transfer(&target) {
+                            linked.exec(emit, None);
+                        }
+                        for (reg, slot) in target.regs.iter().enumerate() {
+                            if let Some(slot) = *slot {
+                                let current = Machine::version(&linked.current, slot);
+                                assert_eq!(linked.regs[reg], Some((slot, current)), "link after step {step} of {ops:?} into {target:?}");
+                            }
+                        }
+                        for (&slot, &version) in linked.current.iter().filter(|(slot, _)| !target.dirty.contains(slot)) {
+                            assert_eq!(Machine::version(&linked.memory, slot), version, "slot {slot} lost by the link after step {step} of {ops:?} into {target:?}");
                         }
                     }
                     Step::Read(_) => {}
