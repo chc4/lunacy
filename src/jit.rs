@@ -659,10 +659,10 @@ pub struct JitContext {
     /// The frame ops the JIT's code has, which a call of an op's body refers to.
     /// See Note [Frame ops] in `specialize`.
     frame_ops: Vec<Rc<dyn Window>>,
-    /// How regions are partitioned into traces, if `LUNACY_TRACES` names a
-    /// policy, or `None` to allocate streaming: no plan, each op placing itself
-    /// in the window it finds and each block entered with the window of the
-    /// first jump to it.
+    /// How regions are partitioned into traces (`LUNACY_TRACES`), or `None` to
+    /// allocate streaming instead: no plan, each op placing itself in the window
+    /// it finds and each block entered with the window of the first jump to it,
+    /// for comparison.
     pub trace_policy: Option<Policy>,
 }
 
@@ -889,7 +889,7 @@ impl JitContext {
             #[cfg(feature = "jit_disasm")]
             disasm: Default::default(),
             trace_policy: match std::env::var("LUNACY_TRACES").as_deref() {
-                Ok("streaming") | Err(_) => None,
+                Ok("streaming") => None,
                 _ => Some(Policy::from_env()),
             },
         };
