@@ -1095,10 +1095,11 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // path, and a way on knowing that instead. Unlike a dynamic guard's test (Note [Dynamic
 // guards]), the op is an op: it writes its outputs either way.
 //
-// In JIT code the `Branch` tests no `select`: the op's hot path falls through to the jump to
-// the hot way, and its cold stencil, which ends in a jump to its site record's address (Note
-// [Cold stencils] in `window`), continues at the jump to the cold way, the record's address
-// for such an op.
+// In JIT code the `Branch` tests no `select`, as a guard's copy tests none (Note [Guard
+// stencils] in `window`): the op's hot path falls through to the hot way, as the next block if
+// it is laid out next, and its cold stencil, which ends in a jump to its site record's
+// continuation (Note [Cold stencils] in `window`), continues at the cold way, laid out after the
+// region's blocks, as such an op's record's continuation.
 
 /// The type of a constant.
 fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {

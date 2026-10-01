@@ -334,11 +334,30 @@ impl Snapshot {
     }
 }
 
-/// The pool of a compiled region: its entries in order, each equal value once.
+/// The pool of a compiled region: its entries in order, each equal value once;
+/// and its code off every hot path, laid out after its blocks.
 #[derive(Default)]
 struct Pool {
     entries: Vec<(DynamicLabel, PoolEntry)>,
     values: HashMap<u64, DynamicLabel, FxBuildHasher>,
+    stubs: Vec<(DynamicLabel, Stub)>,
+}
+
+/// Code a region lays out after its blocks, off its hot paths.
+enum Stub {
+    /// The way from a copy into its cold stencil: the site's record's address
+    /// into `cold_site`, then the jump. See Note [Cold stencils] in `window`.
+    ColdEntry { record: DynamicLabel, cold: usize },
+    /// The cold way after an optimistic op, where its cold stencil continues:
+    /// back from the copy's alignment if `aligned`, the window's moves, then the
+    /// jump. See Note [Optimistic ops] in `specialize`.
+    ColdWay { aligned: bool, moves: SmallVec<[Emit; 16]>, to: JumpTo },
+}
+
+/// Where a jump to a block goes: its code, or a label it will have.
+enum JumpTo {
+    Code(usize),
+    Label(DynamicLabel),
 }
 
 impl Pool {
@@ -507,10 +526,19 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
         Record,
         /// The guard's pass edge.
         Pass,
+        /// The way into the cold stencil.
+        Cold,
     }
     let fall = ops.new_dynamic_label();
-    // The site's record, if the op has a cold path.
-    let record = body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE).then(|| pool.record(ops, cold.unwrap_or(fall), name, captures));
+    // The site's record, if the op has a cold path, and the way into its cold
+    // stencil. See Note [Cold stencils] in `window`.
+    let has_record = body.cold.is_some() || body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE);
+    let record = has_record.then(|| pool.record(ops, cold.unwrap_or(fall), name, captures));
+    let cold_entry = body.cold.map(|stencil| {
+        let label = ops.new_dynamic_label();
+        pool.stubs.push((label, Stub::ColdEntry { record: record.expect("a record for a cold path"), cold: stencil }));
+        label
+    });
     let mut sites: SmallVec<[(usize, usize, Site); 8]> = SmallVec::new();
     sites.extend(body.holes.iter().map(|&(r, i)| match i {
         crate::window::SITE_HOLE => (r.end, r.field, Site::Record),
@@ -518,6 +546,7 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
     }));
     sites.extend(body.relocations().iter().map(|r| (r.end, r.field, Site::Absolute(r.target))));
     sites.extend(body.passes.iter().map(|r| (r.end, r.field, Site::Pass)));
+    sites.extend(body.colds.iter().map(|r| (r.end, r.field, Site::Cold)));
     // A body copied between `sub rsp, 8` and `add rsp, 8` passes through an
     // `add rsp, 8` of its own, after it.
     let passing = (!body.passes.is_empty()).then(|| {
@@ -554,6 +583,10 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
             Site::Pass => {
                 let (target, _) = passing.expect("a guard's pass site");
                 ops.dynamic_relocation(target, 0, field_offset, 0, rel32(RelocationKind::Relative));
+            }
+            Site::Cold => {
+                let entry = cold_entry.expect("a cold path's way in");
+                ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
         }
     }
@@ -1108,6 +1141,36 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.jctx.reserve(ops.offset().0 - pending_start.0);
         }
 
+        let stubs = ops.offset();
+        for (label, stub) in std::mem::take(&mut pool.stubs) {
+            dynasm!(ops ; .arch x64 ; =>label);
+            match stub {
+                Stub::ColdEntry { record, cold } => {
+                    jit_note!(self.jctx, ops, "into a cold stencil");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; lea rax, [=>record]
+                        ; mov QWORD r12 => RunState.cold_site, rax
+                        ; jmp extern cold
+                    );
+                }
+                Stub::ColdWay { aligned, moves, to } => {
+                    jit_note!(self.jctx, ops, "an optimistic op's cold way");
+                    if aligned {
+                        dynasm!(ops ; .arch x64 ; add rsp, 8);
+                    }
+                    for emit in moves {
+                        emit_window_move(&mut ops, emit);
+                    }
+                    match to {
+                        JumpTo::Code(code) => dynasm!(ops ; .arch x64 ; jmp extern code),
+                        JumpTo::Label(label) => dynasm!(ops ; .arch x64 ; jmp =>label),
+                    }
+                }
+            }
+        }
+        self.jctx.reserve(ops.offset().0 - stubs.0);
+
         let epilogue = ops.offset();
         jit_note!(self.jctx, ops, "exit_jit: epilogue");
         dynasm!(ops
@@ -1555,12 +1618,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // Jump to `target`, or fall through to it if `skip`, transferring the
         // window to the one it is entered with: its planned entry window, dirty where the
         // first jump to it compiled delivers it dirty.
-        let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool| {
+        // With `defer`, its moves and target, for code laid out elsewhere, in
+        // place of emitting it.
+        let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool, defer: bool| -> Option<(SmallVec<[Emit; 16]>, JumpTo)> {
             if let Some(target_block) = self.jctx.blocks.get(target) {
                 // We already JIT compiled the block, and can jump to it directly.
                 let transfer = alloc.transfer(&target_block.window);
                 let counted = window_count!(self.jctx, ops, transfer);
                 window_dump!(self.jctx, "      to block {} (compiled, entered with {}): {}{counted}", target.0, target_block.window, emits_line(&transfer));
+                if defer {
+                    return Some((transfer, JumpTo::Code(target_block.ptr.0 as usize)));
+                }
                 for emit in transfer {
                     emit_window_move(ops, emit);
                 }
@@ -1584,6 +1652,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let transfer = alloc.transfer(&pending.window);
                 let counted = window_count!(self.jctx, ops, transfer);
                 window_dump!(self.jctx, "      to block {} (entered with {}): {}{counted}", target.0, pending.window, emits_line(&transfer));
+                if defer {
+                    return Some((transfer, JumpTo::Label(pending.label)));
+                }
                 for emit in transfer {
                     emit_window_move(ops, emit);
                 }
@@ -1593,6 +1664,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                 }
             }
+            None
         };
 
         let emit_bailout = |ops: &mut Assembler, off| {
@@ -2215,7 +2287,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // `successor`, and so the JIT worklist will compile it immediately after this
                     // code.
                     emit_jump(ops, &alloc, target,
-                        off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none());
+                        off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none(), false);
                     successor = Some(*target);
                 },
                 Residual::Ret(pc, a, b, closes, vararg, returns, effects) => {
@@ -2248,12 +2320,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // The op's cold path continues here, at its copy's stack. See Note
                         // [Optimistic ops] in `specialize`.
                         Some((label, aligned)) => {
-                            emit_jump(ops, &alloc, hot, false);
-                            dynasm!(ops ; =>label);
-                            if aligned {
-                                dynasm!(ops ; add rsp, 8);
-                            }
-                            emit_jump(ops, &alloc, cold, false);
+                            let (moves, to) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
+                            pool.stubs.push((label, Stub::ColdWay { aligned, moves, to }));
+                            emit_jump(ops, &alloc, hot, self.jctx.blocks.get(hot).is_none(), false);
                         },
                         // An op run by its body on the stack, which selected.
                         None => {
@@ -2261,9 +2330,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; cmp QWORD r12 => RunState.select, 0
                                 ; jnz >cold_way
                             );
-                            emit_jump(ops, &alloc, hot, false);
+                            emit_jump(ops, &alloc, hot, false, false);
                             dynasm!(ops ; cold_way:);
-                            emit_jump(ops, &alloc, cold, false);
+                            emit_jump(ops, &alloc, cold, false, false);
                         },
                     }
                     successor = Some(*hot);
@@ -2291,7 +2360,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; jnz >next_target
                         );
                         debug_assert_eq!(ops.offset().0 - test, SELECT_TEST, "a Select's test");
-                        emit_jump(ops, &alloc, &target.1, false);
+                        emit_jump(ops, &alloc, &target.1, false, false);
                         dynasm!(ops
                             ; next_target:
                         );
@@ -2305,7 +2374,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // yet, as a `Jump`'s is: falling through, it needs no jump.
                         debug_assert_eq!(off, block.instructions.len() - 1, "a Select ends its block");
                         let first = targets[0].1;
-                        emit_jump(ops, &alloc, &first, self.jctx.blocks.get(&first).is_none());
+                        emit_jump(ops, &alloc, &first, self.jctx.blocks.get(&first).is_none(), false);
                         successor = Some(first);
                     }
                 },
@@ -2345,7 +2414,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     Emit::Op { skip } => {
                                         let body = stencils.body(&**w, skip).expect("a usable skip");
                                         passes = splat(ops, &body, w.name(), &w.captures(), pool, pass, cold);
-                                        if let (Some(label), true) = (cold, w.cold(skip).is_some()) {
+                                        if let (Some(label), true) = (cold, body.cold.is_some()) {
                                             cold_edge = Some((label, body.aligned));
                                         }
                                     }

@@ -251,10 +251,16 @@ pub trait Window: std::fmt::Debug {
     /// Address of this op's `become` continuation (what every one of its
     /// stencils ends by jumping to, and what the copier slices off).
     fn next(&self) -> usize;
-    /// Address of the op's cold stencil at `skip`, which its stencil at `skip`
-    /// jumps to off its hot path, if it has a cold path. See Note [Cold
+    /// Address of the op's cold stencil at `skip`, which its copy at `skip`
+    /// continues to off its hot path, if it has a cold path. See Note [Cold
     /// stencils].
     fn cold(&self, _skip: usize) -> Option<usize> {
+        None
+    }
+    /// Address of the second continuation of an op with a cold path, which its
+    /// stencils jump to when they take it, and the copier points at the way
+    /// into the cold stencil. See Note [Cold stencils].
+    fn to_cold(&self) -> Option<usize> {
         None
     }
     /// Address of a guard op's second continuation, which its stencils jump to
@@ -565,6 +571,7 @@ macro_rules! windowed {
                     assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
                     Some(Self::__cold_at(skip))
                 }
+                fn to_cold(&self) -> Option<usize> { Some(Self::__to_cold as *const () as usize) }
             );
             unsafe fn run<'src, 'intern>(
                 &self,
@@ -650,11 +657,11 @@ macro_rules! windowed {
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
                 let taken = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
-                // The window where it is, into the cold stencil. See Note [Cold stencils].
+                // The window where it is, into its second continuation, which the copy
+                // points at the way into the cold stencil. See Note [Cold stencils].
                 $crate::window::windowed!(@if_cold [$($cold)?]
                     if taken {
-                        state.cold_site = unsafe { $crate::window::hole::<{ $crate::window::SITE_HOLE }>() } as *const u64;
-                        become Self::__cold::<SKIP>(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                        become Self::__to_cold(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
                     }
                 );
                 // A guard's pass, into its second continuation. See Note [Guard stencils].
@@ -687,6 +694,30 @@ macro_rules! windowed {
                     // Unlike `__next`'s body, or LLVM merges the two, and the
                     // guard's branch between them with them.
                     core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8, 1u8));
+                }
+            );
+
+            $crate::window::windowed!(@if_cold [$($cold)?]
+                /// The second continuation of an op with a cold path, as `__next`
+                /// is its first: the copier points jumps to it at the way into the
+                /// cold stencil. See Note [Cold stencils].
+                #[inline(never)]
+                extern "rust-preserve-none" fn __to_cold<'b, 'src, 'intern>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+                base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                w0: $crate::lboxed::LBoxed<'src, 'intern>,
+                w1: $crate::lboxed::LBoxed<'src, 'intern>,
+                w2: $crate::lboxed::LBoxed<'src, 'intern>,
+                w3: $crate::lboxed::LBoxed<'src, 'intern>,
+                w4: $crate::lboxed::LBoxed<'src, 'intern>,
+                w5: $crate::lboxed::LBoxed<'src, 'intern>,
+                w6: $crate::lboxed::LBoxed<'src, 'intern>,
+                w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                w8: $crate::lboxed::LBoxed<'src, 'intern>,
+                ) {
+                    // Unlike `__next`'s body, or LLVM merges the two, and the
+                    // branch between them with them.
+                    core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8, 2u8));
                 }
             );
 
@@ -982,6 +1013,10 @@ pub struct Body {
     /// Whether it's copied between `sub rsp, 8` and `add rsp, 8`: a jump out
     /// of its middle must first undo the `sub`. See Note [Stencil alignment].
     pub aligned: bool,
+    /// Its jumps to its second continuation off its hot path, re-targeted at
+    /// the way into its cold stencil, `cold`. See Note [Cold stencils].
+    pub colds: Vec<RipRel>,
+    pub cold: Option<usize>,
 }
 
 /// A reference to the continuation inside a stencil body.
@@ -1035,6 +1070,8 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let addr = op.stencil(skip);
     // Its cold stencil, which it may jump to. See Note [Cold stencils].
     let cold = op.cold(skip);
+    // The second continuation into it. See Note [Cold stencils].
+    let to_cold = op.to_cold();
     // A guard's second continuation. See Note [Guard stencils].
     let pass = op.pass();
     let &size = image.sizes.get(&addr).ok_or(StencilError::NotInSymtab { op: name })?;
@@ -1128,11 +1165,14 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     };
     let jumps_to_next = |i: usize| -> Result<bool, StencilError> { Ok(jump_target(i)? == Some(next)) };
 
-    // A guard's body ending `jcc __next; jmp __pass` is copied ending `j!cc
-    // __pass`, falling through to its `become` (see Note [Guard stencils]):
-    // the index of that `jcc`, a two-byte `0F 8x` with a rel32.
+    // A body ending `jcc __next; jmp` to its second continuation, a guard's
+    // `__pass` or a cold path's `__to_cold`, is copied ending in the inverted
+    // `jcc` to it, falling through to its `become` (see Notes [Guard stencils]
+    // and [Cold stencils]): the index of that `jcc`, a two-byte `0F 8x` with a
+    // rel32.
     let last = insts.len() - 1;
-    let inverted = (last > 0 && pass.is_some() && jump_target(last)? == pass).then_some(last - 1).filter(|&i| {
+    let second = pass.or(to_cold);
+    let inverted = (last > 0 && second.is_some() && jump_target(last)? == second).then_some(last - 1).filter(|&i| {
         let (off, end, inst) = &insts[i];
         inst.opcode() != Opcode::JMP
             && RELATIVE_BRANCHES.contains(&inst.opcode())
@@ -1151,9 +1191,8 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let mut holes: SmallVec<[(RipRel, usize); MAX_HOLES]> = SmallVec::new();
     let mut relocs: Vec<RipRel> = Vec::new();
     let mut nexts: Vec<NextRef> = Vec::new();
-    // Whether it jumps to its cold stencil, directly.
-    let mut jumps_cold = false;
     let mut passes: Vec<RipRel> = Vec::new();
+    let mut colds: Vec<RipRel> = Vec::new();
     // The opcode bytes of its site hole loads, to make `lea`s.
     let mut leas: SmallVec<[usize; 1]> = SmallVec::new();
     for (i, (off, end, inst)) in insts[..kept].iter().enumerate() {
@@ -1170,16 +1209,14 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
                 if !(addr..=addr + body_len).contains(&target) {
                     let rel = RipRel { field: end - 4, end, target };
                     if Some(i) == inverted {
-                        passes.push(rel);
+                        if pass.is_some() { passes.push(rel) } else { colds.push(rel) }
                     } else if width == 4 && target == next {
                         // Another `become` (e.g. a duplicated tail).
                         nexts.push(NextRef::Direct(rel));
                     } else if width == 4 && Some(target) == pass && inst.opcode() != Opcode::CALL {
                         passes.push(rel);
-                    } else if width == 4 && Some(target) == cold && inst.opcode() != Opcode::CALL {
-                        // Out to the cold stencil, which isn't copied.
-                        jumps_cold = true;
-                        relocs.push(rel);
+                    } else if width == 4 && Some(target) == to_cold && inst.opcode() != Opcode::CALL {
+                        colds.push(rel);
                     } else if width == 4 && inst.opcode() == Opcode::CALL {
                         relocs.push(rel);
                     } else {
@@ -1233,9 +1270,10 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     // Between `sub rsp, 8` and `add rsp, 8` if it uses the stack, or jumps to
     // a cold stencil that does, which starts where it jumps from. See Notes
     // [Stencil alignment] and [Cold stencils].
+    let cold = cold.filter(|_| !colds.is_empty());
     let cold_uses_stack = match cold {
-        Some(cold) if jumps_cold => unsafe { stencil_uses_stack(image, cold, name)? },
-        _ => false,
+        Some(cold) => unsafe { stencil_uses_stack(image, cold, name)? },
+        None => false,
     };
     let aligned = cold_uses_stack || insts[..kept].iter().any(|(_, _, inst)| uses_stack(inst));
     let prefix: &[u8] = if aligned { &SUB_RSP_8 } else { &[] };
@@ -1243,6 +1281,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let holes = holes.into_iter().map(|(r, i)| (shift(r), i)).collect();
     let relocs = relocs.into_iter().map(shift).collect();
     let passes = passes.into_iter().map(shift).collect();
+    let colds = colds.into_iter().map(shift).collect();
     let nexts = nexts
         .into_iter()
         .map(|n| match n {
@@ -1265,7 +1304,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     if aligned {
         copy.extend_from_slice(&ADD_RSP_8);
     }
-    Ok(Body { code: copy, holes, relocs, nexts, fall, passes, aligned })
+    Ok(Body { code: copy, holes, relocs, nexts, fall, passes, aligned, colds, cold })
 }
 
 /// Whether the stencil at `addr` uses the stack anywhere (`uses_stack`).
@@ -1286,6 +1325,20 @@ unsafe fn stencil_uses_stack(image: &Image, addr: usize, op: &'static str) -> Re
     Ok(false)
 }
 
+/// The way into a cold stencil from its copy, with the copy's window and stack
+/// (Note [Cold stencils]): `lea rax, [rip + record]`, `mov [r12 + cold_site],
+/// rax` (r12 the stencils' `state`), `jmp rel32 cold`, the displacements zero for
+/// the caller to fill: the record's at 3, the cold stencil's at 16.
+fn cold_entry() -> [u8; 20] {
+    let site = u32::try_from(core::mem::offset_of!(crate::vm::RunState<'static, 'static>, cold_site)).unwrap().to_le_bytes();
+    let mut code = [0; 20];
+    code[..3].copy_from_slice(&[0x48, 0x8d, 0x05]);
+    code[7..11].copy_from_slice(&[0x49, 0x89, 0x84, 0x24]);
+    code[11..15].copy_from_slice(&site);
+    code[15] = 0xe9;
+    code
+}
+
 /// `ud2`, which traps: placed after a copied body that doesn't end in its
 /// `become`, which must never be reached.
 const UD2: [u8; 2] = [0x0f, 0x0b];
@@ -1293,27 +1346,31 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 // Note [Cold stencils]
 // ~~~~~~~~~~~~~~~~~~~~
 // A window op with a cold path (`windowed!`'s `cold` block) has a second
-// stencil per `SKIP`, `__cold::<SKIP>`, with the same parameters: its stencil
-// ends its hot path in a tail jump to it, with the window where it was, so the
-// hot path needs no call, and so saves nothing around one and moves no
-// arguments into place.
+// stencil per `SKIP`, `__cold::<SKIP>`, with the same parameters, which runs the
+// cold block where the hot path leaves the window: the hot path needs no call,
+// and so saves nothing around one and moves no arguments into place.
+//
+// Its stencils, taking the cold path, end in a second continuation, `__to_cold`,
+// as a guard's do in `__pass` (Note [Guard stencils]), so the body branches to
+// it, a single `jcc` (or one inverted, for a body ending `jcc __next; jmp
+// __to_cold`), and falls through on its hot path. The copier points that branch
+// at the way into the cold stencil, which the JIT lays out after the region's
+// blocks, off every hot path.
 //
 // The cold stencil isn't copied: every copy of the op at that `SKIP` shares the
-// one in this executable, and reaches it with a jump relocated like a call.
-// What differs between copies, their captures and where each continues, is the
-// site's record, `[fall-through address, displacement to each capture's value
-// (i32)...]`, which the JIT lays in the region's pool, whose values the copy
-// loads its captures from too: before the jump, the copy stores the record's address,
-// its site hole (`SITE_HOLE`), to `RunState::cold_site` (`become` wants the
-// callee's signature to be the caller's, so it can't be an argument). The cold
-// stencil binds the captures from the record, runs the cold block, and ends
-// in a tail jump to the record's fall-through address, the window where the
-// cold block left it.
+// one in this executable. What differs between copies, their captures and where
+// each continues, is the site's record, `[continuation address, displacement to
+// each capture's value (i32)...]`, which the JIT lays in the region's pool, whose
+// values the copy loads its captures from too. The way into the cold stencil
+// stores the record's address to `RunState::cold_site` (`become` wants the
+// callee's signature to be the caller's, so it can't be an argument), then
+// jumps to it. The cold stencil binds the captures from the record, runs the
+// cold block, and ends in a tail jump to the record's continuation, the window
+// where the cold block left it: the copy's fall-through, or for an optimistic
+// op, the way on after its cold path (Note [Optimistic ops] in `specialize`).
 //
-// A site costs its record, and no more of the pool: its capture values are
-// the pool's, shared with every copy capturing the same, and its load of the
-// site hole, a `mov` from the hole's slot, is copied as an `lea` of the record
-// itself, so no slot holds the record's address.
+// A site costs its record and its way in, and no more of the pool: its capture
+// values are the pool's, shared with every copy capturing the same.
 //
 // The cold stencil starts where its copy jumped from, so at the copied body's
 // stack: a body that jumps to a cold stencil that uses the stack (for a call
@@ -1437,6 +1494,9 @@ pub unsafe fn assemble(
     // hole's `lea` of its record. See Note [Cold stencils].
     let mut records: Vec<(usize, Captures)> = Vec::new();
     let mut record_refs: Vec<(RipRel, usize)> = Vec::new();
+    // Each copy's jumps into its cold stencil, with the stencil and the record,
+    // for the way into it after the tail.
+    let mut colds: Vec<(Vec<RipRel>, usize, usize)> = Vec::new();
     for &(op, skip) in ops {
         let body = unsafe { stencil_body(image, op, skip) }?;
         let captures = op.captures();
@@ -1450,7 +1510,8 @@ pub unsafe fn assemble(
                 i => holes.push((shift(r), captures[i])),
             }
         }
-        if body.holes.iter().any(|&(_, i)| i == SITE_HOLE) {
+        if let Some(cold) = body.cold {
+            colds.push((body.colds.iter().map(|&r| shift(r)).collect(), cold, records.len()));
             records.push((fall, captures));
         }
         relocs.extend(body.relocs.iter().map(|&r| shift(r)));
@@ -1462,6 +1523,17 @@ pub unsafe fn assemble(
         nexts.extend(body.passes.iter().map(|&r| (NextRef::Direct(shift(r)), fall)));
     }
     code.extend_from_slice(tail);
+    // Each way into a cold stencil: the record's address into `cold_site`, then
+    // the jump. See Note [Cold stencils].
+    for (jumps, cold, record) in colds {
+        let stub = code.len();
+        for r in jumps {
+            nexts.push((NextRef::Direct(r), stub));
+        }
+        code.extend_from_slice(&cold_entry());
+        record_refs.push((RipRel { field: stub + 3, end: stub + 7, target: 0 }, record));
+        relocs.push(RipRel { field: stub + 16, end: stub + 20, target: cold });
+    }
     while code.len() % 8 != 0 {
         code.push(0xcc);
     }
