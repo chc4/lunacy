@@ -102,6 +102,12 @@ impl Slots {
         }
     }
 
+    pub fn intersect(&mut self, other: &Slots) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a &= b;
+        }
+    }
+
     /// Whether every slot in `other` is in `self`.
     pub fn covers(&self, other: &Slots) -> bool {
         self.0.iter().zip(other.0).all(|(a, b)| b & !a == 0)
@@ -283,6 +289,59 @@ impl Region {
             }
         }
         in_loop
+    }
+
+    /// The region's loops, one per header.
+    pub fn loops(&self) -> Loops {
+        let mut loops: Vec<(usize, Vec<bool>)> = Vec::new();
+        for &(latch, header) in &self.retreating {
+            let blocks = self.loop_blocks(latch, header);
+            match loops.iter_mut().find(|(h, _)| *h == header) {
+                Some((_, inside)) => inside.iter_mut().zip(blocks).for_each(|(inside, b)| *inside |= b),
+                None => loops.push((header, blocks)),
+            }
+        }
+        Loops(
+            loops
+                .into_iter()
+                .map(|(_, inside)| {
+                    let (mut reads, mut writes) = (Slots::default(), Slots::default());
+                    for block in self.blocks.iter().zip(&inside).filter(|(_, inside)| **inside).map(|(block, _)| block) {
+                        for event in &block.events {
+                            match event {
+                                Event::Read(slot) => reads.insert(*slot),
+                                Event::Write(slot) => writes.insert(*slot),
+                                Event::Exit(slots) => reads.union(slots),
+                                Event::Flush | Event::Edge(_) => {}
+                            }
+                        }
+                    }
+                    (inside, reads, writes)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// A region's loops: per loop, whether each block is in it, and the slots its
+/// blocks read and write. Code in a loop runs more often than the code around
+/// it, the one measure of frequency that tells a hot region's blocks apart:
+/// their hotness counts down no further than the compile threshold.
+pub struct Loops(Vec<(Vec<bool>, Slots, Slots)>);
+
+impl Loops {
+    /// If the edge from `from` (outside the region, if `None`) into `to`
+    /// enters more frequent code, loops `to` is in and `from` isn't, the slots
+    /// those loops read and those they write.
+    pub fn entered(&self, from: Option<usize>, to: usize) -> Option<(Slots, Slots)> {
+        let mut entered = self.0.iter().filter(|(inside, ..)| inside[to] && !from.is_some_and(|from| inside[from])).peekable();
+        entered.peek()?;
+        let (mut reads, mut writes) = (Slots::default(), Slots::default());
+        for (_, r, w) in entered {
+            reads.union(r);
+            writes.union(w);
+        }
+        Some((reads, writes))
     }
 }
 
@@ -597,6 +656,26 @@ mod tests {
         let r = region(&[&[E(1), E(2)], &[E(2)], &[]], &[]);
         assert_eq!(check(&r, Policy::Unidirectional), vec![vec![0, 1, 2]]);
         check_liveness(&r);
+    }
+
+    #[test]
+    fn an_edge_into_a_loop_enters_more_frequent_code() {
+        // 0 enters the loop 1 -> 2 -> 1, whose block 2 holds the loop 2 -> 3
+        // -> 2; 1 exits to 4.
+        let r = region(&[&[E(1)], &[R(5), W(1), E(2), E(4)], &[W(2), E(3), E(1)], &[R(6), W(3), E(2)], &[]], &[]);
+        let loops = r.loops();
+        let slots = |slots: &[usize]| slots.iter().fold(Slots::default(), |mut set, &slot| {
+            set.insert(slot);
+            set
+        });
+        assert_eq!(loops.entered(Some(0), 1), Some((slots(&[5, 6]), slots(&[1, 2, 3]))));
+        assert_eq!(loops.entered(Some(1), 2), Some((slots(&[6]), slots(&[2, 3]))));
+        assert_eq!(loops.entered(None, 3), Some((slots(&[5, 6]), slots(&[1, 2, 3]))));
+        assert_eq!(loops.entered(Some(2), 3), None);
+        assert_eq!(loops.entered(Some(3), 2), None);
+        assert_eq!(loops.entered(Some(2), 1), None);
+        assert_eq!(loops.entered(Some(1), 4), None);
+        assert_eq!(loops.entered(None, 0), None);
     }
 
     #[test]
