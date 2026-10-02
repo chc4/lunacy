@@ -10,8 +10,8 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::specialize::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, WINDOW};
-use crate::window_alloc::{plan_trace, Cache, Emit, Packed, Placement, Rise, Step, WindowAlloc};
-use crate::trace::{Block as TraceBlock, Event, Loops, Policy, Region, Slots};
+use crate::window_alloc::{plan_trace, Cache, Emit, Packed, Placement, Step, WindowAlloc};
+use crate::trace::{Block as TraceBlock, Event, Policy, Region, Slots};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use smallvec::SmallVec;
@@ -1483,32 +1483,38 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .collect(),
         );
         let live_in = region.liveness();
-        let loops = region.loops();
         self.jctx.region_headers = region.loop_headers().map(|header| ids[header]).collect();
         let traces = region.traces(policy);
         window_dump!(self.jctx, "traces {}", traces.iter().map(|trace| trace.iter().map(|&b| ids[b].0.to_string()).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" | "));
         for (b, live) in live_in.iter().enumerate() {
             window_dump!(self.jctx, "live into block {}: {:?}", ids[b].0, live.iter().collect::<Vec<_>>());
         }
+        // How often each block has run. An edge enters more frequent code if its
+        // target has run at least twice as often as its source (blocks along
+        // one path differ by a run, as the region is compiled mid-path), or is
+        // a loop's header in its trace.
+        let runs = |b: usize| INITIAL_HOTNESS.saturating_sub(self.blocks[ids[b].0].jit_info.hotness.get());
+        let rises = |from: usize, to: usize| runs(to) > 0 && runs(to) >= 2 * runs(from);
         // The window each trace's head starts from, and the block it comes
         // from: the region's entry, the window of the thunk linked into it,
         // from outside the region; another head, the window the hottest edge
         // into it from a trace planned earlier leaves. See Note [Trace
         // allocation].
-        let mut hints: HashMap<BlockId, (usize, Cache, Option<usize>), FxBuildHasher> = HashMap::default();
-        if let Some(window) = entered {
-            hints.insert(entry, (0, window.clone(), None));
-        }
+        let mut hints: HashMap<BlockId, (usize, Cache, usize), FxBuildHasher> = HashMap::default();
         let mut plans = Plans::default();
         for trace in &traces {
             let head = ids[trace[0]];
-            let (hint, from) = hints.get(&head).map(|(_, window, from)| (window.clone(), *from)).unwrap_or_default();
+            let (hint, rise) = match hints.get(&head) {
+                _ if head == entry => (entered.cloned().unwrap_or_default(), true),
+                Some((_, window, from)) => (window.clone(), rises(*from, trace[0])),
+                None => (Cache::default(), false),
+            };
             window_dump!(self.jctx, "trace from block {} starts from {}", head.0, hint);
-            let (planned, exits) = self.plan_trace(trace, &ids, &skips, &index, &live_in, &loops, &plans, &hint, from);
+            let (planned, exits) = self.plan_trace(trace, &ids, &skips, &index, &live_in, &rises, &plans, &hint, rise);
             for (from, target, window) in exits {
                 let hotness = self.blocks[from.0].jit_info.hotness.get();
                 if hints.get(&target).is_none_or(|&(hottest, ..)| hotness < hottest) {
-                    hints.insert(target, (hotness, window, Some(index[&from])));
+                    hints.insert(target, (hotness, window, index[&from]));
                 }
             }
             plans.extend(planned);
@@ -1516,12 +1522,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         plans
     }
 
-    /// Plan one trace's window ops from `hint`, the window of an edge from the
-    /// region's block `from` or from outside it (see Note [Trace allocation]):
-    /// its blocks' residuals as steps, each block continuing into the next,
-    /// the last into its hottest target unless it jumps back into the trace.
+    /// Plan one trace's window ops from `hint`, the edge into its head entering
+    /// more frequent code if `rise` (see Note [Trace allocation]): its blocks'
+    /// residuals as steps, each block continuing into the next, the last into
+    /// its hottest target with an entry window. Every other edge is a
+    /// pseudo-use: of its target's entry window, of the slots live into it, or
+    /// for a jump back into the trace, of what the trace reads from there on.
     /// Returns its blocks' plans and, per edge leaving the trace, its source,
-    /// its target and the window it leaves.
+    /// its target and the window the plan leaves there.
     fn plan_trace(
         &self,
         trace: &[usize],
@@ -1529,22 +1537,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         skips: &[Vec<SmallVec<[usize; WINDOW]>>],
         index: &HashMap<BlockId, usize, FxBuildHasher>,
         live_in: &[Slots],
-        loops: &Loops,
+        rises: &dyn Fn(usize, usize) -> bool,
         plans: &Plans,
         hint: &Cache,
-        from: Option<usize>,
+        rise: bool,
     ) -> (Vec<(BlockId, BlockPlan)>, Vec<(BlockId, BlockId, Cache)>) {
-        let slots_of = |placement: &Placement| {
-            let mut slots = Slots::default();
-            placement.iter().flatten().for_each(|&slot| slots.insert(slot));
-            slots
-        };
-        // What a block the trace leaves into reads first: its entry window's
-        // slots, or those live into it; none for a side exit that never ran.
-        let reads = |target: BlockId, hot: bool| match self.jctx.blocks.get(&target) {
-            Some(done) => slots_of(done.window.regs()),
-            None if !hot && !cfg!(feature = "immediate_jit") && self.blocks[target.0].jit_info.hotness.get() >= INITIAL_HOTNESS => Slots::default(),
-            None => plans.get(&target).map_or(live_in[index[&target]], |plan| slots_of(&plan.entry.unpack())),
+        let window_of = |target: BlockId| match self.jctx.blocks.get(&target) {
+            Some(done) => Some(*done.window.regs()),
+            None => plans.get(&target).map(|plan| plan.entry.unpack()),
         };
         let position = |target: BlockId| trace.iter().position(|&t| ids[t] == target);
         let mut steps = Vec::new();
@@ -1556,20 +1556,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let next = trace.get(pos + 1).map(|&n| ids[n]);
             // The jump the trace goes on to `next` through: the block's last to it.
             let flow = next.and_then(|next| block.instructions.iter().rposition(|res| jump_targets(res).contains(&next)));
-            let targets = || block.instructions.iter().flat_map(jump_targets);
-            let back = targets().any(|target| position(target).is_some_and(|at| at <= pos));
-            let continues = if next.is_none() && !back {
-                targets().min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0))
-            } else {
-                None
+            let back = |target: BlockId| position(target).filter(|&at| at <= pos);
+            let continues = match next {
+                Some(_) => None,
+                None => block
+                    .instructions
+                    .iter()
+                    .flat_map(jump_targets)
+                    .filter(|&target| back(target).is_none() && window_of(target).is_some())
+                    .min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0)),
             };
-            // Whether the edge into the block enters more frequent code.
-            let rise = loops.entered(if pos == 0 { from } else { Some(trace[pos - 1]) }, b);
+            // A loop's header: a block of the trace at or after it jumps back to it.
+            let header = trace[pos..].iter().any(|&l| self.blocks[ids[l].0].instructions.iter().flat_map(jump_targets).any(|t| t == ids[b]));
             starts.push(steps.len());
-            steps.push(Step::Start(rise.map(|(mut reads, writes)| {
-                reads.intersect(&live_in[b]);
-                Rise { reads, writes }
-            })));
+            steps.push(Step::Start { rise: header || if pos == 0 { rise } else { rises(trace[pos - 1], b) } });
             let mut of = vec![None; block.instructions.len()];
             for (off, res) in block.instructions.iter().enumerate() {
                 match res {
@@ -1577,23 +1577,31 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         of[off] = Some(steps.len());
                         steps.push(Step::Op(&**w, skips[b][off].clone()));
                     }
-                    Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => steps.push(Step::Read(*idx)),
+                    Residual::Guard { .. } | Residual::NumericGuard { .. } if inline_guard(res) => {}
                     Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. } => {
-                        for target in jump_targets(res) {
-                            if Some(off) == flow && Some(target) == next {
+                        let targets = jump_targets(res);
+                        for &target in &targets {
+                            if (Some(off) == flow && Some(target) == next) || Some(target) == continues {
                                 continue;
                             }
-                            match position(target).filter(|&at| at <= pos) {
-                                Some(at) => steps.push(Step::Back(starts[at])),
-                                None => {
-                                    let hot = Some(target) == continues;
-                                    leaving.push((steps.len(), ids[b], target));
-                                    steps.push(Step::Exit { hot, reads: reads(target, hot) });
-                                }
+                            if let Some(at) = back(target) {
+                                steps.push(Step::Back(starts[at]));
+                                continue;
                             }
+                            leaving.push((steps.len(), ids[b], target));
+                            steps.push(match window_of(target) {
+                                Some(window) => Step::Exit { window, own: false },
+                                None => Step::ExitLive(live_in[index[&target]].iter().collect()),
+                            });
+                        }
+                        // Last, so the backward walk takes the trace's own
+                        // continuation before its pseudo-uses.
+                        if let Some(target) = continues.filter(|target| targets.contains(target)) {
+                            leaving.push((steps.len(), ids[b], target));
+                            steps.push(Step::Exit { window: window_of(target).expect("a continuation with a window"), own: true });
                         }
                     }
-                    Residual::Thunk(_) => {}
+                    Residual::Thunk(_) => steps.push(Step::Thunk),
                     _ => steps.push(Step::Flush),
                 }
             }
@@ -1607,7 +1615,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .enumerate()
             .map(|(pos, &b)| {
                 let start = starts[pos];
-                let rises = !plan.trivial && matches!(steps[start], Step::Start(Some(_)));
+                let rises = !plan.trivial && matches!(steps[start], Step::Start { rise: true });
                 (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), dirty: plan.dirty[start], rises, placed: placed(&step_of[pos]) })
             })
             .collect();
