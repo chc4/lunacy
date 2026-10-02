@@ -1467,10 +1467,32 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             let _ = index;
             *dest = LBoxed::from_bits(bits);
         });
-        arg = match yield YieldOp::UpvalueNative(b) {
-            ResumeArg::Boxed(bits) => yield YieldOp::ExecWindow(Rc::new(NativeUpval::new(bits, b, &[a]))),
-            _ => yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[a]))),
-        };
+        // One a slot is known to still hold is a move from that slot, or
+        // nothing if it is the destination.
+        windowed!(HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
+            #[cfg(debug_assertions)]
+            {
+                let held = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {
+                    Upvalue::Open(o) => state.vals[*o as usize],
+                    Upvalue::Closed(c) => *c.ro(owner),
+                };
+                assert_eq!(held.bits(), from.bits(), "fragile information: the slot was assumed to hold the upvalue");
+            }
+            let _ = index;
+            *to = from;
+        });
+        match yield YieldOp::UpvalueKnown(b) {
+            ResumeArg::Boxed(bits) => {
+                yield YieldOp::ExecWindow(Rc::new(NativeUpval::new(bits, b, &[a])));
+            },
+            ResumeArg::Integer(slot) if slot as usize == a => {},
+            ResumeArg::Integer(slot) => {
+                yield YieldOp::ExecWindow(Rc::new(HeldUpval::new(b, &[slot as usize, a])));
+            },
+            _ => {
+                yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[a])));
+            },
+        }
         arg = yield YieldOp::LoadUpvalue(a, b);
         return arg;
     }

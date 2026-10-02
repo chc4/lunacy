@@ -235,8 +235,9 @@ pub enum YieldOp {
                                // See Note [Field types]
     LoadUpvalue(usize, usize), // Infrom the executor that STACK[idx]'s type is the same as an UPVALUE[b].
                                // See Note [Fragile information]
-    UpvalueNative(usize), // Resumed with Boxed, the native UPVALUE[idx] holds, if the context knows
-                          // which, else Failed. See Note [Fragile information]
+    UpvalueKnown(usize), // Resumed with what the context knows of UPVALUE[idx]'s value: Boxed, the
+                         // native it holds; else Integer, a stack slot holding it; else Failed.
+                         // See Note [Fragile information]
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
                     // Note [Fragile information]
 
@@ -1471,6 +1472,14 @@ impl Context {
     fn holds(&self, slot: usize) -> Option<usize> {
         self.fragile.iter().find_map(|fact| match fact {
             Fragile::Holds { slot: held, upvalue } if *held == slot => Some(*upvalue),
+            _ => None,
+        })
+    }
+
+    /// A slot holding upvalue `upvalue`'s value, if one is known to.
+    fn held(&self, upvalue: usize) -> Option<usize> {
+        self.fragile.iter().find_map(|fact| match fact {
+            Fragile::Holds { slot, upvalue: held } if *held == upvalue => Some(*slot),
             _ => None,
         })
     }
@@ -2961,12 +2970,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::UpvalueNative(upvalue)) => {
+                CoroutineState::Yielded(YieldOp::UpvalueKnown(upvalue)) => {
                     // A native's fact is of its code, and its value is the one cell it was
                     // made with. A Lua function's is only of its prototype (what its
-                    // identity guard compares), which closure isn't known.
-                    arg = match ctx.upvalue(upvalue) {
-                        Some(CType::NativeFunction(nf)) => ResumeArg::Boxed(LBoxed::box_lvalue(LValue::NClosure(*nf)).bits()),
+                    // identity guard compares), which closure isn't known: that, like any
+                    // other value, is only known as what a slot still holds.
+                    arg = match (ctx.upvalue(upvalue), ctx.held(upvalue)) {
+                        (Some(CType::NativeFunction(nf)), _) => ResumeArg::Boxed(LBoxed::box_lvalue(LValue::NClosure(*nf)).bits()),
+                        (_, Some(slot)) => ResumeArg::Integer(slot as i32),
                         _ => ResumeArg::Failed,
                     };
                 },
