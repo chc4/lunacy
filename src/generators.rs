@@ -1445,7 +1445,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
                     // The running closure's upvalues were captured by an enclosing
                     // function, so an open one is a slot of an enclosing frame, not
                     // one of this frame's (which the window may cache).
-                    assert!(*o < state.base, "open upvalue in the running frame");
+                    debug_assert!(*o < state.base, "open upvalue in the running frame");
                     state.vals[*o as usize]
                 },
                 Upvalue::Closed(c) => *c.ro(owner),
@@ -1515,7 +1515,7 @@ pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
             match upval {
                 Upvalue::Open(o) => {
-                    assert!(o < state.base, "open upvalue in the running frame");
+                    debug_assert!(o < state.base, "open upvalue in the running frame");
                     state.vals[o] = value;
                 },
                 Upvalue::Closed(c) => set_closed(owner, c, value),
