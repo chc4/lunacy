@@ -428,8 +428,15 @@ impl WindowAlloc {
 // register. An op's operands need its run's registers, so the requests
 // crossing an op must fit in the rest of the window: if they don't, those used
 // furthest down are dropped, loaded at their use (and stored where they leave
-// the window, if dirty). A value no use requests is dead, and holds nothing. A
-// flush drops every request.
+// the window, if dirty). A value no use requests is dead, and holds nothing,
+// unless it is dirty: leaving the window would store it, so it keeps its
+// register until the op that writes its slot, which replaces it unstored. It
+// never displaces a value the trace itself uses, and is never moved: when its
+// register is wanted it is stored, as it would have been. When requests don't
+// fit, a pseudo-use of a clean value goes first (at most a load on a side
+// exit), then these and the pseudo-uses of dirty values (a store), then the
+// trace's own uses. A flush drops every
+// request.
 //
 // The ends of a trace take their uses from the traces around it, as the
 // thesis's pseudo-uses and inter-trace hints. An edge leaving the trace into a
@@ -519,6 +526,9 @@ struct Request {
     at: usize,
     /// Whether the trace's own code uses it, rather than a pseudo-use.
     own: bool,
+    /// Whether it is a dirty value no use reads, kept only until the op at
+    /// `at` writes its slot, to save its store.
+    spare: bool,
     /// In a register from after step `from` (from the trace's top, if `None`)
     /// to the use, or dropped: loaded at the use.
     kept: Option<Option<usize>>,
@@ -551,14 +561,17 @@ fn residency(steps: &[Step], width: usize, hint: &Cache, dirty: &[Slots]) -> Vec
     fn request(requests: &mut Vec<Request>, pending: &mut SmallVec<[usize; 16]>, slot: usize, at: usize, own: bool) {
         if pending.iter().all(|&id| requests[id].slot != slot) {
             pending.push(requests.len());
-            requests.push(Request { slot, at, own, kept: None });
+            requests.push(Request { slot, at, own, spare: false, kept: None });
         }
     }
-    // Drop the pending requests `over` holds, beyond `room`: pseudo-uses
-    // first, then the furthest used.
-    fn shed(requests: &[Request], pending: &mut SmallVec<[usize; 16]>, room: usize, over: impl Fn(&Request) -> bool) {
+    // Drop the pending requests `over` holds, beyond `room`: pseudo-uses of
+    // values not in `dirty` first (a load on a side exit, at most), then those
+    // of dirty values and the spare ones (a store), then the trace's own, each
+    // the furthest used first.
+    fn shed(requests: &[Request], pending: &mut SmallVec<[usize; 16]>, room: usize, dirty: &Slots, over: impl Fn(&Request) -> bool) {
+        let rank = |q: &Request| if q.own { 0 } else if q.spare || dirty.contains(q.slot) { 1 } else { 2 };
         while pending.iter().filter(|&&id| over(&requests[id])).count() > room {
-            let victim = pending.iter().copied().filter(|&id| over(&requests[id])).max_by_key(|&id| (!requests[id].own, requests[id].at)).expect("a request to drop");
+            let victim = pending.iter().copied().filter(|&id| over(&requests[id])).max_by_key(|&id| (rank(&requests[id]), requests[id].at)).expect("a request to drop");
             pending.retain(|&mut id| id != victim);
         }
     }
@@ -577,7 +590,7 @@ fn residency(steps: &[Step], width: usize, hint: &Cache, dirty: &[Slots]) -> Vec
             }
             Step::Op(op, _) => {
                 let (slots, accesses) = (op.operands(), op.accesses());
-                shed(&requests, &mut pending, width.saturating_sub(slots.len()), |q| !slots.contains(&q.slot));
+                shed(&requests, &mut pending, width.saturating_sub(slots.len()), &dirty[step], |q| !slots.contains(&q.slot));
                 for &slot in slots {
                     if let Some(at) = pending.iter().position(|&id| requests[id].slot == slot) {
                         let id = pending.remove(at);
@@ -586,6 +599,13 @@ fn residency(steps: &[Step], width: usize, hint: &Cache, dirty: &[Slots]) -> Vec
                 }
                 for (&slot, _) in slots.iter().zip(accesses).filter(|(_, a)| a.reads()) {
                     request(&mut requests, &mut pending, slot, step, true);
+                }
+                // The dirty value a write replaces, which nothing reads.
+                for (&slot, _) in slots.iter().zip(accesses).filter(|(slot, a)| a.writes() && dirty[step].contains(**slot)) {
+                    if pending.iter().all(|&id| requests[id].slot != slot) {
+                        pending.push(requests.len());
+                        requests.push(Request { slot, at: step, own: false, spare: true, kept: None });
+                    }
                 }
             }
             Step::Flush => pending.clear(),
@@ -596,7 +616,7 @@ fn residency(steps: &[Step], width: usize, hint: &Cache, dirty: &[Slots]) -> Vec
             Step::Back(start) => exposed(&steps[*start..step]).iter().for_each(|slot| request(&mut requests, &mut pending, slot, step, true)),
             Step::Thunk => dirty[step].iter().for_each(|slot| request(&mut requests, &mut pending, slot, step, false)),
         }
-        shed(&requests, &mut pending, width, |_| true);
+        shed(&requests, &mut pending, width, &dirty[step], |_| true);
     }
     for id in pending {
         if hint.position(requests[id].slot).is_some() {
@@ -630,7 +650,8 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
             trivial: true,
         };
     }
-    // The slots each step finds written in the trace since the last flush, and
+    // The slots each step finds dirty: written in the trace since the last
+    // flush, or dirty in the hint and not flushed since. And
     // where each op's inputs can be produced in place: the registers their
     // producer in the trace writes them to at the `SKIP`s where its own
     // inputs' producers can (or most can) write those in place in turn, as a
@@ -638,6 +659,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
     let mut dirty = Vec::with_capacity(steps.len());
     let mut in_place: Vec<SmallVec<[u16; 5]>> = Vec::with_capacity(steps.len());
     let mut written = Slots::default();
+    hint.dirty.iter().for_each(|&slot| written.insert(slot));
     // Per slot written since the last flush, the registers its writer can put it in.
     let mut writer: SmallVec<[(usize, u16); 16]> = SmallVec::new();
     // Per block start entered by a rising edge, the slots written since it and
@@ -674,15 +696,32 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
         }
         in_place.push(inputs);
     }
+    // A block entered by a rising edge is entered with the slots the trace
+    // writes from there on dirty: they are dirty from its start to the next
+    // flush.
+    let mut arriving = Slots::default();
+    for (step, s) in steps.iter().enumerate() {
+        dirty[step].union(&arriving);
+        match s {
+            Step::Start { rise: true } => risen.iter().filter(|r| r.0 == step).for_each(|r| arriving.union(&r.1)),
+            Step::Flush => arriving = Slots::default(),
+            _ => {}
+        }
+    }
 
     // The slots in registers before each step: those kept across it, and
     // those it uses that were kept up to it.
     let mut resident: Vec<SmallVec<[usize; WINDOW]>> = vec![SmallVec::new(); steps.len()];
-    for q in residency(steps, width, hint, &dirty) {
+    // Per step, the slots in registers only as spare values, with their request.
+    let mut spare: Vec<SmallVec<[(usize, usize); 2]>> = vec![SmallVec::new(); steps.len()];
+    for (id, q) in residency(steps, width, hint, &dirty).into_iter().enumerate() {
         if let Some(from) = q.kept {
             for step in from.map_or(0, |from| from + 1)..=q.at {
                 if !resident[step].contains(&q.slot) {
                     resident[step].push(q.slot);
+                    if q.spare {
+                        spare[step].push((q.slot, id));
+                    }
                 }
             }
         }
@@ -756,18 +795,22 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
     }
     // Forward, the values left out: each stays in the register the code above
     // leaves it in (the hint's, at the top), until that register is wanted for
-    // another value or taken by an op's run, when it moves to a free one.
+    // another value or taken by an op's run, when it moves to a free one; a
+    // spare value is left to be stored instead.
     let mut above: Placement = hint.regs;
+    let mut stored: SmallVec<[usize; WINDOW]> = SmallVec::new();
     for (step, s) in steps.iter().enumerate() {
         let run = match s {
             Step::Op(op, _) => skips[step]..skips[step] + op.operands().len(),
             _ => 0..0,
         };
         let window = &mut windows[step];
+        let spared = |slot: usize| spare[step].iter().find(|s| s.0 == slot).map(|s| s.1);
+        let stays = |window: &Placement, slot: usize| above.iter().position(|&s| s == Some(slot)).filter(|&reg| reg < width && window[reg].is_none() && !run.contains(&reg));
         let left: SmallVec<[usize; WINDOW]> = resident[step].iter().copied().filter(|slot| !window.contains(&Some(*slot))).collect();
         let mut moving: SmallVec<[usize; WINDOW]> = SmallVec::new();
-        for slot in left {
-            match above.iter().position(|&s| s == Some(slot)).filter(|&reg| reg < width && window[reg].is_none() && !run.contains(&reg)) {
+        for &slot in left.iter().filter(|&&slot| spared(slot).is_none()) {
+            match stays(window, slot) {
                 Some(reg) => window[reg] = Some(slot),
                 None => moving.push(slot),
             }
@@ -777,6 +820,15 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
             // A register nothing is in, before one whose value is no longer kept.
             let reg = (0..width).filter(free).find(|&reg| above[reg].is_none()).or_else(|| (0..width).find(free)).expect("room in the window");
             window[reg] = Some(slot);
+        }
+        // A spare value stays only in a register nothing else took.
+        for &slot in &left {
+            let Some(id) = spared(slot) else { continue };
+            match stays(window, slot).filter(|_| !stored.contains(&id)) {
+                Some(reg) => window[reg] = Some(slot),
+                None if !stored.contains(&id) => stored.push(id),
+                None => {}
+            }
         }
         above = *window;
         if let Step::Op(op, _) = s {
