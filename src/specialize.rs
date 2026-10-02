@@ -235,6 +235,8 @@ pub enum YieldOp {
                                // See Note [Field types]
     LoadUpvalue(usize, usize), // Infrom the executor that STACK[idx]'s type is the same as an UPVALUE[b].
                                // See Note [Fragile information]
+    UpvalueNative(usize), // Resumed with Boxed, the native UPVALUE[idx] holds, if the context knows
+                          // which, else Failed. See Note [Fragile information]
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
                     // Note [Fragile information]
 
@@ -2958,6 +2960,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
                     }
+                },
+                CoroutineState::Yielded(YieldOp::UpvalueNative(upvalue)) => {
+                    // A native's fact is of its code, and its value is the one cell it was
+                    // made with. A Lua function's is only of its prototype (what its
+                    // identity guard compares), which closure isn't known.
+                    arg = match ctx.upvalue(upvalue) {
+                        Some(CType::NativeFunction(nf)) => ResumeArg::Boxed(LBoxed::box_lvalue(LValue::NClosure(*nf)).bits()),
+                        _ => ResumeArg::Failed,
+                    };
                 },
                 CoroutineState::Yielded(YieldOp::LoadUpvalue(slot, upvalue)) => {
                     // See Note [Fragile information].

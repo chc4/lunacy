@@ -1453,7 +1453,24 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             debug!("upval {:?}", &upval);
             *dest = upval;
         });
-        arg = yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[a])));
+        // An upvalue the context knows holds a native is that constant, not a
+        // read. See Note [Fragile information].
+        windowed!(NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
+            #[cfg(debug_assertions)]
+            {
+                let held = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {
+                    Upvalue::Open(o) => state.vals[*o as usize],
+                    Upvalue::Closed(c) => *c.ro(owner),
+                };
+                assert_eq!(held.bits(), bits, "fragile information: another native was assumed");
+            }
+            let _ = index;
+            *dest = LBoxed::from_bits(bits);
+        });
+        arg = match yield YieldOp::UpvalueNative(b) {
+            ResumeArg::Boxed(bits) => yield YieldOp::ExecWindow(Rc::new(NativeUpval::new(bits, b, &[a]))),
+            _ => yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[a]))),
+        };
         arg = yield YieldOp::LoadUpvalue(a, b);
         return arg;
     }
