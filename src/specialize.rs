@@ -341,12 +341,12 @@ pub enum ResumeArg {
     WindowArgs(usize, CType),
 }
 
-// Initialize a hash key, a guard: `at` is `index << 8 | href`. Passes if the table's entry at
+// Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
 // `index` has the key `key` and the frame's witness for `href` has its place, populating the
-// witness. See Note [Hash witnesses]. Its failure path finds the key wherever it is
-// (`href_init_slow`), and the field's type is guarded after (`GuardWitness`), where both paths
-// meet. See Note [Field types].
-windowed!(guard HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
+// witness; its cold path finds the key wherever it is (`href_init_slow`). Exit 0 if the table has
+// the key, where the field's type is guarded (`GuardWitness`), and 1 if not. See Notes [Hash
+// witnesses] and [Field types].
+windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -362,15 +362,20 @@ windowed!(guard HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) 
         Some((epoch, value)) if hidx < state.hash_witnesses.len() => {
             state.witness_top = state.witness_top.max(hidx + 1);
             state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast() };
-            true
+            false
         },
-        _ => false,
+        _ => true,
     }
+} cold {
+    let (href, index) = (at as u8, (at >> 8) as usize);
+    href_init_slow(owner, state, table, href, index, key)
 });
 
-/// `HrefInit`'s failure path: the key isn't at `index`, or the witness's place isn't there yet,
-/// which it makes. Selects 0 if the table has the key, populating the witness, and 1 if not.
-fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, href: u8, index: usize, key: u64) {
+/// `HrefInit`'s cold path: the key isn't at `index`, or the witness's place isn't there yet,
+/// which it makes. Exit 0 if the table has the key, populating the witness, and 1 if not.
+/// `rust-cold` (LLVM's `preserve_most`), so the cold stencil calling it with its window live
+/// needn't save the window around the call.
+extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, href: u8, index: usize, key: u64) -> usize {
     let hidx = state.witness_base + href as usize;
     state.hash_witnesses.grow(hidx + 1);
     state.witness_top = state.witness_top.max(hidx + 1);
@@ -383,18 +388,18 @@ fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, '
     };
     let tab = tab.rw(owner);
     let epoch = tab.epoch;
-    state.hash_witnesses[hidx] = match found {
+    match found {
         Some(index) => {
-            state.select = 0;
             let value = tab.hash.get_index_mut(index).unwrap().1 as *mut LBoxed<'_, '_>;
-            HashWitness { epoch, index, value: value.cast() }
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast() };
+            0
         },
         None => {
             debug!("href_init missing key");
-            state.select = 1;
-            HashWitness { epoch, index, value: core::ptr::null_mut() }
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: core::ptr::null_mut() };
+            1
         },
-    };
+    }
 }
 
 /// A global's cache: where its value is in the global environment, while the
@@ -2611,7 +2616,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             // The key's canonical form, made here once. See Note [Hash witnesses].
             let key = LCanon::constant(&hkey.key).boxed().bits();
-            let href_init = Residual::GuardDynamic(Rc::new(HrefInit::new((index as u64) << 8 | href.0 as u64, key, &[idx])));
+            let href_init = Residual::ExecWindow(Rc::new(HrefInit::new((index as u64) << 8 | href.0 as u64, key, &[idx])));
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
             if !appends || vm.compiled(block_id) {
@@ -2622,19 +2627,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else {
                 vm.blocks[block_id.0].instructions[thunk_pc] = href_init;
             }
-            // Its failure finds the key elsewhere in the table, or doesn't; its pass and a key
-            // found meet at the field's type guard.
-            let slow = vm.new_block(pc.0);
+            // A key found goes on at the field's type guard.
             let typed = vm.new_block(pc.0);
-            vm.blocks[block_id.0].instructions.push(Residual::Jump(slow));
-            vm.blocks[block_id.0].instructions.push(Residual::Jump(typed));
             let missing_key = vm.new_block(pc.0);
-            let href_u8 = href.0;
-            vm.blocks[slow.0].instructions.push(Residual::Exec(ResidualExec::new("href_init", Rc::new(move |owner, state| {
-                let table = state.vals[state.base + idx];
-                href_init_slow(owner, state, table, href_u8, index, key);
-            }))));
-            vm.blocks[slow.0].instructions.push(Residual::Select(
+            vm.blocks[block_id.0].instructions.push(Residual::Select(
                 vec![("has_key", typed), ("missing_key", missing_key)]));
             let missing_coro = thunk_coro.clone();
             vm.blocks[missing_key.0].instructions.push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
