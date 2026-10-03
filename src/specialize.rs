@@ -148,6 +148,7 @@ impl std::fmt::Display for Residual {
             Residual::TailCall { entry: CallEntry::Block(block), a, b, .. } => write!(f, "tcall({}, {}, {})", block.0, a, b),
             Residual::TailCall { entry: CallEntry::Context(_), a, b, .. } => write!(f, "tcall(?, {}, {})", a, b),
             Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
+            Residual::GuardWitness { href, expected } => write!(f, "guard_witness({:?}, {})", href, expected),
             Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Select(targets) => write!(f, "select"),
@@ -301,12 +302,10 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
         self.hazards.iter_mut().for_each(|checked| *checked = false);
     }
 
-    /// Whether this index is free for a new hash key: its type is unknown and no
-    /// shape lists it. A live hash key can also have an unknown type briefly
-    /// (before its field's type is discovered), but then a shape lists it.
-    fn orphan(&self, href: HashRef, types: &[CType]) -> bool {
+    /// Whether this index is free for a new hash key: its type is unknown, which
+    /// a live hash key's never is. See Note [Field types].
+    fn orphan(&self) -> bool {
         self.known_type == LType::Unknown
-            && !types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)))
     }
 
     /// Whether blocks compiled knowing `self` are correct for a context with
@@ -338,11 +337,12 @@ pub enum ResumeArg {
     WindowArgs(usize, CType),
 }
 
-// Initialize a hash key. `at` is `index << 8 | href`. Populate the witness `at` with `key`,
-// proving it both exists and is at the correct offset `index` for `tab`. See Note [Hash witnesses].
-// Selects 0 if the table has the key and 1 if not. The key found at `index`, with the witness's
-// slot there, is the hot path; the rest is its cold stencil (Note [Cold stencils] in `window`).
-windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
+// Initialize a hash key, a guard: `at` is `index << 8 | href`. Passes if the table's entry at
+// `index` has the key `key` and the frame's witness for `href` has its place, populating the
+// witness. See Note [Hash witnesses]. Its failure path finds the key wherever it is
+// (`href_init_slow`), and the field's type is guarded after (`GuardWitness`), where both paths
+// meet. See Note [Field types].
+windowed!(guard HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -358,24 +358,17 @@ windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
         Some((epoch, value)) if hidx < state.hash_witnesses.len() => {
             state.witness_top = state.witness_top.max(hidx + 1);
             state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast() };
-            state.select = 0;
-            false
+            true
         },
-        _ => true,
+        _ => false,
     }
-} cold {
-    let (href, index) = (at as u8, (at >> 8) as usize);
-    href_init_slow(owner, state, table, href, index, key);
 });
 
-/// `HrefInit` when the key isn't at `index`, or the witness's slot isn't there yet. Also handles
-/// growing the witness vector, which is also unlikely. `rust-cold` (LLVM's `preserve_most`), so
-/// the cold stencil calling it with its window live needn't save the window around the call.
-extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, href: u8, index: usize, key: u64) {
+/// `HrefInit`'s failure path: the key isn't at `index`, or the witness's place isn't there yet,
+/// which it makes. Selects 0 if the table has the key, populating the witness, and 1 if not.
+fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, href: u8, index: usize, key: u64) {
     let hidx = state.witness_base + href as usize;
-    if state.hash_witnesses.len() <= hidx {
-        state.hash_witnesses.resize_with(hidx + 1, HashWitness::default);
-    }
+    state.hash_witnesses.grow(hidx + 1);
     state.witness_top = state.witness_top.max(hidx + 1);
     // Safety: the key is a constant's, which outlives the code using it.
     let key: LCanon<'src, 'intern> = unsafe { LCanon::from_bits(key) };
@@ -805,6 +798,10 @@ pub enum Residual {
     /// Whether the witness `href`'s index in the table in `tab` still holds its
     /// key, `key` (canonical bits), with a value of type `expected`.
     HashGuard { tab: usize, href: HashRef, key: u64, expected: LType },
+    /// Whether hash key `href`'s field, read through its witness, has type
+    /// `expected`: a `Guard` on the field rather than a slot. See Note [Field
+    /// types].
+    GuardWitness { href: HashRef, expected: LType },
     EpochCheck { tab: usize, href: HashRef },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
@@ -1033,17 +1030,25 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 // whatever table reaches the code, and tables of the same shape can hold
 // different types there (one table's field an integer, another's a double).
 //
-// So a new href starts with an unknown type, and the load after it discovers
-// the type (`FieldType`): the loaded slot gets an ordinary type guard, and the
-// type it finds becomes the hash key's too. Later loads through the same hash key
-// use that type without a guard.
+// So `href_init` is followed by a guard of the field's type, read through its
+// witness (`GuardWitness`): the href thunk guards the type it finds when forced,
+// and continues the instruction knowing it, for a load's slot and a store's
+// `Retype` alike. A failure finds the field's type and guards that in turn, each
+// type going on in a version of its own. `href_init` is itself a guard, of the
+// key's place in the table, and its failure path, finding the key elsewhere,
+// meets its pass at the field's guard.
 //
 // The type stays valid while the witness has the table's current epoch, because
 // anything that changes a field's type bumps the epoch: a witness store per its
 // `Retype` (never `Same` for an unknown type), and a generic store whose value's
 // type differs. When an access finds the epoch changed, `HashGuard` checks the
-// type again; if that fails it falls back to a fresh href, which rediscovers the
-// type and can rejoin the blocks already compiled for it.
+// type again; if that fails it falls back to a fresh href, which guards the type
+// again and can rejoin the blocks already compiled for it.
+//
+// A live hash key's type is always known: joining contexts that know different
+// types of its field (an integer on one way in, a double on another) drops it,
+// as forgetting its table's slot does, and the next access makes a fresh one. An
+// unknown type marks the index free.
 //
 // A field's type is only ever an `LType`: a shape or a function's identity
 // describes a register, not a field.
@@ -1511,7 +1516,7 @@ impl Context {
     /// [Version compatibility].
     fn accepts(&self, other: &Context) -> bool {
         self.hkeys.iter().enumerate().all(|(i, hkey)| {
-            hkey.orphan(HashRef(i as u8), &self.types) || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
+            hkey.orphan() || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
         })
             && (self.top.is_none() || self.top == other.top)
             && self.fragile_within(other)
@@ -1544,8 +1549,7 @@ impl Context {
         let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
         for (i, mine) in self.hkeys.iter_mut().enumerate() {
             match other.hkeys.get(i) {
-                Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key => {
-                    mine.known_type = mine.known_type.join(theirs.known_type);
+                Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && mine.known_type == theirs.known_type => {
                     for (slot, checked) in mine.hazards.iter_mut().enumerate() {
                         *checked &= theirs.hazards.get(slot) == Some(&true);
                     }
@@ -2231,13 +2235,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `Guard(idx, t)` (`expected` `CType::Type(t)`) or a
     /// `GuardCType(idx, expected)` ends its block in when the context can't
     /// answer it.
-    /// With `field`, the slot was just loaded from that hash key's field
-    /// (`FieldType`), whose type is the one found too. See Note [Field types].
     /// A thunk finding out the type of STACK[idx] for a guard of `expected`.
     /// A function found gets its identity guarded too, unless the chain of
     /// thunks this one is in guards `identities` of them already, `MAX_VERSIONS`
     /// (Note [Call sites]).
-    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
+    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The thunk was forced, so now we know the runtime value and if it
@@ -2285,9 +2287,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let Some((table, _)) = array.filter(|&(_, kind)| kind.count_ones() > 1) {
                 forced_mut.assume(Fragile::Kind { table, kind: LType::Unknown });
             }
-            if let Some(href) = field {
-                forced_mut.hkeys[href.0 as usize].known_type = found_field;
-            }
             // A slot holding an upvalue's value tells of the upvalue: the type the
             // guard found, and past a function's identity guard below, which
             // function. See Note [Fragile information].
@@ -2319,7 +2318,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .filter(|_| identities < MAX_VERSIONS);
             let identities = identities + idx_ctype.is_some() as usize;
             // Push the same thunk down for the next value that fails the guard
-            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected.clone(), field, pc, thunk_ctx.clone(), false, identities);
+            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected.clone(), pc, thunk_ctx.clone(), false, identities);
             vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk.clone()));
             if let Some(CType::NativeFunction(nf)) = &idx_ctype {
                 // We know this original value has the correct native function, and so can compile
@@ -2579,9 +2578,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 return;
             };
             debug!("href forced by {tab:?} -> {val:?}");
-            // Its type is found out from the value loaded, in each table. See
-            // Note [Field types].
-            hkey.known_type = LType::Unknown;
+            // The field's type in this table, which the guard after `href_init` checks in every
+            // table reaching the code. See Note [Field types].
+            let found = val.unbox().typeof_();
+            hkey.known_type = found;
             // Initialize the hkey after discovery with a cleared hazard for the index
             hkey.clear_checks();
             hkey.check(idx);
@@ -2598,8 +2598,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 thunk_mut.types[idx] = CType::Shape(vec![href].into());
             }
             // The key's canonical form, made here once. See Note [Hash witnesses].
-            let lkey = LCanon::constant(&hkey.key);
-            let href_init = Residual::ExecWindow(Rc::new(HrefInit::new((index as u64) << 8 | href.0 as u64, lkey.boxed().bits(), &[idx])));
+            let key = LCanon::constant(&hkey.key).boxed().bits();
+            let href_init = Residual::GuardDynamic(Rc::new(HrefInit::new((index as u64) << 8 | href.0 as u64, key, &[idx])));
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
             if !appends || vm.compiled(block_id) {
@@ -2610,10 +2610,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else {
                 vm.blocks[block_id.0].instructions[thunk_pc] = href_init;
             }
-            let has_key = vm.new_block(pc.0);
+            // Its failure finds the key elsewhere in the table, or doesn't; its pass and a key
+            // found meet at the field's type guard.
+            let slow = vm.new_block(pc.0);
+            let typed = vm.new_block(pc.0);
+            vm.blocks[block_id.0].instructions.push(Residual::Jump(slow));
+            vm.blocks[block_id.0].instructions.push(Residual::Jump(typed));
             let missing_key = vm.new_block(pc.0);
-            vm.blocks[block_id.0].instructions.push(Residual::Select(
-                vec![("has_key", has_key), ("missing_key", missing_key)]));
+            let href_u8 = href.0;
+            vm.blocks[slow.0].instructions.push(Residual::Exec(ResidualExec::new("href_init", Rc::new(move |owner, state| {
+                let table = state.vals[state.base + idx];
+                href_init_slow(owner, state, table, href_u8, index, key);
+            }))));
+            vm.blocks[slow.0].instructions.push(Residual::Select(
+                vec![("has_key", typed), ("missing_key", missing_key)]));
             let missing_coro = thunk_coro.clone();
             vm.blocks[missing_key.0].instructions.push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
                 debug!("missing key thunk");
@@ -2624,10 +2634,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
                 vm.jump_thunk(missing_key, thunk_pc, fail_block);
             })))));
-
-            let guard_block = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::HashRef(href, LType::Unknown));
-            vm.blocks[has_key.0].instructions.push(Residual::Jump(guard_block));
+            vm.guard_witness(owner, typed, thunk_coro.clone(), href, found, pc, thunk_ctx.clone());
         })))
+    }
+
+    /// End `block` in a `GuardWitness` of `href`'s field for `expected`, its pass continuing the
+    /// generator with the field known to be of that type, and its failure finding the field's
+    /// type and guarding that in turn. See Note [Field types].
+    fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>) {
+        let mut typed_ctx = ctx.clone();
+        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = expected;
+        let pass = self.subblock(owner, pc.next_true(), typed_ctx, thunk_coro.clone(), ResumeArg::HashRef(href, expected));
+        let fail = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
+            let found = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() }.unbox().typeof_();
+            debug!("field of {href:?} found {found}, not {expected}");
+            let next = vm.new_block(pc.0);
+            vm.jump_thunk(block, thunk_pc, next);
+            vm.guard_witness(owner, next, thunk_coro.clone(), href, found, pc, ctx.clone());
+        })));
+        self.blocks[block.0].instructions.push(Residual::GuardWitness { href, expected });
+        self.blocks[block.0].instructions.push(Residual::Thunk(fail));
+        self.blocks[block.0].instructions.push(Residual::Jump(pass));
     }
 
     fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId) {
@@ -2650,12 +2678,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.jump_thunk(block_id, thunk_pc, check_block);
             let expected = thunk_ctx.hkeys[href.0 as usize].known_type.clone();
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
-            // A field whose type isn't known has nothing to check it still has:
-            // its hash key is found again. See Note [Field types].
-            if expected == LType::Unknown {
-                vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
-                return;
-            }
+            assert_ne!(expected, LType::Unknown, "a live hash key's field has a type");
             let key = LCanon::constant(&thunk_ctx.hkeys[href.0 as usize].key).boxed().bits();
             vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected });
             vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
@@ -2796,7 +2819,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
                     // Try to find an orphaned HashKey slot to re-use
                     let href;
-                    let orphan = ctx.hkeys.iter().enumerate().position(|(i, hkey)| hkey.orphan(HashRef(i as u8), &ctx.types));
+                    let orphan = ctx.hkeys.iter().enumerate().position(|(_, hkey)| hkey.orphan());
                     if let Some(i) = orphan {
                         href = HashRef(i as u8);
                         Rc::make_mut(&mut ctx).hkeys[i] = HashKey::new(place, k_val.clone());
@@ -2852,7 +2875,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             arg = ResumeArg::MatchedConst(rk & 0xff);
                         }
                     } else {
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, expected.clone(), None, pc, ctx.clone(), true, 0));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, expected.clone(), pc, ctx.clone(), true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -2915,7 +2938,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         debug!("emitting discovery thunk");
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), None, pc, thunk_ctx, true, 0));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), pc, thunk_ctx, true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -2957,18 +2980,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
                     let known = ctx.hkeys[href.0 as usize].known_type.clone();
+                    assert_ne!(known, LType::Unknown, "a live hash key's field has a type");
                     Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, CType::Type(known))]);
-                    if known != LType::Unknown {
-                        (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &CType::Type(known));
-                    } else {
-                        // Record the type on the hash key too, unless the load overwrote
-                        // the table's register and dropped its hash keys.
-                        let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Type(LType::Unknown), live.then_some(href), pc, ctx.clone(), true, 0));
-                        self.end_block(block_id);
-                        self.blocks[block_id.0].instructions.push(thunk);
-                        return None;
-                    }
+                    (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &CType::Type(known));
                 },
                 CoroutineState::Yielded(YieldOp::UpvalueKnown(upvalue)) => {
                     // A native's fact is of its code, and its value is the one cell it was
@@ -3337,6 +3351,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                     }
                 },
+                &Residual::GuardWitness { href, expected } => {
+                    let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
+                    let value = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() };
+                    off += if expected.accepts(value.unbox().typeof_()) { 2 } else { 1 };
+                },
                 &Residual::EpochCheck { tab, href } => {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let tab = state.table_at(tab);
@@ -3613,7 +3632,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Residual::NativeCall { nf, a, b, c }  => {
                             edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("\"{:p}\"", nf)); attr!("label", "ncall"))));
                         },
-                        Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
+                        Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::GuardWitness { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
                             if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
                                 edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "pass"))));
                             }

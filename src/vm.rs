@@ -1423,6 +1423,52 @@ impl Default for HashWitness {
 // collector doesn't move tables. Field reads and writes go through the
 // address; the paths repairing a witness after the epoch changes find the
 // entry again by its index.
+//
+// JIT code reads a witness inline (`GuardWitness`), so `Witnesses` keeps the
+// address of the first one where it can load it: only growing the vector moves
+// it, and only `Witnesses::grow` grows it.
+
+/// The hash witnesses of every frame. See Note [Hash witnesses].
+pub struct Witnesses {
+    /// The address of the first witness, for JIT code (`Witnesses::DATA`).
+    data: *mut HashWitness,
+    vec: FVec<HashWitness>,
+}
+
+impl Witnesses {
+    /// Where in a `Witnesses` the first witness's address is.
+    pub const DATA: usize = core::mem::offset_of!(Witnesses, data);
+
+    pub fn new() -> Self {
+        let mut vec: FVec<HashWitness> = vec![].into();
+        Witnesses { data: vec.as_mut_ptr(), vec }
+    }
+
+    pub fn len(&self) -> usize {
+        self.vec.len()
+    }
+
+    /// Make room for `len` witnesses.
+    pub fn grow(&mut self, len: usize) {
+        if self.vec.len() < len {
+            self.vec.resize_with(len, HashWitness::default);
+            self.data = self.vec.as_mut_ptr();
+        }
+    }
+}
+
+impl Index<usize> for Witnesses {
+    type Output = HashWitness;
+    fn index(&self, index: usize) -> &HashWitness {
+        &self.vec[index]
+    }
+}
+
+impl IndexMut<usize> for Witnesses {
+    fn index_mut(&mut self, index: usize) -> &mut HashWitness {
+        &mut self.vec[index]
+    }
+}
 
 pub struct RunState<'src, 'intern> {
     pub base: usize,
@@ -1456,7 +1502,7 @@ pub struct RunState<'src, 'intern> {
     pub witness_base: usize,
     /// The end of the innermost frame's hash witnesses. See Note [Hash witnesses].
     pub witness_top: usize,
-    pub hash_witnesses: FVec<HashWitness>,
+    pub hash_witnesses: Witnesses,
     pub trap: bool,
     pub current_off: u16,
     /// What a return from JIT code leaves the JIT code with: where its caller
@@ -2088,7 +2134,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 upvals,
                 callstack,
                 counters: Default::default(),
-                hash_witnesses: vec![].into(),
+                hash_witnesses: Witnesses::new(),
                 select: 0,
                 trap: false,
                 #[cfg(feature = "magic")]
