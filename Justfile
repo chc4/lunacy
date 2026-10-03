@@ -794,11 +794,15 @@ hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
 bench-vs base head build='unsafe padded':
     python3 tools/bench_history.py vs {{base}} {{head}} --build "{{build}}"
 
-# `hyperfine-padding` over HYPERFINES.
+# `hyperfine-padding` over HYPERFINES, then the JIT code size of each
+# benchmark into the size history: this checkout's (`jit-sizes`), and with
+# `ref` revision `ref`'s (`jit-size-rev`).
 hyperfines-padding paddings='0,1,2,4,8,16' ref='':
     #!/usr/bin/env bash
     set -euo pipefail
     for run in {{HYPERFINES}}; do just hyperfine-padding ${run%:*} ${run#*:} {{paddings}} {{ref}}; done
+    just jit-sizes
+    if [ -n "{{ref}}" ]; then just jit-size-rev {{ref}}; fi
 
 # `hyperfine-vs ref` over HYPERFINES, then every comparison's table.
 hyperfines-vs ref:
