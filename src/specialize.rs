@@ -243,7 +243,6 @@ pub enum YieldOp {
                     // Note [Fragile information]
 
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key].
-    TryHashKey(usize, usize), // Look up but do not allocate an HREF.
     UpdateHashRef(HashRef, LType), // Update the type of HREF to a new type
     GlobalCache(usize), // Resumed with a Cache for global CONSTANT[k]. See
                         // Note [Global caches]
@@ -2770,15 +2769,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::Failed;
                     continue 'machine;
                 },
-                op @ CoroutineState::Yielded(YieldOp::HashKey(..) | YieldOp::TryHashKey(..)) => {
+                CoroutineState::Yielded(YieldOp::HashKey(place, key)) => {
                     let proto = self.clos.ro(owner).prototype;
-                    // The table's slot, the constant key, and whether to make a hash key
-                    // if none exists yet.
-                    let (place, k_const, allocate) = match op {
-                        CoroutineState::Yielded(YieldOp::HashKey(idx, key)) => (idx, ((key & 0x100) != 0).then_some(key & 0xff), true),
-                        CoroutineState::Yielded(YieldOp::TryHashKey(idx, key)) => (idx, ((key & 0x100) != 0).then_some(key & 0xff), false),
-                        _ => unreachable!(),
-                    };
+                    // The constant key.
+                    let k_const = ((key & 0x100) != 0).then_some(key & 0xff);
                     // Only cache string keys
                     let Some(k_val) = k_const
                         .map(|k| unsafe { &(&(*proto).constants.items)[k] })
@@ -2818,11 +2812,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(Residual::Jump(holds_block));
                         return None;
-                    }
-                    if !allocate {
-                        pc = pc.next_false();
-                        arg = ResumeArg::Failed;
-                        break 'machine;
                     }
                     // We need these HashKeys to not have a lifetime, so that they can be
                     // captured by the generator: we only ever store the generator in the

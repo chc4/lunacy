@@ -471,6 +471,12 @@ windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, s
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     store_field(owner, state, tab, value, href, expected, RETYPE);
 });
+windowed!(SetTableHrefK, [href: u8, expected: LType, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    // A constant's value lives as long as its prototype.
+    let value = LBoxed::from_bits(value);
+    store_field(owner, state, tab, value, href, expected, RETYPE);
+});
 
 pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
@@ -643,10 +649,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             yield YieldOp::Effect(Effect::ArrayStore(stored));
         } else {
             // Hash part set
-            arg = ResumeArg::Failed;
-            // Only a hash key a load already made: making one costs a lookup (`HrefInit`)
-            // each activation, which a field only stored once repays nothing.
-            arg = yield YieldOp::TryHashKey(a, b);
+            arg = yield YieldOp::HashKey(a, b);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 count_store!(field_stores);
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
@@ -660,15 +663,12 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Retype::Unknown => Rc::new(SetTableHref::<{ Retype::Unknown }>::new(hb.0, expected, &[a, c])),
                     });
                 } else {
-                    arg = yield YieldOp::Exec(ResidualExec::new("settable_href", Rc::new(move |owner, state| {
-                        let table = state.vals[state.base + a];
-                        let value: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                            Ok(c) => LBoxed::from(c),
-                            Err(lv) => *lv,
-                        };
-                        let LValue::Table(table) = table.unbox() else { unreachable!() };
-                        store_field(owner, state, table, value, hb.0, expected, retype);
-                    })));
+                    let ResumeArg::Boxed(value) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
+                    arg = yield YieldOp::ExecWindow(match retype {
+                        Retype::Same => Rc::new(SetTableHrefK::<{ Retype::Same }>::new(hb.0, expected, value, &[a])) as Rc<dyn Window>,
+                        Retype::Known => Rc::new(SetTableHrefK::<{ Retype::Known }>::new(hb.0, expected, value, &[a])),
+                        Retype::Unknown => unreachable!("a constant of unknown type"),
+                    });
                 }
                 arg = match retype {
                     Retype::Same => yield YieldOp::SetHazards(Some(a), Some(hb)),
