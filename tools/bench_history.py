@@ -10,7 +10,9 @@ changes to what builds it, its HEAD marked dirty. A run over a `padding`
 parameter (`just hyperfine-padding`: the build at each `LUNACY_JIT_PADDING`) is
 one line per build, named `<build> padded`: its times are every padding's,
 pooled, so its box and whiskers span where the JIT's code lands, and
-`paddings` keeps each padding's own.
+`paddings` keeps each padding's own. A commit and build recorded again keeps
+every line, and what reads the history pools them, as one result of all their
+runs; a dirty HEAD's newest line stands alone, as it may be of other changes.
 
 `report` prints, per benchmark and build, the latest commit's time, the
 current dirty one's, the best and the first recorded, flagging a time worse
@@ -18,6 +20,7 @@ than the best or the commit before it by more than noise. `plot` writes the
 same history as an HTML page of charts, one per benchmark (working/history.html):
 each commit's runs as a box and whiskers per build, in commit order, and the
 dirty ones apart, with the JIT code size of each commit on a second axis.
+`vs` compares two revisions' pooled times on one build, benchmark by benchmark.
 `attach-times` adds the runs' times to results recorded without them, from the
 hyperfine exports they came from.
 
@@ -187,6 +190,32 @@ def sizes_vs(args):
         print(f"{bench + ' ' + arg:24} {cells[0]} {cells[1]} {change:>8}")
 
 
+def times_vs(args):
+    """Each benchmark's pooled time for revision `base` and for `head`, as `build`,
+    fastest change first: their medians and its change, at how many paddings
+    `head`'s median is the lower, whether their quartile boxes are apart; and the
+    changes' geometric mean."""
+    base, head = commit_info(args.base)[0], commit_info(args.head)[0]
+    data, _ = series()
+    rows = []
+    for key, builds in data.items():
+        old, new = builds.get(args.build, {}).get(base), builds.get(args.build, {}).get(head)
+        if not (old and new):
+            continue
+        ob, nb = box(old), box(new)
+        both = sorted(set(old.get('paddings', {})) & set(new.get('paddings', {})), key=int)
+        wins = sum(statistics.median(new['paddings'][p]) < statistics.median(old['paddings'][p]) for p in both)
+        apart = nb['q3'] < ob['q1'] or ob['q3'] < nb['q1']
+        rows.append((nb['median'] / ob['median'] - 1, key, ob['median'], nb['median'],
+                     f"{wins}/{len(both)}" if both else '', 'apart' if apart else 'overlap'))
+    print(f"{'benchmark':24} {args.base[:10]:>10} {args.head[:10]:>10} {'change':>8} {'faster at':>9}  boxes")
+    for change, (bench, arg), om, nm, wins, apart in sorted(rows):
+        print(f"{bench + ' ' + arg:24} {om:10.4f} {nm:10.4f} {change * 100:+7.1f}% {wins:>9}  {apart}")
+    if rows:
+        geomean = statistics.geometric_mean([1 + r[0] for r in rows]) - 1
+        print(f"geometric mean of {len(rows)}: {geomean * 100:+.2f}%")
+
+
 def attach_times(args):
     """Add each hyperfine export's runs' times to the results recorded from it,
     which have its benchmark, argument, build and mean."""
@@ -230,9 +259,26 @@ def box(r):
             'outliers': len(times) - len(inside)}
 
 
+def pool(a, b):
+    """One result of two of the same commit and build: their runs together, and
+    over paddings each padding's runs together."""
+    times = a['times'] + b['times']
+    pooled = dict(b, times=times, runs=len(times), mean=statistics.mean(times),
+                  stddev=statistics.stdev(times), median=statistics.median(times),
+                  min=min(times), max=max(times))
+    if 'paddings' in a or 'paddings' in b:
+        paddings = defaultdict(list)
+        for r in (a, b):
+            for padding, runs in r.get('paddings', {}).items():
+                paddings[padding] += runs
+        pooled['paddings'] = dict(paddings)
+    return pooled
+
+
 def series():
-    """(benchmark, arg) -> build -> commit -> its newest clean result, and the
-    newest dirty result of HEAD, keyed 'dirty'; and the commits' info."""
+    """(benchmark, arg) -> build -> commit -> all its clean results pooled, and
+    the newest dirty result of HEAD, keyed 'dirty' (each dirty result may be of
+    other changes); and the commits' info."""
     head, _ = head_state()
     out = defaultdict(lambda: defaultdict(dict))
     commits = {}
@@ -244,7 +290,8 @@ def series():
             continue
         if r['commit'] not in commits:
             commits[r['commit']] = commit_info(r['commit'])
-        out[key][r['build']][r['commit']] = r
+        runs = out[key][r['build']]
+        runs[r['commit']] = pool(runs[r['commit']], r) if r['commit'] in runs else r
     return out, {c: i for c, i in commits.items() if i is not None}
 
 
@@ -486,6 +533,11 @@ def main():
     v = sub.add_parser('sizes-vs', help="this checkout's JIT code sizes against a revision's")
     v.add_argument('ref')
     v.set_defaults(func=sizes_vs)
+    w = sub.add_parser('vs', help="one revision's times against another's, every run of each pooled")
+    w.add_argument('base')
+    w.add_argument('head')
+    w.add_argument('--build', default='unsafe padded')
+    w.set_defaults(func=times_vs)
     a = sub.add_parser('attach-times', help='add the runs\' times to results recorded without them')
     a.add_argument('json', nargs='+', help='the hyperfine exports they were recorded from')
     a.set_defaults(func=attach_times)

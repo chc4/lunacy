@@ -787,6 +787,13 @@ hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
         "LUNACY_JIT_PADDING={padding} {build} working/{{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record $out.json --benchmark {{benchmark}} --arg {{times}} ${ref:+--ref $ref}
 
+# Revision `head`'s times against revision `base`'s in the benchmark history, as
+# `build`, every run of each pooled: per benchmark their medians, at how many
+# paddings `head` is faster, and whether their quartile boxes are apart
+# (tools/bench_history.py `vs`).
+bench-vs base head build='unsafe padded':
+    python3 tools/bench_history.py vs {{base}} {{head}} --build "{{build}}"
+
 # `hyperfine-padding` over HYPERFINES.
 hyperfines-padding paddings='0,1,2,4,8,16' ref='':
     #!/usr/bin/env bash
