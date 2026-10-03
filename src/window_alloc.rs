@@ -69,7 +69,7 @@ pub const SCRATCH: usize = WINDOW;
 
 /// Window registers the JIT allocates: the first `ALLOCATED` of the `WINDOW` a
 /// stencil passes on. The rest are passed through every op untouched.
-pub const ALLOCATED: usize = 8;
+pub const ALLOCATED: usize = 7;
 const _: () = assert!(ALLOCATED <= WINDOW);
 
 const MEMORY_COST: u32 = 4;
