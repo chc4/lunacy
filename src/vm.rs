@@ -567,8 +567,33 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// `set`, a value stored in the array part widening its kind as `W` says.
     #[inline]
     pub fn set_widening<const W: Widen>(&mut self, owner: &mut Owner, key: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) {
+        if let Some(n) = key.as_number() {
+            return self.set_number_widening::<W>(owner, n, value);
+        }
         self.barrier_back();
-        if let Some(slot) = key.as_number().and_then(array_slot) {
+        let k = LCanon::new(key, intern);
+        self.rw(owner).insert_hash(k, value);
+        self.rw(owner).epoch += 1;
+    }
+
+    /// Look up a number key, which needs no intern arena to canonicalize.
+    pub fn get_number(&self, owner: &Owner, n: f64) -> LBoxed<'src, 'intern> {
+        match array_slot(n) {
+            Some(slot) => self.ro(owner).array.get(slot).copied().unwrap_or(LBoxed::NIL),
+            None => self.ro(owner).hash.get(&LCanon::number(n)).copied().unwrap_or(LBoxed::NIL),
+        }
+    }
+
+    /// `set` of a number key, which needs no intern arena to canonicalize.
+    pub fn set_number(&mut self, owner: &mut Owner, n: f64, value: LBoxed<'src, 'intern>) {
+        self.set_number_widening::<{ Widen::Decode }>(owner, n, value)
+    }
+
+    /// `set_widening` of a number key.
+    #[inline]
+    fn set_number_widening<const W: Widen>(&mut self, owner: &mut Owner, n: f64, value: LBoxed<'src, 'intern>) {
+        self.barrier_back();
+        if let Some(slot) = array_slot(n) {
             // Nil past the end is no store, and nil into the last element
             // shortens the array part. See Note [Array length].
             if value.bits() == LBoxed::NIL.bits() {
@@ -591,8 +616,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
             self.rw(owner).widen_by(W, value);
             return;
         }
-        let k = LCanon::new(key, intern);
-        self.rw(owner).insert_hash(k, value);
+        self.rw(owner).insert_hash(LCanon::number(n), value);
         self.rw(owner).epoch += 1;
     }
 }

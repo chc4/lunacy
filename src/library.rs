@@ -556,21 +556,29 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     let table_lib = module(intern, vec![
         ("new", table_new.clone()),
         ("clear", table_clear.clone()),
+        // Lua 5.1's `tinsert`: the value goes at the position, or at the end
+        // (`#t + 1`) without one. A position from 1 to the end moves the
+        // elements from it up one; one past the end moves nothing; one below 1
+        // moves every element up one, down to the position.
         ("insert", native!(|owner, args| {
-            let t = table(arg(&args, 0));
-            t.barrier_back();
-            let tab = t.rw(owner);
+            let mut t = table(arg(&args, 0));
             let value = arg(&args, args.len() - 1);
-            match args.len() {
-                2 => tab.array.push(value),
-                _ => {
-                    let at = (number(arg(&args, 1)) as usize).clamp(1, tab.array.len() + 1) - 1;
-                    tab.array.insert(at, value);
+            let end = t.ro(owner).array.len() as i64 + 1;
+            let pos = if args.len() == 2 { end } else { number(arg(&args, 1)) as i64 };
+            if (1..=end).contains(&pos) {
+                t.barrier_back();
+                let tab = t.rw(owner);
+                tab.array.insert(pos as usize - 1, value);
+                tab.widen_kind(value.representation());
+                // See Note [Array length].
+                tab.trim();
+            } else {
+                for i in (pos + 1..=end.max(pos)).rev() {
+                    let moved = t.get_number(owner, (i - 1) as f64);
+                    t.set_number(owner, i as f64, moved);
                 }
+                t.set_number(owner, pos as f64, value);
             }
-            tab.widen_kind(value.representation());
-            // See Note [Array length].
-            tab.trim();
             smallvec![]
         })),
         ("remove", native!(|owner, args| {
