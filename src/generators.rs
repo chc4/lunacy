@@ -230,28 +230,44 @@ windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
 
 // GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
 // [Global caches].
+// A cache that misses is refilled out of line.
 windowed!(GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
-    let entry = match cache.hit() {
+    match cache.hit() {
         Some(entry) => {
             #[cfg(debug_assertions)]
             {
                 let key: &LCanon<'_, '_> = core::mem::transmute(&cache.key);
                 assert_eq!(state._G.ro(owner).hash.get(key).map(|value| value as *const _ as usize), Some(entry as usize), "a stale global cache");
             }
-            Some(entry)
+            *dest = *entry.cast();
+            false
         },
-        None => cache.refill(owner, &state._G),
-    };
-    *dest = entry.map_or(LBoxed::NIL, |entry| *entry.cast());
+        None => true,
+    }
+} rejoin {
+    let cache = &*(cache as *const GlobalCache);
+    *dest = cache.refill(owner, &state._G).map_or(LBoxed::NIL, |entry| *entry.cast());
 });
+// A store that hits the cache and keeps the field's type stores in place; any
+// other, or one needing the write barrier, goes out of line.
 windowed!(SetGlobal, [cache: usize], [], |owner, state, base| (value) {
+    let cache = &*(cache as *const GlobalCache);
+    match cache.hit() {
+        // Hash keys of registers holding the environment know a field's type
+        // by its epoch. See Note [Field types].
+        Some(entry) if !state._G.barrier_pending() && (*entry.cast::<LBoxed<'_, '_>>()).unbox().typeof_() == value.unbox().typeof_() => {
+            *entry.cast::<LBoxed<'_, '_>>() = value;
+            false
+        },
+        _ => true,
+    }
+} rejoin {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit().or_else(|| cache.refill(owner, &state._G)) {
         Some(entry) => {
             let entry = &mut *entry.cast::<LBoxed<'_, '_>>();
-            // Hash keys of registers holding the environment know a field's type
-            // by its epoch. See Note [Field types].
+            // See Note [Field types].
             if entry.unbox().typeof_() != value.unbox().typeof_() {
                 state._G.rw(owner).epoch += 1;
             }
@@ -443,8 +459,9 @@ fn retype(new_type: LType, htype: LType) -> Retype {
 }
 
 /// Store through `href`'s witness into `tab`, bumping the table's epoch if the
-/// field's type changes. See `Retype`.
-fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: LType, retype: Retype) {
+/// field's type changes (see `Retype`), and leaving its write barrier to the
+/// caller, after it.
+fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: LType, retype: Retype) {
     let hidx = state.witness_base + href as usize;
     let witness = state.hash_witnesses[hidx];
     debug!("settable_href with {:?} {:?}", &witness, expected);
@@ -462,20 +479,28 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
         }
         Retype::Unknown => tab.rw(owner).epoch += 1,
     }
-    // Last. See Note [Write barriers].
-    tab.barrier_back();
 }
 
 // Store through a hash key's witness into a register's table.
 windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, state, base| (table, value) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    store_field(owner, state, tab, value, href, expected, RETYPE);
+    store_field(owner, state, &tab, value, href, expected, RETYPE);
+    // Last. See Note [Write barriers].
+    tab.barrier_pending()
+} rejoin {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    tab.barrier_slow();
 });
 windowed!(SetTableHrefK, [href: u8, expected: LType, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     // A constant's value lives as long as its prototype.
     let value = LBoxed::from_bits(value);
-    store_field(owner, state, tab, value, href, expected, RETYPE);
+    store_field(owner, state, &tab, value, href, expected, RETYPE);
+    // Last. See Note [Write barriers].
+    tab.barrier_pending()
+} rejoin {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    tab.barrier_slow();
 });
 
 pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -571,7 +596,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 store_array::<W, N>(owner, &tab, integer_slot(k), value);
                 // Last. See Note [Write barriers].
-                tab.barrier_back();
+                tab.barrier_pending()
+            } rejoin {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                tab.barrier_slow();
             });
             windowed!(SetTableArrayK, [k: i32, value: u64], [W: Widen, N: bool], |owner, state, base| (table) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -579,7 +607,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let value = LBoxed::from_bits(value);
                 store_array::<W, N>(owner, &tab, integer_slot(k), value);
                 // Last. See Note [Write barriers].
-                tab.barrier_back();
+                tab.barrier_pending()
+            } rejoin {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                tab.barrier_slow();
             });
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {
@@ -599,7 +630,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 store_array::<W, N>(owner, &tab, integer_slot(key.as_int()), value);
                 // Last. See Note [Write barriers].
-                tab.barrier_back();
+                tab.barrier_pending()
+            } rejoin {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                tab.barrier_slow();
             });
             windowed!(SetTableIntegerK, [value: u64], [W: Widen, N: bool], |owner, state, base| (table, key) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -607,7 +641,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let value = LBoxed::from_bits(value);
                 store_array::<W, N>(owner, &tab, integer_slot(key.as_int()), value);
                 // Last. See Note [Write barriers].
-                tab.barrier_back();
+                tab.barrier_pending()
+            } rejoin {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                tab.barrier_slow();
             });
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {
@@ -1572,15 +1609,21 @@ fn set_closed<'src, 'intern>(owner: &mut Owner, cell: Tc<LBoxed<'src, 'intern>>,
 pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
+        // A closed upvalue is stored out of line.
         windowed!(SetUpval, [index: usize], [], |owner, state, base| (value) {
             let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
             match upval {
                 Upvalue::Open(o) => {
                     debug_assert!(o < state.base, "open upvalue in the running frame");
                     state.vals[o] = value;
+                    false
                 },
-                Upvalue::Closed(c) => set_closed(owner, c, value),
+                Upvalue::Closed(_) => true,
             }
+        } rejoin {
+            let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
+            let Upvalue::Closed(c) = upval else { unreachable!("an upvalue closed by its store") };
+            set_closed(owner, c, value);
         });
         arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, &[a])));
         yield YieldOp::Effect(Effect::SetUpvalue(b));

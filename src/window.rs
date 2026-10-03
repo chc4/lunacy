@@ -399,7 +399,8 @@ pub(crate) use bind_record;
 /// A `cold { .. }` block after the body is the op's cold path: the body then
 /// evaluates to whether to take it, and the cold block, with the same bindings,
 /// runs after it when it does, in a stencil of its own. See Note [Cold
-/// stencils].
+/// stencils]. A `rejoin { .. }` block in its place is a cold path that always
+/// goes on at the op's only exit: the op selects nothing.
 ///
 /// `windowed!(guard Name, ...)` declares a dynamic guard's op, whose body
 /// evaluates to whether it passes: the op selects 0 when it does, and its
@@ -457,6 +458,20 @@ macro_rules! windowed {
         [$($cp:ident : $cpt:ty),* $(,)?],
         |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
         $body:block
+        rejoin $rejoin:block
+    ) => {
+        $crate::window::windowed!(@sort
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [{ let () = $rejoin; 0 }] [rejoin]]
+            [] [] [] (0usize) $($operands)*
+        );
+    };
+    (
+        $(#[$meta:meta])*
+        $name:ident,
+        [$($cap:ident : $cty:ty),* $(,)?],
+        [$($cp:ident : $cpt:ty),* $(,)?],
+        |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
+        $body:block
         $(cold $cold:block)?
     ) => {
         $crate::window::windowed!(@sort
@@ -467,15 +482,17 @@ macro_rules! windowed {
     // `code`, if the op has a second exit: a guard's or a select's. See Note
     // [Window exits].
     (@if_exit1 [] $($code:tt)*) => {};
+    (@if_exit1 [rejoin] $($code:tt)*) => {};
     (@if_exit1 [$kind:ident] $($code:tt)*) => {
         $($code)*
     };
-    // `code`, if the op selects: it has exits, or a cold path. See Note
-    // [Window exits].
+    // `code`, if the op selects: it has exits, or a cold path that doesn't
+    // rejoin. See Note [Window exits].
     (@if_selects [] [] $($code:tt)*) => {};
     (@if_selects [$cold:block] [] $($code:tt)*) => {
         $($code)*
     };
+    (@if_selects [$cold:block] [rejoin] $($code:tt)*) => {};
     (@if_selects [] [$kind:ident] $($code:tt)*) => {
         $($code)*
     };
@@ -485,7 +502,7 @@ macro_rules! windowed {
     (@run [] $body:block) => {
         { let () = unsafe { $body }; 0 }
     };
-    (@run [] $body:block, $cold:block) => {
+    (@run [$($rejoin:ident)?] $body:block, $cold:block) => {
         if unsafe { $body } { $crate::window::TO_COLD } else { 0 }
     };
     (@run [guard] $body:block) => {
@@ -1498,6 +1515,12 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 // cold block, and ends in a tail jump to where the record has the cold block's
 // exit go, the window where the cold block left it: as the copy's exit does
 // (Note [Window exits]).
+//
+// A cold path that rejoins (`rejoin`) always goes on at exit 0, as the op's
+// hot path does: the op has one exit, which both of its record's addresses
+// are, and selects nothing. A slow path the op only sometimes takes (a call
+// to refill a cache, or a write barrier in a collection cycle) is one, kept
+// out of every copy.
 //
 // A site costs its record and its way in, and no more of the pool: its capture
 // values are the pool's, shared with every copy capturing the same.

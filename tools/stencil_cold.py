@@ -12,7 +12,9 @@ its jump to its op's continuation (`__next`). Then, per stencil:
   above     cold blocks at a lower address than a tailcall;
   rejoins   blocks at a higher address than a tailcall jumping to a block at a
             lower address than it: out-of-line code jumping back up into the
-            path to the tailcall.
+            path to the tailcall;
+  calls     calls that return, and what they call: slow paths in the stencil,
+            copied with every copy of it, rather than in its cold stencil.
 
 It prints how many stencils have each, and lists them. With `--dump FILE`, it
 also writes every stencil's assembly to FILE.
@@ -127,6 +129,17 @@ def analyse(code):
     return cold, above, rejoins
 
 
+def calls(code):
+    """The functions a stencil calls that return: its slow paths copied into
+    every copy of it, with what the call keeps of the window around it."""
+    out = []
+    for _, mnem, ops in code:
+        if mnem == 'call' and 'panic' not in ops:
+            m = TARGET.match(ops.strip())
+            out.append(m.group(2) if m and m.group(2) else ops.strip())
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('binary')
@@ -146,6 +159,10 @@ def main():
         print('%s: %d of %d stencils' % (name, len(having), len(found)))
         for op in having:
             print('    %s' % op)
+    calling = sorted((op, calls(code), len(code)) for op, code in found.items() if calls(code))
+    print('calls: %d of %d stencils' % (len(calling), len(found)))
+    for op, callees, size in calling:
+        print('    %s (%d instructions): %s' % (op, size, ', '.join(callees)))
 
 
 if __name__ == '__main__':
