@@ -232,6 +232,30 @@ pub fn check_operands(name: &str, operands: &[usize], accesses: &[Access]) {
     }
 }
 
+// Note [Window exits]
+// ~~~~~~~~~~~~~~~~~~~
+// A window op continues at one of its exits: 0, or for an op with a second exit, 1.
+// Its body evaluates to which: a plain op's always 0, a guard's 1 when it passes, a
+// select's (`windowed!(select ..)`) what it evaluates to, and an op with a cold path
+// takes it (`TO_COLD`) or exit 0, its cold block evaluating to its exit. Run by the
+// interpreter, an op that selects selects its exit (`state.select`), which the residual
+// after it reads: a `Select`, a `Branch`, or the `GuardDynamic` it is.
+//
+// A stencil instead ends in a continuation per exit, `__next` for exit 0 and `__exit1`
+// for exit 1, and in `__to_cold` for its cold path. The JIT points each where its
+// exit goes: a guard's at its edges, an op's before a `Select` or `Branch` at that
+// residual's targets, so the code after the op branches on its exit directly and the
+// residual emits no test of `select`; anywhere else, at code storing the exit to
+// `select`. The cold stencil continues where its site's record says its exit goes
+// (Note [Cold stencils]).
+
+/// The exit of a body taking its cold path. See Note [Window exits].
+pub const TO_COLD: usize = 2;
+
+/// How many exits a window op can have: the addresses a site's record holds. See
+/// Notes [Window exits] and [Cold stencils].
+pub const EXITS: usize = 2;
+
 // ---- the Window trait -----------------------------------------------------
 
 /// A copy&patch window op, as stored in `Residual::ExecWindow`.
@@ -263,10 +287,16 @@ pub trait Window: std::fmt::Debug {
     fn to_cold(&self) -> Option<usize> {
         None
     }
-    /// Address of a guard op's second continuation, which its stencils jump to
-    /// when it passes. See Note [Guard stencils].
-    fn pass(&self) -> Option<usize> {
+    /// Address of the continuation of the op's second exit, a guard's or a
+    /// select's, which its stencils jump to to take it. See Note [Window
+    /// exits].
+    fn exit1(&self) -> Option<usize> {
         None
+    }
+    /// Whether the op selects its exit: has a second exit, or a cold path,
+    /// whose exit is either. See Note [Window exits].
+    fn selects(&self) -> bool {
+        false
     }
     /// Run the body on the window `w` at `skip`, with the captures from `self`.
     unsafe fn run<'src, 'intern>(
@@ -328,14 +358,14 @@ macro_rules! bind_holes {
 pub(crate) use bind_holes;
 
 /// Bind each capture through a site's record, `I` counting up from 0: the
-/// record's `I`th displacement, after its fall-through address, is from the
-/// record to the capture's value. See Note [Cold stencils].
+/// record's `I`th displacement, after its exits' addresses, is from the record
+/// to the capture's value. See Note [Cold stencils].
 #[doc(hidden)]
 macro_rules! bind_record {
     ($site:ident, $idx:expr;) => {};
     ($site:ident, $idx:expr; $cap:ident : $cty:ty $(, $rcap:ident : $rcty:ty)*) => {
         let $cap: $cty = unsafe {
-            let displacement = *($site.add(1) as *const i32).add($idx);
+            let displacement = *($site.add($crate::window::EXITS) as *const i32).add($idx);
             <$cty as $crate::window::Capture>::from_bits(*($site as *const u8).offset(displacement as isize).cast::<u64>())
         };
         $crate::window::bind_record!($site, $idx + 1; $($rcap : $rcty),*);
@@ -373,7 +403,7 @@ pub(crate) use bind_record;
 ///
 /// `windowed!(guard Name, ...)` declares a dynamic guard's op, whose body
 /// evaluates to whether it passes: the op selects 0 when it does, and its
-/// stencils jump to a second continuation instead. See Note [Guard stencils].
+/// stencils jump to a second continuation instead. See Note [Exit stencils].
 ///
 /// `windowed!(frame Name, ...)`, with no operands, declares an op that only
 /// runs at `SKIP` 0 into an empty window, and after which the JIT code loads
@@ -409,6 +439,19 @@ macro_rules! windowed {
     };
     (
         $(#[$meta:meta])*
+        select $name:ident,
+        [$($cap:ident : $cty:ty),* $(,)?],
+        [$($cp:ident : $cpt:ty),* $(,)?],
+        |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
+        $body:block
+    ) => {
+        $crate::window::windowed!(@sort
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [select]]
+            [] [] [] (0usize) $($operands)*
+        );
+    };
+    (
+        $(#[$meta:meta])*
         $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
         [$($cp:ident : $cpt:ty),* $(,)?],
@@ -421,24 +464,38 @@ macro_rules! windowed {
             [] [] [] (0usize) $($operands)*
         );
     };
-    // `code`, if the op is a guard's.
-    (@if_guard [] $($code:tt)*) => {};
-    (@if_guard [$guard:ident] $($code:tt)*) => {
+    // `code`, if the op has a second exit: a guard's or a select's. See Note
+    // [Window exits].
+    (@if_exit1 [] $($code:tt)*) => {};
+    (@if_exit1 [$kind:ident] $($code:tt)*) => {
         $($code)*
     };
-    // The body of an op with no cold path, which never takes it; of one with
-    // a cold path, whether to take it; of a guard, whether it passes.
+    // `code`, if the op selects: it has exits, or a cold path. See Note
+    // [Window exits].
+    (@if_selects [] [] $($code:tt)*) => {};
+    (@if_selects [$cold:block] [] $($code:tt)*) => {
+        $($code)*
+    };
+    (@if_selects [] [$kind:ident] $($code:tt)*) => {
+        $($code)*
+    };
+    // The body's exit, or `TO_COLD`: of an op with no cold path, 0; of one
+    // with a cold path, `TO_COLD` if the body takes it; of a guard, 1 if it
+    // passes; of a select, what it evaluates to. See Note [Window exits].
     (@run [] $body:block) => {
-        { let () = unsafe { $body }; false }
+        { let () = unsafe { $body }; 0 }
     };
     (@run [] $body:block, $cold:block) => {
-        unsafe { $body }
+        if unsafe { $body } { $crate::window::TO_COLD } else { 0 }
     };
-    (@run [$guard:ident] $body:block) => {
+    (@run [guard] $body:block) => {
+        unsafe { $body } as usize
+    };
+    (@run [select] $body:block) => {
         unsafe { $body }
     };
     (@cold_body []) => {
-        {}
+        { 0 }
     };
     (@cold_body [$cold:block]) => {
         $cold
@@ -484,8 +541,8 @@ macro_rules! windowed {
                 Self { $($cap,)* operands: operands.into() }
             }
 
-            /// The body, shared by the interpreter and the stencil: whether to
-            /// take the cold path, or a guard's whether it passes.
+            /// The body, shared by the interpreter and the stencil: its exit, or
+            /// `TO_COLD`. See Note [Window exits].
             #[inline(always)]
             unsafe fn __run<'a, 'b, 'src, 'intern>(
                 $($cap: $cty,)*
@@ -494,12 +551,13 @@ macro_rules! windowed {
                 $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
                 $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
-            ) -> bool {
+            ) -> usize {
                 $crate::window::windowed!(@run [$($guard)?] $body $(, $cold)?)
             }
 
             /// The cold path's body, shared by the interpreter and the cold
-            /// stencil: empty for an op with no cold path, which never runs it.
+            /// stencil: its exit. Exit 0 for an op with no cold path, which
+            /// never runs it.
             #[inline(always)]
             unsafe fn __run_cold<'a, 'b, 'src, 'intern>(
                 $($cap: $cty,)*
@@ -508,12 +566,12 @@ macro_rules! windowed {
                 $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
                 $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
-            ) {
+            ) -> usize {
                 unsafe { $crate::window::windowed!(@cold_body [$($cold)?]) }
             }
 
             /// Run the cold path's body on the window `w` at `skip`, as
-            /// `__window` runs the body.
+            /// `__window` runs the body: its exit.
             #[inline(always)]
             unsafe fn __window_cold<'a, 'b, 'src, 'intern>(
                 $($cap: $cty,)*
@@ -522,11 +580,12 @@ macro_rules! windowed {
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
                 skip: usize,
-            ) {
+            ) -> usize {
                 $( let $in = w[skip + $ii]; )*
                 $( let mut $out = w[skip + $oi]; )*
-                unsafe { Self::__run_cold($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let exit = unsafe { Self::__run_cold($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
                 $( w[skip + $oi] = $out; )*
+                exit
             }
 
             /// Run the body on the window `w` at `skip`: read the inputs, write
@@ -539,12 +598,12 @@ macro_rules! windowed {
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
                 skip: usize,
-            ) -> bool {
+            ) -> usize {
                 $( let $in = w[skip + $ii]; )*
                 $( let mut $out = w[skip + $oi]; )*
-                let taken = unsafe { Self::__run($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let exit = unsafe { Self::__run($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
                 $( w[skip + $oi] = $out; )*
-                taken
+                exit
             }
 
             $crate::window::windowed!(@stencil $kind, [$($cap : $cty),*] [$($cold)?] [$($guard)?]);
@@ -563,8 +622,11 @@ macro_rules! windowed {
                 Self::__stencil_at(skip)
             }
             fn next(&self) -> usize { Self::__next as *const () as usize }
-            $crate::window::windowed!(@if_guard [$($guard)?]
-                fn pass(&self) -> Option<usize> { Some(Self::__pass as *const () as usize) }
+            $crate::window::windowed!(@if_exit1 [$($guard)?]
+                fn exit1(&self) -> Option<usize> { Some(Self::__exit1 as *const () as usize) }
+            );
+            $crate::window::windowed!(@if_selects [$($cold)?] [$($guard)?]
+                fn selects(&self) -> bool { true }
             );
             $crate::window::windowed!(@if_cold [$($cold)?]
                 fn cold(&self, skip: usize) -> Option<usize> {
@@ -582,17 +644,15 @@ macro_rules! windowed {
                 skip: usize,
             ) {
                 assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
-                let taken = unsafe { Self::__window($(self.$cap,)* owner, state, base, w, skip) };
-                // A guard selects 0 when it passes. See Note [Guard stencils].
-                $crate::window::windowed!(@if_guard [$($guard)?] state.select = (!taken) as usize;);
-                // An op with a cold path selects 1 when it takes it, which the cold path
-                // may change. See Note [Cold stencils].
-                $crate::window::windowed!(@if_cold [$($cold)?]
-                    state.select = taken as usize;
-                    if taken {
-                        unsafe { Self::__window_cold($(self.$cap,)* owner, state, base, w, skip) }
-                    }
-                );
+                let exit = unsafe { Self::__window($(self.$cap,)* owner, state, base, w, skip) };
+                // The cold path's exit, if it takes it.
+                let exit = if exit == $crate::window::TO_COLD {
+                    unsafe { Self::__window_cold($(self.$cap,)* owner, state, base, w, skip) }
+                } else {
+                    exit
+                };
+                // An op that selects selects its exit. See Note [Window exits].
+                $crate::window::windowed!(@if_selects [$($cold)?] [$($guard)?] state.select = exit;);
             }
             fn on_stack<'src, 'intern>(
                 &self,
@@ -603,18 +663,20 @@ macro_rules! windowed {
                 let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(at).as_ptr() };
                 $( let $in = state.vals[at + self.operands[$ii]]; )*
                 $( let mut $out = state.vals[at + self.operands[$oi]]; )*
-                let taken = unsafe { Self::__run($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let exit = unsafe { Self::__run($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
                 $( state.vals[at + self.operands[$oi]] = $out; )*
-                $crate::window::windowed!(@if_guard [$($guard)?] state.select = (!taken) as usize;);
-                $crate::window::windowed!(@if_cold [$($cold)?]
-                    state.select = taken as usize;
-                    if taken {
-                        $( let $in = state.vals[at + self.operands[$ii]]; )*
-                        $( let mut $out = state.vals[at + self.operands[$oi]]; )*
-                        unsafe { Self::__run_cold($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
-                        $( state.vals[at + self.operands[$oi]] = $out; )*
-                    }
-                );
+                // The cold path's exit, if it takes it.
+                let exit = if exit == $crate::window::TO_COLD {
+                    $( let $in = state.vals[at + self.operands[$ii]]; )*
+                    $( let mut $out = state.vals[at + self.operands[$oi]]; )*
+                    let exit = unsafe { Self::__run_cold($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                    $( state.vals[at + self.operands[$oi]] = $out; )*
+                    exit
+                } else {
+                    exit
+                };
+                // An op that selects selects its exit. See Note [Window exits].
+                $crate::window::windowed!(@if_selects [$($cold)?] [$($guard)?] state.select = exit;);
             }
         }
     };
@@ -656,29 +718,29 @@ macro_rules! windowed {
                 let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
-                let taken = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
-                // The window where it is, into its second continuation, which the copy
-                // points at the way into the cold stencil. See Note [Cold stencils].
+                let exit = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                // The window where it is, into the continuation the copy points at
+                // the way into the cold stencil. See Note [Cold stencils].
                 $crate::window::windowed!(@if_cold [$($cold)?]
-                    if taken {
+                    if exit == $crate::window::TO_COLD {
                         become Self::__to_cold(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
                     }
                 );
-                // A guard's pass, into its second continuation. See Note [Guard stencils].
-                $crate::window::windowed!(@if_guard [$($guard)?]
-                    if taken {
-                        become Self::__pass(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                // Its second exit. See Note [Window exits].
+                $crate::window::windowed!(@if_exit1 [$($guard)?]
+                    if exit == 1 {
+                        become Self::__exit1(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
                     }
                 );
                 become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
             }
 
-            $crate::window::windowed!(@if_guard [$($guard)?]
-                /// A guard's second continuation, as `__next` is its first: the
-                /// copier points jumps to it at the guard's pass edge. See Note
-                /// [Guard stencils].
+            $crate::window::windowed!(@if_exit1 [$($guard)?]
+                /// The continuation of its second exit, as `__next` is of its
+                /// first: the copier points jumps to it where the JIT has exit 1
+                /// go. See Note [Window exits].
                 #[inline(never)]
-                extern "rust-preserve-none" fn __pass<'b, 'src, 'intern>(
+                extern "rust-preserve-none" fn __exit1<'b, 'src, 'intern>(
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 w0: $crate::lboxed::LBoxed<'src, 'intern>,
@@ -761,20 +823,20 @@ macro_rules! windowed {
                         unsafe { core::hint::unreachable_unchecked() }
                     }
                     let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
-                    // The site's record: its fall-through, then where its
-                    // captures are.
+                    // The site's record: where each of its exits goes, then where
+                    // its captures are.
                     let site = state.cold_site;
                     $crate::window::bind_record!(site, 0; $($cap : $cty),*);
-                    unsafe { Self::__window_cold($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
-                    // SAFETY: the site's fall-through point, in JIT code, where
-                    // its copy's window continues, at the stack it jumped from.
+                    let exit = unsafe { Self::__window_cold($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                    // SAFETY: where the site's exit goes, in JIT code, which its
+                    // copy's window continues to, at the stack it jumped from.
                     let fall: extern "rust-preserve-none" fn(
                         &'b mut $crate::vm::RunState<'src, 'intern>,
                         *mut $crate::lboxed::LBoxed<'src, 'intern>,
                         $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
                         $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
                         $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
-                    ) = unsafe { core::mem::transmute(*site) };
+                    ) = unsafe { core::mem::transmute(*site.add(exit)) };
                     become fall(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
                 }
             );
@@ -1007,9 +1069,9 @@ pub struct Body {
     /// Where in `code` its `become`s go: its end, or the `add rsp, 8` before
     /// it in a body that restores the stack. See Note [Stencil alignment].
     pub fall: usize,
-    /// A guard's jumps to its second continuation, re-targeted at its pass
-    /// edge. See Note [Guard stencils].
-    pub passes: Vec<RipRel>,
+    /// Its jumps to its second exit's continuation, re-targeted where the JIT
+    /// has exit 1 go. See Note [Window exits].
+    pub exit1s: Vec<RipRel>,
     /// Whether it's copied between `sub rsp, 8` and `add rsp, 8`: a jump out
     /// of its middle must first undo the `sub`. See Note [Stencil alignment].
     pub aligned: bool,
@@ -1070,10 +1132,10 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let addr = op.stencil(skip);
     // Its cold stencil, which it may jump to. See Note [Cold stencils].
     let cold = op.cold(skip);
-    // The second continuation into it. See Note [Cold stencils].
+    // The continuation into it. See Note [Cold stencils].
     let to_cold = op.to_cold();
-    // A guard's second continuation. See Note [Guard stencils].
-    let pass = op.pass();
+    // Its second exit's continuation. See Note [Window exits].
+    let exit1 = op.exit1();
     let &size = image.sizes.get(&addr).ok_or(StencilError::NotInSymtab { op: name })?;
     let code = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
 
@@ -1165,14 +1227,17 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     };
     let jumps_to_next = |i: usize| -> Result<bool, StencilError> { Ok(jump_target(i)? == Some(next)) };
 
-    // A body ending `jcc __next; jmp` to its second continuation, a guard's
-    // `__pass` or a cold path's `__to_cold`, is copied ending in the inverted
-    // `jcc` to it, falling through to its `become` (see Notes [Guard stencils]
+    // A body ending `jcc __next; jmp` to another continuation, its second exit's
+    // `__exit1` or its cold path's `__to_cold`, is copied ending in the inverted
+    // `jcc` to it, falling through to its `become` (see Notes [Exit stencils]
     // and [Cold stencils]): the index of that `jcc`, a two-byte `0F 8x` with a
-    // rel32.
+    // rel32, and that continuation.
     let last = insts.len() - 1;
-    let second = pass.or(to_cold);
-    let inverted = (last > 0 && second.is_some() && jump_target(last)? == second).then_some(last - 1).filter(|&i| {
+    let second = match jump_target(last)? {
+        Some(target) if last > 0 && (Some(target) == exit1 || Some(target) == to_cold) => Some(target),
+        _ => None,
+    };
+    let inverted = second.and(Some(last - 1)).filter(|&i| {
         let (off, end, inst) = &insts[i];
         inst.opcode() != Opcode::JMP
             && RELATIVE_BRANCHES.contains(&inst.opcode())
@@ -1182,8 +1247,8 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
             && matches!(inst.operand(0), Operand::ImmediateI32 { imm } if (addr + end).wrapping_add(imm as isize as usize) == next)
     });
 
-    // A final `become` is sliced off, and a guard's final jump to `__pass` it
-    // inverts into its `jcc`; otherwise the whole body is kept.
+    // A final `become` is sliced off, and a final jump to another continuation
+    // it inverts into its `jcc`; otherwise the whole body is kept.
     let sliced = inverted.is_some() || jumps_to_next(last)?;
     let kept = if sliced { insts.len() - 1 } else { insts.len() };
     let body_len = if sliced { insts[kept].0 } else { size };
@@ -1191,7 +1256,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let mut holes: SmallVec<[(RipRel, usize); MAX_HOLES]> = SmallVec::new();
     let mut relocs: Vec<RipRel> = Vec::new();
     let mut nexts: Vec<NextRef> = Vec::new();
-    let mut passes: Vec<RipRel> = Vec::new();
+    let mut exit1s: Vec<RipRel> = Vec::new();
     let mut colds: Vec<RipRel> = Vec::new();
     // The opcode bytes of its site hole loads, to make `lea`s.
     let mut leas: SmallVec<[usize; 1]> = SmallVec::new();
@@ -1209,12 +1274,12 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
                 if !(addr..=addr + body_len).contains(&target) {
                     let rel = RipRel { field: end - 4, end, target };
                     if Some(i) == inverted {
-                        if pass.is_some() { passes.push(rel) } else { colds.push(rel) }
+                        if second == exit1 { exit1s.push(rel) } else { colds.push(rel) }
                     } else if width == 4 && target == next {
                         // Another `become` (e.g. a duplicated tail).
                         nexts.push(NextRef::Direct(rel));
-                    } else if width == 4 && Some(target) == pass && inst.opcode() != Opcode::CALL {
-                        passes.push(rel);
+                    } else if width == 4 && Some(target) == exit1 && inst.opcode() != Opcode::CALL {
+                        exit1s.push(rel);
                     } else if width == 4 && Some(target) == to_cold && inst.opcode() != Opcode::CALL {
                         colds.push(rel);
                     } else if width == 4 && inst.opcode() == Opcode::CALL {
@@ -1280,7 +1345,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     let shift = |r: RipRel| RipRel { field: r.field + prefix.len(), end: r.end + prefix.len(), ..r };
     let holes = holes.into_iter().map(|(r, i)| (shift(r), i)).collect();
     let relocs = relocs.into_iter().map(shift).collect();
-    let passes = passes.into_iter().map(shift).collect();
+    let exit1s = exit1s.into_iter().map(shift).collect();
     let colds = colds.into_iter().map(shift).collect();
     let nexts = nexts
         .into_iter()
@@ -1304,7 +1369,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     if aligned {
         copy.extend_from_slice(&ADD_RSP_8);
     }
-    Ok(Body { code: copy, holes, relocs, nexts, fall, passes, aligned, colds, cold })
+    Ok(Body { code: copy, holes, relocs, nexts, fall, exit1s, aligned, colds, cold })
 }
 
 /// Whether the stencil at `addr` uses the stack anywhere (`uses_stack`).
@@ -1350,8 +1415,8 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 // cold block where the hot path leaves the window: the hot path needs no call,
 // and so saves nothing around one and moves no arguments into place.
 //
-// Its stencils, taking the cold path, end in a second continuation, `__to_cold`,
-// as a guard's do in `__pass` (Note [Guard stencils]), so the body branches to
+// Its stencils, taking the cold path, end in a continuation of their own,
+// `__to_cold`, as for a second exit (Note [Exit stencils]), so the body branches to
 // it, a single `jcc` (or one inverted, for a body ending `jcc __next; jmp
 // __to_cold`), and falls through on its hot path. The copier points that branch
 // at the way into the cold stencil, which the JIT lays out after the region's
@@ -1359,15 +1424,16 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 //
 // The cold stencil isn't copied: every copy of the op at that `SKIP` shares the
 // one in this executable. What differs between copies, their captures and where
-// each continues, is the site's record, `[continuation address, displacement to
-// each capture's value (i32)...]`, which the JIT lays in the region's pool, whose
+// each continues, is the site's record, `[exit 0's address, exit 1's address,
+// displacement to each capture's value (i32)...]`, which the JIT lays in the
+// region's pool, whose
 // values the copy loads its captures from too. The way into the cold stencil
 // stores the record's address to `RunState::cold_site` (`become` wants the
 // callee's signature to be the caller's, so it can't be an argument), then
 // jumps to it. The cold stencil binds the captures from the record, runs the
-// cold block, and ends in a tail jump to the record's continuation, the window
-// where the cold block left it: the copy's fall-through, or for an optimistic
-// op, the way on after its cold path (Note [Optimistic ops] in `specialize`).
+// cold block, and ends in a tail jump to where the record has the cold block's
+// exit go, the window where the cold block left it: as the copy's exit does
+// (Note [Window exits]).
 //
 // A site costs its record and its way in, and no more of the pool: its capture
 // values are the pool's, shared with every copy capturing the same.
@@ -1384,18 +1450,16 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 // themselves, as JIT code taking the way on after an optimistic op needs no
 // `select` (Note [Optimistic ops] in `specialize`).
 
-// Note [Guard stencils]
-// ~~~~~~~~~~~~~~~~~~~~~
-// A dynamic guard's op (`windowed!(guard ..)`) has a body that evaluates to
-// whether the guard passes. Run by the interpreter, the op selects 0 when it
-// does. Its stencils instead end in a second continuation, `__pass`, when it
-// does, and in `__next` when it doesn't: the choice is a branch on what the
-// body computed, and the copy's jump to `__pass` goes straight to the guard's
-// pass edge, rather than the JIT code testing `select` in memory after it,
-// which nothing then writes. A body ending `jcc __next; jmp __pass` is copied
-// ending in the inverted `jcc` to the pass edge, falling through where its
-// `become` would go. A copy between `sub rsp, 8` and `add rsp, 8` jumps to its
-// pass edge through an `add rsp, 8` of its own (Note [Stencil alignment]).
+// Note [Exit stencils]
+// ~~~~~~~~~~~~~~~~~~~~
+// A stencil of an op with a second exit ends in `__exit1` when it takes it, and in
+// `__next` when it takes exit 0 (Note [Window exits]): the choice is a branch on what
+// the body computed, and the copy's jump to `__exit1` goes straight to where the JIT
+// has exit 1 go, rather than the JIT code testing `select` in memory after it. A body
+// ending `jcc __next; jmp __exit1` is copied ending in the inverted `jcc` to exit 1's
+// way, falling through where its `become` would go. A copy between `sub rsp, 8` and
+// `add rsp, 8` takes exit 1 through an `add rsp, 8` of its own (Note [Stencil
+// alignment]).
 
 // Note [Stencil alignment]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1519,8 +1583,8 @@ pub unsafe fn assemble(
             NextRef::Direct(r) => (NextRef::Direct(shift(r)), fall),
             NextRef::Indirect(r) => (NextRef::Indirect(shift(r)), fall),
         }));
-        // Either way a guard goes, the checked code continues.
-        nexts.extend(body.passes.iter().map(|&r| (NextRef::Direct(shift(r)), fall)));
+        // Whichever exit it takes, the checked code continues.
+        nexts.extend(body.exit1s.iter().map(|&r| (NextRef::Direct(shift(r)), fall)));
     }
     code.extend_from_slice(tail);
     // Each way into a cold stencil: the record's address into `cold_site`, then
@@ -1550,7 +1614,7 @@ pub unsafe fn assemble(
     for (_, captures) in &records {
         record_at.push(code.len());
         let displacements = (4 * captures.len()).next_multiple_of(8);
-        code.resize(code.len() + 8 + displacements + 8 * captures.len(), 0);
+        code.resize(code.len() + 8 * EXITS + displacements + 8 * captures.len(), 0);
     }
 
     let map_err = |e: std::io::Error| StencilError::Map(e.to_string());
@@ -1575,13 +1639,17 @@ pub unsafe fn assemble(
         r.patch(&mut code, base, r.target)?;
     }
     for ((fall, captures), &at) in records.iter().zip(&record_at) {
-        code[at..at + 8].copy_from_slice(&((base + fall) as u64).to_le_bytes());
-        let values = at + 8 + (4 * captures.len()).next_multiple_of(8);
+        // Whichever exit the cold path takes, the checked code continues.
+        for exit in 0..EXITS {
+            code[at + 8 * exit..at + 8 * exit + 8].copy_from_slice(&((base + fall) as u64).to_le_bytes());
+        }
+        let displacements = at + 8 * EXITS;
+        let values = displacements + (4 * captures.len()).next_multiple_of(8);
         for (i, value) in captures.iter().enumerate() {
             let slot = values + 8 * i;
             code[slot..slot + 8].copy_from_slice(&value.to_le_bytes());
             let displacement = i32::try_from(slot - at).unwrap();
-            code[at + 8 + 4 * i..at + 12 + 4 * i].copy_from_slice(&displacement.to_le_bytes());
+            code[displacements + 4 * i..displacements + 4 * i + 4].copy_from_slice(&displacement.to_le_bytes());
         }
     }
     for &(r, record) in &record_refs {

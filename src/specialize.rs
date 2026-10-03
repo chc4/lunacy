@@ -782,8 +782,8 @@ pub enum Residual {
     Exec(ResidualExec),
     /// A copy&patch window op (see `crate::window`) to execute.
     ExecWindow(Rc<dyn Window>),
-    /// A guard whose test is a window op: it sets `state.select` to 0 if passed, or 1 if failed.
-    /// See Note [Dynamic guards].
+    /// A guard whose test is a window op: it selects 1 if passed, or 0 if failed. See Note
+    /// [Dynamic guards].
     GuardDynamic(Rc<dyn Window>),
     Call { a: u16, b: u16, c: u16 },
     Select(Vec<(&'static str, BlockId)>),
@@ -1083,8 +1083,8 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 
 // Note [Dynamic guards]
 // ~~~~~~~~~~~~~~~~~~~~~~
-// A `GuardDynamic` residual's test is a window op that reads its operands and sets `state.select`,
-// 0 to pass and 1 to fail, and is otherwise pure. Its two edges continue the generator at
+// A `GuardDynamic` residual's test is a window op that reads its operands and selects its exit, 1
+// to pass and 0 to fail (Note [Window exits] in `window`), and is otherwise pure. Its two edges continue the generator at
 // different `SubPc`s, resumed with `Matched` or `Failed`, so their versions are told apart by the
 // outcome and needn't differ in context: a test can speculate on what no ctype names, like whether
 // a key is in a table's array part (`InArray`), for the instruction's next op alone. Nothing
@@ -2203,7 +2203,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             test.interp(owner, state);
-            let passed = state.select == 0;
+            let passed = state.select == 1;
             // In place, unless the thunk's JIT code can only be patched to a jump.
             // See Note [Thunk patching].
             let block = if vm.compiled(block_id) {
@@ -3424,7 +3424,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::GuardDynamic(w) => {
                     w.interp(owner, &mut state);
-                    off += if state.select == 0 { 2 } else { 1 };
+                    off += if state.select == 1 { 2 } else { 1 };
                 },
                 &Residual::LuaCall { ref entry, a, b, c, stack, vararg } => {
                     let entry = entry.clone();

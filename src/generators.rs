@@ -882,6 +882,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     }
                 } cold {
                     *dest = overflowed::<OP>(k, rhs.as_int());
+                    1
                 });
                 Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true))
             } else if rk {
@@ -893,6 +894,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     }
                 } cold {
                     *dest = overflowed::<OP>(lhs.as_int(), k);
+                    1
                 });
                 // MOD by a constant other than zero always fits.
                 crate::window::windowed!(ModRK, [k: i32], [], |owner, state, base| (lhs, out dest) {
@@ -910,6 +912,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     }
                 } cold {
                     *dest = overflowed::<OP>(lhs.as_int(), rhs.as_int());
+                    1
                 });
                 Some((dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest])), true))
             };
