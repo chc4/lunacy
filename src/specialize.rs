@@ -260,9 +260,11 @@ pub struct HashKey<'src, 'intern> {
     /// The slot of the table the key is in.
     pub idx: usize,
     pub key: LConstant<'src, 'intern>,
-    /// Its field's type. A shape or a function's identity describes a register,
-    /// not a field, so a field's type is an `LType`. See Note [Field types].
-    pub known_type: LType,
+    /// Its field's type, `Unknown` if its field's type isn't stable; `None` if
+    /// the index is free. A shape or a function's identity describes a
+    /// register, not a field, so a field's type is an `LType`. See Note [Field
+    /// types].
+    pub known_type: Option<LType>,
     /// Per slot: whether access through that slot is already checked for
     /// aliasing, so it needs no epoch check.
     pub hazards: SmallVec<[bool; 8]>,
@@ -275,13 +277,13 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
         let checked: Vec<String> = self.hazards.iter().enumerate().filter(|(_, checked)| **checked).map(|(slot, _)| slot.to_string()).collect();
         format!("hkey({}, {}{})",
             String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
-            self.known_type,
+            self.known_type.map_or("free".to_string(), |t| t.to_string()),
             if checked.is_empty() { String::new() } else { format!(", checked {}", checked.join(" ")) })
     }
 
-    /// A new hash key, its type not yet discovered.
+    /// A new hash key, its index reserved until its href thunk finds its type.
     fn new(idx: usize, key: LConstant<'src, 'intern>) -> Self {
-        HashKey { idx, key, known_type: LType::Unknown, hazards: Default::default() }
+        HashKey { idx, key, known_type: None, hazards: Default::default() }
     }
 
     /// Whether access through slot `at` needs no epoch check.
@@ -302,10 +304,9 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
         self.hazards.iter_mut().for_each(|checked| *checked = false);
     }
 
-    /// Whether this index is free for a new hash key: its type is unknown, which
-    /// a live hash key's never is. See Note [Field types].
+    /// Whether this index is free for a new hash key. See Note [Field types].
     fn orphan(&self) -> bool {
-        self.known_type == LType::Unknown
+        self.known_type.is_none()
     }
 
     /// Whether blocks compiled knowing `self` are correct for a context with
@@ -313,7 +314,10 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     fn accepts(&self, other: &Self) -> bool {
         self.idx == other.idx
             && self.key == other.key
-            && self.known_type.accepts(other.known_type)
+            && match (self.known_type, other.known_type) {
+                (Some(mine), Some(theirs)) => mine.accepts(theirs),
+                (mine, theirs) => mine == theirs,
+            }
             && self.hazards.iter().enumerate().all(|(slot, &checked)| !checked || other.hazards.get(slot) == Some(&true))
     }
 }
@@ -1045,10 +1049,11 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 // type again; if that fails it falls back to a fresh href, which guards the type
 // again and can rejoin the blocks already compiled for it.
 //
-// A live hash key's type is always known: joining contexts that know different
-// types of its field (an integer on one way in, a double on another) drops it,
-// as forgetting its table's slot does, and the next access makes a fresh one. An
-// unknown type marks the index free.
+// Joining contexts that know different types of a field (an integer on one way
+// in, a double on another) keeps its hash key, of no stable type (`Unknown`): a
+// load through it guards the loaded slot instead (`FieldType`), and the type
+// found becomes the hash key's again. A hash key's type is `None` only while its
+// index is free.
 //
 // A field's type is only ever an `LType`: a shape or a function's identity
 // describes a register, not a field.
@@ -1549,13 +1554,16 @@ impl Context {
         let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
         for (i, mine) in self.hkeys.iter_mut().enumerate() {
             match other.hkeys.get(i) {
-                Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && mine.known_type == theirs.known_type => {
+                Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && mine.known_type.is_some() && theirs.known_type.is_some() => {
+                    if mine.known_type != theirs.known_type {
+                        mine.known_type = Some(LType::Unknown);
+                    }
                     for (slot, checked) in mine.hazards.iter_mut().enumerate() {
                         *checked &= theirs.hazards.get(slot) == Some(&true);
                     }
                 },
                 _ => {
-                    mine.known_type = LType::Unknown;
+                    mine.known_type = None;
                     mine.clear_checks();
                     dropped.push(HashRef(i as u8));
                 },
@@ -1610,17 +1618,15 @@ impl Context {
                         }
                     }
                     if !migrated {
-                        key.known_type = LType::Unknown;
+                        key.known_type = None;
                     }
                 }
                 // We can only remove hkeys at the end of the array for the same
                 // reason of needing stable hash_witness indexes. For interior ones, we
-                // can mark them as LType::Unknown and try to re-use the index instead
-                // of pushing to the array when we need a new HashKey in order to try
-                // and re-use the slot (and potentially end up with the same
-                // pre-SetTypes context entirely). This is safe because we only ever
-                // have LType::Unknown as the known_type for an hkey before forcing an
-                // href_thunk, which happens immediately.
+                // can mark them free and try to re-use the index instead of pushing
+                // to the array when we need a new HashKey in order to try and re-use
+                // the slot (and potentially end up with the same pre-SetTypes context
+                // entirely). See Note [Field types].
                 while let Some(_) = self.hkeys.pop_if(|hkey| hkey.idx == idx) { }
             }
             self.types[idx] = ty;
@@ -2235,11 +2241,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `Guard(idx, t)` (`expected` `CType::Type(t)`) or a
     /// `GuardCType(idx, expected)` ends its block in when the context can't
     /// answer it.
+    /// With `field`, the slot was just loaded from that hash key's field, of no
+    /// stable type (`FieldType`), whose type is the one found too. See Note
+    /// [Field types].
     /// A thunk finding out the type of STACK[idx] for a guard of `expected`.
     /// A function found gets its identity guarded too, unless the chain of
     /// thunks this one is in guards `identities` of them already, `MAX_VERSIONS`
     /// (Note [Call sites]).
-    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
+    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The thunk was forced, so now we know the runtime value and if it
@@ -2290,6 +2299,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A slot holding an upvalue's value tells of the upvalue: the type the
             // guard found, and past a function's identity guard below, which
             // function. See Note [Fragile information].
+            if let Some(href) = field {
+                forced_mut.hkeys[href.0 as usize].known_type = Some(found_field);
+            }
             let holds = forced_mut.holds(idx);
             if let Some(upvalue) = holds {
                 forced_mut.assume(Fragile::Upvalue { upvalue, ctype: found.clone() });
@@ -2318,7 +2330,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .filter(|_| identities < MAX_VERSIONS);
             let identities = identities + idx_ctype.is_some() as usize;
             // Push the same thunk down for the next value that fails the guard
-            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected.clone(), pc, thunk_ctx.clone(), false, identities);
+            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected.clone(), field, pc, thunk_ctx.clone(), false, identities);
             vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk.clone()));
             if let Some(CType::NativeFunction(nf)) = &idx_ctype {
                 // We know this original value has the correct native function, and so can compile
@@ -2581,7 +2593,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // The field's type in this table, which the guard after `href_init` checks in every
             // table reaching the code. See Note [Field types].
             let found = val.unbox().typeof_();
-            hkey.known_type = found;
+            hkey.known_type = Some(found);
             // Initialize the hkey after discovery with a cleared hazard for the index
             hkey.clear_checks();
             hkey.check(idx);
@@ -2643,7 +2655,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// type and guarding that in turn. See Note [Field types].
     fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>) {
         let mut typed_ctx = ctx.clone();
-        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = expected;
+        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(expected);
         let pass = self.subblock(owner, pc.next_true(), typed_ctx, thunk_coro.clone(), ResumeArg::HashRef(href, expected));
         let fail = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
@@ -2676,9 +2688,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // witness epoch and jump back to the success block.
             let check_block = vm.new_block(pc.0);
             vm.jump_thunk(block_id, thunk_pc, check_block);
-            let expected = thunk_ctx.hkeys[href.0 as usize].known_type.clone();
+            let expected = thunk_ctx.hkeys[href.0 as usize].known_type.expect("a live hash key");
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
-            assert_ne!(expected, LType::Unknown, "a live hash key's field has a type");
+            // A field of no stable type has nothing to check it still has: its
+            // hash key is found again. See Note [Field types].
+            if expected == LType::Unknown {
+                vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
+                return;
+            }
             let key = LCanon::constant(&thunk_ctx.hkeys[href.0 as usize].key).boxed().bits();
             vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected });
             vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
@@ -2741,16 +2758,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::Type(ctype.clone());
                 },
                 CoroutineState::Yielded(YieldOp::UpdateHashRef(href, ref ty)) => {
-                    // We can't set a HashKey's type to Unknown, because then we'd think
-                    // the slot is free to be reused (and it doesn't really make sense).
-                    // Instead, we ignore the update and keep using the old type: there's
-                    // a chance the unknown static type is in fact still our old type and
-                    // we just didn't know, and if there is a runtime mismatch the next
-                    // access's type guard finds it, as the store left the witness at the
-                    // old epoch (`Retype::Unknown`).
+                    // A store of a value of unknown type keeps the field's old type:
+                    // there's a chance the unknown static type is in fact still our old
+                    // type and we just didn't know, and if there is a runtime mismatch
+                    // the next access's epoch check and `HashGuard` find it, as the store
+                    // left the witness at the old epoch (`Retype::Unknown`).
                     let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
                     if *ty != LType::Unknown {
-                        hkey.known_type = *ty;
+                        hkey.known_type = Some(*ty);
                     }
                     // If we updated an href, then we also need to set optimization hazards for any
                     // potentially aliased ones. We also need to invalidate this stack slot as
@@ -2790,7 +2805,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // A cached href. Unless nothing could have invalidated it
                         // since it was last checked, it needs an epoch check first,
                         // which continues into blocks assuming it still holds.
-                        arg = ResumeArg::HashRef(cached.clone(), cached_hkey.known_type.clone());
+                        arg = ResumeArg::HashRef(cached.clone(), cached_hkey.known_type.expect("a live hash key"));
                         if cached_hkey.checked(place) {
                             // Nothing could have invalidated it: no check needed.
                             pc = pc.next_true();
@@ -2875,7 +2890,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             arg = ResumeArg::MatchedConst(rk & 0xff);
                         }
                     } else {
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, expected.clone(), pc, ctx.clone(), true, 0));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, expected.clone(), None, pc, ctx.clone(), true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -2938,7 +2953,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         debug!("emitting discovery thunk");
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), pc, thunk_ctx, true, 0));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), None, pc, thunk_ctx, true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -2979,10 +2994,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
-                    let known = ctx.hkeys[href.0 as usize].known_type.clone();
-                    assert_ne!(known, LType::Unknown, "a live hash key's field has a type");
+                    let known = ctx.hkeys[href.0 as usize].known_type.expect("a live hash key");
                     Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, CType::Type(known))]);
-                    (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &CType::Type(known));
+                    if known != LType::Unknown {
+                        (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &CType::Type(known));
+                    } else {
+                        // Record the type on the hash key too, unless the load overwrote
+                        // the table's register and dropped its hash keys.
+                        let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Type(LType::Unknown), live.then_some(href), pc, ctx.clone(), true, 0));
+                        self.end_block(block_id);
+                        self.blocks[block_id.0].instructions.push(thunk);
+                        return None;
+                    }
                 },
                 CoroutineState::Yielded(YieldOp::UpvalueKnown(upvalue)) => {
                     // A native's fact is of its code, and its value is the one cell it was
