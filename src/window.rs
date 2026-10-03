@@ -651,7 +651,9 @@ macro_rules! windowed {
                 } else {
                     exit
                 };
-                // An op that selects selects its exit. See Note [Window exits].
+                // An op that selects selects its exit; any other has only exit 0. See
+                // Note [Window exits].
+                let _ = exit;
                 $crate::window::windowed!(@if_selects [$($cold)?] [$($guard)?] state.select = exit;);
             }
             fn on_stack<'src, 'intern>(
@@ -675,7 +677,9 @@ macro_rules! windowed {
                 } else {
                     exit
                 };
-                // An op that selects selects its exit. See Note [Window exits].
+                // An op that selects selects its exit; any other has only exit 0. See
+                // Note [Window exits].
+                let _ = exit;
                 $crate::window::windowed!(@if_selects [$($cold)?] [$($guard)?] state.select = exit;);
             }
         }

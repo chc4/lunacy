@@ -1012,38 +1012,38 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
     }
 }
 
-/// Set `select` for a compare's select: 0 to take the jump, when the condition
-/// isn't `a`. `OP` is a const param, so each stencil compares one way.
-/// Unchecked, so that no panic path follows the stencil's `become`.
+/// A compare's exit: 0 to take the jump, when the condition isn't `a`. `OP` is
+/// a const param, so each stencil compares one way. Unchecked, so that no panic
+/// path follows the stencil's `become`. See Note [Window exits] in `window`.
 #[inline(always)]
-unsafe fn select<const OP: Opcode, T: PartialOrd>(state: &mut RunState, a: u8, l: T, r: T) {
+unsafe fn compare_exit<const OP: Opcode, T: PartialOrd>(a: u8, l: T, r: T) -> usize {
     let cond = match OP {
         Opcode::EQ => l == r,
         Opcode::LT => l < r,
         Opcode::LE => l <= r,
         _ => unsafe { core::hint::unreachable_unchecked() },
     };
-    state.select = if (cond as u8) != a { 0 } else { 1 };
+    if (cond as u8) != a { 0 } else { 1 }
 }
 
 // Compares of numbers: registers, `LI`/`RI` if in the integer encoding, and a
 // constant, `k` its value.
-crate::window::windowed!(CompareRR, [a: u8], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs) {
-    select::<OP, f64>(state, a, number::<LI>(lhs), number::<RI>(rhs));
+crate::window::windowed!(select CompareRR, [a: u8], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs) {
+    compare_exit::<OP, f64>(a, number::<LI>(lhs), number::<RI>(rhs))
 });
-crate::window::windowed!(CompareKR, [a: u8, k: f64], [OP: Opcode, RI: bool], |owner, state, base| (rhs) {
-    select::<OP, f64>(state, a, k, number::<RI>(rhs));
+crate::window::windowed!(select CompareKR, [a: u8, k: f64], [OP: Opcode, RI: bool], |owner, state, base| (rhs) {
+    compare_exit::<OP, f64>(a, k, number::<RI>(rhs))
 });
-crate::window::windowed!(CompareRK, [a: u8, k: f64], [OP: Opcode, LI: bool], |owner, state, base| (lhs) {
-    select::<OP, f64>(state, a, number::<LI>(lhs), k);
+crate::window::windowed!(select CompareRK, [a: u8, k: f64], [OP: Opcode, LI: bool], |owner, state, base| (lhs) {
+    compare_exit::<OP, f64>(a, number::<LI>(lhs), k)
 });
 
 // EQ of a double against a number constant `k` (its bits in the double
 // encoding) other than ±0 or NaN: in the double encoding, equal numbers have
 // equal bits but for ±0 (unequal bits) and NaN (equal to nothing), so it
 // compares the bits.
-crate::window::windowed!(EqualBits, [a: u8, k: u64], [], |owner, state, base| (value) {
-    state.select = if ((value.bits() == k) as u8) != a { 0 } else { 1 };
+crate::window::windowed!(select EqualBits, [a: u8, k: u64], [], |owner, state, base| (value) {
+    if ((value.bits() == k) as u8) != a { 0 } else { 1 }
 });
 
 /// A double compared with the constant `k` by `opcode`: `EqualBits` when it can
@@ -1122,8 +1122,8 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
         // [Integers].
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) if integers || (lint && rint) => {
-                crate::window::windowed!(CompareIntRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
-                    select::<OP, i32>(state, a, lhs.as_int(), rhs.as_int());
+                crate::window::windowed!(select CompareIntRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
+                    compare_exit::<OP, i32>(a, lhs.as_int(), rhs.as_int())
                 });
                 arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRR, [], (a, &[b, c])));
             },
@@ -1132,8 +1132,8 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) if integers => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rb)) else { unreachable!() };
-                crate::window::windowed!(CompareIntKR, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (rhs) {
-                    select::<OP, i32>(state, a, k, rhs.as_int());
+                crate::window::windowed!(select CompareIntKR, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (rhs) {
+                    compare_exit::<OP, i32>(a, k, rhs.as_int())
                 });
                 arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntKR, [], (a, k, &[c])));
             },
@@ -1143,8 +1143,8 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) if integers => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rc)) else { unreachable!() };
-                crate::window::windowed!(CompareIntRK, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (lhs) {
-                    select::<OP, i32>(state, a, lhs.as_int(), k);
+                crate::window::windowed!(select CompareIntRK, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (lhs) {
+                    compare_exit::<OP, i32>(a, lhs.as_int(), k)
                 });
                 arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRK, [], (a, k, &[b])));
             },
@@ -1167,11 +1167,11 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             (larg, rarg) if opcode == Opcode::EQ && !matches!((&lnil, &rnil), (ResumeArg::Matched | ResumeArg::MatchedConst(_), _) | (_, ResumeArg::Matched | ResumeArg::MatchedConst(_))) => {
                 // Raw equality of values of any types, a constant operand's boxed
                 // value a hole.
-                crate::window::windowed!(EqualRR, [a: u8], [], |owner, state, base| (lhs, rhs) {
-                    state.select = if (raw_equal(lhs, rhs) as u8) != a { 0 } else { 1 };
+                crate::window::windowed!(select EqualRR, [a: u8], [], |owner, state, base| (lhs, rhs) {
+                    if (raw_equal(lhs, rhs) as u8) != a { 0 } else { 1 }
                 });
-                crate::window::windowed!(EqualRK, [a: u8, k: u64], [], |owner, state, base| (lhs) {
-                    state.select = if (raw_equal(lhs, LBoxed::from_bits(k)) as u8) != a { 0 } else { 1 };
+                crate::window::windowed!(select EqualRK, [a: u8, k: u64], [], |owner, state, base| (lhs) {
+                    if (raw_equal(lhs, LBoxed::from_bits(k)) as u8) != a { 0 } else { 1 }
                 });
                 const RK: usize = 256;
                 let window: Rc<dyn Window> = match (b >= RK, c >= RK) {
@@ -1216,9 +1216,9 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
         let (fallthrough, taken) = (pc, pc + 1);
         arg = yield YieldOp::Guard(a, LType::Bool);
         if let ResumeArg::Matched = arg {
-            // `select` is 1, the fallthrough, when the guarded bool is `C`.
-            windowed!(TestBool, [], [C: bool], |owner, state, base| (value) {
-                state.select = ((value.bits() == LBoxed::VALUE_TRUE) == C) as usize;
+            // Exit 1, the fallthrough, when the guarded bool is `C`.
+            windowed!(select TestBool, [], [C: bool], |owner, state, base| (value) {
+                ((value.bits() == LBoxed::VALUE_TRUE) == C) as usize
             });
             arg = yield YieldOp::ExecWindow(if c != 0 {
                 Rc::new(TestBool::<true>::new(&[a]))
@@ -1363,14 +1363,14 @@ pub fn emit_testset(a: usize, b: usize, c: u16, pc: usize) -> impl Coroutine<Res
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Guard(b, LType::Bool);
         if let ResumeArg::Matched = arg {
-            // `select` is 1, the fallthrough, when the guarded bool is `C`, and then
-            // R(A) is it.
-            windowed!(TestSetBool, [], [C: bool], |owner, state, base| (value, inout dest) {
+            // Exit 1, the fallthrough, when the guarded bool is `C`, and then R(A)
+            // is it.
+            windowed!(select TestSetBool, [], [C: bool], |owner, state, base| (value, inout dest) {
                 let set = (value.bits() == LBoxed::VALUE_TRUE) == C;
                 if set {
                     *dest = value;
                 }
-                state.select = set as usize;
+                set as usize
             });
             yield YieldOp::ExecWindow(if c != 0 {
                 Rc::new(TestSetBool::<true>::new(&[b, a]))
@@ -1628,7 +1628,7 @@ pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
 // and a closure capturing it has it closed (`CLOSE`) at the end of each
 // iteration, before this runs. So it is set on exit too, and the op needn't
 // read its old value.
-crate::window::windowed!(ForLoop, [], [II: bool, LI: bool, SI: bool], |owner, state, base| (idx, limit, step, out var) {
+crate::window::windowed!(select ForLoop, [], [II: bool, LI: bool, SI: bool], |owner, state, base| (idx, limit, step, out var) {
     let comp = if II && LI && SI {
         let (nidx, nlimit, nstep) = (idx.as_int(), limit.as_int(), step.as_int());
         if nstep < 0 { nlimit <= nidx } else { nidx <= nlimit }
@@ -1637,7 +1637,7 @@ crate::window::windowed!(ForLoop, [], [II: bool, LI: bool, SI: bool], |owner, st
         if nstep < 0.0 { nlimit <= nidx } else { nidx <= nlimit }
     };
     *var = idx;
-    state.select = if comp { 0 } else { 1 };
+    if comp { 0 } else { 1 }
 });
 
 /// `ForLoop`, reading integers as `ii`, `li` and `si` say.
