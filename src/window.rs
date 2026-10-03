@@ -505,6 +505,11 @@ macro_rules! windowed {
     (@if_cold [$cold:block] $($code:tt)*) => {
         $($code)*
     };
+    // `code`, if the op has no cold path.
+    (@if_not_cold [] $($code:tt)*) => {
+        $($code)*
+    };
+    (@if_not_cold [$cold:block] $($code:tt)*) => {};
     // Sort the operands into inputs and outputs, each with its window offset,
     // and their accesses in window order.
     (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) inout $op:ident $(, $($rest:tt)*)?) => {
@@ -569,6 +574,40 @@ macro_rules! windowed {
             ) -> usize {
                 unsafe { $crate::window::windowed!(@cold_body [$($cold)?]) }
             }
+
+            $crate::window::windowed!(@if_cold [$($cold)?]
+                /// The body of an op with a cold path, as `__run` but whether it
+                /// takes the cold path: what its stencil branches on.
+                #[inline(always)]
+                unsafe fn __run_taken<'a, 'b, 'src, 'intern>(
+                    $($cap: $cty,)*
+                    $owner: &'a mut $crate::Owner,
+                    $state: &'b mut $crate::vm::RunState<'src, 'intern>,
+                    $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                    $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
+                    $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
+                ) -> bool {
+                    unsafe { $body }
+                }
+
+                /// Run `__run_taken` on the window `w` at `skip`, as `__window`
+                /// runs the body.
+                #[inline(always)]
+                unsafe fn __window_taken<'a, 'b, 'src, 'intern>(
+                    $($cap: $cty,)*
+                    owner: &'a mut $crate::Owner,
+                    state: &'b mut $crate::vm::RunState<'src, 'intern>,
+                    base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                    w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
+                    skip: usize,
+                ) -> bool {
+                    $( let $in = w[skip + $ii]; )*
+                    $( let mut $out = w[skip + $oi]; )*
+                    let taken = unsafe { Self::__run_taken($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                    $( w[skip + $oi] = $out; )*
+                    taken
+                }
+            );
 
             /// Run the cold path's body on the window `w` at `skip`, as
             /// `__window` runs the body: its exit.
@@ -722,19 +761,25 @@ macro_rules! windowed {
                 let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
-                let exit = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
-                // The window where it is, into the continuation the copy points at
-                // the way into the cold stencil. See Note [Cold stencils].
+                // An op with a cold path branches on its body's `bool`, which the
+                // compiler makes a conditional jump into the cold path, the window
+                // where it is: the continuation the copy points at the way into the
+                // cold stencil. See Note [Cold stencils].
                 $crate::window::windowed!(@if_cold [$($cold)?]
-                    if exit == $crate::window::TO_COLD {
+                    let taken = unsafe { Self::__window_taken($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                    if taken {
                         become Self::__to_cold(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
                     }
                 );
-                // Its second exit. See Note [Window exits].
-                $crate::window::windowed!(@if_exit1 [$($guard)?]
-                    if exit == 1 {
-                        become Self::__exit1(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
-                    }
+                // Any other on its exit. See Note [Window exits].
+                $crate::window::windowed!(@if_not_cold [$($cold)?]
+                    let exit = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                    $crate::window::windowed!(@if_exit1 [$($guard)?]
+                        if exit == 1 {
+                            become Self::__exit1(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                        }
+                    );
+                    let _ = exit;
                 );
                 become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
             }
@@ -1064,15 +1109,19 @@ pub struct Body {
     /// dynasm as relocations patched in `finalize` along with the hole pool (JIT
     /// memory is mapped within ±2GiB of the binary, so rel32 still reaches).
     pub relocs: Vec<RipRel>,
-    /// References to the op's continuation besides the sliced trailing
-    /// `become` — e.g. a tail the compiler duplicated onto another path. Every
-    /// `become` means "fall through to the next stencil", so each must reach the
-    /// copy's fall-through point (`fall`); the JIT relocates them against a
+    /// References to its exit 0's continuation `__next` besides a sliced
+    /// trailing `become` — e.g. a tail the compiler duplicated onto another
+    /// path. Each must reach where exit 0 goes: the copy's fall-through point
+    /// (`fall`) if it falls through to exit 0; the JIT relocates them against a
     /// label there.
     pub nexts: Vec<NextRef>,
-    /// Where in `code` its `become`s go: its end, or the `add rsp, 8` before
-    /// it in a body that restores the stack. See Note [Stencil alignment].
+    /// Where in `code` its fall-through is: its end, or the `add rsp, 8`
+    /// before it in a body that restores the stack. See Note [Stencil
+    /// alignment].
     pub fall: usize,
+    /// The exit it falls through to; jumps to its continuation go to `fall`.
+    /// See Note [Exit stencils].
+    pub fall_exit: usize,
     /// Its jumps to its second exit's continuation, re-targeted where the JIT
     /// has exit 1 go. See Note [Window exits].
     pub exit1s: Vec<RipRel>,
@@ -1128,7 +1177,7 @@ pub(crate) const RELATIVE_BRANCHES: [yaxpeax_x86::long_mode::Opcode; 23] = {
 /// sliced tail becomes a fall-through into the next stencil, as it should). A
 /// stencil that can't be copied this way is an error, not a panic, so the JIT
 /// can call the op's body instead.
-pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Result<Body, StencilError> {
+pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize, fall_exit: usize) -> Result<Body, StencilError> {
     use yaxpeax_arch::LengthedInstruction;
     use yaxpeax_x86::long_mode::{InstDecoder, Instruction, Opcode, Operand, RegSpec};
 
@@ -1230,15 +1279,21 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
         })
     };
     let jumps_to_next = |i: usize| -> Result<bool, StencilError> { Ok(jump_target(i)? == Some(next)) };
+    // The continuation the copy falls through to: exit `fall_exit`'s. See Note
+    // [Exit stencils].
+    let fall_to = match fall_exit {
+        0 => next,
+        _ => exit1.expect("a copy falling through to exit 1 of an op with one"),
+    };
 
-    // A body ending `jcc __next; jmp` to another continuation, its second exit's
-    // `__exit1` or its cold path's `__to_cold`, is copied ending in the inverted
-    // `jcc` to it, falling through to its `become` (see Notes [Exit stencils]
-    // and [Cold stencils]): the index of that `jcc`, a two-byte `0F 8x` with a
-    // rel32, and that continuation.
+    // A body ending in a `jcc` to the continuation it falls through to, then a
+    // `jmp` to another (`__next`, `__exit1` or `__to_cold`), is copied ending in
+    // the inverted `jcc` to that other, falling through (see Notes [Exit
+    // stencils] and [Cold stencils]): the index of that `jcc`, a two-byte `0F 8x`
+    // with a rel32, and that continuation.
     let last = insts.len() - 1;
     let second = match jump_target(last)? {
-        Some(target) if last > 0 && (Some(target) == exit1 || Some(target) == to_cold) => Some(target),
+        Some(target) if last > 0 && target != fall_to && (target == next || Some(target) == exit1 || Some(target) == to_cold) => Some(target),
         _ => None,
     };
     let inverted = second.and(Some(last - 1)).filter(|&i| {
@@ -1248,12 +1303,13 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
             && end - off == 6
             && code[*off] == 0x0f
             && code[off + 1] & 0xf0 == 0x80
-            && matches!(inst.operand(0), Operand::ImmediateI32 { imm } if (addr + end).wrapping_add(imm as isize as usize) == next)
+            && matches!(inst.operand(0), Operand::ImmediateI32 { imm } if (addr + end).wrapping_add(imm as isize as usize) == fall_to)
     });
 
-    // A final `become` is sliced off, and a final jump to another continuation
-    // it inverts into its `jcc`; otherwise the whole body is kept.
-    let sliced = inverted.is_some() || jumps_to_next(last)?;
+    // A final jump to the continuation it falls through to is sliced off, and a
+    // final jump to another it inverts into its `jcc`; otherwise the whole body
+    // is kept.
+    let sliced = inverted.is_some() || jump_target(last)? == Some(fall_to);
     let kept = if sliced { insts.len() - 1 } else { insts.len() };
     let body_len = if sliced { insts[kept].0 } else { size };
 
@@ -1278,7 +1334,11 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
                 if !(addr..=addr + body_len).contains(&target) {
                     let rel = RipRel { field: end - 4, end, target };
                     if Some(i) == inverted {
-                        if second == exit1 { exit1s.push(rel) } else { colds.push(rel) }
+                        match second {
+                            Some(t) if t == next => nexts.push(NextRef::Direct(rel)),
+                            t if t == exit1 => exit1s.push(rel),
+                            _ => colds.push(rel),
+                        }
                     } else if width == 4 && target == next {
                         // Another `become` (e.g. a duplicated tail).
                         nexts.push(NextRef::Direct(rel));
@@ -1373,7 +1433,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize) -> Resul
     if aligned {
         copy.extend_from_slice(&ADD_RSP_8);
     }
-    Ok(Body { code: copy, holes, relocs, nexts, fall, exit1s, aligned, colds, cold })
+    Ok(Body { code: copy, holes, relocs, nexts, fall, fall_exit, exit1s, aligned, colds, cold })
 }
 
 /// Whether the stencil at `addr` uses the stack anywhere (`uses_stack`).
@@ -1566,7 +1626,7 @@ pub unsafe fn assemble(
     // for the way into it after the tail.
     let mut colds: Vec<(Vec<RipRel>, usize, usize)> = Vec::new();
     for &(op, skip) in ops {
-        let body = unsafe { stencil_body(image, op, skip) }?;
+        let body = unsafe { stencil_body(image, op, skip, 0) }?;
         let captures = op.captures();
         let at = code.len();
         let shift = |r: RipRel| RipRel { field: r.field + at, end: r.end + at, ..r };
@@ -1833,7 +1893,7 @@ mod tests {
         let flush = Flush::new(&whole_window());
 
         let helper = out_of_line as *const () as usize;
-        let body = unsafe { stencil_body(&image, &call, 0) }.unwrap();
+        let body = unsafe { stencil_body(&image, &call, 0, 0) }.unwrap();
         assert!(
             body.relocations().iter().any(|r| r.target == helper
                 || unsafe { (r.target as *const usize).read_unaligned() } == helper),

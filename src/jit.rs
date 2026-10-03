@@ -377,18 +377,15 @@ enum Stub {
     /// The way from a copy into its cold stencil: the site's record's address
     /// into `cold_site`, then the jump. See Note [Cold stencils] in `window`.
     ColdEntry { record: DynamicLabel, cold: usize },
-    /// The way an op's exit takes to a target of the `Select` or `Branch` after
-    /// it: the window's moves, then the jump. See Note [Window exits] in
-    /// `window`. With `count`, the window dump's counter of its moves.
-    Way { moves: SmallVec<[Emit; 16]>, to: JumpTo, count: Option<i64> },
-    /// The way out of a copy between `sub rsp, 8` and `add rsp, 8` from its
-    /// middle: the `add rsp, 8`, then the jump. See Note [Stencil alignment]
-    /// in `window`.
-    Unaligned { to: DynamicLabel },
+    /// The way an op's exit takes, off the hot path, to a target of the
+    /// `Select` or `Branch` after it: out of its copy's alignment if `aligned`,
+    /// the window's moves, then the jump. See Note [Window exits] in `window`.
+    /// With `count`, the window dump's counter of its moves.
+    Way { aligned: bool, moves: SmallVec<[Emit; 16]>, to: JumpTo, count: Option<i64> },
     /// An exit of an op that selects with no `Select` or `Branch` after it:
-    /// the exit to `select`, then on at `join`. See Note [Window exits] in
-    /// `window`.
-    Select { exit: usize, join: DynamicLabel },
+    /// out of its copy's alignment if `aligned`, the exit to `select`, then on
+    /// at `join`. See Note [Window exits] in `window`.
+    Select { aligned: bool, exit: usize, join: DynamicLabel },
 }
 
 /// Where a jump to a block goes: its code, or a label it will have.
@@ -448,19 +445,21 @@ const COPIES: bool = !cfg!(debug_assertions) && !cfg!(feature = "immediate_jit")
 #[derive(Default)]
 pub struct Stencils {
     image: Option<Result<Image, StencilError>>,
-    bodies: HashMap<usize, (usize, Result<Rc<Body>, StencilError>), FxBuildHasher>,
+    bodies: HashMap<(usize, usize), (usize, Result<Rc<Body>, StencilError>), FxBuildHasher>,
 }
 
 impl Stencils {
-    fn body(&mut self, op: &dyn Window, skip: usize) -> Result<Rc<Body>, StencilError> {
+    /// The body of `op`'s stencil at `skip`, falling through to its exit
+    /// `fall_exit`. See Note [Exit stencils] in `window`.
+    fn body(&mut self, op: &dyn Window, skip: usize, fall_exit: usize) -> Result<Rc<Body>, StencilError> {
         if !COPIES {
             return Err(StencilError::Disabled);
         }
         let image = self.image.get_or_insert_with(Image::load).as_ref().map_err(Clone::clone)?;
         self.bodies
-            .entry(op.stencil(skip))
+            .entry((op.stencil(skip), fall_exit))
             .or_insert_with(|| {
-                let body = unsafe { stencil_body(image, op, skip) }
+                let body = unsafe { stencil_body(image, op, skip, fall_exit) }
                     .map(Rc::new)
                     .inspect_err(|e| warn!("window op not copied, calling its body instead: {e}"));
                 (skip, body)
@@ -472,7 +471,7 @@ impl Stencils {
     /// Each stencil copied: its address, `SKIP`, and the body splatted.
     #[cfg(feature = "jit_disasm")]
     fn copied(&self) -> impl Iterator<Item = (usize, usize, &Body)> {
-        self.bodies.iter().filter_map(|(&addr, (skip, body))| Some((addr, *skip, &**body.as_ref().ok()?)))
+        self.bodies.iter().filter_map(|(&(addr, _), (skip, body))| Some((addr, *skip, &**body.as_ref().ok()?)))
     }
 }
 
@@ -527,9 +526,9 @@ macro_rules! frame_op {
 /// A frame op's stencil, copied at `SKIP` 0, or, in a build that copies none, a
 /// call running its body. See Note [Frame ops] in `specialize`.
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
-    match stencils.body(&**op, 0) {
+    match stencils.body(&**op, 0, 0) {
         Ok(body) => {
-            splat(ops, &body, op.name(), &op.captures(), pool, None);
+            splat(ops, &body, op.name(), &op.captures(), pool, None, Unalign::Target);
         }
         // Debug builds' stencils can keep what optimized ones fold away, but an
         // optimized frame op the copier rejects is a bug to fix.
@@ -548,38 +547,49 @@ fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, 
     }
 }
 
-/// Copy `body`, its exit 0 falling through and its exit 1 going to `exit1`, its
-/// cold path's too. See Note [Window exits] in `window`.
-fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool, exit1: Option<DynamicLabel>) {
+/// How a copy between `sub rsp, 8` and `add rsp, 8` leaves from its middle by
+/// the exit it doesn't fall through to. See Note [Stencil alignment] in `window`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unalign {
+    /// Through an `add rsp, 8` after the copy, which its fall-through jumps
+    /// over.
+    Inline,
+    /// At the exit's target, which the caller starts with an `add rsp, 8`.
+    Target,
+}
+
+/// Copy `body`, its other exit, the one it doesn't fall through to, going to
+/// `other`, its cold path's exits too. See Note [Window exits] in `window`.
+fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool, other: Option<DynamicLabel>, unalign: Unalign) {
     enum Site {
         Value(u64),
         Absolute(usize),
-        Fall,
-        FallAddress,
+        /// Where exit 0 goes.
+        Exit0,
+        /// The address of where exit 0 goes, in the pool.
+        Exit0Address,
         /// The site's record, which its site hole's `lea` gives. See Note
         /// [Cold stencils] in `window`.
         Record,
-        /// Exit 1's way.
+        /// Where exit 1 goes.
         Exit1,
         /// The way into the cold stencil.
         Cold,
     }
     let fall = ops.new_dynamic_label();
-    // Exit 1's way from the copy: out of its alignment first, from a copy
-    // between `sub rsp, 8` and `add rsp, 8`. See Note [Stencil alignment] in
-    // `window`.
-    let way1 = exit1.map(|to| match body.aligned {
-        true => {
-            let label = ops.new_dynamic_label();
-            pool.stubs.push((label, Stub::Unaligned { to }));
-            label
-        }
-        false => to,
+    // The other exit's way from the middle of the copy, out of its alignment
+    // first, inline, if the caller doesn't start its target with it.
+    let detour = (body.aligned && unalign == Unalign::Inline).then(|| ops.new_dynamic_label());
+    let way = detour.or(other);
+    // Where each exit goes.
+    let exits = [0, 1].map(|exit| match exit == body.fall_exit {
+        true => Some(fall),
+        false => way,
     });
     // The site's record, if the op has a cold path, and the way into its cold
     // stencil. See Note [Cold stencils] in `window`.
     let has_record = body.cold.is_some() || body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE);
-    let record = has_record.then(|| pool.record(ops, [fall, way1.unwrap_or(fall)], name, captures));
+    let record = has_record.then(|| pool.record(ops, exits.map(|exit| exit.unwrap_or(fall)), name, captures));
     let cold_entry = body.cold.map(|stencil| {
         let label = ops.new_dynamic_label();
         pool.stubs.push((label, Stub::ColdEntry { record: record.expect("a record for a cold path"), cold: stencil }));
@@ -594,8 +604,8 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
     sites.extend(body.exit1s.iter().map(|r| (r.end, r.field, Site::Exit1)));
     sites.extend(body.colds.iter().map(|r| (r.end, r.field, Site::Cold)));
     sites.extend(body.nexts.iter().map(|n| match *n {
-        NextRef::Direct(r) => (r.end, r.field, Site::Fall),
-        NextRef::Indirect(r) => (r.end, r.field, Site::FallAddress),
+        NextRef::Direct(r) => (r.end, r.field, Site::Exit0),
+        NextRef::Indirect(r) => (r.end, r.field, Site::Exit0Address),
     }));
     sites.sort_by_key(|&(end, ..)| end);
 
@@ -607,13 +617,16 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
         let field_offset = (end - field) as u8;
         match site {
             Site::Absolute(target) => ops.value_relocation(target, field_offset, 0, rel32(RelocationKind::RelToAbs)),
-            Site::Fall => ops.dynamic_relocation(fall, 0, field_offset, 0, rel32(RelocationKind::Relative)),
+            Site::Exit0 => {
+                let to = exits[0].expect("exit 0's way");
+                ops.dynamic_relocation(to, 0, field_offset, 0, rel32(RelocationKind::Relative));
+            }
             Site::Value(value) => {
                 let entry = pool.value(ops, value);
                 ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
-            Site::FallAddress => {
-                let entry = pool.address(ops, fall);
+            Site::Exit0Address => {
+                let entry = pool.address(ops, exits[0].expect("exit 0's way"));
                 ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
             Site::Record => {
@@ -621,8 +634,8 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
                 ops.dynamic_relocation(record, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
             Site::Exit1 => {
-                let way = way1.expect("exit 1's way");
-                ops.dynamic_relocation(way, 0, field_offset, 0, rel32(RelocationKind::Relative));
+                let to = exits[1].expect("exit 1's way");
+                ops.dynamic_relocation(to, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
             Site::Cold => {
                 let entry = cold_entry.expect("a cold path's way in");
@@ -633,6 +646,17 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
     ops.extend(&body.code[at..body.fall]);
     dynasm!(ops ; .arch x64 ; =>fall);
     ops.extend(&body.code[body.fall..]);
+    if let (Some(detour), Some(other)) = (detour, other) {
+        let after = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch x64
+            ; jmp =>after
+            ; =>detour
+            ; add rsp, 8
+            ; jmp =>other
+            ; =>after
+        );
+    }
 }
 
 /// The JIT code buffer's size. `immediate_jit` compiles every block that runs,
@@ -892,7 +916,7 @@ fn inline_guard(res: &Residual) -> bool {
 /// skip is below `WINDOW`, the stencils there are, even for an op with no
 /// operands.
 fn usable_skips(stencils: &mut Stencils, w: &dyn Window) -> SmallVec<[usize; WINDOW]> {
-    (0..=(WINDOW - w.arity()).min(WINDOW - 1)).filter(|&skip| stencils.body(w, skip).is_ok()).collect()
+    (0..=(WINDOW - w.arity()).min(WINDOW - 1)).filter(|&skip| stencils.body(w, skip, 0).is_ok()).collect()
 }
 
 /// The alignment of a loop header's code, which a loop's back edge enters on
@@ -1265,24 +1289,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp extern cold
                     );
                 }
-                Stub::Unaligned { to } => {
-                    jit_note!(self.jctx, ops, "out of a copy's alignment");
-                    dynasm!(ops
-                        ; .arch x64
-                        ; add rsp, 8
-                        ; jmp =>to
-                    );
-                }
-                Stub::Select { exit, join } => {
+                Stub::Select { aligned, exit, join } => {
                     jit_note!(self.jctx, ops, "exit {exit}, selected");
+                    if aligned {
+                        dynasm!(ops ; .arch x64 ; add rsp, 8);
+                    }
                     dynasm!(ops
                         ; .arch x64
                         ; mov QWORD r12 => RunState.select, exit as i32
                         ; jmp =>join
                     );
                 }
-                Stub::Way { moves, to, count } => {
+                Stub::Way { aligned, moves, to, count } => {
                     jit_note!(self.jctx, ops, "an exit's way");
+                    if aligned {
+                        dynasm!(ops ; .arch x64 ; add rsp, 8);
+                    }
                     if let Some(at) = count {
                         emit_count(&mut ops, at);
                     }
@@ -1724,10 +1746,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // and doesn't affect correctness; `GUARD; JMP failure; RET;` for example may say that
         // `failure` is the "next block" despite not quite being correct.
         let mut successor = None;
-        // Where the op just copied has its exit 1 go, for the `Select` or `Branch`
-        // after it to lay its way at: that residual then tests no `select`. See
-        // Note [Window exits] in `window`.
-        let mut fused: Option<DynamicLabel> = None;
+        // Where the op just copied has the exit it doesn't fall through to go,
+        // whether its copy is aligned, and which it falls through to, for the
+        // `Select` or `Branch` after it to lay its ways: that residual then tests
+        // no `select`. See Note [Window exits] in `window`.
+        let mut fused: Option<(DynamicLabel, bool, usize)> = None;
         let entry = ops.offset();
         let x = self.jctx.memory.get_mut().as_ptr();
         let block = &self.blocks[id.0];
@@ -2377,11 +2400,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Branch { hot, cold } => {
                     match fused.take() {
-                        // The op's exit 1, its cold path's, goes here. See Notes [Window
-                        // exits] in `window` and [Optimistic ops] in `specialize`.
-                        Some(label) => {
+                        // The op falls through to exit 0, the hot way; exit 1, its cold
+                        // path's, goes off the hot path. See Notes [Window exits] in
+                        // `window` and [Optimistic ops] in `specialize`.
+                        Some((label, aligned, _)) => {
                             let (moves, to, count) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
-                            pool.stubs.push((label, Stub::Way { moves, to, count }));
+                            pool.stubs.push((label, Stub::Way { aligned, moves, to, count }));
                             emit_jump(ops, &alloc, hot, self.jctx.blocks.get(hot).is_none(), false);
                         },
                         // An op run by its body on the stack, which selected.
@@ -2400,10 +2424,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // The op before it took exit 0, falling through, or exit 1 to its
                 // way. See Note [Window exits] in `window`.
                 Residual::Select(targets) if fused.is_some() => {
-                    let label = fused.take().expect("a fused exit");
-                    let (moves, to, count) = emit_jump(ops, &alloc, &targets[1].1, false, true).expect("a deferred jump's moves");
-                    pool.stubs.push((label, Stub::Way { moves, to, count }));
+                    let (label, aligned, fall_exit) = fused.take().expect("a fused exit");
                     let first = targets[0].1;
+                    if fall_exit == 1 {
+                        // As the test of `select` would be laid out: exit 1's way after
+                        // the op, exit 0 past it to the first target, laid out next.
+                        emit_jump(ops, &alloc, &targets[1].1, false, false);
+                        dynasm!(ops ; .arch x64 ; =>label);
+                        if aligned {
+                            dynasm!(ops ; .arch x64 ; add rsp, 8);
+                        }
+                    } else {
+                        // Exit 1 comes only from its cold path: its way off the hot path.
+                        let (moves, to, count) = emit_jump(ops, &alloc, &targets[1].1, false, true).expect("a deferred jump's moves");
+                        pool.stubs.push((label, Stub::Way { aligned, moves, to, count }));
+                    }
                     emit_jump(ops, &alloc, &first, self.jctx.blocks.get(&first).is_none(), false);
                     successor = Some(first);
                 },
@@ -2467,20 +2502,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             alloc.op(&**w, usable_skips(stencils, &**w))
                         }
                     };
-                    // Where its exit 1 goes: a guard's pass edge; before a `Select` or
-                    // `Branch` the way to its second target, which that residual lays;
-                    // else code selecting it. See Note [Window exits] in `window`.
-                    let fuses = match block.instructions.get(off + 1) {
+                    // How its exits are laid out: a guard falls through to its failure
+                    // edge, exit 1 jumping to its pass edge; before a `Select` it falls
+                    // through to exit 1's way, as the test of `select` would, when its
+                    // stencil can (exit 1 only from its cold path otherwise); before a
+                    // `Branch`, to exit 0, the hot way. See Note [Window exits] in
+                    // `window`.
+                    let next = block.instructions.get(off + 1);
+                    let fuses = match next {
                         Some(Residual::Branch { .. }) => true,
-                        Some(Residual::Select(targets)) => targets.len() == crate::window::EXITS,
+                        Some(Residual::Select(targets)) => targets.len() == EXITS,
                         _ => false,
                     };
-                    let exit1 = match res {
-                        Residual::GuardDynamic(_) => Some(insts[off + 2]),
-                        _ if w.selects() => Some(ops.new_dynamic_label()),
-                        _ => None,
+                    let fall_exit = match next {
+                        Some(Residual::Select(_)) if fuses && w.exit1().is_some() => 1,
+                        _ => 0,
                     };
-                    let mut copied = false;
+                    let (other, unalign) = match res {
+                        Residual::GuardDynamic(_) => (Some(insts[off + 2]), Unalign::Inline),
+                        _ if w.selects() => (Some(ops.new_dynamic_label()), Unalign::Target),
+                        _ => (None, Unalign::Target),
+                    };
+                    let mut copied = None;
                     match emits {
                         Some(emits) => {
                             let counted = window_count!(self.jctx, ops, emits);
@@ -2488,9 +2531,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             for emit in emits {
                                 match emit {
                                     Emit::Op { skip } => {
-                                        let body = stencils.body(&**w, skip).expect("a usable skip");
-                                        splat(ops, &body, w.name(), &w.captures(), pool, exit1);
-                                        copied = true;
+                                        let body = stencils.body(&**w, skip, fall_exit).expect("a usable skip");
+                                        splat(ops, &body, w.name(), &w.captures(), pool, other, unalign);
+                                        copied = Some(body.aligned);
                                     }
                                     emit => emit_window_move(ops, emit),
                                 }
@@ -2515,11 +2558,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             );
                         }
                     }
-                    match (res, exit1) {
+                    match (res, other, copied) {
                         // Its body ran on the stack, and selected: as an inline guard, a
                         // pass jumps to `off + 2`, a failure falls through to `off + 1`,
                         // both with the window live.
-                        (Residual::GuardDynamic(_), _) if !copied => {
+                        (Residual::GuardDynamic(_), _, None) => {
                             #[cfg(feature = "align_selects")]
                             if (self.jctx.region_base + ops.offset().0) % CACHE_LINE + GUARD_TEST > CACHE_LINE {
                                 pad(ops, self.jctx.region_base, CACHE_LINE);
@@ -2532,12 +2575,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             );
                             debug_assert_eq!(ops.offset().0 - test, GUARD_TEST, "a GuardDynamic's test");
                         }
-                        (Residual::GuardDynamic(_), _) => {}
-                        (_, Some(label)) if copied && fuses => fused = Some(label),
+                        (Residual::GuardDynamic(_), ..) => {}
+                        (_, Some(label), Some(aligned)) if fuses => fused = Some((label, aligned, fall_exit)),
                         // Selected, for whatever reads `select` after it.
-                        (_, Some(label)) if copied => {
+                        (_, Some(label), Some(aligned)) => {
                             let join = ops.new_dynamic_label();
-                            pool.stubs.push((label, Stub::Select { exit: 1, join }));
+                            pool.stubs.push((label, Stub::Select { aligned, exit: 1, join }));
                             dynasm!(ops
                                 ; .arch x64
                                 ; mov QWORD r12 => RunState.select, 0
