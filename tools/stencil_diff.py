@@ -4,8 +4,9 @@ op's `SKIP` 0 stencil (as `stencil_cold.py` finds them) in binary A and in B,
 compared instruction by instruction with addresses taken out: a jump inside a
 stencil by its offset in it, a jump or call out of it by the symbol it names,
 and data (RIP-relative operands, thread-locals) not at all, as it's laid out
-differently in each binary. Prints how many are the same, and each that
-differs with its first difference.
+differently in each binary. Prints how many are the same, how many that
+differ change length and the instructions in each binary, those that change
+length by how much, and each that differs with its first difference.
 
     tools/stencil_diff.py A B [--show N]
 
@@ -60,6 +61,13 @@ def main():
             differ.append((op, len(x), len(y), at, x[at] if at < len(x) else '(end)', y[at] if at < len(y) else '(end)'))
     print(f'{len(both) - len(differ)} of {len(both)} stencils the same; '
           f'{len(set(a) - set(b))} only in A, {len(set(b) - set(a))} only in B')
+    # Of those that differ, the ones whose length changed, most grown first.
+    grown = sorted((d for d in differ if d[1] != d[2]), key=lambda d: d[1] - d[2])
+    print(f'{len(differ) - len(grown)} differ at the same length; {len(grown)} change length, '
+          f'{sum(len(normalized(a[op])) for op in both)} instructions in A, '
+          f'{sum(len(normalized(b[op])) for op in both)} in B')
+    for op, nx, ny, *_ in grown[:args.show]:
+        print(f'  {ny - nx:+4} ({nx} -> {ny}) {op}')
     for op, nx, ny, at, x, y in differ[:args.show]:
         print(f'\n{op}: {nx} instructions in A, {ny} in B; first difference at {at}')
         print(f'  A: {x}')
