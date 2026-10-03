@@ -208,6 +208,19 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     /// into another type.
     #[inline(always)]
     pub unsafe fn from_arith(n: f64) -> Self {
+        unsafe { Self::from_arith_tagged(n, Self::NUMBER_TAG) }
+    }
+
+    /// `from_arith`, with `tag` the value of `NUMBER_TAG`: a window op's
+    /// pinned register, so the stencil boxes with it rather than with a
+    /// constant of its own. See Note [Pinned tag] in `window`.
+    ///
+    /// # Safety
+    ///
+    /// As `from_arith`, and `tag` is `NUMBER_TAG`.
+    #[inline(always)]
+    pub unsafe fn from_arith_tagged(n: f64, tag: u64) -> Self {
+        debug_assert_eq!(tag, Self::NUMBER_TAG, "the pinned tag");
         let bits = n.to_bits();
         debug_assert!(bits >> 48 < 0xfffc, "{bits:#x} would box into another type");
         // As JavaScriptCore's JIT boxes a double: subtracting `NUMBER_TAG` (which
@@ -219,7 +232,7 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         {
             let boxed: u64;
             unsafe {
-                core::arch::asm!("sub {v}, {tag}", v = inout(reg) bits => boxed, tag = in(reg) Self::NUMBER_TAG, options(pure, nomem, nostack));
+                core::arch::asm!("sub {v}, {tag}", v = inout(reg) bits => boxed, tag = in(reg) tag, options(pure, nomem, nostack));
             }
             Self::from_raw(boxed)
         }
@@ -234,6 +247,17 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     /// The value is a number, in the double encoding.
     #[inline(always)]
     pub unsafe fn as_double(&self) -> f64 {
+        unsafe { self.as_double_tagged(Self::NUMBER_TAG) }
+    }
+
+    /// `as_double`, with `tag` the value of `NUMBER_TAG`, as `from_arith_tagged`.
+    ///
+    /// # Safety
+    ///
+    /// As `as_double`, and `tag` is `NUMBER_TAG`.
+    #[inline(always)]
+    pub unsafe fn as_double_tagged(&self, tag: u64) -> f64 {
+        debug_assert_eq!(tag, Self::NUMBER_TAG, "the pinned tag");
         debug_assert!(self.is_number() && !self.is_int(), "{:#x} isn't a double", self.0);
         // Adding `NUMBER_TAG`, as JavaScriptCore's JIT decodes it, written as an
         // instruction for the reason `from_arith` gives: a `lea` into another
@@ -243,7 +267,7 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         {
             let bits: u64;
             unsafe {
-                core::arch::asm!("lea {out}, [{v} + {tag}]", out = lateout(reg) bits, v = in(reg) self.0, tag = in(reg) Self::NUMBER_TAG, options(pure, nomem, nostack));
+                core::arch::asm!("lea {out}, [{v} + {tag}]", out = lateout(reg) bits, v = in(reg) self.0, tag = in(reg) tag, options(pure, nomem, nostack));
             }
             f64::from_bits(bits)
         }

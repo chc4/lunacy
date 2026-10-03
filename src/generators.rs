@@ -799,11 +799,11 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
 /// A numeric operand as a double, decoded from the integer encoding if `INT`.
 /// See Note [Integers].
 #[inline(always)]
-unsafe fn number<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>) -> f64 {
+unsafe fn number<'src, 'intern, const INT: bool>(v: LBoxed<'src, 'intern>, tag: u64) -> f64 {
     if INT {
         (unsafe { v.as_int() }) as f64
     } else {
-        unsafe { v.as_double() }
+        unsafe { v.as_double_tagged(tag) }
     }
 }
 
@@ -823,8 +823,8 @@ unsafe fn arith_value<const OP: Opcode>(l: f64, r: f64) -> f64 {
 
 /// The double op `OP` on `l` and `r`, boxed. See Note [Arithmetic NaNs].
 #[inline(always)]
-unsafe fn arith<'src, 'intern, const OP: Opcode>(l: f64, r: f64) -> LBoxed<'src, 'intern> {
-    unsafe { LBoxed::from_arith(arith_value::<OP>(l, r)) }
+unsafe fn arith<'src, 'intern, const OP: Opcode>(l: f64, r: f64, tag: u64) -> LBoxed<'src, 'intern> {
+    unsafe { LBoxed::from_arith_tagged(arith_value::<OP>(l, r), tag) }
 }
 
 /// An integer op's result that doesn't fit the integer encoding, from its cold
@@ -857,14 +857,14 @@ fn integer_op<const OP: Opcode>(l: i32, r: i32) -> Option<i32> {
 // The double ops on registers, `LI`/`RI` if in the integer encoding, and
 // constants, `k` their value. Unchecked, so that no panic path follows the
 // stencil's `become` and the copy can slice it off.
-crate::window::windowed!(NumericRR, [], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs, out dest) {
-    *dest = arith::<OP>(number::<LI>(lhs), number::<RI>(rhs));
+crate::window::windowed!(NumericRR, [], [OP: Opcode, LI: bool, RI: bool], |owner, state, base, tag| (lhs, rhs, out dest) {
+    *dest = arith::<OP>(number::<LI>(lhs, tag), number::<RI>(rhs, tag), tag);
 });
-crate::window::windowed!(NumericKR, [k: f64], [OP: Opcode, RI: bool], |owner, state, base| (rhs, out dest) {
-    *dest = arith::<OP>(k, number::<RI>(rhs));
+crate::window::windowed!(NumericKR, [k: f64], [OP: Opcode, RI: bool], |owner, state, base, tag| (rhs, out dest) {
+    *dest = arith::<OP>(k, number::<RI>(rhs, tag), tag);
 });
-crate::window::windowed!(NumericRK, [k: f64], [OP: Opcode, LI: bool], |owner, state, base| (lhs, out dest) {
-    *dest = arith::<OP>(number::<LI>(lhs), k);
+crate::window::windowed!(NumericRK, [k: f64], [OP: Opcode, LI: bool], |owner, state, base, tag| (lhs, out dest) {
+    *dest = arith::<OP>(number::<LI>(lhs, tag), k, tag);
 });
 
 /// `NumericRR` for `opcode`, reading integer registers as `li`/`ri` say.
@@ -998,8 +998,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 let ResumeArg::Number(r) = (yield YieldOp::NumberK(rhsc)) else { unreachable!() };
                 // A constant's NaN is canonicalized when it is captured (`NumberK`), as it
                 // came from outside the encoding. See Note [Arithmetic NaNs].
-                crate::window::windowed!(NumericKK, [kl: f64, kr: f64], [OP: Opcode], |owner, state, base| (out dest) {
-                    *dest = arith::<OP>(kl, kr);
+                crate::window::windowed!(NumericKK, [kl: f64, kr: f64], [OP: Opcode], |owner, state, base, tag| (out dest) {
+                    *dest = arith::<OP>(kl, kr, tag);
                 });
                 Some(dispatch_numeric_window!(opcode, NumericKK, [], (l, r, &[dest])))
             },
@@ -1065,14 +1065,14 @@ unsafe fn compare_exit<const OP: Opcode, T: PartialOrd>(a: u8, l: T, r: T) -> us
 
 // Compares of numbers: registers, `LI`/`RI` if in the integer encoding, and a
 // constant, `k` its value.
-crate::window::windowed!(select CompareRR, [a: u8], [OP: Opcode, LI: bool, RI: bool], |owner, state, base| (lhs, rhs) {
-    compare_exit::<OP, f64>(a, number::<LI>(lhs), number::<RI>(rhs))
+crate::window::windowed!(select CompareRR, [a: u8], [OP: Opcode, LI: bool, RI: bool], |owner, state, base, tag| (lhs, rhs) {
+    compare_exit::<OP, f64>(a, number::<LI>(lhs, tag), number::<RI>(rhs, tag))
 });
-crate::window::windowed!(select CompareKR, [a: u8, k: f64], [OP: Opcode, RI: bool], |owner, state, base| (rhs) {
-    compare_exit::<OP, f64>(a, k, number::<RI>(rhs))
+crate::window::windowed!(select CompareKR, [a: u8, k: f64], [OP: Opcode, RI: bool], |owner, state, base, tag| (rhs) {
+    compare_exit::<OP, f64>(a, k, number::<RI>(rhs, tag))
 });
-crate::window::windowed!(select CompareRK, [a: u8, k: f64], [OP: Opcode, LI: bool], |owner, state, base| (lhs) {
-    compare_exit::<OP, f64>(a, number::<LI>(lhs), k)
+crate::window::windowed!(select CompareRK, [a: u8, k: f64], [OP: Opcode, LI: bool], |owner, state, base, tag| (lhs) {
+    compare_exit::<OP, f64>(a, number::<LI>(lhs, tag), k)
 });
 
 // EQ of a double against a number constant `k` (its bits in the double
@@ -1671,12 +1671,12 @@ pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
 // and a closure capturing it has it closed (`CLOSE`) at the end of each
 // iteration, before this runs. So it is set on exit too, and the op needn't
 // read its old value.
-crate::window::windowed!(select ForLoop, [], [II: bool, LI: bool, SI: bool], |owner, state, base| (idx, limit, step, out var) {
+crate::window::windowed!(select ForLoop, [], [II: bool, LI: bool, SI: bool], |owner, state, base, tag| (idx, limit, step, out var) {
     let comp = if II && LI && SI {
         let (nidx, nlimit, nstep) = (idx.as_int(), limit.as_int(), step.as_int());
         if nstep < 0 { nlimit <= nidx } else { nidx <= nlimit }
     } else {
-        let (nidx, nlimit, nstep) = (number::<II>(idx), number::<LI>(limit), number::<SI>(step));
+        let (nidx, nlimit, nstep) = (number::<II>(idx, tag), number::<LI>(limit, tag), number::<SI>(step, tag));
         if nstep < 0.0 { nlimit <= nidx } else { nidx <= nlimit }
     };
     *var = idx;

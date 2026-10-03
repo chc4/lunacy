@@ -316,12 +316,13 @@ fn emit_count(ops: &mut Assembler, at: i64) {
     );
 }
 
-/// The window registers `w0..w8` in the order the stencil ABI passes them (the
-/// `rust-preserve-none` arguments after state and base in r12, r13),
-/// then `SCRATCH`: rax, which every stencil clobbers (LLVM loads its `become`
-/// target into it), so it only holds a value within one sequence of moves.
+/// The window registers `w0..w7` in the order the stencil ABI passes them (the
+/// `rust-preserve-none` arguments after state, base and the pinned tag in r12,
+/// r13, r14), then `SCRATCH`: rax, which every stencil clobbers (LLVM loads its
+/// `become` target into it), so it only holds a value within one sequence of
+/// moves.
 const WINDOW_REGS: [u8; WINDOW + 1] = [
-    14, /* r14 */ 15, /* r15 */ 7, /* rdi */ 6, /* rsi */ 2, /* rdx */ 1, /* rcx */
+    15, /* r15 */ 7, /* rdi */ 6, /* rsi */ 2, /* rdx */ 1, /* rcx */
     8, /* r8 */ 9, /* r9 */ 11, /* r11 */ 0, /* rax */
 ];
 
@@ -475,6 +476,15 @@ impl Stencils {
     }
 }
 
+/// Load the pinned tag's register, r14: on entering a region, and after a
+/// frame op. See Note [Pinned tag] in `window`.
+fn emit_pin(ops: &mut Assembler) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov r14, QWORD LBoxed::NUMBER_TAG as i64
+    );
+}
+
 /// Emit an allocator instruction other than `Emit::Op`.
 fn emit_window_move(ops: &mut Assembler, emit: Emit) {
     let reg = |r: usize| WINDOW_REGS[r];
@@ -545,6 +555,8 @@ fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, 
             );
         }
     }
+    // A frame op's stencil keeps no window, the pinned tag's register included.
+    emit_pin(ops);
 }
 
 /// How a copy between `sub rsp, 8` and `add rsp, 8` leaves from its middle by
@@ -1183,6 +1195,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; push rbx
             ; push r13 // save initial base_ptr
         );
+        emit_pin(&mut ops);
         // TODO: Pin state.vals.as_ptr() to a register, which will let us remove a lot of the
         // JitHelper function calls.
 

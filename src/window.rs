@@ -9,8 +9,9 @@
 //!   site enumerates ops (like `Exec`'s closure);
 //! * an `#[inline(always)]` body shared by both tiers (single source of truth);
 //! * a `rust-preserve-none` stencil `__stencil::<SKIP>`: the fixed params
-//!   `(state, base)` (the ABI the JIT pins in r12/r13) followed by the
-//!   register window as **scalar** `LBoxed` params `w0..w8` (r14, r15, rdi, rsi, rdx, rcx, r8, r9, r11; see
+//!   `(state, base, tag)` (the ABI the JIT pins in r12/r13/r14; `tag` is
+//!   `LBoxed::NUMBER_TAG`, see Note [Pinned tag]) followed by the register
+//!   window as **scalar** `LBoxed` params `w0..w7` (r15, rdi, rsi, rdx, rcx, r8, r9, r11; see
 //!   `WINDOW`). The body's `owner` is forged (`crate::forge_owner`): the
 //!   token is zero-sized, so passing it would only spend a register.
 //!   Scalars, not `[LBoxed; N]`, because Rust passes arrays by pointer whatever
@@ -49,7 +50,7 @@
 // Note [Register window]
 // ~~~~~~~~~~~~~~~~~~~~~~
 // A window op's operands are whole `LBoxed` values held in the register window:
-// `WINDOW` registers, passed between stencils as the scalar params `w0..w8`. An
+// `WINDOW` registers, passed between stencils as the scalar params `w0..w7`. An
 // op always runs on a contiguous run of the window: operand `i`, in the order
 // the op declares its operands, is register `SKIP + i`, and
 // `Window::stencil(skip)` is the instance for that `SKIP`. The order is the op's
@@ -87,12 +88,12 @@ use crate::lboxed::LBoxed;
 use crate::vm::RunState;
 use crate::Owner;
 
-/// Number of register-window slots (w0..w8 = r14, r15, rdi, rsi, rdx, rcx, r8, r9, r11).
-/// `rust-preserve-none` passes 12 integer arguments in registers, 2 of them the
+/// Number of register-window slots (w0..w7 = r15, rdi, rsi, rdx, rcx, r8, r9, r11).
+/// `rust-preserve-none` passes 12 integer arguments in registers, 3 of them the
 /// fixed params, but the 12th (rax) can't be a window register: a stencil's
 /// `become` may be an indirect jump through the GOT, whose target LLVM loads
 /// into rax even when rax carries an argument, and that load stays in the copy.
-pub const WINDOW: usize = 9;
+pub const WINDOW: usize = 8;
 /// Number of hole statics available to captures.
 pub const MAX_HOLES: usize = 4;
 /// The hole past the captures' holes, whose value is the address of the site's
@@ -103,8 +104,8 @@ pub const SITE_HOLE: usize = MAX_HOLES;
 /// A window op's hole values.
 pub type Captures = SmallVec<[u64; 4]>;
 /// The register window's values.
-pub type Regs<'src, 'intern> = [LBoxed<'src, 'intern>; 9];
-const _: () = assert!(MAX_HOLES == 4 && WINDOW == 9);
+pub type Regs<'src, 'intern> = [LBoxed<'src, 'intern>; 8];
+const _: () = assert!(MAX_HOLES == 4 && WINDOW == 8);
 
 // ---- holes / continuation / anchor ---------------------------------------
 
@@ -386,7 +387,9 @@ pub(crate) use bind_record;
 /// * `[captures]` — struct fields, and the stencil's holes (at most `MAX_HOLES`;
 ///   more fails at link time; any [`Capture`] type).
 /// * `[const params]` — compile-time parameters baked into the stencil.
-/// * `|owner, state, base|` — names for the fixed params.
+/// * `|owner, state, base|` — names for the fixed params, and optionally a
+///   fourth, `|owner, state, base, tag|`, for `LBoxed::NUMBER_TAG` as the
+///   stencil has it in a register (see Note [Pinned tag]).
 /// * `(operands)` — the window operands in window order: operand `i` is register
 ///   `SKIP + i`. An input is bound in the body as an `LBoxed` value, an output
 ///   (marked `out`) as `&mut LBoxed` to write the result to. The body must not
@@ -421,7 +424,7 @@ macro_rules! windowed {
         $body:block
     ) => {
         $crate::window::windowed!(@sort
-            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] []]
+            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [] __tag []]
             [] [] [] (0usize)
         );
     };
@@ -430,11 +433,11 @@ macro_rules! windowed {
         guard $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
         [$($cp:ident : $cpt:ty),* $(,)?],
-        |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
+        |$owner:ident, $state:ident, $base:ident $(, $tag:ident)?| ($($operands:tt)*)
         $body:block
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [guard]]
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [guard] __tag [$($tag)?]]
             [] [] [] (0usize) $($operands)*
         );
     };
@@ -443,11 +446,11 @@ macro_rules! windowed {
         select $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
         [$($cp:ident : $cpt:ty),* $(,)?],
-        |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
+        |$owner:ident, $state:ident, $base:ident $(, $tag:ident)?| ($($operands:tt)*)
         $body:block
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [select]]
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [select] __tag [$($tag)?]]
             [] [] [] (0usize) $($operands)*
         );
     };
@@ -456,12 +459,12 @@ macro_rules! windowed {
         $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
         [$($cp:ident : $cpt:ty),* $(,)?],
-        |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
+        |$owner:ident, $state:ident, $base:ident $(, $tag:ident)?| ($($operands:tt)*)
         $body:block
         rejoin $rejoin:block
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [{ let () = $rejoin; 0 }] [rejoin]]
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [{ let () = $rejoin; 0 }] [rejoin] __tag [$($tag)?]]
             [] [] [] (0usize) $($operands)*
         );
     };
@@ -470,12 +473,12 @@ macro_rules! windowed {
         $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
         [$($cp:ident : $cpt:ty),* $(,)?],
-        |$owner:ident, $state:ident, $base:ident| ($($operands:tt)*)
+        |$owner:ident, $state:ident, $base:ident $(, $tag:ident)?| ($($operands:tt)*)
         $body:block
         $(cold $cold:block)?
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [$($cold)?] []]
+            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [$($cold)?] [] __tag [$($tag)?]]
             [] [] [] (0usize) $($operands)*
         );
     };
@@ -517,6 +520,10 @@ macro_rules! windowed {
     (@cold_body [$cold:block]) => {
         $cold
     };
+    // What the pinned tag binds to: its name, if the op names it. See Note
+    // [Pinned tag].
+    (@tag_pattern []) => { _ };
+    (@tag_pattern [$tag:ident]) => { $tag };
     // `code`, if the op has a cold path.
     (@if_cold [] $($code:tt)*) => {};
     (@if_cold [$cold:block] $($code:tt)*) => {
@@ -539,7 +546,7 @@ macro_rules! windowed {
         $crate::window::windowed!(@sort $decl [$($in)* ($op, $i)] [$($out)*] [$($acc)* Read] ($i + 1) $($($rest)*)?);
     };
     (@sort
-        [$kind:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block [$($cold:block)?] [$($guard:ident)?]]
+        [$kind:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block [$($cold:block)?] [$($guard:ident)?] $tagp:ident $tagl:tt]
         [$(($in:ident, $ii:expr))*] [$(($out:ident, $oi:expr))*] [$($acc:ident)*] ($arity:expr)
     ) => {
         $(#[$meta])*
@@ -571,9 +578,11 @@ macro_rules! windowed {
                 $owner: &'a mut $crate::Owner,
                 $state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                $tagp: u64,
                 $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
                 $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
             ) -> usize {
+                let $crate::window::windowed!(@tag_pattern $tagl): u64 = $tagp;
                 $crate::window::windowed!(@run [$($guard)?] $body $(, $cold)?)
             }
 
@@ -586,9 +595,11 @@ macro_rules! windowed {
                 $owner: &'a mut $crate::Owner,
                 $state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                $tagp: u64,
                 $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
                 $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
             ) -> usize {
+                let $crate::window::windowed!(@tag_pattern $tagl): u64 = $tagp;
                 unsafe { $crate::window::windowed!(@cold_body [$($cold)?]) }
             }
 
@@ -601,9 +612,11 @@ macro_rules! windowed {
                     $owner: &'a mut $crate::Owner,
                     $state: &'b mut $crate::vm::RunState<'src, 'intern>,
                     $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                    $tagp: u64,
                     $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
                     $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
                 ) -> bool {
+                    let $crate::window::windowed!(@tag_pattern $tagl): u64 = $tagp;
                     unsafe { $body }
                 }
 
@@ -615,12 +628,13 @@ macro_rules! windowed {
                     owner: &'a mut $crate::Owner,
                     state: &'b mut $crate::vm::RunState<'src, 'intern>,
                     base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                    tag: u64,
                     w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
                     skip: usize,
                 ) -> bool {
                     $( let $in = w[skip + $ii]; )*
                     $( let mut $out = w[skip + $oi]; )*
-                    let taken = unsafe { Self::__run_taken($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                    let taken = unsafe { Self::__run_taken($($cap,)* owner, state, base, tag, $($in,)* $(&mut $out,)*) };
                     $( w[skip + $oi] = $out; )*
                     taken
                 }
@@ -634,12 +648,13 @@ macro_rules! windowed {
                 owner: &'a mut $crate::Owner,
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                tag: u64,
                 w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
                 skip: usize,
             ) -> usize {
                 $( let $in = w[skip + $ii]; )*
                 $( let mut $out = w[skip + $oi]; )*
-                let exit = unsafe { Self::__run_cold($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let exit = unsafe { Self::__run_cold($($cap,)* owner, state, base, tag, $($in,)* $(&mut $out,)*) };
                 $( w[skip + $oi] = $out; )*
                 exit
             }
@@ -652,12 +667,13 @@ macro_rules! windowed {
                 owner: &'a mut $crate::Owner,
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                tag: u64,
                 w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
                 skip: usize,
             ) -> usize {
                 $( let $in = w[skip + $ii]; )*
                 $( let mut $out = w[skip + $oi]; )*
-                let exit = unsafe { Self::__run($($cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let exit = unsafe { Self::__run($($cap,)* owner, state, base, tag, $($in,)* $(&mut $out,)*) };
                 $( w[skip + $oi] = $out; )*
                 exit
             }
@@ -700,10 +716,10 @@ macro_rules! windowed {
                 skip: usize,
             ) {
                 assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
-                let exit = unsafe { Self::__window($(self.$cap,)* owner, state, base, w, skip) };
+                let exit = unsafe { Self::__window($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, w, skip) };
                 // The cold path's exit, if it takes it.
                 let exit = if exit == $crate::window::TO_COLD {
-                    unsafe { Self::__window_cold($(self.$cap,)* owner, state, base, w, skip) }
+                    unsafe { Self::__window_cold($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, w, skip) }
                 } else {
                     exit
                 };
@@ -721,13 +737,13 @@ macro_rules! windowed {
                 let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(at).as_ptr() };
                 $( let $in = state.vals[at + self.operands[$ii]]; )*
                 $( let mut $out = state.vals[at + self.operands[$oi]]; )*
-                let exit = unsafe { Self::__run($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                let exit = unsafe { Self::__run($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, $($in,)* $(&mut $out,)*) };
                 $( state.vals[at + self.operands[$oi]] = $out; )*
                 // The cold path's exit, if it takes it.
                 let exit = if exit == $crate::window::TO_COLD {
                     $( let $in = state.vals[at + self.operands[$ii]]; )*
                     $( let mut $out = state.vals[at + self.operands[$oi]]; )*
-                    let exit = unsafe { Self::__run_cold($(self.$cap,)* owner, state, base, $($in,)* $(&mut $out,)*) };
+                    let exit = unsafe { Self::__run_cold($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, $($in,)* $(&mut $out,)*) };
                     $( state.vals[at + self.operands[$oi]] = $out; )*
                     exit
                 } else {
@@ -752,7 +768,6 @@ macro_rules! windowed {
                     5 => Self::__stencil::<5> as *const () as usize,
                     6 => Self::__stencil::<6> as *const () as usize,
                     7 => Self::__stencil::<7> as *const () as usize,
-                    8 => Self::__stencil::<8> as *const () as usize,
                     _ => unreachable!(),
                 }
             }
@@ -761,6 +776,7 @@ macro_rules! windowed {
             pub extern "rust-preserve-none" fn __stencil<'b, 'src, 'intern, const SKIP: usize>(
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                tag: u64,
                 w0: $crate::lboxed::LBoxed<'src, 'intern>,
                 w1: $crate::lboxed::LBoxed<'src, 'intern>,
                 w2: $crate::lboxed::LBoxed<'src, 'intern>,
@@ -769,13 +785,12 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
-                w8: $crate::lboxed::LBoxed<'src, 'intern>,
             ) {
                 if SKIP + Self::ARITY > $crate::window::WINDOW {
                     // Never used: `stencil(skip)` rejects such `skip`.
                     unsafe { core::hint::unreachable_unchecked() }
                 }
-                let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
+                let mut w = [w0, w1, w2, w3, w4, w5, w6, w7];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
                 // An op with a cold path branches on its body's `bool`, which the
@@ -783,22 +798,22 @@ macro_rules! windowed {
                 // where it is: the continuation the copy points at the way into the
                 // cold stencil. See Note [Cold stencils].
                 $crate::window::windowed!(@if_cold [$($cold)?]
-                    let taken = unsafe { Self::__window_taken($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                    let taken = unsafe { Self::__window_taken($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, SKIP) };
                     if taken {
-                        become Self::__to_cold(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                        become Self::__to_cold(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
                     }
                 );
                 // Any other on its exit. See Note [Window exits].
                 $crate::window::windowed!(@if_not_cold [$($cold)?]
-                    let exit = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                    let exit = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, SKIP) };
                     $crate::window::windowed!(@if_exit1 [$($guard)?]
                         if exit == 1 {
-                            become Self::__exit1(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                            become Self::__exit1(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
                         }
                     );
                     let _ = exit;
                 );
-                become Self::__next(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                become Self::__next(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
             }
 
             $crate::window::windowed!(@if_exit1 [$($guard)?]
@@ -809,6 +824,7 @@ macro_rules! windowed {
                 extern "rust-preserve-none" fn __exit1<'b, 'src, 'intern>(
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                tag: u64,
                 w0: $crate::lboxed::LBoxed<'src, 'intern>,
                 w1: $crate::lboxed::LBoxed<'src, 'intern>,
                 w2: $crate::lboxed::LBoxed<'src, 'intern>,
@@ -817,11 +833,10 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
-                w8: $crate::lboxed::LBoxed<'src, 'intern>,
                 ) {
                     // Unlike `__next`'s body, or LLVM merges the two, and the
                     // guard's branch between them with them.
-                    core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8, 1u8));
+                    core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7, 1u8));
                 }
             );
 
@@ -833,6 +848,7 @@ macro_rules! windowed {
                 extern "rust-preserve-none" fn __to_cold<'b, 'src, 'intern>(
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                tag: u64,
                 w0: $crate::lboxed::LBoxed<'src, 'intern>,
                 w1: $crate::lboxed::LBoxed<'src, 'intern>,
                 w2: $crate::lboxed::LBoxed<'src, 'intern>,
@@ -841,11 +857,10 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
-                w8: $crate::lboxed::LBoxed<'src, 'intern>,
                 ) {
                     // Unlike `__next`'s body, or LLVM merges the two, and the
                     // branch between them with them.
-                    core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8, 2u8));
+                    core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7, 2u8));
                 }
             );
 
@@ -861,7 +876,6 @@ macro_rules! windowed {
                         5 => Self::__cold::<5> as *const () as usize,
                         6 => Self::__cold::<6> as *const () as usize,
                         7 => Self::__cold::<7> as *const () as usize,
-                        8 => Self::__cold::<8> as *const () as usize,
                         _ => unreachable!(),
                     }
                 }
@@ -875,6 +889,7 @@ macro_rules! windowed {
                 extern "rust-preserve-none" fn __cold<'b, 'src, 'intern, const SKIP: usize>(
                     state: &'b mut $crate::vm::RunState<'src, 'intern>,
                     base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                tag: u64,
                 w0: $crate::lboxed::LBoxed<'src, 'intern>,
                 w1: $crate::lboxed::LBoxed<'src, 'intern>,
                 w2: $crate::lboxed::LBoxed<'src, 'intern>,
@@ -883,27 +898,26 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
-                w8: $crate::lboxed::LBoxed<'src, 'intern>,
                 ) {
                     if SKIP + Self::ARITY > $crate::window::WINDOW {
                         unsafe { core::hint::unreachable_unchecked() }
                     }
-                    let mut w = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
+                    let mut w = [w0, w1, w2, w3, w4, w5, w6, w7];
                     // The site's record: where each of its exits goes, then where
                     // its captures are.
                     let site = state.cold_site;
                     $crate::window::bind_record!(site, 0; $($cap : $cty),*);
-                    let exit = unsafe { Self::__window_cold($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                    let exit = unsafe { Self::__window_cold($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, SKIP) };
                     // SAFETY: where the site's exit goes, in JIT code, which its
                     // copy's window continues to, at the stack it jumped from.
                     let fall: extern "rust-preserve-none" fn(
                         &'b mut $crate::vm::RunState<'src, 'intern>,
                         *mut $crate::lboxed::LBoxed<'src, 'intern>,
-                        $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
-                        $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
-                        $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
+                        u64,
+                        $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
+                        $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
                     ) = unsafe { core::mem::transmute(*site.add(exit)) };
-                    become fall(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
+                    become fall(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
                 }
             );
 
@@ -920,6 +934,7 @@ macro_rules! windowed {
             extern "rust-preserve-none" fn __next<'b, 'src, 'intern>(
                 state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
+                tag: u64,
                 w0: $crate::lboxed::LBoxed<'src, 'intern>,
                 w1: $crate::lboxed::LBoxed<'src, 'intern>,
                 w2: $crate::lboxed::LBoxed<'src, 'intern>,
@@ -928,9 +943,8 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
-                w8: $crate::lboxed::LBoxed<'src, 'intern>,
             ) {
-                core::hint::black_box((state as *mut _, base, w0, w1, w2, w3, w4, w5, w6, w7, w8));
+                core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7));
             }
     };
     (@stencil frame, [$($cap:ident : $cty:ty),*] [] []) => {
@@ -948,7 +962,7 @@ macro_rules! windowed {
                 let mut w = [$crate::lboxed::LBoxed::NIL; $crate::window::WINDOW];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
-                let _ = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, &mut w, SKIP) };
+                let _ = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, $crate::lboxed::LBoxed::NUMBER_TAG, &mut w, SKIP) };
                 become Self::__next(state)
             }
 
@@ -1489,6 +1503,22 @@ fn cold_entry() -> [u8; 20] {
 /// `become`, which must never be reached.
 const UD2: [u8; 2] = [0x0f, 0x0b];
 
+// Note [Pinned tag]
+// ~~~~~~~~~~~~~~~~~
+// Boxing and unboxing a double adds `NUMBER_TAG`, a 64-bit constant, which a
+// stencil would otherwise materialize in each copy that does it. Through JIT
+// code, r14 holds it instead, as JavaScriptCore's JIT pins its NumberTag: it is
+// every window stencil's third fixed param, `tag`, which each passes on as it
+// passes on `state` and `base`. The JIT loads it on entering a region, and again
+// after a frame op, whose stencil keeps no window; a call out of JIT code
+// preserves it, as r14 is callee-saved in the System V ABI.
+//
+// A window op uses it by naming it in its header (`|owner, state, base,
+// tag|`) and boxing and unboxing with it (`LBoxed::from_arith_tagged`,
+// `as_double_tagged`). LLVM knows nothing of its value, so it uses the
+// register: told the value, it would fold the register back into the constant.
+// Run on the stack the op gets the constant.
+
 // Note [Cold stencils]
 // ~~~~~~~~~~~~~~~~~~~~
 // A window op with a cold path (`windowed!`'s `cold` block) has a second
@@ -1758,11 +1788,11 @@ unsafe fn enter<'src, 'intern>(
     let entry: extern "rust-preserve-none" fn(
         *mut RunState<'src, 'intern>,
         *mut L<'src, 'intern>,
+        u64,
         L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>,
         L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>,
-        L<'src, 'intern>,
     ) = unsafe { core::mem::transmute(exec.ptr(dynasmrt::AssemblyOffset(0))) };
-    entry(state, base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8]);
+    entry(state, base, LBoxed::NUMBER_TAG, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 }
 
 /// Operand slots for an op that reads the whole window (at `SKIP` 0). Its
@@ -1787,9 +1817,9 @@ mod check {
 
     // Writes the window to the address in its capture (a hole), so observing the
     // result doesn't depend on `base`, which the op under test may use.
-    windowed!(CheckFlush, [out: u64], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7, w8) {
+    windowed!(CheckFlush, [out: u64], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7) {
         let out = out as *mut [u64; WINDOW];
-        *out = [w0, w1, w2, w3, w4, w5, w6, w7, w8].map(|w| w.bits());
+        *out = [w0, w1, w2, w3, w4, w5, w6, w7].map(|w| w.bits());
     });
 
     struct Checker {
@@ -1856,8 +1886,8 @@ mod tests {
         *d = LBoxed::from_number(crate::unchecked_unwrap(a.as_number()) + k);
     });
     // Flush the whole window to `base[0..WINDOW]`, to observe the result.
-    windowed!(Flush, [], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7, w8) {
-        *(base as *mut [LBoxed; WINDOW]) = [w0, w1, w2, w3, w4, w5, w6, w7, w8];
+    windowed!(Flush, [], [], |owner, state, base| (w0, w1, w2, w3, w4, w5, w6, w7) {
+        *(base as *mut [LBoxed; WINDOW]) = [w0, w1, w2, w3, w4, w5, w6, w7];
     });
 
     // A stencil that calls out of line (as table get/set through `IndexMap`

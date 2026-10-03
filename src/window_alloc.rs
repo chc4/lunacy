@@ -69,7 +69,7 @@ pub const SCRATCH: usize = WINDOW;
 
 /// Window registers the JIT allocates: the first `ALLOCATED` of the `WINDOW` a
 /// stencil passes on. The rest are passed through every op untouched.
-pub const ALLOCATED: usize = 7;
+pub const ALLOCATED: usize = WINDOW;
 const _: () = assert!(ALLOCATED <= WINDOW);
 
 const MEMORY_COST: u32 = 4;
@@ -1001,7 +1001,7 @@ mod tests {
     fn random_traces() {
         let mut rng = Rng(0x2545f4914f6cdd1d);
         for _ in 0..3000 {
-            let width = 5 + rng.below(5);
+            let width = 5 + rng.below(WINDOW - 4);
             let mut ops = Vec::new();
             let mut kinds = Vec::new();
             let mut starts = vec![0];
