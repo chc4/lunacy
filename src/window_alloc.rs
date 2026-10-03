@@ -67,6 +67,11 @@ use crate::window::{Access, Window, WINDOW};
 /// Location of a value for [`Emit`]: window register `0..WINDOW`, or `SCRATCH`.
 pub const SCRATCH: usize = WINDOW;
 
+/// Window registers the JIT allocates: the first `ALLOCATED` of the `WINDOW` a
+/// stencil passes on. The rest are passed through every op untouched.
+pub const ALLOCATED: usize = 8;
+const _: () = assert!(ALLOCATED <= WINDOW);
+
 const MEMORY_COST: u32 = 4;
 const MOVE_COST: u32 = 1;
 
@@ -204,14 +209,14 @@ struct Plan {
 /// [Window allocation].
 #[derive(Debug)]
 pub struct WindowAlloc {
-    /// Window registers in use: `WINDOW`, or fewer to test register pressure.
+    /// Window registers in use: `ALLOCATED`, or fewer to test register pressure.
     width: usize,
     cache: Cache,
 }
 
 impl Default for WindowAlloc {
     fn default() -> Self {
-        Self::with_width(WINDOW)
+        Self::with_width(ALLOCATED)
     }
 }
 

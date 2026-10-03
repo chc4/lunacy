@@ -10,7 +10,7 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::specialize::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, EXITS, WINDOW};
-use crate::window_alloc::{plan_trace, Cache, Emit, Packed, Placement, Rise, Step, WindowAlloc};
+use crate::window_alloc::{plan_trace, Cache, ALLOCATED, Emit, Packed, Placement, Rise, Step, WindowAlloc};
 use crate::trace::{Block as TraceBlock, Event, Loops, Policy, Region, Slots};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
@@ -1721,7 +1721,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             step_of.push(of);
         }
-        let plan = plan_trace(&steps, WINDOW, hint);
+        let plan = plan_trace(&steps, ALLOCATED, hint);
         let exits = leaving.into_iter().filter_map(|(step, from, target)| Some((from, target, plan.exits[step].clone()?))).collect();
         let placed = |of: &[Option<usize>]| of.iter().map(|step| step.map(|step| (plan.skips[step] as u8, Packed::pack(&plan.windows[step])))).collect();
         let planned = trace
