@@ -454,11 +454,11 @@ pub fn env_moves() -> u64 {
 impl<'src, 'intern> Table<'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
-            array: vec![LBoxed::NIL; array].into(),
+            array: Vec::with_capacity(array).into(),
             hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
             epoch: 0,
             environment: false,
-            kind: if array > 0 { LType::Nil.bit() } else { 0 },
+            kind: 0,
         }
     }
 
@@ -476,6 +476,13 @@ impl<'src, 'intern> Table<'src, 'intern> {
             Widen::No => {}
             Widen::Bit(t) => self.widen_kind(t),
             Widen::Decode => self.widen_kind(value.representation()),
+        }
+    }
+
+    /// Drop the nils ending the array part. See Note [Array length].
+    pub fn trim(&mut self) {
+        while self.array.last().is_some_and(|value| value.bits() == LBoxed::NIL.bits()) {
+            self.array.pop();
         }
     }
 
@@ -505,6 +512,15 @@ impl<'src, 'intern> Table<'src, 'intern> {
         self.epoch += 1;
     }
 }
+
+// Note [Array length]
+// ~~~~~~~~~~~~~~~~~~~
+// A table's length (`#t`) is a border: an index whose value isn't nil and
+// whose successor's is, or zero if `t[1]` is nil. The array part holds the keys
+// from 1 up to its length, and never ends in nil, so its length is a border.
+// Every store into it keeps that: nil stored into its last element drops the
+// nils ending it, and nil stored past its end stores nothing. A window op
+// storing a value the context knows isn't nil has nothing to check.
 
 /// The array slot of a number key: the array part holds the integer keys from
 /// 1 up (growing to fit on a write), the hash part every other number (zero,
@@ -553,6 +569,16 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     pub fn set_widening<const W: Widen>(&mut self, owner: &mut Owner, key: LBoxed<'src, 'intern>, value: LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) {
         self.barrier_back();
         if let Some(slot) = key.as_number().and_then(array_slot) {
+            // Nil past the end is no store, and nil into the last element
+            // shortens the array part. See Note [Array length].
+            if value.bits() == LBoxed::NIL.bits() {
+                if slot < self.ro(owner).array.len() {
+                    self.rw(owner).array[slot] = value;
+                    self.rw(owner).widen_by(W, value);
+                    self.rw(owner).trim();
+                }
+                return;
+            }
             // TODO: sparse arrays
             if self.rw(owner).array.len() <= slot {
                 if self.rw(owner).array.len() < slot {
@@ -956,10 +982,8 @@ impl<'src, 'intern> LValue<'src, 'intern> {
         match self {
             LValue::InternedString(s) => Ok(LValue::number(s.as_bytes().len() as _)),
             LValue::OwnedString(s) => Ok(LValue::number(s.len() as _)),
-            LValue::Table(t) => {
-                // TODO: sparse arrays
-                Ok(LValue::number(t.ro(owner).array.len() as _))
-            },
+            // A border. See Note [Array length].
+            LValue::Table(t) => Ok(LValue::number(t.ro(owner).array.len() as _)),
             _ => unimplemented!(),
         }
     }

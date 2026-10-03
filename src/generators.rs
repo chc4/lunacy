@@ -393,6 +393,24 @@ fn store_kind<'src, 'intern, const W: Widen>(owner: &mut Owner, tab: &Tc<Table<'
     tab.rw(owner).widen_by(W, value);
 }
 
+/// Store `value` into `tab`'s array part at `slot`, widening its kind as `W`
+/// says. A value that `MAY_BE_NIL` and is nil drops the nils ending the array,
+/// and past its end stores nothing (so the store repeats safely, as
+/// `check_windows` repeats it). See Note [Array length] in `vm`.
+#[inline(always)]
+fn store_array<'src, 'intern, const W: Widen, const MAY_BE_NIL: bool>(owner: &mut Owner, tab: &Tc<Table<'src, 'intern>>, slot: usize, value: LBoxed<'src, 'intern>) {
+    if MAY_BE_NIL && value.bits() == LBoxed::NIL.bits() {
+        if slot < tab.ro(owner).array.len() {
+            tab.rw(owner).array[slot] = value;
+            store_kind::<W>(owner, tab, value);
+            tab.rw(owner).trim();
+        }
+        return;
+    }
+    tab.rw(owner).array[slot] = value;
+    store_kind::<W>(owner, tab, value);
+}
+
 /// `$make!` of the const `Widen` that `$how` is.
 macro_rules! with_widen {
     ($how:expr, $make:ident) => {
@@ -532,6 +550,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         let widen = !(own
             || known == ResumeArg::Type(CType::Type(LType::Unknown))
             || (stored != LType::Unknown && known == ResumeArg::Type(CType::Type(stored))));
+        // Whether the value may be nil, which may shorten the array part. See
+        // Note [Array length] in `vm`.
+        let nil = matches!(stored, LType::Nil | LType::Unknown);
         // How the store widens the array's kind: not at all, by the value's
         // representation, known here, or by the value's found out.
         let how = match (widen, stored) {
@@ -540,29 +561,27 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             (true, stored) => Widen::Bit(stored),
         };
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableArray, [k: i32], [W: Widen], |owner, state, base| (table, value) {
-                let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
-                tab.rw(owner).array[integer_slot(k)] = value;
-                store_kind::<W>(owner, &tab, value);
+            windowed!(SetTableArray, [k: i32], [W: Widen, N: bool], |owner, state, base| (table, value) {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                store_array::<W, N>(owner, &tab, integer_slot(k), value);
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            windowed!(SetTableArrayK, [k: i32, value: u64], [W: Widen], |owner, state, base| (table) {
-                let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
+            windowed!(SetTableArrayK, [k: i32, value: u64], [W: Widen, N: bool], |owner, state, base| (table) {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 // A constant's value lives as long as its prototype.
                 let value = LBoxed::from_bits(value);
-                tab.rw(owner).array[integer_slot(k)] = value;
-                store_kind::<W>(owner, &tab, value);
+                store_array::<W, N>(owner, &tab, integer_slot(k), value);
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {
-                    macro_rules! make { ($W:tt) => { Rc::new(SetTableArray::<$W>::new(k, &[a, c])) as Rc<dyn Window> } }
+                    macro_rules! make { ($W:tt) => { if nil { Rc::new(SetTableArray::<$W, true>::new(k, &[a, c])) as Rc<dyn Window> } else { Rc::new(SetTableArray::<$W, false>::new(k, &[a, c])) as Rc<dyn Window> } } }
                     with_widen!(how, make)
                 }
                 Some(value) => {
-                    macro_rules! make { ($W:tt) => { Rc::new(SetTableArrayK::<$W>::new(k, value, &[a])) as Rc<dyn Window> } }
+                    macro_rules! make { ($W:tt) => { if nil { Rc::new(SetTableArrayK::<$W, true>::new(k, value, &[a])) as Rc<dyn Window> } else { Rc::new(SetTableArrayK::<$W, false>::new(k, value, &[a])) as Rc<dyn Window> } } }
                     with_widen!(how, make)
                 }
             });
@@ -570,29 +589,27 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 yield YieldOp::Effect(Effect::ArrayStore(stored));
             }
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableInteger, [], [W: Widen], |owner, state, base| (table, key, value) {
-                let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
-                tab.rw(owner).array[integer_slot(key.as_int())] = value;
-                store_kind::<W>(owner, &tab, value);
+            windowed!(SetTableInteger, [], [W: Widen, N: bool], |owner, state, base| (table, key, value) {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                store_array::<W, N>(owner, &tab, integer_slot(key.as_int()), value);
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
-            windowed!(SetTableIntegerK, [value: u64], [W: Widen], |owner, state, base| (table, key) {
-                let LValue::Table(mut tab) = table.unbox() else { unreachable!() };
+            windowed!(SetTableIntegerK, [value: u64], [W: Widen, N: bool], |owner, state, base| (table, key) {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 // A constant's value lives as long as its prototype.
                 let value = LBoxed::from_bits(value);
-                tab.rw(owner).array[integer_slot(key.as_int())] = value;
-                store_kind::<W>(owner, &tab, value);
+                store_array::<W, N>(owner, &tab, integer_slot(key.as_int()), value);
                 // Last. See Note [Write barriers].
                 tab.barrier_back();
             });
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {
-                    macro_rules! make { ($W:tt) => { Rc::new(SetTableInteger::<$W>::new(&[a, b, c])) as Rc<dyn Window> } }
+                    macro_rules! make { ($W:tt) => { if nil { Rc::new(SetTableInteger::<$W, true>::new(&[a, b, c])) as Rc<dyn Window> } else { Rc::new(SetTableInteger::<$W, false>::new(&[a, b, c])) as Rc<dyn Window> } } }
                     with_widen!(how, make)
                 }
                 Some(value) => {
-                    macro_rules! make { ($W:tt) => { Rc::new(SetTableIntegerK::<$W>::new(value, &[a, b])) as Rc<dyn Window> } }
+                    macro_rules! make { ($W:tt) => { if nil { Rc::new(SetTableIntegerK::<$W, true>::new(value, &[a, b])) as Rc<dyn Window> } else { Rc::new(SetTableIntegerK::<$W, false>::new(value, &[a, b])) as Rc<dyn Window> } } }
                     with_widen!(how, make)
                 }
             });
@@ -731,6 +748,8 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
                         src
                     ).for_each(drop);
                     tab.rw(owner).kind = kind;
+                    // See Note [Array length].
+                    tab.rw(owner).trim();
                 },
                 _ => unreachable!(),
             };

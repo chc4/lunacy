@@ -569,13 +569,22 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                 }
             }
             tab.widen_kind(value.representation());
+            // See Note [Array length].
+            tab.trim();
             smallvec![]
         })),
         ("remove", native!(|owner, args| {
             let t = table(arg(&args, 0));
-            let array = &mut t.rw(owner).array;
-            let at = if args.len() > 1 { number(arg(&args, 1)) as usize } else { array.len() };
-            if (1..=array.len()).contains(&at) { smallvec![array.remove(at - 1)] } else { smallvec![] }
+            let tab = t.rw(owner);
+            let at = if args.len() > 1 { number(arg(&args, 1)) as usize } else { tab.array.len() };
+            if (1..=tab.array.len()).contains(&at) {
+                let removed = tab.array.remove(at - 1);
+                // See Note [Array length].
+                tab.trim();
+                smallvec![removed]
+            } else {
+                smallvec![]
+            }
         })),
         ("concat", native!(|owner, args| {
             let t = table(arg(&args, 0));
