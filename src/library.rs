@@ -226,15 +226,17 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
         ("tan", math1!(TAN)),
         ("random", native!(|owner, args| {
             let r = random();
-            let value = match args.len() {
-                0 => r,
-                1 => (r * number(args[0]).floor()).floor() + 1.0,
+            // A whole number from a range, in the integer encoding where an i32
+            // holds it: the code using it computes on an integer. See Note
+            // [Narrowing] in `specialize`.
+            smallvec![match args.len() {
+                0 => LBoxed::from_double(r),
+                1 => LBoxed::from_number((r * number(args[0]).floor()).floor() + 1.0),
                 _ => {
                     let (m, n) = (number(args[0]).floor(), number(args[1]).floor());
-                    m + (r * (n - m + 1.0)).floor()
+                    LBoxed::from_number(m + (r * (n - m + 1.0)).floor())
                 }
-            };
-            smallvec![LBoxed::from_double(value)]
+            }]
         })),
         ("randomseed", native!(|owner, args| {
             // Never zero, which xorshift stays at.
