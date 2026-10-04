@@ -124,7 +124,7 @@ impl JitHelper {
             let state = state as *mut RunState;
             let rs = &*state;
             let val = &rs.vals[rs.base + idx];
-            expected.accepts(val.unbox().typeof_())
+            val.unbox().typeof_() == expected
         }
     }
     pub unsafe extern "C" fn check_epoch(state: *mut (), tab: usize, href: u8) -> bool {
@@ -152,7 +152,7 @@ impl JitHelper {
             let tab = rs.table_at(tab);
             // The witness's index still holds its key, with a value of the type.
             let entry = tab.ro(owner).hash.get_index(hwit.index);
-            entry.is_some_and(|(k, val)| k.boxed().bits() == key && expected.accepts(val.unbox().typeof_()))
+            entry.is_some_and(|(k, val)| k.boxed().bits() == key && val.unbox().typeof_() == expected)
         }
     }
 
@@ -1564,7 +1564,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return Some(entry);
         }
         let next_stack = unsafe { (*proto).max_stack.into() };
-        let ctx = Rc::new(Context::new(vec![LType::Unknown; next_stack]));
+        let ctx = Rc::new(Context::new(next_stack));
         let block = *self.versions.get(&proto)?.get(&(SubPc::new(0), ctx))?;
         let entry = self.blocks[block.0].jit_info.entry?;
         self.jctx.lua_entries.insert(proto as usize, entry);

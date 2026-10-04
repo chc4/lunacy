@@ -305,7 +305,7 @@ pub fn emit_getglobal(dest: usize, k: usize) -> impl Coroutine<ResumeArg, Yield 
     move |mut arg: ResumeArg| {
         let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
         arg = yield YieldOp::ExecWindow(Rc::new(GetGlobal::new(cache as usize, &[dest])));
-        yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
+        yield YieldOp::SetCTypes(vec![(dest, CType::Unknown)]);
         arg
     }
 }
@@ -344,7 +344,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::Exec(ResidualExec::new("gettable_meta", Rc::new(move |owner, state| {
                 panic!("gettable_meta {:?} {:?} {:?}", &state.vals, &state.vals[state.base + b], have)
             })));
-            yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
+            yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
             return arg;
         }
         // Object shape specialization
@@ -398,7 +398,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let val_b = state.vals[state.base + b as usize].unbox();
                     state.vals[state.base + a as usize] = LBoxed::box_lvalue(val_b.gettable(owner, kc, state.intern));
                 })));
-                yield YieldOp::SetTypes(vec![(a, LType::Unknown)]);
+                yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
             }
         }
         arg
@@ -458,7 +458,6 @@ macro_rules! with_widen {
             Widen::Bit(LType::Table) => $make!({ Widen::Bit(LType::Table) }),
             Widen::Bit(LType::Integer) => $make!({ Widen::Bit(LType::Integer) }),
             Widen::Bit(LType::Double) => $make!({ Widen::Bit(LType::Double) }),
-            Widen::Bit(LType::Unknown) => unreachable!("a store of a known value of unknown representation"),
         }
     };
 }
@@ -466,20 +465,18 @@ macro_rules! with_widen {
 /// How storing a value of type `new_type` changes a field known as `htype`. A
 /// field whose type isn't known yet is never `Same`: its value may have any
 /// type. See Note [Field types].
-fn retype(new_type: LType, htype: LType) -> Retype {
-    if new_type == htype && htype != LType::Unknown {
-        Retype::Same
-    } else if new_type == LType::Unknown {
-        Retype::Unknown
-    } else {
-        Retype::Known
+fn retype(new_type: Option<LType>, htype: Kind) -> Retype {
+    match new_type {
+        Some(new_type) if htype == Kind::Of(new_type) => Retype::Same,
+        None => Retype::Unknown,
+        Some(_) => Retype::Known,
     }
 }
 
 /// Store through `href`'s witness into `tab`, bumping the table's epoch if the
 /// field's type changes (see `Retype`), and leaving its write barrier to the
 /// caller, after it.
-fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: LType, retype: Retype) {
+fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: Kind, retype: Retype) {
     let hidx = state.witness_base + href as usize;
     let witness = state.hash_witnesses[hidx];
     debug!("settable_href with {:?} {:?}", &witness, expected);
@@ -487,7 +484,7 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
     let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
     debug!("settable_href {:?} {:?}", &val1, expected);
     #[cfg(debug_assertions)]
-    assert!(expected.accepts(val1.unbox().typeof_()));
+    assert!(expected.holds(val1.unbox().typeof_()));
     *val1 = value;
     match retype {
         Retype::Same => {}
@@ -500,7 +497,7 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
 }
 
 // Store through a hash key's witness into a register's table.
-windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, state, base| (table, value) {
+windowed!(SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, state, base| (table, value) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     store_field(owner, state, &tab, value, href, expected, RETYPE);
     // Last. See Note [Write barriers].
@@ -509,7 +506,7 @@ windowed!(SetTableHref, [href: u8, expected: LType], [RETYPE: Retype], |owner, s
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.barrier_slow();
 });
-windowed!(SetTableHrefK, [href: u8, expected: LType, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
+windowed!(SetTableHrefK, [href: u8, expected: Kind, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     // A constant's value lives as long as its prototype.
     let value = LBoxed::from_bits(value);
@@ -578,7 +575,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         macro_rules! count_store {
             ($counters:ident) => {
                 let ResumeArg::Type(t) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                let known = match t { CType::Type(LType::Unknown) => 0, CType::Number => 1, _ => 2 };
+                let known = match t { CType::Unknown => 0, CType::Number => 1, _ => 2 };
                 yield YieldOp::Exec(ResidualExec::new("count_store", Rc::new(move |owner, state| {
                     state.counters.$counters[known].increment();
                 })));
@@ -592,7 +589,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             count_store!(array_stores);
         }
         // The stored value's representation, which widens the array's kind: found
-        // out by the store if the context doesn't know it (`Unknown`). See Note
+        // out by the store if the context doesn't know it (`None`). See Note
         // [Array kinds].
         let ResumeArg::Type(stored) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
         let stored = stored.as_ltype();
@@ -602,17 +599,17 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // A mixed array stays mixed whatever is stored into it.
         let known = yield YieldOp::ArrayKind(a);
         let widen = !(own
-            || known == ResumeArg::Type(CType::Type(LType::Unknown))
-            || (stored != LType::Unknown && known == ResumeArg::Type(CType::Type(stored))));
+            || known == ResumeArg::Type(CType::Unknown)
+            || stored.is_some_and(|stored| known == ResumeArg::Type(CType::Type(stored))));
         // Whether the value may be nil, which may shorten the array part. See
         // Note [Array length] in `vm`.
-        let nil = matches!(stored, LType::Nil | LType::Unknown);
+        let nil = matches!(stored, Some(LType::Nil) | None);
         // How the store widens the array's kind: not at all, by the value's
         // representation, known here, or by the value's found out.
         let how = match (widen, stored) {
             (false, _) => Widen::No,
-            (true, LType::Unknown) => Widen::Decode,
-            (true, stored) => Widen::Bit(stored),
+            (true, None) => Widen::Decode,
+            (true, Some(stored)) => Widen::Bit(stored),
         };
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
             windowed!(SetTableArray, [k: i32], [W: Widen, N: bool], |owner, state, base| (table, value) {
@@ -1030,7 +1027,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 yield YieldOp::Exec(ResidualExec::new("numeric_table_table", Rc::new(move |owner, state| {
                     panic!();
                 })));
-                yield YieldOp::SetTypes(vec![(dest, LType::Unknown)]);
+                yield YieldOp::SetCTypes(vec![(dest, CType::Unknown)]);
                 return arg;
             }
         }
@@ -1495,8 +1492,8 @@ pub fn emit_testset(a: usize, b: usize, c: u16, pc: usize) -> impl Coroutine<Res
             });
             // R(A) is a bool if it was one before, whichever path is taken.
             let ResumeArg::Type(before) = (yield YieldOp::Typeof(a)) else { unreachable!() };
-            let after = if before.as_ltype() == LType::Bool { LType::Bool } else { LType::Unknown };
-            yield YieldOp::SetTypes(vec![(a, after)]);
+            let after = if before.as_ltype() == Some(LType::Bool) { CType::Type(LType::Bool) } else { CType::Unknown };
+            yield YieldOp::SetCTypes(vec![(a, after)]);
             arg = yield YieldOp::GetBlock(pc);
             let ResumeArg::BlockId(fallthrough) = arg else { unreachable!() };
             arg = yield YieldOp::GetBlock(pc + 1);
@@ -1537,7 +1534,7 @@ pub fn emit_vararg(a: usize, b: usize, params: usize) -> impl Coroutine<ResumeAr
         if b == 0 {
             yield YieldOp::Clobber(a);
         } else {
-            yield YieldOp::SetTypes((a..a + b - 1).map(|slot| (slot, LType::Unknown)).collect());
+            yield YieldOp::SetCTypes((a..a + b - 1).map(|slot| (slot, CType::Unknown)).collect());
         }
         arg
     }
@@ -1835,7 +1832,7 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
                 yield YieldOp::Exec(ResidualExec::new("forloop_other", Rc::new(move |owner, state| {
                     panic!("forloop induction variable metamethod");
                 })));
-                yield YieldOp::SetTypes(vec![(a + 3, LType::Unknown)]);
+                yield YieldOp::SetCTypes(vec![(a + 3, CType::Unknown)]);
             },
         }
         // The targets are versioned for the context the op leaves, with the loop

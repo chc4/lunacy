@@ -253,7 +253,7 @@ pub enum YieldOp {
                     // Note [Fragile information]
 
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key].
-    UpdateHashRef(HashRef, LType), // Update the type of HREF to a new type
+    UpdateHashRef(HashRef, Option<LType>), // Update the type of HREF to a new type, if known
     GlobalCache(usize), // Resumed with a Cache for global CONSTANT[k]. See
                         // Note [Global caches]
     SetKeyHazards(usize), // SetHazards, for the hash keys of CONSTANT[k] only
@@ -269,11 +269,10 @@ pub struct HashKey<'src, 'intern> {
     /// The slot of the table the key is in.
     pub idx: usize,
     pub key: LConstant<'src, 'intern>,
-    /// Its field's type, `Unknown` if its field's type isn't stable; `None` if
-    /// the index is free. A shape or a function's identity describes a
-    /// register, not a field, so a field's type is an `LType`. See Note [Field
-    /// types].
-    pub known_type: Option<LType>,
+    /// Its field's type, `Mixed` if it isn't stable; `None` if the index is
+    /// free. A shape or a function's identity describes a register, not a
+    /// field, so a field's type is a representation. See Note [Field types].
+    pub known_type: Option<Kind>,
     /// Per slot: whether access through that slot is already checked for
     /// aliasing, so it needs no epoch check.
     pub hazards: SmallVec<[bool; 8]>,
@@ -324,7 +323,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
         self.idx == other.idx
             && self.key == other.key
             && match (self.known_type, other.known_type) {
-                (Some(mine), Some(theirs)) => mine.accepts(theirs),
+                (Some(mine), Some(theirs)) => mine == theirs || mine == Kind::Mixed,
                 (mine, theirs) => mine == theirs,
             }
             && self.hazards.iter().enumerate().all(|(slot, &checked)| !checked || other.hazards.get(slot) == Some(&true))
@@ -339,7 +338,7 @@ pub enum ResumeArg {
     Failed,
     Type(CType),
     BlockId(BlockId),
-    HashRef(HashRef, LType),
+    HashRef(HashRef, Kind),
     Integer(i32),
     Number(f64),
     Boxed(u64),
@@ -879,7 +878,7 @@ pub enum CallEntry {
 /// `proto` with. See Note [Call sites].
 fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize) -> Context {
     let slots = proto.max_stack as usize;
-    let mut entry = Context::new(vec![LType::Unknown; slots]);
+    let mut entry = Context::new(slots);
     let passed = if b != 0 { Some(b - 1) } else { caller.top.map(|top| top.saturating_sub(a + 1)) };
     let Some(passed) = passed.filter(|_| proto.is_vararg == 0) else { return entry };
     for param in 0..(proto.param_count as usize).min(slots) {
@@ -897,6 +896,8 @@ fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum CType {
+    /// Any value.
+    Unknown,
     Type(LType),
     /// A number in either encoding, `Integer` or `Double`.
     Number,
@@ -921,9 +922,10 @@ impl CType {
     pub(crate) fn accepts(&self, other: &CType) -> bool {
         match (self, other) {
             (a, b) if a == b => true,
+            (CType::Unknown, _) => true,
             (CType::Number, CType::Type(LType::Integer | LType::Double)) => true,
             // A shape or a function's identity is below its table or closure.
-            (CType::Type(a), b) => a.accepts(b.as_ltype()),
+            (CType::Type(a), b) => b.as_ltype() == Some(*a),
             _ => false,
         }
     }
@@ -931,7 +933,7 @@ impl CType {
     /// The type's height in the lattice: how much it tells.
     fn depth(&self) -> usize {
         match self {
-            CType::Type(LType::Unknown) => 0,
+            CType::Unknown => 0,
             CType::Number => 1,
             CType::Type(LType::Integer | LType::Double) => 2,
             CType::Type(_) => 1,
@@ -948,18 +950,21 @@ impl CType {
         } else if CType::Number.accepts(self) && CType::Number.accepts(other) {
             CType::Number
         } else {
-            CType::Type(self.as_ltype().join(other.as_ltype()))
+            match (self.as_ltype(), other.as_ltype()) {
+                (Some(a), Some(b)) if a == b => CType::Type(a),
+                _ => CType::Unknown,
+            }
         }
     }
 
-    /// Convert a CType to an LType, potentially losing static information.
-    pub(crate) fn as_ltype(&self) -> LType {
+    /// The representation every value of this type has, if one does: what a
+    /// shape or a function's identity is of, losing it.
+    pub(crate) fn as_ltype(&self) -> Option<LType> {
         match self {
-            CType::Type(ty) => ty.clone(),
-            CType::Number => LType::Unknown,
-            CType::Shape(_) => LType::Table,
-            CType::NativeFunction(_) => LType::Closure,
-            CType::LuaFunction(_) => LType::Closure,
+            CType::Unknown | CType::Number => None,
+            CType::Type(ty) => Some(*ty),
+            CType::Shape(_) => Some(LType::Table),
+            CType::NativeFunction(_) | CType::LuaFunction(_) => Some(LType::Closure),
         }
     }
 }
@@ -967,6 +972,7 @@ impl CType {
 impl std::fmt::Display for CType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CType::Unknown => write!(f, "?"),
             CType::Type(ltype) => ltype.fmt(f),
             CType::Number => write!(f, "number"),
             CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
@@ -1075,18 +1081,18 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 // again and can rejoin the blocks already compiled for it.
 //
 // Joining contexts that know different types of a field (an integer on one way
-// in, a double on another) keeps its hash key, of no stable type (`Unknown`): a
+// in, a double on another) keeps its hash key, of no stable type (`Mixed`): a
 // load through it guards the loaded slot instead (`FieldType`), and the type
 // found becomes the hash key's again. A hash key's type is `None` only while its
 // index is free.
 //
-// A field's type is only ever an `LType`: a shape or a function's identity
+// A field's type is only ever a representation: a shape or a function's identity
 // describes a register, not a field.
 
 /// Whether a jump forgets a type of a register holding no local in scope at
 /// its target, which may still be an expression's temporary (`a and b or c`).
 fn forgotten(ctype: &CType) -> bool {
-    *ctype != CType::Type(LType::Unknown)
+    *ctype != CType::Unknown
 }
 
 /// Whether a jump to a target where the registers from `live` on hold no local
@@ -1099,7 +1105,7 @@ fn forgets(ctx: &Context, live: usize) -> bool {
 /// Forget, for a jump to a target where the registers from `live` on hold no
 /// local, those registers' types and the fragile facts about them.
 fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
-    let dead = (live..ctx.types.len()).filter(|&idx| forgotten(&ctx.types[idx])).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
+    let dead = (live..ctx.types.len()).filter(|&idx| forgotten(&ctx.types[idx])).map(|idx| (idx, CType::Unknown)).collect();
     ctx.set_types(owner, dead);
     for idx in live..ctx.types.len() {
         ctx.effect(Effect::Write(idx));
@@ -1286,17 +1292,18 @@ pub struct Context {
 // bit is set, and mixed once two are. A kind only widens while the array holds values, so a table
 // of a single kind holds only values of it.
 //
-// The context learns kinds as fragile information. A load from an array part of known kind has
-// that type with no test. Any other load's slot is an element of its table (`ElementOf`), and a
-// guard finding out its representation, if the array's kind is that representation, tests the
-// array's kind in place of the element's: an element loaded before is covered, as the kind only
-// widened since, and the kind is known after (`Kind`). An array that isn't of the element's
+// The context learns kinds as fragile information, as one representation or mixed (`Kind`); it
+// learns them from elements, so never knows an array empty. A load from an array part of known
+// kind has that type with no test. Any other load's slot is an element of its table (`ElementOf`),
+// and a guard finding out its representation, if the array's kind is that representation, tests
+// the array's kind in place of the element's: an element loaded before is covered, as the kind
+// only widened since, and the kind is known after (`Kind`). An array that isn't of the element's
 // representation has the element tested, as any value. A loop's first iteration learns the kinds
 // of the arrays it reads elements of, so its later iterations, versioned for what the back edges
 // carry, read them unguarded.
 //
 // A guard finding out the representation of an element of a mixed array knows that too
-// (`Kind` of `Unknown`): it stays mixed however it is stored into, and a store into it needn't
+// (a `Mixed` kind): it stays mixed however it is stored into, and a store into it needn't
 // widen its kind, which no guard then tests.
 //
 // Every store into an array part widens its kind, but for a value of a kind the context knows the
@@ -1355,6 +1362,39 @@ pub struct Context {
 // more than an existing version keeps them in a version of its own; and a path whose facts are
 // incomparable with one compiled before it keeps only those the two share.
 
+/// What the values in a place are: all of one representation, or not. A known
+/// array part's kind (Note [Array kinds]), or a hash key's field's type (Note
+/// [Field types]).
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum Kind {
+    Of(LType),
+    Mixed,
+}
+
+impl Kind {
+    /// Whether a value of representation `t` may be one of this kind.
+    pub fn holds(self, t: LType) -> bool {
+        self == Kind::Of(t) || self == Kind::Mixed
+    }
+
+    /// The type of a value of this kind.
+    pub fn ctype(self) -> CType {
+        match self {
+            Kind::Of(t) => CType::Type(t),
+            Kind::Mixed => CType::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Kind::Of(t) => t.fmt(f),
+            Kind::Mixed => write!(f, "mixed"),
+        }
+    }
+}
+
 /// Speculation the specializer assumes without a guard. See Note [Fragile
 /// information].
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1368,9 +1408,9 @@ pub enum Fragile {
     /// Stack slot `slot` holds a value loaded from the array part of the table
     /// in slot `table`. See Note [Array kinds].
     ElementOf { slot: usize, table: usize },
-    /// The array part of the table in slot `table` has kind `kind`: `Unknown`
-    /// if mixed. See Note [Array kinds].
-    Kind { table: usize, kind: LType },
+    /// The array part of the table in slot `table` has kind `kind`. See Note
+    /// [Array kinds].
+    Kind { table: usize, kind: Kind },
     /// Stack slot `slot` holds a number constant an i32 holds exactly,
     /// `value`. See Note [Narrowing].
     Constant { slot: usize, value: i32 },
@@ -1452,9 +1492,9 @@ pub enum Effect {
     AnyUpvalue,
     /// Code the specializer doesn't see runs: every fact is dropped.
     Opaque,
-    /// A value of representation `LType` (`Unknown` if not known) is stored in
-    /// some table's array part.
-    ArrayStore(LType),
+    /// A value of the representation (`None` if not known) is stored in some
+    /// table's array part.
+    ArrayStore(Option<LType>),
 }
 
 impl Fragile {
@@ -1494,7 +1534,7 @@ impl Fragile {
             (Fragile::ElementOf { .. }, Effect::ArrayStore(_)) => true,
             // Any table may be the one stored into: one of kind `kind` keeps it
             // only for a value of that kind, and a mixed one stays mixed.
-            (Fragile::Kind { kind, .. }, Effect::ArrayStore(stored)) => *kind == LType::Unknown || stored == *kind,
+            (Fragile::Kind { kind, .. }, Effect::ArrayStore(stored)) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
             // Only its slot holds it.
             (Fragile::Constant { slot, .. }, Effect::Write(written)) => written != *slot,
             (Fragile::Constant { .. }, Effect::WriteAny) => false,
@@ -1537,9 +1577,17 @@ impl Effects {
     /// Some table's hash part is stored into.
     pub const HASH: Effects = Effects(1 << 9);
     /// Code the specializer never saw ran: every other effect too.
-    pub const OPAQUE: Effects = Effects(0x7fe);
+    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::OPAQUE_BIT);
     /// The representations stored into some table's array part, as `LType::bit`s.
-    const ARRAYS: u16 = 0xfe;
+    const ARRAYS: u16 = {
+        let mut bits = 0;
+        let mut i = 0;
+        while i < Self::REPRESENTATIONS.len() {
+            bits |= Self::REPRESENTATIONS[i].bit() as u16;
+            i += 1;
+        }
+        bits
+    };
     const OPAQUE_BIT: u16 = 1 << 10;
     /// Every representation a value has, each's bit in `ARRAYS`.
     const REPRESENTATIONS: [LType; 7] = [LType::Nil, LType::Bool, LType::String, LType::Closure, LType::Table, LType::Integer, LType::Double];
@@ -1555,8 +1603,8 @@ impl Effects {
             Effect::Write(_) | Effect::WriteAny => Effects::NONE,
             Effect::SetUpvalue(_) | Effect::AnyUpvalue => Effects::UPVALUE,
             Effect::Opaque => Effects::OPAQUE,
-            Effect::ArrayStore(LType::Unknown) => Effects(Self::ARRAYS),
-            Effect::ArrayStore(stored) => Effects(stored.bit() as u16),
+            Effect::ArrayStore(None) => Effects(Self::ARRAYS),
+            Effect::ArrayStore(Some(stored)) => Effects(stored.bit() as u16),
         }
     }
 
@@ -1572,13 +1620,13 @@ impl Effects {
             for &slot in captured {
                 ctx.effect(Effect::Write(slot));
             }
-            ctx.set_types(owner, captured.iter().map(|&slot| (slot, CType::Type(LType::Unknown))).collect());
+            ctx.set_types(owner, captured.iter().map(|&slot| (slot, CType::Unknown)).collect());
         }
         if self.0 & Self::HASH.0 != 0 {
             ctx.set_hazards(None, None);
         }
         for stored in Self::REPRESENTATIONS.into_iter().filter(|stored| self.0 & stored.bit() as u16 != 0) {
-            ctx.effect(Effect::ArrayStore(stored));
+            ctx.effect(Effect::ArrayStore(Some(stored)));
         }
     }
 }
@@ -1613,9 +1661,10 @@ impl Mark for Context {
 }
 
 impl Context {
-    pub fn new(mut types: Vec<LType>) -> Self {
+    /// A context knowing nothing of `slots` slots.
+    pub fn new(slots: usize) -> Self {
         Self {
-            types: types.drain(..).map(|t| CType::Type(t)).collect(),
+            types: smallvec::smallvec![CType::Unknown; slots],
             hkeys: vec![],
             top: None,
             fragile: SmallVec::new(),
@@ -1650,7 +1699,7 @@ impl Context {
 
     /// The kind of the array part of the table in slot `table`, if known. See
     /// Note [Array kinds].
-    fn array_kind(&self, table: usize) -> Option<LType> {
+    fn array_kind(&self, table: usize) -> Option<Kind> {
         self.fragile.iter().find_map(|fact| match &fact.fragile {
             Fragile::Kind { table: known, kind } if *known == table => Some(*kind),
             _ => None,
@@ -1744,7 +1793,7 @@ impl Context {
 
     /// The type of slot `idx`: unknown past the end.
     fn slot(&self, idx: usize) -> CType {
-        self.types.get(idx).cloned().unwrap_or(CType::Type(LType::Unknown))
+        self.types.get(idx).cloned().unwrap_or(CType::Unknown)
     }
 
     /// Whether a block specialized to `self` is correct in `other`. See Note
@@ -1799,7 +1848,7 @@ impl Context {
             match other.hkeys.get(i) {
                 Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && mine.known_type.is_some() && theirs.known_type.is_some() => {
                     if mine.known_type != theirs.known_type {
-                        mine.known_type = Some(LType::Unknown);
+                        mine.known_type = Some(Kind::Mixed);
                     }
                     for (slot, checked) in mine.hazards.iter_mut().enumerate() {
                         *checked &= theirs.hazards.get(slot) == Some(&true);
@@ -1827,7 +1876,7 @@ impl Context {
     fn set_types(&mut self, owner: &mut Owner, ty_effects: Vec<(usize, CType)>) {
         for (idx, ty) in ty_effects {
             if idx > self.types.len() {
-                self.types.resize(idx + 1, CType::Type(LType::Unknown));
+                self.types.resize(idx + 1, CType::Unknown);
             }
             // We may have shape(1) [hkey(1)], and then transiton a type back to an
             // ltable. Discovering the type again would transition to shape(2)
@@ -2575,7 +2624,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // An element of a known type was guarded, or its array's kind is known:
         // what it was loaded from tells no more. Only the version jumped to is
         // found without it, so it still accepts the jump. See Note [Array kinds].
-        let typed = |fact: &Fact| matches!(fact.fragile, Fragile::ElementOf { slot, .. } if ctx.slot(slot) != CType::Type(LType::Unknown));
+        let typed = |fact: &Fact| matches!(fact.fragile, Fragile::ElementOf { slot, .. } if ctx.slot(slot) != CType::Unknown);
         if ctx.fragile.iter().any(typed) {
             let forgotten: Vec<Fact> = ctx.fragile.iter().filter(|fact| typed(fact)).cloned().collect();
             Rc::make_mut(&mut ctx).fragile.retain(|fact| !forgotten.contains(fact));
@@ -2779,17 +2828,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
             forced_mut.types[idx] = found.clone();
             if let Some(table) = kind_of {
-                forced_mut.assume(Fragile::Kind { table, kind: found_field });
+                forced_mut.assume(Fragile::Kind { table, kind: Kind::Of(found_field) });
             }
             // An array of two representations or more stays mixed.
             if let Some((table, _)) = array.filter(|&(_, kind)| kind.count_ones() > 1) {
-                forced_mut.assume(Fragile::Kind { table, kind: LType::Unknown });
+                forced_mut.assume(Fragile::Kind { table, kind: Kind::Mixed });
             }
             // A slot holding an upvalue's value tells of the upvalue: the type the
             // guard found, and past a function's identity guard below, which
             // function. See Note [Fragile information].
             if let Some(href) = field {
-                forced_mut.hkeys[href.0 as usize].known_type = Some(found_field);
+                forced_mut.hkeys[href.0 as usize].known_type = Some(Kind::Of(found_field));
             }
             let holds = forced_mut.holds(idx);
             if let Some(upvalue) = holds {
@@ -3082,7 +3131,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // The field's type in this table, which the guard after `href_init` checks in every
             // table reaching the code. See Note [Field types].
             let found = val.unbox().typeof_();
-            hkey.known_type = Some(found);
+            hkey.known_type = Some(Kind::Of(found));
             // Initialize the hkey after discovery with a cleared hazard for the index
             hkey.clear_checks();
             hkey.check(idx);
@@ -3135,8 +3184,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// type and guarding that in turn. See Note [Field types].
     fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>) {
         let mut typed_ctx = ctx.clone();
-        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(expected);
-        let pass = self.subblock(owner, pc.next_true(), typed_ctx, thunk_coro.clone(), ResumeArg::HashRef(href, expected));
+        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(Kind::Of(expected));
+        let pass = self.subblock(owner, pc.next_true(), typed_ctx, thunk_coro.clone(), ResumeArg::HashRef(href, Kind::Of(expected)));
         let fail = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
             let found = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() }.unbox().typeof_();
@@ -3172,10 +3221,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false);
             // A field of no stable type has nothing to check it still has: its
             // hash key is found again. See Note [Field types].
-            if expected == LType::Unknown {
+            let Kind::Of(expected) = expected else {
                 vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
                 return;
-            }
+            };
             let key = LCanon::constant(&thunk_ctx.hkeys[href.0 as usize].key).boxed().bits();
             vm.blocks[check_block.0].instructions.push(Residual::HashGuard { tab, href: href.clone(), key, expected });
             vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
@@ -3250,8 +3299,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // the next access's epoch check and `HashGuard` find it, as the store
                     // left the witness at the old epoch (`Retype::Unknown`).
                     let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
-                    if *ty != LType::Unknown {
-                        hkey.known_type = Some(*ty);
+                    if let Some(ty) = *ty {
+                        hkey.known_type = Some(Kind::Of(ty));
                     }
                     // If we updated an href, then we also need to set optimization hazards for any
                     // potentially aliased ones. We also need to invalidate this stack slot as
@@ -3458,7 +3507,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::ArrayKind(table)) => {
                     arg = match ctx.array_kind(table) {
-                        Some(kind) => ResumeArg::Type(CType::Type(kind)),
+                        Some(kind) => ResumeArg::Type(kind.ctype()),
                         None => ResumeArg::Failed,
                     };
                 },
@@ -3468,21 +3517,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::ArrayType(slot, table)) => {
                     let kind = ctx.array_kind(table);
                     let ctx = Rc::make_mut(&mut ctx);
-                    ctx.set_types(owner, vec![(slot, CType::Type(kind.unwrap_or(LType::Unknown)))]);
+                    ctx.set_types(owner, vec![(slot, kind.map_or(CType::Unknown, Kind::ctype))]);
                     if kind.is_none() && slot != table {
                         ctx.assume(Fragile::ElementOf { slot, table });
                     }
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
                     let known = ctx.hkeys[href.0 as usize].known_type.expect("a live hash key");
-                    Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, CType::Type(known))]);
-                    if known != LType::Unknown {
-                        (pc, arg) = navigate(pc, &CType::Type(LType::Unknown), &CType::Type(known));
+                    Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.ctype())]);
+                    if let Kind::Of(known) = known {
+                        (pc, arg) = navigate(pc, &CType::Unknown, &CType::Type(known));
                     } else {
                         // Record the type on the hash key too, unless the load overwrote
                         // the table's register and dropped its hash keys.
                         let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Type(LType::Unknown), live.then_some(href), pc, ctx.clone(), true, 0));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Unknown, live.then_some(href), pc, ctx.clone(), true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -3530,7 +3579,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         _ => {},
                     }
                     let ctx = Rc::make_mut(&mut ctx);
-                    ctx.set_types(owner, vec![(slot, known.unwrap_or(CType::Type(LType::Unknown)))]);
+                    ctx.set_types(owner, vec![(slot, known.unwrap_or(CType::Unknown))]);
                     ctx.assume(Fragile::Holds { slot, upvalue });
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
@@ -3609,7 +3658,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 for idx in a..before.types.len() {
                                     before.effect(Effect::Write(idx));
                                 }
-                                let frame = (a..before.types.len()).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
+                                let frame = (a..before.types.len()).map(|idx| (idx, CType::Unknown)).collect();
                                 before.set_types(owner, frame);
                                 let captured: Rc<[usize]> = captured.iter().copied().filter(|&slot| slot < a).collect();
                                 (Rc::new(before), captured)
@@ -3627,7 +3676,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // TODO: compile a type specialized thunk instead? is that better?
                             let clobbered: Vec<(usize, CType)> = (a..ctx.types.len())
                                 .chain(captured.into_iter().filter(|&slot| slot < a))
-                                .map(|idx| (idx, CType::Type(LType::Unknown)))
+                                .map(|idx| (idx, CType::Unknown))
                                 .collect();
                             Rc::make_mut(&mut ctx).set_types(owner, clobbered);
                             if let Some(result) = &result {
@@ -3690,7 +3739,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.join_effects(owner, Effects::HASH);
                 },
                 CoroutineState::Yielded(YieldOp::Clobber(from)) => {
-                    let clobbered = (from..ctx.types.len()).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
+                    let clobbered = (from..ctx.types.len()).map(|idx| (idx, CType::Unknown)).collect();
                     Rc::make_mut(&mut ctx).set_types(owner, clobbered)
                 },
                 CoroutineState::Yielded(YieldOp::NarrowConstant(slot)) => {
@@ -3860,7 +3909,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("RUN {:?}", res);
             match res {
                 &Residual::Guard { idx, expected } | &Residual::NumericGuard { idx, expected } => {
-                    if expected.accepts(state.vals[state.base + idx].unbox().typeof_()) {
+                    if state.vals[state.base + idx].unbox().typeof_() == expected {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -3897,7 +3946,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 &Residual::GuardWitness { href, expected } => {
                     let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let value = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() };
-                    off += if expected.accepts(value.unbox().typeof_()) { 2 } else { 1 };
+                    off += if value.unbox().typeof_() == expected { 2 } else { 1 };
                 },
                 &Residual::EpochCheck { tab, href } => {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
@@ -3914,7 +3963,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let tab = state.table_at(tab);
                     let entry = tab.ro(owner).hash.get_index(hwit.index);
-                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && expected.accepts(val.unbox().typeof_())) {
+                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && val.unbox().typeof_() == expected) {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -4007,8 +4056,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let next_stack = state.call_lua(owner, Location(id, off).pack(), a, b);
                         // Either use existing block, compile a new one, or use most
                         // generic.
-                        let types = vec![LType::Unknown; next_stack];
-                        let ctx = Rc::new(Context::new(types));
+                        let ctx = Rc::new(Context::new(next_stack));
                         self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
                         self.set_current(lclos.clone());
                         let block = self.version(owner, 0, ctx);

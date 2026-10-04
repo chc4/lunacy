@@ -860,7 +860,6 @@ impl Debug for LCanon<'_, '_> {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, core::marker::ConstParamTy)]
 pub enum LType {
-    Unknown,
     Nil,
     Bool,
     String,
@@ -879,23 +878,11 @@ impl LType {
     pub const fn bit(self) -> u8 {
         1 << self as u8
     }
-
-    /// Whether a value of type `other` is one of type `self`: `other` is
-    /// `self`, or `self` is `Unknown`.
-    pub fn accepts(self, other: LType) -> bool {
-        self == other || self == LType::Unknown
-    }
-
-    /// The most specific type accepting both.
-    pub fn join(self, other: LType) -> LType {
-        if self == other { self } else { LType::Unknown }
-    }
 }
 
 impl std::fmt::Display for LType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LType::Unknown => write!(f, "?"),
             LType::Nil => write!(f, "nil"),
             LType::Bool => write!(f, "bool"),
             LType::String => write!(f, "string"),
@@ -2159,7 +2146,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         // does: its frame is the whole register file, and with no caller to return to, its
         // return ends the run.
         let entry = state.clos.clone();
-        let ctx = Rc::new(Context::new(vec![LType::Unknown; state.vals.len()]));
+        let ctx = Rc::new(Context::new(state.vals.len()));
         spec.versions.entry(entry.ro(owner).prototype).or_insert_with(|| HashMap::default());
         spec.set_current(entry);
         let block = spec.version(owner, 0, ctx);
