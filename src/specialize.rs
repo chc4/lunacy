@@ -229,6 +229,8 @@ pub enum YieldOp {
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Narrow(usize), // Resumed with Matched if STACK[idx] is, or is narrowed to, an integer, else
                    // Failed. See Note [Narrowing]
+    NarrowConstant(usize), // STACK[idx] is narrowed to an integer if a fact says it holds a
+                           // whole constant, else left as it is. See Note [Narrowing]
     HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Narrowing]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
@@ -1119,22 +1121,26 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 
 // Note [Narrowing]
 // ~~~~~~~~~~~~~~~~
-// A double an i32 holds exactly can be narrowed to the integer encoding where an integer pays:
-// a loop's index, limit and step, and an array key. `Narrow` of a slot the context types `Double`
-// ends its block in a thunk; forced on such a value, it narrows the slot in place by an optimistic
-// op (`ToInteger`), whose hot way continues with the slot an integer and its cold way with it a
-// double, and forced on any other value it continues with it a double, no narrowing ever tried at
-// runtime. A slot typed `Integer` is one already, at the same `SubPc` as the narrowed hot way, so
-// the code after both is one version: in a loop, the first iteration narrows its counter, and the
-// rest compute on an integer. A slot a fact says holds a constant an i32 holds exactly (one `LOADK`
-// loaded, until something writes the slot) is narrowed statically, the constant stored again in
-// the integer encoding, at no cost each time the code runs: a counter a loop starts from a
-// constant each time it is entered, even the first iteration computes on an integer. The fact is
-// consumed by the slot's narrowing, whose type then says what it would, or by a guard finding out
-// the slot's type at runtime, which decides how the slot is used instead (one the context answers
-// decides nothing, as a loop's guards before narrowing); otherwise it holds until the slot is
-// written. Where it is never used, the code it was carried through is contracted (Note
-// [Contraction]). Any other slot isn't narrowed.
+// A double an i32 holds exactly can be narrowed to the integer encoding where an integer pays: a
+// loop's index, limit and step, a generic loop's variables, and an array key. `Narrow` of a slot
+// the context types `Double`, or doesn't know the type of, ends its block in a thunk; forced on a
+// double an i32 holds exactly, it narrows the slot in place by an optimistic op (`ToInteger`),
+// whose hot way continues with the slot an integer and its cold way with it as it was (the op takes
+// it cold for anything but such a double), and forced on any other value it continues with it as it
+// was, no narrowing ever tried at runtime. A slot typed `Integer` is one already, at the same
+// `SubPc` as the narrowed hot way, so the code after both is one version: in a loop, the first
+// iteration narrows its counter, and the rest compute on an integer. A slot a fact says holds a
+// constant an i32 holds exactly (one `LOADK` loaded, until something writes the slot) is narrowed
+// statically, the constant stored again in the integer encoding, at no cost each time the code
+// runs: a counter a loop starts from a constant each time it is entered, even the first iteration
+// computes on an integer. The fact is consumed by the slot's narrowing, whose type then says what
+// it would, or by a guard finding out the slot's type at runtime, which decides how the slot is
+// used instead (one the context answers decides nothing, as a loop's guards before narrowing);
+// otherwise it holds until the slot is written. Where it is never used, the code it was carried
+// through is contracted (Note [Contraction]). A slot holding such a constant is narrowed statically
+// too where it escapes, captured by a closure or stored into an upvalue or a table's field: a whole
+// number kept there is most likely used as an integer, and is one for every reader. Any other slot
+// isn't narrowed.
 
 // Note [Contraction]
 // ~~~~~~~~~~~~~~~~~~
@@ -2629,7 +2635,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let value = state.vals[state.base + slot];
-            let whole = value.as_number().is_some_and(crate::lboxed::is_integer);
+            let whole = value.representation() == LType::Double && value.as_number().is_some_and(crate::lboxed::is_integer);
             if !whole {
                 // Not narrowed, so not tried at runtime.
                 let rest = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
@@ -2651,6 +2657,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.blocks[cold.0].instructions.push(Residual::Thunk(side));
             vm.blocks[at.0].instructions.push(Residual::Branch { hot, cold });
         })))
+    }
+
+    /// Narrow slot `slot` of `block`, a double, statically if a fact says it holds a
+    /// whole constant: the constant is stored again in the integer encoding. Whether
+    /// it was. See Note [Narrowing].
+    fn narrow_constant(&mut self, owner: &mut Owner, ctx: &mut Rc<Context>, slot: usize, block: BlockId) -> bool {
+        let Some(value) = ctx.constant(slot) else { return false };
+        ctx.rely(owner, Fragile::Constant { slot, value }.key());
+        self.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::NarrowK::new(value, &[slot]))));
+        // The fact used, and dropped by the write: its type says what it would, so
+        // no version keeps it apart.
+        let ctx = Rc::make_mut(ctx);
+        ctx.effect(Effect::Write(slot));
+        ctx.set_types(owner, vec![(slot, CType::Type(LType::Integer))]);
+        true
     }
 
     /// Where the yield of `coro` at `pc` in `ctx` introduces a fact: rebuilding
@@ -3640,6 +3661,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let clobbered = (from..ctx.types.len()).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
                     Rc::make_mut(&mut ctx).set_types(owner, clobbered)
                 },
+                CoroutineState::Yielded(YieldOp::NarrowConstant(slot)) => {
+                    if ctx.types.get(slot) == Some(&CType::Type(LType::Double)) {
+                        self.narrow_constant(owner, &mut ctx, slot, block_id);
+                    }
+                },
                 CoroutineState::Yielded(YieldOp::HoldsK(slot, k)) => {
                     let proto = self.clos.ro(owner).prototype;
                     if let crate::chunk::Constant::Number(n) = unsafe { &(&(*proto).constants.items)[k] } && is_integer(n.0) {
@@ -3647,26 +3673,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Constant { slot, value: n.0 as i32 }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
                     }
                 },
-                CoroutineState::Yielded(YieldOp::Narrow(slot)) => match ctx.types[slot] {
+                CoroutineState::Yielded(YieldOp::Narrow(slot)) => match ctx.types[slot].clone() {
                     CType::Type(LType::Integer) => {
                         pc = pc.next_true();
                         arg = ResumeArg::Matched;
                     }
-                    // A known constant: stored again in the integer encoding. See Note
-                    // [Narrowing].
-                    CType::Type(LType::Double) if let Some(value) = ctx.constant(slot) => {
-                        ctx.rely(owner, Fragile::Constant { slot, value }.key());
-                        self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::NarrowK::new(value, &[slot]))));
-                        // The fact used, and dropped by the write: its type says what
-                        // it would, so no version keeps it apart.
-                        let ctx = Rc::make_mut(&mut ctx);
-                        ctx.effect(Effect::Write(slot));
-                        ctx.set_types(owner, vec![(slot, CType::Type(LType::Integer))]);
+                    CType::Type(LType::Double) if self.narrow_constant(owner, &mut ctx, slot, block_id) => {
                         pc = pc.next_true();
                         arg = ResumeArg::Matched;
                     }
                     // Found out once forced. See Note [Narrowing].
-                    CType::Type(LType::Double) => {
+                    CType::Type(LType::Double | LType::Unknown) => {
                         let thunk = Residual::Thunk(self.make_narrow_thunk(block_id, coro.clone(), slot, pc, ctx.clone()));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);

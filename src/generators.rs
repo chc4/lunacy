@@ -540,6 +540,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         if b & 0x100 == 0 {
             yield YieldOp::Narrow(b);
         }
+        // A whole constant stored into a field, narrowed. See Note [Narrowing] in
+        // `specialize`.
+        if c & 0x100 == 0 {
+            yield YieldOp::NarrowConstant(c);
+        }
         let integer = match yield YieldOp::GuardCType(b, CType::Type(LType::Integer)) {
             ResumeArg::MatchedConst(k) => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };
@@ -1632,6 +1637,13 @@ pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: u
     move |mut arg: ResumeArg| {
         let skip = !upvalues.is_empty();
         let upvalues = upvalues.clone();
+        // A whole constant in a captured slot, narrowed. See Note [Narrowing] in
+        // `specialize`.
+        for i in 0..upvalues.len() {
+            if let (Opcode::MOVE, b) = upvalues[i] {
+                yield YieldOp::NarrowConstant(b);
+            }
+        }
         arg = yield YieldOp::Exec(ResidualExec::new("closure", Rc::new(move |owner, state| {
             let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx] };
             let mut fresh = LClosure::new(proto as *const _);
@@ -1692,6 +1704,9 @@ pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             let Upvalue::Closed(c) = upval else { unreachable!("an upvalue closed by its store") };
             set_closed(owner, c, value);
         });
+        // A whole constant stored into an upvalue, narrowed. See Note [Narrowing]
+        // in `specialize`.
+        yield YieldOp::NarrowConstant(a);
         arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, &[a])));
         yield YieldOp::Effect(Effect::SetUpvalue(b));
         arg
@@ -1894,6 +1909,11 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
             let ResumeArg::BlockId(done) = arg else { unreachable!() };
             arg = yield YieldOp::Jump(done);
             return arg;
+        }
+        // The loop's variables, as a numeric loop's, are narrowed where an integer
+        // can be. See Note [Narrowing] in `specialize`.
+        for slot in f..f + c {
+            yield YieldOp::Narrow(slot);
         }
         let ResumeArg::Type(t) = (yield YieldOp::Typeof(f)) else { unreachable!() };
         yield YieldOp::ExecWindow(Rc::new(ForInMove::new(&[f, a + 2])));
