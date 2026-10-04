@@ -1152,7 +1152,10 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 //
 // When a version is about to be compiled for a context, and a version at the same point differs
 // from it only in having more facts, all with origins and none used, the duplicate need not
-// exist: those origins are queued for contraction. A contraction forgets every version carrying
+// exist: those origins are queued for contraction. So too if the context's own facts the version
+// lacks each say otherwise about something one of those facts is about, as a slot holding one
+// constant on one path and another on the other: neither is worth keeping where they meet, and
+// the context drops its own there. A contraction forgets every version carrying
 // a fact with one of the origins, and rebuilds each origin's block from where it introduced the
 // fact, as if it never had: the code after is compiled again, without the fact, and reaches the
 // versions every other path does. Code forgotten is never entered again, but what is already
@@ -1988,7 +1991,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ectx.clone().adopt(owner, &ctx);
             return exists;
         }
-        self.contractible(owner, pc, &ctx);
+        let ctx = self.contractible(owner, pc, ctx);
+        if let Some(((_, ectx), &exists)) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get_key_value(&(pc, ctx.clone())) {
+            ectx.clone().adopt(owner, &ctx);
+            return exists;
+        }
         let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((epc, ty), block)| *epc == pc).collect();
         if count.len() >= HARD_MAX_VERSIONS {
             panic!("too many versions: {:#?}", count);
@@ -2028,7 +2035,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ectx.clone().adopt(owner, &ctx);
             return (exists, "exact", None);
         }
-        self.contractible(owner, subpc, &ctx);
+        let ctx = self.contractible(owner, subpc, ctx);
+        let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
+        if let Some(((_, ectx), &exists)) = versions.get_key_value(&(subpc, ctx.clone())) {
+            ectx.clone().adopt(owner, &ctx);
+            return (exists, "exact", None);
+        }
         let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
         let existing: Vec<(Rc<Context>, BlockId)> = versions
             .iter()
@@ -2100,23 +2112,39 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// Queue the origins of the facts a version at `pc` has past those of `ctx`,
     /// which is about to get a version of its own, for contraction: if no code
-    /// relied on them, the version only duplicates the one `ctx` gets. See Note
-    /// [Contraction].
-    fn contractible(&mut self, owner: &mut Owner, pc: SubPc, ctx: &Context) {
+    /// relied on them, the version only duplicates the one `ctx` gets. A fact
+    /// of `ctx` about the same thing as one of those, which says otherwise, is
+    /// dropped: what `ctx` is then left with is the context the version
+    /// contracted to. See Note [Contraction].
+    fn contractible(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>) -> Rc<Context> {
         let proto = self.clos.ro(owner).prototype;
         let mut origins: Vec<Origin> = Vec::new();
+        let mut conflicting: SmallVec<[(u8, usize); 2]> = SmallVec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         for ((epc, ectx), _block) in self.versions.get(&proto).unwrap() {
-            if *epc != pc || !ectx.alike(ctx) || !ctx.fragile_within(ectx) || ctx.fragile.len() == ectx.fragile.len() {
+            if *epc != pc || !ectx.alike(&ctx) {
                 continue;
             }
-            let extra = ectx.fragile.iter().filter(|fact| !ctx.fragile.contains(fact));
+            // `ctx`'s facts the version lacks each contradict one of its own.
+            let mine: SmallVec<[(u8, usize); 2]> = ctx.fragile.iter().filter(|fact| !ectx.fragile.contains(fact)).map(|fact| fact.key()).collect();
+            if !mine.iter().all(|key| ectx.fragile.iter().any(|theirs| theirs.key() == *key)) {
+                continue;
+            }
+            let mut extra = ectx.fragile.iter().filter(|fact| !ctx.fragile.contains(fact)).peekable();
+            if extra.peek().is_none() {
+                continue;
+            }
             let Some(sets) = extra.map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
             let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
             if found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                 continue;
             }
             _duplicates.push(_block.0);
+            for key in mine {
+                if !conflicting.contains(&key) {
+                    conflicting.push(key);
+                }
+            }
             for origin in found {
                 if !origins.iter().any(|known| Rc::ptr_eq(known, &origin)) {
                     origins.push(origin);
@@ -2138,6 +2166,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             self.contractions.push((proto, origins));
         }
+        if conflicting.is_empty() {
+            return ctx;
+        }
+        let mut lowered = (*ctx).clone();
+        lowered.fragile.retain(|fact| !conflicting.contains(&fact.key()));
+        Rc::new(lowered)
     }
 
     /// Contract the queued origins of the running function that no code still to
