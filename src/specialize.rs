@@ -193,6 +193,8 @@ pub enum YieldOp {
     TypeofRk(usize), // Resumed with the type of STACK[idx] or CONSTANT[idx]
     TypeofK(usize), // Resumed with the type of CONSTANT[idx], for an index too wide for an rk
     IntegerK(usize), // Resumed with the value of CONSTANT[idx] as an Integer
+    IntegralK(usize), // Resumed with Matched if CONSTANT[idx] is a number an i32 holds exactly,
+                      // which a typed op may take as an integer. See Note [Integers]
     NumberK(usize), // Resumed with the value of CONSTANT[idx] as a Number
     BoxedK(usize), // Resumed with the value of CONSTANT[idx], as its Boxed bits
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
@@ -976,6 +978,14 @@ impl std::fmt::Display for CType {
 // code: a jump into a version typing a slot `Number` or `Unknown` enters it as it is, and generic
 // code (a table, an upvalue, a native, a return) reads either.
 //
+// A number is a double unless something narrows it to an integer, as LuaJIT narrows: a
+// constant as a value (loaded, stored, passed) is a double whatever its value, as are a native's
+// result and the generic paths' arithmetic. What narrows is a loop (below), a length, a bit
+// operation, and a typed integer op on integers. A constant an i32 holds exactly is a compile-time
+// value either encoding can hold, so to an op asking for an integer (a constant guard for one,
+// `IntegralK`) it is one: an integer register plus such a constant, or such a constant as an
+// array key, is an integer op.
+//
 // Numeric operations should attempt to specialize on their operands' encoding where
 // they can, so they don't require decoding at runtime. The integer encoding can only store small
 // numbers, and so the result of arithmatic operations must be careful to check for overflow or
@@ -993,6 +1003,9 @@ impl std::fmt::Display for CType {
 // translates to eagerly typing FORPREP induction variables as integers, so that they aren't only
 // discovered partway through a loop and cause recompilation, and arithmetic operations discover
 // the types of their operands in a non-eager way that keeps their types stable when not demanded.
+// FORPREP promotes each of its index, limit and step that is a double an i32 holds exactly to the
+// integer encoding, as an optimistic op (Note [Optimistic ops]), so a loop over doubles that are
+// whole, as every constant bound is, is an integer loop, and its index an array key.
 
 /// Where a guard for `expected` continues its generator, with what, when the value's type is
 /// `found`. Each step down the lattice translates into one SubPc step, so that continuing the
@@ -1118,14 +1131,29 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // continuation (Note [Cold stencils] in `window`), continues at the cold way, laid out after the
 // region's blocks, as such an op's record's continuation.
 
-/// The type of a constant.
+/// The type of a constant, as a value: a number is a double. See Note
+/// [Integers].
 fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
     match k {
         crate::chunk::Constant::Nil => CType::Type(LType::Nil),
         crate::chunk::Constant::Bool(_) => CType::Type(LType::Bool),
-        crate::chunk::Constant::Number(n) if is_integer(n.0) => CType::Type(LType::Integer),
         crate::chunk::Constant::Number(_) => CType::Type(LType::Double),
         crate::chunk::Constant::String(_) => CType::Type(LType::String),
+    }
+}
+
+/// Whether a constant is a number an i32 holds exactly.
+fn integral_constant<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> bool {
+    matches!(k, crate::chunk::Constant::Number(n) if is_integer(n.0))
+}
+
+/// The type of a constant to a guard for `expected`: a number an i32 holds
+/// exactly is an integer to a guard for one, which its op then takes as an
+/// integer (`IntegerK`), else as `constant_ctype` says. See Note [Integers].
+fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected: &CType) -> CType {
+    match expected {
+        CType::Type(LType::Integer) if integral_constant(k) => CType::Type(LType::Integer),
+        _ => constant_ctype(k),
     }
 }
 
@@ -2728,6 +2756,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     assert!(is_integer(n.0), "{} isn't an integer", n.0);
                     arg = ResumeArg::Integer(n.0 as i32);
                 },
+                CoroutineState::Yielded(YieldOp::IntegralK(k)) => {
+                    let proto = self.clos.ro(owner).prototype;
+                    arg = if integral_constant(unsafe { &(&(*proto).constants.items)[k] }) { ResumeArg::Matched } else { ResumeArg::Failed };
+                },
                 CoroutineState::Yielded(YieldOp::NumberK(k)) => {
                     let proto = self.clos.ro(owner).prototype;
                     let crate::chunk::Constant::Number(n) = (unsafe { &(&(*proto).constants.items)[k] }) else { unreachable!() };
@@ -2843,7 +2875,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let proto = self.clos.ro(owner).prototype;
                     if (rk & 0x100)!=0 {
                         let r_const = rk & (0xff);
-                        let ty = constant_ctype(unsafe { &(&(*proto).constants.items)[r_const as usize] });
+                        let ty = constant_ctype_for(unsafe { &(&(*proto).constants.items)[r_const as usize] }, &CType::Type(*expected));
                         debug!("GuardRk constant {:?} {:?}", ty, expected);
                         // Constants always have known types
                         if CType::Type(*expected).accepts(&ty) {
@@ -2863,7 +2895,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::GuardCType(rk, ref expected)) => {
                     let known = if (rk & 0x100) != 0 {
                         let proto = self.clos.ro(owner).prototype;
-                        constant_ctype(unsafe { &(&(*proto).constants.items)[rk & 0xff] })
+                        constant_ctype_for(unsafe { &(&(*proto).constants.items)[rk & 0xff] }, expected)
                     } else {
                         ctx.types[rk].clone()
                     };

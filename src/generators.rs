@@ -142,8 +142,8 @@ macro_rules! integer_encoded {
 macro_rules! integer_operands {
     ($lhs:expr, $rhs:expr) => {{
         let integer = ResumeArg::Type(CType::Type(LType::Integer));
-        let lt = (yield YieldOp::TypeofRk($lhs)) == integer;
-        let rt = (yield YieldOp::TypeofRk($rhs)) == integer;
+        let lt = if ($lhs & 0x100) != 0 { (yield YieldOp::IntegralK($lhs & 0xff)) == ResumeArg::Matched } else { (yield YieldOp::TypeofRk($lhs)) == integer };
+        let rt = if ($rhs & 0x100) != 0 { (yield YieldOp::IntegralK($rhs & 0xff)) == ResumeArg::Matched } else { (yield YieldOp::TypeofRk($rhs)) == integer };
         if lt && ($rhs & 0x100) == 0 {
             integer_encoded!($rhs)
         } else if rt && ($lhs & 0x100) == 0 {
@@ -1351,7 +1351,7 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         arg = yield YieldOp::Exec(ResidualExec::new("unm", Rc::new(move |owner, state| {
             let res = match state.vals[state.base + b as usize].unbox() {
                 // TODO: metatables
-                LValue::Integer(_) | LValue::Double(_) => LValue::number(-state.vals[state.base + b as usize].as_number().unwrap()),
+                LValue::Integer(_) | LValue::Double(_) => LValue::Double(Number(-state.vals[state.base + b as usize].as_number().unwrap())),
                 _ => unimplemented!(),
             };
             state.vals[state.base + a as usize] = LBoxed::box_lvalue(res);
@@ -1372,9 +1372,10 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
                     LValue::InternedString(s) => s.as_bytes().len(),
                     _ => unreachable!(),
                 };
-                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::number(n as _));
+                state.vals[state.base + a] = LBoxed::from_int(n as i32);
             })));
-            yield YieldOp::SetCTypes(vec![(a, CType::Number)]);
+            // A length, an integer. See Note [Integers].
+            yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
             return arg;
         }
         arg = yield YieldOp::Guard(b, LType::Table);
@@ -1383,9 +1384,10 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
             arg = yield YieldOp::Exec(ResidualExec::new("len_tab", Rc::new(move |owner, state| {
                 let LValue::Table(b) = state.vals[state.base + b].unbox() else { unreachable!() };
                 let n = b.ro(owner).array.len();
-                state.vals[state.base + a] = LBoxed::box_lvalue(LValue::number(n as _));
+                state.vals[state.base + a] = LBoxed::from_int(n as i32);
             })));
-            yield YieldOp::SetCTypes(vec![(a, CType::Number)]);
+            // A length, an integer. See Note [Integers].
+            yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
             return arg;
         } else {
             unimplemented!("__len metamethod")
@@ -1698,14 +1700,38 @@ pub fn emit_self(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
     }
 }
 
+// FORPREP's promotion of a double an i32 holds exactly to the integer
+// encoding, in place, on its hot path; on its cold path the double stays. See
+// Note [Integers].
+windowed!(ToInteger, [], [], |owner, state, base| (inout v) {
+    let d = v.as_double();
+    if crate::lboxed::is_integer(d) {
+        *v = LBoxed::from_int(d as i32);
+        false
+    } else {
+        core::intrinsics::cold_path();
+        true
+    }
+} cold {
+    1
+});
+
 pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         debug!("forprep {a} {sbx} {pc}");
         // An integer loop's index, limit and step are integers: find out which
-        // are. See Note [Integers].
+        // are, and promote a double an i32 holds exactly to one. See Note
+        // [Integers].
         for slot in a..a + 3 {
-            yield YieldOp::GuardCType(slot, CType::Type(LType::Integer));
+            if (yield YieldOp::GuardCType(slot, CType::Type(LType::Integer))) == ResumeArg::Matched {
+                continue;
+            }
+            if (yield YieldOp::GuardCType(slot, CType::Type(LType::Double))) == ResumeArg::Matched {
+                let fits = yield YieldOp::OptimisticExec(Rc::new(ToInteger::new(&[slot])));
+                let ty = if fits == ResumeArg::Matched { LType::Integer } else { LType::Double };
+                yield YieldOp::SetCTypes(vec![(slot, CType::Type(ty))]);
+            }
         }
         let mut sub = emit_numeric(Opcode::SUB, a, a, a + 2);
         drain!(sub, arg);

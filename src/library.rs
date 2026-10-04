@@ -234,15 +234,15 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
                     m + (r * (n - m + 1.0)).floor()
                 }
             };
-            smallvec![LBoxed::from_number(value)]
+            smallvec![LBoxed::from_double(value)]
         })),
         ("randomseed", native!(|owner, args| {
             // Never zero, which xorshift stays at.
             RANDOM.with(|state| state.set(number(arg(&args, 0)).to_bits() ^ 0x9e37_79b9_7f4a_7c15 | 1));
             smallvec![]
         })),
-        ("max", native!(|owner, args| smallvec![LBoxed::from_number(args.iter().map(|&v| number(v)).fold(f64::NEG_INFINITY, f64::max))])),
-        ("min", native!(|owner, args| smallvec![LBoxed::from_number(args.iter().map(|&v| number(v)).fold(f64::INFINITY, f64::min))])),
+        ("max", native!(|owner, args| smallvec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::NEG_INFINITY, f64::max))])),
+        ("min", native!(|owner, args| smallvec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::INFINITY, f64::min))])),
     ]
 }
 
@@ -330,19 +330,11 @@ fn math1<const OP: u8>(x: f64) -> f64 {
     }
 }
 
-/// Whether `math1::<OP>`'s result is boxed in the double encoding, its type
-/// `Double`: a function whose results are seldom whole. The rest box theirs
-/// canonically, a number of either encoding. See Note [Integers] in
-/// `specialize`.
-const fn math1_double(op: u8) -> bool {
-    matches!(op, SQRT | SIN | COS | TAN)
-}
-
-/// `math1::<OP>`'s result, boxed as `math1_double` says.
+/// `math1::<OP>`'s result, a double like every number a native computes. See
+/// Note [Integers] in `specialize`.
 #[inline(always)]
 fn math1_boxed<'s, 'i, const OP: u8>(x: f64) -> LBoxed<'s, 'i> {
-    let r = math1::<OP>(x);
-    if math1_double(OP) { LBoxed::from_double(r) } else { LBoxed::from_number(r) }
+    LBoxed::from_double(math1::<OP>(x))
 }
 
 crate::window::windowed!(MathUnary, [], [OP: u8, X: bool], |owner, state, base| (x, out r) {
@@ -362,7 +354,7 @@ fn math1_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option
     } else {
         std::rc::Rc::new(MathUnary::<OP, false>::new(&operands))
     };
-    let result = if math1_double(OP) { crate::specialize::CType::Type(LType::Double) } else { crate::specialize::CType::Number };
+    let result = crate::specialize::CType::Type(LType::Double);
     Some(NativeOp { window, args: crate::specialize::CType::Number, result })
 }
 
@@ -508,11 +500,11 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             }
             _ => None,
         };
-        smallvec![parsed.map_or(LBoxed::NIL, LBoxed::from_number)]
+        smallvec![parsed.map_or(LBoxed::NIL, LBoxed::from_double)]
     });
 
     let string_lib = module(intern, vec![
-        ("len", native!(|owner, args| smallvec![LBoxed::from_number(bytes(arg(&args, 0)).len() as f64)])),
+        ("len", native!(|owner, args| smallvec![LBoxed::from_int(bytes(arg(&args, 0)).len() as i32)])),
         ("sub", native!(|owner, args| {
             let s = bytes(arg(&args, 0));
             let range = span(s.len(), number_or(arg(&args, 1), 1.0), number_or(arg(&args, 2), -1.0));
@@ -522,7 +514,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             let s = bytes(arg(&args, 0));
             let i = number_or(arg(&args, 1), 1.0);
             let range = span(s.len(), i, number_or(arg(&args, 2), i));
-            s[range].iter().map(|&b| LBoxed::from_number(b as f64)).collect()
+            s[range].iter().map(|&b| LBoxed::from_int(b as i32)).collect()
         })),
         ("char", native!(|owner, args| smallvec![string(args.iter().map(|&b| number(b) as u8).collect())])),
         ("rep", native!(|owner, args| {

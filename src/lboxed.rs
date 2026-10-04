@@ -104,12 +104,11 @@ impl<'src> IStr<'src> {
 // native's argument. The encoding says nothing of the number: an integer and
 // the equal double are the same Lua value, so the generic decoders
 // (`as_number`, `unbox`) read either as the same `f64`, and a table key is
-// canonicalized (Note [Canonical values] in `vm`). Code producing a number
-// without knowing which encoding its consumers want (`from_number`: a
-// constant, a native's result, the generic paths) boxes it canonically, a
-// whole i32 but -0 as an integer, so equal numbers from there reach code in
-// the same encoding. The specializer's typed ops box the encoding their
-// result's type says. See Note [Integers] in `specialize`.
+// canonicalized (Note [Canonical values] in `vm`). A number is a double unless
+// something narrows it to an integer: a constant, a native's result and the
+// generic paths' arithmetic box doubles, whatever their value, and the
+// specializer's typed ops box the encoding their result's type says. See Note
+// [Integers] in `specialize`.
 
 // Note [Arithmetic NaNs]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -184,8 +183,8 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         Self::from_raw(bits)
     }
 
-    /// Box a number canonically: a whole i32 but -0 as an integer, anything else
-    /// as a double. See Note [Integer encoding].
+    /// Box a number canonically, as a table key is: a whole i32 but -0 as an
+    /// integer, anything else as a double. See Note [Canonical values] in `vm`.
     #[inline(always)]
     pub fn from_number(n: f64) -> Self {
         if is_integer(n) { Self::from_int(n as i32) } else { Self::from_double(n) }
@@ -457,7 +456,8 @@ impl<'src, 'intern> From<&LConstant<'src, 'intern>> for LBoxed<'src, 'intern> {
         match value {
             Constant::Nil => Self::NIL,
             Constant::Bool(b) => Self::from_bool(*b),
-            Constant::Number(n) => Self::from_number(n.0),
+            // A double, whatever its value. See Note [Integers] in `specialize`.
+            Constant::Number(n) => Self::from_double(n.0),
             Constant::String(s) => Self::interned(*s),
         }
     }
