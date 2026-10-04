@@ -1130,8 +1130,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // loaded, until something writes the slot) is narrowed statically, the constant stored again in
 // the integer encoding, at no cost each time the code runs: a counter a loop starts from a
 // constant each time it is entered, even the first iteration computes on an integer. The fact is
-// consumed by the slot's narrowing, whose type then says what it would, or by a guard of the
-// slot's type, which decides how the slot is used instead; otherwise it holds until the slot is
+// consumed by the slot's narrowing, whose type then says what it would, or by a guard finding out
+// the slot's type at runtime, which decides how the slot is used instead (one the context answers
+// decides nothing, as a loop's guards before narrowing); otherwise it holds until the slot is
 // written. Where it is never used, the code it was carried through is contracted (Note
 // [Contraction]). Any other slot isn't narrowed.
 
@@ -1650,8 +1651,8 @@ impl Context {
     }
 
     /// A slot holding upvalue `upvalue`'s value, if one is known to.
-    /// Slot `slot`'s type is guarded: a fact that it holds a constant has had
-    /// its use. See Note [Narrowing].
+    /// Slot `slot`'s type is found out at runtime: a fact that it holds a
+    /// constant has had its use. See Note [Narrowing].
     fn used(&mut self, slot: usize) {
         self.fragile.retain(|fact| !matches!(fact.fragile, Fragile::Constant { slot: held, .. } if held == slot));
     }
@@ -3264,10 +3265,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::GuardCType(rk, ref expected)) => {
-                    // See Note [Narrowing].
-                    if (rk & 0x100) == 0 {
-                        Rc::make_mut(&mut ctx).used(rk);
-                    }
                     let known = if (rk & 0x100) != 0 {
                         let proto = self.clos.ro(owner).prototype;
                         constant_ctype_for(unsafe { &(&(*proto).constants.items)[rk & 0xff] }, expected)
@@ -3282,6 +3279,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             arg = ResumeArg::MatchedConst(rk & 0xff);
                         }
                     } else {
+                        // See Note [Narrowing].
+                        Rc::make_mut(&mut ctx).used(rk);
                         let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, expected.clone(), None, pc, ctx.clone(), true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
@@ -3326,8 +3325,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::Guard(idx, expected)) => {
-                    // See Note [Narrowing].
-                    Rc::make_mut(&mut ctx).used(idx);
                     debug!("guard {:?} == {:?}", ctx.types[idx], expected);
                     let ctype = &ctx.types[idx];
                     let expected_ctype = CType::Type(expected);
@@ -3344,6 +3341,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         // Dynamic branch: create a thunk that will discovery the type of the
                         // guarded value when forced, and fork the coroutine for the observed case.
+                        // See Note [Narrowing].
+                        Rc::make_mut(&mut ctx).used(idx);
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         debug!("emitting discovery thunk");
