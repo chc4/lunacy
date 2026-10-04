@@ -676,9 +676,27 @@ impl Ahead {
     }
 }
 
+/// Each value `cache` holds and its worth after step `at` (see `Ahead::worth`),
+/// as `slot:distance`, `slot:exit distance` for one live only along a side
+/// exit, or `slot:-` for none, for the trace (`alloc` events).
+#[cfg(feature = "tracing")]
+fn worths(ahead: &Ahead, cache: &Cache, at: usize) -> String {
+    cache
+        .slots()
+        .map(|(_, slot)| match ahead.worth(slot, at, cache.dirty.contains(&slot)) {
+            Some((false, far)) => format!("{slot}:{far}"),
+            Some((true, far)) => format!("{slot}:exit {far}"),
+            None => format!("{slot}:-"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Plan a trace's window ops in a window of `width` registers, its head
-/// entered from `hint`. See Note [Trace allocation].
-pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
+/// entered from `hint`; `trace` names it in the trace (`alloc` events, see
+/// `just trace-sql`). See Note [Trace allocation].
+pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> TracePlan {
+    let _ = trace;
     assert!(width <= WINDOW);
     let mut ahead = Ahead::new(steps);
     let trivial = steps.iter().all(|s| matches!(s, Step::Start(_) | Step::Back(_) | Step::Exit { .. }));
@@ -751,6 +769,15 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
                     unboxed |= u8::from(form) << reg;
                 }
                 let entry = Cache { regs, unboxed, dirty: dirty.iter().collect() };
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("alloc", "start", &[
+                    ("trace", trace.into()),
+                    ("step", step.into()),
+                    ("rise", usize::from(rise.is_some()).into()),
+                    ("arrives", format!("{now}").as_str().into()),
+                    ("worth", worths(&ahead, now, step).as_str().into()),
+                    ("entry", format!("{entry}").as_str().into()),
+                ]);
                 alloc = WindowAlloc { width, cache: entry };
                 ahead.entered(step, &regs, unboxed);
                 plan.windows[step] = regs;
@@ -759,15 +786,41 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache) -> TracePlan {
             }
             Step::Op(op, usable) => {
                 let (want, skip) = place(&alloc, &ahead, step, *op, usable);
-                alloc.reconcile(&want, *op, skip);
-                alloc.op(*op, [skip]).expect("a placed op runs at its SKIP");
+                #[cfg(feature = "tracing")]
+                let (before, worth) = (format!("{}", alloc.cache()), worths(&ahead, alloc.cache(), step));
+                let mut emits = alloc.reconcile(&want, *op, skip);
+                emits.extend(alloc.op(*op, [skip]).expect("a placed op runs at its SKIP"));
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("alloc", "op", &[
+                    ("trace", trace.into()),
+                    ("step", step.into()),
+                    ("name", op.name().into()),
+                    ("before", before.as_str().into()),
+                    ("worth", worth.as_str().into()),
+                    ("skip", skip.into()),
+                    ("emits", emits.iter().map(|emit| emit.to_string()).collect::<Vec<_>>().join("; ").as_str().into()),
+                    ("after", format!("{}", alloc.cache()).as_str().into()),
+                ]);
+                let _ = emits;
                 plan.windows[step] = want;
                 plan.skips[step] = skip;
             }
             Step::Flush => {
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("alloc", "flush", &[("trace", trace.into()), ("step", step.into()), ("window", format!("{}", alloc.cache()).as_str().into())]);
                 alloc.flush();
             }
-            Step::Exit { .. } => plan.exits[step] = Some(alloc.cache().clone()),
+            Step::Exit { hot, .. } => {
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("alloc", "exit", &[
+                    ("trace", trace.into()),
+                    ("step", step.into()),
+                    ("hot", usize::from(*hot).into()),
+                    ("window", format!("{}", alloc.cache()).as_str().into()),
+                ]);
+                let _ = hot;
+                plan.exits[step] = Some(alloc.cache().clone());
+            }
             Step::Read(_) | Step::Back(_) => {}
         }
     }
@@ -1048,7 +1101,7 @@ mod tests {
         let windows = windows(ops, doubles);
         let steps: Vec<Step> =
             std::iter::once(Step::Start(None)).chain(windows.iter().map(|w| Step::Op(&**w, (0..WINDOW).collect()))).collect();
-        let plan = plan_trace(&steps, width, &Cache::default());
+        let plan = plan_trace(&steps, width, &Cache::default(), 0);
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
         for (i, w) in windows.iter().enumerate() {
@@ -1238,7 +1291,7 @@ mod tests {
                 window
             };
             let hint = some_window(&mut rng);
-            let plan = plan_trace(&steps, width, &hint);
+            let plan = plan_trace(&steps, width, &hint, 0);
             let mut machine = Machine::default();
             for &slot in &hint.dirty {
                 machine.current.insert(slot, 1);
@@ -1293,7 +1346,7 @@ mod tests {
                         // planned from the window the plan leaves here: its
                         // thunk's exit, and the thunk linked into a block
                         // entered with any window, lose no write.
-                        let trivial = plan_trace(&[Step::Start(None)], width, plan.exits[step].as_ref().unwrap());
+                        let trivial = plan_trace(&[Step::Start(None)], width, plan.exits[step].as_ref().unwrap(), 0);
                         let entry = Cache::entry(trivial.windows[0], trivial.unboxed[0], alloc.cache(), &trivial.dirty[0]);
                         let mut linked = machine.clone();
                         for emit in alloc.transfer(&entry) {
@@ -1381,7 +1434,7 @@ mod tests {
         hint.dirty.push(2);
         let rise = || Some(Rise { reads: Slots::default(), writes: Slots::default() });
         for steps in [vec![Step::Start(None)], vec![Step::Start(rise())], vec![Step::Start(None), Step::Exit { hot: true, reads: Slots::default() }]] {
-            let plan = plan_trace(&steps, WINDOW, &hint);
+            let plan = plan_trace(&steps, WINDOW, &hint, 0);
             assert!(plan.trivial);
             assert_eq!(plan.windows[0], hint.regs);
             assert_eq!(plan.unboxed[0], hint.unboxed);

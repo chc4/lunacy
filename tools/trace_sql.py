@@ -14,7 +14,17 @@ The specializer's are also views, one column per argument:
       each version compiled.
   block_summary(block, line, pc, residuals, context, hotness, jitted)
       every block at the end of the run (line 0 for one no version names).
-
+  alloc_step(trace, step, line, block, pc, off)
+      each step of each trace the window planner planned: the block it is in
+      and, for a residual, its offset (a block's start's is 2^64-1).
+  alloc_start(trace, step, rise, arrives, worth, entry)
+      each block start planned: whether its edge rises into a loop, the
+      window the trace arrives with and each value's worth there (its next
+      use's distance, `exit n` if only a side exit's, `-` for none), and the
+      entry window chosen.
+  alloc_op(trace, step, name, before, worth, skip, emits, after)
+      each window op planned: the window before it and its values' worth, its
+      SKIP, what it emits (stores, loads, moves), and the window after.
     tools/trace_sql.py [--trace working/lunacy.fxt] QUERY
 (in the devshell, whose `trace_processor_shell` it runs; `just trace-sql`)
 """
@@ -26,8 +36,12 @@ VIEWS = {
     'spec_version': ['line', 'pc', 'outcome', 'block', 'versions', 'context', 'joined', 'shapes_dropped'],
     'spec_block': ['block', 'line', 'pc', 'context'],
     'block_summary': ['block', 'line', 'pc', 'residuals', 'context', 'hotness', 'jitted'],
+    'alloc_step': ['trace', 'step', 'line', 'block', 'pc', 'off'],
+    'alloc_start': ['trace', 'step', 'rise', 'arrives', 'worth', 'entry'],
+    'alloc_op': ['trace', 'step', 'name', 'before', 'worth', 'skip', 'emits', 'after'],
 }
-EVENTS = {'spec_version': 'version', 'spec_block': 'block', 'block_summary': 'block_summary'}
+EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
+          'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op')}
 
 
 def main():
@@ -39,8 +53,9 @@ def main():
     tp = TraceProcessor(trace=args.trace, config=TraceProcessorConfig(bin_path=shutil.which('trace_processor_shell')))
     for view, columns in VIEWS.items():
         extracted = ', '.join(f"EXTRACT_ARG(arg_set_id, '{c}') AS {c}" for c in columns)
+        category, name = EVENTS[view]
         tp.query(f"CREATE PERFETTO VIEW {view} AS SELECT ts, {extracted} FROM slice "
-                 f"WHERE category = 'spec' AND name = '{EVENTS[view]}'")
+                 f"WHERE category = '{category}' AND name = '{name}'")
     result = tp.query(args.query)
     rows = [row for row in result]
     if not rows:

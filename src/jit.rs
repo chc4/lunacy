@@ -760,6 +760,10 @@ pub struct JitContext {
     /// The loop headers of the region being compiled, which start aligned
     /// (`LOOP_ALIGN`) with feature `align_loops`.
     region_headers: std::collections::HashSet<BlockId, FxBuildHasher>,
+    /// The line of the function a region being compiled is of, for its
+    /// planning's trace events.
+    #[cfg(feature = "tracing")]
+    traced_line: usize,
     /// The address the region being compiled starts at, which alignment is
     /// relative to.
     region_base: usize,
@@ -1080,6 +1084,8 @@ impl JitContext {
             thunk_sites: HashMap::default(),
             region_sites: Vec::new(),
             region_headers: Default::default(),
+            #[cfg(feature = "tracing")]
+            traced_line: 0,
             region_base: 0,
             waiting: HashMap::default(),
             lua_entries: HashMap::default(),
@@ -1301,6 +1307,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let linked = self.jctx.waiting.get(&id).and_then(|sites| sites.last()).map(|site| site.window.clone());
             let window = match self.jctx.trace_policy {
                 Some(policy) => {
+                    #[cfg(feature = "tracing")]
+                    {
+                        self.jctx.traced_line = unsafe { (*self.clos.ro(owner).prototype).line_defined } as usize;
+                    }
                     plans = self.plan_region(id, policy, linked.as_ref());
                     plans[&id].entry_window(linked.as_ref().unwrap_or(&Cache::default()))
                 }
@@ -1814,7 +1824,31 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             step_of.push(of);
         }
-        let plan = plan_trace(&steps, ALLOCATED, hint);
+        // The trace's steps' blocks and residuals, for the planner's trace events.
+        #[cfg(feature = "tracing")]
+        let traced = {
+            static TRACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = TRACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let line = self.jctx.traced_line;
+            for (pos, &b) in trace.iter().enumerate() {
+                let (block, pc) = (ids[b].0, self.blocks[ids[b].0].pc);
+                let ops = step_of[pos].iter().enumerate().filter_map(|(off, step)| Some((off, (*step)?)));
+                for (off, step) in std::iter::once((usize::MAX, starts[pos])).chain(ops) {
+                    crate::tracing::instant("alloc", "step", &[
+                        ("trace", id.into()),
+                        ("step", step.into()),
+                        ("line", line.into()),
+                        ("block", block.into()),
+                        ("pc", pc.into()),
+                        ("off", off.into()),
+                    ]);
+                }
+            }
+            id
+        };
+        #[cfg(not(feature = "tracing"))]
+        let traced = 0;
+        let plan = plan_trace(&steps, ALLOCATED, hint, traced);
         let exits = leaving.into_iter().filter_map(|(step, from, target)| Some((from, target, plan.exits[step].clone()?))).collect();
         let placed = |of: &[Option<usize>]| of.iter().map(|step| step.map(|step| (plan.skips[step] as u8, Packed::pack(&plan.windows[step])))).collect();
         let planned = trace
