@@ -540,11 +540,6 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         if b & 0x100 == 0 {
             yield YieldOp::Narrow(b);
         }
-        // A whole constant stored into a field, narrowed. See Note [Narrowing] in
-        // `specialize`.
-        if c & 0x100 == 0 {
-            yield YieldOp::NarrowConstant(c);
-        }
         let integer = match yield YieldOp::GuardCType(b, CType::Type(LType::Integer)) {
             ResumeArg::MatchedConst(k) => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };

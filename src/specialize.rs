@@ -1123,24 +1123,26 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // ~~~~~~~~~~~~~~~~
 // A double an i32 holds exactly can be narrowed to the integer encoding where an integer pays: a
 // loop's index, limit and step, a generic loop's variables, and an array key. `Narrow` of a slot
-// the context types `Double`, or doesn't know the type of, ends its block in a thunk; forced on a
-// double an i32 holds exactly, it narrows the slot in place by an optimistic op (`ToInteger`),
-// whose hot way continues with the slot an integer and its cold way with it as it was (the op takes
-// it cold for anything but such a double), and forced on any other value it continues with it as it
-// was, no narrowing ever tried at runtime. A slot typed `Integer` is one already, at the same
-// `SubPc` as the narrowed hot way, so the code after both is one version: in a loop, the first
-// iteration narrows its counter, and the rest compute on an integer. A slot a fact says holds a
-// constant an i32 holds exactly (one `LOADK` loaded, until something writes the slot) is narrowed
-// statically, the constant stored again in the integer encoding, at no cost each time the code
-// runs: a counter a loop starts from a constant each time it is entered, even the first iteration
-// computes on an integer. The fact is consumed by the slot's narrowing, whose type then says what
-// it would, or by a guard finding out the slot's type at runtime, which decides how the slot is
-// used instead (one the context answers decides nothing, as a loop's guards before narrowing);
-// otherwise it holds until the slot is written. Where it is never used, the code it was carried
-// through is contracted (Note [Contraction]). A slot holding such a constant is narrowed statically
-// too where it escapes, captured by a closure or stored into an upvalue or a table's field: a whole
-// number kept there is most likely used as an integer, and is one for every reader. Any other slot
-// isn't narrowed.
+// the context types `Double` ends its block in a thunk; forced on a double an i32 holds exactly, it
+// narrows the slot in place by an optimistic op (`ToInteger`), whose hot way continues with the
+// slot an integer and its cold way with it a double, and forced on any other value it continues
+// with it a double, no narrowing ever tried at runtime. A slot of any other type isn't narrowed:
+// one of unknown type is most often of another type than a double, and narrowing it would end its
+// block for nothing. A slot typed `Integer` is one already, at the same `SubPc` as the narrowed hot
+// way, so the code after both is one version: in a loop, the first iteration narrows its counter,
+// and the rest compute on an integer. A slot a fact says holds a constant an i32 holds exactly (one
+// `LOADK` loaded, until something writes the slot) is narrowed statically, the constant stored
+// again in the integer encoding, at no cost each time the code runs: a counter a loop starts from a
+// constant each time it is entered, even the first iteration computes on an integer. The fact is
+// consumed by the slot's narrowing, whose type then says what it would, or by a guard finding out
+// the slot's type at runtime, which decides how the slot is used instead (one the context answers
+// decides nothing, as a loop's guards before narrowing); otherwise it holds until the slot is
+// written. Where it is never used, the code it was carried through is contracted (Note
+// [Contraction]). A slot holding such a constant is narrowed statically too where it escapes into
+// an upvalue, captured by a closure or stored into one: a whole number kept there is most likely
+// used as an integer, and is one for every reader. A store into a table isn't narrowed: values
+// reach a table's elements from many stores, constants stored from the constant table and copies
+// among them, and narrowing only some would leave it holding both encodings.
 
 // Note [Contraction]
 // ~~~~~~~~~~~~~~~~~~
@@ -3683,7 +3685,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         arg = ResumeArg::Matched;
                     }
                     // Found out once forced. See Note [Narrowing].
-                    CType::Type(LType::Double | LType::Unknown) => {
+                    CType::Type(LType::Double) => {
                         let thunk = Residual::Thunk(self.make_narrow_thunk(block_id, coro.clone(), slot, pc, ctx.clone()));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
