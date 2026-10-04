@@ -1292,10 +1292,13 @@ pub struct Context {
 // carrying one invalidation per backwards edge may drop a single fact from the set at a different
 // position each time, and cause `2^n` combination repeatedly compiling the same loop.
 //
-// Instead the versions of a pc that differ only in their facts are kept ordered by inclusion, each
-// one's facts a subset of the next's, and a context reaching the pc forgets whatever facts it has
-// that would break that order. Dropping facts is always sound, since a version relying on fewer
-// facts accepts any context with more, and n facts then give at most n + 1 versions.
+// Instead the versions of a pc that differ only in their facts are kept ordered by inclusion, kind
+// by kind of fact (`Fragile::class`), each one's facts of a kind a subset of the next's, and a
+// context reaching the pc forgets whatever facts it has that would break that order. Dropping
+// facts is always sound, since a version relying on fewer facts accepts any context with more, and
+// n facts of a kind then give at most n + 1 versions for it. Kinds are kept apart so that facts of
+// one kind, established and lost on their own schedule, never cost another kind's: a join of
+// versions keeps a fact unless a version with facts of its kind lacks it.
 //
 // Which facts a path keeps depends on the order paths are compiled in. Facts established before a
 // loop's paths diverge reach every back edge, and are kept by all of them; a path that establishes
@@ -1343,6 +1346,12 @@ pub enum Effect {
 }
 
 impl Fragile {
+    /// Its kind: facts of different kinds are kept apart where versions are
+    /// told apart by their facts. See Note [Fragile information].
+    fn class(&self) -> u8 {
+        self.key().0
+    }
+
     /// What the fact is about, unique among a context's facts, and their order.
     fn key(&self) -> (u8, usize) {
         match self {
@@ -1627,7 +1636,9 @@ impl Context {
         if self.top != other.top {
             self.top = None;
         }
-        self.fragile.retain(|fact| other.fragile.contains(fact));
+        // Kind by kind: a context with no fact of a kind doesn't drop that kind's.
+        // See Note [Fragile information].
+        self.fragile.retain(|fact| other.fragile.contains(fact) || !other.fragile.iter().any(|theirs| theirs.class() == fact.class()));
         let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
         for (i, mine) in self.hkeys.iter_mut().enumerate() {
             match other.hkeys.get(i) {
@@ -1884,30 +1895,38 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .filter(|((epc, _), _)| *epc == subpc)
             .map(|((_, ectx), block)| (ectx.clone(), *block))
             .collect();
-        // Versions differing only in fragile information are a chain of subsets,
-        // each version's facts in the next's: `ctx` keeps the most facts that
-        // keep it one. See Note [Fragile information].
-        let mut chain: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
-        chain.sort_by_key(|(ectx, _)| ectx.fragile.len());
-        let below = chain.iter().rposition(|(ectx, _)| ectx.fragile_within(&ctx));
-        // Above the top every fact is kept; otherwise those shared with the
-        // version above the highest `ctx` has all of, or with the bottom.
-        let bound = match below {
-            Some(below) => chain.get(below + 1),
-            None => chain.first(),
-        };
-        let ctx = match bound {
-            Some((above, _)) => {
-                let mut lowered = (*ctx).clone();
-                lowered.fragile.retain(|fact| above.fragile.contains(fact));
-                if let Some((under, block)) = below.map(|below| chain[below]) {
-                    if under.fragile == lowered.fragile {
-                        return (*block, "fragile", None);
-                    }
-                }
-                Rc::new(lowered)
-            },
-            None => ctx,
+        // Versions differing only in fragile information are, kind by kind of
+        // fact, a chain of subsets, each version's facts of the kind in the
+        // next's: `ctx` keeps the most facts of each kind that keep it one. See
+        // Note [Fragile information].
+        let alike: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
+        let mut classes: SmallVec<[u8; 8]> = alike.iter().flat_map(|(ectx, _)| ectx.fragile.iter()).chain(ctx.fragile.iter()).map(Fragile::class).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        let mut kept: Vec<Fragile> = Vec::new();
+        for class in classes {
+            let of = |facts: &[Fragile]| facts.iter().filter(|fact| fact.class() == class).cloned().collect::<Vec<_>>();
+            let mine = of(&ctx.fragile);
+            let mut chain: Vec<Vec<Fragile>> = alike.iter().map(|(ectx, _)| of(&ectx.fragile)).collect();
+            chain.sort_by_key(Vec::len);
+            chain.dedup();
+            let below = chain.iter().rposition(|facts| facts.iter().all(|fact| mine.contains(fact)));
+            // Above the top every fact is kept; otherwise those shared with the
+            // version above the highest `ctx` has all of, or with the bottom.
+            match below.map_or(chain.first(), |below| chain.get(below + 1)) {
+                Some(above) => kept.extend(mine.into_iter().filter(|fact| above.contains(fact))),
+                None => kept.extend(mine),
+            }
+        }
+        let ctx = if kept.len() == ctx.fragile.len() {
+            ctx
+        } else {
+            let mut lowered = (*ctx).clone();
+            lowered.fragile.retain(|fact| kept.contains(fact));
+            if let Some((_, block)) = alike.iter().find(|(ectx, _)| ectx.fragile == lowered.fragile) {
+                return (*block, "fragile", None);
+            }
+            Rc::new(lowered)
         };
         if existing.len() < MAX_VERSIONS {
             return (self.block(owner, pc, ctx), "new", None);
