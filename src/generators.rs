@@ -867,6 +867,33 @@ crate::window::windowed!(NumericRK, [k: f64], [OP: Opcode, LI: bool], |owner, st
     *dest = arith::<OP>(number::<LI>(lhs, tag), k, tag);
 });
 
+// Twins of the double ops on doubles, taking and giving them unboxed. See Note
+// [Unboxed doubles] in `window_alloc`.
+crate::window::windowed!(NumericRRX, [], [OP: Opcode], |owner, state, base| (f64 lhs, f64 rhs, out f64 dest) {
+    *dest = arith_value::<OP>(lhs, rhs);
+});
+crate::window::windowed!(NumericKRX, [k: f64], [OP: Opcode], |owner, state, base| (f64 rhs, out f64 dest) {
+    *dest = arith_value::<OP>(k, rhs);
+});
+crate::window::windowed!(NumericRKX, [k: f64], [OP: Opcode], |owner, state, base| (f64 lhs, out f64 dest) {
+    *dest = arith_value::<OP>(lhs, k);
+});
+impl<const OP: Opcode> crate::window::Twin for NumericRR<OP, false, false> {
+    fn twin(&self) -> Option<Rc<dyn Window>> {
+        Some(Rc::new(NumericRRX::<OP>::new(Window::operands(self))))
+    }
+}
+impl<const OP: Opcode> crate::window::Twin for NumericKR<OP, false> {
+    fn twin(&self) -> Option<Rc<dyn Window>> {
+        Some(Rc::new(NumericKRX::<OP>::new(self.k, Window::operands(self))))
+    }
+}
+impl<const OP: Opcode> crate::window::Twin for NumericRK<OP, false> {
+    fn twin(&self) -> Option<Rc<dyn Window>> {
+        Some(Rc::new(NumericRKX::<OP>::new(self.k, Window::operands(self))))
+    }
+}
+
 /// `NumericRR` for `opcode`, reading integer registers as `li`/`ri` say.
 fn numeric_rr(opcode: Opcode, li: bool, ri: bool, operands: &[usize]) -> Rc<dyn Window> {
     match (li, ri) {
@@ -1074,6 +1101,33 @@ crate::window::windowed!(select CompareKR, [a: u8, k: f64], [OP: Opcode, RI: boo
 crate::window::windowed!(select CompareRK, [a: u8, k: f64], [OP: Opcode, LI: bool], |owner, state, base, tag| (lhs) {
     compare_exit::<OP, f64>(a, number::<LI>(lhs, tag), k)
 });
+
+// Twins of the compares of doubles, taking them unboxed. See Note [Unboxed
+// doubles] in `window_alloc`.
+crate::window::windowed!(select CompareRRX, [a: u8], [OP: Opcode], |owner, state, base| (f64 lhs, f64 rhs) {
+    compare_exit::<OP, f64>(a, lhs, rhs)
+});
+crate::window::windowed!(select CompareKRX, [a: u8, k: f64], [OP: Opcode], |owner, state, base| (f64 rhs) {
+    compare_exit::<OP, f64>(a, k, rhs)
+});
+crate::window::windowed!(select CompareRKX, [a: u8, k: f64], [OP: Opcode], |owner, state, base| (f64 lhs) {
+    compare_exit::<OP, f64>(a, lhs, k)
+});
+impl<const OP: Opcode> crate::window::Twin for CompareRR<OP, false, false> {
+    fn twin(&self) -> Option<Rc<dyn Window>> {
+        Some(Rc::new(CompareRRX::<OP>::new(self.a, Window::operands(self))))
+    }
+}
+impl<const OP: Opcode> crate::window::Twin for CompareKR<OP, false> {
+    fn twin(&self) -> Option<Rc<dyn Window>> {
+        Some(Rc::new(CompareKRX::<OP>::new(self.a, self.k, Window::operands(self))))
+    }
+}
+impl<const OP: Opcode> crate::window::Twin for CompareRK<OP, false> {
+    fn twin(&self) -> Option<Rc<dyn Window>> {
+        Some(Rc::new(CompareRKX::<OP>::new(self.a, self.k, Window::operands(self))))
+    }
+}
 
 // EQ of a double against a number constant `k` (its bits in the double
 // encoding) other than ±0 or NaN: in the double encoding, equal numbers have

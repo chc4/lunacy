@@ -453,9 +453,28 @@ const COPIES: bool = !cfg!(debug_assertions) && !cfg!(feature = "immediate_jit")
 pub struct Stencils {
     image: Option<Result<Image, StencilError>>,
     bodies: HashMap<(usize, usize), (usize, Result<Rc<Body>, StencilError>), FxBuildHasher>,
+    /// Each window op the JIT has compiled, by address, and the op it copies
+    /// for it (see `effective`); the op kept so its address isn't reused.
+    twins: HashMap<usize, (Rc<dyn Window>, Rc<dyn Window>), FxBuildHasher>,
 }
 
 impl Stencils {
+    /// The op the JIT copies for `op`: its twin, which takes some operands
+    /// unboxed, if it has one whose stencils copy, else `op` itself, the same
+    /// each time. See Note [Unboxed doubles] in `window_alloc`.
+    fn effective(&mut self, op: &Rc<dyn Window>) -> Rc<dyn Window> {
+        let key = Rc::as_ptr(op) as *const () as usize;
+        if let Some((_, w)) = self.twins.get(&key) {
+            return w.clone();
+        }
+        let w = match op.twin() {
+            Some(twin) if !usable_skips(self, &*twin).is_empty() => twin,
+            _ => op.clone(),
+        };
+        self.twins.insert(key, (op.clone(), w.clone()));
+        w
+    }
+
     /// The body of `op`'s stencil at `skip`, falling through to its exit
     /// `fall_exit`. See Note [Exit stencils] in `window`.
     fn body(&mut self, op: &dyn Window, skip: usize, fall_exit: usize) -> Result<Rc<Body>, StencilError> {
@@ -1611,20 +1630,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
         }
-        // The usable `SKIP`s of each window op; one with none is called, a flush.
+        // The op the JIT copies for each window op, and its usable `SKIP`s; one
+        // with none is called, a flush.
         let stencils = &mut self.jctx.stencils;
-        let skips: Vec<Vec<SmallVec<[usize; WINDOW]>>> = ids
+        let windows: Vec<Vec<Option<Rc<dyn Window>>>> = ids
             .iter()
             .map(|block| {
                 self.blocks[block.0]
                     .instructions
                     .iter()
                     .map(|res| match res {
-                        Residual::ExecWindow(w) | Residual::GuardDynamic(w) => usable_skips(stencils, &**w),
-                        _ => SmallVec::new(),
+                        Residual::ExecWindow(w) | Residual::GuardDynamic(w) => Some(stencils.effective(w)),
+                        _ => None,
                     })
                     .collect()
             })
+            .collect();
+        let skips: Vec<Vec<SmallVec<[usize; WINDOW]>>> = windows
+            .iter()
+            .map(|block| block.iter().map(|w| w.as_ref().map_or_else(SmallVec::new, |w| usable_skips(stencils, &**w))).collect())
             .collect();
         let slots_of = |placement: &Placement| {
             let mut slots = Slots::default();
@@ -1693,7 +1717,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let head = ids[trace[0]];
             let (hint, from) = hints.get(&head).map(|(_, window, from)| (window.clone(), *from)).unwrap_or_default();
             window_dump!(self.jctx, "trace from block {} starts from {}", head.0, hint);
-            let (planned, exits) = self.plan_trace(trace, &ids, &skips, &index, &live_in, &loops, &plans, &hint, from);
+            let (planned, exits) = self.plan_trace(trace, &ids, &windows, &skips, &index, &live_in, &loops, &plans, &hint, from);
             for (from, target, window) in exits {
                 let hotness = self.blocks[from.0].jit_info.hotness.get();
                 if hints.get(&target).is_none_or(|&(hottest, ..)| hotness < hottest) {
@@ -1715,6 +1739,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         &self,
         trace: &[usize],
         ids: &[BlockId],
+        windows: &[Vec<Option<Rc<dyn Window>>>],
         skips: &[Vec<SmallVec<[usize; WINDOW]>>],
         index: &HashMap<BlockId, usize, FxBuildHasher>,
         live_in: &[Slots],
@@ -1762,9 +1787,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut of = vec![None; block.instructions.len()];
             for (off, res) in block.instructions.iter().enumerate() {
                 match res {
-                    Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[b][off].is_empty() => {
+                    Residual::ExecWindow(_) | Residual::GuardDynamic(_) if !skips[b][off].is_empty() => {
                         of[off] = Some(steps.len());
-                        steps.push(Step::Op(&**w, skips[b][off].clone()));
+                        steps.push(Step::Op(&**windows[b][off].as_ref().expect("a window op"), skips[b][off].clone()));
                     }
                     Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => steps.push(Step::Read(*idx)),
                     Residual::GuardWitness { .. } => {}
@@ -2568,6 +2593,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                 },
                 Residual::ExecWindow(w) | Residual::GuardDynamic(w) => {
+                    // The op copied for it, as planning placed. See Note [Unboxed
+                    // doubles] in `window_alloc`.
+                    let w = self.jctx.stencils.effective(w);
+                    let w = &w;
                     let stencils = &mut self.jctx.stencils;
                     let emits = match plans.get(&id) {
                         Some(plan) => plan.placed[off].map(|(skip, want)| {

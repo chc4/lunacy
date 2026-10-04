@@ -80,6 +80,7 @@
 // sound.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use dynasmrt::mmap::{ExecutableBuffer, MutableBuffer};
 use smallvec::SmallVec;
@@ -259,6 +260,21 @@ pub const EXITS: usize = 2;
 
 // ---- the Window trait -----------------------------------------------------
 
+/// A window op's twin: the same op on the same operands, taking and giving
+/// some unboxed (`Window::doubles`), which the JIT copies in the op's place, so
+/// the generators that emit the op know nothing of it. An op has one where an
+/// impl for its type says, the default none. See Note [Unboxed doubles] in
+/// `window_alloc`.
+pub trait Twin {
+    fn twin(&self) -> Option<Rc<dyn Window>>;
+}
+
+impl<T> Twin for T {
+    default fn twin(&self) -> Option<Rc<dyn Window>> {
+        None
+    }
+}
+
 /// A copy&patch window op, as stored in `Residual::ExecWindow`.
 pub trait Window: std::fmt::Debug {
     fn name(&self) -> &'static str;
@@ -305,6 +321,11 @@ pub trait Window: std::fmt::Debug {
     fn doubles(&self) -> u8 {
         0
     }
+    /// Its twin, if it has one: the same op on the same operands, taking some
+    /// unboxed, which the JIT copies in its place. See `Twin`.
+    fn twin(&self) -> Option<Rc<dyn Window>> {
+        None
+    }
     /// Run the body on the window `w` at `skip`, with the captures from `self`.
     unsafe fn run<'src, 'intern>(
         &self,
@@ -342,6 +363,9 @@ impl dyn Window {
         let before = w;
         unsafe { self.run(owner, state, base, &mut w, 0) };
         check::check(self, owner, state, base, before, &w);
+        if let Some(twin) = self.twin() {
+            check::check(&*twin, owner, state, base, before, &w);
+        }
         for (i, (slot, _)) in operands.filter(|(_, (_, a))| a.writes()) {
             state.vals[state.base + slot] = w[i];
         }
@@ -540,20 +564,47 @@ macro_rules! windowed {
         $($code)*
     };
     (@if_not_cold [$cold:block] $($code:tt)*) => {};
-    // Sort the operands into inputs and outputs, each with its window offset,
+    // Sort the operands into inputs and outputs, each with its window offset
+    // and form (`f64` unboxed, see Note [Unboxed doubles] in `window_alloc`),
     // and their accesses in window order.
+    (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) out f64 $op:ident $(, $($rest:tt)*)?) => {
+        $crate::window::windowed!(@sort $decl [$($in)*] [$($out)* ($op, $i, double)] [$($acc)* Write] ($i + 1) $($($rest)*)?);
+    };
+    (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) f64 $op:ident $(, $($rest:tt)*)?) => {
+        $crate::window::windowed!(@sort $decl [$($in)* ($op, $i, double)] [$($out)*] [$($acc)* Read] ($i + 1) $($($rest)*)?);
+    };
     (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) inout $op:ident $(, $($rest:tt)*)?) => {
-        $crate::window::windowed!(@sort $decl [$($in)*] [$($out)* ($op, $i)] [$($acc)* Update] ($i + 1) $($($rest)*)?);
+        $crate::window::windowed!(@sort $decl [$($in)*] [$($out)* ($op, $i, boxed)] [$($acc)* Update] ($i + 1) $($($rest)*)?);
     };
     (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) out $op:ident $(, $($rest:tt)*)?) => {
-        $crate::window::windowed!(@sort $decl [$($in)*] [$($out)* ($op, $i)] [$($acc)* Write] ($i + 1) $($($rest)*)?);
+        $crate::window::windowed!(@sort $decl [$($in)*] [$($out)* ($op, $i, boxed)] [$($acc)* Write] ($i + 1) $($($rest)*)?);
     };
     (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) $op:ident $(, $($rest:tt)*)?) => {
-        $crate::window::windowed!(@sort $decl [$($in)* ($op, $i)] [$($out)*] [$($acc)* Read] ($i + 1) $($($rest)*)?);
+        $crate::window::windowed!(@sort $decl [$($in)* ($op, $i, boxed)] [$($out)*] [$($acc)* Read] ($i + 1) $($($rest)*)?);
     };
+    // An operand of form `boxed` or `double`: its type, reading it from the
+    // window `w` or its paired XMM registers `x` at `at`, writing it there, the
+    // same from and to its stack home (where it is boxed), and its bit in
+    // `Window::doubles`.
+    (@ty boxed, $s:lifetime, $i:lifetime) => { $crate::lboxed::LBoxed<$s, $i> };
+    (@ty double, $s:lifetime, $i:lifetime) => { f64 };
+    (@get boxed, $w:ident, $x:ident, $at:expr) => { $w[$at] };
+    (@get double, $w:ident, $x:ident, $at:expr) => { $x[$at] };
+    (@put boxed, $w:ident, $x:ident, $at:expr, $v:expr) => { $w[$at] = $v };
+    (@put double, $w:ident, $x:ident, $at:expr, $v:expr) => { $x[$at] = $v };
+    (@from_stack boxed, $v:expr) => { $v };
+    (@from_stack double, $v:expr) => { unsafe { $v.as_double() } };
+    (@out_from_stack boxed, $v:expr) => { $v };
+    (@out_from_stack double, $v:expr) => { 0.0f64 };
+    (@to_stack boxed, $v:expr) => { $v };
+    (@to_stack double, $v:expr) => { unsafe { $crate::lboxed::LBoxed::from_arith($v) } };
+    (@unbox boxed, $w:ident, $x:ident, $at:expr) => {};
+    (@unbox double, $w:ident, $x:ident, $at:expr) => { $x[$at] = unsafe { $w[$at].as_double() } };
+    (@bit boxed, $i:expr) => { 0u8 };
+    (@bit double, $i:expr) => { (1u8 << ($i)) };
     (@sort
         [$kind:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block [$($cold:block)?] [$($guard:ident)?] $tagp:ident $tagl:tt]
-        [$(($in:ident, $ii:expr))*] [$(($out:ident, $oi:expr))*] [$($acc:ident)*] ($arity:expr)
+        [$(($in:ident, $ii:expr, $if:ident))*] [$(($out:ident, $oi:expr, $of:ident))*] [$($acc:ident)*] ($arity:expr)
     ) => {
         $(#[$meta])*
         #[derive(Debug, Clone)]
@@ -585,8 +636,8 @@ macro_rules! windowed {
                 $state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 $tagp: u64,
-                $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
-                $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
+                $($in: $crate::window::windowed!(@ty $if, 'src, 'intern),)*
+                $($out: &mut $crate::window::windowed!(@ty $of, 'src, 'intern),)*
             ) -> usize {
                 let $crate::window::windowed!(@tag_pattern $tagl): u64 = $tagp;
                 $crate::window::windowed!(@run [$($guard)?] $body $(, $cold)?)
@@ -602,8 +653,8 @@ macro_rules! windowed {
                 $state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 $tagp: u64,
-                $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
-                $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
+                $($in: $crate::window::windowed!(@ty $if, 'src, 'intern),)*
+                $($out: &mut $crate::window::windowed!(@ty $of, 'src, 'intern),)*
             ) -> usize {
                 let $crate::window::windowed!(@tag_pattern $tagl): u64 = $tagp;
                 unsafe { $crate::window::windowed!(@cold_body [$($cold)?]) }
@@ -619,8 +670,8 @@ macro_rules! windowed {
                     $state: &'b mut $crate::vm::RunState<'src, 'intern>,
                     $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                     $tagp: u64,
-                    $($in: $crate::lboxed::LBoxed<'src, 'intern>,)*
-                    $($out: &mut $crate::lboxed::LBoxed<'src, 'intern>,)*
+                    $($in: $crate::window::windowed!(@ty $if, 'src, 'intern),)*
+                    $($out: &mut $crate::window::windowed!(@ty $of, 'src, 'intern),)*
                 ) -> bool {
                     let $crate::window::windowed!(@tag_pattern $tagl): u64 = $tagp;
                     unsafe { $body }
@@ -636,12 +687,13 @@ macro_rules! windowed {
                     base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                     tag: u64,
                     w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
+                    x: &mut [f64; $crate::window::WINDOW],
                     skip: usize,
                 ) -> bool {
-                    $( let $in = w[skip + $ii]; )*
-                    $( let mut $out = w[skip + $oi]; )*
+                    $( let $in = $crate::window::windowed!(@get $if, w, x, skip + $ii); )*
+                    $( let mut $out = $crate::window::windowed!(@get $of, w, x, skip + $oi); )*
                     let taken = unsafe { Self::__run_taken($($cap,)* owner, state, base, tag, $($in,)* $(&mut $out,)*) };
-                    $( w[skip + $oi] = $out; )*
+                    $( $crate::window::windowed!(@put $of, w, x, skip + $oi, $out); )*
                     taken
                 }
             );
@@ -656,12 +708,13 @@ macro_rules! windowed {
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 tag: u64,
                 w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
+                x: &mut [f64; $crate::window::WINDOW],
                 skip: usize,
             ) -> usize {
-                $( let $in = w[skip + $ii]; )*
-                $( let mut $out = w[skip + $oi]; )*
+                $( let $in = $crate::window::windowed!(@get $if, w, x, skip + $ii); )*
+                $( let mut $out = $crate::window::windowed!(@get $of, w, x, skip + $oi); )*
                 let exit = unsafe { Self::__run_cold($($cap,)* owner, state, base, tag, $($in,)* $(&mut $out,)*) };
-                $( w[skip + $oi] = $out; )*
+                $( $crate::window::windowed!(@put $of, w, x, skip + $oi, $out); )*
                 exit
             }
 
@@ -675,12 +728,13 @@ macro_rules! windowed {
                 base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 tag: u64,
                 w: &mut [$crate::lboxed::LBoxed<'src, 'intern>; $crate::window::WINDOW],
+                x: &mut [f64; $crate::window::WINDOW],
                 skip: usize,
             ) -> usize {
-                $( let $in = w[skip + $ii]; )*
-                $( let mut $out = w[skip + $oi]; )*
+                $( let $in = $crate::window::windowed!(@get $if, w, x, skip + $ii); )*
+                $( let mut $out = $crate::window::windowed!(@get $of, w, x, skip + $oi); )*
                 let exit = unsafe { Self::__run($($cap,)* owner, state, base, tag, $($in,)* $(&mut $out,)*) };
-                $( w[skip + $oi] = $out; )*
+                $( $crate::window::windowed!(@put $of, w, x, skip + $oi, $out); )*
                 exit
             }
 
@@ -695,6 +749,8 @@ macro_rules! windowed {
                 ::smallvec::smallvec![$($crate::window::Capture::to_bits(self.$cap)),*]
             }
             fn arity(&self) -> usize { Self::ARITY }
+            fn doubles(&self) -> u8 { 0 $(| $crate::window::windowed!(@bit $if, $ii))* $(| $crate::window::windowed!(@bit $of, $oi))* }
+            fn twin(&self) -> Option<std::rc::Rc<dyn $crate::window::Window>> { <Self as $crate::window::Twin>::twin(self) }
             fn stencil(&self, skip: usize) -> usize {
                 assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
                 Self::__stencil_at(skip)
@@ -722,13 +778,17 @@ macro_rules! windowed {
                 skip: usize,
             ) {
                 assert!(skip + Self::ARITY <= $crate::window::WINDOW, "{} at {skip} overruns the window", stringify!($name));
-                let exit = unsafe { Self::__window($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, w, skip) };
+                // The window is boxed: unboxed inputs from it, and outputs back.
+                let mut x = [0.0f64; $crate::window::WINDOW];
+                $( $crate::window::windowed!(@unbox $if, w, x, skip + $ii); )*
+                let exit = unsafe { Self::__window($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, w, &mut x, skip) };
                 // The cold path's exit, if it takes it.
                 let exit = if exit == $crate::window::TO_COLD {
-                    unsafe { Self::__window_cold($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, w, skip) }
+                    unsafe { Self::__window_cold($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, w, &mut x, skip) }
                 } else {
                     exit
                 };
+                $( w[skip + $oi] = $crate::window::windowed!(@to_stack $of, $crate::window::windowed!(@get $of, w, x, skip + $oi)); )*
                 // An op that selects selects its exit; any other has only exit 0. See
                 // Note [Window exits].
                 let _ = exit;
@@ -741,16 +801,16 @@ macro_rules! windowed {
             ) {
                 let at = state.base;
                 let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(at).as_ptr() };
-                $( let $in = state.vals[at + self.operands[$ii]]; )*
-                $( let mut $out = state.vals[at + self.operands[$oi]]; )*
+                $( let $in = $crate::window::windowed!(@from_stack $if, state.vals[at + self.operands[$ii]]); )*
+                $( let mut $out = $crate::window::windowed!(@out_from_stack $of, state.vals[at + self.operands[$oi]]); )*
                 let exit = unsafe { Self::__run($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, $($in,)* $(&mut $out,)*) };
-                $( state.vals[at + self.operands[$oi]] = $out; )*
+                $( state.vals[at + self.operands[$oi]] = $crate::window::windowed!(@to_stack $of, $out); )*
                 // The cold path's exit, if it takes it.
                 let exit = if exit == $crate::window::TO_COLD {
-                    $( let $in = state.vals[at + self.operands[$ii]]; )*
-                    $( let mut $out = state.vals[at + self.operands[$oi]]; )*
+                    $( let $in = $crate::window::windowed!(@from_stack $if, state.vals[at + self.operands[$ii]]); )*
+                    $( let mut $out = $crate::window::windowed!(@out_from_stack $of, state.vals[at + self.operands[$oi]]); )*
                     let exit = unsafe { Self::__run_cold($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, $($in,)* $(&mut $out,)*) };
-                    $( state.vals[at + self.operands[$oi]] = $out; )*
+                    $( state.vals[at + self.operands[$oi]] = $crate::window::windowed!(@to_stack $of, $out); )*
                     exit
                 } else {
                     exit
@@ -805,6 +865,7 @@ macro_rules! windowed {
                     unsafe { core::hint::unreachable_unchecked() }
                 }
                 let mut w = [w0, w1, w2, w3, w4, w5, w6, w7];
+                let mut x = [x0, x1, x2, x3, x4, x5, x6, x7];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
                 // An op with a cold path branches on its body's `bool`, which the
@@ -812,22 +873,22 @@ macro_rules! windowed {
                 // where it is: the continuation the copy points at the way into the
                 // cold stencil. See Note [Cold stencils].
                 $crate::window::windowed!(@if_cold [$($cold)?]
-                    let taken = unsafe { Self::__window_taken($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, SKIP) };
+                    let taken = unsafe { Self::__window_taken($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, &mut x, SKIP) };
                     if taken {
-                        become Self::__to_cold(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, x1, x2, x3, x4, x5, x6, x7)
+                        become Self::__to_cold(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7])
                     }
                 );
                 // Any other on its exit. See Note [Window exits].
                 $crate::window::windowed!(@if_not_cold [$($cold)?]
-                    let exit = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, SKIP) };
+                    let exit = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, &mut x, SKIP) };
                     $crate::window::windowed!(@if_exit1 [$($guard)?]
                         if exit == 1 {
-                            become Self::__exit1(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, x1, x2, x3, x4, x5, x6, x7)
+                            become Self::__exit1(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7])
                         }
                     );
                     let _ = exit;
                 );
-                become Self::__next(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, x1, x2, x3, x4, x5, x6, x7)
+                become Self::__next(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7])
             }
 
             $crate::window::windowed!(@if_exit1 [$($guard)?]
@@ -941,11 +1002,12 @@ macro_rules! windowed {
                         unsafe { core::hint::unreachable_unchecked() }
                     }
                     let mut w = [w0, w1, w2, w3, w4, w5, w6, w7];
+                let mut x = [x0, x1, x2, x3, x4, x5, x6, x7];
                     // The site's record: where each of its exits goes, then where
                     // its captures are.
                     let site = state.cold_site;
                     $crate::window::bind_record!(site, 0; $($cap : $cty),*);
-                    let exit = unsafe { Self::__window_cold($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, SKIP) };
+                    let exit = unsafe { Self::__window_cold($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, &mut x, SKIP) };
                     // SAFETY: where the site's exit goes, in JIT code, which its
                     // copy's window continues to, at the stack it jumped from.
                     let fall: extern "rust-preserve-none" fn(
@@ -956,7 +1018,7 @@ macro_rules! windowed {
                         $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
                         f64, f64, f64, f64, f64, f64, f64, f64,
                     ) = unsafe { core::mem::transmute(*site.add(exit)) };
-                    become fall(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, x1, x2, x3, x4, x5, x6, x7)
+                    become fall(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7])
                 }
             );
 
@@ -1009,7 +1071,8 @@ macro_rules! windowed {
                 let mut w = [$crate::lboxed::LBoxed::NIL; $crate::window::WINDOW];
                 $crate::window::bind_holes!(0; $($cap : $cty),*);
                 // The JIT lends this code the thread's owner. See `crate::forge_owner`.
-                let _ = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, $crate::lboxed::LBoxed::NUMBER_TAG, &mut w, SKIP) };
+                let mut x = [0.0f64; $crate::window::WINDOW];
+                let _ = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, $crate::lboxed::LBoxed::NUMBER_TAG, &mut w, &mut x, SKIP) };
                 become Self::__next(state)
             }
 
@@ -1830,6 +1893,7 @@ unsafe fn enter<'src, 'intern>(
     state: *mut RunState<'src, 'intern>,
     base: *mut LBoxed<'src, 'intern>,
     w: Regs<'src, 'intern>,
+    x: [f64; WINDOW],
 ) {
     type L<'s, 'i> = LBoxed<'s, 'i>;
     let entry: extern "rust-preserve-none" fn(
@@ -1840,7 +1904,7 @@ unsafe fn enter<'src, 'intern>(
         L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>,
         f64, f64, f64, f64, f64, f64, f64, f64,
     ) = unsafe { core::mem::transmute(exec.ptr(dynasmrt::AssemblyOffset(0))) };
-    entry(state, base, LBoxed::NUMBER_TAG, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    entry(state, base, LBoxed::NUMBER_TAG, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
 }
 
 /// Operand slots for an op that reads the whole window (at `SKIP` 0). Its
@@ -1869,10 +1933,17 @@ mod check {
         let out = out as *mut [u64; WINDOW];
         *out = [w0, w1, w2, w3, w4, w5, w6, w7].map(|w| w.bits());
     });
+    // The same of the window's XMM halves, for an op giving its outputs
+    // unboxed. See Note [Unboxed doubles] in `window_alloc`.
+    windowed!(CheckFlushX, [out: u64], [], |owner, state, base| (f64 x0, f64 x1, f64 x2, f64 x3, f64 x4, f64 x5, f64 x6, f64 x7) {
+        let out = out as *mut [u64; WINDOW];
+        *out = [x0, x1, x2, x3, x4, x5, x6, x7].map(f64::to_bits);
+    });
 
     struct Checker {
         image: Image,
         out: *mut [u64; WINDOW],
+        xout: *mut [u64; WINDOW],
         /// Assembled checks, or `None` for an op the copier declined.
         programs: HashMap<(usize, Captures), Option<ExecutableBuffer>>,
     }
@@ -1893,12 +1964,14 @@ mod check {
             let c = c.get_or_insert_with(|| Checker {
                 image: Image::load().expect("check_windows: load this executable's image"),
                 out: Box::leak(Box::new([0u64; WINDOW])),
+                xout: Box::leak(Box::new([0u64; WINDOW])),
                 programs: HashMap::new(),
             });
             let flush = CheckFlush::new(c.out as u64, &whole_window());
+            let flushx = CheckFlushX::new(c.xout as u64, &whole_window());
             let image = &c.image;
             let program = c.programs.entry((op.stencil(0), op.captures())).or_insert_with(|| {
-                match unsafe { assemble(image, &[(op, 0), (&flush, 0)], &[0xc3]) } {
+                match unsafe { assemble(image, &[(op, 0), (&flush, 0), (&flushx, 0)], &[0xc3]) } {
                     Ok(exec) => Some(exec),
                     // Debug builds' stencils can keep what optimized ones fold
                     // away (e.g. a jump table for an unfolded `match OP`), but an
@@ -1911,8 +1984,13 @@ mod check {
                 }
             });
             let Some(exec) = program else { return };
-            unsafe { enter(exec, state, base, before) };
-            let native = unsafe { *c.out };
+            // Each register's XMM half its value unboxed, as an unboxed input's is.
+            let x = before.map(|v| f64::from_bits(v.bits().wrapping_add(LBoxed::NUMBER_TAG)));
+            unsafe { enter(exec, state, base, before, x) };
+            // An unboxed output, boxed as the JIT boxes it.
+            let (boxed, unboxed) = unsafe { (*c.out, *c.xout) };
+            let outputs = (0..op.arity()).filter(|&i| op.accesses()[i].writes() && op.doubles() & 1 << i != 0).fold(0u8, |m, i| m | 1 << i);
+            let native: [u64; WINDOW] = core::array::from_fn(|i| if outputs & 1 << i != 0 { unboxed[i].wrapping_sub(LBoxed::NUMBER_TAG) } else { boxed[i] });
             let interp: [u64; WINDOW] = core::array::from_fn(|i| after[i].bits());
             assert_eq!(native, interp, "{}: copy&patched stencil disagrees with the interpreter", op.name());
         });
@@ -1967,7 +2045,7 @@ mod tests {
         for (w, &v) in w.iter_mut().zip(values) {
             *w = LBoxed::from_number(v);
         }
-        unsafe { enter(exec, core::ptr::null_mut(), out.as_mut_ptr(), w) };
+        unsafe { enter(exec, core::ptr::null_mut(), out.as_mut_ptr(), w, [0.0; WINDOW]) };
     }
 
     /// Both arms of a branchy stencil fall through to the next stencil, however
