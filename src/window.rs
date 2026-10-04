@@ -299,6 +299,12 @@ pub trait Window: std::fmt::Debug {
     fn selects(&self) -> bool {
         false
     }
+    /// The operands its stencils take and give as unboxed doubles, in their
+    /// window registers' paired XMM registers: bit `i` for operand `i`. See
+    /// Note [Unboxed doubles] in `window_alloc`.
+    fn doubles(&self) -> u8 {
+        0
+    }
     /// Run the body on the window `w` at `skip`, with the captures from `self`.
     unsafe fn run<'src, 'intern>(
         &self,

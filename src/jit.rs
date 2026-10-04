@@ -10,7 +10,7 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::specialize::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, EXITS, WINDOW};
-use crate::window_alloc::{plan_trace, Cache, ALLOCATED, Emit, Packed, Placement, Rise, Step, WindowAlloc};
+use crate::window_alloc::{plan_trace, Cache, ALLOCATED, Emit, Packed, Placement, Rise, Step, WindowAlloc, SCRATCH};
 use crate::trace::{Block as TraceBlock, Event, Loops, Policy, Region, Slots};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
@@ -104,6 +104,10 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
 // trapping at the snapshot's location.
 //
 // rax is free for the address: as `SCRATCH` it holds no value between moves.
+//
+// A store of an unboxed register names its XMM half, which `flush_snapshot`
+// saves next to the general registers and boxes as it stores it. See Note
+// [Unboxed doubles] in `window_alloc`.
 
 /// A five-byte nop: the room a thunk site leaves for a `jmp rel32`.
 const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
@@ -345,19 +349,21 @@ enum PoolEntry {
 struct Snapshot {
     /// Where the flush is.
     location: PackedLocation,
-    /// The window register index and slot of each store.
-    stores: Vec<(usize, usize)>,
+    /// The window register index, whether its value is unboxed, and slot of
+    /// each store.
+    stores: Vec<(usize, bool, usize)>,
 }
 
 impl Snapshot {
     /// Its pool bytes: `location`, the store count as a `u32`, then a `u16`
-    /// slot and `u16` register index for each store, padded to 8 bytes.
+    /// slot and `u16` register index for each store, padded to 8 bytes. The
+    /// index of a register's XMM half is `WINDOW` past its own.
     fn bytes(&self) -> Vec<u8> {
         let mut bytes = (self.location.bits() as u64).to_le_bytes().to_vec();
         bytes.extend(u32::try_from(self.stores.len()).unwrap().to_le_bytes());
-        for &(reg, slot) in &self.stores {
+        for &(reg, unboxed, slot) in &self.stores {
             bytes.extend(u16::try_from(slot).expect("a slot in a u16").to_le_bytes());
-            bytes.extend(u16::try_from(reg).unwrap().to_le_bytes());
+            bytes.extend(u16::try_from(reg + if unboxed { WINDOW } else { 0 }).unwrap().to_le_bytes());
         }
         bytes.resize(bytes.len().next_multiple_of(8), 0);
         bytes
@@ -425,7 +431,7 @@ impl Pool {
     /// `location`. See Note [Snapshots].
     fn snapshot(&mut self, ops: &mut Assembler, location: Location, stores: impl IntoIterator<Item = Emit>) -> DynamicLabel {
         let stores = stores.into_iter().map(|emit| match emit {
-            Emit::Store { slot, reg } => (reg, slot),
+            Emit::Store { slot, reg, unboxed } => (reg, unboxed, slot),
             emit => unreachable!("a flush only stores, not {emit:?}"),
         }).collect();
         let label = ops.new_dynamic_label();
@@ -485,22 +491,59 @@ fn emit_pin(ops: &mut Assembler) {
     );
 }
 
-/// Emit an allocator instruction other than `Emit::Op`.
+/// The XMM register paired with window register `r`, as `WINDOW_REGS` names
+/// its general register: xmm`r`, the stencil ABI's `x{r}`, and for `SCRATCH`
+/// xmm15, which no stencil takes. See Note [Unboxed doubles] in `window_alloc`.
+fn xmm(r: usize) -> u8 {
+    if r == SCRATCH { 15 } else { r as u8 }
+}
+
+/// Emit an allocator instruction other than `Emit::Op`. Boxing subtracts the
+/// pinned tag and unboxing adds it, as `LBoxed` does (see Note [Pinned tag] in
+/// `window`), through r10, never a window register.
 fn emit_window_move(ops: &mut Assembler, emit: Emit) {
     let reg = |r: usize| WINDOW_REGS[r];
     match emit {
-        Emit::Load { reg: r, slot } => dynasm!(ops
+        Emit::Load { reg: r, slot, unboxed: false } => dynasm!(ops
             ; .arch x64
             ; mov Rq(reg(r)), QWORD [r13 + (slot * 8) as i32]
         ),
-        Emit::Store { slot, reg: r } => dynasm!(ops
+        Emit::Load { reg: r, slot, unboxed: true } => dynasm!(ops
+            ; .arch x64
+            ; mov r10, QWORD [r13 + (slot * 8) as i32]
+            ; add r10, r14
+            ; vmovq Rx(xmm(r)), r10
+        ),
+        Emit::Store { slot, reg: r, unboxed: false } => dynasm!(ops
             ; .arch x64
             ; mov QWORD [r13 + (slot * 8) as i32], Rq(reg(r))
         ),
-        Emit::Move { dst, src } => dynasm!(ops
+        Emit::Store { slot, reg: r, unboxed: true } => dynasm!(ops
             ; .arch x64
-            ; mov Rq(reg(dst)), Rq(reg(src))
+            ; vmovq r10, Rx(xmm(r))
+            ; sub r10, r14
+            ; mov QWORD [r13 + (slot * 8) as i32], r10
         ),
+        Emit::Move { dst, src } => match (dst.unboxed, src.unboxed) {
+            (false, false) => dynasm!(ops
+                ; .arch x64
+                ; mov Rq(reg(dst.reg)), Rq(reg(src.reg))
+            ),
+            (true, true) => dynasm!(ops
+                ; .arch x64
+                ; vmovaps Rx(xmm(dst.reg)), Rx(xmm(src.reg))
+            ),
+            (true, false) => dynasm!(ops
+                ; .arch x64
+                ; lea r10, [Rq(reg(src.reg)) + r14]
+                ; vmovq Rx(xmm(dst.reg)), r10
+            ),
+            (false, true) => dynasm!(ops
+                ; .arch x64
+                ; vmovq Rq(reg(dst.reg)), Rx(xmm(src.reg))
+                ; sub Rq(reg(dst.reg)), r14
+            ),
+        },
         // An op is splatted by the caller.
         Emit::Op { .. } => unreachable!(),
     }
@@ -809,6 +852,8 @@ pub struct Pending {
 pub struct BlockPlan {
     /// The registers of its entry window.
     entry: Packed,
+    /// Those holding theirs unboxed.
+    unboxed: u8,
     /// The slots its entry window has dirty, whichever jump into it is
     /// compiled first.
     dirty: Slots,
@@ -828,7 +873,7 @@ impl BlockPlan {
     /// compiled.
     fn entry_window(&self, from: &Cache) -> Cache {
         let none = Cache::default();
-        Cache::entry(self.entry.unpack(), if self.rises { &none } else { from }, &self.dirty)
+        Cache::entry(self.entry.unpack(), self.unboxed, if self.rises { &none } else { from }, &self.dirty)
     }
 }
 
@@ -1051,7 +1096,12 @@ impl JitContext {
         let mut ops = Assembler::new(base.0 as usize);
         let flush = ops.offset();
         jit_note!(self, ops, "flush_snapshot");
-        // Window register `i` at `[rsp + i * 8]`.
+        // Window register `i` at `[rsp + i * 8]`, its XMM half at `[rsp +
+        // (WINDOW + i) * 8]`.
+        dynasm!(ops ; .arch x64 ; sub rsp, (WINDOW * 8) as i32);
+        for r in 0..WINDOW {
+            dynasm!(ops ; .arch x64 ; vmovq QWORD [rsp + (r * 8) as i32], Rx(xmm(r)));
+        }
         for &reg in WINDOW_REGS[..WINDOW].iter().rev() {
             dynasm!(ops ; .arch x64 ; push Rq(reg));
         }
@@ -1065,6 +1115,11 @@ impl JitContext {
             ; movzx esi, WORD [rdx]
             ; movzx edi, WORD [rdx + 2]
             ; mov r8, QWORD [rsp + rdi * 8]
+            // An XMM half's value, boxed.
+            ; cmp edi, WINDOW as i32
+            ; jb >boxed
+            ; sub r8, r14
+            ; boxed:
             ; mov QWORD [r13 + rsi * 8], r8
             ; add rdx, 4
             ; dec ecx
@@ -1077,7 +1132,7 @@ impl JitContext {
         for &reg in &WINDOW_REGS[..WINDOW] {
             dynasm!(ops ; .arch x64 ; pop Rq(reg));
         }
-        dynasm!(ops ; .arch x64 ; ret);
+        dynasm!(ops ; .arch x64 ; add rsp, (WINDOW * 8) as i32 ; ret);
         let exit = ops.offset();
         jit_note!(self, ops, "exit_snapshot");
         // A trap at the snapshot's block and `current_off`, what a region
@@ -1743,7 +1798,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .map(|(pos, &b)| {
                 let start = starts[pos];
                 let rises = !plan.trivial && matches!(steps[start], Step::Start(Some(_)));
-                (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), dirty: plan.dirty[start], rises, placed: placed(&step_of[pos]) })
+                (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), unboxed: plan.unboxed[start], dirty: plan.dirty[start], rises, placed: placed(&step_of[pos]) })
             })
             .collect();
         (planned, exits)
@@ -1971,6 +2026,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // both with the window live. `v` holds the value: its window
                     // register, or else r10.
                     let v = match alloc.register_of(*idx) {
+                        // Unboxed, boxed into r10 for the test, the window as it was.
+                        Some(reg) if alloc.cache().loc(reg).unboxed => {
+                            window_dump!(self.jctx, "      tests r10 <- x{reg} boxed");
+                            dynasm!(ops
+                                ; .arch x64
+                                ; vmovq r10, Rx(xmm(reg))
+                                ; sub r10, r14
+                            );
+                            10 // r10
+                        }
                         Some(reg) => {
                             window_dump!(self.jctx, "      tests w{reg}");
                             WINDOW_REGS[reg]
@@ -2506,7 +2571,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let stencils = &mut self.jctx.stencils;
                     let emits = match plans.get(&id) {
                         Some(plan) => plan.placed[off].map(|(skip, want)| {
-                            let mut emits = alloc.reconcile(&want.unpack(), &**w);
+                            let mut emits = alloc.reconcile(&want.unpack(), &**w, skip as usize);
                             emits.extend(alloc.op(&**w, [skip as usize]).expect("a placed op runs at its SKIP"));
                             emits
                         }),
