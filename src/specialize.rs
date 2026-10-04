@@ -231,6 +231,9 @@ pub enum YieldOp {
                    // Failed. See Note [Narrowing]
     NarrowConstant(usize), // STACK[idx] is narrowed to an integer if a fact says it holds a
                            // whole constant, else left as it is. See Note [Narrowing]
+    EncodeK(usize, usize), // STACK[idx] is about to be loaded with CONSTANT[k]: resumed with
+                           // Matched to load it as an integer, Failed as a double whose fact
+                           // isn't introduced, else as a double. See Note [Contraction]
     HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Narrowing]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
@@ -1173,6 +1176,12 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // neither the interpreter nor a frame returning will run code past an origin's introduction,
 // which rebuilding replaces, and is dropped if an origin has JIT code, or a fact was used since.
 //
+// A fact used for what it says can be rebuilt from the same origin the other way: a constant some
+// code narrows to an integer (Note [Narrowing]) is loaded as an integer instead, so every path
+// from its load computes on the integer, and none narrows it again. The narrowing still writes
+// the integer until the rebuild, which waits and is dropped as a contraction is, but for the fact
+// being used.
+//
 // An origin is rebuilt once; the fact may be introduced again by other paths, which may be
 // contracted in turn. Each contraction replaces code carrying the fact with code that doesn't, so
 // it ends, and a fact some code finds a use for before its duplicate appears is kept.
@@ -1383,8 +1392,10 @@ type Origins = Rc<TLCell<TlcOwner, Vec<Origin>>>;
 type Origin = Rc<TLCell<TlcOwner, OriginState>>;
 
 pub struct OriginState {
-    /// Rebuilds the code after the introduction without the fact: taken once.
-    rebuild: Option<Box<dyn FnOnce(&mut Specializer, &mut Owner)>>,
+    /// Rebuilds the code from the introduction, resuming its generator with
+    /// how: without the fact, or with the constant loaded as an integer. Taken
+    /// once.
+    rebuild: Option<Box<dyn FnOnce(&mut Specializer, &mut Owner, ResumeArg)>>,
     /// The block introducing it, which rebuilding truncates at `offset`.
     block: BlockId,
     offset: usize,
@@ -1913,9 +1924,10 @@ pub struct Specializer<'src, 'intern> {
     /// The join of the effects of the code compiled for each prototype, at a
     /// stable address its returns read. See Note [Call effects].
     effects: std::collections::HashMap<LProto<'src, 'intern>, Box<Cell<Effects>>, InternedHasher>,
-    /// Origins of facts to rebuild without them, with their function, once
-    /// nothing runs the code rebuilding replaces. See Note [Contraction].
-    contractions: Vec<(LProto<'src, 'intern>, Vec<Origin>)>,
+    /// Origins of facts to rebuild, with their function and how (`Failed`
+    /// without the fact, `Matched` with the constant an integer), once nothing
+    /// runs the code rebuilding replaces. See Note [Contraction].
+    contractions: Vec<(LProto<'src, 'intern>, Vec<Origin>, ResumeArg)>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -2161,7 +2173,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
         }
-        let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
+        let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
         if !origins.is_empty() && !origins.iter().all(queued) {
             #[cfg(feature = "tracing")]
             {
@@ -2174,7 +2186,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ("context", context.as_str().into()),
                 ]);
             }
-            self.contractions.push((proto, origins));
+            self.contractions.push((proto, origins, ResumeArg::Failed));
         }
         if conflicting.is_empty() {
             return ctx;
@@ -2193,14 +2205,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return;
         }
         let proto = self.clos.ro(owner).prototype;
-        for (of, origins) in std::mem::take(&mut self.contractions) {
+        for (of, origins, how) in std::mem::take(&mut self.contractions) {
             if of != proto {
-                self.contractions.push((of, origins));
+                self.contractions.push((of, origins, how));
                 continue;
             }
             let _blocks = Self::ids(origins.iter().map(|origin| owner.ro(origin).block.0));
-            // Relied on since, or rebuilt in code that has its own JIT code.
-            let refused = if origins.iter().any(|origin| owner.ro(origin).used) {
+            let _how = if how == ResumeArg::Matched { "integer" } else { "drop" };
+            // Relied on since (which an integer serves as well), or rebuilt in code
+            // that has its own JIT code.
+            let refused = if how == ResumeArg::Failed && origins.iter().any(|origin| owner.ro(origin).used) {
                 Some("used")
             } else if origins.iter().any(|origin| owner.ro(origin).rebuild.is_some() && self.compiled(owner.ro(origin).block)) {
                 Some("compiled")
@@ -2214,6 +2228,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 crate::tracing::instant("spec", "contract_refused", &[
                     ("line", self.traced_line(owner).into()),
                     ("origins", _blocks.as_str().into()),
+                    ("how", _how.into()),
                     ("reason", _reason.into()),
                 ]);
                 continue;
@@ -2227,7 +2242,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ("origins", _blocks.as_str().into()),
                     ("at", at.0.0.into()),
                 ]);
-                self.contractions.push((of, origins));
+                self.contractions.push((of, origins, how));
                 continue;
             }
             let carries = |ctx: &Context| ctx.fragile.iter().any(|fact| {
@@ -2247,12 +2262,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             crate::tracing::instant("spec", "contract", &[
                 ("line", self.traced_line(owner).into()),
                 ("origins", _blocks.as_str().into()),
+                ("how", _how.into()),
                 ("offsets", Self::ids(live.iter().map(|origin| owner.ro(origin).offset)).as_str().into()),
                 ("forgotten", Self::ids(_forgotten.iter().copied()).as_str().into()),
             ]);
             for origin in live {
                 let rebuild = owner.rw(&origin).rebuild.take().unwrap();
-                rebuild(self, owner);
+                rebuild(self, owner, how.clone());
             }
         }
     }
@@ -2668,7 +2684,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// it was. See Note [Narrowing].
     fn narrow_constant(&mut self, owner: &mut Owner, ctx: &mut Rc<Context>, slot: usize, block: BlockId) -> bool {
         let Some(value) = ctx.constant(slot) else { return false };
-        ctx.rely(owner, Fragile::Constant { slot, value }.key());
+        let key = Fragile::Constant { slot, value }.key();
+        ctx.rely(owner, key);
+        // Rebuilt from where the constant was loaded, as an integer. See Note
+        // [Contraction].
+        if let Some(set) = ctx.fragile.iter().find(|fact| fact.key() == key).and_then(|fact| fact.origins.as_ref()) {
+            let origins: Vec<Origin> = owner.ro(set).iter().filter(|origin| owner.ro(origin).rebuild.is_some()).cloned().collect();
+            let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
+            if !origins.is_empty() && !origins.iter().all(queued) {
+                self.contractions.push((self.clos.ro(owner).prototype, origins, ResumeArg::Matched));
+            }
+        }
         self.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::NarrowK::new(value, &[slot]))));
         // The fact used, and dropped by the write: its type says what it would, so
         // no version keeps it apart.
@@ -2684,10 +2710,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn origin(&self, block: BlockId, coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, ctx: Rc<Context>) -> Origin {
         let offset = self.blocks[block.0].instructions.len();
         let allocates = self.blocks[block.0].allocates;
-        let rebuild = move |vm: &mut Specializer, owner: &mut Owner| {
+        let rebuild = move |vm: &mut Specializer, owner: &mut Owner, how: ResumeArg| {
             vm.blocks[block.0].instructions.truncate(offset);
             vm.blocks[block.0].allocates = allocates;
-            if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx, coro, ResumeArg::Start, block) {
+            if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx, coro, how, block) {
                 vm.compile(owner, next, ctx, block);
             }
         };
@@ -3173,6 +3199,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn compile_one<C>(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
+        // Where the constant being loaded was, for its fact's origin.
+        let mut loading: Option<Origin> = None;
         loop {
             let mut state = Pin::new(&mut coro).resume(arg);
             arg = ResumeArg::Start;
@@ -3670,10 +3698,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         self.narrow_constant(owner, &mut ctx, slot, block_id);
                     }
                 },
+                CoroutineState::Yielded(YieldOp::EncodeK(_, k)) => {
+                    let proto = self.clos.ro(owner).prototype;
+                    if let crate::chunk::Constant::Number(n) = unsafe { &(&(*proto).constants.items)[k] } && is_integer(n.0) {
+                        loading = Some(self.origin(block_id, coro.clone(), pc, ctx.clone()));
+                    }
+                },
                 CoroutineState::Yielded(YieldOp::HoldsK(slot, k)) => {
                     let proto = self.clos.ro(owner).prototype;
                     if let crate::chunk::Constant::Number(n) = unsafe { &(&(*proto).constants.items)[k] } && is_integer(n.0) {
-                        let origin = self.origin(block_id, coro.clone(), pc, ctx.clone());
+                        let origin = loading.take().expect("a constant's load yields EncodeK first");
                         Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Constant { slot, value: n.0 as i32 }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
                     }
                 },

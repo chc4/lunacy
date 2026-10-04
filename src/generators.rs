@@ -164,12 +164,24 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
             *dest = LBoxed::from_bits(bits);
         });
         match c {
-            LType::Integer | LType::Double => {
-                let ResumeArg::Type(t) = (yield YieldOp::TypeofK(bx as usize)) else { unreachable!() };
-                let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
-                yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
-                yield YieldOp::SetCTypes(vec![(dest, t)]);
-                yield YieldOp::HoldsK(dest, bx as usize);
+            LType::Integer | LType::Double => match yield YieldOp::EncodeK(dest, bx as usize) {
+                // Rebuilt to load it as an integer. See Note [Contraction] in
+                // `specialize`.
+                ResumeArg::Matched => {
+                    let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(bx as usize)) else { unreachable!() };
+                    yield YieldOp::ExecWindow(Rc::new(LoadK::new(LBoxed::from_int(k).bits(), &[dest])));
+                    yield YieldOp::SetTypes(vec![(dest, LType::Integer)]);
+                },
+                encoding => {
+                    let ResumeArg::Type(t) = (yield YieldOp::TypeofK(bx as usize)) else { unreachable!() };
+                    let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
+                    yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
+                    yield YieldOp::SetCTypes(vec![(dest, t)]);
+                    // Rebuilt without the fact, it isn't introduced.
+                    if encoding != ResumeArg::Failed {
+                        yield YieldOp::HoldsK(dest, bx as usize);
+                    }
+                },
             },
             LType::String => {
                 let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };

@@ -29,13 +29,15 @@ The specializer's are also views, one column per argument:
       each version about to be compiled at `pc` for `context` while versions
       (`duplicates`) differ from it only in facts no code relied on: the
       blocks introducing those facts are queued for contraction.
-  contract(ts, line, origins, offsets, forgotten)
+  contract(ts, line, origins, how, offsets, forgotten)
       each contraction: the blocks rebuilt from where they introduced the
-      facts (at those residual offsets), and the versions forgotten.
+      facts (at those residual offsets), how (`drop`, without the facts, or
+      `integer`, with their constants loaded as integers), and the versions
+      forgotten.
   contract_deferred(ts, line, origins, at)
       a queued contraction waiting while the interpreter (in block `at`) or a
       frame returning still runs code rebuilding replaces.
-  contract_refused(ts, line, origins, reason)
+  contract_refused(ts, line, origins, how, reason)
       a queued contraction dropped: a fact `used` since, an origin `compiled`,
       or every origin `rebuilt` already.
 
@@ -54,9 +56,9 @@ VIEWS = {
     'alloc_start': ['trace', 'step', 'rise', 'arrives', 'worth', 'entry'],
     'alloc_op': ['trace', 'step', 'name', 'before', 'worth', 'skip', 'emits', 'after'],
     'contractible': ['line', 'pc', 'duplicates', 'origins', 'context'],
-    'contract': ['line', 'origins', 'offsets', 'forgotten'],
+    'contract': ['line', 'origins', 'how', 'offsets', 'forgotten'],
     'contract_deferred': ['line', 'origins', 'at'],
-    'contract_refused': ['line', 'origins', 'reason'],
+    'contract_refused': ['line', 'origins', 'how', 'reason'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
