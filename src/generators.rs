@@ -1857,6 +1857,9 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         if let ResumeArg::WindowArgs(end, args) = (yield YieldOp::NativeWindowArgs(a, b, c)) {
             for slot in a + 1..end {
                 yield YieldOp::GuardCType(slot, args.clone());
+                // A whole constant passed to the op, narrowed, so the op reads it as
+                // an integer. See Note [Narrowing] in `specialize`.
+                yield YieldOp::NarrowConstant(slot);
             }
         }
         // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch
