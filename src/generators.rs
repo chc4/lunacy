@@ -157,8 +157,8 @@ macro_rules! integer_operands {
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // The constant's boxed value is the op's hole. It is already in canonical
-        // form (an integer if possible). See Note [Integers].
+        // The constant's boxed value is the op's hole: a number is a double. See
+        // Note [Integers] in `specialize`.
         windowed!(LoadK, [bits: u64], [], |owner, state, base| (out dest) {
             // A constant's value lives as long as its prototype.
             *dest = LBoxed::from_bits(bits);
@@ -169,6 +169,7 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
                 let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
                 yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
                 yield YieldOp::SetCTypes(vec![(dest, t)]);
+                yield YieldOp::HoldsK(dest, bx as usize);
             },
             LType::String => {
                 let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
@@ -342,6 +343,11 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             yield YieldOp::FieldType(a, hc);
         } else {
             // An integer key in the array part, potentially from a constant `k`. See Note [Dynamic guards].
+            // A double key an i32 holds exactly, narrowed. See Note [Narrowing] in
+            // `specialize`.
+            if c & 0x100 == 0 {
+                yield YieldOp::Narrow(c);
+            }
             let integer = match yield YieldOp::GuardCType(c, CType::Type(LType::Integer)) {
                 ResumeArg::MatchedConst(k) => {
                     let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };
@@ -529,6 +535,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         }
         // An integer key in the array part. Potentially from a constant (`k`).
         // See Note [Dynamic guards].
+        // A double key an i32 holds exactly, narrowed. See Note [Narrowing] in
+        // `specialize`.
+        if b & 0x100 == 0 {
+            yield YieldOp::Narrow(b);
+        }
         let integer = match yield YieldOp::GuardCType(b, CType::Type(LType::Integer)) {
             ResumeArg::MatchedConst(k) => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(k)) else { unreachable!() };
@@ -1700,9 +1711,9 @@ pub fn emit_self(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
     }
 }
 
-// FORPREP's promotion of a double an i32 holds exactly to the integer
-// encoding, in place, on its hot path; on its cold path the double stays. See
-// Note [Integers].
+// The narrowing of a double an i32 holds exactly to the integer encoding, in
+// place, on its hot path; on its cold path the double stays. See Note
+// [Narrowing] in `specialize`.
 windowed!(ToInteger, [], [], |owner, state, base| (inout v) {
     let d = v.as_double();
     if crate::lboxed::is_integer(d) {
@@ -1716,21 +1727,22 @@ windowed!(ToInteger, [], [], |owner, state, base| (inout v) {
     1
 });
 
+// A known constant stored again in the integer encoding. See Note [Narrowing]
+// in `specialize`.
+windowed!(NarrowK, [value: i32], [], |owner, state, base| (out dest) {
+    *dest = LBoxed::from_int(value);
+});
+
 pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
         debug!("forprep {a} {sbx} {pc}");
         // An integer loop's index, limit and step are integers: find out which
-        // are, and promote a double an i32 holds exactly to one. See Note
-        // [Integers].
+        // are, and narrow a double an i32 holds exactly to one. See Note
+        // [Narrowing] in `specialize`.
         for slot in a..a + 3 {
-            if (yield YieldOp::GuardCType(slot, CType::Type(LType::Integer))) == ResumeArg::Matched {
-                continue;
-            }
-            if (yield YieldOp::GuardCType(slot, CType::Type(LType::Double))) == ResumeArg::Matched {
-                let fits = yield YieldOp::OptimisticExec(Rc::new(ToInteger::new(&[slot])));
-                let ty = if fits == ResumeArg::Matched { LType::Integer } else { LType::Double };
-                yield YieldOp::SetCTypes(vec![(slot, CType::Type(ty))]);
+            if (yield YieldOp::GuardCType(slot, CType::Type(LType::Integer))) != ResumeArg::Matched {
+                yield YieldOp::Narrow(slot);
             }
         }
         let mut sub = emit_numeric(Opcode::SUB, a, a, a + 2);

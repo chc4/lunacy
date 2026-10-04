@@ -227,6 +227,9 @@ pub enum YieldOp {
 
     SetTypes(Vec<(usize, LType)>), // Inform the executor that STACK[idx] = type for each entry
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
+    Narrow(usize), // Resumed with Matched if STACK[idx] is, or is narrowed to, an integer, else
+                   // Failed. See Note [Narrowing]
+    HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Narrowing]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
                       // knows it, else Failed. See Note [Array kinds]
@@ -1114,6 +1117,25 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // fails statically instead, to measure the blocks the guards cost (`just
 // graph-guards`).
 
+// Note [Narrowing]
+// ~~~~~~~~~~~~~~~~
+// A double an i32 holds exactly can be narrowed to the integer encoding where an integer pays:
+// a loop's index, limit and step, and an array key. `Narrow` of a slot the context types `Double`
+// ends its block in a thunk; forced on such a value, it narrows the slot in place by an optimistic
+// op (`ToInteger`), whose hot way continues with the slot an integer and its cold way with it a
+// double, and forced on any other value it continues with it a double, no narrowing ever tried at
+// runtime. A slot typed `Integer` is one already, at the same `SubPc` as the narrowed hot way, so
+// the code after both is one version: in a loop, the first iteration narrows its counter, and the
+// rest compute on an integer. A slot a fact says holds a constant an i32 holds exactly (one `LOADK`
+// loaded, until something writes the slot) is narrowed statically, the constant stored again in
+// the integer encoding, at no cost each time the code runs: a counter a loop starts from a
+// constant each time it is entered, even the first iteration computes on an integer. The fact
+// only serves the slot's first use, in the code the `LOADK` falls through to (a loop's first
+// iteration is that code), so it is dropped there: by its narrowing, whose type then says what it
+// would, by any op reading the slot as it is, and by a jump. Kept longer, every block until the
+// slot is next written would have a version with it and one without, though nothing uses it. Any
+// other slot isn't narrowed.
+
 // Note [Optimistic ops]
 // ~~~~~~~~~~~~~~~~~~~~~
 // An op can do its common case on its hot path and the rest on its cold path (Note [Cold
@@ -1296,6 +1318,9 @@ pub enum Fragile {
     /// The array part of the table in slot `table` has kind `kind`: `Unknown`
     /// if mixed. See Note [Array kinds].
     Kind { table: usize, kind: LType },
+    /// Stack slot `slot` holds a number constant an i32 holds exactly,
+    /// `value`. See Note [Narrowing].
+    Constant { slot: usize, value: i32 },
 }
 
 /// What fragile information an operation may falsify. See Note [Fragile
@@ -1325,6 +1350,7 @@ impl Fragile {
             Fragile::Upvalue { upvalue, .. } => (1, *upvalue),
             Fragile::ElementOf { slot, .. } => (2, *slot),
             Fragile::Kind { table, .. } => (3, *table),
+            Fragile::Constant { slot, .. } => (4, *slot),
         }
     }
 
@@ -1348,6 +1374,10 @@ impl Fragile {
             // Any table may be the one stored into: one of kind `kind` keeps it
             // only for a value of that kind, and a mixed one stays mixed.
             (Fragile::Kind { kind, .. }, Effect::ArrayStore(stored)) => *kind == LType::Unknown || stored == *kind,
+            // Only its slot holds it.
+            (Fragile::Constant { slot, .. }, Effect::Write(written)) => written != *slot,
+            (Fragile::Constant { .. }, Effect::WriteAny) => false,
+            (Fragile::Constant { .. }, Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_)) => true,
         }
     }
 }
@@ -1519,6 +1549,21 @@ impl Context {
     }
 
     /// A slot holding upvalue `upvalue`'s value, if one is known to.
+    /// Slot `slot`'s value is read: a fact that it holds a constant has had its
+    /// use. See Note [Narrowing].
+    fn used(&mut self, slot: usize) {
+        self.fragile.retain(|fact| !matches!(fact, Fragile::Constant { slot: held, .. } if *held == slot));
+    }
+
+    /// The number constant slot `slot` holds, if a fact says. See Note
+    /// [Narrowing].
+    fn constant(&self, slot: usize) -> Option<i32> {
+        self.fragile.iter().find_map(|fact| match fact {
+            Fragile::Constant { slot: held, value } if *held == slot => Some(*value),
+            _ => None,
+        })
+    }
+
     fn held(&self, upvalue: usize) -> Option<usize> {
         self.fragile.iter().find_map(|fact| match fact {
             Fragile::Holds { slot, upvalue: held } if *held == upvalue => Some(*slot),
@@ -2193,6 +2238,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let forgotten: Vec<Fragile> = ctx.fragile.iter().filter(|fact| typed(fact)).cloned().collect();
             Rc::make_mut(&mut ctx).fragile.retain(|fact| !forgotten.contains(fact));
         }
+        // A slot's constant only serves the code it falls through to. See Note
+        // [Narrowing].
+        if ctx.fragile.iter().any(|fact| matches!(fact, Fragile::Constant { .. })) {
+            Rc::make_mut(&mut ctx).fragile.retain(|fact| !matches!(fact, Fragile::Constant { .. }));
+        }
         ctx
     }
 
@@ -2263,6 +2313,35 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// A `GuardDynamic`'s side not yet taken, compiled and jumped to in its
     /// place when first taken. See Note [Dynamic guards].
+    /// The thunk a `Narrow` of `slot`, a double, ends its block in. See Note
+    /// [Narrowing].
+    fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let value = state.vals[state.base + slot];
+            let whole = value.as_number().is_some_and(crate::lboxed::is_integer);
+            if !whole {
+                // Not narrowed, so not tried at runtime.
+                let rest = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
+                vm.jump_thunk(block_id, thunk_pc, rest);
+                return;
+            }
+            // Narrowed by an optimistic op: on its hot path the slot is an integer, on
+            // its cold path still the double. See Note [Optimistic ops].
+            let at = vm.new_block(pc.0);
+            vm.jump_thunk(block_id, thunk_pc, at);
+            let mut written = thunk_ctx.clone();
+            Rc::make_mut(&mut written).effect(Effect::Write(slot));
+            let mut narrowed = written.clone();
+            Rc::make_mut(&mut narrowed).set_types(owner, vec![(slot, CType::Type(LType::Integer))]);
+            vm.blocks[at.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::ToInteger::new(&[slot]))));
+            let hot = vm.subblock(owner, pc.next_true(), narrowed, thunk_coro.clone(), ResumeArg::Matched);
+            let cold = vm.new_block(pc.0);
+            let side = vm.make_side_thunk(cold, thunk_coro.clone(), pc.next_false(), written, ResumeArg::Failed);
+            vm.blocks[cold.0].instructions.push(Residual::Thunk(side));
+            vm.blocks[at.0].instructions.push(Residual::Branch { hot, cold });
+        })))
+    }
+
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
@@ -2916,6 +2995,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
                     // Its outputs are written whichever path it takes. See Note [Optimistic ops].
                     for (&slot, access) in op.operands().iter().zip(op.accesses()) {
+                        if access.reads() {
+                            Rc::make_mut(&mut ctx).used(slot);
+                        }
                         if access.writes() {
                             Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
                         }
@@ -2940,6 +3022,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::GuardDynamic(test)) => {
                     assert!(test.accesses().iter().all(|access| *access == Access::Read), "{}: a guard's test has no outputs", test.name());
+                    for &slot in test.operands() {
+                        Rc::make_mut(&mut ctx).used(slot);
+                    }
                     if cfg!(feature = "no_dynamic_guards") {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
@@ -2982,6 +3067,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
                     for (&slot, access) in w.operands().iter().zip(w.accesses()) {
+                        if access.reads() {
+                            Rc::make_mut(&mut ctx).used(slot);
+                        }
                         if access.writes() {
                             Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
                         }
@@ -3229,6 +3317,41 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Clobber(from)) => {
                     let clobbered = (from..ctx.types.len()).map(|idx| (idx, CType::Type(LType::Unknown))).collect();
                     Rc::make_mut(&mut ctx).set_types(owner, clobbered)
+                },
+                CoroutineState::Yielded(YieldOp::HoldsK(slot, k)) => {
+                    let proto = self.clos.ro(owner).prototype;
+                    if let crate::chunk::Constant::Number(n) = unsafe { &(&(*proto).constants.items)[k] } && is_integer(n.0) {
+                        Rc::make_mut(&mut ctx).assume(Fragile::Constant { slot, value: n.0 as i32 });
+                    }
+                },
+                CoroutineState::Yielded(YieldOp::Narrow(slot)) => match ctx.types[slot] {
+                    CType::Type(LType::Integer) => {
+                        pc = pc.next_true();
+                        arg = ResumeArg::Matched;
+                    }
+                    // A known constant: stored again in the integer encoding. See Note
+                    // [Narrowing].
+                    CType::Type(LType::Double) if let Some(value) = ctx.constant(slot) => {
+                        self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::NarrowK::new(value, &[slot]))));
+                        // The fact used, and dropped by the write: its type says what
+                        // it would, so no version keeps it apart.
+                        let ctx = Rc::make_mut(&mut ctx);
+                        ctx.effect(Effect::Write(slot));
+                        ctx.set_types(owner, vec![(slot, CType::Type(LType::Integer))]);
+                        pc = pc.next_true();
+                        arg = ResumeArg::Matched;
+                    }
+                    // Found out once forced. See Note [Narrowing].
+                    CType::Type(LType::Double) => {
+                        let thunk = Residual::Thunk(self.make_narrow_thunk(block_id, coro.clone(), slot, pc, ctx.clone()));
+                        self.end_block(block_id);
+                        self.blocks[block_id.0].instructions.push(thunk);
+                        return None;
+                    }
+                    _ => {
+                        pc = pc.next_false();
+                        arg = ResumeArg::Failed;
+                    }
                 },
                 CoroutineState::Yielded(YieldOp::SetCTypes(ty_effects)) => {
                     Rc::make_mut(&mut ctx).set_types(owner, ty_effects)
