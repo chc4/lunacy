@@ -785,6 +785,14 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                x0: f64,
+                x1: f64,
+                x2: f64,
+                x3: f64,
+                x4: f64,
+                x5: f64,
+                x6: f64,
+                x7: f64,
             ) {
                 if SKIP + Self::ARITY > $crate::window::WINDOW {
                     // Never used: `stencil(skip)` rejects such `skip`.
@@ -800,7 +808,7 @@ macro_rules! windowed {
                 $crate::window::windowed!(@if_cold [$($cold)?]
                     let taken = unsafe { Self::__window_taken($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, SKIP) };
                     if taken {
-                        become Self::__to_cold(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
+                        become Self::__to_cold(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, x1, x2, x3, x4, x5, x6, x7)
                     }
                 );
                 // Any other on its exit. See Note [Window exits].
@@ -808,12 +816,12 @@ macro_rules! windowed {
                     let exit = unsafe { Self::__window($($cap,)* $crate::forge_owner(), &mut *state, base, tag, &mut w, SKIP) };
                     $crate::window::windowed!(@if_exit1 [$($guard)?]
                         if exit == 1 {
-                            become Self::__exit1(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
+                            become Self::__exit1(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, x1, x2, x3, x4, x5, x6, x7)
                         }
                     );
                     let _ = exit;
                 );
-                become Self::__next(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
+                become Self::__next(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, x1, x2, x3, x4, x5, x6, x7)
             }
 
             $crate::window::windowed!(@if_exit1 [$($guard)?]
@@ -833,10 +841,18 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                x0: f64,
+                x1: f64,
+                x2: f64,
+                x3: f64,
+                x4: f64,
+                x5: f64,
+                x6: f64,
+                x7: f64,
                 ) {
                     // Unlike `__next`'s body, or LLVM merges the two, and the
                     // guard's branch between them with them.
-                    core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7, 1u8));
+                    core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7, x0, x1, x2, x3, x4, x5, x6, x7, 1u8));
                 }
             );
 
@@ -857,10 +873,18 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                x0: f64,
+                x1: f64,
+                x2: f64,
+                x3: f64,
+                x4: f64,
+                x5: f64,
+                x6: f64,
+                x7: f64,
                 ) {
                     // Unlike `__next`'s body, or LLVM merges the two, and the
                     // branch between them with them.
-                    core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7, 2u8));
+                    core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7, x0, x1, x2, x3, x4, x5, x6, x7, 2u8));
                 }
             );
 
@@ -898,6 +922,14 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                x0: f64,
+                x1: f64,
+                x2: f64,
+                x3: f64,
+                x4: f64,
+                x5: f64,
+                x6: f64,
+                x7: f64,
                 ) {
                     if SKIP + Self::ARITY > $crate::window::WINDOW {
                         unsafe { core::hint::unreachable_unchecked() }
@@ -916,8 +948,9 @@ macro_rules! windowed {
                         u64,
                         $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
                         $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>, $crate::lboxed::LBoxed<'src, 'intern>,
+                        f64, f64, f64, f64, f64, f64, f64, f64,
                     ) = unsafe { core::mem::transmute(*site.add(exit)) };
-                    become fall(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])
+                    become fall(state, base, tag, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, x1, x2, x3, x4, x5, x6, x7)
                 }
             );
 
@@ -943,8 +976,16 @@ macro_rules! windowed {
                 w5: $crate::lboxed::LBoxed<'src, 'intern>,
                 w6: $crate::lboxed::LBoxed<'src, 'intern>,
                 w7: $crate::lboxed::LBoxed<'src, 'intern>,
+                x0: f64,
+                x1: f64,
+                x2: f64,
+                x3: f64,
+                x4: f64,
+                x5: f64,
+                x6: f64,
+                x7: f64,
             ) {
-                core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7));
+                core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7, x0, x1, x2, x3, x4, x5, x6, x7));
             }
     };
     (@stencil frame, [$($cap:ident : $cty:ty),*] [] []) => {
@@ -1791,8 +1832,9 @@ unsafe fn enter<'src, 'intern>(
         u64,
         L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>,
         L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>, L<'src, 'intern>,
+        f64, f64, f64, f64, f64, f64, f64, f64,
     ) = unsafe { core::mem::transmute(exec.ptr(dynasmrt::AssemblyOffset(0))) };
-    entry(state, base, LBoxed::NUMBER_TAG, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    entry(state, base, LBoxed::NUMBER_TAG, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
 }
 
 /// Operand slots for an op that reads the whole window (at `SKIP` 0). Its
