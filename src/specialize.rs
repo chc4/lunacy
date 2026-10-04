@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 
 use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Location, Upvalue};
 use qcell::{LCell, LCellOwner};
-use crate::Owner;
+use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{Tc, Vm};
 use crate::vm::{BlockId, HashRef};
 use crate::vm::{LClosure, LProto};
@@ -1129,12 +1129,39 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // rest compute on an integer. A slot a fact says holds a constant an i32 holds exactly (one `LOADK`
 // loaded, until something writes the slot) is narrowed statically, the constant stored again in
 // the integer encoding, at no cost each time the code runs: a counter a loop starts from a
-// constant each time it is entered, even the first iteration computes on an integer. The fact
-// only serves the slot's first use, in the code the `LOADK` falls through to (a loop's first
-// iteration is that code), so it is dropped there: by its narrowing, whose type then says what it
-// would, by any op reading the slot as it is, and by a jump. Kept longer, every block until the
-// slot is next written would have a version with it and one without, though nothing uses it. Any
-// other slot isn't narrowed.
+// constant each time it is entered, even the first iteration computes on an integer. The fact is
+// consumed by the slot's narrowing, whose type then says what it would, or by a guard of the
+// slot's type, which decides how the slot is used instead; otherwise it holds until the slot is
+// written. Where it is never used, the code it was carried through is contracted (Note
+// [Contraction]). Any other slot isn't narrowed.
+
+// Note [Contraction]
+// ~~~~~~~~~~~~~~~~~~
+// A fact the context carries can be worth nothing: no code relies on it before it is dropped,
+// yet every version it reaches is told apart from the one a path without it gets, so code without
+// the fact is compiled a second time. A loop's first iteration, entered with a constant its
+// counter starts from, is compiled apart from the iterations after, which enter without it, and
+// never rejoins them.
+//
+// A fact introduced where its introduction can be rebuilt records that origin: the block, where
+// in it, and the generator there, which can be resumed in the context without the fact. Each
+// context the fact flows into shares its set of origins: a version reached by another path with
+// an equal fact adds that path's origins, as does a join keeping the fact. Code relying on the
+// fact marks its origins used.
+//
+// When a version is about to be compiled for a context, and a version at the same point differs
+// from it only in having more facts, all with origins and none used, the duplicate need not
+// exist: those origins are queued for contraction. A contraction forgets every version carrying
+// a fact with one of the origins, and rebuilds each origin's block from where it introduced the
+// fact, as if it never had: the code after is compiled again, without the fact, and reaches the
+// versions every other path does. Code forgotten is never entered again, but what is already
+// running it can finish, as it is correct where the fact holds. So contraction waits until
+// neither the interpreter nor a frame returning will run code past an origin's introduction,
+// which rebuilding replaces, and is dropped if an origin has JIT code, or a fact was used since.
+//
+// An origin is rebuilt once; the fact may be introduced again by other paths, which may be
+// contracted in turn. Each contraction replaces code carrying the fact with code that doesn't, so
+// it ends, and a fact some code finds a use for before its duplicate appears is kept.
 
 // Note [Optimistic ops]
 // ~~~~~~~~~~~~~~~~~~~~~
@@ -1226,7 +1253,7 @@ pub struct Context {
     pub top: Option<usize>,
     /// What the specializer assumes and no guard checks, in `Fragile::key`
     /// order. See Note [Fragile information].
-    pub fragile: SmallVec<[Fragile; 2]>,
+    pub fragile: SmallVec<[Fact; 2]>,
 }
 
 // Note [Array kinds]
@@ -1324,6 +1351,66 @@ pub enum Fragile {
     /// Stack slot `slot` holds a number constant an i32 holds exactly,
     /// `value`. See Note [Narrowing].
     Constant { slot: usize, value: i32 },
+}
+
+/// A fragile fact, with where the paths reaching it introduced it, if that can
+/// be rebuilt without it. See Note [Contraction].
+#[derive(Clone)]
+pub struct Fact {
+    pub fragile: Fragile,
+    origins: Option<Origins>,
+}
+
+/// The origins of a fact, shared by every context the fact flows into.
+type Origins = Rc<TLCell<TlcOwner, Vec<Origin>>>;
+
+/// Where code introduced a fact, which can be rebuilt from there without it.
+/// See Note [Contraction].
+type Origin = Rc<TLCell<TlcOwner, OriginState>>;
+
+pub struct OriginState {
+    /// Rebuilds the code after the introduction without the fact: taken once.
+    rebuild: Option<Box<dyn FnOnce(&mut Specializer, &mut Owner)>>,
+    /// The block introducing it, which rebuilding truncates at `offset`.
+    block: BlockId,
+    offset: usize,
+    /// Whether code relied on the fact, which then isn't contracted.
+    used: bool,
+}
+
+impl Fact {
+    fn new(fragile: Fragile) -> Self {
+        Self { fragile, origins: None }
+    }
+}
+
+impl Deref for Fact {
+    type Target = Fragile;
+    fn deref(&self) -> &Fragile {
+        &self.fragile
+    }
+}
+
+// The origins are where a fact came from, not what it says: versions are
+// told apart only by the fact.
+impl PartialEq for Fact {
+    fn eq(&self, other: &Fact) -> bool {
+        self.fragile == other.fragile
+    }
+}
+
+impl Eq for Fact {}
+
+impl std::hash::Hash for Fact {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.fragile.hash(state)
+    }
+}
+
+impl std::fmt::Debug for Fact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fragile.fmt(f)
+    }
 }
 
 /// What fragile information an operation may falsify. See Note [Fragile
@@ -1493,7 +1580,7 @@ impl Mark for Context {
             ctype.mark(owner);
         }
         for fact in &self.fragile {
-            if let Fragile::Upvalue { ctype, .. } = fact {
+            if let Fragile::Upvalue { ctype, .. } = &fact.fragile {
                 ctype.mark(owner);
             }
         }
@@ -1521,6 +1608,11 @@ impl Context {
     /// Assume `fact`, in place of any about the same thing. See Note [Fragile
     /// information].
     fn assume(&mut self, fact: Fragile) {
+        self.introduce(Fact::new(fact));
+    }
+
+    /// Assume `fact`, as `assume`, with its origins.
+    fn introduce(&mut self, fact: Fact) {
         self.fragile.retain(|known| known.key() != fact.key());
         self.fragile.push(fact);
         self.fragile.sort_by_key(|fact| fact.key());
@@ -1534,7 +1626,7 @@ impl Context {
     /// The kind of the array part of the table in slot `table`, if known. See
     /// Note [Array kinds].
     fn array_kind(&self, table: usize) -> Option<LType> {
-        self.fragile.iter().find_map(|fact| match fact {
+        self.fragile.iter().find_map(|fact| match &fact.fragile {
             Fragile::Kind { table: known, kind } if *known == table => Some(*kind),
             _ => None,
         })
@@ -1543,7 +1635,7 @@ impl Context {
     /// The slot of the table whose array part slot `slot`'s value was loaded
     /// from, if known. See Note [Array kinds].
     fn element_of(&self, slot: usize) -> Option<usize> {
-        self.fragile.iter().find_map(|fact| match fact {
+        self.fragile.iter().find_map(|fact| match &fact.fragile {
             Fragile::ElementOf { slot: loaded, table } if *loaded == slot => Some(*table),
             _ => None,
         })
@@ -1551,30 +1643,57 @@ impl Context {
 
     /// The upvalue whose value slot `slot` holds, if known.
     fn holds(&self, slot: usize) -> Option<usize> {
-        self.fragile.iter().find_map(|fact| match fact {
+        self.fragile.iter().find_map(|fact| match &fact.fragile {
             Fragile::Holds { slot: held, upvalue } if *held == slot => Some(*upvalue),
             _ => None,
         })
     }
 
     /// A slot holding upvalue `upvalue`'s value, if one is known to.
-    /// Slot `slot`'s value is read: a fact that it holds a constant has had its
-    /// use. See Note [Narrowing].
+    /// Slot `slot`'s type is guarded: a fact that it holds a constant has had
+    /// its use. See Note [Narrowing].
     fn used(&mut self, slot: usize) {
-        self.fragile.retain(|fact| !matches!(fact, Fragile::Constant { slot: held, .. } if *held == slot));
+        self.fragile.retain(|fact| !matches!(fact.fragile, Fragile::Constant { slot: held, .. } if held == slot));
+    }
+
+    /// Mark that code relies on the fact about `key`, so that it isn't
+    /// contracted. See Note [Contraction].
+    fn rely(&self, owner: &mut Owner, key: (u8, usize)) {
+        if let Some(origins) = self.fragile.iter().find(|fact| fact.key() == key).and_then(|fact| fact.origins.as_ref()) {
+            for origin in owner.ro(origins).clone() {
+                owner.rw(&origin).used = true;
+            }
+        }
+    }
+
+    /// Add the origins of `other`'s facts to those of the same facts of `self`,
+    /// whose code `other`'s paths now reach. See Note [Contraction].
+    fn adopt(&self, owner: &mut Owner, other: &Context) {
+        for fact in &self.fragile {
+            let Some(mine) = &fact.origins else { continue };
+            let Some(theirs) = other.fragile.iter().find(|theirs| *theirs == fact).and_then(|theirs| theirs.origins.as_ref()) else { continue };
+            if Rc::ptr_eq(mine, theirs) {
+                continue;
+            }
+            for origin in owner.ro(theirs).clone() {
+                if !owner.ro(mine).iter().any(|known| Rc::ptr_eq(known, &origin)) {
+                    owner.rw(mine).push(origin);
+                }
+            }
+        }
     }
 
     /// The number constant slot `slot` holds, if a fact says. See Note
     /// [Narrowing].
     fn constant(&self, slot: usize) -> Option<i32> {
-        self.fragile.iter().find_map(|fact| match fact {
+        self.fragile.iter().find_map(|fact| match &fact.fragile {
             Fragile::Constant { slot: held, value } if *held == slot => Some(*value),
             _ => None,
         })
     }
 
     fn held(&self, upvalue: usize) -> Option<usize> {
-        self.fragile.iter().find_map(|fact| match fact {
+        self.fragile.iter().find_map(|fact| match &fact.fragile {
             Fragile::Holds { slot, upvalue: held } if *held == upvalue => Some(*slot),
             _ => None,
         })
@@ -1582,7 +1701,7 @@ impl Context {
 
     /// The type of upvalue `upvalue`'s value, if known.
     fn upvalue(&self, upvalue: usize) -> Option<&CType> {
-        self.fragile.iter().find_map(|fact| match fact {
+        self.fragile.iter().find_map(|fact| match &fact.fragile {
             Fragile::Upvalue { upvalue: known, ctype } if *known == upvalue => Some(ctype),
             _ => None,
         })
@@ -1639,6 +1758,17 @@ impl Context {
         // Kind by kind: a context with no fact of a kind doesn't drop that kind's.
         // See Note [Fragile information].
         self.fragile.retain(|fact| other.fragile.contains(fact) || !other.fragile.iter().any(|theirs| theirs.class() == fact.class()));
+        for fact in self.fragile.iter_mut() {
+            let theirs = other.fragile.iter().find(|theirs| *theirs == fact).and_then(|theirs| theirs.origins.as_ref());
+            fact.origins = match (fact.origins.take(), theirs) {
+                (Some(mine), Some(theirs)) => {
+                    let mut origins = owner.ro(&mine).clone();
+                    origins.extend(owner.ro(theirs).iter().filter(|origin| !owner.ro(&mine).iter().any(|known| Rc::ptr_eq(known, origin))).cloned());
+                    Some(Rc::new(TLCell::new(origins)))
+                },
+                (mine, theirs) => mine.or_else(|| theirs.cloned()),
+            };
+        }
         let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
         for (i, mine) in self.hkeys.iter_mut().enumerate() {
             match other.hkeys.get(i) {
@@ -1769,6 +1899,9 @@ pub struct Specializer<'src, 'intern> {
     /// The join of the effects of the code compiled for each prototype, at a
     /// stable address its returns read. See Note [Call effects].
     effects: std::collections::HashMap<LProto<'src, 'intern>, Box<Cell<Effects>>, InternedHasher>,
+    /// Origins of facts to rebuild without them, with their function, once
+    /// nothing runs the code rebuilding replaces. See Note [Contraction].
+    contractions: Vec<(LProto<'src, 'intern>, Vec<Origin>)>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -1795,6 +1928,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             returns: Vec::new(),
             return_ids: HashMap::default(),
             effects: HashMap::default(),
+            contractions: Vec::new(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             clos,
@@ -1849,9 +1983,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
-        if let Some(exists) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(pc, ctx.clone())) {
-            return exists.clone();
+        if let Some(((_, ectx), &exists)) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get_key_value(&(pc, ctx.clone())) {
+            ectx.clone().adopt(owner, &ctx);
+            return exists;
         }
+        self.contractible(owner, pc, &ctx);
         let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((epc, ty), block)| *epc == pc).collect();
         if count.len() >= HARD_MAX_VERSIONS {
             panic!("too many versions: {:#?}", count);
@@ -1887,9 +2023,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn choose_version(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>) -> (BlockId, &'static str, Option<Rc<Context>>) {
         let subpc = SubPc::new(pc);
         let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
-        if let Some(&exists) = versions.get(&(subpc, ctx.clone())) {
+        if let Some(((_, ectx), &exists)) = versions.get_key_value(&(subpc, ctx.clone())) {
+            ectx.clone().adopt(owner, &ctx);
             return (exists, "exact", None);
         }
+        self.contractible(owner, subpc, &ctx);
+        let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
         let existing: Vec<(Rc<Context>, BlockId)> = versions
             .iter()
             .filter(|((epc, _), _)| *epc == subpc)
@@ -1900,14 +2039,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // next's: `ctx` keeps the most facts of each kind that keep it one. See
         // Note [Fragile information].
         let alike: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
-        let mut classes: SmallVec<[u8; 8]> = alike.iter().flat_map(|(ectx, _)| ectx.fragile.iter()).chain(ctx.fragile.iter()).map(Fragile::class).collect();
+        let mut classes: SmallVec<[u8; 8]> = alike.iter().flat_map(|(ectx, _)| ectx.fragile.iter()).chain(ctx.fragile.iter()).map(|fact| fact.class()).collect();
         classes.sort_unstable();
         classes.dedup();
-        let mut kept: Vec<Fragile> = Vec::new();
+        let mut kept: Vec<Fact> = Vec::new();
         for class in classes {
-            let of = |facts: &[Fragile]| facts.iter().filter(|fact| fact.class() == class).cloned().collect::<Vec<_>>();
+            let of = |facts: &[Fact]| facts.iter().filter(|fact| fact.class() == class).cloned().collect::<Vec<_>>();
             let mine = of(&ctx.fragile);
-            let mut chain: Vec<Vec<Fragile>> = alike.iter().map(|(ectx, _)| of(&ectx.fragile)).collect();
+            let mut chain: Vec<Vec<Fact>> = alike.iter().map(|(ectx, _)| of(&ectx.fragile)).collect();
             chain.sort_by_key(Vec::len);
             chain.dedup();
             let below = chain.iter().rposition(|facts| facts.iter().all(|fact| mine.contains(fact)));
@@ -1923,7 +2062,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         } else {
             let mut lowered = (*ctx).clone();
             lowered.fragile.retain(|fact| kept.contains(fact));
-            if let Some((_, block)) = alike.iter().find(|(ectx, _)| ectx.fragile == lowered.fragile) {
+            if let Some((ectx, block)) = alike.iter().find(|(ectx, _)| ectx.fragile == lowered.fragile) {
+                ectx.adopt(owner, &lowered);
                 return (*block, "fragile", None);
             }
             Rc::new(lowered)
@@ -1936,9 +2076,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .iter()
                 .filter(|(ectx, _)| ectx.accepts(ctx))
                 .min_by_key(|(ectx, block)| (ectx.distance(ctx), block.0))
-                .map(|(_, block)| *block)
+                .cloned()
         };
-        if let Some(block) = accepting(&ctx) {
+        if let Some((ectx, block)) = accepting(&ctx) {
+            ectx.adopt(owner, &ctx);
             return (block, "accepting", None);
         }
         let mut joined = (*ctx).clone();
@@ -1946,13 +2087,134 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             joined.join(owner, ectx);
         }
         let joined = Rc::new(joined);
-        if let Some(block) = accepting(&joined) {
+        if let Some((ectx, block)) = accepting(&joined) {
+            ectx.adopt(owner, &joined);
             return (block, "joined", Some(joined));
         }
         if existing.len() >= HARD_MAX_VERSIONS {
             panic!("too many versions at {pc}: {:#?}", existing.iter().map(|(ectx, _)| ectx).collect::<Vec<_>>());
         }
         (self.block(owner, pc, joined.clone()), "joined-new", Some(joined))
+    }
+
+    /// Queue the origins of the facts a version at `pc` has past those of `ctx`,
+    /// which is about to get a version of its own, for contraction: if no code
+    /// relied on them, the version only duplicates the one `ctx` gets. See Note
+    /// [Contraction].
+    fn contractible(&mut self, owner: &mut Owner, pc: SubPc, ctx: &Context) {
+        let proto = self.clos.ro(owner).prototype;
+        let mut origins: Vec<Origin> = Vec::new();
+        let mut _duplicates: Vec<usize> = Vec::new();
+        for ((epc, ectx), _block) in self.versions.get(&proto).unwrap() {
+            if *epc != pc || !ectx.alike(ctx) || !ctx.fragile_within(ectx) || ctx.fragile.len() == ectx.fragile.len() {
+                continue;
+            }
+            let extra = ectx.fragile.iter().filter(|fact| !ctx.fragile.contains(fact));
+            let Some(sets) = extra.map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+            let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
+            if found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
+                continue;
+            }
+            _duplicates.push(_block.0);
+            for origin in found {
+                if !origins.iter().any(|known| Rc::ptr_eq(known, &origin)) {
+                    origins.push(origin);
+                }
+            }
+        }
+        let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
+        if !origins.is_empty() && !origins.iter().all(queued) {
+            #[cfg(feature = "tracing")]
+            {
+                let context = ctx.tostring(owner);
+                crate::tracing::instant("spec", "contractible", &[
+                    ("line", self.traced_line(owner).into()),
+                    ("pc", pc.0.into()),
+                    ("duplicates", Self::ids(_duplicates.iter().copied()).as_str().into()),
+                    ("origins", Self::ids(origins.iter().map(|origin| owner.ro(origin).block.0)).as_str().into()),
+                    ("context", context.as_str().into()),
+                ]);
+            }
+            self.contractions.push((proto, origins));
+        }
+    }
+
+    /// Contract the queued origins of the running function that no code still to
+    /// run relies on: the interpreter at `at`, or a frame returning, past where
+    /// one was introduced. The versions their facts reach are forgotten, and each
+    /// origin rebuilt without its fact. See Note [Contraction].
+    fn contract(&mut self, owner: &mut Owner, state: &RunState<'src, 'intern>, at: Location) {
+        if self.contractions.is_empty() {
+            return;
+        }
+        let proto = self.clos.ro(owner).prototype;
+        for (of, origins) in std::mem::take(&mut self.contractions) {
+            if of != proto {
+                self.contractions.push((of, origins));
+                continue;
+            }
+            let _blocks = Self::ids(origins.iter().map(|origin| owner.ro(origin).block.0));
+            // Relied on since, or rebuilt in code that has its own JIT code.
+            let refused = if origins.iter().any(|origin| owner.ro(origin).used) {
+                Some("used")
+            } else if origins.iter().any(|origin| owner.ro(origin).rebuild.is_some() && self.compiled(owner.ro(origin).block)) {
+                Some("compiled")
+            } else if origins.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
+                Some("rebuilt")
+            } else {
+                None
+            };
+            if let Some(_reason) = refused {
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("spec", "contract_refused", &[
+                    ("line", self.traced_line(owner).into()),
+                    ("origins", _blocks.as_str().into()),
+                    ("reason", _reason.into()),
+                ]);
+                continue;
+            }
+            let live: Vec<Origin> = origins.iter().filter(|origin| owner.ro(origin).rebuild.is_some()).cloned().collect();
+            let past = |origin: &OriginState, Location(block, off): &Location| *block == origin.block && *off >= origin.offset;
+            if live.iter().any(|origin| past(owner.ro(origin), &at) || state.callstack.iter().any(|entry| past(owner.ro(origin), &entry.ret))) {
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("spec", "contract_deferred", &[
+                    ("line", self.traced_line(owner).into()),
+                    ("origins", _blocks.as_str().into()),
+                    ("at", at.0.0.into()),
+                ]);
+                self.contractions.push((of, origins));
+                continue;
+            }
+            let carries = |ctx: &Context| ctx.fragile.iter().any(|fact| {
+                fact.origins.as_ref().is_some_and(|set| owner.ro(set).iter().any(|origin| origins.iter().any(|known| Rc::ptr_eq(known, origin))))
+            });
+            let versions = self.versions.get_mut(&proto).unwrap();
+            let mut _forgotten: Vec<usize> = Vec::new();
+            versions.retain(|(_, ctx), block| {
+                let keep = !carries(ctx);
+                if !keep {
+                    _forgotten.push(block.0);
+                }
+                keep
+            });
+            _forgotten.sort_unstable();
+            #[cfg(feature = "tracing")]
+            crate::tracing::instant("spec", "contract", &[
+                ("line", self.traced_line(owner).into()),
+                ("origins", _blocks.as_str().into()),
+                ("offsets", Self::ids(live.iter().map(|origin| owner.ro(origin).offset)).as_str().into()),
+                ("forgotten", Self::ids(_forgotten.iter().copied()).as_str().into()),
+            ]);
+            for origin in live {
+                let rebuild = owner.rw(&origin).rebuild.take().unwrap();
+                rebuild(self, owner);
+            }
+        }
+    }
+
+    /// `ids` as a comma separated list, for traces.
+    fn ids(ids: impl Iterator<Item = usize>) -> String {
+        ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
     }
 
     /// The source line of the function being specialized, for traces.
@@ -2252,15 +2514,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // An element of a known type was guarded, or its array's kind is known:
         // what it was loaded from tells no more. Only the version jumped to is
         // found without it, so it still accepts the jump. See Note [Array kinds].
-        let typed = |fact: &Fragile| matches!(fact, Fragile::ElementOf { slot, .. } if ctx.slot(*slot) != CType::Type(LType::Unknown));
+        let typed = |fact: &Fact| matches!(fact.fragile, Fragile::ElementOf { slot, .. } if ctx.slot(slot) != CType::Type(LType::Unknown));
         if ctx.fragile.iter().any(typed) {
-            let forgotten: Vec<Fragile> = ctx.fragile.iter().filter(|fact| typed(fact)).cloned().collect();
+            let forgotten: Vec<Fact> = ctx.fragile.iter().filter(|fact| typed(fact)).cloned().collect();
             Rc::make_mut(&mut ctx).fragile.retain(|fact| !forgotten.contains(fact));
-        }
-        // A slot's constant only serves the code it falls through to. See Note
-        // [Narrowing].
-        if ctx.fragile.iter().any(|fact| matches!(fact, Fragile::Constant { .. })) {
-            Rc::make_mut(&mut ctx).fragile.retain(|fact| !matches!(fact, Fragile::Constant { .. }));
         }
         ctx
     }
@@ -2359,6 +2616,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.blocks[cold.0].instructions.push(Residual::Thunk(side));
             vm.blocks[at.0].instructions.push(Residual::Branch { hot, cold });
         })))
+    }
+
+    /// Where the yield of `coro` at `pc` in `ctx` introduces a fact: rebuilding
+    /// truncates `block` there and resumes `coro` in `ctx`, without the fact.
+    /// See Note [Contraction].
+    fn origin(&self, block: BlockId, coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, ctx: Rc<Context>) -> Origin {
+        let offset = self.blocks[block.0].instructions.len();
+        let allocates = self.blocks[block.0].allocates;
+        let rebuild = move |vm: &mut Specializer, owner: &mut Owner| {
+            vm.blocks[block.0].instructions.truncate(offset);
+            vm.blocks[block.0].allocates = allocates;
+            if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx, coro, ResumeArg::Start, block) {
+                vm.compile(owner, next, ctx, block);
+            }
+        };
+        Rc::new(TLCell::new(OriginState { rebuild: Some(Box::new(rebuild)), block, offset, used: false }))
     }
 
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
@@ -2991,6 +3264,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::GuardCType(rk, ref expected)) => {
+                    // See Note [Narrowing].
+                    if (rk & 0x100) == 0 {
+                        Rc::make_mut(&mut ctx).used(rk);
+                    }
                     let known = if (rk & 0x100) != 0 {
                         let proto = self.clos.ro(owner).prototype;
                         constant_ctype_for(unsafe { &(&(*proto).constants.items)[rk & 0xff] }, expected)
@@ -3014,9 +3291,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
                     // Its outputs are written whichever path it takes. See Note [Optimistic ops].
                     for (&slot, access) in op.operands().iter().zip(op.accesses()) {
-                        if access.reads() {
-                            Rc::make_mut(&mut ctx).used(slot);
-                        }
                         if access.writes() {
                             Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
                         }
@@ -3041,9 +3315,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::GuardDynamic(test)) => {
                     assert!(test.accesses().iter().all(|access| *access == Access::Read), "{}: a guard's test has no outputs", test.name());
-                    for &slot in test.operands() {
-                        Rc::make_mut(&mut ctx).used(slot);
-                    }
                     if cfg!(feature = "no_dynamic_guards") {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
@@ -3055,6 +3326,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::Guard(idx, expected)) => {
+                    // See Note [Narrowing].
+                    Rc::make_mut(&mut ctx).used(idx);
                     debug!("guard {:?} == {:?}", ctx.types[idx], expected);
                     let ctype = &ctx.types[idx];
                     let expected_ctype = CType::Type(expected);
@@ -3086,9 +3359,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
                     for (&slot, access) in w.operands().iter().zip(w.accesses()) {
-                        if access.reads() {
-                            Rc::make_mut(&mut ctx).used(slot);
-                        }
                         if access.writes() {
                             Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
                         }
@@ -3340,7 +3610,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::HoldsK(slot, k)) => {
                     let proto = self.clos.ro(owner).prototype;
                     if let crate::chunk::Constant::Number(n) = unsafe { &(&(*proto).constants.items)[k] } && is_integer(n.0) {
-                        Rc::make_mut(&mut ctx).assume(Fragile::Constant { slot, value: n.0 as i32 });
+                        let origin = self.origin(block_id, coro.clone(), pc, ctx.clone());
+                        Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Constant { slot, value: n.0 as i32 }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
                     }
                 },
                 CoroutineState::Yielded(YieldOp::Narrow(slot)) => match ctx.types[slot] {
@@ -3351,6 +3622,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // A known constant: stored again in the integer encoding. See Note
                     // [Narrowing].
                     CType::Type(LType::Double) if let Some(value) = ctx.constant(slot) => {
+                        ctx.rely(owner, Fragile::Constant { slot, value }.key());
                         self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::NarrowK::new(value, &[slot]))));
                         // The fact used, and dropped by the write: its type says what
                         // it would, so no version keeps it apart.
@@ -3677,7 +3949,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("thunk {:?}", thunk);
                     // Forcing it replaces it: it runs from its own reference.
                     let thunk = thunk.clone();
-                    (thunk.0.borrow_mut())(self, owner, &mut state, off)
+                    (thunk.0.borrow_mut())(self, owner, &mut state, off);
+                    self.contract(owner, &state, Location(id, off));
                 },
                 &Residual::Arrive { a, c } | &Residual::Arrived { a, c, .. } => {
                     off += 1;

@@ -25,6 +25,20 @@ The specializer's are also views, one column per argument:
   alloc_op(trace, step, name, before, worth, skip, emits, after)
       each window op planned: the window before it and its values' worth, its
       SKIP, what it emits (stores, loads, moves), and the window after.
+  contractible(ts, line, pc, duplicates, origins, context)
+      each version about to be compiled at `pc` for `context` while versions
+      (`duplicates`) differ from it only in facts no code relied on: the
+      blocks introducing those facts are queued for contraction.
+  contract(ts, line, origins, offsets, forgotten)
+      each contraction: the blocks rebuilt from where they introduced the
+      facts (at those residual offsets), and the versions forgotten.
+  contract_deferred(ts, line, origins, at)
+      a queued contraction waiting while the interpreter (in block `at`) or a
+      frame returning still runs code rebuilding replaces.
+  contract_refused(ts, line, origins, reason)
+      a queued contraction dropped: a fact `used` since, an origin `compiled`,
+      or every origin `rebuilt` already.
+
     tools/trace_sql.py [--trace working/lunacy.fxt] QUERY
 (in the devshell, whose `trace_processor_shell` it runs; `just trace-sql`)
 """
@@ -39,9 +53,15 @@ VIEWS = {
     'alloc_step': ['trace', 'step', 'line', 'block', 'pc', 'off'],
     'alloc_start': ['trace', 'step', 'rise', 'arrives', 'worth', 'entry'],
     'alloc_op': ['trace', 'step', 'name', 'before', 'worth', 'skip', 'emits', 'after'],
+    'contractible': ['line', 'pc', 'duplicates', 'origins', 'context'],
+    'contract': ['line', 'origins', 'offsets', 'forgotten'],
+    'contract_deferred': ['line', 'origins', 'at'],
+    'contract_refused': ['line', 'origins', 'reason'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
-          'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op')}
+          'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
+          'contractible': ('spec', 'contractible'), 'contract': ('spec', 'contract'),
+          'contract_deferred': ('spec', 'contract_deferred'), 'contract_refused': ('spec', 'contract_refused')}
 
 
 def main():
