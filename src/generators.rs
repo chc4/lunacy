@@ -433,7 +433,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             return arg;
         }
         // Object shape specialization
-        arg = yield YieldOp::HashKey(b, c);
+        arg = yield YieldOp::HashKey(b, c, true);
         if let ResumeArg::HashRef(hc, htype) = arg {
             let ResumeArg::Boxed(key) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
             arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, key, &[b, a])));
@@ -796,7 +796,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             yield YieldOp::Effect(Effect::ArrayStore(stored));
         } else {
             // Hash part set
-            arg = yield YieldOp::HashKey(a, b);
+            arg = yield YieldOp::HashKey(a, b, false);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 count_store!(field_stores);
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };

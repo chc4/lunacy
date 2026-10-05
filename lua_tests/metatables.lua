@@ -47,6 +47,19 @@ local function fallback(t)
   return t[1], t[2], t[3], t[4], t.x
 end
 
+-- `__index` stored to in a loop, through the same store each time, then read
+-- through the chain with no call between them, the object and the metatable
+-- in the same registers throughout.
+local function retarget(obj, mt, a, b)
+  local out = {}
+  for i = 1, 6 do
+    if i % 2 == 1 then mt.__index = a else mt.__index = b end
+    out[#out + 1] = obj.value
+  end
+  return table.concat(out, " ")
+end
+local retarget_mt = {}
+
 local function globals()
   return undefined_global, another_undefined
 end
@@ -55,6 +68,7 @@ local function run()
   print(chorus({Animal.new("cat"), Dog.new("rex"), Puppy.new("bit")}))
   print(stale(Puppy.new("pip")))
   print(fallback(defaults))
+  print(retarget(setmetatable({}, retarget_mt), retarget_mt, {value = "A"}, {value = "B"}))
   print(getmetatable(Dog.new("a")) == Dog, getmetatable({}), getmetatable(setmetatable({}, {__metatable = "locked"})))
   local ok, err = pcall(setmetatable, 1, {})
   local protected_ok, protected = pcall(setmetatable, setmetatable({}, {__metatable = true}), {})
@@ -67,11 +81,13 @@ print(globals())
 chorus.__jit = 1
 stale.__jit = 1
 fallback.__jit = 1
+retarget.__jit = 1
 globals.__jit = 1
 run()
 -- EXPECT: cat makes a sound/animal, rex barks/animal, bit barks/animal
 -- EXPECT: animal	own	pip makes a sound	other	animal
 -- EXPECT: 10	2	30	nil	dx
+-- EXPECT: A B A B A B
 -- EXPECT: true	nil	locked
 -- EXPECT: false	true	false	true
 -- EXPECT: nil	nil
@@ -79,6 +95,7 @@ run()
 -- EXPECT: cat makes a sound/animal, rex barks/animal, bit barks/animal
 -- EXPECT: animal	own	pip makes a sound	other	animal
 -- EXPECT: 10	2	30	nil	dx
+-- EXPECT: A B A B A B
 -- EXPECT: true	nil	locked
 -- EXPECT: false	true	false	true
 -- EXPECT: from G's __index	nil

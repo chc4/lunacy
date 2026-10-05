@@ -1540,6 +1540,22 @@ impl<'src, 'intern> CallstackEntry<'src, 'intern> {
     }
 }
 
+/// How far down its register's `__index` chain a hash key's lookup goes at
+/// most: the tables it chains through. See Note [Table metatables] in
+/// `specialize`.
+pub const MAX_CHAIN: usize = 3;
+
+/// A table a hash key's lookup chained through: it lacked the key, and its
+/// metatable's `__index` was the next table. Each holds while its epoch and its
+/// metatable's do. See Note [Table metatables] in `specialize`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Link {
+    pub table: u64,
+    pub epoch: usize,
+    pub metatable: u64,
+    pub metatable_epoch: usize,
+}
+
 /// A protected call's handler: where an error raised in it goes. See Note
 /// [Errors] in `specialize`.
 #[derive(Debug, Clone, Copy)]
@@ -1556,18 +1572,21 @@ pub struct Handler {
 
 /// Where a frame's hash key was found in its table's hash part (its entry's
 /// index, and its value's address), and the table, by address, and its epoch
-/// then. See Note [Hash witnesses].
+/// then; and the tables its lookup chained through to that one, `depth` of
+/// them. See Note [Hash witnesses].
 #[derive(Debug, Clone, Copy)]
 pub struct HashWitness {
     pub index: usize,
     pub value: *mut LBoxed<'static, 'static>,
     pub epoch: usize,
     pub table: u64,
+    pub depth: u8,
+    pub links: [Link; MAX_CHAIN],
 }
 
 impl Default for HashWitness {
     fn default() -> Self {
-        HashWitness { index: 0, value: core::ptr::null_mut(), epoch: 0, table: 0 }
+        HashWitness { index: 0, value: core::ptr::null_mut(), epoch: 0, table: 0, depth: 0, links: [Link::default(); MAX_CHAIN] }
     }
 }
 
@@ -2112,7 +2131,24 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// witnesses].
     pub fn witness_holds(&self, owner: &Owner, slot: usize, href: u8) -> bool {
         let witness = self.hash_witnesses[self.witness_base + href as usize];
-        self.hash_part_at(owner, slot).is_some_and(|tab| witness.table == tab.0.to_addr() && witness.epoch == tab.ro(owner).epoch)
+        let Some(mut tab) = self.hash_part_at(owner, slot) else { return false };
+        // Each table chained through, and its metatable, unchanged. See Note [Table
+        // metatables] in `specialize`.
+        let depth = witness.depth as usize;
+        for (i, link) in witness.links[..depth].iter().enumerate() {
+            if tab.0.to_addr() != link.table || tab.ro(owner).epoch != link.epoch {
+                return false;
+            }
+            let Some(metatable) = &tab.ro(owner).metatable else { return false };
+            if metatable.0.to_addr() != link.metatable || metatable.ro(owner).epoch != link.metatable_epoch {
+                return false;
+            }
+            // The metatable's `__index` is unchanged with its epoch: the next table is
+            // the one recorded, which it keeps alive.
+            let next = if i + 1 < depth { witness.links[i + 1].table } else { witness.table };
+            tab = Tc(unsafe { Gc::from_addr(next) });
+        }
+        witness.table == tab.0.to_addr() && witness.epoch == tab.ro(owner).epoch
     }
 
     /// Whether the entry at the index of the frame's witness for `href`, a
