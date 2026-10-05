@@ -60,6 +60,15 @@ local function retarget(obj, mt, a, b)
 end
 local retarget_mt = {}
 
+-- A field read through the chain on one call, then from objects with it as
+-- their own, or with it cleared to nil, on later ones.
+local function own_field(o)
+  return o.x
+end
+local own_mt = {__index = {x = "inherited"}}
+local own_cleared = setmetatable({x = 1}, own_mt)
+own_cleared.x = nil
+
 local function globals()
   return undefined_global, another_undefined
 end
@@ -69,6 +78,8 @@ local function run()
   print(stale(Puppy.new("pip")))
   print(fallback(defaults))
   print(retarget(setmetatable({}, retarget_mt), retarget_mt, {value = "A"}, {value = "B"}))
+  local plain, own = setmetatable({}, own_mt), setmetatable({x = "own"}, own_mt)
+  print(own_field(plain), own_field(own), own_field(own_cleared), own_field(plain), own_field(own))
   print(getmetatable(Dog.new("a")) == Dog, getmetatable({}), getmetatable(setmetatable({}, {__metatable = "locked"})))
   local ok, err = pcall(setmetatable, 1, {})
   local protected_ok, protected = pcall(setmetatable, setmetatable({}, {__metatable = true}), {})
@@ -82,12 +93,14 @@ chorus.__jit = 1
 stale.__jit = 1
 fallback.__jit = 1
 retarget.__jit = 1
+own_field.__jit = 1
 globals.__jit = 1
 run()
 -- EXPECT: cat makes a sound/animal, rex barks/animal, bit barks/animal
 -- EXPECT: animal	own	pip makes a sound	other	animal
 -- EXPECT: 10	2	30	nil	dx
 -- EXPECT: A B A B A B
+-- EXPECT: inherited	own	inherited	inherited	own
 -- EXPECT: true	nil	locked
 -- EXPECT: false	true	false	true
 -- EXPECT: nil	nil
@@ -96,6 +109,7 @@ run()
 -- EXPECT: animal	own	pip makes a sound	other	animal
 -- EXPECT: 10	2	30	nil	dx
 -- EXPECT: A B A B A B
+-- EXPECT: inherited	own	inherited	inherited	own
 -- EXPECT: true	nil	locked
 -- EXPECT: false	true	false	true
 -- EXPECT: from G's __index	nil

@@ -11,7 +11,7 @@ use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Locat
 use qcell::{LCell, LCellOwner};
 use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{Tc, Vm};
-use crate::vm::{BlockId, HashRef};
+use crate::vm::{BlockId, HashRef, Place};
 use crate::vm::{LClosure, LProto};
 use crate::vm::{LValue, LType, Number, Table, FVec, LBoxed, LCanon, IStr};
 use crate::lboxed::is_integer;
@@ -150,7 +150,7 @@ impl std::fmt::Display for Residual {
             Residual::TailCall { entry: CallEntry::Context(_), a, b, .. } => write!(f, "tcall(?, {}, {})", a, b),
             Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
             Residual::GuardWitness { href, expected } => write!(f, "guard_witness({:?}, {})", href, expected),
-            Residual::EpochCheck { tab, href, depth } => write!(f, "epoch({}, {:?}, {})", tab, href, depth),
+            Residual::EpochCheck { tab, href, place } => write!(f, "epoch({}, {:?}, {:?})", tab, href, place),
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Select(targets) => write!(f, "select"),
             Residual::Branch { .. } => write!(f, "branch"),
@@ -278,10 +278,17 @@ pub struct HashKey<'src, 'intern> {
     /// Per slot: whether access through that slot is already checked for
     /// aliasing, so it needs no epoch check.
     pub hazards: SmallVec<[bool; 8]>,
-    /// How many tables down its register's `__index` chain the key is: 0 for
-    /// the register's own. See Note [Table metatables].
-    pub depth: u8,
+    /// Where the table its field is in comes from: `idx`'s register, or down
+    /// that register's table's `__index` chain. See Note [Table metatables].
+    pub place: Place,
+    /// For a key its table lacks, or has nil, found down the table's `__index`
+    /// chain: the hash key it's found at. See Note [Table metatables].
+    pub chain: Option<HashRef>,
 }
+
+/// How many `__index` hops down a table's chain a hash key's field can be.
+/// See Note [Table metatables].
+const MAX_CHAIN: usize = 3;
 
 impl<'src, 'intern> HashKey<'src, 'intern> {
     fn tostring(&self, owner: &Owner) -> String {
@@ -296,7 +303,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 
     /// A new hash key, its index reserved until its href thunk finds its type.
     fn new(idx: usize, key: LConstant<'src, 'intern>) -> Self {
-        HashKey { idx, key, known_type: None, hazards: Default::default(), depth: 0 }
+        HashKey { idx, key, known_type: None, hazards: Default::default(), place: Place::Register, chain: None }
     }
 
     /// Whether access through slot `at` needs no epoch check.
@@ -327,7 +334,8 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     fn accepts(&self, other: &Self) -> bool {
         self.idx == other.idx
             && self.key == other.key
-            && self.depth == other.depth
+            && self.place == other.place
+            && self.chain == other.chain
             && match (self.known_type, other.known_type) {
                 (Some(mine), Some(theirs)) => mine == theirs || mine == Kind::Mixed,
                 (mine, theirs) => mine == theirs,
@@ -399,45 +407,16 @@ windowed!(select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (u
     }
 });
 
-// `HrefInit` for a hash key found `depth` tables down its receiver's `__index` chain: exit 0 if
-// the chain is as it was, each table but the last without the key, and the last has it,
-// populating the witness and its links, and 1 if not. See Note [Table metatables].
-windowed!(select HrefInitChain, [at: u64, key: u64, depth: u8], [], |owner, state, base| (receiver) {
+// `HrefInit` for a hash key at a place down its register's `__index` chain (`place`, as
+// `Place::bits`): exit 0 if the table there has the key, populating the witness, and 1 if not,
+// or if there's no table there. See Note [Table metatables].
+windowed!(select HrefInitAt, [at: u64, key: u64, place: u16], [], |owner, state, base| () {
     let (href, index) = (at as u8, (at >> 8) as usize);
-    href_init_chain(owner, state, receiver, href, index, key, depth as usize)
+    match state.place_table(owner, 0, Place::from_bits(place)) {
+        Some(tab) => href_init_slow(owner, state, tab, href, index, key),
+        None => 1,
+    }
 });
-
-/// `HrefInitChain`'s walk: each table chained through recorded as a link of the witness.
-extern "rust-cold" fn href_init_chain<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, receiver: LBoxed<'src, 'intern>, href: u8, index: usize, key: u64, depth: usize) -> usize {
-    // Safety: the key is a constant's, which outlives the code using it.
-    let canonical: LCanon<'src, 'intern> = unsafe { LCanon::from_bits(key) };
-    let mut tab = match receiver.unbox() {
-        LValue::Table(tab) => tab,
-        LValue::Userdata(u) => match u.ro(owner).index_table(owner, &state.index_key) {
-            Some(tab) => tab,
-            None => return 1,
-        },
-        _ => unreachable!("a hash key of what isn't a table or a userdata"),
-    };
-    let mut links = [crate::vm::Link::default(); crate::vm::MAX_CHAIN];
-    for link in links.iter_mut().take(depth) {
-        // A nil field is no field. See Note [Table metatables].
-        if tab.ro(owner).hash.get(&canonical).is_some_and(|value| value.bits() != LBoxed::NIL.bits()) {
-            return 1;
-        }
-        let Some(metatable) = tab.ro(owner).metatable.clone() else { return 1 };
-        *link = crate::vm::Link { table: tab.0.to_addr(), epoch: tab.ro(owner).epoch, metatable: metatable.0.to_addr(), metatable_epoch: metatable.ro(owner).epoch };
-        let Some(next) = tab.index_table(owner) else { return 1 };
-        tab = next;
-    }
-    let exit = href_init_slow(owner, state, tab, href, index, key);
-    let at = state.witness_base + href as usize;
-    if state.witness_links.len() <= at {
-        state.witness_links.resize(at + 1, [crate::vm::Link::default(); crate::vm::MAX_CHAIN]);
-    }
-    state.witness_links[at] = links;
-    exit
-}
 
 /// `HrefInit`'s cold path: the key isn't at `index`, or the witness's place isn't there yet,
 /// which it makes. Exit 0 if `tab` has the key, populating the witness, and 1 if not.
@@ -879,8 +858,8 @@ pub enum Residual {
     /// `expected`: a `Guard` on the field rather than a slot. See Note [Field
     /// types].
     GuardWitness { href: HashRef, expected: LType },
-    /// `depth` the hash key's. See Note [Table metatables].
-    EpochCheck { tab: usize, href: HashRef, depth: u8 },
+    /// `place` its hash key's. See Note [Table metatables].
+    EpochCheck { tab: usize, href: HashRef, place: Place },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
     /// A call to the Lua function in R(A), The target `entry` is a prototype a `LuaGuard` or the
@@ -1162,27 +1141,27 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 // one, or storing to a `__newindex` key, is not implemented.
 //
 // Every load that can find nil continues down the chain: the generic lookup does, and the fast
-// loads (a field through its hash key, an array element, a global) leave for it on a cold path
-// when they load nil. A fast load whose value's type is known not to be nil (a field's known
-// type, an array's kind) can't find nil, and has no such path. A load whose hash key knows its
-// field is nil knows nothing of what it loads, as the chain can find anything, and what it
-// finds tells nothing of the field.
+// loads (an array element, a global) leave for it on a cold path when they load nil. A fast load
+// whose value's type is known not to be nil (an array's kind) can't find nil, and has no such
+// path.
+//
+// A load with a constant key follows the chain with hash keys. When its table lacks the key, or
+// has it nil, and has an `__index` table, the load uses two more hash keys: one for the
+// metatable's `__index` field, and one for the key in that table, which knows the type of the
+// field found there. Each has its own witness and epoch check like any other, and finds its
+// table through the witness before it, so a table with no metatable pays nothing for chains.
+// The load continues this way for a bounded number of hops. A table without the key at the
+// end of the chain is a load the hash keys don't handle. Once the generator knows of a chain,
+// a later load of that key checks every hash key in it, and if any check fails the whole chain
+// is found again. The chain's hash keys belong to its first one's register and go together.
+// A load never uses a hash key whose field it knows is nil: the field might be found down a
+// chain.
+//
+// Stores set the table's own field, so they never follow a chain.
 //
 // A table's epoch changes whenever what a lookup through it could find changes: a key inserted,
 // its metatable set, or its `__index` field stored to, whatever the value (a store usually keeps
 // the epoch when it keeps the field's type).
-//
-// A load with a constant key, such as a method call on an object, can have a hash key that
-// points down the chain: its depth is how many `__index` hops away the key was found, up to
-// `MAX_CHAIN`. Its witness records, for each table it passed through, that table and its
-// metatable with their epochs, and the field in the table that has the key. The epoch check
-// compares each of them in turn, with a pointer load and two compares per hop and no hash
-// lookups: an unchanged epoch means the table still lacks the key and still has that metatable,
-// and the metatable still has that `__index`. If any differs, the chain is walked again.
-//
-// Only loads use these. A store sets the object's own field, never one found down the chain,
-// so it never uses a hash key with a depth. A store to an `__index` field makes every hash key
-// with a depth check its epochs again.
 
 // Note [String methods]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -1990,7 +1969,7 @@ impl Context {
         let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
         for (i, mine) in self.hkeys.iter_mut().enumerate() {
             match other.hkeys.get(i) {
-                Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && theirs.depth == mine.depth && mine.known_type.is_some() && theirs.known_type.is_some() => {
+                Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && theirs.place == mine.place && theirs.chain == mine.chain && mine.known_type.is_some() && theirs.known_type.is_some() => {
                     if mine.known_type != theirs.known_type {
                         mine.known_type = Some(Kind::Mixed);
                     }
@@ -2005,6 +1984,7 @@ impl Context {
                 },
             }
         }
+        dropped.extend(self.fix_chains());
         let shapes: Vec<(usize, CType)> = (0..self.types.len())
             .filter_map(|idx| match &self.types[idx] {
                 CType::Shape(of, hrefs) if hrefs.iter().any(|href| dropped.contains(href)) => {
@@ -2063,11 +2043,117 @@ impl Context {
                 // to the array when we need a new HashKey in order to try and re-use
                 // the slot (and potentially end up with the same pre-SetTypes context
                 // entirely). See Note [Field types].
+                self.fix_chains();
                 while let Some(_) = self.hkeys.pop_if(|hkey| hkey.idx == idx) { }
             }
             self.types[idx] = ty;
             warn!("set types to {:?}", &self.types);
         }
+    }
+
+    /// Keep the hash keys of `__index` chains whole: a chain's hash keys share
+    /// its head's register, and go when any of them does. The heads that go,
+    /// which shapes may hold. See Note [Table metatables].
+    fn fix_chains(&mut self) -> SmallVec<[HashRef; 4]> {
+        let mut dropped = SmallVec::new();
+        loop {
+            let mut changed = false;
+            let len = self.hkeys.len();
+            let live = |hkeys: &[HashKey], h: HashRef| hkeys.get(h.0 as usize).is_some_and(|hkey| !hkey.orphan());
+            for i in 0..len {
+                let hkey = &self.hkeys[i];
+                let Some(next) = hkey.chain.filter(|_| !hkey.orphan()) else { continue };
+                let whole = live(&self.hkeys, next) && match self.hkeys[next.0 as usize].place {
+                    Place::Index(link) => live(&self.hkeys, link) && self.hkeys[link.0 as usize].place == Place::Metatable(HashRef(i as u8)),
+                    _ => false,
+                };
+                if !whole {
+                    self.hkeys[i].known_type = None;
+                    self.hkeys[i].clear_checks();
+                    if self.hkeys[i].place == Place::Register {
+                        dropped.push(HashRef(i as u8));
+                    }
+                    changed = true;
+                }
+            }
+            // The register of the chain each hash key down one is in.
+            let mut reached: Vec<Option<usize>> = vec![None; len];
+            for i in 0..len {
+                if self.hkeys[i].place != Place::Register || self.hkeys[i].orphan() {
+                    continue;
+                }
+                let idx = self.hkeys[i].idx;
+                let mut at = i;
+                while let Some(next) = self.hkeys[at].chain {
+                    let next = next.0 as usize;
+                    reached[next] = Some(idx);
+                    if let Place::Index(link) = self.hkeys[next].place {
+                        reached[link.0 as usize] = Some(idx);
+                    }
+                    at = next;
+                }
+            }
+            for i in 0..len {
+                if self.hkeys[i].place == Place::Register || self.hkeys[i].orphan() {
+                    continue;
+                }
+                match reached[i] {
+                    Some(idx) => self.hkeys[i].idx = idx,
+                    None => {
+                        self.hkeys[i].known_type = None;
+                        self.hkeys[i].clear_checks();
+                        changed = true;
+                    },
+                }
+            }
+            if !changed {
+                return dropped;
+            }
+        }
+    }
+
+    /// A new hash key: at a free index, or a new one.
+    fn alloc_hkey(&mut self, hkey: HashKey<'static, 'static>) -> HashRef {
+        let hkey: HashKey<'_, '_> = hkey;
+        match self.hkeys.iter().position(|hkey| hkey.orphan()) {
+            Some(i) => {
+                self.hkeys[i] = hkey;
+                HashRef(i as u8)
+            },
+            None => {
+                let hr: u8 = self.hkeys.len().try_into().expect("too many hrefs");
+                self.hkeys.push(hkey);
+                HashRef(hr)
+            },
+        }
+    }
+
+    /// The hash keys of `head`'s chain, in the order each one's table is
+    /// found: `head`, then each `__index` and the hash key it finds. See Note
+    /// [Table metatables].
+    fn chain_of(&self, head: HashRef) -> SmallVec<[HashRef; 7]> {
+        let mut out = smallvec::smallvec![head];
+        let mut at = head;
+        while let Some(next) = self.hkeys[at.0 as usize].chain {
+            if let Place::Index(link) = self.hkeys[next.0 as usize].place {
+                out.push(link);
+            }
+            out.push(next);
+            at = next;
+        }
+        out
+    }
+
+    /// How many `__index` hops down its register's chain `href`'s table is.
+    fn chain_depth(&self, href: HashRef) -> usize {
+        let mut depth = 0;
+        let mut at = href;
+        while let Place::Index(link) = self.hkeys[at.0 as usize].place {
+            depth += 1;
+            let Place::Metatable(before) = self.hkeys[link.0 as usize].place else { break };
+            at = before;
+        }
+        depth
     }
 
     /// Set optimization hazards for a stack slot, potentially scoped to only information which
@@ -2092,7 +2178,7 @@ impl Context {
             let index = matches!(hkey, crate::chunk::Constant::String(s) if s.as_bytes() == b"__index");
             let types = &self.types;
             invalidate = self.hkeys.iter().enumerate()
-                .filter(|(i, hk)| hk.key == *hkey || (index && (hk.depth > 0 || matches!(types.get(hk.idx), Some(CType::Shape(LType::Userdata, _))))))
+                .filter(|(i, hk)| hk.key == *hkey || (index && matches!(types.get(hk.idx), Some(CType::Shape(LType::Userdata, _)))))
                 .map(|(i, _)| i).collect();
         }
         if let Some(keep) = keep {
@@ -2987,14 +3073,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A slot holding an upvalue's value tells of the upvalue: the type the
             // guard found, and past a function's identity guard below, which
             // function. See Note [Fragile information].
-            // Only if the field itself has it: a value found down its table's `__index`
-            // chain, the field being nil, isn't the field's. See Note [Table metatables].
             if let Some(href) = field {
-                let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
-                let raw = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() };
-                if raw.unbox().typeof_() == found_field {
-                    forced_mut.hkeys[href.0 as usize].known_type = Some(Kind::Of(found_field));
-                }
+                forced_mut.hkeys[href.0 as usize].known_type = Some(Kind::Of(found_field));
             }
             let holds = forced_mut.holds(idx);
             if let Some(upvalue) = holds {
@@ -3339,69 +3419,76 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, chains: bool) -> ThunkRef {
+    /// The thunk hash key `href`, of register `idx`, is found at. Forced, it finds the key in the
+    /// table at the hash key's place and lays out its `href_init` and the guard of its field's
+    /// type, continuing the generator with the field known, or, for an `__index`'s hash key, the
+    /// thunk of the hash key after it (`next`). A load (`chains`) of a key its table lacks, or has
+    /// nil, in a table whose metatable has an `__index` table goes on down the chain; any other key
+    /// a load can't find, or a store's table lacks, continues the generator without it, in
+    /// `fail_ctx`. See Notes [Field types] and [Table metatables].
+    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let thunk_coro = thunk_coro.clone();
-            let mut orig_ctx = thunk_ctx.clone();
-            let thunk_mut = Rc::make_mut(&mut thunk_ctx);
-            let hkey = &mut thunk_mut.hkeys[href.0 as usize];
-            debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
-            // A table, or a userdata, whose fields are its `__index` table's. See Note [Userdata
-            // fields].
-            let receiver = state.vals[state.base + idx].unbox().typeof_();
-            // A load finds a key its table lacks down the table's `__index` chain, a
-            // nil field being no field. See Note [Table metatables].
-            let key = LCanon::new((&hkey.key).into(), state.intern);
-            let mut entry = None;
-            let mut tab = state.hash_part_at(owner, idx);
-            for depth in 0..=if chains { crate::vm::MAX_CHAIN } else { 0 } {
-                let Some(t) = tab else { break };
-                if let Some((index, _, val)) = t.ro(owner).hash.get_full(&key)
-                    && (depth == 0 || val.bits() != LBoxed::NIL.bits())
-                {
-                    entry = Some((index, *val, depth));
-                    break;
-                }
-                tab = t.index_table(owner);
-            }
-            let Some((index, val, depth)) = entry else {
-                // The table doesn't have this key, which means we should actually just bailout
+            let mut ctx = thunk_ctx.clone();
+            let place = ctx.hkeys[href.0 as usize].place;
+            debug!("forcing href thunk for {idx} {href:?} {:?}", ctx.hkeys[href.0 as usize]);
+            let key = LCanon::new((&ctx.hkeys[href.0 as usize].key).into(), state.intern);
+            let tab = state.place_table(owner, idx, place);
+            let entry = tab.as_ref().and_then(|tab| tab.ro(owner).hash.get_full(&key).map(|(index, _, val)| (index, *val)));
+            let nil = entry.is_none_or(|(_, val)| val.bits() == LBoxed::NIL.bits());
+            // A nil field is no field: a load goes on down the chain. See Note [Table
+            // metatables].
+            let chained = chains && next.is_none() && nil
+                && ctx.chain_depth(href) < MAX_CHAIN
+                && tab.as_ref().is_some_and(|tab| tab.index_table(owner).is_some());
+            // A load never finds nil through a hash key: another table reaching it may
+            // have a metatable.
+            let usable = match next {
+                None if chains => !nil || chained,
+                _ => entry.is_some(),
+            };
+            if !usable {
                 let fail_block = vm.new_block(pc.0);
-                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), thunk_coro, ResumeArg::Failed, fail_block) {
+                if let Some((succ_next, succ_ty, _)) = vm.compile_one(owner, pc.next_false(), fail_ctx.clone(), thunk_coro, ResumeArg::Failed, fail_block) {
                     vm.compile(owner, succ_next, succ_ty, fail_block);
                 }
                 vm.jump_thunk(block_id, thunk_pc, fail_block);
                 return;
-            };
-            debug!("href forced by {receiver} -> {val:?}");
+            }
+            let (index, val) = entry.unwrap_or((0, LBoxed::NIL));
+            debug!("href forced by {place:?} -> {val:?}");
             // The field's type in this table, which the guard after `href_init` checks in every
             // table reaching the code. See Note [Field types].
             let found = val.unbox().typeof_();
-            hkey.known_type = Some(Kind::Of(found));
-            hkey.depth = depth as u8;
-            // Initialize the hkey after discovery with a cleared hazard for the index
-            hkey.clear_checks();
-            hkey.check(idx);
-
-            // TODO: track the maximum number of hkeys + grow here instead so we can initialize the RunState
-            // array.
-
-            // The receiver's shape now has this hash key.
-            if let CType::Shape(_, existing) = &mut thunk_mut.types[idx] {
-                if !existing.contains(&href) {
-                    existing.push(href)
-                }
-            } else {
-                thunk_mut.types[idx] = CType::Shape(receiver, vec![href].into());
+            let receiver = state.vals[state.base + idx].unbox().typeof_();
+            let ctx_mut = Rc::make_mut(&mut ctx);
+            {
+                let hkey = &mut ctx_mut.hkeys[href.0 as usize];
+                hkey.known_type = Some(Kind::Of(found));
+                hkey.chain = None;
+                // Initialize the hkey after discovery with a cleared hazard for the index
+                hkey.clear_checks();
+                hkey.check(idx);
             }
-            // The key's canonical form, made here once. See Note [Hash witnesses].
-            let key = LCanon::constant(&hkey.key).boxed().bits();
+            // A chain it had before goes.
+            ctx_mut.fix_chains();
+            let kbits = LCanon::constant(&ctx_mut.hkeys[href.0 as usize].key).boxed().bits();
+            // The receiver's shape now has this hash key.
+            if place == Place::Register {
+                if let CType::Shape(_, existing) = &mut ctx_mut.types[idx] {
+                    if !existing.contains(&href) {
+                        existing.push(href)
+                    }
+                } else {
+                    ctx_mut.types[idx] = CType::Shape(receiver, vec![href].into());
+                }
+            }
             let at = (index as u64) << 8 | href.0 as u64;
-            let href_init = Residual::ExecWindow(match receiver {
-                _ if depth > 0 => Rc::new(HrefInitChain::new(at, key, depth as u8, &[idx])) as Rc<dyn Window>,
-                LType::Table => Rc::new(HrefInit::new(at, key, &[idx])),
-                LType::Userdata => Rc::new(HrefInitIndex::new(at, key, &[idx])),
-                _ => unreachable!("a hash key of a {receiver}"),
+            let href_init = Residual::ExecWindow(match (place, receiver) {
+                (Place::Register, LType::Table) => Rc::new(HrefInit::new(at, kbits, &[idx])) as Rc<dyn Window>,
+                (Place::Register, LType::Userdata) => Rc::new(HrefInitIndex::new(at, kbits, &[idx])),
+                (Place::Register, _) => unreachable!("a hash key of a {receiver}"),
+                (place, _) => Rc::new(HrefInitAt::new(at, kbits, place.bits(), &[])),
             });
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
@@ -3413,39 +3500,67 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else {
                 vm.blocks[block_id.0].instructions[thunk_pc] = href_init;
             }
-            // A key found goes on at the field's type guard.
             let typed = vm.new_block(pc.0);
             let missing_key = vm.new_block(pc.0);
             vm.blocks[block_id.0].instructions.push(Residual::Select(
                 vec![("has_key", typed), ("missing_key", missing_key)]));
-            let missing_coro = thunk_coro.clone();
-            vm.blocks[missing_key.0].instructions.push(Residual::Thunk(ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-                debug!("missing key thunk");
-                // Same as the outer thunk missing the key
-                let fail_block = vm.new_block(pc.0);
-                if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), missing_coro.clone(), ResumeArg::Failed, fail_block) {
-                    vm.compile(owner, succ_next, succ_ty, fail_block);
-                }
-                vm.jump_thunk(missing_key, thunk_pc, fail_block);
-            })))));
-            vm.guard_witness(owner, typed, thunk_coro.clone(), href, found, pc, thunk_ctx.clone());
+            if chained {
+                // Its own field is none or nil, which a guard checks where it has the key,
+                // and the chain goes on at its metatable's `__index`, then the key in the
+                // table that is. See Note [Table metatables].
+                let index_key: LConstant<'_, '_> = crate::chunk::Constant::String(crate::vm::intern_bytes(state.intern, b"__index"));
+                // As the generator's constants, the intern arena outlives the code.
+                let index_key: LConstant<'static, 'static> = unsafe { core::mem::transmute(index_key) };
+                let own_key: LConstant<'static, 'static> = unsafe { core::mem::transmute(ctx_mut.hkeys[href.0 as usize].key.clone()) };
+                let link = ctx_mut.alloc_hkey(HashKey { place: Place::Metatable(href), known_type: Some(Kind::Mixed), ..HashKey::new(idx, index_key) });
+                let found_at = ctx_mut.alloc_hkey(HashKey { place: Place::Index(link), known_type: Some(Kind::Mixed), ..HashKey::new(idx, own_key) });
+                ctx_mut.hkeys[href.0 as usize].chain = Some(found_at);
+                let chain = vm.new_block(pc.0);
+                let link_thunk = vm.make_href_thunk(chain, thunk_coro.clone(), idx, link, pc, ctx.clone(), true, true, Some(found_at), fail_ctx.clone());
+                vm.blocks[chain.0].instructions.push(Residual::Thunk(link_thunk));
+                let refind = vm.make_href_thunk(typed, thunk_coro.clone(), idx, href, pc, thunk_ctx.clone(), false, chains, None, fail_ctx.clone());
+                vm.blocks[typed.0].instructions.push(Residual::GuardWitness { href, expected: LType::Nil });
+                vm.blocks[typed.0].instructions.push(Residual::Thunk(refind));
+                vm.blocks[typed.0].instructions.push(Residual::Jump(chain));
+                vm.blocks[missing_key.0].instructions.push(Residual::Jump(chain));
+                return;
+            }
+            // A table reaching it without the key: found again, down its chain or not at all.
+            let refind = vm.make_href_thunk(missing_key, thunk_coro.clone(), idx, href, pc, thunk_ctx.clone(), false, chains, next, fail_ctx.clone());
+            vm.blocks[missing_key.0].instructions.push(Residual::Thunk(refind));
+            vm.guard_witness(owner, typed, thunk_coro, idx, href, found, pc, ctx, chains, next, fail_ctx.clone());
         })))
     }
 
     /// End `block` in a `GuardWitness` of `href`'s field for `expected`, its pass continuing the
-    /// generator with the field known to be of that type, and its failure finding the field's
-    /// type and guarding that in turn. See Note [Field types].
-    fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>) {
+    /// generator with the field known to be of that type, or, for an `__index`'s hash key, the
+    /// thunk of the hash key after it (`next`), and its failure finding the field's type and
+    /// guarding that in turn: a load's field found nil, or an `__index` no longer a table, is
+    /// found again instead. See Notes [Field types] and [Table metatables].
+    fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) {
         let mut typed_ctx = ctx.clone();
         Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(Kind::Of(expected));
-        let pass = self.subblock(owner, pc.next_true(), typed_ctx, thunk_coro.clone(), ResumeArg::HashRef(href, Kind::Of(expected)));
+        let pass = match next {
+            Some(next) => {
+                let pass = self.new_block(pc.0);
+                let thunk = self.make_href_thunk(pass, thunk_coro.clone(), idx, next, pc, typed_ctx, true, true, None, fail_ctx.clone());
+                self.blocks[pass.0].instructions.push(Residual::Thunk(thunk));
+                pass
+            },
+            None => self.subblock(owner, pc.next_true(), typed_ctx, thunk_coro.clone(), ResumeArg::HashRef(href, Kind::Of(expected))),
+        };
         let fail = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
             let found = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() }.unbox().typeof_();
             debug!("field of {href:?} found {found}, not {expected}");
-            let next = vm.new_block(pc.0);
-            vm.jump_thunk(block, thunk_pc, next);
-            vm.guard_witness(owner, next, thunk_coro.clone(), href, found, pc, ctx.clone());
+            let again = vm.new_block(pc.0);
+            vm.jump_thunk(block, thunk_pc, again);
+            if (chains && found == LType::Nil) || next.is_some() {
+                let refind = vm.make_href_thunk(again, thunk_coro.clone(), idx, href, pc, ctx.clone(), true, chains, next, fail_ctx.clone());
+                vm.blocks[again.0].instructions.push(Residual::Thunk(refind));
+                return;
+            }
+            vm.guard_witness(owner, again, thunk_coro.clone(), idx, href, found, pc, ctx.clone(), chains, next, fail_ctx.clone());
         })));
         self.blocks[block.0].instructions.push(Residual::GuardWitness { href, expected });
         self.blocks[block.0].instructions.push(Residual::Thunk(fail));
@@ -3461,8 +3576,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // epoches in our witness table they only ever would fail if a table transitions its type
         // inside a block, which is unlikely to happen very often.
         let thunk_coro = thunk_coro.clone();
-        let depth = thunk_ctx.hkeys[href.0 as usize].depth;
-        self.blocks[block_id.0].instructions.push(Residual::EpochCheck { tab, href, depth });
+        self.blocks[block_id.0].instructions.push(Residual::EpochCheck { tab, href, place: Place::Register });
         // Build the thunk for if we fail the epoch check
         let fail_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             debug!("hit epoch fail thunk");
@@ -3472,11 +3586,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let check_block = vm.new_block(pc.0);
             vm.jump_thunk(block_id, thunk_pc, check_block);
             let expected = thunk_ctx.hkeys[href.0 as usize].known_type.expect("a live hash key");
-            let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false, chains);
-            // A field of no stable type has nothing to check it still has, and a
-            // chain is walked again whole: its hash key is found again. See Notes
-            // [Field types] and [Table metatables].
-            let (Kind::Of(expected), 0) = (expected, thunk_ctx.hkeys[href.0 as usize].depth) else {
+            let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false, chains, None, thunk_ctx.clone());
+            // A field of no stable type has nothing to check it still has: its
+            // hash key is found again. See Note [Field types].
+            let Kind::Of(expected) = expected else {
                 vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
                 return;
             };
@@ -3593,19 +3706,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     debug!("hashkey on existing {existing:?}");
                     if let Some(cached) = existing.into_iter().find(|cached| &ctx.hkeys[cached.0 as usize].key == k_val) {
                         debug!("using cached href {:?}", cached);
-                        let cached_hkey = &ctx.hkeys[cached.0 as usize];
-                        // A store sets the register's own field: not one found down
-                        // its `__index` chain. See Note [Table metatables].
-                        if !chains && cached_hkey.depth > 0 {
+                        let chain = ctx.chain_of(cached);
+                        let tail = *chain.last().unwrap();
+                        let tail_type = ctx.hkeys[tail.0 as usize].known_type.expect("a live hash key");
+                        // A store sets the register's own field, never one down its
+                        // chain. See Note [Table metatables].
+                        if !chains && chain.len() > 1 {
                             pc = pc.next_false();
                             arg = ResumeArg::Failed;
                             break 'machine;
                         }
+                        // A load never finds nil, or a field of no stable type, through a
+                        // hash key: it finds it again, down the chain or not at all.
+                        if chains && !matches!(tail_type, Kind::Of(t) if t != LType::Nil) {
+                            let refind = self.make_href_thunk(block_id, coro.clone(), place, cached, pc, ctx.clone(), true, true, None, ctx.clone());
+                            self.end_block(block_id);
+                            self.blocks[block_id.0].instructions.push(Residual::Thunk(refind));
+                            return None;
+                        }
                         // A cached href. Unless nothing could have invalidated it
                         // since it was last checked, it needs an epoch check first,
-                        // which continues into blocks assuming it still holds.
-                        arg = ResumeArg::HashRef(cached.clone(), cached_hkey.known_type.expect("a live hash key"));
-                        if cached_hkey.checked(place) {
+                        // which continues into blocks assuming it still holds; a
+                        // chain's, every one of its hash keys'.
+                        arg = ResumeArg::HashRef(tail, tail_type);
+                        if chain.iter().all(|h| ctx.hkeys[h.0 as usize].checked(place)) {
                             // Nothing could have invalidated it: no check needed.
                             pc = pc.next_true();
                             debug!("using cached hkey without hazards");
@@ -3614,9 +3738,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // After a passing epoch check, later accesses need no check
                         // until something may invalidate it again.
                         let mut holds_ctx = ctx.clone();
-                        Rc::make_mut(&mut holds_ctx).hkeys[cached.0 as usize].check(place);
+                        for h in &chain {
+                            Rc::make_mut(&mut holds_ctx).hkeys[h.0 as usize].check(place);
+                        }
                         let holds_block = self.subblock(owner, pc.next_true(), holds_ctx.clone(), coro.clone(), arg);
-                        self.make_epoch_check(owner, block_id, coro.clone(), place, cached.clone(), pc, ctx.clone(), holds_block, chains);
+                        if chain.len() == 1 {
+                            self.make_epoch_check(owner, block_id, coro.clone(), place, cached.clone(), pc, ctx.clone(), holds_block, chains);
+                        } else {
+                            // Each in turn, each one's table found through the ones before it;
+                            // any failing finds the key again. See Note [Table metatables].
+                            for &h in &chain {
+                                let refind = self.make_href_thunk(block_id, coro.clone(), place, cached, pc, ctx.clone(), false, true, None, ctx.clone());
+                                self.blocks[block_id.0].instructions.push(Residual::EpochCheck { tab: place, href: h, place: ctx.hkeys[h.0 as usize].place });
+                                self.blocks[block_id.0].instructions.push(Residual::Thunk(refind));
+                            }
+                        }
 
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(Residual::Jump(holds_block));
@@ -3643,7 +3779,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     let thunk_coro = coro.clone();
                     let thunk_ctx = ctx.clone();
-                    let witness = Residual::Thunk(self.make_href_thunk(block_id, thunk_coro, place, href.clone(), pc, thunk_ctx, true, chains));
+                    let witness = Residual::Thunk(self.make_href_thunk(block_id, thunk_coro, place, href.clone(), pc, thunk_ctx.clone(), true, chains, None, thunk_ctx));
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(witness);
                     return None;
@@ -4242,8 +4378,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let value = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() };
                     off += if value.unbox().typeof_() == expected { 2 } else { 1 };
                 },
-                &Residual::EpochCheck { tab, href, depth } => {
-                    if state.witness_holds(owner, tab, href.0, depth) {
+                &Residual::EpochCheck { tab, href, place } => {
+                    if state.witness_holds(owner, tab, place, href.0) {
                         // Fallthrough
                         off += 2;
                     } else {

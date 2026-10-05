@@ -237,11 +237,8 @@ extern "rust-cold" fn index_value<'src, 'intern>(owner: &mut Owner, state: &mut 
     LBoxed::box_lvalue(receiver.unbox().gettable(owner, Cow::Owned(key.unbox()), state.intern))
 }
 
-// A field through its hash key's witness, whose key is `key`. If `CHAINS`, a
-// nil one is looked up again down the `__index` chain from the table holding
-// it; a field of a type that isn't nil needn't be. See Note [Table metatables]
-// in `specialize`.
-windowed!(GetTableHref, [href: u8, key: u64], [CHAINS: bool], |owner, state, base| (out dest) {
+// A field through its hash key's witness.
+windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
     // Written by the frame's `href_init` already. See Note [Hash
     // witnesses].
     let witness = state.hash_witnesses[state.witness_base + href as usize];
@@ -252,12 +249,6 @@ windowed!(GetTableHref, [href: u8, key: u64], [CHAINS: bool], |owner, state, bas
 
     debug!("gettable_href fetched {val1:?}");
     *dest = val1;
-    CHAINS && dest.bits() == LBoxed::NIL.bits()
-} rejoin {
-    let witness = state.hash_witnesses[state.witness_base + href as usize];
-    // The witness holds, so its table is alive.
-    let holder = LBoxed::box_lvalue(LValue::Table(Tc(crate::gc::Gc::from_addr(witness.table))));
-    *dest = index_value(owner, state, holder, LBoxed::from_bits(key));
 });
 
 // GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
@@ -439,16 +430,8 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         }
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c, true);
-        if let ResumeArg::HashRef(hc, htype) = arg {
-            // A field of a type that isn't nil can't be nil: only one that may be
-            // looks down the `__index` chain. See Note [Table metatables] in
-            // `specialize`.
-            let ResumeArg::Boxed(key) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
-            arg = yield YieldOp::ExecWindow(if matches!(htype, Kind::Of(t) if t != LType::Nil) {
-                Rc::new(GetTableHref::<false>::new(hc.0, key, &[a])) as Rc<dyn Window>
-            } else {
-                Rc::new(GetTableHref::<true>::new(hc.0, key, &[a]))
-            });
+        if let ResumeArg::HashRef(hc, _) = arg {
+            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, &[a])));
             // Its type: the hash key's, or found out. See Note [Field types].
             yield YieldOp::FieldType(a, hc);
         } else if !table {
