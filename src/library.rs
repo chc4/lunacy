@@ -70,13 +70,13 @@ thread_local! {
 // (B = 0) has a fixed arity when the specializer knows the top. See Note [Known
 // top] in `specialize`.
 
-/// Raise `message` as an error, which ends the program.
-fn raise(message: String) -> ! {
-    panic!("error: {message}")
+/// An error with the message `message`. See Note [Errors] in `specialize`.
+fn error_value<'s, 'i>(message: String) -> LBoxed<'s, 'i> {
+    string(message.into_bytes())
 }
 
 /// `type`'s name for a value's type.
-fn type_name(v: LBoxed) -> &'static [u8] {
+pub(crate) fn type_name(v: LBoxed) -> &'static [u8] {
     match v.unbox() {
         LValue::Nil => b"nil",
         LValue::Bool(_) => b"boolean",
@@ -150,7 +150,7 @@ macro_rules! native {
             for (slot, &result) in returns.iter_mut().zip(results.iter()) {
                 *slot = result;
             }
-            results.len().min(returns.len())
+            Ok(results.len().min(returns.len()))
         }
     };
 }
@@ -597,7 +597,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                     results.extend(found.explicit()?.into_iter().map(|c| capture(&s, c)));
                     Ok(results)
                 });
-                found.unwrap_or_else(|message| raise(message)).unwrap_or_else(|| smallvec![LBoxed::NIL])
+                found.map_err(error_value)?.unwrap_or_else(|| smallvec![LBoxed::NIL])
             }
         })),
         ("match", native!(pure |owner, args| {
@@ -605,7 +605,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             let found = patterns::find(&s, &p, init(s.len(), arg(&args, 2)), |found| {
                 Ok(found.captures()?.into_iter().map(|c| capture(&s, c)).collect())
             });
-            found.unwrap_or_else(|message| raise(message)).unwrap_or_else(|| smallvec![LBoxed::NIL])
+            found.map_err(error_value)?.unwrap_or_else(|| smallvec![LBoxed::NIL])
         })),
         ("gsub", native!(pure |owner, args| {
             let (s, p, replacement) = (bytes(arg(&args, 0)), bytes(arg(&args, 1)), arg(&args, 2));
@@ -629,9 +629,9 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                     }
                 }),
                 LValue::LClosure(_) | LValue::NClosure(_) => unimplemented!("string.gsub with a function replacement: a native can't call a function"),
-                _ => raise("bad argument #3 to 'gsub' (string/function/table expected)".into()),
+                _ => return Err(error_value("bad argument #3 to 'gsub' (string/function/table expected)".into())),
             };
-            let (out, n) = replaced.unwrap_or_else(|message| raise(message));
+            let (out, n) = replaced.map_err(error_value)?;
             smallvec![string(out), LBoxed::from_int(n as i32)]
         })),
     ]);
@@ -757,14 +757,18 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         };
         match metatable {
             Ok(metatable) => smallvec![LBoxed::box_lvalue(LValue::Userdata(Tc::new(Userdata::new(metatable))))],
-            Err(()) => raise("bad argument #1 to 'newproxy' (boolean or proxy expected)".into()),
+            Err(()) => return Err(error_value("bad argument #1 to 'newproxy' (boolean or proxy expected)".into())),
         }
     });
-    // Lunacy has no `pcall`: an error ends the run.
-    let error = native!(pure |owner, args| {
-        let message = arg(&args, 0).unbox().as_string(owner).map(|s| String::from_utf8_lossy(s.as_slice()).into_owned());
-        raise(message.unwrap_or_else(|| format!("{:?}", arg(&args, 0).unbox())))
-    });
+    // A call of `pcall` is a protected call of its first argument, which the specializer
+    // lays out at the call site; this runs only for a call site that doesn't
+    // specialize. See Note [Errors] in `specialize`.
+    let pcall = LValue::NClosure(NClosure::protected_call(native!(@fn owner, args, {
+        let _ = &args;
+        return Err(error_value("not implemented: pcall from a call site that isn't specialized".into()))
+    })));
+    // Its argument, whatever it is, is the error. See Note [Errors] in `specialize`.
+    let error = native!(pure |owner, args| return Err(arg(&args, 0)));
 
     let require = native!(pure |owner, args| {
         let name = bytes(arg(&args, 0));
@@ -790,6 +794,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "require"), require),
         (InternString::intern(intern, "unpack"), unpack),
         (InternString::intern(intern, "error"), error),
+        (InternString::intern(intern, "pcall"), pcall),
         (InternString::intern(intern, "newproxy"), newproxy),
         (InternString::intern(intern, "string"), string_lib),
         (InternString::intern(intern, "table"), table_lib),

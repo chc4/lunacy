@@ -196,6 +196,15 @@ impl JitHelper {
         }
     }
 
+    /// Raise `error`, a native's, called from JIT code. See Note [Errors] in
+    /// `specialize`.
+    pub unsafe extern "C" fn raise(state: *mut (), error: u64) {
+        unsafe {
+            let state = &mut *(state as *mut RunState<'static, 'static>);
+            state.raise(LBoxed::from_bits(error));
+        }
+    }
+
     /// A call from JIT code of the native `nf` taking every result, through
     /// `call_native`: there may be more than the call's slots.
     pub unsafe extern "C" fn native_call(state: *mut (), nf: usize, a: u16, b: u16) {
@@ -2018,6 +2027,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let past_arrive = insts[off + 2];
                 dynasm!(ops
                     ; .arch x64
+                    // A native's error exits as an exec's trap does. See Note [Errors] in
+                    // `specialize`.
+                    ; cmp BYTE r12 => RunState.trap, 0
+                    ; jz >no_trap
+                    ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                    ; jmp ->exit_jit
+                    ; no_trap:
                     ; cmp rax, 1
                     // One, we just fully called a native function and we need to skip the Arrive
                     // operation immediately after this.
@@ -2372,13 +2388,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::NativeCall { nf, a, b, c } if *c == 0 => {
                     // Taking every result, which may be more than the call's slots
                     // (`unpack`): `call_native` makes room for them.
+                    // An error it raises exits as an exec's trap does. See Note [Errors]
+                    // in `specialize`.
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r12 // state
                         ; mov rsi, QWORD (*nf as usize as i64)
                         ; mov edx, *a as i32
                         ; mov ecx, *b as i32
+                        ; mov WORD r12 => RunState.current_off, ((off + 1) as i16)
                         ; call extern (JitHelper::native_call as *const () as usize)
+                        ; cmp BYTE r12 => RunState.trap, 0
+                        ; jz >no_trap
+                        ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; jmp ->exit_jit
+                        ; no_trap:
                     );
                 },
                 Residual::NativeCall { nf, a, b, c } => {
@@ -2422,6 +2446,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; lea rdi, [r13 + ((a + 1) * 8)] // args ptr = &vals[base + a + 1]
                         ; lea rdx, [r13 + (a * 8)]       // returns ptr = &vals[base + a]
                         ; call extern (*nf as usize)     // direct, statically-known target
+                    );
+                    // It returns a `Result<usize, LBoxed>`: in al bit 0 whether it's an
+                    // error, and in rdx the count or the error. An error exits as an
+                    // exec's trap does. See Note [Errors] in `specialize`.
+                    dynasm!(ops
+                        ; .arch x64
+                        ; test al, 1
+                        ; jz >native_ok
+                        ; mov rdi, r12
+                        ; mov rsi, rdx
+                        ; mov WORD r12 => RunState.current_off, ((off + 1) as i16)
+                        ; call extern (JitHelper::raise as *const () as usize)
+                        ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; jmp ->exit_jit
+                        ; native_ok:
+                        ; mov rax, rdx
                     );
                     // Taking every result, the caller reads up to the top: the
                     // native returns how many it wrote, within the slots it got.

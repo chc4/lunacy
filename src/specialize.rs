@@ -1664,6 +1664,24 @@ impl Effects {
     }
 }
 
+// Note [Errors]
+// ~~~~~~~~~~~~~~
+// An error is any value, raised by a native (its `Err`), by `error`, or by the run loop for a
+// call of what isn't a function. It is pending on the run's state until the run loop unwinds
+// it; JIT code raising one exits to the run loop first, as it does for a trap.
+//
+// A protected call (`pcall`) is laid out at its call site as a call of its first argument
+// between pushing a handler and popping it: the callstack's depth at the call, the slot its
+// results go to, how many it wants, and the block the code after it continues at. Unwinding
+// pops the innermost handler and the frames above its depth, closing their upvalues as their
+// returns would, and continues after the call with false and the error as its results. An
+// error with no handler ends the program. `error` adds no position to a message, whatever its
+// level.
+//
+// The code after a protected call knows nothing of its results, and its effects are opaque:
+// the call may have stopped anywhere. A `pcall` whose call site doesn't specialize its callee
+// has no handler pushed for it, and raises an error instead.
+
 // Note [Known top]
 // ~~~~~~~~~~~~~~~~
 // A CALL with C = 0 leaves every result from R(A) up, and the frame's top
@@ -2994,6 +3012,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // See Note [Call effects].
                     vm.join_effects(owner, Effects::OPAQUE);
                 },
+                // An error raised in it continues after it. See Note [Errors].
+                LValue::NClosure(nf) if nf.is_protected_call() && identities < MAX_VERSIONS => {
+                    layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
+                    layout.push(next(vm));
+                    let after = after.block(vm, owner);
+                    layout.extend(Self::protected_call(a, b, c, after));
+                    layout.push(Residual::Jump(after));
+                    vm.blocks[block.0].instructions.extend(layout);
+                    vm.join_effects(owner, Effects::OPAQUE);
+                    return;
+                },
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
                     layout.push(next(vm));
@@ -3119,6 +3148,36 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// (`identities`); a call of a native, guarded likewise, and a return of its
     /// results; past that, or for what isn't a function, a generic call and a
     /// return of its results. See Note [Tail calls].
+    /// The layout of a protected call (`pcall`) in R(A) with B and C, an error
+    /// raised in it continuing at `after`: its handler pushed, a call of R(A+1)
+    /// with the rest of the arguments, and on its return the handler popped and
+    /// true before its results. See Note [Errors].
+    fn protected_call(a: usize, b: usize, c: usize, after: BlockId) -> Vec<Residual> {
+        if b == 1 {
+            return vec![Residual::Exec(ResidualExec::new("pcall_argument", Rc::new(|_owner, state| {
+                state.raise(LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::string(b"bad argument #1 to 'pcall' (value expected)"))));
+            })))];
+        }
+        // One fewer argument, and one fewer result, but for none (C = 1) or all
+        // (C = 0) of them.
+        let (callee_b, callee_c) = (b.saturating_sub(1), if c <= 1 { c } else { c - 1 });
+        let c16 = c as u16;
+        vec![
+            Residual::Exec(ResidualExec::new("pcall", Rc::new(move |_owner, state| {
+                let handler = crate::vm::Handler { depth: state.callstack.len(), slot: state.base + a, c: c16, after };
+                state.handlers.push(handler);
+            }))),
+            Residual::Call { a: a as u16 + 1, b: callee_b as u16, c: callee_c as u16 },
+            Residual::Arrive { a: a as u16 + 1, c: callee_c as u16 },
+            Residual::Exec(ResidualExec::new("pcall_return", Rc::new(move |_owner, state| {
+                state.handlers.pop();
+                state.vals[state.base + a] = LBoxed::from_bool(true);
+            }))),
+            // It may call a native, which may allocate.
+            Residual::GC,
+        ]
+    }
+
     fn make_tail_call_thunk(&self, block_id: BlockId, site: Rc<TailSite>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, as for a call thunk. See Note [Thunk patching].
@@ -3146,6 +3205,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let entry = Rc::new(entry_context(calling, unsafe { &*proto }, a, b));
                     let callee_effects: *const Cell<Effects> = vm.effects_of(proto.cast());
                     layout.push(Residual::TailCall { entry: CallEntry::Context(entry), a: a16, b: b16, closes, vararg, effects, callee_effects });
+                },
+                // Returning its results, or false and the error. See Note [Errors].
+                LValue::NClosure(nf) if nf.is_protected_call() && identities < MAX_VERSIONS => {
+                    layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
+                    layout.push(next(vm));
+                    let after = vm.new_block(vm.blocks[block.0].pc);
+                    vm.blocks[after.0].instructions.push(ret.clone());
+                    layout.extend(Self::protected_call(a, b, 0, after));
+                    layout.push(ret);
+                    vm.join_effects(owner, Effects::OPAQUE);
                 },
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
@@ -3689,8 +3758,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let mut result = None;
                             let mut pure = false;
                             let calling = ctx.clone();
-                            let native = matches!(ctx.types[a], CType::NativeFunction(_));
-                            if let CType::NativeFunction(nf) = &ctx.types[a] {
+                            // A protected call's is laid out by the call thunk, which
+                            // needs a continuation for it to unwind to. See Note [Errors].
+                            let native = matches!(&ctx.types[a], CType::NativeFunction(nf) if !nf.is_protected_call());
+                            if native && let CType::NativeFunction(nf) = &ctx.types[a] {
                                 // A native runs as a window op if we have one, and we have all of its
                                 // arguments of the type it assumes. It gives one result, even with
                                 // C = 0.
@@ -3899,6 +3970,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // SAFETY: We have no unrooted variables or parameters.
                 unsafe { gc.step(&state, &*self, owner); }
             }
+            // See Note [Errors].
+            if state.error.is_some() {
+                (id, off) = (self.unwind(owner, &mut state), 0);
+            }
             let block = &mut self.blocks[id.0];
             #[cfg(feature = "graph")]
             if off == 0 {
@@ -3970,6 +4045,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // thunk at offset=0, we don't want to jump back to the JIT again.
                     }
                 }
+            }
+            // An error JIT code exited for. See Note [Errors].
+            if state.error.is_some() {
+                (id, off) = (self.unwind(owner, &mut state), 0);
+                continue;
             }
             if state.gas > 0 && state.gas < 100 {
                 let res = &self.blocks[id.0].instructions[off];
@@ -4149,7 +4229,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         off += 1;
                         // FIXME(metatables): __call
                     } else {
-                        panic!("cant call {:?}", to_call);
+                        // See Note [Errors].
+                        let name = String::from_utf8_lossy(crate::library::type_name(state.vals[state.base + a as usize]));
+                        state.raise(LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::string(format!("attempt to call a {name} value").as_bytes()))));
                     }
                 },
                 &Residual::Jump(target) => {
@@ -4200,6 +4282,47 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
             }
         }
+    }
+
+    /// Unwind the pending error to the innermost protected call: pop the call's
+    /// frames, if its function is a Lua function, closing their upvalues; its
+    /// results are false and the error, and the code after it continues, where
+    /// this returns. An error with no protected call ends the program. See Note
+    /// [Errors].
+    fn unwind(&mut self, owner: &mut Owner, state: &mut RunState<'src, 'intern>) -> BlockId {
+        let error = state.error.take().expect("a pending error");
+        state.trap = false;
+        let Some(handler) = state.handlers.pop() else {
+            let message = error.unbox().as_string(owner).map(|s| String::from_utf8_lossy(s.as_slice()).into_owned());
+            panic!("error: {}", message.unwrap_or_else(|| format!("{:?}", error.unbox())));
+        };
+        if state.callstack.len() > handler.depth {
+            // The call's function's frame starts where the frame above its own
+            // entry was called from, or is the running one.
+            let callee = state.callstack.get(handler.depth + 1).map_or(state.base, |entry| entry.frame);
+            state.close_upvalues_from(owner, callee);
+            let entry = &state.callstack[handler.depth];
+            let (clos, frame, witness_frame, witness_top) = (entry.clos.clone(), entry.frame, entry.witness_frame, entry.witness_top);
+            state.callstack.truncate(handler.depth);
+            state.clos = clos;
+            state.base = frame;
+            state.witness_base = witness_frame;
+            state.witness_top = witness_top;
+        }
+        // `c - 1` results, or both with C = 0, the top just past them.
+        let results = [LBoxed::from_bool(false), error];
+        let wanted = if handler.c == 0 { 2 } else { handler.c as usize - 1 };
+        if handler.slot + wanted > state.vals.len() {
+            state.vals.lengthen(handler.slot + wanted);
+        }
+        for i in 0..wanted {
+            state.vals[handler.slot + i] = results.get(i).copied().unwrap_or(LBoxed::NIL);
+        }
+        if handler.c == 0 {
+            state.top = handler.slot + 2;
+        }
+        self.set_current(state.clos.clone());
+        handler.after
     }
 
     /// Force the entry blocks of the prototypes `closure.__jit = ...` named (feature

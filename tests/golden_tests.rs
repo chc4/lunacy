@@ -116,7 +116,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
                 ).collect::<Vec<_>>();
                 let output = s.into_iter().intersperse("\t".to_string()).collect::<String>();
                 CAPTURED.with(|c| c.rw(owner).push(output));
-                0
+                Ok(0)
             })));
             _g.set(owner, print_key, custom_print, s.intern());
 
@@ -125,7 +125,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
             let mut index = vm::Table::new(0, 1);
             index.insert_lvalue(vm::InternString::intern(s.intern(), "answer"), vm::LValue::NClosure(vm::NClosure::pure(|mut seq, _args, returns, _owner| {
                 returns.rw(&mut seq).iter_mut().next().map(|r| *r = vm::LBoxed::from_double(42.0));
-                1
+                Ok(1)
             })));
             let mut metatable = vm::Table::new(0, 1);
             metatable.insert_lvalue(vm::InternString::intern(s.intern(), "__index"), vm::LValue::Table(vm::Tc::new(index)));
@@ -137,7 +137,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
                 let metatable = unsafe { vm::LBoxed::from_bits(USERDATA_METATABLE.with(|bits| bits.get())) }.as_table();
                 let userdata = vm::LValue::Userdata(vm::Tc::new(vm::Userdata::new(metatable)));
                 returns.rw(&mut seq).iter_mut().next().map(|r| *r = vm::LBoxed::box_lvalue(userdata));
-                1
+                Ok(1)
             })));
             _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "make_userdata")), make_userdata, s.intern());
 

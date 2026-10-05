@@ -1182,11 +1182,12 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
 
 /// A native function: from its arguments, it writes its results into the slots
 /// for them (which overlap the arguments; see Note [Library natives] in
-/// `library`), and returns how many it wrote.
-pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner) -> usize;
+/// `library`), and returns how many it wrote, or the error it raises (Note
+/// [Errors] in `specialize`).
+pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner) -> Result<usize, LBoxed<'src, 'intern>>;
 /// A native function given the owner shared, so it writes no object the
 /// program can see. See Note [Library natives] in `library`.
-pub type PureNativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &Owner) -> usize;
+pub type PureNativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &Owner) -> Result<usize, LBoxed<'src, 'intern>>;
 /// A native's window op for a call to it (the `CALL`'s `a`, `b`, `c`), with
 /// which of its arguments are in the integer encoding (`ints`), if it has one
 /// for that call's arity. See Note [Native windows] in `library`.
@@ -1245,17 +1246,30 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: NativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(native, None, false) }
+        NClosure { cell: NClosureCell::leak(native, None, false, false) }
     }
 
     /// A pure native. See Note [Library natives] in `library`.
     pub fn pure(native: PureNativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), None, true) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, true, false) }
+    }
+
+    /// `pcall`, whose call is laid out as a protected call of its first
+    /// argument, `native` running only for a call site that doesn't specialize.
+    /// See Note [Errors] in `specialize`.
+    pub fn protected_call(native: PureNativeFunc) -> Self {
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, true, true) }
+    }
+
+    /// Whether a call of it is a protected call of its first argument. See
+    /// Note [Errors] in `specialize`.
+    pub fn is_protected_call(&self) -> bool {
+        self.cell.protects
     }
 
     /// A pure native that runs as a window op where `window` gives one.
     pub fn pure_windowed(native: PureNativeFunc, window: NativeWindow) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), Some(window), true) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), Some(window), true, false) }
     }
 
     /// A pure native, as natives are called: with the owner mutable, which it
@@ -1489,6 +1503,20 @@ impl<'src, 'intern> CallstackEntry<'src, 'intern> {
     }
 }
 
+/// A protected call's handler: where an error raised in it goes. See Note
+/// [Errors] in `specialize`.
+#[derive(Debug, Clone, Copy)]
+pub struct Handler {
+    /// The callstack's length at the call: the frames above it are the call's.
+    pub depth: usize,
+    /// The slot of the called `pcall`, absolute, where the call's results go.
+    pub slot: usize,
+    /// The call's C: one more than the results it wants, or 0 for all of them.
+    pub c: u16,
+    /// The block the code after the call continues at.
+    pub after: BlockId,
+}
+
 /// Where a frame's hash key was found in its table's hash part (its entry's
 /// index, and its value's address), and the table, by address, and its epoch
 /// then. See Note [Hash witnesses].
@@ -1605,6 +1633,11 @@ pub struct RunState<'src, 'intern> {
     pub witness_top: usize,
     pub hash_witnesses: Witnesses,
     pub trap: bool,
+    /// The error raised and not yet handled. See Note [Errors] in `specialize`.
+    pub error: Option<LBoxed<'src, 'intern>>,
+    /// The protected calls running, innermost last. See Note [Errors] in
+    /// `specialize`.
+    pub handlers: FVec<Handler>,
     pub current_off: u16,
     /// What a return from JIT code leaves the JIT code with: where its caller
     /// continues (a `PackedLocation`), or -2 for a return from the entry
@@ -1690,15 +1723,25 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             unimplemented!()
         };
         let wanted = returns.len();
-        let mut count = 0;
+        let mut result = Ok(0);
         LCellOwner::scope(|mut seq| {
             // Safety: LCellOwner guarantees that the native function can only ever
             // have mutable access to one slice at a time. The transmute wraps the
             // aliased stack slices in-place as `LCell`s (repr(transparent) over UnsafeCell).
             let args = unsafe { core::mem::transmute(seq.cell(args)) };
             let returns = unsafe { core::mem::transmute(seq.cell(returns)) };
-            count = (nf)(seq, args, returns, owner);
+            result = (nf)(seq, args, returns, owner);
         });
+        let count = match result {
+            Ok(count) => count,
+            Err(error) => {
+                if c == 0 {
+                    self.vals.truncate(len);
+                }
+                self.raise(error);
+                return;
+            },
+        };
         // Taking every result, the caller reads up to the top; wanting `c - 1`,
         // the ones it didn't write are nil.
         if c == 0 {
@@ -2006,6 +2049,13 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
+    /// Raise `error`: the run loop unwinds to the innermost protected call, and
+    /// JIT code exits to it first. See Note [Errors] in `specialize`.
+    pub fn raise(&mut self, error: LBoxed<'src, 'intern>) {
+        self.error = Some(error);
+        self.trap = true;
+    }
+
     /// The table whose hash part the hash keys of `slot` of the running frame
     /// are in: a table's own, or a userdata's `__index` table, if it has one.
     /// See Note [Userdata fields] in `specialize`.
@@ -2047,6 +2097,9 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
         self.vals.truncate(extent);
         self.clos.mark(owner);
         self._G.mark(owner);
+        if let Some(error) = &self.error {
+            error.mark(owner);
+        }
         // The open upvalues' cells, which `close_upvalues` closes when their frame
         // returns: a closure capturing one may be garbage before then. Their values
         // are the stack's, marked above.
@@ -2086,7 +2139,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         // argument with `as_number()` and write the result back as a boxed double.
         math_tab.insert_lvalue(InternString::intern(intern, "huge"), LValue::NClosure(NClosure::pure(|mut seq, args, returns, _owner|{
             returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::from_double(f64::INFINITY));
-            1
+            Ok(1)
         })));
         math_tab.insert_lvalue(InternString::intern(intern, "pi"), LValue::Double(Number(std::f64::consts::PI)));
         for (name, native) in crate::library::math_natives() {
@@ -2113,15 +2166,22 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     ).collect::<Vec<_>>();
                     //println!("> {}", String::from_utf8_lossy(s.iter().into()));
                     println!("{}", s.iter().intersperse(&"\t".to_string()).cloned().collect::<String>());
-                    0
+                    Ok(0)
                 }))),
-                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::pure(|seq, args, _returns, _owner| {
-                    if let [b, ..] = args.ro(&seq) {
-                        if let LValue::Bool(false) = b.unbox() {
-                            panic!("lua assert failed");
-                        }
+                // Lua's `assert(v [, message])`: its arguments, unless `v` is false or nil,
+                // where it raises `message`, or "assertion failed!".
+                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::pure(|mut seq, args, returns, _owner| {
+                    let args: smallvec::SmallVec<[LBoxed<'_, '_>; 4]> = smallvec::SmallVec::from_slice(args.ro(&seq));
+                    match args.first() {
+                        Some(v) if v.truthy() => {
+                            let returns = returns.rw(&mut seq);
+                            for (slot, &arg) in returns.iter_mut().zip(args.iter()) {
+                                *slot = arg;
+                            }
+                            Ok(args.len().min(returns.len()))
+                        },
+                        _ => Err(args.get(1).copied().unwrap_or_else(|| LBoxed::box_lvalue(LValue::OwnedString(Gc::string(b"assertion failed!"))))),
                     }
-                    0
                 }))),
                 // Lua's `collectgarbage(opt [, arg])`: drive the collector explicitly.
                 (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
@@ -2145,7 +2205,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         _ => LValue::Nil,
                     };
                     returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::box_lvalue(result));
-                    1
+                    Ok(1)
                 }))),
                 math,
                 os,
@@ -2302,6 +2362,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 hash_witnesses: Witnesses::new(),
                 select: 0,
                 trap: false,
+                error: None,
+                handlers: vec![].into(),
                 #[cfg(feature = "magic")]
                 force_jit: vec![].into(),
                 current_off: 0,
