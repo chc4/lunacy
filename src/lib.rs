@@ -46,6 +46,7 @@ pub mod gc;
 #[cfg(feature = "tracing")]
 pub mod tracing;
 pub mod library;
+pub mod patterns;
 
 pub use vm::Vm;
 /// Marker branding the per-thread cell owner. `Owner` is unique per thread — a second

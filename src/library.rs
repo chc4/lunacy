@@ -12,6 +12,7 @@ use crate::gc::Gc;
 use crate::lboxed::LBoxed;
 use crate::vm::{FVec, IStr, InternString, InternedHasher, LType, LValue, NClosure, Table, Tc, Userdata};
 use crate::vm::NativeOp;
+use crate::patterns::{self, Capture};
 
 // Note [Library natives]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -64,10 +65,61 @@ thread_local! {
 // (B = 0) has a fixed arity when the specializer knows the top. See Note [Known
 // top] in `specialize`.
 
-/// `error`'s results: it has none, as it raises `message`, which ends the
-/// program.
-fn raise<'s, 'i>(message: String) -> SmallVec<[LBoxed<'s, 'i>; 4]> {
+/// Raise `message` as an error, which ends the program.
+fn raise(message: String) -> ! {
     panic!("error: {message}")
+}
+
+/// `type`'s name for a value's type.
+fn type_name(v: LBoxed) -> &'static [u8] {
+    match v.unbox() {
+        LValue::Nil => b"nil",
+        LValue::Bool(_) => b"boolean",
+        LValue::Integer(_) | LValue::Double(_) => b"number",
+        LValue::InternedString(_) | LValue::OwnedString(_) => b"string",
+        LValue::Table(_) => b"table",
+        LValue::LClosure(_) | LValue::NClosure(_) => b"function",
+        LValue::Userdata(_) => b"userdata",
+    }
+}
+
+/// A capture of a match in `src`: its bytes, or its position. See Note
+/// [Patterns] in `patterns`.
+fn capture<'s, 'i>(src: &[u8], capture: Capture) -> LBoxed<'s, 'i> {
+    match capture {
+        Capture::Bytes(range) => string(src[range].to_vec()),
+        Capture::Position(at) => LBoxed::from_int(at as i32),
+    }
+}
+
+/// Where `string.find` and `string.match` start, from their `init`
+/// argument: 1-based and negative from the end, clamped to the string.
+fn init(len: usize, v: LBoxed) -> usize {
+    let init = number_or(v, 1.0) as i64;
+    let init = if init < 0 { init + len as i64 + 1 } else { init };
+    (init - 1).clamp(0, len as i64) as usize
+}
+
+/// `string.gsub`'s replacement string for a match: `%0` to `%9` its captures,
+/// `%` and anything else that byte.
+fn substitute(src: &[u8], replacement: &[u8], found: &patterns::Found) -> Result<Vec<u8>, String> {
+    let mut out = vec![];
+    let mut bytes = replacement.iter();
+    while let Some(&b) = bytes.next() {
+        if b != b'%' {
+            out.push(b);
+            continue;
+        }
+        match bytes.next().copied().unwrap_or(0) {
+            b'0' => out.extend_from_slice(&src[found.range.clone()]),
+            d @ b'1'..=b'9' => match found.capture((d - b'1') as usize)? {
+                Capture::Bytes(range) => out.extend_from_slice(&src[range]),
+                Capture::Position(at) => out.extend_from_slice(at.to_string().as_bytes()),
+            },
+            other => out.push(other),
+        }
+    }
+    Ok(out)
 }
 
 /// A native computing its results from its arguments. See Note [Library natives].
@@ -481,18 +533,7 @@ fn module<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, L
 
 /// The library's globals, by name, to install in the global table.
 pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'s, 'i>, LValue<'s, 'i>)> {
-    let type_ = native!(pure |owner, args| {
-        let name: &[u8] = match arg(&args, 0).unbox() {
-            LValue::Nil => b"nil",
-            LValue::Bool(_) => b"boolean",
-            LValue::Integer(_) | LValue::Double(_) => b"number",
-            LValue::InternedString(_) | LValue::OwnedString(_) => b"string",
-            LValue::Table(_) => b"table",
-            LValue::LClosure(_) | LValue::NClosure(_) => b"function",
-            LValue::Userdata(_) => b"userdata",
-        };
-        smallvec![string(name.to_vec())]
-    });
+    let type_ = native!(pure |owner, args| smallvec![string(type_name(arg(&args, 0)).to_vec())]);
     let tostring = native!(pure |owner, args| {
         let s = arg(&args, 0).unbox().as_string(owner).expect("a string form");
         smallvec![LBoxed::box_lvalue(LValue::OwnedString(s))]
@@ -536,6 +577,58 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             smallvec![string(out)]
         })),
         ("format", native!(pure |owner, args| smallvec![string(format(&bytes(arg(&args, 0)), args.get(1..).unwrap_or(&[])))])),
+        // See Note [Patterns] in `patterns`.
+        ("find", native!(pure |owner, args| {
+            let (s, p) = (bytes(arg(&args, 0)), bytes(arg(&args, 1)));
+            let init = init(s.len(), arg(&args, 2));
+            if arg(&args, 3).truthy() || !patterns::has_specials(&p) {
+                match patterns::find_plain(&s[init..], &p) {
+                    Some(at) => smallvec![LBoxed::from_int((init + at + 1) as i32), LBoxed::from_int((init + at + p.len()) as i32)],
+                    None => smallvec![LBoxed::NIL],
+                }
+            } else {
+                let found = patterns::find(&s, &p, init, |found| {
+                    let mut results: SmallVec<[LBoxed<'_, '_>; 4]> = smallvec![LBoxed::from_int(found.range.start as i32 + 1), LBoxed::from_int(found.range.end as i32)];
+                    results.extend(found.explicit()?.into_iter().map(|c| capture(&s, c)));
+                    Ok(results)
+                });
+                found.unwrap_or_else(|message| raise(message)).unwrap_or_else(|| smallvec![LBoxed::NIL])
+            }
+        })),
+        ("match", native!(pure |owner, args| {
+            let (s, p) = (bytes(arg(&args, 0)), bytes(arg(&args, 1)));
+            let found = patterns::find(&s, &p, init(s.len(), arg(&args, 2)), |found| {
+                Ok(found.captures()?.into_iter().map(|c| capture(&s, c)).collect())
+            });
+            found.unwrap_or_else(|message| raise(message)).unwrap_or_else(|| smallvec![LBoxed::NIL])
+        })),
+        ("gsub", native!(pure |owner, args| {
+            let (s, p, replacement) = (bytes(arg(&args, 0)), bytes(arg(&args, 1)), arg(&args, 2));
+            let max = if arg(&args, 3).bits() == LBoxed::NIL.bits() { s.len() as i64 + 1 } else { number(arg(&args, 3)) as i64 };
+            let replaced = match replacement.unbox() {
+                LValue::Integer(_) | LValue::Double(_) | LValue::InternedString(_) | LValue::OwnedString(_) => {
+                    let replacement = bytes(replacement);
+                    patterns::gsub(&s, &p, max, |found| substitute(&s, &replacement, found).map(Some))
+                },
+                // The value at the first capture, raw, if it's a string or a number;
+                // a false one keeps the match.
+                LValue::Table(t) => patterns::gsub(&s, &p, max, |found| {
+                    let value = match found.capture(0)? {
+                        Capture::Bytes(range) => t.get_string(owner, &s[range]),
+                        Capture::Position(at) => t.get_number(owner, at as f64),
+                    };
+                    match value.unbox() {
+                        LValue::Nil | LValue::Bool(false) => Ok(None),
+                        LValue::Integer(_) | LValue::Double(_) | LValue::InternedString(_) | LValue::OwnedString(_) => Ok(Some(bytes(value))),
+                        _ => Err(format!("invalid replacement value (a {})", String::from_utf8_lossy(type_name(value)))),
+                    }
+                }),
+                LValue::LClosure(_) | LValue::NClosure(_) => unimplemented!("string.gsub with a function replacement: a native can't call a function"),
+                _ => raise("bad argument #3 to 'gsub' (string/function/table expected)".into()),
+            };
+            let (out, n) = replaced.unwrap_or_else(|message| raise(message));
+            smallvec![string(out), LBoxed::from_int(n as i32)]
+        })),
     ]);
 
     let table_new = native!(pure |owner, args| {

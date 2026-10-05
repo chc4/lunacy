@@ -613,6 +613,13 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
         self.rw(owner).epoch += 1;
     }
 
+    /// Look up a string key by its bytes, which needs no intern arena: a key
+    /// that's a string is interned, and this hashes as it does. See Note
+    /// [Canonical values].
+    pub fn get_string(&self, owner: &Owner, bytes: &[u8]) -> LBoxed<'src, 'intern> {
+        self.ro(owner).hash.get(&StringBytes(bytes)).copied().unwrap_or(LBoxed::NIL)
+    }
+
     /// Look up a number key, which needs no intern arena to canonicalize.
     pub fn get_number(&self, owner: &Owner, n: f64) -> LBoxed<'src, 'intern> {
         match array_slot(n) {
@@ -812,6 +819,22 @@ impl<'src, 'intern> crate::gc::CellKind for TLCell<TlcOwner, Userdata<'src, 'int
 // Hashing agrees with that equality: an interned string hashes by its precomputed content
 // hash (so strings spread by content, not by arena address), everything else by its bits.
 // Equal bits give equal hashes.
+/// A string's bytes as a hash key: equal to the interned string of those bytes,
+/// and hashed as it is (`intern_bytes`). See Note [Canonical values].
+struct StringBytes<'b>(&'b [u8]);
+
+impl Hash for StringBytes<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(FxBuildHasher::default().hash_one(self.0));
+    }
+}
+
+impl<'src, 'intern> indexmap::Equivalent<LCanon<'src, 'intern>> for StringBytes<'_> {
+    fn equivalent(&self, key: &LCanon<'src, 'intern>) -> bool {
+        matches!(key.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == self.0)
+    }
+}
+
 /// An `LBoxed` in canonical form, giving owner-free `Hash`/`Eq`. See Note [Canonical values].
 #[derive(Clone, Copy)]
 #[repr(transparent)]
