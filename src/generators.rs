@@ -228,7 +228,19 @@ pub fn emit_loadnil(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yie
 }
 
 // Load a field through its hash key's witness. See Note [Hash witnesses].
-windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
+/// `receiver[key]` as Lua reads it, through `__index`: the cold paths of the
+/// loads that found nil. `rust-cold` (LLVM's `preserve_most`), so a cold
+/// stencil calling it with its window live needn't save the window around the
+/// call. See Notes [Table metatables] in `specialize` and [Cold stencils] in
+/// `window`.
+extern "rust-cold" fn index_value<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, receiver: LBoxed<'src, 'intern>, key: LBoxed<'src, 'intern>) -> LBoxed<'src, 'intern> {
+    LBoxed::box_lvalue(receiver.unbox().gettable(owner, Cow::Owned(key.unbox()), state.intern))
+}
+
+// A field through its hash key's witness, of `receiver`, whose key is `key`. A
+// nil one is looked up again as Lua reads it, through its `__index`. See Note
+// [Table metatables] in `specialize`.
+windowed!(GetTableHref, [href: u8, key: u64], [], |owner, state, base| (receiver, out dest) {
     // Written by the frame's `href_init` already. See Note [Hash
     // witnesses].
     let witness = state.hash_witnesses[state.witness_base + href as usize];
@@ -239,6 +251,9 @@ windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
 
     debug!("gettable_href fetched {val1:?}");
     *dest = val1;
+    dest.bits() == LBoxed::NIL.bits()
+} rejoin {
+    *dest = index_value(owner, state, receiver, LBoxed::from_bits(key));
 });
 
 // GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
@@ -260,7 +275,16 @@ windowed!(GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
     }
 } rejoin {
     let cache = &*(cache as *const GlobalCache);
-    *dest = cache.refill(owner, &state._G).map_or(LBoxed::NIL, |entry| *entry.cast());
+    // A global the environment lacks is its `__index`'s. See Note [Table metatables]
+    // in `specialize`.
+    *dest = match cache.refill(owner, &state._G) {
+        Some(entry) => *entry.cast(),
+        None => {
+            let key: &LCanon<'_, '_> = core::mem::transmute(&cache.key);
+            let env = LBoxed::box_lvalue(LValue::Table(state._G.clone()));
+            index_value(owner, state, env, key.boxed())
+        },
+    };
 });
 // A string's field, from the strings' table through the cache of its constant
 // key. See Note [String methods] in `specialize`.
@@ -330,7 +354,17 @@ pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield =
     #[coroutine]
     move |mut arg: ResumeArg| {
         let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
-        arg = yield YieldOp::ExecWindow(Rc::new(SetGlobal::new(cache as usize, &[src])));
+        // A store to `__index` moves the environment to a new epoch, as only the
+        // generic store does. See Note [Table metatables] in `specialize`.
+        arg = if (yield YieldOp::IsKey(k, b"__index")) == ResumeArg::Matched {
+            let cache = cache as usize;
+            yield YieldOp::Exec(ResidualExec::new("setglobal_index", Rc::new(move |owner, state| {
+                let value = state.vals[state.base + src];
+                set_global(owner, state, unsafe { &*(cache as *const GlobalCache) }, value);
+            })))
+        } else {
+            yield YieldOp::ExecWindow(Rc::new(SetGlobal::new(cache as usize, &[src])))
+        };
         // A register may hold the environment: its hash keys of this global must
         // check the epoch again.
         yield YieldOp::SetKeyHazards(k);
@@ -401,7 +435,8 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c);
         if let ResumeArg::HashRef(hc, htype) = arg {
-            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, &[a])));
+            let ResumeArg::Boxed(key) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
+            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, key, &[b, a])));
             // Its type: the hash key's, or found out. See Note [Field types].
             yield YieldOp::FieldType(a, hc);
         } else if !table {
@@ -428,9 +463,14 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 None => yield YieldOp::Decided(false),
             };
             if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
+                // A nil element of a table with a metatable is its `__index`'s. See
+                // Note [Table metatables] in `specialize`.
                 windowed!(GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
                     let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     *dest = tab.ro(owner).array[integer_slot(k)];
+                    dest.bits() == LBoxed::NIL.bits() && tab.ro(owner).metatable.is_some()
+                } rejoin {
+                    *dest = index_value(owner, state, table, LBoxed::from_int(k));
                 });
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableArray::new(k, &[b, a])));
                 yield YieldOp::ArrayType(a, b);
@@ -438,6 +478,9 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
                     let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     *dest = tab.ro(owner).array[integer_slot(key.as_int())];
+                    dest.bits() == LBoxed::NIL.bits() && tab.ro(owner).metatable.is_some()
+                } rejoin {
+                    *dest = index_value(owner, state, table, key);
                 });
                 arg = yield YieldOp::ExecWindow(Rc::new(GetTableInteger::new(&[b, c, a])));
                 yield YieldOp::ArrayType(a, b);
@@ -758,7 +801,13 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 count_store!(field_stores);
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
                 let new_type = value_type.as_ltype();
-                let retype = retype(new_type, htype);
+                // A store to `__index` moves the table to a new epoch, whatever it
+                // stores. See Note [Table metatables] in `specialize`.
+                let index = b & 0x100 != 0 && (yield YieldOp::IsKey(b & 0xff, b"__index")) == ResumeArg::Matched;
+                let retype = match retype(new_type, htype) {
+                    Retype::Same if index => Retype::Known,
+                    retype => retype,
+                };
                 let expected = htype;
                 if c & 0x100 == 0 {
                     arg = yield YieldOp::ExecWindow(match retype {

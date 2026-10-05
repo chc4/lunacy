@@ -254,6 +254,7 @@ pub enum YieldOp {
                     // Note [Fragile information]
 
     HashKey(usize, usize), // Looks up or allocates an HREF for STACK[idx][key].
+    IsKey(usize, &'static [u8]), // Whether CONSTANT[k] is the string of these bytes: Matched, else Failed
     UpdateHashRef(HashRef, Option<LType>), // Update the type of HREF to a new type, if known
     GlobalCache(usize), // Resumed with a Cache for global CONSTANT[k]. See
                         // Note [Global caches]
@@ -1107,6 +1108,22 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 //
 // A field's type is only ever a representation: a shape or a function's identity
 // describes a register, not a field.
+
+// Note [Table metatables]
+// ~~~~~~~~~~~~~~~~~~~~~~~
+// A table can have a metatable (`setmetatable`). When a lookup finds no value for a key, or a
+// nil one, it continues in the metatable's `__index` table, and so on down the chain, as Lua's
+// does. Only a table `__index` is supported, and no `__newindex`: setting a metatable that has
+// one, or storing to a `__newindex` key, is not implemented.
+//
+// Every load that can find nil continues down the chain: the generic lookup does, and the fast
+// loads (a field through its hash key, an array element, a global) leave for it on a cold path
+// when they load nil. A load whose hash key knows its field is nil knows nothing of what it
+// loads, as the chain can find anything.
+//
+// A table's epoch changes whenever what a lookup through it could find changes: a key inserted,
+// its metatable set, or its `__index` field stored to, whatever the value (a store usually keeps
+// the epoch when it keeps the field's type).
 
 // Note [String methods]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -3468,6 +3485,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::Failed;
                     continue 'machine;
                 },
+                CoroutineState::Yielded(YieldOp::IsKey(k, name)) => {
+                    let proto = self.clos.ro(owner).prototype;
+                    let constant = unsafe { &(&(*proto).constants.items)[k] };
+                    arg = if matches!(constant, crate::chunk::Constant::String(s) if s.as_bytes() == name) { ResumeArg::Matched } else { ResumeArg::Failed };
+                },
                 CoroutineState::Yielded(YieldOp::HashKey(place, key)) => {
                     let proto = self.clos.ro(owner).prototype;
                     // The constant key.
@@ -3683,6 +3705,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
                     let known = ctx.hkeys[href.0 as usize].known_type.expect("a live hash key");
+                    // A nil field's load is its `__index`'s, of any type. See Note [Table
+                    // metatables].
+                    let known = match known {
+                        Kind::Of(LType::Nil) => Kind::Mixed,
+                        known => known,
+                    };
                     Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.ctype())]);
                     if let Kind::Of(known) = known {
                         (pc, arg) = navigate(pc, &CType::Unknown, &CType::Type(known));

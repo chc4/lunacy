@@ -450,6 +450,9 @@ pub struct Table<'src, 'intern> {
     /// since it was last emptied, a bit each (`LType::bit`). It is of a single
     /// kind when one bit is set. See Note [Array kinds] in `specialize`.
     pub kind: u8,
+    /// Its metatable, which only `setmetatable` changes. See Note [Table
+    /// metatables] in `specialize`.
+    pub metatable: Option<Tc<Table<'src, 'intern>>>,
 }
 
 /// How a store into an array part widens its kind. See Note [Array kinds] in
@@ -484,6 +487,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
             epoch: 0,
             cached: false,
             kind: 0,
+            metatable: None,
         }
     }
 
@@ -610,8 +614,40 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
         }
         self.barrier_back();
         let k = LCanon::new(key, intern);
+        // See Note [Table metatables] in `specialize`.
+        if matches!(k.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == b"__newindex") {
+            unimplemented!("__newindex");
+        }
         self.rw(owner).insert_hash(k, value);
         self.rw(owner).epoch += 1;
+    }
+
+    /// `t[key]` as Lua reads it: its raw value, or else its metatable's
+    /// `__index` table's, chained, as far as Lua follows one. See Note [Table
+    /// metatables] in `specialize`.
+    pub fn index(&self, owner: &Owner, key: &LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> LBoxed<'src, 'intern> {
+        let mut tab = self.clone();
+        // Lua 5.1's `MAXTAGLOOP`.
+        for _ in 0..100 {
+            let value = tab.get(owner, key, intern).unwrap_or(LBoxed::NIL);
+            if value.bits() != LBoxed::NIL.bits() {
+                return value;
+            }
+            let Some(next) = tab.index_table(owner) else { return LBoxed::NIL };
+            tab = next;
+        }
+        unimplemented!("loop in gettable")
+    }
+
+    /// Its metatable's `__index`, if it's a table: where a key it lacks is
+    /// looked up next. See Note [Table metatables] in `specialize`.
+    pub fn index_table(&self, owner: &Owner) -> Option<Tc<Table<'src, 'intern>>> {
+        let index = self.ro(owner).metatable.as_ref()?.get_string(owner, b"__index");
+        match index.unbox() {
+            LValue::Nil => None,
+            LValue::Table(next) => Some(next),
+            other => unimplemented!("an __index that isn't a table: {other:?}"),
+        }
     }
 
     /// Look up a string key by its bytes, which needs no intern arena: a key
@@ -1124,14 +1160,14 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             LValue::Table(tab) => {
                 debug!("table {:?}", tab);
                 let key = LBoxed::box_lvalue(index.into_owned());
-                tab.get(owner, &key, intern).map(|b| b.unbox()).unwrap_or(LValue::Nil)
+                tab.index(owner, &key, intern).unbox()
             },
             // Its metatable's `__index` table's field, raw.
             LValue::Userdata(u) => {
                 let index_key = LCanon::new(LBoxed::box_lvalue(InternString::intern(intern, "__index")), intern);
                 let key = LBoxed::box_lvalue(index.into_owned());
                 match u.ro(owner).index_table(owner, &index_key) {
-                    Some(tab) => tab.get(owner, &key, intern).map(|b| b.unbox()).unwrap_or(LValue::Nil),
+                    Some(tab) => tab.index(owner, &key, intern).unbox(),
                     None if u.ro(owner).metatable().is_some_and(|mt| mt.ro(owner).hash.contains_key(&index_key)) => unimplemented!("__index of a userdata that isn't a table"),
                     None => LValue::Nil,
                 }
@@ -2222,6 +2258,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             epoch: 0,
             cached: true,
             kind: 0,
+            metatable: None,
         });
         // `_g` needs no explicit root: it lives in the `RunState` (`RunState::mark` shades it)
         // for the whole run, which is the only time a collection can see it. See Note [GC roots].

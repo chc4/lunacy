@@ -654,6 +654,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             epoch: 0,
             cached: false,
             kind: 0,
+            metatable: None,
         };
         smallvec![LBoxed::box_lvalue(LValue::Table(Tc::new(t)))]
     });
@@ -771,6 +772,45 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             Err(()) => return Err(error_value("bad argument #1 to 'newproxy' (boolean or proxy expected)".into())),
         }
     });
+    // Lua's `setmetatable(t, mt)` on a table: its metatable changes, which moves it
+    // to a new epoch. See Note [Table metatables] in `specialize`.
+    let setmetatable = native!(|owner, args| {
+        let Some(t) = arg(&args, 0).as_table() else {
+            return Err(error_value(format!("bad argument #1 to 'setmetatable' (table expected, got {})", String::from_utf8_lossy(type_name(arg(&args, 0))))));
+        };
+        let metatable = match arg(&args, 1).unbox() {
+            LValue::Nil => None,
+            LValue::Table(mt) => Some(mt),
+            _ => return Err(error_value("bad argument #2 to 'setmetatable' (nil or table expected)".into())),
+        };
+        if let Some(old) = &t.ro(owner).metatable && old.get_string(owner, b"__metatable").bits() != LBoxed::NIL.bits() {
+            return Err(error_value("cannot change a protected metatable".into()));
+        }
+        if metatable.as_ref().is_some_and(|mt| mt.get_string(owner, b"__newindex").bits() != LBoxed::NIL.bits()) {
+            unimplemented!("__newindex");
+        }
+        t.barrier_back();
+        t.rw(owner).metatable = metatable;
+        t.rw(owner).epoch += 1;
+        smallvec![arg(&args, 0)]
+    });
+    // Lua's `getmetatable`: a table's or a userdata's metatable, or its
+    // `__metatable` field if it has one. A string has none here: its fields are the
+    // string library's directly. See Note [String methods] in `specialize`.
+    let getmetatable = native!(pure |owner, args| {
+        let metatable = match arg(&args, 0).unbox() {
+            LValue::Table(t) => t.ro(owner).metatable.clone(),
+            LValue::Userdata(u) => u.ro(owner).metatable().cloned(),
+            _ => None,
+        };
+        smallvec![match metatable {
+            Some(mt) => match mt.get_string(owner, b"__metatable") {
+                protected if protected.bits() != LBoxed::NIL.bits() => protected,
+                _ => LBoxed::box_lvalue(LValue::Table(mt)),
+            },
+            None => LBoxed::NIL,
+        }]
+    });
     // A call of `pcall` is a protected call of its first argument, which the specializer
     // lays out at the call site; this runs only for a call site that doesn't
     // specialize. See Note [Errors] in `specialize`.
@@ -806,6 +846,8 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "unpack"), unpack),
         (InternString::intern(intern, "error"), error),
         (InternString::intern(intern, "pcall"), pcall),
+        (InternString::intern(intern, "setmetatable"), setmetatable),
+        (InternString::intern(intern, "getmetatable"), getmetatable),
         (InternString::intern(intern, "newproxy"), newproxy),
         (InternString::intern(intern, "string"), string_lib),
         (InternString::intern(intern, "table"), table_lib),

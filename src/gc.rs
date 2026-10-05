@@ -90,6 +90,9 @@ impl<'src, 'intern> Mark for Table<'src, 'intern> {
             item.mark(owner);
         }
         self.hash.mark(owner);
+        if let Some(metatable) = &self.metatable {
+            metatable.mark(owner);
+        }
     }
 }
 

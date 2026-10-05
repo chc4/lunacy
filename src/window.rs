@@ -1771,12 +1771,15 @@ fn near_hint(len: usize) -> Result<*mut core::ffi::c_void, StencilError> {
 /// values. Every hole is repointed at its pool slot, every reference to an op's
 /// continuation at that copy's fall-through point (the next stencil), and every
 /// other RIP-relative reference is re-targeted at its original absolute address.
+/// The buffer is called (`enter`), so the bodies are between `sub rsp, 8` and
+/// `add rsp, 8`: they start where the stack is 16-aligned, as copies in JIT code
+/// do. See Note [Stencil alignment].
 pub unsafe fn assemble(
     image: &Image,
     ops: &[(&dyn Window, usize)],
     tail: &[u8],
 ) -> Result<ExecutableBuffer, StencilError> {
-    let mut code = Vec::new();
+    let mut code = Vec::from(SUB_RSP_8);
     let mut holes: Vec<(RipRel, u64)> = Vec::new();
     let mut relocs: Vec<RipRel> = Vec::new();
     // Each continuation reference, with its copy's fall-through offset.
@@ -1813,6 +1816,7 @@ pub unsafe fn assemble(
         // Whichever exit it takes, the checked code continues.
         nexts.extend(body.exit1s.iter().map(|&r| (NextRef::Direct(shift(r)), fall)));
     }
+    code.extend_from_slice(&ADD_RSP_8);
     code.extend_from_slice(tail);
     // Each way into a cold stencil: the record's address into `cold_site`, then
     // the jump. See Note [Cold stencils].

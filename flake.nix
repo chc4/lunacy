@@ -84,6 +84,7 @@
             traceProcessor    # Perfetto's trace processor, for the `perfetto` module
             pkgs.perf         # `just flamegraph`
             pkgs.cargo-flamegraph
+            pkgs.gdb          # backtraces of crashes in JIT code and stencils
           ];
 
           # mimalloc (and other -sys crates) need a C toolchain to build.
