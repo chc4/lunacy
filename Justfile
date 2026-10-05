@@ -150,8 +150,9 @@ jit-disasm benchmark times='10' features='unsafe':
 jit-code-size benchmark times='10': (jit-disasm benchmark times)
     python3 tools/jit_code_size.py working/jit_disasm.txt
 
-# How much machine code LuaJIT's JIT generates for a benchmark
-# (tools/luajit_mcode.lua), to compare with `jit-code-size`.
+# How much machine code LuaJIT's JIT generates for a benchmark, and whether it
+# flushes its traces partway (tools/luajit_mcode.lua), to compare with
+# `jit-code-size`.
 luajit-mcode benchmark times='10':
     just _luajitc {{benchmark}}
     luajit tools/luajit_mcode.lua working/{{benchmark}}.luajit.bin {{times}}
