@@ -44,6 +44,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             LValue::LClosure(_) | LValue::NClosure(_) => LType::Closure,
             LValue::Nil => LType::Nil,
             LValue::Bool(_) => LType::Bool,
+            LValue::Userdata(_) => LType::Userdata,
         }
     }
 
@@ -1590,7 +1591,7 @@ impl Effects {
     };
     const OPAQUE_BIT: u16 = 1 << 10;
     /// Every representation a value has, each's bit in `ARRAYS`.
-    const REPRESENTATIONS: [LType; 7] = [LType::Nil, LType::Bool, LType::String, LType::Closure, LType::Table, LType::Integer, LType::Double];
+    const REPRESENTATIONS: [LType; 8] = [LType::Nil, LType::Bool, LType::String, LType::Closure, LType::Table, LType::Integer, LType::Double, LType::Userdata];
 
     pub fn join(self, other: Effects) -> Effects {
         Effects(self.0 | other.0)

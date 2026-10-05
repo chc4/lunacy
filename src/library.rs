@@ -10,7 +10,7 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::gc::Gc;
 use crate::lboxed::LBoxed;
-use crate::vm::{FVec, IStr, InternString, InternedHasher, LType, LValue, NClosure, Table, Tc};
+use crate::vm::{FVec, IStr, InternString, InternedHasher, LType, LValue, NClosure, Table, Tc, Userdata};
 use crate::vm::NativeOp;
 
 // Note [Library natives]
@@ -480,6 +480,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             LValue::InternedString(_) | LValue::OwnedString(_) => b"string",
             LValue::Table(_) => b"table",
             LValue::LClosure(_) | LValue::NClosure(_) => b"function",
+            LValue::Userdata(_) => b"userdata",
         };
         smallvec![string(name.to_vec())]
     });
@@ -638,6 +639,20 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let j = number_or(arg(&args, 2), array.len() as f64) as i64;
         (i..=j).map(|k| if k >= 1 { array.get(k as usize - 1).copied().unwrap_or(LBoxed::NIL) } else { LBoxed::NIL }).collect()
     });
+    // Lua 5.1's `newproxy`: a new userdata with no metatable, with a new empty
+    // one (`true`), or sharing a userdata's, which it must have.
+    let newproxy = native!(|owner, args| {
+        let metatable = match arg(&args, 0).unbox() {
+            LValue::Nil | LValue::Bool(false) => Ok(None),
+            LValue::Bool(true) => Ok(Some(Tc::new(Table::new(0, 0)))),
+            LValue::Userdata(proxy) => proxy.ro(owner).metatable.clone().map(Some).ok_or(()),
+            _ => Err(()),
+        };
+        match metatable {
+            Ok(metatable) => smallvec![LBoxed::box_lvalue(LValue::Userdata(Tc::new(Userdata { metatable })))],
+            Err(()) => raise("bad argument #1 to 'newproxy' (boolean or proxy expected)".into()),
+        }
+    });
     // Lunacy has no `pcall`: an error ends the run.
     let error = native!(|owner, args| {
         let message = arg(&args, 0).unbox().as_string(owner).map(|s| String::from_utf8_lossy(s.as_slice()).into_owned());
@@ -668,6 +683,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "require"), require),
         (InternString::intern(intern, "unpack"), unpack),
         (InternString::intern(intern, "error"), error),
+        (InternString::intern(intern, "newproxy"), newproxy),
         (InternString::intern(intern, "string"), string_lib),
         (InternString::intern(intern, "table"), table_lib),
         (InternString::intern(intern, "io"), io_lib),

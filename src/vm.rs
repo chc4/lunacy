@@ -410,6 +410,13 @@ impl std::hash::BuildHasher for InternedHasher {
     }
 }
 
+/// A userdata: a value with an identity and a metatable, and no contents Lua
+/// can read.
+#[derive(Debug)]
+pub struct Userdata<'src, 'intern> {
+    pub metatable: Option<Tc<Table<'src, 'intern>>>,
+}
+
 // Values are raw `LBoxed`; hash keys are `LCanon`. See Note [Canonical values].
 #[derive(Debug)]
 pub struct Table<'src, 'intern> {
@@ -736,6 +743,7 @@ pub enum LValue<'src, 'intern> {
     // Closures
     LClosure(Tc<LClosure<'src, 'intern>>) = 8,
     NClosure(NClosure) = 9,
+    Userdata(Tc<Userdata<'src, 'intern>>) = 6,
 }
 
 /// The NuN-boxed value type lives in its own module so its payload field can
@@ -769,6 +777,9 @@ impl<'src, 'intern> crate::gc::CellKind for TLCell<TlcOwner, LClosure<'src, 'int
 impl crate::gc::CellKind for LStr {
     fn cell_kind() -> u8 { LBoxed::KIND_OWNED }
 }
+impl<'src, 'intern> crate::gc::CellKind for TLCell<TlcOwner, Userdata<'src, 'intern>> {
+    fn cell_kind() -> u8 { LBoxed::KIND_USERDATA }
+}
 
 // Note [Canonical values]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -778,8 +789,8 @@ impl crate::gc::CellKind for LStr {
 // arena dedups to the one pointer shared by every string with those bytes, and a number
 // is boxed canonically (`LBoxed::from_number`), as an integer and the equal double are
 // one key (Note [Integer encoding] in `lboxed`), as are 0 and -0. Everything else is
-// already canonical: interned strings are that unique pointer, tables/closures compare
-// by identity, and bool/nil are their own bits.
+// already canonical: interned strings are that unique pointer, tables, closures and
+// userdata compare by identity, and bool/nil are their own bits.
 //
 // Hashing agrees with that equality: an interned string hashes by its precomputed content
 // hash (so strings spread by content, not by arena address), everything else by its bits.
@@ -869,6 +880,7 @@ pub enum LType {
     Integer,
     /// A number in the double encoding.
     Double,
+    Userdata,
 }
 
 impl LType {
@@ -890,6 +902,7 @@ impl std::fmt::Display for LType {
             LType::Table => write!(f, "table"),
             LType::Integer => write!(f, "integer"),
             LType::Double => write!(f, "double"),
+            LType::Userdata => write!(f, "userdata"),
         }
     }
 }
@@ -907,6 +920,7 @@ impl<'src, 'intern> PartialEq for LValue<'src, 'intern> {
                 a.as_bytes() == b.as_slice(),
             (LValue::LClosure(a), LValue::LClosure(b)) => a == b,
             (LValue::NClosure(a), LValue::NClosure(b)) => a == b,
+            (LValue::Userdata(a), LValue::Userdata(b)) => a == b,
             (a, b) => match (a.as_f64(), b.as_f64()) {
                 (Some(a), Some(b)) => a == b,
                 _ => false,
@@ -943,6 +957,9 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             },
             (LValue::NClosure(left_c), LValue::NClosure(right_c)) => {
                 return Err("attempt to compare functions".into())
+            },
+            (LValue::Userdata(_), LValue::Userdata(_)) if opcode != Opcode::EQ => {
+                return Err("attempt to compare two userdata values".into())
             },
             _ => (),
         }
@@ -1039,6 +1056,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 write!(s, "function({:p}, {:?} @ {})", l.as_ptr(), src, line);
             },
             LValue::NClosure(nf) => { write!(s, "native({:p})", nf.native()); },
+            LValue::Userdata(u) => { write!(s, "userdata: {:p}", u.as_ptr()); },
         }
         s
     }
@@ -1054,6 +1072,7 @@ impl<'src, 'intern> LValue<'src, 'intern> {
             LValue::Table(tc) => { write!(s, "{:?}", tc); },
             LValue::Nil => return None,
             LValue::LClosure(l) => { write!(s, "function({:p})", l.as_ptr()); },
+            LValue::Userdata(u) => { write!(s, "userdata: {:p}", u.as_ptr()); },
             x => unimplemented!("{:?}", x),
         }
         Some(Gc::string(&s))

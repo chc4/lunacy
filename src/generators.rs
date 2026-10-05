@@ -458,6 +458,7 @@ macro_rules! with_widen {
             Widen::Bit(LType::Table) => $make!({ Widen::Bit(LType::Table) }),
             Widen::Bit(LType::Integer) => $make!({ Widen::Bit(LType::Integer) }),
             Widen::Bit(LType::Double) => $make!({ Widen::Bit(LType::Double) }),
+            Widen::Bit(LType::Userdata) => $make!({ Widen::Bit(LType::Userdata) }),
         }
     };
 }

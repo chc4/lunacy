@@ -16,7 +16,7 @@ use internment::ArenaIntern;
 use crate::chunk::Constant;
 use crate::gc::Gc;
 use crate::vm::{
-    LClosure, LConstant, LType, LValue, NClosure, NativeFunc, Number, Table, Tc, FVec,
+    LClosure, LConstant, LType, LValue, NClosure, NativeFunc, Number, Table, Tc, FVec, Userdata,
 };
 
 /// A NuN-boxed Lua value (JavaScriptCore `JSValue` encoding). 8 bytes:
@@ -151,6 +151,7 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     pub const KIND_NCLOSURE: u8 = (LType::Closure as u8) << 1 | 1;
     pub const KIND_OWNED: u8 = (LType::String as u8) << 1;
     pub const KIND_INTERNED: u8 = (LType::String as u8) << 1 | 1;
+    pub const KIND_USERDATA: u8 = (LType::Userdata as u8) << 1;
 
     /// Canonical quiet NaN, so `+ DOUBLE_ENCODE_OFFSET` never wraps a NaN into
     /// the pointer/immediate range.
@@ -313,7 +314,7 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
             // SAFETY: `bits` is a live cell pointer (upheld by the sealed
             // constructors).
             let kind = unsafe { crate::gc::read_cell_kind(bits) };
-            debug_assert!(matches!(kind, Self::KIND_TABLE | Self::KIND_LCLOSURE | Self::KIND_NCLOSURE | Self::KIND_OWNED | Self::KIND_INTERNED), "a cell of kind {kind}");
+            debug_assert!(matches!(kind, Self::KIND_TABLE | Self::KIND_LCLOSURE | Self::KIND_NCLOSURE | Self::KIND_OWNED | Self::KIND_INTERNED | Self::KIND_USERDATA), "a cell of kind {kind}");
             // SAFETY: a cell's kind is one of the `KIND_*`, each a representation
             // shifted up a bit.
             unsafe { core::mem::transmute::<u8, LType>(kind >> 1) }
@@ -384,6 +385,7 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
             LValue::NClosure(n) => Self::from_raw(n.cell as *const NClosureCell as u64),
             LValue::InternedString(s) => Self::interned(s),
             LValue::OwnedString(s) => Self::from_raw(s.to_addr()),
+            LValue::Userdata(u) => Self::from_raw(u.0.to_addr()),
         }
     }
 
@@ -419,6 +421,7 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
             Self::KIND_LCLOSURE => LValue::LClosure(Tc(unsafe { Gc::from_addr(bits) })),
             Self::KIND_NCLOSURE => LValue::NClosure(NClosure { cell: unsafe { &*(bits as *const NClosureCell) } }),
             Self::KIND_OWNED => LValue::OwnedString(unsafe { Gc::from_addr(bits) }),
+            Self::KIND_USERDATA => LValue::Userdata(Tc(unsafe { Gc::from_addr(bits) })),
             Self::KIND_INTERNED => {
                 let ptr = bits as *const IStr<'src>;
                 LValue::InternedString(unsafe { std::mem::transmute(ptr) })

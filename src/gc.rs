@@ -6,7 +6,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::collections::BTreeMap;
 use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
-use crate::vm::{Tc, LValue, LBoxed, LCanon, LClosure, NClosure, Table, Upvalue};
+use crate::vm::{Tc, LValue, LBoxed, LCanon, LClosure, NClosure, Table, Upvalue, Userdata};
 use crate::vm::FVec;
 use crate::{TLCell, TlcOwner, Owner};
 use indexmap::IndexMap;
@@ -25,6 +25,7 @@ impl<'src, 'intern> Mark for LValue<'src, 'intern> {
             LValue::OwnedString(s) => s.mark(owner),
             LValue::LClosure(c) => c.mark(owner),
             LValue::NClosure(c) => c.mark(owner),
+            LValue::Userdata(u) => u.mark(owner),
         }
     }
 }
@@ -96,6 +97,14 @@ impl<'src, 'intern> Mark for LClosure<'src, 'intern> {
     fn mark(&self, owner: &Owner) {
         for upval in self.upvalues.iter() {
             upval.mark(owner);
+        }
+    }
+}
+
+impl<'src, 'intern> Mark for Userdata<'src, 'intern> {
+    fn mark(&self, owner: &Owner) {
+        if let Some(metatable) = &self.metatable {
+            metatable.mark(owner);
         }
     }
 }

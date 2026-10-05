@@ -979,14 +979,22 @@ fn emit_type_test(ops: &mut Assembler, v: u8, expected: LType, numeric: bool, pa
             ; jbe =>pass
             ; guard_fail:
         ),
-        _ => unreachable!(),
+        LType::Userdata => dynasm!(ops
+            ; .arch x64
+            ; mov Rq(m), QWORD (LBoxed::NOT_CELL_MASK as i64)
+            ; test Rq(v), Rq(m)
+            ; jnz >guard_fail // not a cell
+            ; cmp BYTE [Rq(v)], (LBoxed::KIND_USERDATA as i8)
+            ; jz =>pass
+            ; guard_fail:
+        ),
     }
 }
 
 /// A type guard tested inline, in the window register caching its slot.
 fn inline_guard(res: &Residual) -> bool {
     matches!(res, Residual::Guard {
-        expected: LType::Integer | LType::Double | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String,
+        expected: LType::Integer | LType::Double | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String | LType::Userdata,
         ..
     } | Residual::NumericGuard { .. })
 }
