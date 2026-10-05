@@ -88,6 +88,14 @@ impl<'src> IStr<'src> {
     }
 }
 
+// Note [No value below nil]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~
+// Nil's bits, 2, are the smallest any value has: a cell is a non-null pointer
+// aligned to 8, and every other value has the `OTHER_TAG` bit or `NUMBER_TAG`
+// bits set. So a value is nil exactly when its bits are at most nil's, which
+// `is_nil` tests. Every value is built through one constructor, which asserts
+// this in debug builds.
+
 // Note [Integer encoding]
 // ~~~~~~~~~~~~~~~~~~~~~~~
 // A number has two encodings, as in JavaScriptCore's NuN boxing (JSCJSValue.h):
@@ -153,13 +161,28 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
     /// the pointer/immediate range.
     const CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
 
-    pub const NIL: Self = LBoxed(Self::VALUE_NIL, PhantomData);
+    pub const NIL: Self = Self::from_raw(Self::VALUE_NIL);
 
     /// The raw payload constructor — private, so arbitrary bits can never become
     /// an `LBoxed` from outside this module. This is the crux of `unbox`'s safety.
     #[inline(always)]
     const fn from_raw(v: u64) -> Self {
+        // See Note [No value below nil].
+        debug_assert!(v >= Self::VALUE_NIL, "a value's bits are never below nil's");
         LBoxed(v, PhantomData)
+    }
+
+    /// Whether this is nil. See Note [No value below nil].
+    #[inline(always)]
+    pub fn is_nil(&self) -> bool {
+        // A range check rather than an equality, though the two agree on every
+        // value. Code that has tested a value equal to a constant may replace
+        // the value with that constant from then on, so where the test is true
+        // the compiler loads nil afresh into the register already holding it,
+        // and a branch on the test can no longer jump straight to where the
+        // value is used. A range check leaves the value unknown on both sides,
+        // so its register is used as it is.
+        self.0 <= Self::VALUE_NIL
     }
 
     /// Read-only access to the raw payload (for identity comparisons/hashing).

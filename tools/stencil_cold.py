@@ -39,13 +39,20 @@ def demangled(args):
     return subprocess.run([DEMANGLE], input=raw, capture_output=True, check=True).stdout.decode()
 
 
-def stencils(binary):
-    """{op: [(address, mnemonic, operands)]} over the stencils in `binary`."""
+def symbol_sizes(binary):
+    """{address: size in bytes} over the functions in `binary`."""
     size_of = {}
     for line in demangled(['-t', binary]).splitlines():
         fields = line.split()
         if len(fields) >= 6 and fields[2] == 'F':
             size_of[int(fields[0], 16)] = int(fields[4], 16)
+    return size_of
+
+
+def stencils(binary, size_of=None):
+    """{op: [(address, mnemonic, operands)]} over the stencils in `binary`."""
+    if size_of is None:
+        size_of = symbol_sizes(binary)
     found, op, start = {}, None, 0
     for line in demangled(['-d', '--no-show-raw-insn', binary]).splitlines():
         m = HEADER.match(line)

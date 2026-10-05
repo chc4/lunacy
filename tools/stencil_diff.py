@@ -6,7 +6,8 @@ stencil by its offset in it, a jump or call out of it by the symbol it names,
 and data (RIP-relative operands, thread-locals) not at all, as it's laid out
 differently in each binary. Prints how many are the same, how many that
 differ change length and the instructions in each binary, those that change
-length by how much, and each that differs with its first difference.
+length by how much, the stencils whose size in bytes changes and by how much
+(most grown first), and each that differs with its first difference.
 
     tools/stencil_diff.py A B [--show N]
 
@@ -17,7 +18,7 @@ import re
 import sys
 
 sys.path.insert(0, 'tools')
-from stencil_cold import stencils
+from stencil_cold import stencils, symbol_sizes
 
 # A branch target: an address and the symbol it's in.
 TARGET = re.compile(r'\b([0-9a-f]+) <([^>]*)>')
@@ -51,8 +52,11 @@ def main():
     ap.add_argument('--show', type=int, default=20, help='how many differing stencils to list')
     args = ap.parse_args()
 
-    a, b = stencils(args.a), stencils(args.b)
+    size_a, size_b = symbol_sizes(args.a), symbol_sizes(args.b)
+    a, b = stencils(args.a, size_a), stencils(args.b, size_b)
     both = sorted(set(a) & set(b))
+    bytes_a = {op: size_a.get(a[op][0][0], 0) for op in both if a[op]}
+    bytes_b = {op: size_b.get(b[op][0][0], 0) for op in both if b[op]}
     differ = []
     for op in both:
         x, y = normalized(a[op]), normalized(b[op])
@@ -68,6 +72,11 @@ def main():
           f'{sum(len(normalized(b[op])) for op in both)} in B')
     for op, nx, ny, *_ in grown[:args.show]:
         print(f'  {ny - nx:+4} ({nx} -> {ny}) {op}')
+    resized = sorted((op for op in bytes_a if op in bytes_b and bytes_a[op] != bytes_b[op]),
+                     key=lambda op: bytes_a[op] - bytes_b[op])
+    print(f'{len(resized)} change size in bytes, {sum(bytes_a.values())} bytes in A, {sum(bytes_b.values())} in B')
+    for op in resized[:args.show]:
+        print(f'  {bytes_b[op] - bytes_a[op]:+5} bytes ({bytes_a[op]} -> {bytes_b[op]}) {op}')
     for op, nx, ny, at, x, y in differ[:args.show]:
         print(f'\n{op}: {nx} instructions in A, {ny} in B; first difference at {at}')
         print(f'  A: {x}')

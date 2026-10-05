@@ -474,14 +474,14 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             windowed!(GetTableArrayChain, [k: i32], [], |owner, state, base| (table, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(k)];
-                dest.bits() == LBoxed::NIL.bits()
+                dest.is_nil()
             } cold {
                 1
             });
             windowed!(GetTableIntegerChain, [], [], |owner, state, base| (table, key, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(key.as_int())];
-                dest.bits() == LBoxed::NIL.bits()
+                dest.is_nil()
             } cold {
                 1
             });
@@ -539,10 +539,12 @@ fn store_kind<'src, 'intern, const W: Widen>(owner: &mut Owner, tab: &Tc<Table<'
 /// `check_windows` repeats it). See Note [Array length] in `vm`.
 #[inline(always)]
 fn store_array<'src, 'intern, const W: Widen, const MAY_BE_NIL: bool>(owner: &mut Owner, tab: &Tc<Table<'src, 'intern>>, slot: usize, value: LBoxed<'src, 'intern>) {
-    if MAY_BE_NIL && value.bits() == LBoxed::NIL.bits() {
+    if MAY_BE_NIL && value.is_nil() {
         if slot < tab.ro(owner).array.len() {
-            tab.rw(owner).array[slot] = value;
-            store_kind::<W>(owner, tab, value);
+            // Nil itself rather than `value`, which `is_nil` leaves unknown, so its
+            // kind is known here.
+            tab.rw(owner).array[slot] = LBoxed::NIL;
+            store_kind::<W>(owner, tab, LBoxed::NIL);
             tab.rw(owner).trim();
         }
         return;
