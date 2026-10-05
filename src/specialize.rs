@@ -1140,10 +1140,10 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 // does. Only a table `__index` is supported, and no `__newindex`: setting a metatable that has
 // one, or storing to a `__newindex` key, is not implemented.
 //
-// Every load that can find nil continues down the chain: the generic lookup does, and the fast
-// loads (an array element, a global) leave for it on a cold path when they load nil. A fast load
-// whose value's type is known not to be nil (an array's kind) can't find nil, and has no such
-// path.
+// Every load that can find nil continues down the chain. The generic lookup does. A global
+// leaves for it on a cold path when it loads nil. An array element exits when it loads nil, and
+// the code after that exit looks the key up down the chain. An array load whose kind is known
+// not to be nil can't find nil, and has no such exit.
 //
 // A load with a constant key follows the chain with hash keys. When its table lacks the key, or
 // has it nil, and has an `__index` table, the load uses two more hash keys: one for the

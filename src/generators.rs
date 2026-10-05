@@ -457,37 +457,49 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 Some(None) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[b, c]))),
                 None => yield YieldOp::Decided(false),
             };
-            // A nil element of a table with a metatable is its `__index`'s, if
-            // `CHAINS`: an array of a kind that isn't nil holds none. See Note
-            // [Table metatables] in `specialize`.
+            // A nil element of a table with a metatable is its `__index`'s: an array
+            // of a kind that isn't nil holds none. See Note [Table metatables] in
+            // `specialize`.
             let chains = !(in_array == ResumeArg::Matched && matches!(yield YieldOp::ArrayKind(b), ResumeArg::Type(CType::Type(t)) if t != LType::Nil));
-            if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
-                windowed!(GetTableArray, [k: i32], [CHAINS: bool], |owner, state, base| (table, out dest) {
-                    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-                    *dest = tab.ro(owner).array[integer_slot(k)];
-                    CHAINS && dest.bits() == LBoxed::NIL.bits() && tab.ro(owner).metatable.is_some()
-                } rejoin {
-                    *dest = index_value(owner, state, table, LBoxed::from_int(k));
-                });
-                arg = yield YieldOp::ExecWindow(if chains {
-                    Rc::new(GetTableArray::<true>::new(k, &[b, a])) as Rc<dyn Window>
-                } else {
-                    Rc::new(GetTableArray::<false>::new(k, &[b, a]))
-                });
-                yield YieldOp::ArrayType(a, b);
-            } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
-                windowed!(GetTableInteger, [], [CHAINS: bool], |owner, state, base| (table, key, out dest) {
-                    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-                    *dest = tab.ro(owner).array[integer_slot(key.as_int())];
-                    CHAINS && dest.bits() == LBoxed::NIL.bits() && tab.ro(owner).metatable.is_some()
-                } rejoin {
-                    *dest = index_value(owner, state, table, key);
-                });
-                arg = yield YieldOp::ExecWindow(if chains {
-                    Rc::new(GetTableInteger::<true>::new(&[b, c, a])) as Rc<dyn Window>
-                } else {
-                    Rc::new(GetTableInteger::<false>::new(&[b, c, a]))
-                });
+            windowed!(GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                *dest = tab.ro(owner).array[integer_slot(k)];
+            });
+            windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                *dest = tab.ro(owner).array[integer_slot(key.as_int())];
+            });
+            // A load that may find nil takes its cold path on nil, the way on from
+            // which looks the key up down the chain. See Note [Optimistic ops].
+            windowed!(GetTableArrayChain, [k: i32], [], |owner, state, base| (table, out dest) {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                *dest = tab.ro(owner).array[integer_slot(k)];
+                dest.bits() == LBoxed::NIL.bits()
+            } cold {
+                1
+            });
+            windowed!(GetTableIntegerChain, [], [], |owner, state, base| (table, key, out dest) {
+                let LValue::Table(tab) = table.unbox() else { unreachable!() };
+                *dest = tab.ro(owner).array[integer_slot(key.as_int())];
+                dest.bits() == LBoxed::NIL.bits()
+            } cold {
+                1
+            });
+            let load: Option<(Rc<dyn Window>, Rc<dyn Window>)> = match (integer, &in_array) {
+                (Some(Some(k)), ResumeArg::Matched) => Some((Rc::new(GetTableArray::new(k, &[b, a])), Rc::new(GetTableArrayChain::new(k, &[b, a])))),
+                (Some(None), ResumeArg::Matched) => Some((Rc::new(GetTableInteger::new(&[b, c, a])), Rc::new(GetTableIntegerChain::new(&[b, c, a])))),
+                _ => None,
+            };
+            if let Some((plain, chain)) = load {
+                // As one step each way, as the nil test is. See Note [Subblocks].
+                if !chains {
+                    yield YieldOp::Decided(true);
+                    arg = yield YieldOp::ExecWindow(plain);
+                } else if (yield YieldOp::OptimisticExec(chain)) != ResumeArg::Matched {
+                    arg = yield YieldOp::Exec(gettable(a, b, c));
+                    yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
+                    return arg;
+                }
                 yield YieldOp::ArrayType(a, b);
             } else {
                 // Any other key: through `gettable`.
