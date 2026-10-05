@@ -2171,16 +2171,19 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 // Lua's `assert(v [, message])`: its arguments, unless `v` is false or nil,
                 // where it raises `message`, or "assertion failed!".
                 (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::pure(|mut seq, args, returns, _owner| {
-                    let args: smallvec::SmallVec<[LBoxed<'_, '_>; 4]> = smallvec::SmallVec::from_slice(args.ro(&seq));
-                    match args.first() {
+                    match args.ro(&seq).first() {
+                        // Only the arguments the call wants back are copied, none for most.
                         Some(v) if v.truthy() => {
-                            let returns = returns.rw(&mut seq);
-                            for (slot, &arg) in returns.iter_mut().zip(args.iter()) {
-                                *slot = arg;
+                            // Each before it's overwritten: the results start a slot
+                            // below the arguments.
+                            let count = args.ro(&seq).len().min(returns.ro(&seq).len());
+                            for i in 0..count {
+                                let arg = args.ro(&seq)[i];
+                                returns.rw(&mut seq)[i] = arg;
                             }
-                            Ok(args.len().min(returns.len()))
+                            Ok(count)
                         },
-                        _ => Err(args.get(1).copied().unwrap_or_else(|| LBoxed::box_lvalue(LValue::OwnedString(Gc::string(b"assertion failed!"))))),
+                        _ => Err(args.ro(&seq).get(1).copied().unwrap_or_else(|| LBoxed::box_lvalue(LValue::OwnedString(Gc::string(b"assertion failed!"))))),
                     }
                 }))),
                 // Lua's `collectgarbage(opt [, arg])`: drive the collector explicitly.
