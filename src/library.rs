@@ -645,11 +645,11 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let metatable = match arg(&args, 0).unbox() {
             LValue::Nil | LValue::Bool(false) => Ok(None),
             LValue::Bool(true) => Ok(Some(Tc::new(Table::new(0, 0)))),
-            LValue::Userdata(proxy) => proxy.ro(owner).metatable.clone().map(Some).ok_or(()),
+            LValue::Userdata(proxy) => proxy.ro(owner).metatable().cloned().map(Some).ok_or(()),
             _ => Err(()),
         };
         match metatable {
-            Ok(metatable) => smallvec![LBoxed::box_lvalue(LValue::Userdata(Tc::new(Userdata { metatable })))],
+            Ok(metatable) => smallvec![LBoxed::box_lvalue(LValue::Userdata(Tc::new(Userdata::new(metatable))))],
             Err(()) => raise("bad argument #1 to 'newproxy' (boolean or proxy expected)".into()),
         }
     });

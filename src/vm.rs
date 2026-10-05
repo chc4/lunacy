@@ -411,10 +411,27 @@ impl std::hash::BuildHasher for InternedHasher {
 }
 
 /// A userdata: a value with an identity and a metatable, and no contents Lua
-/// can read.
+/// can read. Its metatable is fixed when it's made, which compiled code reading
+/// its fields relies on. See Note [Userdata fields] in `specialize`.
 #[derive(Debug)]
 pub struct Userdata<'src, 'intern> {
-    pub metatable: Option<Tc<Table<'src, 'intern>>>,
+    metatable: Option<Tc<Table<'src, 'intern>>>,
+}
+
+impl<'src, 'intern> Userdata<'src, 'intern> {
+    pub fn new(metatable: Option<Tc<Table<'src, 'intern>>>) -> Self {
+        Userdata { metatable }
+    }
+
+    pub fn metatable(&self) -> Option<&Tc<Table<'src, 'intern>>> {
+        self.metatable.as_ref()
+    }
+
+    /// The table its fields are read from: its metatable's `__index`, read
+    /// raw at `index_key`, if a table.
+    pub fn index_table(&self, owner: &Owner, index_key: &LCanon<'src, 'intern>) -> Option<Tc<Table<'src, 'intern>>> {
+        self.metatable.as_ref()?.ro(owner).hash.get(index_key)?.as_table()
+    }
 }
 
 // Values are raw `LBoxed`; hash keys are `LCanon`. See Note [Canonical values].
@@ -1085,6 +1102,16 @@ impl<'src, 'intern> LValue<'src, 'intern> {
                 let key = LBoxed::box_lvalue(index.into_owned());
                 tab.get(owner, &key, intern).map(|b| b.unbox()).unwrap_or(LValue::Nil)
             },
+            // Its metatable's `__index` table's field, raw.
+            LValue::Userdata(u) => {
+                let index_key = LCanon::new(LBoxed::box_lvalue(InternString::intern(intern, "__index")), intern);
+                let key = LBoxed::box_lvalue(index.into_owned());
+                match u.ro(owner).index_table(owner, &index_key) {
+                    Some(tab) => tab.get(owner, &key, intern).map(|b| b.unbox()).unwrap_or(LValue::Nil),
+                    None if u.ro(owner).metatable().is_some_and(|mt| mt.ro(owner).hash.contains_key(&index_key)) => unimplemented!("__index of a userdata that isn't a table"),
+                    None => LValue::Nil,
+                }
+            },
             x => unimplemented!("gettable on {:?}", x),
         };
         debug!("gettable {:?}", &val_b);
@@ -1405,18 +1432,19 @@ impl<'src, 'intern> CallstackEntry<'src, 'intern> {
 }
 
 /// Where a frame's hash key was found in its table's hash part (its entry's
-/// index, and its value's address), and the table's epoch then. See Note
-/// [Hash witnesses].
+/// index, and its value's address), and the table, by address, and its epoch
+/// then. See Note [Hash witnesses].
 #[derive(Debug, Clone, Copy)]
 pub struct HashWitness {
     pub index: usize,
     pub value: *mut LBoxed<'static, 'static>,
     pub epoch: usize,
+    pub table: u64,
 }
 
 impl Default for HashWitness {
     fn default() -> Self {
-        HashWitness { index: 0, value: core::ptr::null_mut(), epoch: 0 }
+        HashWitness { index: 0, value: core::ptr::null_mut(), epoch: 0, table: 0 }
     }
 }
 
@@ -1430,12 +1458,14 @@ impl Default for HashWitness {
 // function's entry context has no hash keys and a hash key's `href_init` runs
 // before any use of it.
 //
-// A witness holds its entry's index and its value's address while the table's
-// epoch is the one it saw: a table's hash part only reallocates or moves an
+// A witness holds its entry's index and its value's address while its table is
+// the one it saw, at the epoch it saw: a table's hash part only reallocates or moves an
 // entry when a key is inserted or removed, which bumps the epoch, and the
-// collector doesn't move tables. Field reads and writes go through the
-// address; the paths repairing a witness after the epoch changes find the
-// entry again by its index.
+// collector doesn't move tables. The table a hash key's slot reaches can change
+// with no write to the slot (Note [Userdata fields] in `specialize`), so a
+// witness is checked against the table as well as its epoch. Field reads and
+// writes go through the address; the paths repairing a witness after the epoch
+// changes find the entry again by its index.
 //
 // JIT code reads a witness inline (`GuardWitness`), so `Witnesses` keeps the
 // address of the first one where it can load it: only growing the vector moves
@@ -1529,6 +1559,8 @@ pub struct RunState<'src, 'intern> {
     pub force_jit: FVec<LProto<'src, 'intern>>,
     /// Intern arena for canonicalizing owned strings at box time.
     pub intern: &'intern internment::Arena<IStr<'src>>,
+    /// The key `__index`, canonical.
+    pub index_key: LCanon<'src, 'intern>,
 }
 
 // Manual `Debug` (the `intern` arena isn't `Debug`); skips it and the counters.
@@ -1916,10 +1948,33 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
-    /// The table in `slot` of the running frame.
-    pub fn table_at(&self, slot: usize) -> Tc<Table<'src, 'intern>> {
-        let LValue::Table(tab) = self.vals[self.base + slot].unbox() else { unreachable!("slot {slot} holds no table") };
-        tab
+    /// The table whose hash part the hash keys of `slot` of the running frame
+    /// are in: a table's own, or a userdata's `__index` table, if it has one.
+    /// See Note [Userdata fields] in `specialize`.
+    pub fn hash_part_at(&self, owner: &Owner, slot: usize) -> Option<Tc<Table<'src, 'intern>>> {
+        match self.vals[self.base + slot].unbox() {
+            LValue::Table(tab) => Some(tab),
+            LValue::Userdata(u) => u.ro(owner).index_table(owner, &self.index_key),
+            _ => unreachable!("slot {slot} holds no table or userdata"),
+        }
+    }
+
+    /// Whether the frame's witness for `href`, a hash key of `slot`, still
+    /// holds: its table is the one it saw, at the epoch it saw. See Note [Hash
+    /// witnesses].
+    pub fn witness_holds(&self, owner: &Owner, slot: usize, href: u8) -> bool {
+        let witness = self.hash_witnesses[self.witness_base + href as usize];
+        self.hash_part_at(owner, slot).is_some_and(|tab| witness.table == tab.0.to_addr() && witness.epoch == tab.ro(owner).epoch)
+    }
+
+    /// Whether the entry at the index of the frame's witness for `href`, a
+    /// hash key of `slot`, still has `key`, with a value of type `expected`,
+    /// in the table `slot` reaches now.
+    pub fn witness_entry_holds(&self, owner: &Owner, slot: usize, href: u8, key: u64, expected: LType) -> bool {
+        let witness = self.hash_witnesses[self.witness_base + href as usize];
+        self.hash_part_at(owner, slot).is_some_and(|tab| {
+            tab.ro(owner).hash.get_index(witness.index).is_some_and(|(k, val)| k.boxed().bits() == key && val.unbox().typeof_() == expected)
+        })
     }
 }
 
@@ -2156,6 +2211,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 exit: 0,
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
                 intern,
+                index_key: LCanon::new(LBoxed::box_lvalue(InternString::intern(intern, "__index")), intern),
             }
         };
         // `gc` is the scope's rooting token, threaded in by `Scoped::run`; the rooting scope

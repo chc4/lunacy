@@ -103,7 +103,7 @@ impl<'src, 'intern> Mark for LClosure<'src, 'intern> {
 
 impl<'src, 'intern> Mark for Userdata<'src, 'intern> {
     fn mark(&self, owner: &Owner) {
-        if let Some(metatable) = &self.metatable {
+        if let Some(metatable) = self.metatable() {
             metatable.mark(owner);
         }
     }

@@ -359,6 +359,7 @@ windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    let address = tab.0.to_addr();
     let hit = {
         let tab = tab.rw(owner);
         let epoch = tab.epoch;
@@ -370,27 +371,40 @@ windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     match hit {
         Some((epoch, value)) if hidx < state.hash_witnesses.len() => {
             state.witness_top = state.witness_top.max(hidx + 1);
-            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast() };
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast(), table: address };
             false
         },
         _ => true,
     }
 } cold {
     let (href, index) = (at as u8, (at >> 8) as usize);
-    href_init_slow(owner, state, table, href, index, key)
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    href_init_slow(owner, state, tab, href, index, key)
+});
+
+// `HrefInit` for a hash key of a userdata, in its `__index` table: exit 0 if that has the key,
+// populating the witness, and 1 if not, or if it has no `__index` table. See Note [Userdata
+// fields].
+windowed!(select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (userdata) {
+    let (href, index) = (at as u8, (at >> 8) as usize);
+    let LValue::Userdata(u) = userdata.unbox() else { unreachable!() };
+    match u.ro(owner).index_table(owner, &state.index_key) {
+        Some(tab) => href_init_slow(owner, state, tab, href, index, key),
+        None => 1,
+    }
 });
 
 /// `HrefInit`'s cold path: the key isn't at `index`, or the witness's place isn't there yet,
-/// which it makes. Exit 0 if the table has the key, populating the witness, and 1 if not.
+/// which it makes. Exit 0 if `tab` has the key, populating the witness, and 1 if not.
 /// `rust-cold` (LLVM's `preserve_most`), so the cold stencil calling it with its window live
 /// needn't save the window around the call.
-extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, href: u8, index: usize, key: u64) -> usize {
+extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: Tc<Table<'src, 'intern>>, href: u8, index: usize, key: u64) -> usize {
     let hidx = state.witness_base + href as usize;
     state.hash_witnesses.grow(hidx + 1);
     state.witness_top = state.witness_top.max(hidx + 1);
     // Safety: the key is a constant's, which outlives the code using it.
     let key: LCanon<'src, 'intern> = unsafe { LCanon::from_bits(key) };
-    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    let address = tab.0.to_addr();
     let found = match tab.ro(owner).hash.get_index(index) {
         Some((k, _)) if *k == key => Some(index),
         _ => tab.ro(owner).hash.get_index_of(&key),
@@ -400,12 +414,12 @@ extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &m
     match found {
         Some(index) => {
             let value = tab.hash.get_index_mut(index).unwrap().1 as *mut LBoxed<'_, '_>;
-            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast() };
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast(), table: address };
             0
         },
         None => {
             debug!("href_init missing key");
-            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: core::ptr::null_mut() };
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: core::ptr::null_mut(), table: address };
             1
         },
     }
@@ -887,7 +901,7 @@ fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>
             CType::Type(LType::Nil)
         } else {
             match caller.slot(a + 1 + param) {
-                CType::Shape(_) => CType::Type(LType::Table),
+                CType::Shape(of, _) => CType::Type(of),
                 ctype => ctype,
             }
         };
@@ -902,7 +916,8 @@ pub enum CType {
     Type(LType),
     /// A number in either encoding, `Integer` or `Double`.
     Number,
-    Shape(SmallVec<[HashRef; 4]>),
+    /// A table, or a userdata (Note [Userdata fields]), with these hash keys.
+    Shape(LType, SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
     LuaFunction(Tc<LClosure<'static, 'static>>),
 }
@@ -964,7 +979,7 @@ impl CType {
         match self {
             CType::Unknown | CType::Number => None,
             CType::Type(ty) => Some(*ty),
-            CType::Shape(_) => Some(LType::Table),
+            CType::Shape(of, _) => Some(*of),
             CType::NativeFunction(_) | CType::LuaFunction(_) => Some(LType::Closure),
         }
     }
@@ -976,7 +991,7 @@ impl std::fmt::Display for CType {
             CType::Unknown => write!(f, "?"),
             CType::Type(ltype) => ltype.fmt(f),
             CType::Number => write!(f, "number"),
-            CType::Shape(shape) => write!(f, "shape({})", shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
+            CType::Shape(of, shape) => write!(f, "{}shape({})", if *of == LType::Table { "" } else { "userdata " }, shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
             CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
             CType::LuaFunction(lclos) => write!(f, "fn({:?})", lclos.as_ptr()),
         }
@@ -1089,6 +1104,22 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 //
 // A field's type is only ever a representation: a shape or a function's identity
 // describes a register, not a field.
+
+// Note [Userdata fields]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// A userdata has no fields of its own: a field read from one is its metatable's `__index`
+// table's, read raw, with no chain past it. So a register holding a userdata has hash keys as a
+// table's register does, in that table's hash part, and a shape of its own representation
+// (`CType::Shape`), which no table guard accepts. A userdata's metatable is fixed when it's
+// made, but its metatable's `__index` is an ordinary field: what reaches the table, from
+// `href_init` and from every epoch check, reads it again, and a userdata without an `__index`
+// table has no hash keys, as a table without the key.
+//
+// That table can change with no write to the register, so a witness records which table it's into,
+// and an epoch check fails for another table as for another epoch (Note [Hash witnesses]). A check
+// is made where one would be for a table, and also after a store through a hash key into an
+// `__index` field, which only makes hash keys of the same key check again; a store into a hash
+// part through no hash key already makes every hash key check again.
 
 /// Whether a jump forgets a type of a register holding no local in scope at
 /// its target, which may still be an expression's temporary (`a and b or c`).
@@ -1864,9 +1895,9 @@ impl Context {
         }
         let shapes: Vec<(usize, CType)> = (0..self.types.len())
             .filter_map(|idx| match &self.types[idx] {
-                CType::Shape(hrefs) if hrefs.iter().any(|href| dropped.contains(href)) => {
+                CType::Shape(of, hrefs) if hrefs.iter().any(|href| dropped.contains(href)) => {
                     let kept: SmallVec<[HashRef; 4]> = hrefs.iter().filter(|href| !dropped.contains(href)).cloned().collect();
-                    Some((idx, if kept.is_empty() { CType::Type(LType::Table) } else { CType::Shape(kept) }))
+                    Some((idx, if kept.is_empty() { CType::Type(*of) } else { CType::Shape(*of, kept) }))
                 },
                 _ => None,
             })
@@ -1894,14 +1925,14 @@ impl Context {
             // that has the issue of runtime hash_witness entries referring to the same
             // path-dependent index and having to emit shuffles if you take a
             // de-duplicated branch but with different indexes.
-            if let CType::Shape(shape) = &self.types[idx] {
+            if let CType::Shape(_, shape) = &self.types[idx] {
                 for (kidx, key) in self.hkeys.iter_mut().enumerate() {
                     if key.idx != idx { continue; }
                     // Try to migrate
                     let mut migrated = false;
                     for (new_idx, other_type) in self.types.iter().enumerate() {
                         if new_idx == idx { continue; }
-                        let CType::Shape(other_shape) = other_type else { continue };
+                        let CType::Shape(_, other_shape) = other_type else { continue };
                         let hr: u8 = kidx.try_into().expect("too many hkeys");
                         if other_shape.contains(&HashRef(hr)) {
                             warn!("migrating {} to stack slot {}", kidx, new_idx);
@@ -1944,7 +1975,13 @@ impl Context {
             // that have the same key value: writing to `x.a` may invalidate `y.a`, but never
             // `y.b`.
             let hkey = &self.hkeys[href.0 as usize].key;
-            invalidate = self.hkeys.iter().enumerate().filter(|(i, hk)| hk.key == *hkey).map(|(i, _)| i).collect();
+            // Writing `__index` may change which table a userdata's fields are in. See Note
+            // [Userdata fields].
+            let index = matches!(hkey, crate::chunk::Constant::String(s) if s.as_bytes() == b"__index");
+            let types = &self.types;
+            invalidate = self.hkeys.iter().enumerate()
+                .filter(|(i, hk)| hk.key == *hkey || (index && matches!(types.get(hk.idx), Some(CType::Shape(LType::Userdata, _)))))
+                .map(|(i, _)| i).collect();
         }
         if let Some(keep) = keep {
             invalidate = invalidate.drain(..).filter(|i| self.hkeys[*i].idx != keep).collect();
@@ -2343,7 +2380,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let context = requested.tostring(owner);
         let joined_context = joined.map(|j| j.tostring(owner)).unwrap_or_default();
         let shapes_dropped = joined.map_or(0, |j| {
-            (0..requested.types.len()).filter(|&i| matches!(requested.types[i], CType::Shape(_)) && !matches!(j.slot(i), CType::Shape(_))).count()
+            (0..requested.types.len()).filter(|&i| matches!(requested.types[i], CType::Shape(..)) && !matches!(j.slot(i), CType::Shape(..))).count()
         });
         crate::tracing::instant("spec", "version", &[
             ("line", self.traced_line(owner).into()),
@@ -2560,7 +2597,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         0 => UNKNOWN_RETURN,
                         b => {
                             let results = (a as usize..a as usize + b as usize - 1).map(|slot| match ctx.slot(slot) {
-                                CType::Shape(_) => CType::Type(LType::Table),
+                                CType::Shape(of, _) => CType::Type(of),
                                 ctype => ctype,
                             });
                             self.return_id(results.collect())
@@ -3118,8 +3155,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let thunk_mut = Rc::make_mut(&mut thunk_ctx);
             let hkey = &mut thunk_mut.hkeys[href.0 as usize];
             debug!("forcing href thunk for {idx} {href:?} {hkey:?}");
-            let tab = state.table_at(idx);
-            let Some((index, key, val)) = tab.ro(owner).hash.get_full(&LCanon::new((&hkey.key).into(), state.intern)) else {
+            // A table, or a userdata, whose fields are its `__index` table's. See Note [Userdata
+            // fields].
+            let receiver = state.vals[state.base + idx].unbox().typeof_();
+            let entry = state.hash_part_at(owner, idx).and_then(|tab| {
+                tab.ro(owner).hash.get_full(&LCanon::new((&hkey.key).into(), state.intern)).map(|(index, _, val)| (index, *val))
+            });
+            let Some((index, val)) = entry else {
                 // The table doesn't have this key, which means we should actually just bailout
                 let fail_block = vm.new_block(pc.0);
                 if let Some((succ_next, succ_ty, succ_ret)) = vm.compile_one(owner, pc.next_false(), orig_ctx.clone(), thunk_coro, ResumeArg::Failed, fail_block) {
@@ -3128,7 +3170,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.jump_thunk(block_id, thunk_pc, fail_block);
                 return;
             };
-            debug!("href forced by {tab:?} -> {val:?}");
+            debug!("href forced by {receiver} -> {val:?}");
             // The field's type in this table, which the guard after `href_init` checks in every
             // table reaching the code. See Note [Field types].
             let found = val.unbox().typeof_();
@@ -3140,17 +3182,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // TODO: track the maximum number of hkeys + grow here instead so we can initialize the RunState
             // array.
 
-            // The table's shape now has this hash key.
-            if let CType::Shape(existing) = &mut thunk_mut.types[idx] {
+            // The receiver's shape now has this hash key.
+            if let CType::Shape(_, existing) = &mut thunk_mut.types[idx] {
                 if !existing.contains(&href) {
                     existing.push(href)
                 }
             } else {
-                thunk_mut.types[idx] = CType::Shape(vec![href].into());
+                thunk_mut.types[idx] = CType::Shape(receiver, vec![href].into());
             }
             // The key's canonical form, made here once. See Note [Hash witnesses].
             let key = LCanon::constant(&hkey.key).boxed().bits();
-            let href_init = Residual::ExecWindow(Rc::new(HrefInit::new((index as u64) << 8 | href.0 as u64, key, &[idx])));
+            let at = (index as u64) << 8 | href.0 as u64;
+            let href_init = Residual::ExecWindow(match receiver {
+                LType::Table => Rc::new(HrefInit::new(at, key, &[idx])) as Rc<dyn Window>,
+                LType::Userdata => Rc::new(HrefInitIndex::new(at, key, &[idx])),
+                _ => unreachable!("a hash key of a {receiver}"),
+            });
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
             if !appends || vm.compiled(block_id) {
@@ -3233,13 +3280,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // Re-init the witness and jump back to success block
                 // The entry may have moved with the epoch: find its value again
                 // by its index. See Note [Hash witnesses].
-                let t = state.table_at(tab);
+                // The table may be another, which `HashGuard` found the key in.
+                let t = state.hash_part_at(owner, tab).expect("a table `HashGuard` found the key in");
                 let epoch = t.ro(owner).epoch;
                 debug!("repairing {:?} epoch", href);
                 let witness = &mut state.hash_witnesses[state.witness_base + href.0 as usize];
                 let value = t.rw(owner).hash.get_index_mut(witness.index).unwrap().1 as *mut LBoxed<'_, '_>;
                 witness.value = value.cast();
                 witness.epoch = epoch;
+                witness.table = t.0.to_addr();
             }))));
             vm.blocks[check_block.0].instructions.push(Residual::Jump(success_block));
         })));
@@ -3325,9 +3374,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                     // The table's existing hash keys: its shape's.
                     let existing: SmallVec<[HashRef; 4]> = match &ctx.types[place] {
-                        CType::Type(LType::Table) => SmallVec::new(),
-                        CType::Shape(existing) => existing.clone(),
-                        _ => panic!("HashKey should only be used on a table"),
+                        CType::Type(LType::Table | LType::Userdata) => SmallVec::new(),
+                        CType::Shape(_, existing) => existing.clone(),
+                        _ => panic!("HashKey should only be used on a table or a userdata"),
                     };
                     debug!("hashkey on existing {existing:?}");
                     if let Some(cached) = existing.into_iter().find(|cached| &ctx.hkeys[cached.0 as usize].key == k_val) {
@@ -3531,7 +3580,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         // Record the type on the hash key too, unless the load overwrote
                         // the table's register and dropped its hash keys.
-                        let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(hrefs) if hrefs.contains(&href)));
+                        let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(_, hrefs) if hrefs.contains(&href)));
                         let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Unknown, live.then_some(href), pc, ctx.clone(), true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
@@ -3950,10 +3999,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += if value.unbox().typeof_() == expected { 2 } else { 1 };
                 },
                 &Residual::EpochCheck { tab, href } => {
-                    let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
-                    let tab = state.table_at(tab);
-                    warn!("epochcheck sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
-                    if hwit.epoch == tab.ro(owner).epoch {
+                    if state.witness_holds(owner, tab, href.0) {
                         // Fallthrough
                         off += 2;
                     } else {
@@ -3961,10 +4007,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 &Residual::HashGuard { tab, href, key, expected } => {
-                    let hwit = state.hash_witnesses[state.witness_base + href.0 as usize];
-                    let tab = state.table_at(tab);
-                    let entry = tab.ro(owner).hash.get_index(hwit.index);
-                    if entry.is_some_and(|(k, val)| k.boxed().bits() == key && val.unbox().typeof_() == expected) {
+                    if state.witness_entry_holds(owner, tab, href.0, key, expected) {
                         // Fallthrough
                         off += 2;
                     } else {

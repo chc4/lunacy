@@ -335,11 +335,26 @@ crate::window::windowed!(guard InArrayK, [k: i32], [], |owner, state, base| (tab
 });
 
 
+/// R(A) := R(B)[RK(C)] for any table or userdata and key, through `gettable`.
+fn gettable(a: usize, b: usize, c: usize) -> ResidualExec {
+    ResidualExec::new("gettable", Rc::new(move |owner, state| {
+        let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+            Ok(c) => Cow::Owned(LValue::from(c)),
+            Err(lv) => Cow::Owned(lv.unbox()),
+        };
+        debug!("gettable {:?}", &kc);
+        let val_b = state.vals[state.base + b as usize].unbox();
+        state.vals[state.base + a as usize] = LBoxed::box_lvalue(val_b.gettable(owner, kc, state.intern));
+    }))
+}
+
 pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        arg = yield YieldOp::Guard(b, LType::Table);
-        if arg != ResumeArg::Matched {
+        let table = (yield YieldOp::Guard(b, LType::Table)) == ResumeArg::Matched;
+        // A userdata's fields are its `__index` table's. See Note [Userdata fields] in
+        // `specialize`.
+        if !table && (yield YieldOp::Guard(b, LType::Userdata)) != ResumeArg::Matched {
             let have = yield YieldOp::Typeof(b);
             arg = yield YieldOp::Exec(ResidualExec::new("gettable_meta", Rc::new(move |owner, state| {
                 panic!("gettable_meta {:?} {:?} {:?}", &state.vals, &state.vals[state.base + b], have)
@@ -353,6 +368,9 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, &[a])));
             // Its type: the hash key's, or found out. See Note [Field types].
             yield YieldOp::FieldType(a, hc);
+        } else if !table {
+            arg = yield YieldOp::Exec(gettable(a, b, c));
+            yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
         } else {
             // An integer key in the array part, potentially from a constant `k`. See Note [Dynamic guards].
             // A double key an i32 holds exactly, narrowed. See Note [Narrowing] in
@@ -389,15 +407,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 yield YieldOp::ArrayType(a, b);
             } else {
                 // Any other key: through `gettable`.
-                arg = yield YieldOp::Exec(ResidualExec::new("gettable", Rc::new(move |owner, state| {
-                    let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                        Ok(c) => Cow::Owned(LValue::from(c)),
-                        Err(lv) => Cow::Owned(lv.unbox()),
-                    };
-                    debug!("gettable {:?}", &kc);
-                    let val_b = state.vals[state.base + b as usize].unbox();
-                    state.vals[state.base + a as usize] = LBoxed::box_lvalue(val_b.gettable(owner, kc, state.intern));
-                })));
+                arg = yield YieldOp::Exec(gettable(a, b, c));
                 yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
             }
         }

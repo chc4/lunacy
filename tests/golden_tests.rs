@@ -10,6 +10,9 @@ use lunacy::vm;
 use lunacy::{TLCell, TlcOwner, Owner};
 
 thread_local! {
+    // The metatable of `make_userdata`'s userdata, as its bits: a native captures nothing. The
+    // global `userdata_metatable` holds it too, which keeps it alive.
+    static USERDATA_METATABLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // The owner is per-thread (a second `Owner::new()` on a thread panics), so a shared
     // `static` cell — which would have to be `Sync` — can't hold it; each test thread gets
     // its own capture buffer instead.
@@ -113,6 +116,27 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
                 0
             })));
             _g.set(owner, print_key, custom_print, s.intern());
+
+            // `make_userdata()`: a userdata whose metatable's `__index` table has `answer`, a
+            // native returning 42, as a library's objects have methods.
+            let mut index = vm::Table::new(0, 1);
+            index.insert_lvalue(vm::InternString::intern(s.intern(), "answer"), vm::LValue::NClosure(vm::NClosure::new(|mut seq, _args, returns, _owner| {
+                returns.rw(&mut seq).iter_mut().next().map(|r| *r = vm::LBoxed::from_double(42.0));
+                1
+            })));
+            let mut metatable = vm::Table::new(0, 1);
+            metatable.insert_lvalue(vm::InternString::intern(s.intern(), "__index"), vm::LValue::Table(vm::Tc::new(index)));
+            let metatable = vm::LBoxed::box_lvalue(vm::LValue::Table(vm::Tc::new(metatable)));
+            USERDATA_METATABLE.with(|bits| bits.set(metatable.bits()));
+            _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "userdata_metatable")), metatable, s.intern());
+            let make_userdata = vm::LBoxed::box_lvalue(vm::LValue::NClosure(vm::NClosure::new(|mut seq, _args, returns, _owner| {
+                // Safety: the global `userdata_metatable` keeps it alive.
+                let metatable = unsafe { vm::LBoxed::from_bits(USERDATA_METATABLE.with(|bits| bits.get())) }.as_table();
+                let userdata = vm::LValue::Userdata(vm::Tc::new(vm::Userdata::new(metatable)));
+                returns.rw(&mut seq).iter_mut().next().map(|r| *r = vm::LBoxed::box_lvalue(userdata));
+                1
+            })));
+            _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "make_userdata")), make_userdata, s.intern());
 
             let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
             let args = vec![].into();

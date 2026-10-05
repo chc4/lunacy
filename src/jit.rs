@@ -135,10 +135,7 @@ impl JitHelper {
             let mut owner = ();
             let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
-            let hwit = rs.hash_witnesses[rs.witness_base + href as usize];
-            let tab = rs.table_at(tab);
-            debug!("JIT check_epoch sees {} == {}", hwit.epoch, tab.ro(owner).epoch);
-            hwit.epoch == tab.ro(owner).epoch
+            rs.witness_holds(owner, tab, href)
         }
     }
     pub unsafe extern "C" fn check_hash_guard(state: *mut (), tab: usize, href: u8, expected: LType, key: u64) -> bool {
@@ -148,11 +145,7 @@ impl JitHelper {
             let mut owner = ();
             let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
-            let hwit = rs.hash_witnesses[rs.witness_base + href as usize];
-            let tab = rs.table_at(tab);
-            // The witness's index still holds its key, with a value of the type.
-            let entry = tab.ro(owner).hash.get_index(hwit.index);
-            entry.is_some_and(|(k, val)| k.boxed().bits() == key && val.unbox().typeof_() == expected)
+            rs.witness_entry_holds(owner, tab, href, key, expected)
         }
     }
 
