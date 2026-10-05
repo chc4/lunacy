@@ -2240,10 +2240,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let mut math_tab = Table::new(0, 0);
         // Unary float builtins consume the boxed stack directly: decode the one
         // argument with `as_number()` and write the result back as a boxed double.
-        math_tab.insert_lvalue(InternString::intern(intern, "huge"), LValue::NClosure(NClosure::pure(|mut seq, args, returns, _owner|{
-            returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::from_double(f64::INFINITY));
-            Ok(1)
-        })));
+        math_tab.insert_lvalue(InternString::intern(intern, "huge"), LValue::Double(Number(f64::INFINITY)));
         math_tab.insert_lvalue(InternString::intern(intern, "pi"), LValue::Double(Number(std::f64::consts::PI)));
         for (name, native) in crate::library::math_natives() {
             math_tab.insert_lvalue(InternString::intern(intern, name), native);
@@ -2263,6 +2260,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             array: vec![].into(),
             hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
+                (InternString::intern(intern, "_VERSION"), LValue::InternedString(intern_bytes(intern, b"Lua 5.1"))),
                 (InternString::intern(intern, "print"), LValue::NClosure(NClosure::pure(|seq, args, _returns, owner| {
                     let s = args.ro(&seq).iter().map(|val| val.unbox().as_string(owner)).flat_map(|maybe_str|
                         maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
