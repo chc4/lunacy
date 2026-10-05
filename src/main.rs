@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let header = header.globally_intern(&intern_strings);
         let vm = Vm::new(&header.top_level as *const _);
         vm.scope(&intern_strings, &mut owner, |s, owner| -> Result<(), Box<dyn Error>> {
-            let _g = s.global_env();
+            let _g = s.global_env(owner);
             let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
             let _r_vals = s.run(owner, _g.clone(), clos, vec![].into())?;
             Ok(())

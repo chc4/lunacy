@@ -106,7 +106,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
         vm.scope(&intern_strings, &mut owner, |s, owner| -> Vec<String> {
             CAPTURED.with(|c| *c.rw(owner) = Vec::new());
 
-            let mut _g = s.global_env();
+            let mut _g = s.global_env(owner);
 
             // Override print
             let print_key = vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "print"));

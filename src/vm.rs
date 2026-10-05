@@ -1293,12 +1293,19 @@ pub struct Vm<'src, 'intern> {
     pub top_level: LProto<'src, 'intern>,
 }
 
+/// The library written in Lua, compiled by `build.rs`. See Note [Library natives]
+/// in `library`.
+static LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/library.luac"));
+
 /// Branded view of a VM and its arena inside a [`Vm::scope`], at a fresh invariant `'gc`. The
 /// brand confines GC values to the scope. See Note [Scoped heap].
 pub struct Scoped<'gc> {
     // `*const Vm<'src,'intern>` / `*const Arena<..'src..>`, type-erased and read back at `'gc`.
     vm: *const (),
     intern: *const (),
+    /// The library written in Lua's chunk (`LProto`), type-erased as `vm` is.
+    /// See Note [Library natives] in `library`.
+    library: *const (),
     // The scope's rooting token; its `'gc` makes `Scoped` invariant (which pins the brand — see
     // the SAFETY note on `Vm::scope`) and unlocks the crate-private `Vm::run`/`global_env`.
     gc: GcCtx<'gc>,
@@ -1320,10 +1327,16 @@ impl<'gc> Scoped<'gc> {
         unsafe { &*(self.intern as *const internment::Arena<IStr<'gc>>) }
     }
 
-    /// Build the global environment table. Scope-gated; see Note [Scoped heap].
-    #[inline]
-    pub fn global_env(&self) -> Tc<Table<'gc, 'gc>> {
-        self.vm().global_env(self.intern())
+    /// Build the global environment table, and run the library written in Lua
+    /// in it (Note [Library natives] in `library`): before any value of the
+    /// caller's exists, which nothing would root while it runs. Scope-gated; see
+    /// Note [Scoped heap].
+    pub fn global_env(&self, owner: &mut Owner) -> Tc<Table<'gc, 'gc>> {
+        let _g = self.vm().global_env(self.intern());
+        // SAFETY: as `vm`.
+        let library = Tc::new(LClosure::new(self.library as LProto<'gc, 'gc>));
+        self.vm().execute(self.gc, owner, _g.clone(), library, vec![].into(), self.intern());
+        _g
     }
 
     /// Run a closure — the only way in, since `Vm::run` is crate-private. See Note [Scoped
@@ -2171,6 +2184,10 @@ impl<'src, 'intern> Vm<'src, 'intern> {
     ) -> R {
         let _guard = ScopeGuard::enter();
         let root_scope = Heap::root_scope();
+        // The library written in Lua, for the scope's whole heap: its closures are
+        // values in it. See Note [Library natives] in `library`.
+        let (_, library) = crate::chunk::header(LIBRARY).expect("the library's bytecode");
+        let library = library.globally_intern(intern);
         // SAFETY: `Scoped::vm`/`intern` read the erased pointers back at `'gc`, which must not
         // outlive `'src`/`'intern`. `'gc` is not caller-chosen: the only `'gc`-carrying field is
         // `gc`, and `RootScope::token` returns `GcCtx<'lua>` borrowing the local `root_scope`.
@@ -2182,6 +2199,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let scoped = Scoped {
             vm: self as *const Vm<'src, 'intern> as *const (),
             intern: intern as *const internment::Arena<IStr<'src>> as *const (),
+            library: &library.top_level as LProto<'src, 'intern> as *const (),
             gc: root_scope.token(),
         };
         let r = body(scoped, owner);
@@ -2214,13 +2232,47 @@ impl<'src, 'intern> Vm<'src, 'intern> {
     {
         #[cfg(feature = "tracing")]
         crate::tracing::begin("interpreter", "run", &[]);
-        args.resize_with(unsafe {
-            (*clos.ro(owner).prototype).max_stack as usize
-        }, || LBoxed::NIL);
         // The global `_G` is the global environment, as Lua's base library sets it.
         let env = LBoxed::box_lvalue(LValue::Table(_G.clone()));
         _G.set(owner, LBoxed::box_lvalue(InternString::intern(intern, "_G")), env, intern);
+        let (spec, state, r_vals) = self.execute(gc, owner, _G, clos, args, intern);
+        #[cfg(all(feature = "counters", not(test)))] {
+            println!("counters after run {:?} instructions {:?}", state.counters, spec.count());
+        }
+        #[cfg(feature = "tracing")]
+        {
+            spec.trace_blocks(owner);
+            crate::tracing::end("interpreter", "run", &[]);
+            crate::tracing::flush();
+        }
 
+        // Into `LUNACY_GRAPH_DIR`, or the working directory.
+        #[cfg(feature = "graph")]
+        for proto in unsafe { &(*self.top_level).prototypes.items } {
+            let dir = std::env::var("LUNACY_GRAPH_DIR").unwrap_or_else(|_| ".".into());
+            let outfile = format!("{dir}/func_{}.pdf", proto.line_defined);
+            spec.dump(owner, proto, outfile.as_str());
+        }
+        let _ = (&spec, &state);
+
+        Ok(r_vals)
+    }
+
+    /// Run `clos` with `args` to its return, in a specializer of its own: the
+    /// specializer, the run's state, and what it returned.
+    fn execute<'lua, 'gc>(&'lua self,
+        gc: GcCtx<'gc>,
+        owner: &mut Owner,
+        _G: Tc<Table<'src, 'intern>>,
+        clos: Tc<LClosure<'src, 'intern>>,
+        mut args: ValueStack<'src, 'intern>,
+        intern: &'intern internment::Arena<IStr<'src>>,
+    ) -> (Specializer<'src, 'intern>, RunState<'src, 'intern>, FVec<LValue<'src, 'intern>>)
+        where 'src: 'lua
+    {
+        args.resize_with(unsafe {
+            (*clos.ro(owner).prototype).max_stack as usize
+        }, || LBoxed::NIL);
         let mut spec = Specializer::new(clos.clone());
         let mut state = {
             let mut vals = args;
@@ -2270,27 +2322,12 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         spec.versions.entry(entry.ro(owner).prototype).or_insert_with(|| HashMap::default());
         spec.set_current(entry);
         let block = spec.version(owner, 0, ctx);
-        let (state, r_vals) = spec.run(gc, owner, block, state);
-        #[cfg(all(feature = "counters", not(test)))] {
-            println!("counters after run {:?} instructions {:?}", state.counters, spec.count());
-        }
-        #[cfg(feature = "tracing")]
-        {
-            spec.trace_blocks(owner);
-            crate::tracing::end("interpreter", "run", &[]);
-            crate::tracing::flush();
-        }
-
-        // Into `LUNACY_GRAPH_DIR`, or the working directory.
-        #[cfg(feature = "graph")]
-        for proto in unsafe { &(*self.top_level).prototypes.items } {
-            let dir = std::env::var("LUNACY_GRAPH_DIR").unwrap_or_else(|_| ".".into());
-            let outfile = format!("{dir}/func_{}.pdf", proto.line_defined);
-            spec.dump(owner, proto, outfile.as_str());
-        }
-
+        let (mut state, r_vals) = spec.run(gc, owner, block, state);
+        // Its frame is gone, as a returning function's is: the closures it made
+        // outlive it (the library written in Lua's, in the global environment).
+        state.close_upvalues_from(owner, 0);
         // Decode the boxed return values back into the `LValue` view for callers.
-        Ok(r_vals.into_iter().map(|b| b.unbox()).collect::<Vec<_>>().into())
+        (spec, state, r_vals.into_iter().map(|b| b.unbox()).collect::<Vec<_>>().into())
     }
 
 }

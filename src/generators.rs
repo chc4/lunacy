@@ -1219,6 +1219,32 @@ fn unboxed_equal<'s, 'i>(l: LBoxed<'s, 'i>, r: LBoxed<'s, 'i>) -> bool {
     l.unbox() == r.unbox()
 }
 
+/// The order of two strings, by their bytes, as the C locale's `strcoll`
+/// orders them. Out of line, as `unboxed_equal` is.
+#[inline(never)]
+fn string_order<'s, 'i>(l: LBoxed<'s, 'i>, r: LBoxed<'s, 'i>) -> std::cmp::Ordering {
+    fn bytes<'a>(v: &'a LValue<'_, '_>) -> &'a [u8] {
+        match v {
+            LValue::InternedString(s) => s.as_bytes(),
+            LValue::OwnedString(s) => s.as_slice(),
+            _ => unreachable!("a string"),
+        }
+    }
+    let (l, r) = (l.unbox(), r.unbox());
+    bytes(&l).cmp(bytes(&r))
+}
+
+// Orderings of strings: registers, and a constant, `k` its boxed value, on the
+// left if `KL`.
+crate::window::windowed!(select CompareStringRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
+    compare_exit::<OP, std::cmp::Ordering>(a, string_order(lhs, rhs), std::cmp::Ordering::Equal)
+});
+crate::window::windowed!(select CompareStringRK, [a: u8, k: u64], [OP: Opcode, KL: bool], |owner, state, base| (operand) {
+    let k = LBoxed::from_bits(k);
+    let order = if KL { string_order(k, operand) } else { string_order(operand, k) };
+    compare_exit::<OP, std::cmp::Ordering>(a, order, std::cmp::Ordering::Equal)
+});
+
 pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -1310,10 +1336,26 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                 };
                 arg = yield YieldOp::ExecWindow(window);
             },
+            (larg, rarg) if opcode != Opcode::EQ => {
+                const RK: usize = 256;
+                let lstr = yield YieldOp::GuardRk(b, LType::String);
+                let rstr = yield YieldOp::GuardRk(c, LType::String);
+                let window = match (lstr, rstr) {
+                    (ResumeArg::Matched, ResumeArg::Matched) => dispatch_compare_window!(opcode, CompareStringRR, [], (a, &[b, c])),
+                    (ResumeArg::MatchedConst(_), ResumeArg::Matched) => {
+                        let ResumeArg::Boxed(k) = (yield YieldOp::BoxedK(b - RK)) else { unreachable!() };
+                        dispatch_compare_window!(opcode, CompareStringRK, [true], (a, k, &[c]))
+                    },
+                    (ResumeArg::Matched, ResumeArg::MatchedConst(_)) => {
+                        let ResumeArg::Boxed(k) = (yield YieldOp::BoxedK(c - RK)) else { unreachable!() };
+                        dispatch_compare_window!(opcode, CompareStringRK, [false], (a, k, &[b]))
+                    },
+                    (ResumeArg::MatchedConst(_), ResumeArg::MatchedConst(_)) => unimplemented!("ordering two constants"),
+                    _ => unimplemented!("ordering values that aren't both numbers or strings (an error, or a metamethod)"),
+                };
+                arg = yield YieldOp::ExecWindow(window);
+            },
             (larg, rarg) => {
-                if opcode != Opcode::EQ {
-                    unimplemented!("ordering a nil (an error, or a metamethod)");
-                }
                 let equal = match (&lnil, &rnil) {
                     (ResumeArg::Matched | ResumeArg::MatchedConst(_), ResumeArg::Matched | ResumeArg::MatchedConst(_)) => true,
                     (ResumeArg::Matched | ResumeArg::MatchedConst(_), _) | (_, ResumeArg::Matched | ResumeArg::MatchedConst(_)) => false,

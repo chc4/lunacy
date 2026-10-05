@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Both runs share `_g` and the `run_iter` closure it holds, so they live in one GC
         // scope (branded `'gc`); the heap is hard-reset when the scope returns. See Vm::scope.
         vm.scope(&intern_strings, &mut owner, |s, owner| -> Result<(), Box<dyn Error>> {
-            let _g = s.global_env();
+            let _g = s.global_env(owner);
             let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
             let mut _r_vals = s.run(owner, _g.clone(), clos, vec![].into())?;
 

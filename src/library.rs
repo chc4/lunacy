@@ -31,6 +31,11 @@ use crate::patterns::{self, Capture};
 // make new ones, but write none the program could already see, so a call to one
 // has no effects the specializer tracks.
 //
+// What a native can't be, as it keeps state between calls (`string.gmatch`'s
+// iterator) or calls a function (`string.gsub`'s replacement, `table.sort`'s
+// order), is written in Lua (src/library.lua), which the VM runs before each
+// program, in its global environment.
+//
 // Natives are plain functions, with no intern arena and no global table, so the
 // strings they make are owned, not interned. `require` finds the built-in
 // modules in `MODULES`, registered by `globals` from the values it installs,
