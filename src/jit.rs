@@ -127,7 +127,7 @@ impl JitHelper {
             val.unbox().typeof_() == expected
         }
     }
-    pub unsafe extern "C" fn check_epoch(state: *mut (), tab: usize, href: u8) -> bool {
+    pub unsafe extern "C" fn check_epoch(state: *mut (), tab: usize, href: u8, depth: u8) -> bool {
         unsafe {
             //println!("state {:?} {} {}", state, tab, href);
             let state = state as *mut RunState;
@@ -135,7 +135,7 @@ impl JitHelper {
             let mut owner = ();
             let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
             let rs = &*state;
-            rs.witness_holds(owner, tab, href)
+            rs.witness_holds(owner, tab, href, depth)
         }
     }
     pub unsafe extern "C" fn check_hash_guard(state: *mut (), tab: usize, href: u8, expected: LType, key: u64) -> bool {
@@ -2188,13 +2188,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
-                Residual::EpochCheck { tab, href } => {
+                Residual::EpochCheck { tab, href, depth } => {
                     let href_u8 = href.0;
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r12 // state
                         ; mov rsi, QWORD (*tab as i64)
                         ; mov rdx, WORD (href_u8 as i32)
+                        ; mov rcx, WORD (*depth as i32)
                         ; call extern (JitHelper::check_epoch as *const () as usize)
                         ; test al, 1 // a returned bool is bit 0: the rest of al may not be zero
                         ; jnz =>insts[off + 2]

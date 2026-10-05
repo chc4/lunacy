@@ -400,6 +400,7 @@ fn gettable(a: usize, b: usize, c: usize) -> ResidualExec {
         debug!("gettable {:?}", &kc);
         let val_b = state.vals[state.base + b as usize].unbox();
         state.vals[state.base + a as usize] = match val_b {
+            LValue::Table(tab) => tab.index(owner, &LBoxed::box_lvalue(kc.into_owned()), state.intern),
             LValue::InternedString(_) | LValue::OwnedString(_) => {
                 let key = LBoxed::box_lvalue(kc.into_owned());
                 state.strings.get(owner, &key, state.intern).unwrap_or(LBoxed::NIL)

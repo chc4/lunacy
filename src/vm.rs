@@ -626,6 +626,15 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// `__index` table's, chained, as far as Lua follows one. See Note [Table
     /// metatables] in `specialize`.
     pub fn index(&self, owner: &Owner, key: &LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> LBoxed<'src, 'intern> {
+        let value = self.get(owner, key, intern).unwrap_or(LBoxed::NIL);
+        if value.bits() != LBoxed::NIL.bits() || self.ro(owner).metatable.is_none() {
+            return value;
+        }
+        self.index_chain(owner, key, intern)
+    }
+
+    /// `index` past a table that lacks the key and has a metatable.
+    fn index_chain(&self, owner: &Owner, key: &LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> LBoxed<'src, 'intern> {
         let mut tab = self.clone();
         // Lua 5.1's `MAXTAGLOOP`.
         for _ in 0..100 {
@@ -1572,21 +1581,21 @@ pub struct Handler {
 
 /// Where a frame's hash key was found in its table's hash part (its entry's
 /// index, and its value's address), and the table, by address, and its epoch
-/// then; and the tables its lookup chained through to that one, `depth` of
-/// them. See Note [Hash witnesses].
+/// then. A hash key found down its table's `__index` chain has the tables it
+/// passed through in `RunState::witness_links`, apart: a witness's size is a
+/// power of two, which every op reaching one indexes with a shift. See Note
+/// [Hash witnesses].
 #[derive(Debug, Clone, Copy)]
 pub struct HashWitness {
     pub index: usize,
     pub value: *mut LBoxed<'static, 'static>,
     pub epoch: usize,
     pub table: u64,
-    pub depth: u8,
-    pub links: [Link; MAX_CHAIN],
 }
 
 impl Default for HashWitness {
     fn default() -> Self {
-        HashWitness { index: 0, value: core::ptr::null_mut(), epoch: 0, table: 0, depth: 0, links: [Link::default(); MAX_CHAIN] }
+        HashWitness { index: 0, value: core::ptr::null_mut(), epoch: 0, table: 0 }
     }
 }
 
@@ -1688,6 +1697,10 @@ pub struct RunState<'src, 'intern> {
     /// The end of the innermost frame's hash witnesses. See Note [Hash witnesses].
     pub witness_top: usize,
     pub hash_witnesses: Witnesses,
+    /// The tables each witness's lookup chained through, at the witness's
+    /// index, for a hash key with a depth. See Note [Table metatables] in
+    /// `specialize`.
+    pub witness_links: FVec<[Link; MAX_CHAIN]>,
     pub trap: bool,
     /// The error raised and not yet handled. See Note [Errors] in `specialize`.
     pub error: Option<LBoxed<'src, 'intern>>,
@@ -2129,13 +2142,22 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// Whether the frame's witness for `href`, a hash key of `slot`, still
     /// holds: its table is the one it saw, at the epoch it saw. See Note [Hash
     /// witnesses].
-    pub fn witness_holds(&self, owner: &Owner, slot: usize, href: u8) -> bool {
-        let witness = self.hash_witnesses[self.witness_base + href as usize];
-        let Some(mut tab) = self.hash_part_at(owner, slot) else { return false };
-        // Each table chained through, and its metatable, unchanged. See Note [Table
-        // metatables] in `specialize`.
-        let depth = witness.depth as usize;
-        for (i, link) in witness.links[..depth].iter().enumerate() {
+    pub fn witness_holds(&self, owner: &Owner, slot: usize, href: u8, depth: u8) -> bool {
+        let at = self.witness_base + href as usize;
+        let witness = &self.hash_witnesses[at];
+        let Some(tab) = self.hash_part_at(owner, slot) else { return false };
+        if depth == 0 {
+            return witness.table == tab.0.to_addr() && witness.epoch == tab.ro(owner).epoch;
+        }
+        Self::chain_holds(owner, witness, &self.witness_links[at][..depth as usize], tab)
+    }
+
+    /// `witness_holds` of a witness whose lookup chained from `tab` through
+    /// `links`: each table chained through, and its metatable, unchanged. See
+    /// Note [Table metatables] in `specialize`.
+    fn chain_holds(owner: &Owner, witness: &HashWitness, links: &[Link], mut tab: Tc<Table<'src, 'intern>>) -> bool {
+        let depth = links.len();
+        for (i, link) in links.iter().enumerate() {
             if tab.0.to_addr() != link.table || tab.ro(owner).epoch != link.epoch {
                 return false;
             }
@@ -2145,7 +2167,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             }
             // The metatable's `__index` is unchanged with its epoch: the next table is
             // the one recorded, which it keeps alive.
-            let next = if i + 1 < depth { witness.links[i + 1].table } else { witness.table };
+            let next = if i + 1 < depth { links[i + 1].table } else { witness.table };
             tab = Tc(unsafe { Gc::from_addr(next) });
         }
         witness.table == tab.0.to_addr() && witness.epoch == tab.ro(owner).epoch
@@ -2442,6 +2464,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 callstack,
                 counters: Default::default(),
                 hash_witnesses: Witnesses::new(),
+                witness_links: vec![].into(),
                 select: 0,
                 trap: false,
                 error: None,

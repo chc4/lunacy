@@ -150,7 +150,7 @@ impl std::fmt::Display for Residual {
             Residual::TailCall { entry: CallEntry::Context(_), a, b, .. } => write!(f, "tcall(?, {}, {})", a, b),
             Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
             Residual::GuardWitness { href, expected } => write!(f, "guard_witness({:?}, {})", href, expected),
-            Residual::EpochCheck { tab, href } => write!(f, "epoch({}, {:?})", tab, href),
+            Residual::EpochCheck { tab, href, depth } => write!(f, "epoch({}, {:?}, {})", tab, href, depth),
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Select(targets) => write!(f, "select"),
             Residual::Branch { .. } => write!(f, "branch"),
@@ -376,8 +376,7 @@ windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     match hit {
         Some((epoch, value)) if hidx < state.hash_witnesses.len() => {
             state.witness_top = state.witness_top.max(hidx + 1);
-            let witness = &mut state.hash_witnesses[hidx];
-            (witness.epoch, witness.index, witness.value, witness.table, witness.depth) = (epoch, index, value.cast(), address, 0);
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast(), table: address };
             false
         },
         _ => true,
@@ -432,8 +431,11 @@ extern "rust-cold" fn href_init_chain<'src, 'intern>(owner: &mut Owner, state: &
         tab = next;
     }
     let exit = href_init_slow(owner, state, tab, href, index, key);
-    let witness = &mut state.hash_witnesses[state.witness_base + href as usize];
-    (witness.links, witness.depth) = (links, depth as u8);
+    let at = state.witness_base + href as usize;
+    if state.witness_links.len() <= at {
+        state.witness_links.resize(at + 1, [crate::vm::Link::default(); crate::vm::MAX_CHAIN]);
+    }
+    state.witness_links[at] = links;
     exit
 }
 
@@ -457,14 +459,12 @@ extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &m
     match found {
         Some(index) => {
             let value = tab.hash.get_index_mut(index).unwrap().1 as *mut LBoxed<'_, '_>;
-            let witness = &mut state.hash_witnesses[hidx];
-            (witness.epoch, witness.index, witness.value, witness.table, witness.depth) = (epoch, index, value.cast(), address, 0);
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast(), table: address };
             0
         },
         None => {
             debug!("href_init missing key");
-            let witness = &mut state.hash_witnesses[hidx];
-            (witness.epoch, witness.index, witness.value, witness.table, witness.depth) = (epoch, index, core::ptr::null_mut(), address, 0);
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: core::ptr::null_mut(), table: address };
             1
         },
     }
@@ -879,7 +879,8 @@ pub enum Residual {
     /// `expected`: a `Guard` on the field rather than a slot. See Note [Field
     /// types].
     GuardWitness { href: HashRef, expected: LType },
-    EpochCheck { tab: usize, href: HashRef },
+    /// `depth` the hash key's. See Note [Table metatables].
+    EpochCheck { tab: usize, href: HashRef, depth: u8 },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
     /// A call to the Lua function in R(A), The target `entry` is a prototype a `LuaGuard` or the
@@ -3460,7 +3461,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // epoches in our witness table they only ever would fail if a table transitions its type
         // inside a block, which is unlikely to happen very often.
         let thunk_coro = thunk_coro.clone();
-        self.blocks[block_id.0].instructions.push(Residual::EpochCheck { tab, href });
+        let depth = thunk_ctx.hkeys[href.0 as usize].depth;
+        self.blocks[block_id.0].instructions.push(Residual::EpochCheck { tab, href, depth });
         // Build the thunk for if we fail the epoch check
         let fail_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             debug!("hit epoch fail thunk");
@@ -4240,8 +4242,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let value = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() };
                     off += if value.unbox().typeof_() == expected { 2 } else { 1 };
                 },
-                &Residual::EpochCheck { tab, href } => {
-                    if state.witness_holds(owner, tab, href.0) {
+                &Residual::EpochCheck { tab, href, depth } => {
+                    if state.witness_holds(owner, tab, href.0, depth) {
                         // Fallthrough
                         off += 2;
                     } else {
