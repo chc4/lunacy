@@ -2236,9 +2236,11 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             crate::tracing::flush();
         }
 
+        // Into `LUNACY_GRAPH_DIR`, or the working directory.
         #[cfg(feature = "graph")]
         for proto in unsafe { &(*self.top_level).prototypes.items } {
-            let outfile = format!("func_{}.pdf", proto.line_defined);
+            let dir = std::env::var("LUNACY_GRAPH_DIR").unwrap_or_else(|_| ".".into());
+            let outfile = format!("{dir}/func_{}.pdf", proto.line_defined);
             spec.dump(owner, proto, outfile.as_str());
         }
 

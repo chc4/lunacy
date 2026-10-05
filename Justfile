@@ -270,6 +270,11 @@ graph name:
     mkdir -p working
     luac5.1 -o working/{{name}}.bin {{name}}.lua
     cd working && cargo run --features graph --bin lunacy -- {{name}}.bin
+# lua_tests/<name>.lua's residual graphs as the golden test runner runs it
+# (with its globals, such as `make_userdata`), in working/graphs/<name>.
+graph-golden name:
+    mkdir -p working/graphs/{{name}}
+    LUNACY_GOLDEN={{name}} LUNACY_GRAPH_DIR=$PWD/working/graphs/{{name}} cargo test --features graph --test golden_tests test_golden
 graph-release name:
     mkdir -p working
     luac5.1 -o working/{{name}}.bin {{name}}.lua

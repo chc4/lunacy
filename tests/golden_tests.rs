@@ -22,9 +22,12 @@ thread_local! {
 #[test]
 fn test_golden() {
     let test_dir = Path::new("lua_tests");
+    // `LUNACY_GOLDEN`: only the test of that name.
+    let only = std::env::var("LUNACY_GOLDEN").ok();
     let mut entries: Vec<_> = fs::read_dir(test_dir)
         .unwrap()
         .map(|r| r.unwrap())
+        .filter(|e| only.as_ref().is_none_or(|name| e.path().file_stem().is_some_and(|stem| stem == name.as_str())))
         .collect();
     entries.sort_by_key(|e| e.path());
 
