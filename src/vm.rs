@@ -543,7 +543,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
 
     /// Drop the nils ending the array part. See Note [Array length].
     pub fn trim(&mut self) {
-        while self.array.last().is_some_and(|value| value.bits() == LBoxed::NIL.bits()) {
+        while self.array.last().is_some_and(|value| value.is_nil()) {
             self.array.pop();
         }
     }
@@ -719,7 +719,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
         if let Some(slot) = array_slot(n) {
             // Nil past the end is no store, and nil into the last element
             // shortens the array part. See Note [Array length].
-            if value.bits() == LBoxed::NIL.bits() {
+            if value.is_nil() {
                 if slot < self.ro(owner).array.len() {
                     self.rw(owner).array[slot] = value;
                     self.rw(owner).widen_by(W, value);

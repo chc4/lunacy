@@ -3435,7 +3435,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let key = LCanon::new((&ctx.hkeys[href.0 as usize].key).into(), state.intern);
             let tab = state.place_table(owner, idx, place);
             let entry = tab.as_ref().and_then(|tab| tab.ro(owner).hash.get_full(&key).map(|(index, _, val)| (index, *val)));
-            let nil = entry.is_none_or(|(_, val)| val.bits() == LBoxed::NIL.bits());
+            let nil = entry.is_none_or(|(_, val)| val.is_nil());
             // A nil field is no field: a load goes on down the chain. See Note [Table
             // metatables].
             let chained = chains && next.is_none() && nil

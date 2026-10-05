@@ -331,7 +331,7 @@ fn not_a_number(v: LBoxed) -> ! {
 
 /// An optional number argument.
 fn number_or(v: LBoxed, default: f64) -> f64 {
-    if v.bits() == LBoxed::NIL.bits() { default } else { number(v) }
+    if v.is_nil() { default } else { number(v) }
 }
 
 /// A string or number argument's bytes, as `..` would convert it.
@@ -620,7 +620,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         })),
         ("gsub", native!(pure |owner, args| {
             let (s, p, replacement) = (bytes(arg(&args, 0)), bytes(arg(&args, 1)), arg(&args, 2));
-            let max = if arg(&args, 3).bits() == LBoxed::NIL.bits() { s.len() as i64 + 1 } else { number(arg(&args, 3)) as i64 };
+            let max = if arg(&args, 3).is_nil() { s.len() as i64 + 1 } else { number(arg(&args, 3)) as i64 };
             let replaced = match replacement.unbox() {
                 LValue::Integer(_) | LValue::Double(_) | LValue::InternedString(_) | LValue::OwnedString(_) => {
                     let replacement = bytes(replacement);
