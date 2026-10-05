@@ -261,7 +261,7 @@ impl<T> Gc<T> {
             next: AtomicPtr::new(core::ptr::null_mut()),
             // Born white; swept next cycle unless reached. See Note [Incremental GC].
             color: Cell::new(white()),
-            size: core::mem::size_of::<GcInner<T>>(),
+            size: GcInner::<T>::SIZE,
             #[cfg(feature = "gc_sanitize")]
             finalize: |ptr| unsafe {
                 let ptr = ptr.cast::<GcInner<T>>();
@@ -365,20 +365,30 @@ impl<T> Mark for Gc<T> {
 
 /// `kind` is the cell-type tag read at offset 0 by NuN-boxing (`read_cell_kind`),
 /// so it stays first under `#[repr(C)]`; `vm::IStr` mirrors this to share the read.
-/// The byte-sized fields (`kind`/`color`/`alive`) precede the word-sized ones so
-/// they pack into the leading word. The rest is the tricolor collector's state.
+/// The fields smaller than a word (`kind`/`color`/`alive`/`size`) precede the
+/// word-sized ones so they pack into the leading word. The rest is the tricolor
+/// collector's state.
 #[repr(C)]
 pub(crate) struct GcInner<T: ?Sized> {
     kind: u8,
     color: Cell<u8>,
     #[cfg(feature = "gc_sanitize")]
     alive: AtomicBool,
+    /// The cell's size in bytes, which every cell's fits.
+    size: u32,
     next: AtomicPtr<GcInner<()>>,
     finalize: fn(*mut GcInner<()>),
-    size: usize,
     // `pub(crate)` so the JIT can address a cell's payload with dynasm's typed
     // offset (`offset_of!(GcInner<_>, val)`).
     pub(crate) val: T,
+}
+
+impl<T> GcInner<T> {
+    /// The size of a cell of `T`, checked to fit its header's `size` when it's built.
+    const SIZE: u32 = {
+        assert!(core::mem::size_of::<GcInner<T>>() <= u32::MAX as usize, "a cell's size fits its header's");
+        core::mem::size_of::<GcInner<T>>() as u32
+    };
 }
 
 /// Put a new cell on the heap's list of every cell, and charge the heap its `size`.
@@ -398,7 +408,7 @@ unsafe fn link(cell: *mut GcInner<()>) {
                 Err(new_top) => top = new_top,
             }
         }
-        (*heap).total_bytes += (*cell).size;
+        (*heap).total_bytes += (*cell).size as usize;
     }
 }
 
@@ -448,6 +458,8 @@ impl Gc<LStr> {
     /// A string of `len` bytes, which `fill` must write all of. See Note [String cells].
     pub fn build(len: usize, fill: impl FnOnce(&mut LStrWriter)) -> Self {
         let layout = Self::layout(len);
+        // A cell's size fits its header's.
+        let size = u32::try_from(layout.size()).expect("string too long");
         let cell = unsafe { std::alloc::alloc(layout) }.cast::<GcInner<LStr>>();
         if cell.is_null() {
             std::alloc::handle_alloc_error(layout);
@@ -458,7 +470,7 @@ impl Gc<LStr> {
                 next: AtomicPtr::new(core::ptr::null_mut()),
                 // Born white; swept next cycle unless reached. See Note [Incremental GC].
                 color: Cell::new(white()),
-                size: layout.size(),
+                size,
                 #[cfg(feature = "gc_sanitize")]
                 finalize: |ptr| {
                     (*ptr.cast::<GcInner<LStr>>()).alive.store(false, Ordering::Release)
@@ -468,7 +480,7 @@ impl Gc<LStr> {
                 #[cfg(not(feature = "gc_sanitize"))]
                 finalize: |ptr| {
                     let layout = std::alloc::Layout::from_size_align_unchecked(
-                        (*ptr).size, core::mem::align_of::<GcInner<LStr>>());
+                        (*ptr).size as usize, core::mem::align_of::<GcInner<LStr>>());
                     std::alloc::dealloc(ptr.cast(), layout)
                 },
                 val: LStr { len, bytes: [] },
@@ -742,7 +754,7 @@ impl Heap {
                 debug!("freeing {current:p}");
                 unsafe {
                     (*prev).store(next_ptr, Ordering::Release);
-                    (*heap).total_bytes = (*heap).total_bytes.saturating_sub((*current).size);
+                    (*heap).total_bytes = (*heap).total_bytes.saturating_sub((*current).size as usize);
                     ((*current).finalize)(current.cast());
                 }
             } else {
