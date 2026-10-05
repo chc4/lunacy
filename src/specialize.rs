@@ -3022,9 +3022,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// A function found gets its identity guarded too, unless the chain of
     /// thunks this one is in guards `identities` of them already, `MAX_VERSIONS`
     /// (Note [Call sites]).
-    fn make_discovery_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
+    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            // Each forcing patches the thunk where it was forced, in `block_id`: one
+            // thunk can be the failure of more than one guard there.
+            let mut block_id = block_id;
             // The thunk was forced, so now we know the runtime value and if it
             // will pass the guard or not.
             // Instead of emitting a guard against `expected`, we can instead just fill in the real
@@ -3426,8 +3429,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// nil, in a table whose metatable has an `__index` table goes on down the chain; any other key
     /// a load can't find, or a store's table lacks, continues the generator without it, in
     /// `fail_ctx`. See Notes [Field types] and [Table metatables].
-    fn make_href_thunk(&self, mut block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
+    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            // Each forcing patches the thunk where it was forced, in `block_id`.
+            let mut block_id = block_id;
             let thunk_coro = thunk_coro.clone();
             let mut ctx = thunk_ctx.clone();
             let place = ctx.hkeys[href.0 as usize].place;
