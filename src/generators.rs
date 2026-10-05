@@ -262,6 +262,21 @@ windowed!(GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
     *dest = cache.refill(owner, &state._G).map_or(LBoxed::NIL, |entry| *entry.cast());
 });
+// A string's field, from the strings' table through the cache of its constant
+// key. See Note [String methods] in `specialize`.
+windowed!(GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
+    let cache = &*(cache as *const GlobalCache);
+    match cache.hit() {
+        Some(entry) => {
+            *dest = *entry.cast();
+            false
+        },
+        None => true,
+    }
+} rejoin {
+    let cache = &*(cache as *const GlobalCache);
+    *dest = cache.refill(owner, &state.strings).map_or(LBoxed::NIL, |entry| *entry.cast());
+});
 // A store that hits the cache and keeps the field's type stores in place; any
 // other, or one needing the write barrier, goes out of line.
 windowed!(SetGlobal, [cache: usize], [], |owner, state, base| (value) {
@@ -335,16 +350,24 @@ crate::window::windowed!(guard InArrayK, [k: i32], [], |owner, state, base| (tab
 });
 
 
-/// R(A) := R(B)[RK(C)] for any table or userdata and key, through `gettable`.
+/// R(A) := R(B)[RK(C)] for any table, userdata or string and key, through
+/// `gettable`; a string's from the strings' table. See Note [String methods] in
+/// `specialize`.
 fn gettable(a: usize, b: usize, c: usize) -> ResidualExec {
     ResidualExec::new("gettable", Rc::new(move |owner, state| {
-        let kc = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
+        let kc: Cow<'_, LValue<'_, '_>> = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
             Ok(c) => Cow::Owned(LValue::from(c)),
             Err(lv) => Cow::Owned(lv.unbox()),
         };
         debug!("gettable {:?}", &kc);
         let val_b = state.vals[state.base + b as usize].unbox();
-        state.vals[state.base + a as usize] = LBoxed::box_lvalue(val_b.gettable(owner, kc, state.intern));
+        state.vals[state.base + a as usize] = match val_b {
+            LValue::InternedString(_) | LValue::OwnedString(_) => {
+                let key = LBoxed::box_lvalue(kc.into_owned());
+                state.strings.get(owner, &key, state.intern).unwrap_or(LBoxed::NIL)
+            },
+            _ => LBoxed::box_lvalue(val_b.gettable(owner, kc, state.intern)),
+        };
     }))
 }
 
@@ -355,6 +378,19 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // A userdata's fields are its `__index` table's. See Note [Userdata fields] in
         // `specialize`.
         if !table && (yield YieldOp::Guard(b, LType::Userdata)) != ResumeArg::Matched {
+            // A string's fields are the strings' table's: a constant string key's
+            // through a cache. See Note [String methods] in `specialize`.
+            if (yield YieldOp::Guard(b, LType::String)) == ResumeArg::Matched {
+                let constant = c & 0x100 != 0 && (yield YieldOp::TypeofK(c & 0xff)) == ResumeArg::Type(CType::Type(LType::String));
+                arg = if constant {
+                    let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(c & 0xff)) else { unreachable!() };
+                    yield YieldOp::ExecWindow(Rc::new(GetStringMethod::new(cache as usize, &[a])))
+                } else {
+                    yield YieldOp::Exec(gettable(a, b, c))
+                };
+                yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
+                return arg;
+            }
             let have = yield YieldOp::Typeof(b);
             arg = yield YieldOp::Exec(ResidualExec::new("gettable_meta", Rc::new(move |owner, state| {
                 panic!("gettable_meta {:?} {:?} {:?}", &state.vals, &state.vals[state.base + b], have)

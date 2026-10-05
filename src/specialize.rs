@@ -1070,6 +1070,9 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 // The cache has a stable address (the specializer owns it), which is the window
 // op's hole, so refilling it needs no change to compiled code.
 //
+// String method lookups are cached the same way (Note [String methods]). Inserting into the
+// strings' table, or clearing it, moves its entries too, and bumps the same counter.
+//
 // A register may hold the environment too (`_G`, or an alias of it), with hash
 // keys whose field types rely on its epoch. So a SETGLOBAL changing a value's
 // type bumps the epoch, and makes hash keys of the same key check it again.
@@ -1104,6 +1107,20 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 //
 // A field's type is only ever a representation: a shape or a function's identity
 // describes a register, not a field.
+
+// Note [String methods]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// In Lua, every string shares one metatable whose `__index` is the `string` library, so
+// `s:lower()` calls `string.lower`. We look a string's fields up in that table (the strings'
+// table) directly, with no further `__index` chain.
+//
+// A lookup with a constant key, such as a method call, goes through a per-site cache, like a
+// global's (Note [Global caches]). We don't use hash keys for this: a hash key belongs to a
+// register, and a register that holds a different string each time (a loop variable, say)
+// would have to find the key again every time. The table is the same for every string, so
+// caching the lookup site is enough.
+//
+// A lookup with any other key searches the table.
 
 // Note [Userdata fields]
 // ~~~~~~~~~~~~~~~~~~~~~~

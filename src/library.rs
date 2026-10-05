@@ -529,7 +529,14 @@ fn bit2_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
 
 /// A table of `entries`, keyed by interned names.
 fn module<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, LValue<'s, 'i>)>) -> LValue<'s, 'i> {
+    module_table(intern, entries, false)
+}
+
+/// A library's table, `cached` if caches hold its entries' addresses. See Note
+/// [Global caches] in `specialize`.
+fn module_table<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, LValue<'s, 'i>)>, cached: bool) -> LValue<'s, 'i> {
     let mut t = Table::new(0, entries.len());
+    t.cached = cached;
     for (name, value) in entries {
         t.insert_lvalue(InternString::intern(intern, name), value);
     }
@@ -561,7 +568,11 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         smallvec![parsed.map_or(LBoxed::NIL, LBoxed::from_double)]
     });
 
-    let string_lib = module(intern, vec![
+    // Indexing a string reads it, through caches. See Note [String methods] in
+    // `specialize`.
+    let string_lib = module_table(intern, vec![
+        ("lower", native!(pure |owner, args| smallvec![string(bytes(arg(&args, 0)).to_ascii_lowercase())])),
+        ("upper", native!(pure |owner, args| smallvec![string(bytes(arg(&args, 0)).to_ascii_uppercase())])),
         ("len", native!(pure |owner, args| smallvec![LBoxed::from_int(bytes(arg(&args, 0)).len() as i32)])),
         ("sub", native!(pure |owner, args| {
             let s = bytes(arg(&args, 0));
@@ -634,14 +645,14 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             let (out, n) = replaced.map_err(error_value)?;
             smallvec![string(out), LBoxed::from_int(n as i32)]
         })),
-    ]);
+    ], true);
 
     let table_new = native!(pure |owner, args| {
         let t = Table {
             array: FVec::from(Vec::with_capacity(number_or(arg(&args, 0), 0.0) as usize)),
             hash: IndexMap::with_capacity_and_hasher(number_or(arg(&args, 1), 0.0) as usize, InternedHasher::default()),
             epoch: 0,
-            environment: false,
+            cached: false,
             kind: 0,
         };
         smallvec![LBoxed::box_lvalue(LValue::Table(Tc::new(t)))]

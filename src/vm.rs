@@ -439,12 +439,13 @@ impl<'src, 'intern> Userdata<'src, 'intern> {
 pub struct Table<'src, 'intern> {
     pub array: FVec<LBoxed<'src, 'intern>>,
     /// Inserted into and cleared only through `insert_hash` and `clear_hash`,
-    /// which count the global environment's entry moves.
+    /// which count its entries' moves if it's `cached`.
     pub hash: IndexMap<LCanon<'src, 'intern>, LBoxed<'src, 'intern>, InternedHasher>,
     pub epoch: usize,
-    /// Whether this is the global environment. See Note [Global caches] in
-    /// `generator`.
-    pub environment: bool,
+    /// Whether caches hold its entries' addresses, which moving its entries
+    /// invalidates: the global environment's, and the strings' table's. See
+    /// Notes [Global caches] and [String methods] in `specialize`.
+    pub cached: bool,
     /// The array part's kind: the representations of the values stored in it
     /// since it was last emptied, a bit each (`LType::bit`). It is of a single
     /// kind when one bit is set. See Note [Array kinds] in `specialize`.
@@ -464,9 +465,9 @@ pub enum Widen {
 }
 
 thread_local! {
-    /// How many times the global environment's hash entries have moved: global
-    /// caches holding an entry's address are valid while it's unchanged. See
-    /// Note [Global caches] in `specialize`.
+    /// How many times a `cached` table's hash entries have moved: caches
+    /// holding an entry's address are valid while it's unchanged. See Note
+    /// [Global caches] in `specialize`.
     static ENV_MOVES: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -481,7 +482,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
             array: Vec::with_capacity(array).into(),
             hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
             epoch: 0,
-            environment: false,
+            cached: false,
             kind: 0,
         }
     }
@@ -514,7 +515,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
     /// them. Returns the key's old value.
     pub fn insert_hash(&mut self, key: LCanon<'src, 'intern>, value: LBoxed<'src, 'intern>) -> Option<LBoxed<'src, 'intern>> {
         let old = self.hash.insert(key, value);
-        if old.is_none() && self.environment {
+        if old.is_none() && self.cached {
             ENV_MOVES.with(|moves| moves.set(moves.get() + 1));
         }
         old
@@ -523,7 +524,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
     /// Empty the hash part, moving every entry out.
     pub fn clear_hash(&mut self) {
         self.hash.clear();
-        if self.environment {
+        if self.cached {
             ENV_MOVES.with(|moves| moves.set(moves.get() + 1));
         }
     }
@@ -1652,6 +1653,9 @@ pub struct RunState<'src, 'intern> {
     pub intern: &'intern internment::Arena<IStr<'src>>,
     /// The key `__index`, canonical.
     pub index_key: LCanon<'src, 'intern>,
+    /// The strings' table, the `string` library, which indexing a string reads.
+    /// See Note [String methods] in `specialize`.
+    pub strings: Tc<Table<'src, 'intern>>,
 }
 
 // Manual `Debug` (the `intern` arena isn't `Debug`); skips it and the counters.
@@ -2097,6 +2101,7 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
         self.vals.truncate(extent);
         self.clos.mark(owner);
         self._G.mark(owner);
+        self.strings.mark(owner);
         if let Some(error) = &self.error {
             error.mark(owner);
         }
@@ -2215,7 +2220,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 ].into_iter().chain(crate::library::globals(intern)).map(|(k, v)| (LCanon(LBoxed::box_lvalue(k)), LBoxed::box_lvalue(v)))
             ),
             epoch: 0,
-            environment: true,
+            cached: true,
             kind: 0,
         });
         // `_g` needs no explicit root: it lives in the `RunState` (`RunState::mark` shades it)
@@ -2337,6 +2342,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LBoxed::NIL);
         let mut spec = Specializer::new(clos.clone());
+        let strings = _G.get_string(owner, b"string").as_table().expect("the string library");
         let mut state = {
             let mut vals = args;
             // The top-level frame occupies the whole allocated register file.
@@ -2374,6 +2380,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
                 intern,
                 index_key: LCanon::new(LBoxed::box_lvalue(InternString::intern(intern, "__index")), intern),
+                strings,
             }
         };
         // `gc` is the scope's rooting token, threaded in by `Scoped::run`; the rooting scope
