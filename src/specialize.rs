@@ -1162,8 +1162,10 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 //
 // Every load that can find nil continues down the chain: the generic lookup does, and the fast
 // loads (a field through its hash key, an array element, a global) leave for it on a cold path
-// when they load nil. A load whose hash key knows its field is nil knows nothing of what it
-// loads, as the chain can find anything.
+// when they load nil. A fast load whose value's type is known not to be nil (a field's known
+// type, an array's kind) can't find nil, and has no such path. A load whose hash key knows its
+// field is nil knows nothing of what it loads, as the chain can find anything, and what it
+// finds tells nothing of the field.
 //
 // A table's epoch changes whenever what a lookup through it could find changes: a key inserted,
 // its metatable set, or its `__index` field stored to, whatever the value (a store usually keeps
@@ -2984,8 +2986,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A slot holding an upvalue's value tells of the upvalue: the type the
             // guard found, and past a function's identity guard below, which
             // function. See Note [Fragile information].
+            // Only if the field itself has it: a value found down its table's `__index`
+            // chain, the field being nil, isn't the field's. See Note [Table metatables].
             if let Some(href) = field {
-                forced_mut.hkeys[href.0 as usize].known_type = Some(Kind::Of(found_field));
+                let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
+                let raw = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() };
+                if raw.unbox().typeof_() == found_field {
+                    forced_mut.hkeys[href.0 as usize].known_type = Some(Kind::Of(found_field));
+                }
             }
             let holds = forced_mut.holds(idx);
             if let Some(upvalue) = holds {

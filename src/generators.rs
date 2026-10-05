@@ -237,10 +237,11 @@ extern "rust-cold" fn index_value<'src, 'intern>(owner: &mut Owner, state: &mut 
     LBoxed::box_lvalue(receiver.unbox().gettable(owner, Cow::Owned(key.unbox()), state.intern))
 }
 
-// A field through its hash key's witness, of `receiver`, whose key is `key`. A
-// nil one is looked up again as Lua reads it, through its `__index`. See Note
-// [Table metatables] in `specialize`.
-windowed!(GetTableHref, [href: u8, key: u64], [], |owner, state, base| (receiver, out dest) {
+// A field through its hash key's witness, whose key is `key`. If `CHAINS`, a
+// nil one is looked up again down the `__index` chain from the table holding
+// it; a field of a type that isn't nil needn't be. See Note [Table metatables]
+// in `specialize`.
+windowed!(GetTableHref, [href: u8, key: u64], [CHAINS: bool], |owner, state, base| (out dest) {
     // Written by the frame's `href_init` already. See Note [Hash
     // witnesses].
     let witness = state.hash_witnesses[state.witness_base + href as usize];
@@ -251,9 +252,12 @@ windowed!(GetTableHref, [href: u8, key: u64], [], |owner, state, base| (receiver
 
     debug!("gettable_href fetched {val1:?}");
     *dest = val1;
-    dest.bits() == LBoxed::NIL.bits()
+    CHAINS && dest.bits() == LBoxed::NIL.bits()
 } rejoin {
-    *dest = index_value(owner, state, receiver, LBoxed::from_bits(key));
+    let witness = state.hash_witnesses[state.witness_base + href as usize];
+    // The witness holds, so its table is alive.
+    let holder = LBoxed::box_lvalue(LValue::Table(Tc(crate::gc::Gc::from_addr(witness.table))));
+    *dest = index_value(owner, state, holder, LBoxed::from_bits(key));
 });
 
 // GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
@@ -435,8 +439,15 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c, true);
         if let ResumeArg::HashRef(hc, htype) = arg {
+            // A field of a type that isn't nil can't be nil: only one that may be
+            // looks down the `__index` chain. See Note [Table metatables] in
+            // `specialize`.
             let ResumeArg::Boxed(key) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
-            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, key, &[b, a])));
+            arg = yield YieldOp::ExecWindow(if matches!(htype, Kind::Of(t) if t != LType::Nil) {
+                Rc::new(GetTableHref::<false>::new(hc.0, key, &[a])) as Rc<dyn Window>
+            } else {
+                Rc::new(GetTableHref::<true>::new(hc.0, key, &[a]))
+            });
             // Its type: the hash key's, or found out. See Note [Field types].
             yield YieldOp::FieldType(a, hc);
         } else if !table {
@@ -462,27 +473,37 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 Some(None) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[b, c]))),
                 None => yield YieldOp::Decided(false),
             };
+            // A nil element of a table with a metatable is its `__index`'s, if
+            // `CHAINS`: an array of a kind that isn't nil holds none. See Note
+            // [Table metatables] in `specialize`.
+            let chains = !(in_array == ResumeArg::Matched && matches!(yield YieldOp::ArrayKind(b), ResumeArg::Type(CType::Type(t)) if t != LType::Nil));
             if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
-                // A nil element of a table with a metatable is its `__index`'s. See
-                // Note [Table metatables] in `specialize`.
-                windowed!(GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
+                windowed!(GetTableArray, [k: i32], [CHAINS: bool], |owner, state, base| (table, out dest) {
                     let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     *dest = tab.ro(owner).array[integer_slot(k)];
-                    dest.bits() == LBoxed::NIL.bits() && tab.ro(owner).metatable.is_some()
+                    CHAINS && dest.bits() == LBoxed::NIL.bits() && tab.ro(owner).metatable.is_some()
                 } rejoin {
                     *dest = index_value(owner, state, table, LBoxed::from_int(k));
                 });
-                arg = yield YieldOp::ExecWindow(Rc::new(GetTableArray::new(k, &[b, a])));
+                arg = yield YieldOp::ExecWindow(if chains {
+                    Rc::new(GetTableArray::<true>::new(k, &[b, a])) as Rc<dyn Window>
+                } else {
+                    Rc::new(GetTableArray::<false>::new(k, &[b, a]))
+                });
                 yield YieldOp::ArrayType(a, b);
             } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
-                windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
+                windowed!(GetTableInteger, [], [CHAINS: bool], |owner, state, base| (table, key, out dest) {
                     let LValue::Table(tab) = table.unbox() else { unreachable!() };
                     *dest = tab.ro(owner).array[integer_slot(key.as_int())];
-                    dest.bits() == LBoxed::NIL.bits() && tab.ro(owner).metatable.is_some()
+                    CHAINS && dest.bits() == LBoxed::NIL.bits() && tab.ro(owner).metatable.is_some()
                 } rejoin {
                     *dest = index_value(owner, state, table, key);
                 });
-                arg = yield YieldOp::ExecWindow(Rc::new(GetTableInteger::new(&[b, c, a])));
+                arg = yield YieldOp::ExecWindow(if chains {
+                    Rc::new(GetTableInteger::<true>::new(&[b, c, a])) as Rc<dyn Window>
+                } else {
+                    Rc::new(GetTableInteger::<false>::new(&[b, c, a]))
+                });
                 yield YieldOp::ArrayType(a, b);
             } else {
                 // Any other key: through `gettable`.
