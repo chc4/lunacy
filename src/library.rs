@@ -24,6 +24,12 @@ use crate::vm::NativeOp;
 // only as many result slots as the call's function and arguments take, so a
 // native can't return more results than that yet.
 //
+// A native given the owner mutable can write any object the program can see,
+// in ways the specializer can't model, so a call to one is assumed to have done
+// anything. A pure native is given the owner shared: it can read any object, and
+// make new ones, but write none the program could already see, so a call to one
+// has no effects the specializer tracks.
+//
 // Natives are plain functions, with no intern arena and no global table, so the
 // strings they make are owned, not interned. `require` finds the built-in
 // modules in `MODULES`, registered by `globals` from the values it installs,
@@ -65,18 +71,21 @@ fn raise<'s, 'i>(message: String) -> SmallVec<[LBoxed<'s, 'i>; 4]> {
 }
 
 /// A native computing its results from its arguments. See Note [Library natives].
-/// With `window:`, also a window op for calls to it, which LBBV runs. See Note
-/// [Native windows].
+/// With `pure`, given the owner shared, so it writes no object the program can
+/// see; with `window:`, also a window op for calls to it, which LBBV runs. See
+/// Note [Native windows].
 macro_rules! native {
-    (window: $window:expr, |$owner:ident, $args:ident| $body:expr) => {{
-        let native = match native!(|$owner, $args| $body) {
-            LValue::NClosure(n) => LValue::NClosure(NClosure::windowed(n.native(), $window)),
-            _ => unreachable!(),
-        };
-        native
-    }};
+    (pure window: $window:expr, |$owner:ident, $args:ident| $body:expr) => {
+        LValue::NClosure(NClosure::pure_windowed(native!(@fn $owner, $args, $body), $window))
+    };
+    (pure |$owner:ident, $args:ident| $body:expr) => {
+        LValue::NClosure(NClosure::pure(native!(@fn $owner, $args, $body)))
+    };
     (|$owner:ident, $args:ident| $body:expr) => {
-        LValue::NClosure(NClosure::new(|mut seq, args, returns, $owner| {
+        LValue::NClosure(NClosure::new(native!(@fn $owner, $args, $body)))
+    };
+    (@fn $owner:ident, $args:ident, $body:expr) => {
+        |mut seq, args, returns, $owner| {
             let $args: SmallVec<[LBoxed<'_, '_>; 8]> = SmallVec::from_slice(args.ro(&seq));
             let results: SmallVec<[LBoxed<'_, '_>; 4]> = $body;
             let _ = &$owner;
@@ -85,7 +94,7 @@ macro_rules! native {
                 *slot = result;
             }
             results.len().min(returns.len())
-        }))
+        }
     };
 }
 
@@ -213,7 +222,7 @@ fn format(fmt: &[u8], args: &[LBoxed]) -> Vec<u8> {
 pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
     macro_rules! math1 {
         ($op:ident) => {
-            native!(window: math1_window::<$op>, |owner, args| smallvec![math1_boxed::<$op>(number(arg(&args, 0)))])
+            native!(pure window: math1_window::<$op>, |owner, args| smallvec![math1_boxed::<$op>(number(arg(&args, 0)))])
         };
     }
     vec![
@@ -224,7 +233,7 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
         ("sin", math1!(SIN)),
         ("cos", math1!(COS)),
         ("tan", math1!(TAN)),
-        ("random", native!(|owner, args| {
+        ("random", native!(pure |owner, args| {
             let r = random();
             // A whole number from a range, in the integer encoding where an i32
             // holds it: the code using it computes on an integer. See Note
@@ -238,13 +247,13 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
                 }
             }]
         })),
-        ("randomseed", native!(|owner, args| {
+        ("randomseed", native!(pure |owner, args| {
             // Never zero, which xorshift stays at.
             RANDOM.with(|state| state.set(number(arg(&args, 0)).to_bits() ^ 0x9e37_79b9_7f4a_7c15 | 1));
             smallvec![]
         })),
-        ("max", native!(|owner, args| smallvec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::NEG_INFINITY, f64::max))])),
-        ("min", native!(|owner, args| smallvec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::INFINITY, f64::min))])),
+        ("max", native!(pure |owner, args| smallvec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::NEG_INFINITY, f64::max))])),
+        ("min", native!(pure |owner, args| smallvec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::INFINITY, f64::min))])),
     ]
 }
 
@@ -472,7 +481,7 @@ fn module<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, L
 
 /// The library's globals, by name, to install in the global table.
 pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'s, 'i>, LValue<'s, 'i>)> {
-    let type_ = native!(|owner, args| {
+    let type_ = native!(pure |owner, args| {
         let name: &[u8] = match arg(&args, 0).unbox() {
             LValue::Nil => b"nil",
             LValue::Bool(_) => b"boolean",
@@ -484,11 +493,11 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         };
         smallvec![string(name.to_vec())]
     });
-    let tostring = native!(|owner, args| {
+    let tostring = native!(pure |owner, args| {
         let s = arg(&args, 0).unbox().as_string(owner).expect("a string form");
         smallvec![LBoxed::box_lvalue(LValue::OwnedString(s))]
     });
-    let tonumber = native!(|owner, args| {
+    let tonumber = native!(pure |owner, args| {
         let v = arg(&args, 0);
         let base = number_or(arg(&args, 1), 10.0) as u32;
         let parsed = match v.unbox() {
@@ -507,29 +516,29 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     });
 
     let string_lib = module(intern, vec![
-        ("len", native!(|owner, args| smallvec![LBoxed::from_int(bytes(arg(&args, 0)).len() as i32)])),
-        ("sub", native!(|owner, args| {
+        ("len", native!(pure |owner, args| smallvec![LBoxed::from_int(bytes(arg(&args, 0)).len() as i32)])),
+        ("sub", native!(pure |owner, args| {
             let s = bytes(arg(&args, 0));
             let range = span(s.len(), number_or(arg(&args, 1), 1.0), number_or(arg(&args, 2), -1.0));
             smallvec![string(s[range].to_vec())]
         })),
-        ("byte", native!(|owner, args| {
+        ("byte", native!(pure |owner, args| {
             let s = bytes(arg(&args, 0));
             let i = number_or(arg(&args, 1), 1.0);
             let range = span(s.len(), i, number_or(arg(&args, 2), i));
             s[range].iter().map(|&b| LBoxed::from_int(b as i32)).collect()
         })),
-        ("char", native!(|owner, args| smallvec![string(args.iter().map(|&b| number(b) as u8).collect())])),
-        ("rep", native!(|owner, args| {
+        ("char", native!(pure |owner, args| smallvec![string(args.iter().map(|&b| number(b) as u8).collect())])),
+        ("rep", native!(pure |owner, args| {
             let s = bytes(arg(&args, 0));
             let n = number(arg(&args, 1)).max(0.0) as usize;
             let out = s.repeat(n);
             smallvec![string(out)]
         })),
-        ("format", native!(|owner, args| smallvec![string(format(&bytes(arg(&args, 0)), args.get(1..).unwrap_or(&[])))])),
+        ("format", native!(pure |owner, args| smallvec![string(format(&bytes(arg(&args, 0)), args.get(1..).unwrap_or(&[])))])),
     ]);
 
-    let table_new = native!(|owner, args| {
+    let table_new = native!(pure |owner, args| {
         let t = Table {
             array: FVec::from(Vec::with_capacity(number_or(arg(&args, 0), 0.0) as usize)),
             hash: IndexMap::with_capacity_and_hasher(number_or(arg(&args, 1), 0.0) as usize, InternedHasher::default()),
@@ -589,7 +598,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                 smallvec![]
             }
         })),
-        ("concat", native!(|owner, args| {
+        ("concat", native!(pure |owner, args| {
             let t = table(arg(&args, 0));
             let sep = if args.len() > 1 { bytes(arg(&args, 1)) } else { Vec::new() };
             let items: Vec<LBoxed> = t.ro(owner).array.iter().copied().collect();
@@ -606,7 +615,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     ]);
 
     let io_lib = module(intern, vec![
-        ("write", native!(|owner, args| {
+        ("write", native!(pure |owner, args| {
             let mut out = std::io::stdout().lock();
             for &v in &args {
                 out.write_all(&bytes(v)).expect("writing stdout");
@@ -614,25 +623,25 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             smallvec![]
         })),
         // The benchmarks' `io.write` that discards its output.
-        ("write_devnull", native!(|owner, args| smallvec![])),
+        ("write_devnull", native!(pure |owner, args| smallvec![])),
     ]);
 
     let bit_lib = module(intern, vec![
-        ("tobit", native!(window: bit1_window::<TOBIT>, |owner, args| bit_result(bit1::<TOBIT>(tobit(arg(&args, 0)))))),
-        ("bnot", native!(window: bit1_window::<BNOT>, |owner, args| bit_result(bit1::<BNOT>(tobit(arg(&args, 0)))))),
-        ("band", native!(window: bit2_window::<BAND>, |owner, args| bit_result(args.iter().fold(-1, |x, &v| bit2::<BAND>(x, tobit(v)))))),
-        ("bor", native!(window: bit2_window::<BOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BOR>(x, tobit(v)))))),
-        ("bxor", native!(window: bit2_window::<BXOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BXOR>(x, tobit(v)))))),
-        ("lshift", native!(window: bit2_window::<LSHIFT>, |owner, args| bit_result(bit2::<LSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("rshift", native!(window: bit2_window::<RSHIFT>, |owner, args| bit_result(bit2::<RSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("arshift", native!(window: bit2_window::<ARSHIFT>, |owner, args| bit_result(bit2::<ARSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("rol", native!(window: bit2_window::<ROL>, |owner, args| bit_result(bit2::<ROL>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("ror", native!(window: bit2_window::<ROR>, |owner, args| bit_result(bit2::<ROR>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
-        ("bswap", native!(window: bit1_window::<BSWAP>, |owner, args| bit_result(bit1::<BSWAP>(tobit(arg(&args, 0)))))),
+        ("tobit", native!(pure window: bit1_window::<TOBIT>, |owner, args| bit_result(bit1::<TOBIT>(tobit(arg(&args, 0)))))),
+        ("bnot", native!(pure window: bit1_window::<BNOT>, |owner, args| bit_result(bit1::<BNOT>(tobit(arg(&args, 0)))))),
+        ("band", native!(pure window: bit2_window::<BAND>, |owner, args| bit_result(args.iter().fold(-1, |x, &v| bit2::<BAND>(x, tobit(v)))))),
+        ("bor", native!(pure window: bit2_window::<BOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BOR>(x, tobit(v)))))),
+        ("bxor", native!(pure window: bit2_window::<BXOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BXOR>(x, tobit(v)))))),
+        ("lshift", native!(pure window: bit2_window::<LSHIFT>, |owner, args| bit_result(bit2::<LSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("rshift", native!(pure window: bit2_window::<RSHIFT>, |owner, args| bit_result(bit2::<RSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("arshift", native!(pure window: bit2_window::<ARSHIFT>, |owner, args| bit_result(bit2::<ARSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("rol", native!(pure window: bit2_window::<ROL>, |owner, args| bit_result(bit2::<ROL>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("ror", native!(pure window: bit2_window::<ROR>, |owner, args| bit_result(bit2::<ROR>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
+        ("bswap", native!(pure window: bit1_window::<BSWAP>, |owner, args| bit_result(bit1::<BSWAP>(tobit(arg(&args, 0)))))),
     ]);
 
     // Every value of `t` from `i` to `j`, by default all of its array part.
-    let unpack = native!(|owner, args| {
+    let unpack = native!(pure |owner, args| {
         let t = table(arg(&args, 0));
         let array = &t.ro(owner).array;
         let i = number_or(arg(&args, 1), 1.0) as i64;
@@ -641,7 +650,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     });
     // Lua 5.1's `newproxy`: a new userdata with no metatable, with a new empty
     // one (`true`), or sharing a userdata's, which it must have.
-    let newproxy = native!(|owner, args| {
+    let newproxy = native!(pure |owner, args| {
         let metatable = match arg(&args, 0).unbox() {
             LValue::Nil | LValue::Bool(false) => Ok(None),
             LValue::Bool(true) => Ok(Some(Tc::new(Table::new(0, 0)))),
@@ -654,12 +663,12 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         }
     });
     // Lunacy has no `pcall`: an error ends the run.
-    let error = native!(|owner, args| {
+    let error = native!(pure |owner, args| {
         let message = arg(&args, 0).unbox().as_string(owner).map(|s| String::from_utf8_lossy(s.as_slice()).into_owned());
         raise(message.unwrap_or_else(|| format!("{:?}", arg(&args, 0).unbox())))
     });
 
-    let require = native!(|owner, args| {
+    let require = native!(pure |owner, args| {
         let name = bytes(arg(&args, 0));
         let found = MODULES.with_borrow(|modules| modules.iter().find(|(m, _)| m.as_bytes() == name).map(|(_, v)| *v));
         let Some(module) = found else { panic!("require: no built-in module {:?}", String::from_utf8_lossy(&name)) };

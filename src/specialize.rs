@@ -479,8 +479,8 @@ pub(crate) use drain;
 //
 // A closure may read or write a slot it captured whenever it runs, which is during a call. For
 // that reason, the type of a slot any CLOSURE of a function captures (`captured_slots`) is
-// forgotten after each call, and no context types a captured slot with what a call may have
-// changed.
+// forgotten after each call that isn't a pure native's (Note [Library natives] in `library`), and
+// no context types a captured slot with what a call may have changed.
 //
 // GETUPVAL and SETUPVAL read and write an open cell's slot in memory, never the
 // register window: it is a slot of an enclosing frame, below the running one's.
@@ -1358,9 +1358,9 @@ pub struct Context {
 //
 // Effects come from the residuals as they are yielded (`Context::effect`). A window op writes the
 // slots its accesses say it writes (`Effect::Write`), an exec may write any slot
-// (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op is `Effect::Opaque`,
-// and what a residual can't show a yield says (`YieldOp::Effect`: SETUPVAL's
-// `Effect::SetUpvalue`). A store into a table is always yielded as one, `Effect::ArrayStore` or
+// (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op or a pure native's
+// (Note [Library natives] in `library`) is `Effect::Opaque`, and what a residual can't show a
+// yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A store into a table is always yielded as one, `Effect::ArrayStore` or
 // the hash hazards it sets, even where `WriteAny` already drops what it falsifies: an exec's
 // `WriteAny` is of its own frame, and a caller sees only the store (Note [Call effects]).
 //
@@ -1586,8 +1586,9 @@ impl Fragile {
 // (`Specializer::effects`), which only grows. It is kept out of the context, so it never makes a
 // version of its own: whatever path code for the prototype is compiled on adds to the one join. A
 // call adds its callee's effects once its continuation knows them (Note [Call continuations]),
-// and opaque where nothing does: a native's call that isn't a window op, a call the call site
-// doesn't specialize, and a continuation that doesn't know the return.
+// and opaque where nothing does: a call to a native that isn't pure (Note [Library natives] in
+// `library`), a call the call site doesn't specialize, and a continuation that doesn't know the
+// return.
 //
 // A return reads its prototype's join when it runs, and returns it with the id of what it returns
 // (`RETURNED | effects << EFFECTS_SHIFT | id`). Code only runs once compiled, so the join then
@@ -3001,17 +3002,37 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // [Native windows].
                     let window = native_op(&calling, &nf, a, b, c)
                         .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(&calling.slot(slot))));
+                    // What the code after an effect-free call knows: its context before the
+                    // call, but for the callee's frame, and a window op's result.
+                    let mut known = continuation.as_ref().map(|(before, _, pc)| ((**before).clone(), *pc));
                     if let Some((_, op)) = window {
                         layout.push(Residual::ExecWindow(op.window));
                         if c == 0 {
                             layout.push(Residual::ExecWindow(Rc::new(SetTop::new(a + 1, &[]))));
                         }
+                        if let Some((known, _)) = &mut known {
+                            known.types[a] = op.result;
+                            known.top = (c == 0).then_some(a + 1);
+                        }
                     } else {
                         layout.push(Residual::NativeCall { nf: nf.native(), a: a16, b: b16, c: c16 });
                         // A native may allocate (a table, a string).
                         layout.push(Residual::GC);
+                        if let Some((known, _)) = &mut known {
+                            known.top = None;
+                        }
                         // See Note [Call effects].
-                        vm.join_effects(owner, Effects::OPAQUE);
+                        if !nf.is_pure() {
+                            vm.join_effects(owner, Effects::OPAQUE);
+                            known = None;
+                        }
+                    }
+                    // See Note [Library natives] in `library`.
+                    if let Some((known, pc)) = known {
+                        let known = vm.jumping(owner, Rc::new(known), pc);
+                        layout.push(Residual::Jump(After::Version(pc, known).block(vm, owner)));
+                        vm.blocks[block.0].instructions.extend(layout);
+                        return;
                     }
                 },
                 _ => {
@@ -3133,7 +3154,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // A native may allocate (a table, a string).
                     layout.push(Residual::GC);
                     layout.push(ret);
-                    vm.join_effects(owner, Effects::OPAQUE);
+                    if !nf.is_pure() {
+                        vm.join_effects(owner, Effects::OPAQUE);
+                    }
                 },
                 _ => {
                     layout.push(Residual::Call { a: a16, b: b16, c: 0 });
@@ -3661,10 +3684,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
-                            // `result` here not only implies that we know the type of the result,
-                            // but also that the operation is pure; we can treat it as not having
-                            // any effects.
+                            // The result's type, if known. A window op's has one; it and a pure
+                            // native's call have no effects. See Note [Library natives].
                             let mut result = None;
+                            let mut pure = false;
                             let calling = ctx.clone();
                             let native = matches!(ctx.types[a], CType::NativeFunction(_));
                             if let CType::NativeFunction(nf) = &ctx.types[a] {
@@ -3683,19 +3706,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(SetTop::new(a + 1, &[]))));
                                     }
                                     result = Some(op.result);
+                                    pure = true;
                                 } else {
                                     self.blocks[block_id.0].instructions.push(Residual::NativeCall {
                                         nf: nf.native(), a: a as u16, b: b as u16, c: c as u16
                                     });
                                     // A native may allocate (a table, a string).
                                     self.blocks[block_id.0].allocates = true;
+                                    pure = nf.is_pure();
                                     // See Note [Call effects].
-                                    self.join_effects(owner, Effects::OPAQUE);
+                                    if !pure {
+                                        self.join_effects(owner, Effects::OPAQUE);
+                                    }
                                 }
                             }
                             // Any other call may run a closure, which reads and writes the
                             // slots it captured. See Note [Captured slots].
-                            let captured = if result.is_none() {
+                            let captured = if !pure {
                                 captured_slots(unsafe { &*self.clos.ro(owner).prototype })
                             } else {
                                 vec![]
@@ -3713,7 +3740,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 let captured: Rc<[usize]> = captured.iter().copied().filter(|&slot| slot < a).collect();
                                 (Rc::new(before), captured)
                             });
-                            if result.is_none() {
+                            if !pure {
                                 // An unknown call may invalidate any fragile information.
                                 // See Note [Fragile information].
                                 Rc::make_mut(&mut ctx).effect(Effect::Opaque);
@@ -3728,6 +3755,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 .chain(captured.into_iter().filter(|&slot| slot < a))
                                 .map(|idx| (idx, CType::Unknown))
                                 .collect();
+                            // And the facts about them. See Note [Fragile information].
+                            for &(idx, _) in &clobbered {
+                                Rc::make_mut(&mut ctx).effect(Effect::Write(idx));
+                            }
                             Rc::make_mut(&mut ctx).set_types(owner, clobbered);
                             if let Some(result) = &result {
                                 // We know the type of the result, so can use it in our static

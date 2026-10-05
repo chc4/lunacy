@@ -123,7 +123,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
             // `make_userdata()`: a userdata whose metatable's `__index` table has `answer`, a
             // native returning 42, as a library's objects have methods.
             let mut index = vm::Table::new(0, 1);
-            index.insert_lvalue(vm::InternString::intern(s.intern(), "answer"), vm::LValue::NClosure(vm::NClosure::new(|mut seq, _args, returns, _owner| {
+            index.insert_lvalue(vm::InternString::intern(s.intern(), "answer"), vm::LValue::NClosure(vm::NClosure::pure(|mut seq, _args, returns, _owner| {
                 returns.rw(&mut seq).iter_mut().next().map(|r| *r = vm::LBoxed::from_double(42.0));
                 1
             })));
@@ -132,7 +132,7 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
             let metatable = vm::LBoxed::box_lvalue(vm::LValue::Table(vm::Tc::new(metatable)));
             USERDATA_METATABLE.with(|bits| bits.set(metatable.bits()));
             _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "userdata_metatable")), metatable, s.intern());
-            let make_userdata = vm::LBoxed::box_lvalue(vm::LValue::NClosure(vm::NClosure::new(|mut seq, _args, returns, _owner| {
+            let make_userdata = vm::LBoxed::box_lvalue(vm::LValue::NClosure(vm::NClosure::pure(|mut seq, _args, returns, _owner| {
                 // Safety: the global `userdata_metatable` keeps it alive.
                 let metatable = unsafe { vm::LBoxed::from_bits(USERDATA_METATABLE.with(|bits| bits.get())) }.as_table();
                 let userdata = vm::LValue::Userdata(vm::Tc::new(vm::Userdata::new(metatable)));

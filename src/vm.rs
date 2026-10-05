@@ -1161,6 +1161,9 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
 /// for them (which overlap the arguments; see Note [Library natives] in
 /// `library`), and returns how many it wrote.
 pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner) -> usize;
+/// A native function given the owner shared, so it writes no object the
+/// program can see. See Note [Library natives] in `library`.
+pub type PureNativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &Owner) -> usize;
 /// A native's window op for a call to it (the `CALL`'s `a`, `b`, `c`), with
 /// which of its arguments are in the integer encoding (`ints`), if it has one
 /// for that call's arity. See Note [Native windows] in `library`.
@@ -1219,12 +1222,31 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: NativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(native) }
+        NClosure { cell: NClosureCell::leak(native, None, false) }
     }
 
-    /// A native that runs as a window op where `window` gives one.
-    pub fn windowed(native: NativeFunc, window: NativeWindow) -> Self {
-        NClosure { cell: NClosureCell::leak_windowed(native, window) }
+    /// A pure native. See Note [Library natives] in `library`.
+    pub fn pure(native: PureNativeFunc) -> Self {
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, true) }
+    }
+
+    /// A pure native that runs as a window op where `window` gives one.
+    pub fn pure_windowed(native: PureNativeFunc, window: NativeWindow) -> Self {
+        NClosure { cell: NClosureCell::leak(Self::called(native), Some(window), true) }
+    }
+
+    /// A pure native, as natives are called: with the owner mutable, which it
+    /// only reads through.
+    fn called(native: PureNativeFunc) -> NativeFunc {
+        // SAFETY: the types differ only in `&Owner` against `&mut Owner`, which
+        // are ABI-compatible.
+        unsafe { core::mem::transmute::<PureNativeFunc, NativeFunc>(native) }
+    }
+
+    /// Whether it writes no object the program can see. See Note [Library
+    /// natives] in `library`.
+    pub fn is_pure(&self) -> bool {
+        self.cell.pure
     }
 
     /// The window op a call `a`, `b`, `c` to this native runs as, if any.
@@ -2026,7 +2048,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let mut math_tab = Table::new(0, 0);
         // Unary float builtins consume the boxed stack directly: decode the one
         // argument with `as_number()` and write the result back as a boxed double.
-        math_tab.insert_lvalue(InternString::intern(intern, "huge"), LValue::NClosure(NClosure::new(|mut seq, args, returns, _owner|{
+        math_tab.insert_lvalue(InternString::intern(intern, "huge"), LValue::NClosure(NClosure::pure(|mut seq, args, returns, _owner|{
             returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::from_double(f64::INFINITY));
             1
         })));
@@ -2036,7 +2058,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         }
 
         let mut os_tab = Table::new(0, 0);
-        os_tab.insert_lvalue(InternString::intern(intern, "exit"), LValue::NClosure(NClosure::new(|seq, args, _returns, _owner| {
+        os_tab.insert_lvalue(InternString::intern(intern, "exit"), LValue::NClosure(NClosure::pure(|seq, args, _returns, _owner| {
             match args.ro(&seq) {
                 [b] => std::process::exit(b.as_number().unwrap_or_else(|| unimplemented!()) as i32),
                 _ => unimplemented!(),
@@ -2049,7 +2071,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             array: vec![].into(),
             hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
-                (InternString::intern(intern, "print"), LValue::NClosure(NClosure::new(|seq, args, _returns, owner| {
+                (InternString::intern(intern, "print"), LValue::NClosure(NClosure::pure(|seq, args, _returns, owner| {
                     let s = args.ro(&seq).iter().map(|val| val.unbox().as_string(owner)).flat_map(|maybe_str|
                         maybe_str.map(|s| -> String { String::from(String::from_utf8_lossy(s.as_slice()).to_owned()) })
                     ).collect::<Vec<_>>();
@@ -2057,7 +2079,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     println!("{}", s.iter().intersperse(&"\t".to_string()).cloned().collect::<String>());
                     0
                 }))),
-                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::new(|seq, args, _returns, _owner| {
+                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::pure(|seq, args, _returns, _owner| {
                     if let [b, ..] = args.ro(&seq) {
                         if let LValue::Bool(false) = b.unbox() {
                             panic!("lua assert failed");
