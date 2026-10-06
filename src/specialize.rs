@@ -1296,10 +1296,11 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // fact: an integer op is rebuilt to compute in the double encoding once its result doesn't fit
 // (Note [Optimistic ops]).
 //
-// Rebuilding replaces code, and the blocks only that code reached are then unreachable: no other
-// block, no frame returning, no handler, and no code running reaches them, and none has JIT code.
-// Their versions are forgotten, as a contraction's are, so they stop counting against the versions
-// a point can have. The narrowing still writes
+// Rebuilding replaces code, and the blocks only that code reached are then unreachable: nothing
+// that runs (the code running, a frame returning, a handler, JIT code) reaches them. Versions are
+// no roots, as only code that runs finds one again: versions reaching each other, as a caller's and
+// the callee's it calls, are reached or not together. The unreachable ones are forgotten, as a
+// contraction's are, so they stop counting against the versions a point can have. The narrowing still writes
 // the integer until the rebuild, which waits and is dropped as a contraction is, but for the fact
 // being used.
 //
@@ -2604,9 +2605,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Forget the versions of the blocks that only the code contractions just replaced reached:
-    /// those reachable from `replaced`, that code's targets, which no other block, the rebuilt
-    /// blocks, the code running or a frame returning, nor a protected call's handler reaches, and
-    /// that have no JIT code. See Note [Contraction].
+    /// those reachable from `replaced`, that code's targets, which nothing that runs reaches (the
+    /// rebuilt blocks, the code running or a frame returning, a protected call's handler, JIT
+    /// code). See Note [Contraction].
     fn drop_unreachable(&mut self, owner: &Owner, state: &RunState<'src, 'intern>, at: Location, replaced: Vec<BlockId>, rebuilt: Vec<BlockId>) {
         let mut reached: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = Default::default();
         let mut work = replaced;
@@ -2615,21 +2616,61 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 work.extend(Self::targets(&self.blocks[block.0].instructions));
             }
         }
-        let mut work: Vec<BlockId> = self.blocks.iter().enumerate()
-            .filter(|(id, _)| !reached.contains(&BlockId(*id)))
-            .flat_map(|(_, block)| Self::targets(&block.instructions))
+        // What runs, each kind's for the trace. A version is only found again by code that
+        // runs, so the versions are no roots: a cycle of them, as a call to a version of a
+        // function whose return the caller's version continues from, is reached or not as a
+        // whole.
+        let running: Vec<BlockId> = std::iter::once(at.0)
+            .chain(state.callstack.iter().map(|entry| entry.ret.0))
+            .chain(state.handlers.iter().map(|handler| handler.after))
             .collect();
-        work.extend(rebuilt);
-        work.push(at.0);
-        work.extend(state.callstack.iter().map(|entry| entry.ret.0));
-        work.extend(state.handlers.iter().map(|handler| handler.after));
-        work.extend(reached.iter().copied().filter(|&block| self.compiled(block)));
-        let mut live: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = Default::default();
-        while let Some(block) = work.pop() {
-            if reached.contains(&block) && live.insert(block) {
-                work.extend(Self::targets(&self.blocks[block.0].instructions));
+        let compiled: Vec<BlockId> = (0..self.blocks.len()).map(BlockId).filter(|&block| self.compiled(block)).collect();
+        let closure = |roots: &[BlockId]| {
+            let mut live: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = Default::default();
+            let mut work = roots.to_vec();
+            while let Some(block) = work.pop() {
+                if live.insert(block) {
+                    work.extend(Self::targets(&self.blocks[block.0].instructions));
+                }
             }
-        }
+            live
+        };
+        let roots: Vec<BlockId> = rebuilt.iter().chain(&running).chain(&compiled).copied().collect();
+        let live = closure(&roots);
+        #[cfg(feature = "tracing")]
+        let _kept_by = [("rebuilt", &rebuilt), ("running", &running), ("compiled", &compiled)]
+            .iter()
+            .map(|(kind, roots)| format!("{kind} {}", closure(roots).iter().filter(|block| reached.contains(block)).count()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // The path from a root to the first reached block it keeps, the root first.
+        #[cfg(feature = "tracing")]
+        let _kept_path = {
+            let mut parent: std::collections::HashMap<BlockId, BlockId, rustc_hash::FxBuildHasher> = Default::default();
+            let mut seen: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = roots.iter().copied().collect();
+            let mut queue: std::collections::VecDeque<BlockId> = roots.iter().copied().collect();
+            let mut found = None;
+            while let Some(block) = queue.pop_front() {
+                if reached.contains(&block) {
+                    found = Some(block);
+                    break;
+                }
+                for target in Self::targets(&self.blocks[block.0].instructions) {
+                    if seen.insert(target) {
+                        parent.insert(target, block);
+                        queue.push_back(target);
+                    }
+                }
+            }
+            let mut path = Vec::new();
+            let mut at = found;
+            while let Some(block) = at {
+                path.push(block.0.to_string());
+                at = parent.get(&block).copied();
+            }
+            path.reverse();
+            path.join(" -> ")
+        };
         let mut _dropped: Vec<usize> = Vec::new();
         for versions in self.versions.values_mut() {
             versions.retain(|_, block| {
@@ -2646,6 +2687,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ("line", self.traced_line(owner).into()),
             ("reached", reached.len().into()),
             ("dropped", Self::ids(_dropped.iter().copied()).as_str().into()),
+            ("kept_by", _kept_by.as_str().into()),
+            ("kept_path", _kept_path.as_str().into()),
+            ("at", at.0.0.into()),
         ]);
         let _ = owner;
     }
