@@ -236,6 +236,9 @@ pub enum YieldOp {
                            // Matched to load it as an integer, Failed as a double whose fact
                            // isn't introduced, else as a double. See Note [Contraction]
     HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Narrowing]
+    Encoding(usize), // An optimistic integer op's result is about to be put in STACK[idx]: resumed
+                     // with the double type to compute it in the double encoding, else with the
+                     // integer one. See Note [Optimistic ops]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
                       // knows it, else Failed. See Note [Array kinds]
@@ -1036,7 +1039,8 @@ impl std::fmt::Display for CType {
 // A number is a double unless something narrows it to an integer, as LuaJIT narrows: a
 // constant as a value (loaded, stored, passed) is a double whatever its value, as are a native's
 // result and the generic paths' arithmetic. What narrows is a loop (below), a length, a bit
-// operation, and a typed integer op on integers. A constant an i32 holds exactly is a compile-time
+// operation, and a typed integer op on integers, until its result first overflows (Note
+// [Optimistic ops]). A constant an i32 holds exactly is a compile-time
 // value either encoding can hold, so to an op asking for an integer (a constant guard for one,
 // `IntegralK`) it is one: an integer register plus such a constant, or such a constant as an
 // array key, is an integer op.
@@ -1288,7 +1292,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 //
 // A fact used for what it says can be rebuilt from the same origin the other way: a constant some
 // code narrows to an integer (Note [Narrowing]) is loaded as an integer instead, so every path
-// from its load computes on the integer, and none narrows it again. The narrowing still writes
+// from its load computes on the integer, and none narrows it again. A fact falsified can be too:
+// an integer op's result fitting, once it doesn't, is computed in the double encoding instead
+// (Note [Optimistic ops]). The narrowing still writes
 // the integer until the rebuild, which waits and is dropped as a contraction is, but for the fact
 // being used.
 //
@@ -1306,6 +1312,15 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // integer encoding (Note [Integers]), while the rarer case still has its result, from the cold
 // path, and a way on knowing that instead. Unlike a dynamic guard's test (Note [Dynamic
 // guards]), the op is an op: it writes its outputs either way.
+//
+// An integer op whose result can overflow first asks which encoding its result is in, which is
+// where the fact that its result fits comes from (Note [Contraction]). It is the integer
+// encoding until the op's result first overflows: then the op is rebuilt to compute in the double
+// encoding, so its result is a double on every path, and the versions that knew it fit are
+// forgotten. Values that fit only some of the time, as sums of bit operations' results often do,
+// so get one version of the code after them instead of one for each encoding they turn up in. An
+// op whose block has JIT code by its first overflow, or whose fact was contracted away, keeps both
+// ways.
 //
 // In JIT code the `Branch` tests no `select`, as a guard's copy tests none (Note [Guard
 // stencils] in `window`): the op's hot path falls through to the hot way, as the next block if
@@ -1518,6 +1533,9 @@ pub enum Fragile {
     /// Stack slot `slot` holds a number constant an i32 holds exactly,
     /// `value`. See Note [Narrowing].
     Constant { slot: usize, value: i32 },
+    /// Stack slot `slot` holds an optimistic integer op's result, which fit
+    /// the integer encoding. See Note [Optimistic ops].
+    Fits { slot: usize },
 }
 
 /// A fragile fact, with where the paths reaching it introduced it, if that can
@@ -1616,6 +1634,7 @@ impl Fragile {
             Fragile::ElementOf { slot, .. } => (2, *slot),
             Fragile::Kind { table, .. } => (3, *table),
             Fragile::Constant { slot, .. } => (4, *slot),
+            Fragile::Fits { slot } => (5, *slot),
         }
     }
 
@@ -1643,6 +1662,9 @@ impl Fragile {
             (Fragile::Constant { slot, .. }, Effect::Write(written)) => written != *slot,
             (Fragile::Constant { .. }, Effect::WriteAny) => false,
             (Fragile::Constant { .. }, Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_)) => true,
+            (Fragile::Fits { slot }, Effect::Write(written)) => written != *slot,
+            (Fragile::Fits { .. }, Effect::WriteAny) => false,
+            (Fragile::Fits { .. }, Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_)) => true,
         }
     }
 }
@@ -2496,7 +2518,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 continue;
             }
             let _blocks = Self::ids(origins.iter().map(|origin| owner.ro(origin).block.0));
-            let _how = if how == ResumeArg::Matched { "integer" } else { "drop" };
+            let _how = match how {
+                ResumeArg::Matched => "integer",
+                ResumeArg::Failed => "drop",
+                _ => "double",
+            };
             // Relied on since (which an integer serves as well), or rebuilt in code
             // that has its own JIT code.
             let refused = if how == ResumeArg::Failed && origins.iter().any(|origin| owner.ro(origin).used) {
@@ -3003,6 +3029,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
         };
         Rc::new(TLCell::new(OriginState { rebuild: Some(Box::new(rebuild)), block, offset, used: false }))
+    }
+
+    /// An optimistic op's cold way, as `make_side_thunk`'s, which the first time it's taken also
+    /// queues where the op's encoding was asked, if anywhere, to be rebuilt computing it in the
+    /// double encoding. See Note [Optimistic ops].
+    fn make_overflow_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, asked: Option<Origin>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
+            vm.jump_thunk(block_id, thunk_pc, side);
+            let Some(origin) = asked.clone().filter(|origin| owner.ro(origin).rebuild.is_some()) else { return };
+            let queued = vm.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, &origin)));
+            if !queued {
+                vm.contractions.push((vm.clos.ro(owner).prototype, vec![origin], ResumeArg::Type(CType::Type(LType::Double))));
+            }
+        })))
     }
 
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
@@ -3625,6 +3666,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     {
         // Where the constant being loaded was, for its fact's origin.
         let mut loading: Option<Origin> = None;
+        // Where the encoding of the optimistic op about to be laid out was asked, and
+        // the slot its result goes in. See Note [Optimistic ops].
+        let mut encoding: Option<(usize, Origin)> = None;
         loop {
             let mut state = Pin::new(&mut coro).resume(arg);
             arg = ResumeArg::Start;
@@ -3833,6 +3877,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
+                CoroutineState::Yielded(YieldOp::Encoding(slot)) => {
+                    encoding = Some((slot, self.origin(block_id, coro.clone(), pc, ctx.clone())));
+                    arg = ResumeArg::Type(CType::Type(LType::Integer));
+                },
                 CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
                     // Its outputs are written whichever path it takes. See Note [Optimistic ops].
                     for (&slot, access) in op.operands().iter().zip(op.accesses()) {
@@ -3842,9 +3890,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op));
-                    let hot = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
+                    // A result that fits is the fact of where its encoding was asked, which its
+                    // overflow rebuilds to compute in the double encoding. See Note [Optimistic ops].
+                    let asked = encoding.take();
+                    let mut fits = ctx.clone();
+                    if let Some((slot, origin)) = &asked {
+                        Rc::make_mut(&mut fits).introduce(Fact { fragile: Fragile::Fits { slot: *slot }, origins: Some(Rc::new(TLCell::new(vec![origin.clone()]))) });
+                    }
+                    let hot = self.subblock(owner, pc.next_true(), fits, coro.clone(), ResumeArg::Matched);
                     let cold = self.new_block(pc.0);
-                    let side = self.make_side_thunk(cold, coro.clone(), pc.next_false(), ctx.clone(), ResumeArg::Failed);
+                    let side = self.make_overflow_thunk(cold, coro.clone(), pc.next_false(), ctx.clone(), asked.map(|(_, origin)| origin));
                     self.blocks[cold.0].instructions.push(Residual::Thunk(side));
                     self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
                     return None;
