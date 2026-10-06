@@ -185,6 +185,9 @@ impl JitHelper {
                     state.call_native(ncall.native(), a, b, c, owner);
                     1
                 }
+                // Inside frames JIT code called, the interpreter makes the call, once the callstack
+                // is whole. See Note [Frame ops] in `specialize`.
+                LValue::LClosure(_) if state.jit_depth > 0 => 0,
                 LValue::LClosure(lclos) => {
                     let Some(entry) = spec.lua_entry(owner, &lclos) else { return 0 };
                     let ret = PackedLocation::from_bits(ret as usize);
@@ -193,6 +196,20 @@ impl JitHelper {
                 }
                 _ => 0,
             }
+        }
+    }
+
+    /// The entry of the frame a call from JIT code made, which a bailout is unwinding, from what
+    /// the call kept on the native stack at `kept` (the frame's caller's hash witnesses' top and
+    /// base, base, and closure, in that order up the stack) and its return location `ret`. Gives
+    /// back the bailout's `exit`, for the call to leave with. See Note [Frame ops] in `specialize`.
+    pub unsafe extern "C" fn unwind_frame(state: *mut (), kept: *const u64, ret: u64, exit: u64) -> u64 {
+        unsafe {
+            let state = &mut *(state as *mut RunState<'static, 'static>);
+            let kept = core::slice::from_raw_parts(kept, 4);
+            let clos = crate::vm::Tc(crate::gc::Gc::from_addr(kept[3]));
+            state.unwind_jit_frame(clos, kept[2] as usize, kept[1] as usize, kept[0] as usize, PackedLocation::from_bits(ret as usize));
+            exit
         }
     }
 
@@ -228,6 +245,10 @@ impl JitHelper {
             if let Residual::LuaCall { entry: CallEntry::Block(entry), .. } = &specializer.blocks[block].instructions[call] {
                 if let Some(code) = specializer.blocks[entry.0].jit_info.entry {
                     let state = &mut *(state as *mut RunState<'static, 'static>);
+                    // As `dynamic_call`'s. See Note [Frame ops] in `specialize`.
+                    if state.jit_depth > 0 {
+                        return 0;
+                    }
                     let owner = crate::forge_owner();
                     state.call_lua(owner, PackedLocation::from_bits(ret as usize), a, b);
                     return code as usize;
@@ -738,12 +759,20 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
 /// The JIT code buffer's size. `immediate_jit` compiles every block that runs,
 /// each as its own region, so it gets twice as much.
 const JIT_SIZE: usize = 0x1000 * 16 * if cfg!(feature = "immediate_jit") { 2 } else { 1 };
+
+/// The JIT code buffer's size for this run: `LUNACY_JIT_SIZE` bytes, to measure
+/// how much code a program needs past the limit, else `JIT_SIZE`.
+fn jit_size() -> usize {
+    std::env::var("LUNACY_JIT_SIZE").map_or(JIT_SIZE, |bytes| bytes.parse().expect("LUNACY_JIT_SIZE: a number of bytes"))
+}
 pub struct JitContext {
     pub memory: std::cell::Cell<dynasmrt::mmap::ExecutableBuffer>,
     pub blocks: HashMap<BlockId, JitBlock, FxBuildHasher>,
     pub pending: BTreeMap<BlockId, Pending>,
     pub stencils: Stencils,
     pub used: usize,
+    /// The buffer's size (`jit_size`).
+    size: usize,
     /// The shared code of an exit through a snapshot. See Note [Snapshots].
     exit_snapshot: usize,
     pub perf_map: Option<std::cell::RefCell<std::fs::File>>,
@@ -1054,6 +1083,22 @@ fn pad(ops: &mut Assembler, base: usize, align: usize) -> usize {
     padding
 }
 
+/// How many of a block's residuals its code runs: up to its first jump or thunk no guard before
+/// it can skip. See Note [Contraction] in `specialize`.
+fn runs_to(residuals: &[Residual]) -> usize {
+    // Whether the residual before can skip this one: a guard's side exit.
+    let mut guarded = false;
+    for (off, res) in residuals.iter().enumerate() {
+        if matches!(res, Residual::Jump(_) | Residual::Thunk(_)) && !guarded {
+            return off + 1;
+        }
+        guarded = matches!(res, Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::NativeGuard { .. }
+            | Residual::LuaGuard { .. } | Residual::GuardWitness { .. } | Residual::EpochCheck { .. } | Residual::HashGuard { .. }
+            | Residual::GuardDynamic(_) | Residual::ReturnedFrom(_));
+    }
+    residuals.len()
+}
+
 /// The blocks a residual jumps to.
 fn jump_targets(res: &Residual) -> SmallVec<[BlockId; 2]> {
     match res {
@@ -1066,13 +1111,14 @@ fn jump_targets(res: &Residual) -> SmallVec<[BlockId; 2]> {
 
 impl JitContext {
     pub fn new() -> Self {
-        let near = Self::find_near();
+        let size = jit_size();
+        let near = Self::find_near(size);
         assert!(near != core::ptr::null_mut());
-        let mut memory = dynasmrt::mmap::MutableBuffer::new_with_hint(JIT_SIZE, near).unwrap();
+        let mut memory = dynasmrt::mmap::MutableBuffer::new_with_hint(size, near).unwrap();
         debug!("allocated JIT memory @ {:?}", memory.as_ptr());
         // Set the JIT memory to the max size initially, so that we don't need to
         // mprotect back to mutable just to reserve
-        memory.set_len(JIT_SIZE);
+        memory.set_len(size);
         let mut perf_map = None;
         #[cfg(feature = "perf")]
         {
@@ -1108,6 +1154,7 @@ impl JitContext {
             // `LUNACY_JIT_PADDING` bytes are left unused at the buffer's start,
             // to time the same code at other places in its cache lines.
             used: std::env::var("LUNACY_JIT_PADDING").map_or(0, |bytes| bytes.parse().expect("LUNACY_JIT_PADDING: a number of bytes")),
+            size,
             exit_snapshot: 0,
             perf_map,
             window_dump,
@@ -1201,22 +1248,22 @@ impl JitContext {
         }
     }
 
-    fn find_near() -> *mut core::ffi::c_void {
+    fn find_near(size: usize) -> *mut core::ffi::c_void {
         let target = JitHelper::check_guard as *mut u8 as usize;
         let MAX_DIST = 2isize.pow(31);
         let maps = rsprocmaps::from_path("/proc/self/maps").unwrap();
-        // Our goal is to find an available place in memory such that our entire JIT_SIZE buffer is
+        // Our goal is to find an available place in memory such that our entire `size` buffer is
         // within 2GB of the target.
         // This means that we can
-        // 1) allocate memory before it, with a start <2GB away, and a JIT_SIZE hole
-        // 2) allocate memory after it, with a start <2GB-JIT_SIZE away, and a JIT_SIZE hole
+        // 1) allocate memory before it, with a start <2GB away, and a `size` hole
+        // 2) allocate memory after it, with a start <2GB-`size` away, and a `size` hole
         // Really this needs to have the target be a *range* and require a buffer that is within
         // distance of both the start and end, and then we should compute the start and end based
         // off all of our closure call targets...but it isn't likely to matter, so we don't.
         let res = maps.map_windows(|[first, second]| {
             let (Ok(first), Ok(second)) = (first, second) else { return None };
             // Case 1
-            if (target as isize - first.address_range.end as isize).abs() < MAX_DIST && (second.address_range.begin - first.address_range.end) as usize >= JIT_SIZE {
+            if (target as isize - first.address_range.end as isize).abs() < MAX_DIST && (second.address_range.begin - first.address_range.end) as usize >= size {
                 debug!("Found near JIT location @ {:#x}", first.address_range.end);
                 return Some(first.address_range.end as *mut core::ffi::c_void);
             }
@@ -1234,7 +1281,7 @@ impl JitContext {
 
     // Reserve memory in the JIT buffer
     fn reserve(&mut self, len: usize) {
-        assert!(self.used + len < JIT_SIZE, "JIT code past the end of its buffer");
+        assert!(self.used + len < self.size, "JIT code past the end of its buffer");
         self.used += len;
     }
 
@@ -1643,7 +1690,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut next = 0;
         while let Some(&block) = ids.get(next) {
             next += 1;
-            for target in self.blocks[block.0].instructions.iter().flat_map(jump_targets) {
+            let residuals = &self.blocks[block.0].instructions;
+            for target in residuals[..runs_to(residuals)].iter().flat_map(jump_targets) {
                 if !self.jctx.blocks.contains_key(&target) && !index.contains_key(&target) {
                     index.insert(target, ids.len());
                     ids.push(target);
@@ -1680,7 +1728,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .zip(&skips)
                 .map(|(block, skips)| {
                     let mut events = Vec::new();
-                    for (off, res) in self.blocks[block.0].instructions.iter().enumerate() {
+                    let residuals = &self.blocks[block.0].instructions;
+                    for (off, res) in residuals[..runs_to(residuals)].iter().enumerate() {
                         match res {
                             Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[off].is_empty() => {
                                 let operands = w.operands().iter().zip(w.accesses());
@@ -1789,8 +1838,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let block = &self.blocks[ids[b].0];
             let next = trace.get(pos + 1).map(|&n| ids[n]);
             // The jump the trace goes on to `next` through: the block's last to it.
-            let flow = next.and_then(|next| block.instructions.iter().rposition(|res| jump_targets(res).contains(&next)));
-            let targets = || block.instructions.iter().flat_map(jump_targets);
+            let ran = &block.instructions[..runs_to(&block.instructions)];
+            let flow = next.and_then(|next| ran.iter().rposition(|res| jump_targets(res).contains(&next)));
+            let targets = || ran.iter().flat_map(jump_targets);
             let back = targets().any(|target| position(target).is_some_and(|at| at <= pos));
             let continues = if next.is_none() && !back {
                 targets().min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0))
@@ -1805,7 +1855,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Rise { reads, writes }
             })));
             let mut of = vec![None; block.instructions.len()];
-            for (off, res) in block.instructions.iter().enumerate() {
+            for (off, res) in block.instructions[..runs_to(&block.instructions)].iter().enumerate() {
                 match res {
                     Residual::ExecWindow(_) | Residual::GuardDynamic(_) if !skips[b][off].is_empty() => {
                         of[off] = Some(steps.len());
@@ -2068,7 +2118,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         };
         let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_));
         let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. });
-        for (off, res) in block.instructions.iter().enumerate() {
+        let end = runs_to(&block.instructions);
+        for (off, res) in block.instructions[..end].iter().enumerate() {
             debug!("JIT operation {res:?}");
             window_dump!(self.jctx, "  {off:3} {res}");
             jit_note!(self.jctx, ops, "  {off:3} {res}");
@@ -2263,19 +2314,29 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     ; jmp >lua_call
                                 );
                             }
-                            // The frame, pushed by `PushFrame` returning here. See Note
+                            // The frame, pushed by `PushFrame` returning here, with what its
+                            // entry would hold kept on the native stack: put back when it
+                            // returns, or written as its entry if it bails out. See Note
                             // [Frame ops] in `specialize`.
                             // The callee's frame past a fixed count of arguments is
                             // nilled here, a store a slot, but for a big one, which
                             // `PushFrame` nils, as it does past a count up to the top.
                             let packed_ret = Location(BlockId(id.0), off + 1).pack();
                             let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
-                            let (ret, abs) = (packed_ret.bits() as u64, hold(*a) | hold(*b) << 16 | (*stack as u64) << 32);
+                            let abs = hold(*a) | hold(*b) << 16 | (*stack as u64) << 32;
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
                             let push = match nils {
-                                Some(_) => frame_op!(PushFrame [false,] (ret, abs); *a, *b),
-                                None => frame_op!(PushFrame [true,] (ret, abs); *a, *b),
+                                Some(_) => frame_op!(PushFrame [false,] (abs); *a, *b),
+                                None => frame_op!(PushFrame [true,] (abs); *a, *b),
                             };
+                            jit_note!(self.jctx, ops, "        keep the caller's frame");
+                            dynasm!(ops
+                                ; .arch x64
+                                ; push QWORD r12 => RunState.clos
+                                ; push QWORD r12 => RunState.base
+                                ; push QWORD r12 => RunState.witness_base
+                                ; push QWORD r12 => RunState.witness_top
+                            );
                             jit_note!(self.jctx, ops, "        PushFrame");
                             emit_frame_op(ops, &mut self.jctx.stencils, pool, &push);
                             self.jctx.frame_ops.push(push);
@@ -2310,15 +2371,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     );
                                 },
                             }
+                            jit_note!(self.jctx, ops, "        put back the caller's frame, or unwind");
                             dynasm!(ops
                                 ; .arch x64
-                                ; mov r13, QWORD [rsp - 0]
-
-                                // Check if the call is trying to bailout: we propagate the bailout
-                                // if so, unwinding our native stack but yielding to the generator run loop
-                                // with a suspended Location stack.
+                                // A bailout in the callee: its frame's entry is written from
+                                // what was kept, and the bailout goes on to this code's caller.
                                 ; cmp BYTE r12 => RunState.trap, 0
-                                ; jnz ->exit_jit
+                                ; jz >call_returned
+                                ; mov rdi, r12
+                                ; mov rsi, rsp
+                                ; mov rdx, QWORD (packed_ret.bits() as i64)
+                                ; mov rcx, rax
+                                ; call extern (JitHelper::unwind_frame as *const () as usize)
+                                ; add rsp, 32
+                                ; jmp ->exit_jit
+                                ; call_returned:
+                                ; pop QWORD r12 => RunState.witness_top
+                                ; pop QWORD r12 => RunState.witness_base
+                                ; pop QWORD r12 => RunState.base
+                                ; pop QWORD r12 => RunState.clos
+                                ; mov r13, QWORD [rsp - 0]
                             );
                             if code.is_none() {
                                 dynasm!(ops
@@ -2549,7 +2621,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // `successor`, and so the JIT worklist will compile it immediately after this
                     // code.
                     emit_jump(ops, &alloc, target,
-                        off == (block.instructions.len() - 1) && self.jctx.blocks.get(target).is_none(), false);
+                        off == end - 1 && self.jctx.blocks.get(target).is_none(), false);
                     successor = Some(*target);
                 },
                 Residual::Ret(pc, a, b, closes, vararg, returns, effects) => {

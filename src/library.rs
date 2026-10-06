@@ -237,29 +237,27 @@ fn format(fmt: &[u8], args: &[LBoxed]) -> Vec<u8> {
             b'c' => out.extend(c_format(spec, "c", CArg::Char(number(value) as i32))),
             b'e' | b'E' | b'f' | b'g' | b'G' => out.extend(c_format(spec, &(conv as char).to_string(), CArg::Double(number(value)))),
             b's' => {
-                let mut s = bytes(value);
+                let s = bytes(&value);
                 let text = String::from_utf8_lossy(spec).into_owned();
                 let (width, precision) = match text.split_once('.') {
                     Some((w, p)) => (w, p.parse::<usize>().ok()),
                     None => (text.as_str(), None),
                 };
-                if let Some(p) = precision {
-                    s.truncate(p);
-                }
+                let s = &s[..precision.map_or(s.len(), |p| p.min(s.len()))];
                 let left = width.contains('-');
                 let width: usize = width.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0);
                 let pad = width.saturating_sub(s.len());
                 if !left {
                     out.extend(std::iter::repeat_n(b' ', pad));
                 }
-                out.extend(s);
+                out.extend_from_slice(s);
                 if left {
                     out.extend(std::iter::repeat_n(b' ', pad));
                 }
             }
             b'q' => {
                 out.push(b'"');
-                for b in bytes(value) {
+                for &b in bytes(&value).iter() {
                     match b {
                         b'"' | b'\\' | b'\n' => out.extend([b'\\', b]),
                         b'\r' => out.extend(b"\\r"),
@@ -335,13 +333,23 @@ fn number_or(v: LBoxed, default: f64) -> f64 {
 }
 
 /// A string or number argument's bytes, as `..` would convert it.
-fn bytes(v: LBoxed) -> Vec<u8> {
+/// A string's are borrowed for as long as `v` is, a number's made.
+fn bytes<'a>(v: &'a LBoxed<'_, '_>) -> std::borrow::Cow<'a, [u8]> {
     match v.unbox() {
-        LValue::InternedString(s) => s.as_bytes().to_vec(),
-        LValue::OwnedString(s) => s.as_slice().to_vec(),
-        LValue::Integer(i) => format!("{}", i).into_bytes(),
-        LValue::Double(n) => format!("{}", n.0).into_bytes(),
+        LValue::InternedString(s) => std::borrow::Cow::Borrowed(s.into_ref().as_bytes()),
+        // The cell is `v`'s, so it lives as long as `v` is borrowed, and its bytes never change.
+        LValue::OwnedString(s) => std::borrow::Cow::Borrowed(unsafe { core::slice::from_raw_parts(s.as_slice().as_ptr(), s.as_slice().len()) }),
+        LValue::Integer(i) => std::borrow::Cow::Owned(format!("{}", i).into_bytes()),
+        LValue::Double(n) => std::borrow::Cow::Owned(format!("{}", n.0).into_bytes()),
         other => unimplemented!("a string argument, not {other:?}"),
+    }
+}
+
+/// Argument `i`'s bytes, as `bytes`, borrowed from the arguments.
+fn arg_bytes<'a>(args: &'a [LBoxed<'_, '_>], i: usize) -> std::borrow::Cow<'a, [u8]> {
+    match args.get(i) {
+        Some(v) => bytes(v),
+        None => unimplemented!("a string argument, not Nil"),
     }
 }
 
@@ -556,7 +564,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let parsed = match v.unbox() {
             LValue::Integer(_) | LValue::Double(_) if base == 10 => v.as_number(),
             LValue::InternedString(_) | LValue::OwnedString(_) => {
-                let text = String::from_utf8_lossy(&bytes(v)).trim().to_lowercase();
+                let text = String::from_utf8_lossy(&bytes(&v)).trim().to_lowercase();
                 match text.strip_prefix("0x") {
                     Some(hex) if base == 10 || base == 16 => i64::from_str_radix(hex, 16).ok().map(|n| n as f64),
                     _ if base == 10 => text.parse::<f64>().ok().filter(|n| n.is_finite() || text.contains("inf")),
@@ -571,31 +579,31 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     // Indexing a string reads it, through caches. See Note [String methods] in
     // `specialize`.
     let string_lib = module_table(intern, vec![
-        ("lower", native!(pure |owner, args| smallvec![string(bytes(arg(&args, 0)).to_ascii_lowercase())])),
-        ("upper", native!(pure |owner, args| smallvec![string(bytes(arg(&args, 0)).to_ascii_uppercase())])),
-        ("len", native!(pure |owner, args| smallvec![LBoxed::from_int(bytes(arg(&args, 0)).len() as i32)])),
+        ("lower", native!(pure |owner, args| smallvec![string(arg_bytes(&args, 0).to_ascii_lowercase())])),
+        ("upper", native!(pure |owner, args| smallvec![string(arg_bytes(&args, 0).to_ascii_uppercase())])),
+        ("len", native!(pure |owner, args| smallvec![LBoxed::from_int(arg_bytes(&args, 0).len() as i32)])),
         ("sub", native!(pure |owner, args| {
-            let s = bytes(arg(&args, 0));
+            let s = arg_bytes(&args, 0);
             let range = span(s.len(), number_or(arg(&args, 1), 1.0), number_or(arg(&args, 2), -1.0));
             smallvec![string(s[range].to_vec())]
         })),
         ("byte", native!(pure |owner, args| {
-            let s = bytes(arg(&args, 0));
+            let s = arg_bytes(&args, 0);
             let i = number_or(arg(&args, 1), 1.0);
             let range = span(s.len(), i, number_or(arg(&args, 2), i));
             s[range].iter().map(|&b| LBoxed::from_int(b as i32)).collect()
         })),
         ("char", native!(pure |owner, args| smallvec![string(args.iter().map(|&b| number(b) as u8).collect())])),
         ("rep", native!(pure |owner, args| {
-            let s = bytes(arg(&args, 0));
+            let s = arg_bytes(&args, 0);
             let n = number(arg(&args, 1)).max(0.0) as usize;
             let out = s.repeat(n);
             smallvec![string(out)]
         })),
-        ("format", native!(pure |owner, args| smallvec![string(format(&bytes(arg(&args, 0)), args.get(1..).unwrap_or(&[])))])),
+        ("format", native!(pure |owner, args| smallvec![string(format(&arg_bytes(&args, 0), args.get(1..).unwrap_or(&[])))])),
         // See Note [Patterns] in `patterns`.
         ("find", native!(pure |owner, args| {
-            let (s, p) = (bytes(arg(&args, 0)), bytes(arg(&args, 1)));
+            let (s, p) = (arg_bytes(&args, 0), arg_bytes(&args, 1));
             let init = init(s.len(), arg(&args, 2));
             if arg(&args, 3).truthy() || !patterns::has_specials(&p) {
                 match patterns::find_plain(&s[init..], &p) {
@@ -612,18 +620,18 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             }
         })),
         ("match", native!(pure |owner, args| {
-            let (s, p) = (bytes(arg(&args, 0)), bytes(arg(&args, 1)));
+            let (s, p) = (arg_bytes(&args, 0), arg_bytes(&args, 1));
             let found = patterns::find(&s, &p, init(s.len(), arg(&args, 2)), |found| {
                 Ok(found.captures()?.into_iter().map(|c| capture(&s, c)).collect())
             });
             found.map_err(error_value)?.unwrap_or_else(|| smallvec![LBoxed::NIL])
         })),
         ("gsub", native!(pure |owner, args| {
-            let (s, p, replacement) = (bytes(arg(&args, 0)), bytes(arg(&args, 1)), arg(&args, 2));
+            let (s, p, replacement) = (arg_bytes(&args, 0), arg_bytes(&args, 1), arg(&args, 2));
             let max = if arg(&args, 3).is_nil() { s.len() as i64 + 1 } else { number(arg(&args, 3)) as i64 };
             let replaced = match replacement.unbox() {
                 LValue::Integer(_) | LValue::Double(_) | LValue::InternedString(_) | LValue::OwnedString(_) => {
-                    let replacement = bytes(replacement);
+                    let replacement = bytes(&replacement);
                     patterns::gsub(&s, &p, max, |found| substitute(&s, &replacement, found).map(Some))
                 },
                 // The value at the first capture, raw, if it's a string or a number;
@@ -635,7 +643,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                     };
                     match value.unbox() {
                         LValue::Nil | LValue::Bool(false) => Ok(None),
-                        LValue::Integer(_) | LValue::Double(_) | LValue::InternedString(_) | LValue::OwnedString(_) => Ok(Some(bytes(value))),
+                        LValue::Integer(_) | LValue::Double(_) | LValue::InternedString(_) | LValue::OwnedString(_) => Ok(Some(bytes(&value).into_owned())),
                         _ => Err(format!("invalid replacement value (a {})", String::from_utf8_lossy(type_name(value)))),
                     }
                 }),
@@ -710,7 +718,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         })),
         ("concat", native!(pure |owner, args| {
             let t = table(arg(&args, 0));
-            let sep = if args.len() > 1 { bytes(arg(&args, 1)) } else { Vec::new() };
+            let sep = if args.len() > 1 { arg_bytes(&args, 1) } else { std::borrow::Cow::Borrowed(&[][..]) };
             let items: Vec<LBoxed> = t.ro(owner).array.iter().copied().collect();
             let range = span(items.len(), number_or(arg(&args, 2), 1.0), number_or(arg(&args, 3), items.len() as f64));
             let mut out = Vec::new();
@@ -718,7 +726,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                 if n > 0 {
                     out.extend_from_slice(&sep);
                 }
-                out.extend_from_slice(&bytes(item));
+                out.extend_from_slice(&bytes(&item));
             }
             smallvec![string(out)]
         })),
@@ -728,7 +736,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         ("write", native!(pure |owner, args| {
             let mut out = std::io::stdout().lock();
             for &v in &args {
-                out.write_all(&bytes(v)).expect("writing stdout");
+                out.write_all(&bytes(&v)).expect("writing stdout");
             }
             smallvec![]
         })),
@@ -822,7 +830,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     let error = native!(pure |owner, args| return Err(arg(&args, 0)));
 
     let require = native!(pure |owner, args| {
-        let name = bytes(arg(&args, 0));
+        let name = arg_bytes(&args, 0);
         let found = MODULES.with_borrow(|modules| modules.iter().find(|(m, _)| m.as_bytes() == name).map(|(_, v)| *v));
         let Some(module) = found else { panic!("require: no built-in module {:?}", String::from_utf8_lossy(&name)) };
         // SAFETY: the value is alive, held by the global table; see `MODULES`.

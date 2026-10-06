@@ -1528,7 +1528,8 @@ pub const EFFECTS_SHIFT: u32 = 20;
 // the running one's and each caller's in the callstack, and of the top, which is
 // past them while results a call returned all of (C = 0) are still to be
 // consumed. It is computed when the GC runs, from the callstack, rather than
-// kept on each call and return.
+// kept on each call and return. While frames JIT code called are running, which
+// have no entries (Note [Frame ops] in `specialize`), it is the whole stack.
 //
 // Marking the stack shrinks it to its live extent (`RunState::mark`), and the
 // GC marks the roots again, the mutator stopped, before it sweeps: so a slot
@@ -1722,6 +1723,13 @@ pub struct RunState<'src, 'intern> {
     /// continues (a `PackedLocation`), or -2 for a return from the entry
     /// frame. `PopFrame` writes it. See Note [Frame ops] in `specialize`.
     pub exit: u64,
+    /// How many frames JIT code called past the callstack's, which have no
+    /// entries in it. See Note [Frame ops] in `specialize`.
+    pub jit_depth: usize,
+    /// How many entries past the callstack's length a bailout through frames
+    /// JIT code called has written, as their calls unwind. See Note [Frame ops]
+    /// in `specialize`.
+    pub unwound: usize,
     pub gas: i64,
     /// Prototypes whose entry blocks `closure.__jit = ...` asked to compile, for
     /// `Specializer::run` to force (feature `magic`). See `emit_settable`.
@@ -1889,10 +1897,33 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// `max_stack`, which the caller knows.
     #[inline(always)]
     pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, stack: u8, fills: bool) -> usize {
+        let entry = CallstackEntry {
+            clos: self.clos.clone(),
+            ret: Location::unpack(ret),
+            frame: self.base,
+            // Set by `call_lua` if the function is vararg.
+            func: core::mem::MaybeUninit::uninit(),
+            witness_frame: self.witness_base,
+            witness_top: self.witness_top,
+        };
+        let stack = self.enter_frame(owner, a, b, stack, fills);
+        self.callstack.push(entry);
+        stack
+    }
+
+    /// `push_frame`, for a call from JIT code of a function that isn't vararg: the caller keeps
+    /// what an entry would hold, and the frame has none. See Note [Frame ops] in `specialize`.
+    #[inline(always)]
+    pub fn push_jit_frame(&mut self, owner: &mut Owner, a: usize, b: usize, stack: u8, fills: bool) -> usize {
+        self.jit_depth += 1;
+        self.enter_frame(owner, a, b, stack, fills)
+    }
+
+    /// The callee's frame of a call of R(A), made the running one, as `push_frame` says.
+    #[inline(always)]
+    fn enter_frame(&mut self, owner: &mut Owner, a: usize, b: usize, stack: u8, fills: bool) -> usize {
         let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unreachable!() };
         debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "a call's frame size isn't its callee's");
-        let ret_loc = Location::unpack(ret);
-        // record call stack: we say where to return to and where to put the values
         let next_stack = stack as usize;
         let next_base = self.base + a + 1;
         // Its arguments are `b - 1` values, or up to the top, which the caller
@@ -1907,15 +1938,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         if fills && passed < end {
             self.nil_slots(passed, end);
         }
-        self.callstack.push(CallstackEntry {
-            clos: self.clos.clone(),
-            ret: ret_loc,
-            frame: self.base,
-            // Set by `call_lua` if the function is vararg.
-            func: core::mem::MaybeUninit::uninit(),
-            witness_frame: self.witness_base,
-            witness_top: self.witness_top,
-        });
         self.base = next_base;
         // Start `top` at the end of the callee's register file.
         self.top = next_base + next_stack;
@@ -1930,6 +1952,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// frames].
     pub fn vararg(&mut self, owner: &Owner, a: usize, b: usize, params: usize) {
         debug_assert!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, "VARARG in a function that isn't vararg");
+        // Only a frame JIT code didn't call is a vararg function's. See Note [Frame ops] in
+        // `specialize`.
+        assert_eq!(self.jit_depth, 0, "VARARG in a frame JIT code called");
         // The outermost frame, a chunk, has none.
         let extra = self.callstack.last().map_or(0, |entry| {
             // SAFETY: `entry` is the running frame's, and VARARG runs only in a
@@ -1983,17 +2008,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     #[inline(always)]
     pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> Result<Location, std::ops::Range<usize>> {
         debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, vararg, "a return's vararg isn't its function's");
-        if closes {
-            if !self.upvals.is_empty() {
-                self.close_upvalues(owner);
-            }
-        } else {
-            debug_assert!(
-                self.upvals.iter().all(|(upval, _)| matches!(upval, Upvalue::Open(idx) if *idx < self.base)),
-                "an upvalue open into a frame whose function captures none of it"
-            );
-        }
-
+        self.close_leaving(owner, closes);
         let from = self.base + a;
         let count = if b == 0 { self.top - from } else { b - 1 };
         match self.callstack.pop() {
@@ -2009,12 +2024,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                     self.base - 1
                 };
                 let CallstackEntry { clos, ret, frame, witness_frame, witness_top, .. } = entry;
-                match count {
-                    0 => {},
-                    1 => self.vals[to] = self.vals[from],
-                    _ => self.move_down(from, count, to),
-                }
-                self.top = to + count;
+                self.move_results(from, count, to);
                 self.clos = clos;
                 self.base = frame;
                 self.witness_base = witness_frame;
@@ -2022,6 +2032,46 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                 Ok(ret)
             },
             None => Err(from..from + count),
+        }
+    }
+
+    /// `leave`, from a frame JIT code called: its results go to its function's slot, the top past
+    /// them, and its caller, which kept what an entry would hold, puts back the rest. See Note
+    /// [Frame ops] in `specialize`.
+    #[inline(always)]
+    pub fn leave_jit_frame(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) {
+        debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg }, 0, "a return of a vararg function from a frame JIT code called");
+        self.close_leaving(owner, closes);
+        let from = self.base + a;
+        let count = if b == 0 { self.top - from } else { b - 1 };
+        self.move_results(from, count, self.base - 1);
+        self.jit_depth -= 1;
+    }
+
+    /// Move a return's `count` results from `from` down to its function's slot, `to`, the top just
+    /// past them.
+    #[inline(always)]
+    fn move_results(&mut self, from: usize, count: usize, to: usize) {
+        match count {
+            0 => {},
+            1 => self.vals[to] = self.vals[from],
+            _ => self.move_down(from, count, to),
+        }
+        self.top = to + count;
+    }
+
+    /// Close the returning frame's open upvalues, if its function can have opened any.
+    #[inline(always)]
+    fn close_leaving(&mut self, owner: &mut Owner, closes: bool) {
+        if closes {
+            if !self.upvals.is_empty() {
+                self.close_upvalues(owner);
+            }
+        } else {
+            debug_assert!(
+                self.upvals.iter().all(|(upval, _)| matches!(upval, Upvalue::Open(idx) if *idx < self.base)),
+                "an upvalue open into a frame whose function captures none of it"
+            );
         }
     }
 
@@ -2056,6 +2106,13 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let proto = unsafe { &*lclos.ro(owner).prototype };
         let (stack, callee_vararg, params) = (proto.max_stack as usize, proto.is_vararg != 0, proto.param_count as usize);
         let next_base = match self.callstack.last() {
+            // A frame JIT code called is no vararg function's, and its entry isn't there to
+            // record a vararg callee's function slot. See Note [Frame ops] in `specialize`.
+            _ if self.jit_depth > 0 => {
+                assert!(!vararg && !callee_vararg, "not implemented: a tail call of a vararg function in a frame JIT code called");
+                self.move_down(from, count, self.base - 1);
+                self.base
+            },
             Some(entry) => {
                 // The function's slot, as `leave` finds it. See Note [Vararg frames].
                 let func = if vararg {
@@ -2089,7 +2146,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         self.clos = lclos.clone();
         // The frame's entry records its function's slot if it is vararg. See Note
         // [Vararg frames].
-        if let Some(entry) = self.callstack.last_mut() {
+        if let Some(entry) = self.callstack.last_mut().filter(|_| self.jit_depth == 0) {
             entry.func = if callee_vararg { core::mem::MaybeUninit::new(next_base - 1) } else { core::mem::MaybeUninit::uninit() };
         }
         if callee_vararg {
@@ -2122,6 +2179,11 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// frame's `base + max_stack`, the running one's and each caller's, and of
     /// the top. See Note [Stack frames].
     pub fn live_extent(&self, owner: &Owner) -> usize {
+        // Frames JIT code called have no entries to say where theirs end: the whole stack, which
+        // each made long enough for its frame.
+        if self.jit_depth > 0 {
+            return self.vals.len();
+        }
         let end = |base: usize, clos: &Tc<LClosure<'src, 'intern>>| base + unsafe { (*clos.ro(owner).prototype).max_stack as usize };
         let running = end(self.base, &self.clos).max(self.top);
         let extent = self.callstack.iter().map(|call| end(call.frame, &call.clos)).fold(running, usize::max);
@@ -2131,6 +2193,33 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 }
 
 impl<'src, 'intern> RunState<'src, 'intern> {
+    /// The entry of the frame JIT code called at `jit_depth`, written as its call unwinds a bailout,
+    /// from what its caller kept: its closure, base, and hash witnesses' range, and the call's
+    /// return location. The first room is made for every frame JIT code called. See Note [Frame
+    /// ops] in `specialize`.
+    pub fn unwind_jit_frame(&mut self, clos: Tc<LClosure<'src, 'intern>>, frame: usize, witness_frame: usize, witness_top: usize, ret: PackedLocation) {
+        if self.unwound == 0 {
+            self.callstack.reserve(self.jit_depth);
+            self.unwound = self.jit_depth;
+        }
+        let index = self.callstack.len() + self.jit_depth - 1;
+        let entry = CallstackEntry { clos, ret: Location::unpack(ret), frame, func: core::mem::MaybeUninit::uninit(), witness_frame, witness_top };
+        // SAFETY: `index` is within the room made above, past the length, and written once: each
+        // frame JIT code called is at its own depth.
+        unsafe { self.callstack.as_mut_ptr().add(index).write(entry) };
+        self.jit_depth -= 1;
+    }
+
+    /// Take the entries `unwind_jit_frame` wrote into the callstack, once JIT code has exited.
+    pub fn finish_unwinding(&mut self) {
+        assert_eq!(self.jit_depth, 0, "JIT code exited with frames it called still running");
+        // SAFETY: `unwind_jit_frame` wrote each of them, from the outermost frame JIT code called
+        // in.
+        let len = self.callstack.len() + self.unwound;
+        unsafe { self.callstack.set_len(len) };
+        self.unwound = 0;
+    }
+
     /// Raise `error`: the run loop unwinds to the innermost protected call, and
     /// JIT code exits to it first. See Note [Errors] in `specialize`.
     pub fn raise(&mut self, error: LBoxed<'src, 'intern>) {
@@ -2211,9 +2300,9 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
                 cell.mark(owner);
             }
         }
-        // Our callstack isn't actually guaranteed to be accurate, because it could be lagging due
-        // to being inside the JIT with a native call frame instead. However, we would only end up
-        // missing closures which were already rooted by the JIT, so it's fine.
+        // Inside JIT code, the frames it called have no entries here (Note [Frame ops] in
+        // `specialize`): each one's closure is in its function's slot, in its caller's frame, which
+        // the stack marks.
         for call in self.callstack.iter() {
             call.clos.mark(owner);
         }
@@ -2468,6 +2557,8 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 hash_witnesses: Witnesses::new(),
                 select: 0,
                 trap: false,
+                jit_depth: 0,
+                unwound: 0,
                 error: None,
                 handlers: vec![].into(),
                 #[cfg(feature = "magic")]

@@ -9,9 +9,9 @@ then its symbol), so the addresses agree: `just jit-profile` makes both. With
 precise samples (IBS), a sample's address is the instruction that ran.
 
 Prints the samples' split between the JIT's code and the binary's functions,
-and the JIT's by what emitted the code (the disassembly's notes: a region's
-entry and exit, and a block's residuals and the parts of one) summed over
-every copy. `--out` writes the disassembly of every range with a sample, each
+the JIT's by what emitted the code (the disassembly's notes: a region's entry
+and exit, and a block's residuals and the parts of one) summed over every
+copy, and the JIT's by block. `--out` writes the disassembly of every range with a sample, each
 instruction with its count. `--op` sums the copies of what one note names
 (`PushFrame`, `window(GetTableInteger`) instruction by instruction, over the
 copies of the same code, and prints each code with its first copy's text.
@@ -98,6 +98,14 @@ def main():
         by_kind[' / '.join(kind(n) for n in notes[1:]) or kind(notes[0]) if notes else '(no note)'] += n
     print(f'\nJIT samples by what emitted the code (summed over copies):')
     for k, n in by_kind.most_common(args.top):
+        print(f'  {n:7} {100 * n / total:5.1f}%  {k}')
+
+    by_block = Counter()
+    for i, n in counts.items():
+        block = next((note for note in insts[i][3] if note.startswith('block ')), '(no block)')
+        by_block[block] += n
+    print(f'\nJIT samples by block:')
+    for k, n in by_block.most_common(args.top):
         print(f'  {n:7} {100 * n / total:5.1f}%  {k}')
 
     if args.op:

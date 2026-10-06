@@ -236,9 +236,10 @@ pub enum YieldOp {
                            // Matched to load it as an integer, Failed as a double whose fact
                            // isn't introduced, else as a double. See Note [Contraction]
     HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Narrowing]
-    Encoding, // An optimistic integer op is about to be laid out: resumed with the double type to
-              // compute it in the double encoding instead, else with the integer one. See Note
-              // [Optimistic ops]
+    Encoding(Fits), // An optimistic integer op is about to be laid out, whose result fits for the
+                    // values its operands have if the test does: resumed, once the op first runs,
+                    // with the double type to compute it in the double encoding instead, else with
+                    // the integer one. See Note [Optimistic ops]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
                       // knows it, else Failed. See Note [Array kinds]
@@ -344,6 +345,17 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
                 (mine, theirs) => mine == theirs,
             }
             && self.hazards.iter().enumerate().all(|(slot, &checked)| !checked || other.hazards.get(slot) == Some(&true))
+    }
+}
+
+/// Whether an integer op's result fits the integer encoding for the values its operands have.
+/// See Note [Optimistic ops].
+#[derive(Clone)]
+pub struct Fits(pub Rc<dyn Fn(&RunState) -> bool>);
+
+impl std::fmt::Debug for Fits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("fits")
     }
 }
 
@@ -654,14 +666,32 @@ impl After {
 // Note [Frame ops]
 // ~~~~~~~~~~~~~~~~
 // JIT code and the interpreter share one Lua call stack: `state.callstack`, and the running frame
-// in `state`. Whenever control leaves JIT code, the frames there must be exactly what the
-// interpreter would have.
-// No Lua frame exists only in the native stack, so a bailout just discards
-// JIT code's native frames and resumes the suspended Lua frame in the interpreter.
+// in `state`. Whenever the interpreter runs, the callstack must be exactly what it would have made
+// itself.
 //
-// JIT code keeps the callstack intact by running the interpreter's own frame maintenance
-// functions, not a copy of the logic. Each one is ran as a window op, copied into the JIT code,
-// which means that the size of each function is very size and branch prediction sensitive.
+// A call from JIT code to JIT code makes no entry: it only moves the running frame to the callee's
+// (`push_jit_frame`), and counts the frames JIT code has called past the callstack's
+// (`jit_depth`). The caller keeps what the entry would hold (its closure, base, and hash
+// witnesses' range) on the native stack, and puts it back when the callee returns
+// (`leave_jit_frame`), which only moves the results down. A return from a frame JIT code didn't
+// call pops its entry, as the interpreter's does.
+//
+// The callstack is made whole only when control leaves JIT code from inside frames it called.
+// Each call there unwinds the bailout through its own code: it writes the entry of the frame it
+// called at that frame's depth past the callstack's length, from what it kept and its own return
+// location, in room the first one makes for all of them, and leaves in turn. Once the outermost
+// leaves, the run loop takes them into the callstack (`finish_unwinding`), in order.
+//
+// Only a frame JIT code didn't call can be a vararg function's: its entry records its function's
+// slot (Note [Vararg frames] in `vm`). A call from JIT code that would make one, or reach the
+// interpreter's call path, while frames JIT code called are running, goes to the interpreter
+// instead, which makes the callstack whole first. The frames JIT code called stay rooted for the
+// collector without entries: each one's closure is in its function's slot, in its caller's frame,
+// and while any runs, the collector marks the whole stack (Note [Stack frames] in `vm`).
+//
+// JIT code runs the interpreter's own frame maintenance functions, not a copy of the logic. Each
+// one is ran as a window op, copied into the JIT code, which means that the size of each function
+// is very size and branch prediction sensitive.
 
 // Note [Count case analysis]
 // Callstack maintenance operations (See Note [Frame ops]) have differing behavior based on the
@@ -711,14 +741,12 @@ impl Count {
     }
 }
 
-// `call_lua` for a call of R(A). `abs` is its `a | b << 16 | stack << 32` (A and B as
-// `Count::hold` holds them, `stack` the callee's `max_stack`). The pushed frame returns to `ret`
-// (a `PackedLocation`). Requires nilling the callee's frame if `FILLS`, or else the JIT code does.
-// The callee isn't vararg: its frame's entry records no function slot (Note [Vararg frames]).
-// See Note [Frame ops].
-windowed!(frame PushFrame, [ret: u64, abs: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
+// `push_jit_frame` for a call of R(A). `abs` is its `a | b << 16 | stack << 32` (A and B as
+// `Count::hold` holds them, `stack` the callee's `max_stack`). Requires nilling the callee's frame
+// if `FILLS`, or else the JIT code does. The callee isn't vararg. See Note [Frame ops].
+windowed!(frame PushFrame, [abs: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
     let (a, b) = (A.lift(abs as u16), B.lift((abs >> 16) as u16));
-    state.push_frame(owner, crate::vm::PackedLocation::from_bits(ret as usize), a, b, (abs >> 32) as u8, FILLS);
+    state.push_jit_frame(owner, a, b, (abs >> 32) as u8, FILLS);
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
 
@@ -740,7 +768,13 @@ windowed!(frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, 
 windowed!(frame PopFrame, [at: u64, ab: u64, effects: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     let Location(BlockId(block), off) = Location::unpack(crate::vm::PackedLocation::from_bits(at as usize));
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
-    state.exit = if state.callstack.is_empty() {
+    // See Note [Call continuations].
+    let returned = || crate::vm::RETURNED | (unsafe { *(effects as *const u16) } as u64) << crate::vm::EFFECTS_SHIFT | ab >> 32;
+    state.exit = if state.jit_depth > 0 {
+        state.leave_jit_frame(owner, a, b, CLOSES);
+        state.returned = returned();
+        state.returned
+    } else if state.callstack.is_empty() {
         state.current_off = off as u16;
         ((-2i32 as u64) << 32) | block as u64
     } else {
@@ -748,8 +782,7 @@ windowed!(frame PopFrame, [at: u64, ab: u64, effects: u64], [CLOSES: bool, VARAR
             // See Note [Call continuations].
             Ok(location) => {
                 state.resume = location.pack().bits() as u64;
-                let effects = unsafe { *(effects as *const u16) } as u64;
-                state.returned = crate::vm::RETURNED | effects << crate::vm::EFFECTS_SHIFT | ab >> 32;
+                state.returned = returned();
                 state.returned
             },
             // With a caller frame, `leave` returns to it.
@@ -1282,32 +1315,47 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // exist: those origins are queued for contraction. So too if the context's own facts the version
 // lacks each say otherwise about something one of those facts is about, as a slot holding one
 // constant on one path and another on the other: neither is worth keeping where they meet, and
-// the context drops its own there. A contraction forgets every version carrying
+// the context drops its own there. So too when the versions at a point are joined: the facts of
+// theirs the join drops, all with origins and none used, are worth nothing past it. And when a
+// version's slot holding an unused constant holds another type in the context: the version is
+// kept for the type, and the constant contracted out of it. A contraction forgets every version carrying
 // a fact with one of the origins, and rebuilds each origin's block from where it introduced the
 // fact, as if it never had: the code after is compiled again, without the fact, and reaches the
 // versions every other path does. Code forgotten is never entered again, but what is already
 // running it can finish, as it is correct where the fact holds. So contraction waits until
-// neither the interpreter nor a frame returning will run code past an origin's introduction,
-// which rebuilding replaces, and is dropped if an origin has JIT code, or a fact was used since.
+// neither the interpreter nor a frame returning will run code past an origin's introduction, and
+// is dropped if an origin has JIT code, or a fact was used since. The residual where the origin
+// introduced the fact then becomes a thunk: code entering the block from its start ends there, as
+// the JIT and the trimming below read it, and the residuals after it are dead. Forced, the thunk
+// compiles the code from the origin again, as any thunk lays out its code (Note [Thunk patching]
+// in `jit`): in place, truncating the dead residuals.
 //
 // A fact used for what it says can be rebuilt from the same origin the other way: a constant some
 // code narrows to an integer (Note [Narrowing]) is loaded as an integer instead, so every path
-// from its load computes on the integer, and none narrows it again. An origin needn't introduce a
-// fact: an integer op is rebuilt to compute in the double encoding once its result doesn't fit
-// (Note [Optimistic ops]).
+// from its load computes on the integer, and none narrows it again. The narrowing still writes
+// the integer until the rebuild, which waits and is dropped as a contraction is, but for the fact
+// being used. An origin needn't introduce a fact: an integer op is rebuilt to compute in the
+// double encoding once its result doesn't fit (Note [Optimistic ops]).
 //
 // Rebuilding replaces code, and the blocks only that code reached are then unreachable: nothing
-// that runs (the code running, a frame returning, a handler) reaches them. JIT code is entered only
+// that runs (the code running, a frame returning, a handler, a rebuilt block) reaches them. JIT code is entered only
 // as its block is, so it keeps alive only what it reaches when its block is reached. Versions are
 // no roots, as only code that runs finds one again: versions reaching each other, as a caller's and
 // the callee's it calls, are reached or not together. The unreachable ones are forgotten, as a
-// contraction's are, so they stop counting against the versions a point can have. The narrowing still writes
-// the integer until the rebuild, which waits and is dropped as a contraction is, but for the fact
-// being used.
+// contraction's are, so they stop counting against the versions a point can have. While code is
+// still running in what the replaced code reached, it may reach any of it, so that rebuild's are
+// tried again each time a thunk is forced, until none is.
 //
 // An origin is rebuilt once; the fact may be introduced again by other paths, which may be
 // contracted in turn. Each contraction replaces code carrying the fact with code that doesn't, so
 // it ends, and a fact some code finds a use for before its duplicate appears is kept.
+
+/// Whether an integer op's overflow rebuilds it to compute in doubles (Note [Optimistic ops]);
+/// set `LUNACY_NO_OVERFLOW_REBUILD` for no rebuild, to compare.
+fn overflow_rebuilds() -> bool {
+    static REBUILDS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUNACY_NO_OVERFLOW_REBUILD").is_none());
+    *REBUILDS
+}
 
 // Note [Optimistic ops]
 // ~~~~~~~~~~~~~~~~~~~~~
@@ -1320,10 +1368,12 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // path, and a way on knowing that instead. Unlike a dynamic guard's test (Note [Dynamic
 // guards]), the op is an op: it writes its outputs either way.
 //
-// An integer op whose result can overflow first asks which encoding its result is in, an origin
-// to rebuild it from (Note [Contraction]). It is the integer encoding until the op's result first
-// overflows: then the op is rebuilt to compute in the double encoding, so its result is a double on
-// every path, and the code only its integer result reached is unreachable, and forgotten. Values
+// An integer op whose result can overflow is laid out the first time it runs, as a guard is: if
+// its result doesn't fit for its operands then, it computes in the double encoding, with no
+// integer way at all. If it fits, it is the optimistic integer op, from an origin to rebuild it
+// from (Note [Contraction]), until its result first overflows: then the op is rebuilt to compute in
+// the double encoding, so its result is a double on every path, and the code only its integer
+// result reached is unreachable, and forgotten. Values
 // that fit only some of the time, as sums of bit operations' results often do, so get one version
 // of the code after them instead of one for each encoding they turn up in. An op whose block has
 // JIT code by its first overflow keeps both ways.
@@ -2234,6 +2284,16 @@ pub struct Specializer<'src, 'intern> {
     /// without the fact, `Matched` with the constant an integer), once nothing
     /// runs the code rebuilding replaces. See Note [Contraction].
     contractions: Vec<(LProto<'src, 'intern>, Vec<Origin>, ResumeArg)>,
+    /// Where the optimistic integer op being laid out was decided to be one, which its first
+    /// overflow rebuilds it from. See Note [Optimistic ops].
+    encoding: Option<Origin>,
+    /// Where each rebuilt block ends for code entering it from its start. See Note [Contraction].
+    cuts: std::collections::HashMap<BlockId, usize, rustc_hash::FxBuildHasher>,
+    /// The targets of the code each rebuild replaced, whose blocks only it reaches are yet to be
+    /// forgotten. See Note [Contraction].
+    trimming: Vec<Vec<BlockId>>,
+    /// The rebuilt blocks. See Note [Contraction].
+    rebuilt: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -2261,6 +2321,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return_ids: HashMap::default(),
             effects: HashMap::default(),
             contractions: Vec::new(),
+            encoding: None,
+            cuts: Default::default(),
+            trimming: Vec::new(),
+            rebuilt: Default::default(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             clos,
@@ -2428,6 +2492,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             joined.join(owner, ectx);
         }
         let joined = Rc::new(joined);
+        self.contract_joined(owner, subpc, &existing, &joined);
         if let Some((ectx, block)) = accepting(&joined) {
             ectx.adopt(owner, &joined);
             return (block, "joined", Some(joined));
@@ -2436,6 +2501,48 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             panic!("too many versions at {pc}: {:#?}", existing.iter().map(|(ectx, _)| ectx).collect::<Vec<_>>());
         }
         (self.block(owner, pc, joined.clone()), "joined-new", Some(joined))
+    }
+
+    /// Queue the origins of the facts versions at `pc` have that `joined`, their join, drops, for
+    /// contraction: no code relied on them, and the join's version is the one the code after them
+    /// gets. See Note [Contraction].
+    fn contract_joined(&mut self, owner: &mut Owner, pc: SubPc, existing: &[(Rc<Context>, BlockId)], joined: &Context) {
+        let proto = self.clos.ro(owner).prototype;
+        let mut origins: Vec<Origin> = Vec::new();
+        let mut _duplicates: Vec<usize> = Vec::new();
+        for (ectx, block) in existing {
+            let mut extra = ectx.fragile.iter().filter(|fact| !joined.fragile.contains(fact)).peekable();
+            if extra.peek().is_none() {
+                continue;
+            }
+            let Some(sets) = extra.map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+            let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
+            if found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
+                continue;
+            }
+            _duplicates.push(block.0);
+            for origin in found {
+                if !origins.iter().any(|known| Rc::ptr_eq(known, &origin)) {
+                    origins.push(origin);
+                }
+            }
+        }
+        let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
+        if origins.is_empty() || origins.iter().all(queued) {
+            return;
+        }
+        #[cfg(feature = "tracing")]
+        {
+            let context = joined.tostring(owner);
+            crate::tracing::instant("spec", "contractible", &[
+                ("line", self.traced_line(owner).into()),
+                ("pc", pc.0.into()),
+                ("duplicates", Self::ids(_duplicates.iter().copied()).as_str().into()),
+                ("origins", Self::ids(origins.iter().map(|origin| owner.ro(origin).block.0)).as_str().into()),
+                ("context", context.as_str().into()),
+            ]);
+        }
+        self.contractions.push((proto, origins, ResumeArg::Failed));
     }
 
     /// Queue the origins of the facts a version at `pc` has past those of `ctx`,
@@ -2450,7 +2557,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut conflicting: SmallVec<[(u8, usize); 2]> = SmallVec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         for ((epc, ectx), _block) in self.versions.get(&proto).unwrap() {
-            if *epc != pc || !ectx.alike(&ctx) {
+            if *epc != pc {
+                continue;
+            }
+            // A version whose slot holding a constant holds another type here: the constant is
+            // worth nothing past the point either. See Note [Contraction].
+            if !ectx.alike(&ctx) {
+                let retyped = ectx.fragile.iter().filter(|fact| {
+                    matches!(fact.fragile, Fragile::Constant { slot, .. } if !ctx.fragile.contains(fact) && ectx.slot(slot) != ctx.slot(slot))
+                });
+                let Some(sets) = retyped.map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+                let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
+                if found.is_empty() || found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
+                    continue;
+                }
+                _duplicates.push(_block.0);
+                for origin in found {
+                    if !origins.iter().any(|known| Rc::ptr_eq(known, &origin)) {
+                        origins.push(origin);
+                    }
+                }
                 continue;
             }
             // `ctx`'s facts the version lacks each contradict one of its own.
@@ -2507,16 +2633,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// one was introduced. The versions their facts reach are forgotten, and each
     /// origin rebuilt without its fact. See Note [Contraction].
     fn contract(&mut self, owner: &mut Owner, state: &RunState<'src, 'intern>, at: Location) {
-        if self.contractions.is_empty() {
-            return;
+        if !self.trimming.is_empty() || !self.contractions.is_empty() {
+            self.rebuild_queued(owner, state, &at);
+            self.trim(owner, state, at);
         }
+    }
+
+    /// Rebuild the queued origins of the running function that nothing runs past, the interpreter
+    /// at `at` or a frame returning: each becomes a thunk compiling the code from there again, and
+    /// the blocks the code it replaced reached are to be trimmed. See Note [Contraction].
+    fn rebuild_queued(&mut self, owner: &mut Owner, state: &RunState<'src, 'intern>, at: &Location) {
         let proto = self.clos.ro(owner).prototype;
-        // The targets of the code the rebuilds replace, and the blocks rebuilt.
-        let mut replaced: Vec<BlockId> = Vec::new();
-        let mut rebuilt: Vec<BlockId> = Vec::new();
-        // The hot and cold ways of the optimistic ops replaced, for the trace.
-        let mut hot: Vec<BlockId> = Vec::new();
-        let mut cold: Vec<BlockId> = Vec::new();
         for (of, origins, how) in std::mem::take(&mut self.contractions) {
             if of != proto {
                 self.contractions.push((of, origins, how));
@@ -2551,7 +2678,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let live: Vec<Origin> = origins.iter().filter(|origin| owner.ro(origin).rebuild.is_some()).cloned().collect();
             let past = |origin: &OriginState, Location(block, off): &Location| *block == origin.block && *off >= origin.offset;
-            if live.iter().any(|origin| past(owner.ro(origin), &at) || state.callstack.iter().any(|entry| past(owner.ro(origin), &entry.ret))) {
+            if live.iter().any(|origin| past(owner.ro(origin), at) || state.callstack.iter().any(|entry| past(owner.ro(origin), &entry.ret))) {
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("spec", "contract_deferred", &[
                     ("line", self.traced_line(owner).into()),
@@ -2584,21 +2711,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ]);
             for origin in live {
                 let (block, offset) = (owner.ro(&origin).block, owner.ro(&origin).offset);
-                replaced.extend(Self::targets(&self.blocks[block.0].instructions[offset..]));
-                for residual in &self.blocks[block.0].instructions[offset..] {
-                    if let Residual::Branch { hot: integer, cold: double } = residual {
-                        hot.push(*integer);
-                        cold.push(*double);
-                    }
-                }
-                rebuilt.push(block);
+                self.trimming.push(Self::targets(&self.blocks[block.0].instructions[offset..]).collect());
+                self.rebuilt.insert(block);
                 let rebuild = owner.rw(&origin).rebuild.take().unwrap();
                 rebuild(self, owner, how.clone());
             }
         }
-        if !replaced.is_empty() {
-            self.drop_unreachable(owner, state, at, replaced, rebuilt, hot, cold);
-        }
+    }
+
+    /// The residuals of `block` that code entering it at `from` runs: from there to its end, or to
+    /// a rebuild's jump in it if `from` is before that. See Note [Contraction].
+    fn runnable(&self, block: BlockId, from: usize) -> &[Residual] {
+        let residuals = &self.blocks[block.0].instructions;
+        let end = match self.cuts.get(&block) {
+            Some(&cut) if from < cut => cut.min(residuals.len()),
+            _ => residuals.len(),
+        };
+        &residuals[from.min(end)..end]
     }
 
     /// The blocks `residuals` can go on to.
@@ -2614,75 +2743,55 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })
     }
 
-    /// Forget the versions of the blocks that only the code contractions just replaced reached:
-    /// those reachable from `replaced`, that code's targets, which nothing that runs reaches (the
-    /// rebuilt blocks, the code running or a frame returning, a protected call's handler). A
-    /// block's JIT code keeps alive only what it reaches when it is reached itself: every way into
-    /// JIT code is an edge of the blocks. See Note [Contraction].
-    fn drop_unreachable(&mut self, owner: &Owner, state: &RunState<'src, 'intern>, at: Location, replaced: Vec<BlockId>, rebuilt: Vec<BlockId>, _hot: Vec<BlockId>, _cold: Vec<BlockId>) {
-        let mut reached: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = Default::default();
-        let mut work = replaced;
-        while let Some(block) = work.pop() {
-            if reached.insert(block) {
-                work.extend(Self::targets(&self.blocks[block.0].instructions));
+    /// Forget the versions of the blocks only code rebuilds replaced reached, of each rebuild whose
+    /// replaced code nothing running is in any more: those reachable from the targets of that code
+    /// which nothing that runs reaches (the code running or a frame returning, a protected call's
+    /// handler, a rebuilt block). The others are tried again later. A block's JIT code keeps alive
+    /// only what it reaches when it is reached itself: every way into JIT code is an edge of the
+    /// blocks. See Note [Contraction].
+    fn trim(&mut self, owner: &Owner, state: &RunState<'src, 'intern>, at: Location) {
+        type Blocks = std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>;
+        // Where what runs goes on from: the code running and a frame returning from where they are.
+        let running: Vec<(BlockId, usize)> = std::iter::once((at.0, at.1))
+            .chain(state.callstack.iter().map(|entry| (entry.ret.0, entry.ret.1)))
+            .chain(state.handlers.iter().map(|handler| (handler.after, 0)))
+            .collect();
+        let mut reached = Blocks::default();
+        for targets in std::mem::take(&mut self.trimming) {
+            let mut reach = Blocks::default();
+            let mut work = targets.clone();
+            while let Some(block) = work.pop() {
+                if reach.insert(block) {
+                    work.extend(Self::targets(&self.blocks[block.0].instructions));
+                }
+            }
+            if running.iter().any(|(block, _)| reach.contains(block)) {
+                self.trimming.push(targets);
+            } else {
+                reached.extend(reach);
             }
         }
-        // What runs, each kind's for the trace. A version is only found again by code that
-        // runs, so the versions are no roots: a cycle of them, as a call to a version of a
-        // function whose return the caller's version continues from, is reached or not as a
-        // whole.
-        let running: Vec<BlockId> = std::iter::once(at.0)
-            .chain(state.callstack.iter().map(|entry| entry.ret.0))
-            .chain(state.handlers.iter().map(|handler| handler.after))
-            .collect();
-        #[cfg(feature = "tracing")]
-        let compiled: Vec<BlockId> = (0..self.blocks.len()).map(BlockId).filter(|&block| self.compiled(block)).collect();
-        let closure = |roots: &[BlockId]| {
-            let mut live: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = Default::default();
-            let mut work = roots.to_vec();
-            while let Some(block) = work.pop() {
-                if live.insert(block) {
-                    work.extend(Self::targets(&self.blocks[block.0].instructions));
+        if reached.is_empty() {
+            return;
+        }
+        // What runs reaches, entering each block where it does (`runnable`).
+        let live_from = |roots: &mut dyn Iterator<Item = (BlockId, usize)>| {
+            let mut live = Blocks::default();
+            let mut entered: std::collections::HashSet<(BlockId, usize), rustc_hash::FxBuildHasher> = Default::default();
+            let mut work: Vec<(BlockId, usize)> = roots.collect();
+            while let Some((block, from)) = work.pop() {
+                if entered.insert((block, from)) {
+                    live.insert(block);
+                    work.extend(Self::targets(self.runnable(block, from)).map(|target| (target, 0)));
                 }
             }
             live
         };
-        let roots: Vec<BlockId> = rebuilt.iter().chain(&running).copied().collect();
-        let live = closure(&roots);
+        let live = live_from(&mut running.iter().copied().chain(self.rebuilt.iter().map(|&block| (block, 0))));
         #[cfg(feature = "tracing")]
-        let _kept_by = [("rebuilt", &rebuilt), ("running", &running)]
-            .iter()
-            .map(|(kind, roots)| format!("{kind} {}", closure(roots).iter().filter(|block| reached.contains(block)).count()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        // The path from a root to the first reached block it keeps, the root first.
-        #[cfg(feature = "tracing")]
-        let _kept_path = {
-            let mut parent: std::collections::HashMap<BlockId, BlockId, rustc_hash::FxBuildHasher> = Default::default();
-            let mut seen: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = roots.iter().copied().collect();
-            let mut queue: std::collections::VecDeque<BlockId> = roots.iter().copied().collect();
-            let mut found = None;
-            while let Some(block) = queue.pop_front() {
-                if reached.contains(&block) {
-                    found = Some(block);
-                    break;
-                }
-                for target in Self::targets(&self.blocks[block.0].instructions) {
-                    if seen.insert(target) {
-                        parent.insert(target, block);
-                        queue.push_back(target);
-                    }
-                }
-            }
-            let mut path = Vec::new();
-            let mut at = found;
-            while let Some(block) = at {
-                path.push(block.0.to_string());
-                at = parent.get(&block).copied();
-            }
-            path.reverse();
-            path.join(" -> ")
-        };
+        let _kept_by = format!("running {}, rebuilt {}",
+            live_from(&mut running.iter().copied()).iter().filter(|block| reached.contains(block)).count(),
+            live_from(&mut self.rebuilt.iter().map(|&block| (block, 0))).iter().filter(|block| reached.contains(block)).count());
         let mut _dropped: Vec<usize> = Vec::new();
         for versions in self.versions.values_mut() {
             versions.retain(|_, block| {
@@ -2699,58 +2808,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ("line", self.traced_line(owner).into()),
             ("reached", reached.len().into()),
             ("dropped", Self::ids(_dropped.iter().copied()).as_str().into()),
+            ("waiting", self.trimming.len().into()),
             ("kept_by", _kept_by.as_str().into()),
-            ("kept_path", _kept_path.as_str().into()),
-            ("hot_path", {
-                // The path from a root to a block only the hot ways reach that is kept, the root
-                // first.
-                let ways = closure(&_hot);
-                let cold = closure(&_cold);
-                // Each block's parent, and the residual it was reached through.
-                let mut parent: std::collections::HashMap<BlockId, (BlockId, &'static str), rustc_hash::FxBuildHasher> = Default::default();
-                let mut seen: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = roots.iter().copied().collect();
-                let mut queue: std::collections::VecDeque<BlockId> = roots.iter().copied().collect();
-                let mut found = None;
-                while let Some(block) = queue.pop_front() {
-                    if ways.contains(&block) && !cold.contains(&block) {
-                        found = Some(block);
-                        break;
-                    }
-                    for residual in &self.blocks[block.0].instructions {
-                        let edges: SmallVec<[(BlockId, &'static str); 2]> = match residual {
-                            Residual::Jump(target) => smallvec::smallvec![(*target, "jump")],
-                            Residual::Branch { hot, cold } => smallvec::smallvec![(*hot, "hot"), (*cold, "cold")],
-                            Residual::Select(targets) => targets.iter().map(|(name, target)| (*target, *name)).collect(),
-                            Residual::LuaCall { entry: CallEntry::Block(target), .. } => smallvec::smallvec![(*target, "call")],
-                            Residual::TailCall { entry: CallEntry::Block(target), .. } => smallvec::smallvec![(*target, "tailcall")],
-                            _ => SmallVec::new(),
-                        };
-                        for (target, how) in edges {
-                            if seen.insert(target) {
-                                parent.insert(target, (block, how));
-                                queue.push_back(target);
-                            }
-                        }
-                    }
-                }
-                let mut path = Vec::new();
-                let mut at = found.map(|block| (block, ""));
-                while let Some((block, how)) = at {
-                    let kind = if running.contains(&block) { "running " } else if rebuilt.contains(&block) { "rebuilt " } else if compiled.contains(&block) { "jit " } else { "" };
-                    let line = self.blocks[block.0].pc;
-                    path.push(format!("{kind}{}@pc{line}{}", block.0, if how.is_empty() { String::new() } else { format!(" -{how}->") }));
-                    at = parent.get(&block).map(|&(parent, how)| (parent, how));
-                }
-                path.reverse();
-                path.join(" ")
-            }.as_str().into()),
-            ("hot", {
-                let ways = closure(&_hot);
-                let cold = closure(&_cold);
-                let only = ways.iter().filter(|block| !cold.contains(block));
-                format!("{} reached, {} kept, {} also cold's, {} only hot's kept", ways.len(), ways.iter().filter(|block| live.contains(block)).count(),
-                    ways.iter().filter(|block| cold.contains(block)).count(), only.filter(|block| live.contains(block)).count())
-            }.as_str().into()),
             ("at", at.0.0.into()),
         ]);
         let _ = owner;
@@ -2778,6 +2837,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let shapes_dropped = joined.map_or(0, |j| {
             (0..requested.types.len()).filter(|&i| matches!(requested.types[i], CType::Shape(..)) && !matches!(j.slot(i), CType::Shape(..))).count()
         });
+        let origins = requested.fragile.iter().map(|fact| {
+            let from = fact.origins.as_ref().map(|set| owner.ro(set).iter().map(|origin| format!("{}@{}", owner.ro(origin).block.0, owner.ro(origin).offset)).collect::<Vec<_>>().join(","));
+            format!("{:?} <- {}", fact.fragile, from.unwrap_or_default())
+        }).collect::<Vec<_>>().join("; ");
         crate::tracing::instant("spec", "version", &[
             ("line", self.traced_line(owner).into()),
             ("pc", pc.into()),
@@ -2787,6 +2850,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ("context", context.as_str().into()),
             ("joined", joined_context.as_str().into()),
             ("shapes_dropped", shapes_dropped.into()),
+            ("origins", origins.as_str().into()),
         ]);
     }
 
@@ -3174,7 +3238,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         if let Some(set) = ctx.fragile.iter().find(|fact| fact.key() == key).and_then(|fact| fact.origins.as_ref()) {
             let origins: Vec<Origin> = owner.ro(set).iter().filter(|origin| owner.ro(origin).rebuild.is_some()).cloned().collect();
             let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
-            if !origins.is_empty() && !origins.iter().all(queued) {
+            let queues = !origins.is_empty() && !origins.iter().all(queued);
+            #[cfg(feature = "tracing")]
+            crate::tracing::instant("spec", "narrow", &[
+                ("line", self.traced_line(owner).into()),
+                ("slot", slot.into()),
+                ("block", block.0.into()),
+                ("origins", owner.ro(set).iter().map(|origin| {
+                    let o = owner.ro(origin);
+                    format!("{}@{}{}", o.block.0, o.offset, if o.rebuild.is_some() { "" } else { " rebuilt" })
+                }).collect::<Vec<_>>().join(",").as_str().into()),
+                ("queued", (queues as u64).into()),
+            ]);
+            if queues {
                 self.contractions.push((self.clos.ro(owner).prototype, origins, ResumeArg::Matched));
             }
         }
@@ -3192,15 +3268,73 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// See Note [Contraction].
     fn origin(&self, block: BlockId, coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, ctx: Rc<Context>) -> Origin {
         let offset = self.blocks[block.0].instructions.len();
-        let allocates = self.blocks[block.0].allocates;
+        // The origin becomes a thunk laying out the rebuilt code. See Note [Contraction].
         let rebuild = move |vm: &mut Specializer, owner: &mut Owner, how: ResumeArg| {
-            vm.blocks[block.0].instructions.truncate(offset);
-            vm.blocks[block.0].allocates = allocates;
-            if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx, coro, how, block) {
-                vm.compile(owner, next, ctx, block);
+            let thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+                // In place, unless the thunk's JIT code can only be patched to a jump (Note [Thunk
+                // patching] in `jit`). Nothing returns into the residuals after it, which it
+                // truncates: the rebuild waited until nothing ran past it.
+                assert!(!state.callstack.iter().any(|entry| entry.ret.0 == block && entry.ret.1 > thunk_pc), "a frame returns past a rebuilt origin");
+                let at = if vm.compiled(block) {
+                    let at = vm.new_block(pc.0);
+                    vm.jump_thunk(block, thunk_pc, at);
+                    at
+                } else {
+                    vm.blocks[block.0].instructions.truncate(thunk_pc);
+                    if vm.cuts.get(&block).is_some_and(|&cut| cut > thunk_pc) {
+                        vm.cuts.remove(&block);
+                    }
+                    block
+                };
+                if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx.clone(), coro.clone(), how.clone(), at) {
+                    vm.compile(owner, next, ctx, at);
+                }
+            })));
+            let residuals = &mut vm.blocks[block.0].instructions;
+            if offset < residuals.len() {
+                residuals[offset] = Residual::Thunk(thunk);
+            } else {
+                residuals.push(Residual::Thunk(thunk));
             }
+            vm.cuts.insert(block, offset + 1);
         };
         Rc::new(TLCell::new(OriginState { rebuild: Some(Box::new(rebuild)), block, offset, used: false }))
+    }
+
+    /// The thunk an optimistic integer op's `Encoding` ends its block in: forced, it lays out the
+    /// op as the integer one, from an origin its first overflow rebuilds it from, if its result
+    /// fits for its operands' values, and else as the double one. See Note [Optimistic ops].
+    fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            // In place, unless the thunk's JIT code can only be patched to a jump. See Note
+            // [Thunk patching].
+            let at = if vm.compiled(block_id) {
+                let at = vm.new_block(pc.0);
+                vm.jump_thunk(block_id, thunk_pc, at);
+                at
+            } else {
+                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
+                block_id
+            };
+            let fit = (fits.0)(state);
+            #[cfg(feature = "tracing")]
+            crate::tracing::instant("spec", "encoding", &[
+                ("line", vm.traced_line(owner).into()),
+                ("pc", pc.0.into()),
+                ("block", at.0.into()),
+                ("encoding", if fit { "integer" } else { "double" }.into()),
+            ]);
+            let answer = if fit {
+                vm.encoding = Some(vm.origin(at, thunk_coro.clone(), pc, thunk_ctx.clone()));
+                ResumeArg::Type(CType::Type(LType::Integer))
+            } else {
+                ResumeArg::Type(CType::Type(LType::Double))
+            };
+            if let Some((next, ctx, _)) = vm.compile_one(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), answer, at) {
+                vm.compile(owner, next, ctx, at);
+            }
+            vm.encoding = None;
+        })))
     }
 
     /// An optimistic op's cold way, as `make_side_thunk`'s, which the first time it's taken also
@@ -3210,6 +3344,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
             vm.jump_thunk(block_id, thunk_pc, side);
+            if !overflow_rebuilds() {
+                return;
+            }
             let Some(origin) = asked.clone().filter(|origin| owner.ro(origin).rebuild.is_some()) else { return };
             let queued = vm.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, &origin)));
             if !queued {
@@ -3559,7 +3696,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let c16 = c as u16;
         vec![
             Residual::Exec(ResidualExec::new("pcall", Rc::new(move |_owner, state| {
-                let handler = crate::vm::Handler { depth: state.callstack.len(), slot: state.base + a, c: c16, after };
+                // Frames JIT code called are the callstack's too. See Note [Frame ops].
+                let handler = crate::vm::Handler { depth: state.callstack.len() + state.jit_depth, slot: state.base + a, c: c16, after };
                 state.handlers.push(handler);
             }))),
             Residual::Call { a: a as u16 + 1, b: callee_b as u16, c: callee_c as u16 },
@@ -3838,9 +3976,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     {
         // Where the constant being loaded was, for its fact's origin.
         let mut loading: Option<Origin> = None;
-        // Where the encoding of the optimistic op about to be laid out was asked.
-        // See Note [Optimistic ops].
-        let mut encoding: Option<Origin> = None;
         loop {
             let mut state = Pin::new(&mut coro).resume(arg);
             arg = ResumeArg::Start;
@@ -4049,9 +4184,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::Encoding) => {
-                    encoding = Some(self.origin(block_id, coro.clone(), pc, ctx.clone()));
-                    arg = ResumeArg::Type(CType::Type(LType::Integer));
+                CoroutineState::Yielded(YieldOp::Encoding(fits)) => {
+                    // Decided by its operands the first time it runs. See Note [Optimistic ops].
+                    let thunk = Residual::Thunk(self.make_encoding_thunk(block_id, coro.clone(), pc, ctx.clone(), fits));
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(thunk);
+                    return None;
                 },
                 CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
                     // Its outputs are written whichever path it takes. See Note [Optimistic ops].
@@ -4066,7 +4204,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let cold = self.new_block(pc.0);
                     // Its overflow rebuilds it from where its encoding was asked. See Note
                     // [Optimistic ops].
-                    let side = self.make_overflow_thunk(cold, coro.clone(), pc.next_false(), ctx.clone(), encoding.take());
+                    let asked = self.encoding.take();
+                    let side = self.make_overflow_thunk(cold, coro.clone(), pc.next_false(), ctx.clone(), asked);
                     self.blocks[cold.0].instructions.push(Residual::Thunk(side));
                     self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
                     return None;
@@ -4491,6 +4630,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     warn!("running jit for {id:?} with base_ptr {base_ptr:p}");
                     state.trap = false;
                     let ret = jit_entry(&mut state, base_ptr);
+                    state.finish_unwinding();
                     #[cfg(feature = "magic")]
                     if !state.force_jit.is_empty() {
                         self.force_jit(&mut state);

@@ -4,7 +4,9 @@
 block, and each kind of residual (a window op by its op), and the code between
 residuals (region prologues, window loads, constant pools) by what it does.
 
-    jit_code_size.py [working/jit_disasm.txt] [--top N]
+    jit_code_size.py [working/jit_disasm.txt] [--top N] [--function LINE]
+
+`--function` counts only the code of the function defined at that line.
 """
 import argparse
 import re
@@ -23,6 +25,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('disasm', nargs='?', default='working/jit_disasm.txt')
     ap.add_argument('--top', type=int, default=20)
+    ap.add_argument('--function', help="only the function defined at this line")
     args = ap.parse_args()
 
     by_function, by_block, by_kind, uses, blocks_of = Counter(), Counter(), Counter(), Counter(), {}
@@ -41,7 +44,8 @@ def main():
             continue
         if m := RESIDUAL.match(line):
             kind = f'{m.group(1)}({m.group(2)})' if m.group(2) else m.group(1)
-            uses[kind] += 1
+            if not args.function or function == args.function:
+                uses[kind] += 1
             continue
         if m := COMMENT.match(line):
             # Code the JIT lays out around residuals, by what it does, but for
@@ -50,6 +54,8 @@ def main():
                 kind = re.sub(r'\d+', 'N', m.group(1).split(',')[0].split('{')[0]).strip()
             continue
         if m := INSN.match(line):
+            if args.function and function != args.function:
+                continue
             size = len(m.group(1)) // 2
             by_function[function] += size
             by_kind[kind] += size

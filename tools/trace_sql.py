@@ -5,11 +5,12 @@ working/lunacy.fxt) in Perfetto's trace processor, and print the rows.
 Events are slices; an event's arguments are `EXTRACT_ARG(arg_set_id, 'name')`.
 The specializer's are also views, one column per argument:
 
-  spec_version(ts, line, pc, outcome, block, versions, context, joined, shapes_dropped)
+  spec_version(ts, line, pc, outcome, block, versions, context, joined, shapes_dropped, origins)
       each `Specializer::version`: the function's line, the pc, how the block
       was chosen (exact, fragile, new, accepting, joined, joined-new), the
       block, the versions at the pc after it, the context requested, the join
-      (if one was made) and how many of the context's shapes it lost.
+      (if one was made), how many of the context's shapes it lost, and where
+      each of its fragile facts was introduced (`fact <- block@offset,...`).
   spec_block(ts, block, line, pc, context)
       each version compiled.
   block_summary(block, line, pc, residuals, context, hotness, jitted)
@@ -34,19 +35,24 @@ The specializer's are also views, one column per argument:
       facts (at those residual offsets), how (`drop`, without the facts,
       `integer`, with their constants loaded as integers, or `double`, an
       integer op computing in doubles), and the versions forgotten.
-  unreachable(ts, line, reached, dropped, kept_by)
-      after a round of contractions: how many blocks the code they replaced
-      reached, those of them no longer reachable, whose versions were
-      forgotten, how many of them each kind of root still reaches (the
-      rebuilt blocks, the running code), and the path (block ids,
-      from a root) to the first of them a root reaches, the block running, and
-      how many blocks the replaced optimistic ops' hot ways reach and keep,
-      how many of those their cold ways reach too, and how many only the hot
-      ways reach yet are kept, and the path to one such (each root marked by
-      its kind, and blocks with JIT code `jit`).
+  encoding(ts, line, pc, block, encoding)
+      each optimistic integer op the first time it runs: the block it is
+      laid out in, and whether it computes in the `integer` or the `double`
+      encoding, as its result fits or not then.
+  unreachable(ts, line, reached, dropped, waiting, kept_by, at)
+      after a forced thunk, for the rebuilds whose replaced code nothing
+      running is in: how many blocks that code reached, those of them no
+      longer reachable, whose versions were forgotten, how many rebuilds are
+      still waiting, how many of the reached blocks each kind of root keeps
+      (the running code, the rebuilt blocks), and the block running.
+  narrow(ts, line, slot, block, origins, queued)
+      each constant a fact says a slot holds narrowed to an integer where
+      `block` is compiled: the fact's origins (block@offset, ` rebuilt` if
+      one already was), and whether a contraction loading it as an integer
+      was queued.
   contract_deferred(ts, line, origins, at)
-      a queued contraction waiting while the interpreter (in block `at`) or a
-      frame returning still runs code rebuilding replaces.
+      a queued contraction waiting, as the interpreter (in block `at`) or a
+      frame returning will run code past where an origin introduced its fact.
   contract_refused(ts, line, origins, how, reason)
       a queued contraction dropped: a fact `used` since, an origin `compiled`,
       or every origin `rebuilt` already.
@@ -59,7 +65,7 @@ import shutil
 from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 VIEWS = {
-    'spec_version': ['line', 'pc', 'outcome', 'block', 'versions', 'context', 'joined', 'shapes_dropped'],
+    'spec_version': ['line', 'pc', 'outcome', 'block', 'versions', 'context', 'joined', 'shapes_dropped', 'origins'],
     'spec_block': ['block', 'line', 'pc', 'context'],
     'block_summary': ['block', 'line', 'pc', 'residuals', 'context', 'hotness', 'jitted'],
     'alloc_step': ['trace', 'step', 'line', 'block', 'pc', 'off'],
@@ -69,13 +75,16 @@ VIEWS = {
     'contract': ['line', 'origins', 'how', 'offsets', 'forgotten'],
     'contract_deferred': ['line', 'origins', 'at'],
     'contract_refused': ['line', 'origins', 'how', 'reason'],
-    'unreachable': ['line', 'reached', 'dropped', 'kept_by', 'kept_path', 'at', 'hot', 'hot_path'],
+    'unreachable': ['line', 'reached', 'dropped', 'waiting', 'kept_by', 'at'],
+    'encoding': ['line', 'pc', 'block', 'encoding'],
+    'narrow': ['line', 'slot', 'block', 'origins', 'queued'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
           'contractible': ('spec', 'contractible'), 'contract': ('spec', 'contract'),
           'contract_deferred': ('spec', 'contract_deferred'), 'contract_refused': ('spec', 'contract_refused'),
-          'unreachable': ('spec', 'unreachable')}
+          'unreachable': ('spec', 'unreachable'), 'encoding': ('spec', 'encoding'),
+          'narrow': ('spec', 'narrow')}
 
 
 def main():

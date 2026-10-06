@@ -974,6 +974,17 @@ unsafe fn overflowed<'src, 'intern, const OP: Opcode>(l: i32, r: i32) -> LBoxed<
 /// The integer op `OP`'s result, if it fits the integer encoding: it must be in
 /// range, and neither -0 nor NaN. See Note [Integers].
 #[inline(always)]
+/// Whether `opcode`'s integer op on `l` and `r` gives an integer, as its hot path does.
+fn integer_fits(opcode: Opcode, l: i32, r: i32) -> bool {
+    match opcode {
+        Opcode::ADD => integer_op::<{ Opcode::ADD }>(l, r).is_some(),
+        Opcode::SUB => integer_op::<{ Opcode::SUB }>(l, r).is_some(),
+        Opcode::MUL => integer_op::<{ Opcode::MUL }>(l, r).is_some(),
+        Opcode::MOD => integer_op::<{ Opcode::MOD }>(l, r).is_some(),
+        _ => unreachable!("an integer op of {opcode:?}"),
+    }
+}
+
 fn integer_op<const OP: Opcode>(l: i32, r: i32) -> Option<i32> {
     match OP {
         Opcode::ADD => l.checked_add(r),
@@ -1070,7 +1081,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             let (lk, rk) = ((lhs & 0x100) != 0, (rhs & 0x100) != 0);
             // The op, and whether its result can fail to fit. A constant operand is its
             // value, as `k`. luac folds two.
-            let op = if !integers || (lk && rk) {
+            // The op, whether its result can fail to fit, and whether it fits for the values its
+            // operands have. A constant operand is its value, as `k`.
+            let op: Option<(Rc<dyn Window>, bool, Option<crate::specialize::Fits>)> = if !integers || (lk && rk) {
                 None
             } else if lk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(lhs & 0xff)) else { unreachable!() };
@@ -1083,7 +1096,8 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     *dest = overflowed::<OP>(k, rhs.as_int());
                     1
                 });
-                Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true))
+                let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| integer_fits(opcode, k, unsafe { state.vals[state.base + rhs].as_int() })));
+                Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true, Some(fits)))
             } else if rk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rhs & 0xff)) else { unreachable!() };
                 crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
@@ -1100,8 +1114,11 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<{ Opcode::MOD }>(lhs.as_int(), k)));
                 });
                 Some(match opcode == Opcode::MOD && k != 0 {
-                    true => (Rc::new(ModRK::new(k, &[lhs, dest])) as Rc<dyn Window>, false),
-                    false => (dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest])), true),
+                    true => (Rc::new(ModRK::new(k, &[lhs, dest])) as Rc<dyn Window>, false, None),
+                    false => {
+                        let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| integer_fits(opcode, unsafe { state.vals[state.base + lhs].as_int() }, k)));
+                        (dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest])), true, Some(fits))
+                    },
                 })
             } else {
                 crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
@@ -1113,26 +1130,32 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     *dest = overflowed::<OP>(lhs.as_int(), rhs.as_int());
                     1
                 });
-                Some((dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest])), true))
+                let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| unsafe {
+                    integer_fits(opcode, state.vals[state.base + lhs].as_int(), state.vals[state.base + rhs].as_int())
+                }));
+                Some((dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest])), true, Some(fits)))
             };
             // As one step each way, as a guard of whether the result fits is
-            // (Note [Subblocks]).
-            match op {
-                Some((op, true)) => {
-                    // In the integer encoding, unless the op has overflowed, which rebuilds
-                    // it to compute in the double one. See Note [Optimistic ops] in
-                    // `specialize`.
-                    if (yield YieldOp::Encoding) != ResumeArg::Type(CType::Type(LType::Double)) {
-                        let fits = yield YieldOp::OptimisticExec(op);
+            // (Note [Subblocks]). Cloned out of, never moved: cloning the generator
+            // across these yields clones `op` too, which must stay whole.
+            let window = |op: &Option<(Rc<dyn Window>, bool, Option<crate::specialize::Fits>)>| op.as_ref().unwrap().0.clone();
+            match op.as_ref().map(|(_, fallible, fits)| (*fallible, fits.is_some())) {
+                Some((true, true)) => {
+                    // In the integer encoding if it fits when it first runs, until it
+                    // overflows, which rebuilds it to compute in the double one. See Note
+                    // [Optimistic ops] in `specialize`.
+                    let fits = op.as_ref().and_then(|(_, _, fits)| fits.clone()).unwrap();
+                    if (yield YieldOp::Encoding(fits)) != ResumeArg::Type(CType::Type(LType::Double)) {
+                        let fits = yield YieldOp::OptimisticExec(window(&op));
                         let ty = if fits == ResumeArg::Matched { LType::Integer } else { LType::Double };
                         yield YieldOp::SetCTypes(vec![(dest, CType::Type(ty))]);
                         return arg;
                     }
                     yield YieldOp::Decided(false);
                 },
-                Some((op, false)) => {
+                Some(_) => {
                     yield YieldOp::Decided(true);
-                    yield YieldOp::ExecWindow(op);
+                    yield YieldOp::ExecWindow(window(&op));
                     yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Integer))]);
                     return arg;
                 },
