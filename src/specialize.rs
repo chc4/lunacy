@@ -236,9 +236,9 @@ pub enum YieldOp {
                            // Matched to load it as an integer, Failed as a double whose fact
                            // isn't introduced, else as a double. See Note [Contraction]
     HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Narrowing]
-    Encoding(usize), // An optimistic integer op's result is about to be put in STACK[idx]: resumed
-                     // with the double type to compute it in the double encoding, else with the
-                     // integer one. See Note [Optimistic ops]
+    Encoding, // An optimistic integer op is about to be laid out: resumed with the double type to
+              // compute it in the double encoding instead, else with the integer one. See Note
+              // [Optimistic ops]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
                       // knows it, else Failed. See Note [Array kinds]
@@ -1292,9 +1292,14 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 //
 // A fact used for what it says can be rebuilt from the same origin the other way: a constant some
 // code narrows to an integer (Note [Narrowing]) is loaded as an integer instead, so every path
-// from its load computes on the integer, and none narrows it again. A fact falsified can be too:
-// an integer op's result fitting, once it doesn't, is computed in the double encoding instead
-// (Note [Optimistic ops]). The narrowing still writes
+// from its load computes on the integer, and none narrows it again. An origin needn't introduce a
+// fact: an integer op is rebuilt to compute in the double encoding once its result doesn't fit
+// (Note [Optimistic ops]).
+//
+// Rebuilding replaces code, and the blocks only that code reached are then unreachable: no other
+// block, no frame returning, no handler, and no code running reaches them, and none has JIT code.
+// Their versions are forgotten, as a contraction's are, so they stop counting against the versions
+// a point can have. The narrowing still writes
 // the integer until the rebuild, which waits and is dropped as a contraction is, but for the fact
 // being used.
 //
@@ -1313,14 +1318,13 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // path, and a way on knowing that instead. Unlike a dynamic guard's test (Note [Dynamic
 // guards]), the op is an op: it writes its outputs either way.
 //
-// An integer op whose result can overflow first asks which encoding its result is in, which is
-// where the fact that its result fits comes from (Note [Contraction]). It is the integer
-// encoding until the op's result first overflows: then the op is rebuilt to compute in the double
-// encoding, so its result is a double on every path, and the versions that knew it fit are
-// forgotten. Values that fit only some of the time, as sums of bit operations' results often do,
-// so get one version of the code after them instead of one for each encoding they turn up in. An
-// op whose block has JIT code by its first overflow, or whose fact was contracted away, keeps both
-// ways.
+// An integer op whose result can overflow first asks which encoding its result is in, an origin
+// to rebuild it from (Note [Contraction]). It is the integer encoding until the op's result first
+// overflows: then the op is rebuilt to compute in the double encoding, so its result is a double on
+// every path, and the code only its integer result reached is unreachable, and forgotten. Values
+// that fit only some of the time, as sums of bit operations' results often do, so get one version
+// of the code after them instead of one for each encoding they turn up in. An op whose block has
+// JIT code by its first overflow keeps both ways.
 //
 // In JIT code the `Branch` tests no `select`, as a guard's copy tests none (Note [Guard
 // stencils] in `window`): the op's hot path falls through to the hot way, as the next block if
@@ -1533,9 +1537,6 @@ pub enum Fragile {
     /// Stack slot `slot` holds a number constant an i32 holds exactly,
     /// `value`. See Note [Narrowing].
     Constant { slot: usize, value: i32 },
-    /// Stack slot `slot` holds an optimistic integer op's result, which fit
-    /// the integer encoding. See Note [Optimistic ops].
-    Fits { slot: usize },
 }
 
 /// A fragile fact, with where the paths reaching it introduced it, if that can
@@ -1634,7 +1635,6 @@ impl Fragile {
             Fragile::ElementOf { slot, .. } => (2, *slot),
             Fragile::Kind { table, .. } => (3, *table),
             Fragile::Constant { slot, .. } => (4, *slot),
-            Fragile::Fits { slot } => (5, *slot),
         }
     }
 
@@ -1662,9 +1662,6 @@ impl Fragile {
             (Fragile::Constant { slot, .. }, Effect::Write(written)) => written != *slot,
             (Fragile::Constant { .. }, Effect::WriteAny) => false,
             (Fragile::Constant { .. }, Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_)) => true,
-            (Fragile::Fits { slot }, Effect::Write(written)) => written != *slot,
-            (Fragile::Fits { .. }, Effect::WriteAny) => false,
-            (Fragile::Fits { .. }, Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_)) => true,
         }
     }
 }
@@ -2512,6 +2509,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return;
         }
         let proto = self.clos.ro(owner).prototype;
+        // The targets of the code the rebuilds replace, and the blocks rebuilt.
+        let mut replaced: Vec<BlockId> = Vec::new();
+        let mut rebuilt: Vec<BlockId> = Vec::new();
         for (of, origins, how) in std::mem::take(&mut self.contractions) {
             if of != proto {
                 self.contractions.push((of, origins, how));
@@ -2578,10 +2578,76 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ("forgotten", Self::ids(_forgotten.iter().copied()).as_str().into()),
             ]);
             for origin in live {
+                let (block, offset) = (owner.ro(&origin).block, owner.ro(&origin).offset);
+                replaced.extend(Self::targets(&self.blocks[block.0].instructions[offset..]));
+                rebuilt.push(block);
                 let rebuild = owner.rw(&origin).rebuild.take().unwrap();
                 rebuild(self, owner, how.clone());
             }
         }
+        if !replaced.is_empty() {
+            self.drop_unreachable(owner, state, at, replaced, rebuilt);
+        }
+    }
+
+    /// The blocks `residuals` can go on to.
+    fn targets(residuals: &[Residual]) -> impl Iterator<Item = BlockId> + '_ {
+        residuals.iter().flat_map(|residual| -> SmallVec<[BlockId; 2]> {
+            match residual {
+                Residual::Jump(target) => smallvec::smallvec![*target],
+                Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
+                Residual::Select(targets) => targets.iter().map(|(_, target)| *target).collect(),
+                Residual::LuaCall { entry: CallEntry::Block(target), .. } | Residual::TailCall { entry: CallEntry::Block(target), .. } => smallvec::smallvec![*target],
+                _ => SmallVec::new(),
+            }
+        })
+    }
+
+    /// Forget the versions of the blocks that only the code contractions just replaced reached:
+    /// those reachable from `replaced`, that code's targets, which no other block, the rebuilt
+    /// blocks, the code running or a frame returning, nor a protected call's handler reaches, and
+    /// that have no JIT code. See Note [Contraction].
+    fn drop_unreachable(&mut self, owner: &Owner, state: &RunState<'src, 'intern>, at: Location, replaced: Vec<BlockId>, rebuilt: Vec<BlockId>) {
+        let mut reached: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = Default::default();
+        let mut work = replaced;
+        while let Some(block) = work.pop() {
+            if reached.insert(block) {
+                work.extend(Self::targets(&self.blocks[block.0].instructions));
+            }
+        }
+        let mut work: Vec<BlockId> = self.blocks.iter().enumerate()
+            .filter(|(id, _)| !reached.contains(&BlockId(*id)))
+            .flat_map(|(_, block)| Self::targets(&block.instructions))
+            .collect();
+        work.extend(rebuilt);
+        work.push(at.0);
+        work.extend(state.callstack.iter().map(|entry| entry.ret.0));
+        work.extend(state.handlers.iter().map(|handler| handler.after));
+        work.extend(reached.iter().copied().filter(|&block| self.compiled(block)));
+        let mut live: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = Default::default();
+        while let Some(block) = work.pop() {
+            if reached.contains(&block) && live.insert(block) {
+                work.extend(Self::targets(&self.blocks[block.0].instructions));
+            }
+        }
+        let mut _dropped: Vec<usize> = Vec::new();
+        for versions in self.versions.values_mut() {
+            versions.retain(|_, block| {
+                let keep = !reached.contains(block) || live.contains(block);
+                if !keep {
+                    _dropped.push(block.0);
+                }
+                keep
+            });
+        }
+        _dropped.sort_unstable();
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("spec", "unreachable", &[
+            ("line", self.traced_line(owner).into()),
+            ("reached", reached.len().into()),
+            ("dropped", Self::ids(_dropped.iter().copied()).as_str().into()),
+        ]);
+        let _ = owner;
     }
 
     /// `ids` as a comma separated list, for traces.
@@ -3666,9 +3732,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     {
         // Where the constant being loaded was, for its fact's origin.
         let mut loading: Option<Origin> = None;
-        // Where the encoding of the optimistic op about to be laid out was asked, and
-        // the slot its result goes in. See Note [Optimistic ops].
-        let mut encoding: Option<(usize, Origin)> = None;
+        // Where the encoding of the optimistic op about to be laid out was asked.
+        // See Note [Optimistic ops].
+        let mut encoding: Option<Origin> = None;
         loop {
             let mut state = Pin::new(&mut coro).resume(arg);
             arg = ResumeArg::Start;
@@ -3877,8 +3943,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::Encoding(slot)) => {
-                    encoding = Some((slot, self.origin(block_id, coro.clone(), pc, ctx.clone())));
+                CoroutineState::Yielded(YieldOp::Encoding) => {
+                    encoding = Some(self.origin(block_id, coro.clone(), pc, ctx.clone()));
                     arg = ResumeArg::Type(CType::Type(LType::Integer));
                 },
                 CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
@@ -3890,16 +3956,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op));
-                    // A result that fits is the fact of where its encoding was asked, which its
-                    // overflow rebuilds to compute in the double encoding. See Note [Optimistic ops].
-                    let asked = encoding.take();
-                    let mut fits = ctx.clone();
-                    if let Some((slot, origin)) = &asked {
-                        Rc::make_mut(&mut fits).introduce(Fact { fragile: Fragile::Fits { slot: *slot }, origins: Some(Rc::new(TLCell::new(vec![origin.clone()]))) });
-                    }
-                    let hot = self.subblock(owner, pc.next_true(), fits, coro.clone(), ResumeArg::Matched);
+                    let hot = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
                     let cold = self.new_block(pc.0);
-                    let side = self.make_overflow_thunk(cold, coro.clone(), pc.next_false(), ctx.clone(), asked.map(|(_, origin)| origin));
+                    // Its overflow rebuilds it from where its encoding was asked. See Note
+                    // [Optimistic ops].
+                    let side = self.make_overflow_thunk(cold, coro.clone(), pc.next_false(), ctx.clone(), encoding.take());
                     self.blocks[cold.0].instructions.push(Residual::Thunk(side));
                     self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
                     return None;

@@ -31,8 +31,12 @@ The specializer's are also views, one column per argument:
       blocks introducing those facts are queued for contraction.
   contract(ts, line, origins, how, offsets, forgotten)
       each contraction: the blocks rebuilt from where they introduced the
-      facts (at those residual offsets), how (`drop`, without the facts, or
-      `integer`, with their constants loaded as integers), and the versions
+      facts (at those residual offsets), how (`drop`, without the facts,
+      `integer`, with their constants loaded as integers, or `double`, an
+      integer op computing in doubles), and the versions forgotten.
+  unreachable(ts, line, reached, dropped)
+      after a round of contractions: how many blocks the code they replaced
+      reached, and those of them no longer reachable, whose versions were
       forgotten.
   contract_deferred(ts, line, origins, at)
       a queued contraction waiting while the interpreter (in block `at`) or a
@@ -59,11 +63,13 @@ VIEWS = {
     'contract': ['line', 'origins', 'how', 'offsets', 'forgotten'],
     'contract_deferred': ['line', 'origins', 'at'],
     'contract_refused': ['line', 'origins', 'how', 'reason'],
+    'unreachable': ['line', 'reached', 'dropped'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
           'contractible': ('spec', 'contractible'), 'contract': ('spec', 'contract'),
-          'contract_deferred': ('spec', 'contract_deferred'), 'contract_refused': ('spec', 'contract_refused')}
+          'contract_deferred': ('spec', 'contract_deferred'), 'contract_refused': ('spec', 'contract_refused'),
+          'unreachable': ('spec', 'unreachable')}
 
 
 def main():

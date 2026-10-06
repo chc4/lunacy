@@ -1122,7 +1122,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     // In the integer encoding, unless the op has overflowed, which rebuilds
                     // it to compute in the double one. See Note [Optimistic ops] in
                     // `specialize`.
-                    if (yield YieldOp::Encoding(dest)) != ResumeArg::Type(CType::Type(LType::Double)) {
+                    if (yield YieldOp::Encoding) != ResumeArg::Type(CType::Type(LType::Double)) {
                         let fits = yield YieldOp::OptimisticExec(op);
                         let ty = if fits == ResumeArg::Matched { LType::Integer } else { LType::Double };
                         yield YieldOp::SetCTypes(vec![(dest, CType::Type(ty))]);
