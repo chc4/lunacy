@@ -38,8 +38,12 @@ The specializer's are also views, one column per argument:
       after a round of contractions: how many blocks the code they replaced
       reached, those of them no longer reachable, whose versions were
       forgotten, how many of them each kind of root still reaches (the
-      rebuilt blocks, the running code, JIT code), and the path (block ids,
-      from a root) to the first of them a root reaches, and the block running.
+      rebuilt blocks, the running code), and the path (block ids,
+      from a root) to the first of them a root reaches, the block running, and
+      how many blocks the replaced optimistic ops' hot ways reach and keep,
+      how many of those their cold ways reach too, and how many only the hot
+      ways reach yet are kept, and the path to one such (each root marked by
+      its kind, and blocks with JIT code `jit`).
   contract_deferred(ts, line, origins, at)
       a queued contraction waiting while the interpreter (in block `at`) or a
       frame returning still runs code rebuilding replaces.
@@ -65,7 +69,7 @@ VIEWS = {
     'contract': ['line', 'origins', 'how', 'offsets', 'forgotten'],
     'contract_deferred': ['line', 'origins', 'at'],
     'contract_refused': ['line', 'origins', 'how', 'reason'],
-    'unreachable': ['line', 'reached', 'dropped', 'kept_by', 'kept_path', 'at'],
+    'unreachable': ['line', 'reached', 'dropped', 'kept_by', 'kept_path', 'at', 'hot', 'hot_path'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),

@@ -1297,7 +1297,8 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // (Note [Optimistic ops]).
 //
 // Rebuilding replaces code, and the blocks only that code reached are then unreachable: nothing
-// that runs (the code running, a frame returning, a handler, JIT code) reaches them. Versions are
+// that runs (the code running, a frame returning, a handler) reaches them. JIT code is entered only
+// as its block is, so it keeps alive only what it reaches when its block is reached. Versions are
 // no roots, as only code that runs finds one again: versions reaching each other, as a caller's and
 // the callee's it calls, are reached or not together. The unreachable ones are forgotten, as a
 // contraction's are, so they stop counting against the versions a point can have. The narrowing still writes
@@ -2513,6 +2514,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // The targets of the code the rebuilds replace, and the blocks rebuilt.
         let mut replaced: Vec<BlockId> = Vec::new();
         let mut rebuilt: Vec<BlockId> = Vec::new();
+        // The hot and cold ways of the optimistic ops replaced, for the trace.
+        let mut hot: Vec<BlockId> = Vec::new();
+        let mut cold: Vec<BlockId> = Vec::new();
         for (of, origins, how) in std::mem::take(&mut self.contractions) {
             if of != proto {
                 self.contractions.push((of, origins, how));
@@ -2581,13 +2585,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             for origin in live {
                 let (block, offset) = (owner.ro(&origin).block, owner.ro(&origin).offset);
                 replaced.extend(Self::targets(&self.blocks[block.0].instructions[offset..]));
+                for residual in &self.blocks[block.0].instructions[offset..] {
+                    if let Residual::Branch { hot: integer, cold: double } = residual {
+                        hot.push(*integer);
+                        cold.push(*double);
+                    }
+                }
                 rebuilt.push(block);
                 let rebuild = owner.rw(&origin).rebuild.take().unwrap();
                 rebuild(self, owner, how.clone());
             }
         }
         if !replaced.is_empty() {
-            self.drop_unreachable(owner, state, at, replaced, rebuilt);
+            self.drop_unreachable(owner, state, at, replaced, rebuilt, hot, cold);
         }
     }
 
@@ -2606,9 +2616,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// Forget the versions of the blocks that only the code contractions just replaced reached:
     /// those reachable from `replaced`, that code's targets, which nothing that runs reaches (the
-    /// rebuilt blocks, the code running or a frame returning, a protected call's handler, JIT
-    /// code). See Note [Contraction].
-    fn drop_unreachable(&mut self, owner: &Owner, state: &RunState<'src, 'intern>, at: Location, replaced: Vec<BlockId>, rebuilt: Vec<BlockId>) {
+    /// rebuilt blocks, the code running or a frame returning, a protected call's handler). A
+    /// block's JIT code keeps alive only what it reaches when it is reached itself: every way into
+    /// JIT code is an edge of the blocks. See Note [Contraction].
+    fn drop_unreachable(&mut self, owner: &Owner, state: &RunState<'src, 'intern>, at: Location, replaced: Vec<BlockId>, rebuilt: Vec<BlockId>, _hot: Vec<BlockId>, _cold: Vec<BlockId>) {
         let mut reached: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = Default::default();
         let mut work = replaced;
         while let Some(block) = work.pop() {
@@ -2624,6 +2635,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .chain(state.callstack.iter().map(|entry| entry.ret.0))
             .chain(state.handlers.iter().map(|handler| handler.after))
             .collect();
+        #[cfg(feature = "tracing")]
         let compiled: Vec<BlockId> = (0..self.blocks.len()).map(BlockId).filter(|&block| self.compiled(block)).collect();
         let closure = |roots: &[BlockId]| {
             let mut live: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = Default::default();
@@ -2635,10 +2647,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             live
         };
-        let roots: Vec<BlockId> = rebuilt.iter().chain(&running).chain(&compiled).copied().collect();
+        let roots: Vec<BlockId> = rebuilt.iter().chain(&running).copied().collect();
         let live = closure(&roots);
         #[cfg(feature = "tracing")]
-        let _kept_by = [("rebuilt", &rebuilt), ("running", &running), ("compiled", &compiled)]
+        let _kept_by = [("rebuilt", &rebuilt), ("running", &running)]
             .iter()
             .map(|(kind, roots)| format!("{kind} {}", closure(roots).iter().filter(|block| reached.contains(block)).count()))
             .collect::<Vec<_>>()
@@ -2689,6 +2701,56 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ("dropped", Self::ids(_dropped.iter().copied()).as_str().into()),
             ("kept_by", _kept_by.as_str().into()),
             ("kept_path", _kept_path.as_str().into()),
+            ("hot_path", {
+                // The path from a root to a block only the hot ways reach that is kept, the root
+                // first.
+                let ways = closure(&_hot);
+                let cold = closure(&_cold);
+                // Each block's parent, and the residual it was reached through.
+                let mut parent: std::collections::HashMap<BlockId, (BlockId, &'static str), rustc_hash::FxBuildHasher> = Default::default();
+                let mut seen: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher> = roots.iter().copied().collect();
+                let mut queue: std::collections::VecDeque<BlockId> = roots.iter().copied().collect();
+                let mut found = None;
+                while let Some(block) = queue.pop_front() {
+                    if ways.contains(&block) && !cold.contains(&block) {
+                        found = Some(block);
+                        break;
+                    }
+                    for residual in &self.blocks[block.0].instructions {
+                        let edges: SmallVec<[(BlockId, &'static str); 2]> = match residual {
+                            Residual::Jump(target) => smallvec::smallvec![(*target, "jump")],
+                            Residual::Branch { hot, cold } => smallvec::smallvec![(*hot, "hot"), (*cold, "cold")],
+                            Residual::Select(targets) => targets.iter().map(|(name, target)| (*target, *name)).collect(),
+                            Residual::LuaCall { entry: CallEntry::Block(target), .. } => smallvec::smallvec![(*target, "call")],
+                            Residual::TailCall { entry: CallEntry::Block(target), .. } => smallvec::smallvec![(*target, "tailcall")],
+                            _ => SmallVec::new(),
+                        };
+                        for (target, how) in edges {
+                            if seen.insert(target) {
+                                parent.insert(target, (block, how));
+                                queue.push_back(target);
+                            }
+                        }
+                    }
+                }
+                let mut path = Vec::new();
+                let mut at = found.map(|block| (block, ""));
+                while let Some((block, how)) = at {
+                    let kind = if running.contains(&block) { "running " } else if rebuilt.contains(&block) { "rebuilt " } else if compiled.contains(&block) { "jit " } else { "" };
+                    let line = self.blocks[block.0].pc;
+                    path.push(format!("{kind}{}@pc{line}{}", block.0, if how.is_empty() { String::new() } else { format!(" -{how}->") }));
+                    at = parent.get(&block).map(|&(parent, how)| (parent, how));
+                }
+                path.reverse();
+                path.join(" ")
+            }.as_str().into()),
+            ("hot", {
+                let ways = closure(&_hot);
+                let cold = closure(&_cold);
+                let only = ways.iter().filter(|block| !cold.contains(block));
+                format!("{} reached, {} kept, {} also cold's, {} only hot's kept", ways.len(), ways.iter().filter(|block| live.contains(block)).count(),
+                    ways.iter().filter(|block| cold.contains(block)).count(), only.filter(|block| live.contains(block)).count())
+            }.as_str().into()),
             ("at", at.0.0.into()),
         ]);
         let _ = owner;
