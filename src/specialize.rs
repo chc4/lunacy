@@ -1342,12 +1342,16 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // as its block is, so it keeps alive only what it reaches when its block is reached. Versions are
 // no roots, as only code that runs finds one again: versions reaching each other, as a caller's and
 // the callee's it calls, are reached or not together. The unreachable ones are forgotten, as a
-// contraction's are, so they stop counting against the versions a point can have. While code is
+// contraction's are, once their point has all the versions it can have and needs the room: until
+// then a path reaching one again, as a thunk forced into code that finds it, takes it as it is,
+// with its JIT code. While code is
 // still running in what the replaced code reached, it may reach any of it, so that rebuild's are
 // tried again each time a thunk is forced, until none is.
 //
-// An origin is rebuilt once; the fact may be introduced again by other paths, which may be
-// contracted in turn. Each contraction replaces code carrying the fact with code that doesn't, so
+// An origin's rebuild is kept for its point in the function: code compiled there again, as a
+// rebuild of an origin before it in the same code compiles it again, takes the same answer
+// instead of introducing the fact or asking again. An origin is rebuilt once; the fact may be
+// introduced again by other paths, which may be contracted in turn. Each contraction replaces code carrying the fact with code that doesn't, so
 // it ends, and a fact some code finds a use for before its duplicate appears is kept.
 
 /// Whether an integer op's overflow rebuilds it to compute in doubles (Note [Optimistic ops]);
@@ -1614,6 +1618,8 @@ pub struct OriginState {
     /// The block introducing it, which rebuilding truncates at `offset`.
     block: BlockId,
     offset: usize,
+    /// Where in the function it is, whose rebuild's answer is kept for it.
+    pc: SubPc,
     /// Whether code relied on the fact, which then isn't contracted.
     used: bool,
 }
@@ -2294,6 +2300,12 @@ pub struct Specializer<'src, 'intern> {
     trimming: Vec<Vec<BlockId>>,
     /// The rebuilt blocks. See Note [Contraction].
     rebuilt: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>,
+    /// The versions the trimming found unreachable, forgotten once their point needs the room.
+    /// See Note [Contraction].
+    unreachable: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>,
+    /// Each function's points a contraction rebuilt an origin at, with how: code compiled there
+    /// again takes the same answer. See Note [Contraction].
+    decided: std::collections::HashMap<LProto<'src, 'intern>, std::collections::HashMap<SubPc, ResumeArg, rustc_hash::FxBuildHasher>, InternedHasher>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -2325,6 +2337,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             cuts: Default::default(),
             trimming: Vec::new(),
             rebuilt: Default::default(),
+            decided: Default::default(),
+            unreachable: Default::default(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             clos,
@@ -2425,13 +2439,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
         if let Some(((_, ectx), &exists)) = versions.get_key_value(&(subpc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
+            self.unreachable.remove(&exists);
             return (exists, "exact", None);
         }
         let ctx = self.contractible(owner, subpc, ctx);
         let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
         if let Some(((_, ectx), &exists)) = versions.get_key_value(&(subpc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
+            self.unreachable.remove(&exists);
             return (exists, "exact", None);
+        }
+        if self.versions_at(owner, subpc) >= MAX_VERSIONS {
+            self.evict(owner, subpc);
         }
         let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
         let existing: Vec<(Rc<Context>, BlockId)> = versions
@@ -2469,6 +2488,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             lowered.fragile.retain(|fact| kept.contains(fact));
             if let Some((ectx, block)) = alike.iter().find(|(ectx, _)| ectx.fragile == lowered.fragile) {
                 ectx.adopt(owner, &lowered);
+                self.unreachable.remove(block);
                 return (*block, "fragile", None);
             }
             Rc::new(lowered)
@@ -2485,6 +2505,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         };
         if let Some((ectx, block)) = accepting(&ctx) {
             ectx.adopt(owner, &ctx);
+            self.unreachable.remove(&block);
             return (block, "accepting", None);
         }
         let mut joined = (*ctx).clone();
@@ -2495,12 +2516,40 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.contract_joined(owner, subpc, &existing, &joined);
         if let Some((ectx, block)) = accepting(&joined) {
             ectx.adopt(owner, &joined);
+            self.unreachable.remove(&block);
             return (block, "joined", Some(joined));
         }
         if existing.len() >= HARD_MAX_VERSIONS {
             panic!("too many versions at {pc}: {:#?}", existing.iter().map(|(ectx, _)| ectx).collect::<Vec<_>>());
         }
         (self.block(owner, pc, joined.clone()), "joined-new", Some(joined))
+    }
+
+    /// How many versions the running function has at `pc`.
+    fn versions_at(&self, owner: &Owner, pc: SubPc) -> usize {
+        self.versions.get(&self.clos.ro(owner).prototype).map_or(0, |versions| versions.keys().filter(|(at, _)| *at == pc).count())
+    }
+
+    /// Forget the versions at `pc` of the running function the trimming found unreachable, which
+    /// a point with all the versions it can have needs the room of. See Note [Contraction].
+    fn evict(&mut self, owner: &Owner, pc: SubPc) {
+        let unreachable = &mut self.unreachable;
+        let mut _evicted: Vec<usize> = Vec::new();
+        self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().retain(|(at, _), block| {
+            let evict = *at == pc && unreachable.remove(block);
+            if evict {
+                _evicted.push(block.0);
+            }
+            !evict
+        });
+        #[cfg(feature = "tracing")]
+        if !_evicted.is_empty() {
+            crate::tracing::instant("spec", "evicted", &[
+                ("line", self.traced_line(owner).into()),
+                ("pc", pc.0.into()),
+                ("blocks", Self::ids(_evicted.iter().copied()).as_str().into()),
+            ]);
+        }
     }
 
     /// Queue the origins of the facts versions at `pc` have that `joined`, their join, drops, for
@@ -2639,6 +2688,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
+    /// How a contraction rebuilt the origin at `pc` of the running function, if one did: code
+    /// compiled there again takes the same answer. See Note [Contraction].
+    fn decision(&self, owner: &Owner, pc: SubPc) -> Option<ResumeArg> {
+        self.decided.get(&self.clos.ro(owner).prototype)?.get(&pc).cloned()
+    }
+
     /// Rebuild the queued origins of the running function that nothing runs past, the interpreter
     /// at `at` or a frame returning: each becomes a thunk compiling the code from there again, and
     /// the blocks the code it replaced reached are to be trimmed. See Note [Contraction].
@@ -2713,6 +2768,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let (block, offset) = (owner.ro(&origin).block, owner.ro(&origin).offset);
                 self.trimming.push(Self::targets(&self.blocks[block.0].instructions[offset..]).collect());
                 self.rebuilt.insert(block);
+                self.decided.entry(proto).or_default().insert(owner.ro(&origin).pc, how.clone());
                 let rebuild = owner.rw(&origin).rebuild.take().unwrap();
                 rebuild(self, owner, how.clone());
             }
@@ -2793,14 +2849,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             live_from(&mut running.iter().copied()).iter().filter(|block| reached.contains(block)).count(),
             live_from(&mut self.rebuilt.iter().map(|&block| (block, 0))).iter().filter(|block| reached.contains(block)).count());
         let mut _dropped: Vec<usize> = Vec::new();
-        for versions in self.versions.values_mut() {
-            versions.retain(|_, block| {
-                let keep = !reached.contains(block) || live.contains(block);
-                if !keep {
+        for versions in self.versions.values() {
+            for block in versions.values() {
+                if reached.contains(block) && !live.contains(block) && self.unreachable.insert(*block) {
                     _dropped.push(block.0);
                 }
-                keep
-            });
+            }
         }
         _dropped.sort_unstable();
         #[cfg(feature = "tracing")]
@@ -3298,7 +3352,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             vm.cuts.insert(block, offset + 1);
         };
-        Rc::new(TLCell::new(OriginState { rebuild: Some(Box::new(rebuild)), block, offset, used: false }))
+        Rc::new(TLCell::new(OriginState { rebuild: Some(Box::new(rebuild)), block, offset, pc, used: false }))
     }
 
     /// The thunk an optimistic integer op's `Encoding` ends its block in: forced, it lays out the
@@ -4184,6 +4238,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
+                CoroutineState::Yielded(YieldOp::Encoding(_)) if let Some(how) = self.decision(owner, pc) => {
+                    arg = how;
+                },
                 CoroutineState::Yielded(YieldOp::Encoding(fits)) => {
                     // Decided by its operands the first time it runs. See Note [Optimistic ops].
                     let thunk = Residual::Thunk(self.make_encoding_thunk(block_id, coro.clone(), pc, ctx.clone(), fits));
@@ -4533,6 +4590,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     if ctx.types.get(slot) == Some(&CType::Type(LType::Double)) {
                         self.narrow_constant(owner, &mut ctx, slot, block_id);
                     }
+                },
+                CoroutineState::Yielded(YieldOp::EncodeK(..)) if let Some(how) = self.decision(owner, pc) => {
+                    arg = how;
                 },
                 CoroutineState::Yielded(YieldOp::EncodeK(_, k)) => {
                     let proto = self.clos.ro(owner).prototype;

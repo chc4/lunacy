@@ -42,7 +42,8 @@ The specializer's are also views, one column per argument:
   unreachable(ts, line, reached, dropped, waiting, kept_by, at)
       after a forced thunk, for the rebuilds whose replaced code nothing
       running is in: how many blocks that code reached, those of them no
-      longer reachable, whose versions were forgotten, how many rebuilds are
+      longer reachable, whose versions are forgotten once their point needs
+      the room (`evicted`), how many rebuilds are
       still waiting, how many of the reached blocks each kind of root keeps
       (the running code, the rebuilt blocks), and the block running.
   narrow(ts, line, slot, block, origins, queued)
@@ -53,6 +54,9 @@ The specializer's are also views, one column per argument:
   contract_deferred(ts, line, origins, at)
       a queued contraction waiting, as the interpreter (in block `at`) or a
       frame returning will run code past where an origin introduced its fact.
+  evicted(ts, line, pc, blocks)
+      the versions at a point the trimming found unreachable, forgotten as the
+      point has all the versions it can have.
   contract_refused(ts, line, origins, how, reason)
       a queued contraction dropped: a fact `used` since, an origin `compiled`,
       or every origin `rebuilt` already.
@@ -78,13 +82,14 @@ VIEWS = {
     'unreachable': ['line', 'reached', 'dropped', 'waiting', 'kept_by', 'at'],
     'encoding': ['line', 'pc', 'block', 'encoding'],
     'narrow': ['line', 'slot', 'block', 'origins', 'queued'],
+    'evicted': ['line', 'pc', 'blocks'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
           'contractible': ('spec', 'contractible'), 'contract': ('spec', 'contract'),
           'contract_deferred': ('spec', 'contract_deferred'), 'contract_refused': ('spec', 'contract_refused'),
           'unreachable': ('spec', 'unreachable'), 'encoding': ('spec', 'encoding'),
-          'narrow': ('spec', 'narrow')}
+          'narrow': ('spec', 'narrow'), 'evicted': ('spec', 'evicted')}
 
 
 def main():
