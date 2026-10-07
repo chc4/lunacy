@@ -1856,7 +1856,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let (a, b) = (a as usize, b as usize);
         // The arguments' end, before the frame is pushed.
         let passed = if b == 0 { self.top } else { self.base + a + b };
-        let stack = self.push_frame(owner, ret, a, b, stack, true);
+        let stack = self.push_frame::<true>(owner, ret, a, b, stack, true);
         if vararg {
             let func = self.base - 1;
             self.callstack.last_mut().expect("the frame just pushed").func = core::mem::MaybeUninit::new(func);
@@ -1895,9 +1895,14 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// instruction. With `fills`, this nils it; without, the caller does, before
     /// anything reads the stack or marks it. `stack` is the callee's
     /// `max_stack`, which the caller knows.
+    ///
+    /// With `ENTRY`, the caller's state is recorded in a `CallstackEntry`
+    /// returning to `ret`; without, for a call from JIT code of a function that
+    /// isn't vararg, the frame is only counted (`jit_depth`), the caller keeping
+    /// that state, and `ret` is unused. See Note [Frame ops] in `specialize`.
     #[inline(always)]
-    pub fn push_frame(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, stack: u8, fills: bool) -> usize {
-        let entry = CallstackEntry {
+    pub fn push_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, stack: u8, fills: bool) -> usize {
+        let entry = ENTRY.then(|| CallstackEntry {
             clos: self.clos.clone(),
             ret: Location::unpack(ret),
             frame: self.base,
@@ -1905,23 +1910,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             func: core::mem::MaybeUninit::uninit(),
             witness_frame: self.witness_base,
             witness_top: self.witness_top,
-        };
-        let stack = self.enter_frame(owner, a, b, stack, fills);
-        self.callstack.push(entry);
-        stack
-    }
-
-    /// `push_frame`, for a call from JIT code of a function that isn't vararg: the caller keeps
-    /// what an entry would hold, and the frame has none. See Note [Frame ops] in `specialize`.
-    #[inline(always)]
-    pub fn push_jit_frame(&mut self, owner: &mut Owner, a: usize, b: usize, stack: u8, fills: bool) -> usize {
-        self.jit_depth += 1;
-        self.enter_frame(owner, a, b, stack, fills)
-    }
-
-    /// The callee's frame of a call of R(A), made the running one, as `push_frame` says.
-    #[inline(always)]
-    fn enter_frame(&mut self, owner: &mut Owner, a: usize, b: usize, stack: u8, fills: bool) -> usize {
+        });
         let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unreachable!() };
         debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "a call's frame size isn't its callee's");
         let next_stack = stack as usize;
@@ -1943,6 +1932,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         self.top = next_base + next_stack;
         self.witness_base = self.witness_top;
         self.clos = lclos.clone();
+        match entry {
+            Some(entry) => self.callstack.push(entry),
+            None => self.jit_depth += 1,
+        }
         next_stack
     }
 
@@ -2003,14 +1996,33 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// the caller continues. From the outermost frame, instead the range of the
     /// stack its results are in, which the caller takes off it.
     ///
+    /// Without `ENTRY`, the frame is one a call from JIT code made, with no
+    /// entry (`push_frame`): its results go to its function's slot, just below
+    /// its base, and its caller, which kept the rest, puts it back; `None`.
+    ///
     /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
     /// Note [Frame ops] in `specialize`.
     #[inline(always)]
-    pub fn leave(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> Result<Location, std::ops::Range<usize>> {
+    pub fn leave<const ENTRY: bool>(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> Result<Option<Location>, std::ops::Range<usize>> {
         debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, vararg, "a return's vararg isn't its function's");
-        self.close_leaving(owner, closes);
+        if closes {
+            if !self.upvals.is_empty() {
+                self.close_upvalues(owner);
+            }
+        } else {
+            debug_assert!(
+                self.upvals.iter().all(|(upval, _)| matches!(upval, Upvalue::Open(idx) if *idx < self.base)),
+                "an upvalue open into a frame whose function captures none of it"
+            );
+        }
         let from = self.base + a;
         let count = if b == 0 { self.top - from } else { b - 1 };
+        if !ENTRY {
+            debug_assert!(!vararg, "a return of a vararg function from a frame JIT code called");
+            self.move_results(from, count, self.base - 1);
+            self.jit_depth -= 1;
+            return Ok(None);
+        }
         match self.callstack.pop() {
             Some(entry) => {
                 // The function's slot: a vararg function's frame's is recorded,
@@ -2029,23 +2041,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                 self.base = frame;
                 self.witness_base = witness_frame;
                 self.witness_top = witness_top;
-                Ok(ret)
+                Ok(Some(ret))
             },
             None => Err(from..from + count),
         }
-    }
-
-    /// `leave`, from a frame JIT code called: its results go to its function's slot, the top past
-    /// them, and its caller, which kept what an entry would hold, puts back the rest. See Note
-    /// [Frame ops] in `specialize`.
-    #[inline(always)]
-    pub fn leave_jit_frame(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) {
-        debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg }, 0, "a return of a vararg function from a frame JIT code called");
-        self.close_leaving(owner, closes);
-        let from = self.base + a;
-        let count = if b == 0 { self.top - from } else { b - 1 };
-        self.move_results(from, count, self.base - 1);
-        self.jit_depth -= 1;
     }
 
     /// Move a return's `count` results from `from` down to its function's slot, `to`, the top just
@@ -2058,21 +2057,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             _ => self.move_down(from, count, to),
         }
         self.top = to + count;
-    }
-
-    /// Close the returning frame's open upvalues, if its function can have opened any.
-    #[inline(always)]
-    fn close_leaving(&mut self, owner: &mut Owner, closes: bool) {
-        if closes {
-            if !self.upvals.is_empty() {
-                self.close_upvalues(owner);
-            }
-        } else {
-            debug_assert!(
-                self.upvals.iter().all(|(upval, _)| matches!(upval, Upvalue::Open(idx) if *idx < self.base)),
-                "an upvalue open into a frame whose function captures none of it"
-            );
-        }
     }
 
     /// TAILCALL A B in the running frame: close the frame's open upvalues, if

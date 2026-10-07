@@ -670,10 +670,11 @@ impl After {
 // itself.
 //
 // A call from JIT code to JIT code makes no entry: it only moves the running frame to the callee's
-// (`push_jit_frame`), and counts the frames JIT code has called past the callstack's
+// (`push_frame` without `ENTRY`), and counts the frames JIT code has called past the callstack's
 // (`jit_depth`). The caller keeps what the entry would hold (its closure, base, and hash
-// witnesses' range) on the native stack, and puts it back when the callee returns
-// (`leave_jit_frame`), which only moves the results down. A return from a frame JIT code didn't
+// witnesses' range) on the native stack, and puts it back when the callee returns (`leave`
+// without `ENTRY`), which only moves the results down. Either way the frame itself is made and
+// left by the same code. A return from a frame JIT code didn't
 // call pops its entry, as the interpreter's does.
 //
 // The callstack is made whole only when control leaves JIT code from inside frames it called.
@@ -741,12 +742,12 @@ impl Count {
     }
 }
 
-// `push_jit_frame` for a call of R(A). `abs` is its `a | b << 16 | stack << 32` (A and B as
+// `push_frame`, without the callstack's entry, for a call of R(A). `abs` is its `a | b << 16 | stack << 32` (A and B as
 // `Count::hold` holds them, `stack` the callee's `max_stack`). Requires nilling the callee's frame
 // if `FILLS`, or else the JIT code does. The callee isn't vararg. See Note [Frame ops].
 windowed!(frame PushFrame, [abs: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
     let (a, b) = (A.lift(abs as u16), B.lift((abs >> 16) as u16));
-    state.push_jit_frame(owner, a, b, (abs >> 32) as u8, FILLS);
+    state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), a, b, (abs >> 32) as u8, FILLS);
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
 
@@ -771,22 +772,22 @@ windowed!(frame PopFrame, [at: u64, ab: u64, effects: u64], [CLOSES: bool, VARAR
     // See Note [Call continuations].
     let returned = || crate::vm::RETURNED | (unsafe { *(effects as *const u16) } as u64) << crate::vm::EFFECTS_SHIFT | ab >> 32;
     state.exit = if state.jit_depth > 0 {
-        state.leave_jit_frame(owner, a, b, CLOSES);
+        let _ = state.leave::<false>(owner, a, b, CLOSES, VARARG);
         state.returned = returned();
         state.returned
     } else if state.callstack.is_empty() {
         state.current_off = off as u16;
         ((-2i32 as u64) << 32) | block as u64
     } else {
-        match state.leave(owner, a, b, CLOSES, VARARG) {
+        match state.leave::<true>(owner, a, b, CLOSES, VARARG) {
             // See Note [Call continuations].
-            Ok(location) => {
+            Ok(Some(location)) => {
                 state.resume = location.pack().bits() as u64;
                 state.returned = returned();
                 state.returned
             },
-            // With a caller frame, `leave` returns to it.
-            Err(_) => unreachable!(),
+            // With a caller frame's entry, `leave` returns to it.
+            Ok(None) | Err(_) => unreachable!(),
         }
     };
 });
@@ -4956,8 +4957,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 &Residual::Ret(_, a, b, closes, vararg, returns, effects) => {
                     debug!("spec final blocks: {:?}", self.blocks);
-                    match state.leave(owner, a as usize, b as usize, closes, vararg) {
-                        Ok(Location(block, disp)) => {
+                    match state.leave::<true>(owner, a as usize, b as usize, closes, vararg) {
+                        // The interpreter runs no frame JIT code called: each has its entry.
+                        Ok(None) => unreachable!("a return from a frame with no entry in the interpreter"),
+                        Ok(Some(Location(block, disp))) => {
                             // See Note [Call continuations].
                             let effects = unsafe { (*effects).get() }.0 as u64;
                             state.returned = crate::vm::RETURNED | effects << crate::vm::EFFECTS_SHIFT | returns as u64;
