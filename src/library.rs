@@ -285,8 +285,8 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
         };
     }
     vec![
-        ("floor", math1!(FLOOR)),
-        ("ceil", math1!(CEIL)),
+        ("floor", native!(pure generator: whole_generator::<FLOOR>, |owner, args| vec![math1_boxed::<FLOOR>(number(arg(&args, 0)))])),
+        ("ceil", native!(pure generator: whole_generator::<CEIL>, |owner, args| vec![math1_boxed::<CEIL>(number(arg(&args, 0)))])),
         ("sqrt", math1!(SQRT)),
         ("abs", math1!(ABS)),
         ("sin", math1!(SIN)),
@@ -439,11 +439,7 @@ fn math1_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option
     } else {
         std::rc::Rc::new(MathUnary::<OP, false>::new(&operands))
     };
-    let result = match OP {
-        FLOOR | CEIL => crate::specialize::CType::Number,
-        _ => crate::specialize::CType::Type(LType::Double),
-    };
-    Some(NativeOp { window, args: crate::specialize::CType::Number, result })
+    Some(NativeOp { window, args: crate::specialize::CType::Number, result: crate::specialize::CType::Type(LType::Double) })
 }
 
 /// A number argument of a window op, which the specializer checked. See Note
@@ -607,6 +603,65 @@ crate::window::windowed!(ByteRange, [], [N: usize], |owner, state, base| (s, i, 
     let byte = |k: usize| if k < N { LBoxed::from_int(unsafe { *bytes.get_unchecked(at + k) } as i32) } else { LBoxed::NIL };
     (*r0, *r1, *r2, *r3) = (byte(0), byte(1), byte(2), byte(3));
 });
+
+// `math.floor` or `math.ceil` (`OP`) of a whole number in the integer encoding: the number itself.
+crate::window::windowed!(WholeOfInt, [], [], |owner, state, base| (x, out r) {
+    *r = x;
+});
+// `OP` of a double, in the integer encoding where an i32 holds the result: a cold path for one it
+// doesn't, which is a double. As an integer op whose result doesn't fit. See Note [Optimistic ops]
+// in `specialize`.
+crate::window::windowed!(WholeOptimistic, [], [OP: u8], |owner, state, base| (x, out r) {
+    let whole = math1::<OP>(unsafe { checked_number(x) });
+    if crate::lboxed::is_integer(whole) {
+        *r = LBoxed::from_int(whole as i32);
+        false
+    } else {
+        core::intrinsics::cold_path();
+        true
+    }
+} cold {
+    *r = LBoxed::from_double(math1::<OP>(unsafe { checked_number(x) }));
+    1
+});
+// `OP` of a double, in the double encoding.
+crate::window::windowed!(WholeDouble, [], [OP: u8], |owner, state, base| (x, out r) {
+    *r = LBoxed::from_double(math1::<OP>(unsafe { checked_number(x) }));
+});
+
+/// `math.floor`'s and `math.ceil`'s generator (`OP`): for a call of one number keeping one
+/// result, its result in the encoding an integer op's is, decided the first time it runs, and
+/// rebuilt to compute in doubles once one doesn't fit; any other call is the native's. See Notes
+/// [Native generators] and [Optimistic ops] in `specialize`.
+fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 2 && c == 2 {
+            if (yield YieldOp::Guard(a + 1, LType::Integer)) == ResumeArg::Matched {
+                yield YieldOp::ExecWindow(std::rc::Rc::new(WholeOfInt::new(&[a + 1, a])));
+                yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
+                return ResumeArg::Start;
+            }
+            if (yield YieldOp::Guard(a + 1, LType::Double)) == ResumeArg::Matched {
+                let fits = Fits(std::rc::Rc::new(move |state: &crate::vm::RunState| {
+                    crate::lboxed::is_integer(math1::<OP>(unsafe { checked_number(state.vals[state.base + a + 1]) }))
+                }));
+                if (yield YieldOp::Encoding(fits)) != ResumeArg::Type(CType::Type(LType::Double)) {
+                    let fit = yield YieldOp::OptimisticExec(std::rc::Rc::new(WholeOptimistic::<OP>::new(&[a + 1, a])));
+                    let ty = if fit == ResumeArg::Matched { LType::Integer } else { LType::Double };
+                    yield YieldOp::SetCTypes(vec![(a, CType::Type(ty))]);
+                    return ResumeArg::Start;
+                }
+                yield YieldOp::Decided(false);
+                yield YieldOp::ExecWindow(std::rc::Rc::new(WholeDouble::<OP>::new(&[a + 1, a])));
+                yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Double))]);
+                return ResumeArg::Start;
+            }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
 
 /// `string.byte`'s generator: for `byte(s, i, j)` keeping one to four results, of a string and
 /// integer positions, its results read where they are in range, as integers; any other call is
