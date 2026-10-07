@@ -1325,19 +1325,19 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: NativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(native, None, false, false) }
+        NClosure { cell: NClosureCell::leak(native, None, None, false, false) }
     }
 
     /// A pure native. See Note [Library natives] in `library`.
     pub fn pure(native: PureNativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), None, true, false) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, false) }
     }
 
     /// `pcall`, whose call is laid out as a protected call of its first
     /// argument, `native` running only for a call site that doesn't specialize.
     /// See Note [Errors] in `specialize`.
     pub fn protected_call(native: PureNativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), None, true, true) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, true) }
     }
 
     /// Whether a call of it is a protected call of its first argument. See
@@ -1348,7 +1348,18 @@ impl NClosure {
 
     /// A pure native that runs as a window op where `window` gives one.
     pub fn pure_windowed(native: PureNativeFunc, window: NativeWindow) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), Some(window), true, false) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), Some(window), None, true, false) }
+    }
+
+    /// A pure native whose call is compiled by `generator`, as an opcode's is. See Note [Native
+    /// generators] in `library`.
+    pub fn pure_generated(native: PureNativeFunc, generator: crate::specialize::NativeGenerator) -> Self {
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, Some(generator), true, false) }
+    }
+
+    /// The generator a call to this native is compiled by, if it has one.
+    pub fn generator(&self) -> Option<crate::specialize::NativeGenerator> {
+        self.cell.generator
     }
 
     /// A pure native, as natives are called: with the owner mutable, which it

@@ -134,6 +134,9 @@ macro_rules! native {
     (pure window: $window:expr, |$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::pure_windowed(native!(@fn $owner, $args, $body), $window))
     };
+    (pure generator: $generator:expr, |$owner:ident, $args:ident| $body:expr) => {
+        LValue::NClosure(NClosure::pure_generated(native!(@fn $owner, $args, $body), $generator))
+    };
     (pure |$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::pure(native!(@fn $owner, $args, $body)))
     };
@@ -568,6 +571,73 @@ fn bitn_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
     Some(NativeOp { window, args: crate::specialize::CType::Number, result: crate::specialize::CType::Type(LType::Integer) })
 }
 
+// Note [Native generators]
+// ~~~~~~~~~~~~~~~~~~~~~~~~
+// A native can have a generator for its call, of an opcode's generator's type: past the guard of
+// the native's identity, the call is compiled by a generator it makes for the call's A, B and C,
+// at the call's pc, as an opcode is by its own, and the code after the call is compiled from the
+// context it ends in. So a native's call can guard its arguments, lay out ops whose results' types
+// hold past a dynamic guard, and fall back to a call of the native itself (`YieldOp::NativeCall`)
+// where none of that applies, all as an opcode's code does. Only a pure native has one.
+
+/// A string argument's bytes, which the code running the op has guarded it is.
+#[inline(always)]
+unsafe fn string_bytes<'a>(s: &'a LBoxed<'_, '_>) -> &'a [u8] {
+    match s.unbox() {
+        LValue::InternedString(s) => s.into_ref().as_bytes(),
+        // The cell is `s`'s, so it lives as long as `s` is borrowed.
+        LValue::OwnedString(s) => unsafe { core::slice::from_raw_parts(s.as_slice().as_ptr(), s.as_slice().len()) },
+        _ => unsafe { core::hint::unreachable_unchecked() },
+    }
+}
+
+// Whether `string.byte(s, i, j)`'s first `N` results are bytes of `s`: `s` a string, and `i` and
+// `j` integers, with `1 <= i` and `i + N - 1 <= min(j, #s)`.
+crate::window::windowed!(guard ByteInRange, [], [N: usize], |owner, state, base| (s, i, j) {
+    let (i, j) = unsafe { (i.as_int(), j.as_int()) };
+    let len = unsafe { string_bytes(&s) }.len().min(i32::MAX as usize) as i32;
+    1 <= i && i.saturating_add(N as i32 - 1) <= j.min(len)
+});
+// `string.byte(s, i, j)`'s results to R(A) on, where `ByteInRange::<N>` passed: its first `N`
+// bytes from `i`, and nil past them, up to R(A+3), which a call of three arguments always has.
+crate::window::windowed!(ByteRange, [], [N: usize], |owner, state, base| (s, i, out r0, out r1, out r2, out r3) {
+    let bytes = unsafe { string_bytes(&s) };
+    let at = unsafe { i.as_int() } as usize - 1;
+    // SAFETY: `ByteInRange::<N>` passed, so `at + k` is in `bytes` for every `k < N`.
+    let byte = |k: usize| if k < N { LBoxed::from_int(unsafe { *bytes.get_unchecked(at + k) } as i32) } else { LBoxed::NIL };
+    (*r0, *r1, *r2, *r3) = (byte(0), byte(1), byte(2), byte(3));
+});
+
+/// `string.byte`'s generator: for `byte(s, i, j)` keeping one to four results, of a string and
+/// integer positions, its results read where they are in range, as integers; any other call is
+/// the native's. See Note [Native generators].
+fn byte_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    use crate::window::Window;
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        let n = c.wrapping_sub(1);
+        if b == 4 && (1..=4).contains(&n)
+            && (yield YieldOp::Guard(a + 1, LType::String)) == ResumeArg::Matched
+            && (yield YieldOp::Guard(a + 2, LType::Integer)) == ResumeArg::Matched
+            && (yield YieldOp::Guard(a + 3, LType::Integer)) == ResumeArg::Matched
+        {
+            let (test, op): (std::rc::Rc<dyn Window>, std::rc::Rc<dyn Window>) = match n {
+                1 => (std::rc::Rc::new(ByteInRange::<1>::new(&[a + 1, a + 2, a + 3])), std::rc::Rc::new(ByteRange::<1>::new(&[a + 1, a + 2, a, a + 1, a + 2, a + 3]))),
+                2 => (std::rc::Rc::new(ByteInRange::<2>::new(&[a + 1, a + 2, a + 3])), std::rc::Rc::new(ByteRange::<2>::new(&[a + 1, a + 2, a, a + 1, a + 2, a + 3]))),
+                3 => (std::rc::Rc::new(ByteInRange::<3>::new(&[a + 1, a + 2, a + 3])), std::rc::Rc::new(ByteRange::<3>::new(&[a + 1, a + 2, a, a + 1, a + 2, a + 3]))),
+                _ => (std::rc::Rc::new(ByteInRange::<4>::new(&[a + 1, a + 2, a + 3])), std::rc::Rc::new(ByteRange::<4>::new(&[a + 1, a + 2, a, a + 1, a + 2, a + 3]))),
+            };
+            if (yield YieldOp::GuardDynamic(test)) == ResumeArg::Matched {
+                yield YieldOp::ExecWindow(op);
+                yield YieldOp::SetCTypes((0..4).map(|k| (a + k, CType::Type(if k < n { LType::Integer } else { LType::Nil }))).collect());
+                return ResumeArg::Start;
+            }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
 /// A table of `entries`, keyed by interned names.
 fn module<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, LValue<'s, 'i>)>) -> LValue<'s, 'i> {
     module_table(intern, entries, false)
@@ -620,7 +690,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             let range = span(s.len(), number_or(arg(&args, 1), 1.0), number_or(arg(&args, 2), -1.0));
             vec![string(s[range].to_vec())]
         })),
-        ("byte", native!(pure |owner, args| {
+        ("byte", native!(pure generator: byte_generator, |owner, args| {
             let s = arg_bytes(&args, 0);
             let i = number_or(arg(&args, 1), 1.0);
             let range = span(s.len(), i, number_or(arg(&args, 2), i));

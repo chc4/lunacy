@@ -188,6 +188,28 @@ pub enum CallTarget {
     Concrete(Pc),
 }
 
+/// A native's generator, of an opcode's generator's type, boxed: a native's call is compiled by
+/// it as an opcode is by its own. See Note [Native generators] in `library`.
+pub trait NativeGen: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Unpin {
+    fn clone_box(&self) -> Box<dyn NativeGen>;
+}
+
+impl<C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static> NativeGen for C {
+    fn clone_box(&self) -> Box<dyn NativeGen> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn NativeGen> {
+    fn clone(&self) -> Self {
+        (**self).clone_box()
+    }
+}
+
+/// A native's generator for its call CALL A B C, given the native itself, for a call of it the
+/// generator lays out as any native's (`YieldOp::NativeCall`).
+pub type NativeGenerator = fn(crate::vm::NativeFunc, usize, usize, usize) -> Box<dyn NativeGen>;
+
 #[derive(Clone, Debug)]
 pub enum YieldOp {
     Typeof(usize), // Resumed with the type of STACK[idx]
@@ -241,6 +263,7 @@ pub enum YieldOp {
                     // with the double type to compute it in the double encoding instead, else with
                     // the integer one. See Note [Optimistic ops]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
+    NativeCall { nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize }, // Emit a call of a pure native, its results from STACK[a] on of unknown type. See Note [Native generators] in `library`.
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
                       // knows it, else Failed. See Note [Array kinds]
     IsElementOf(usize, usize), // Resumed with Matched if STACK[a] was loaded from STACK[b]'s array
@@ -3572,7 +3595,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// below it, and the pc after it, a Lua function's call continues at a thunk
     /// specializing it to the return. See Notes [Call sites], [Call
     /// continuations] and [Call effects].
-    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
             // is a guard's failure, with the rest of the layout after it. See Note
@@ -3586,7 +3609,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 block_id
             };
             let (a16, b16, c16) = (a as u16, b as u16, c as u16);
-            let next = |vm: &Specializer| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), a, b, c, after.clone(), continuation.clone(), identities + 1, false));
+            let next = |vm: &Specializer| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), pc, a, b, c, after.clone(), continuation.clone(), identities + 1, false));
             let mut layout = vec![];
             match state.vals[state.base + a].unbox() {
                 LValue::LClosure(lclos) if matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS => {
@@ -3622,6 +3645,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
                     layout.push(next(vm));
+                    // Past the guard, a native with a generator is compiled by it, as an opcode is,
+                    // and the code after the call is a version. See Note [Native generators] in
+                    // `library`.
+                    if let (Some(generator), After::Version(..)) = (nf.generator(), &after) {
+                        vm.blocks[block.0].instructions.extend(layout);
+                        let coro = Box::new(generator(nf.native(), a, b, c));
+                        if let Some((next, ctx, _)) = vm.compile_one(owner, pc, calling.clone(), coro, ResumeArg::Start, block) {
+                            let ctx = vm.jumping(owner, ctx, next);
+                            let version = After::Version(next, ctx).block(vm, owner);
+                            vm.blocks[block.0].instructions.push(Residual::Jump(version));
+                        }
+                        return;
+                    }
                     // Past the guard the native is known: it runs as its window op if
                     // the call's arguments have the types the op assumes. See Note
                     // [Native windows].
@@ -4338,6 +4374,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
                 },
+                CoroutineState::Yielded(YieldOp::NativeCall { nf, a, b, c }) => {
+                    self.blocks[block_id.0].instructions.push(Residual::NativeCall { nf, a: a as u16, b: b as u16, c: c as u16 });
+                    // A native may allocate (a table, a string).
+                    self.blocks[block_id.0].allocates = true;
+                    // Its results, and its frame above them, overwrote every register from `a` on.
+                    let clobbered: Vec<(usize, CType)> = (a..ctx.types.len()).map(|idx| (idx, CType::Unknown)).collect();
+                    for &(idx, _) in &clobbered {
+                        Rc::make_mut(&mut ctx).effect(Effect::Write(idx));
+                    }
+                    Rc::make_mut(&mut ctx).set_types(owner, clobbered);
+                    Rc::make_mut(&mut ctx).top = None;
+                },
                 CoroutineState::Yielded(YieldOp::Effect(effect)) => {
                     Rc::make_mut(&mut ctx).effect(effect);
                     // See Note [Call effects].
@@ -4463,6 +4511,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // A protected call's is laid out by the call thunk, which
                             // needs a continuation for it to unwind to. See Note [Errors].
                             let native = matches!(&ctx.types[a], CType::NativeFunction(nf) if !nf.is_protected_call());
+                            // A native with a generator is compiled by it, as an opcode is. See Note
+                            // [Native generators] in `library`.
+                            if native && !resumes && let CType::NativeFunction(nf) = &ctx.types[a] && let Some(generator) = nf.generator() {
+                                let coro = Box::new(generator(nf.native(), a, b, c));
+                                return self.compile_one(owner, pc, ctx, coro, ResumeArg::Start, block_id);
+                            }
                             if native && let CType::NativeFunction(nf) = &ctx.types[a] {
                                 // A native runs as a window op if we have one, and we have all of its
                                 // arguments of the type it assumes. It gives one result, even with
@@ -4561,7 +4615,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 (After::Version(pc.0 + 1, after), continuation)
                             };
                             self.end_block(block_id);
-                            let thunk = self.make_call_thunk(block_id, calling, a, b, c, after, continuation, 0, true);
+                            let thunk = self.make_call_thunk(block_id, calling, pc, a, b, c, after, continuation, 0, true);
                             self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
                             return None;
                         },

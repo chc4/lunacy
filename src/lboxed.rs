@@ -51,6 +51,9 @@ pub(crate) struct NClosureCell {
     /// The native's window op for a call, if it offers one. See Note [Native
     /// windows] in `library`.
     pub(crate) window: Option<crate::vm::NativeWindow>,
+    /// The native's generator for a call, if it has one. See Note [Native
+    /// generators] in `library`.
+    pub(crate) generator: Option<crate::specialize::NativeGenerator>,
     /// Whether it writes no object the program can see. See Note [Library
     /// natives] in `library`.
     pub(crate) pure: bool,
@@ -63,8 +66,8 @@ impl NClosureCell {
     /// Leak a headered cell for `native`. `NClosure` holds the returned pointer
     /// for its whole life, so boxing a native only reads it; the cell is `'static`
     /// and outside the GC, so `Mark` needn't trace it.
-    pub(crate) fn leak(native: NativeFunc, window: Option<crate::vm::NativeWindow>, pure: bool, protects: bool) -> &'static NClosureCell {
-        Box::leak(Box::new(NClosureCell { kind: LBoxed::KIND_NCLOSURE, native, window, pure, protects }))
+    pub(crate) fn leak(native: NativeFunc, window: Option<crate::vm::NativeWindow>, generator: Option<crate::specialize::NativeGenerator>, pure: bool, protects: bool) -> &'static NClosureCell {
+        Box::leak(Box::new(NClosureCell { kind: LBoxed::KIND_NCLOSURE, native, window, generator, pure, protects }))
     }
 }
 
