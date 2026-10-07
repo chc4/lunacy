@@ -512,6 +512,14 @@ crate::window::windowed!(BitUnary, [], [OP: u8, X: bool], |owner, state, base| (
 crate::window::windowed!(BitBinary, [], [OP: u8, X: bool, Y: bool], |owner, state, base| (x, y, out r) {
     *r = LBoxed::from_int(bit2::<OP>(bit_arg::<X>(x), bit_arg::<Y>(y)));
 });
+// A folding bit op of three and of four numbers, all in the integer encoding if `INTS`.
+crate::window::windowed!(BitTernary, [], [OP: u8, INTS: bool], |owner, state, base| (x, y, z, out r) {
+    *r = LBoxed::from_int(bit2::<OP>(bit2::<OP>(bit_arg::<INTS>(x), bit_arg::<INTS>(y)), bit_arg::<INTS>(z)));
+});
+crate::window::windowed!(BitQuaternary, [], [OP: u8, INTS: bool], |owner, state, base| (x, y, z, w, out r) {
+    let xy = bit2::<OP>(bit_arg::<INTS>(x), bit_arg::<INTS>(y));
+    *r = LBoxed::from_int(bit2::<OP>(bit2::<OP>(xy, bit_arg::<INTS>(z)), bit_arg::<INTS>(w)));
+});
 
 /// `bit1::<OP>` as a window op, for a call with one number and one result: its
 /// argument in the encoding it has (`ints`).
@@ -540,6 +548,22 @@ fn bit2_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
         (false, true) => std::rc::Rc::new(BitBinary::<OP, false, true>::new(&operands)),
         (true, false) => std::rc::Rc::new(BitBinary::<OP, true, false>::new(&operands)),
         (true, true) => std::rc::Rc::new(BitBinary::<OP, true, true>::new(&operands)),
+    };
+    Some(NativeOp { window, args: crate::specialize::CType::Number, result: crate::specialize::CType::Type(LType::Integer) })
+}
+
+/// A folding bit op (`band`, `bor`, `bxor`) as a window op, for a call with two to four numbers
+/// and one result: as `bit2_window` for two, and past that specialized only to whether they are
+/// all in the integer encoding.
+fn bitn_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<NativeOp> {
+    let all = ints.iter().all(|&int| int);
+    let window: std::rc::Rc<dyn crate::window::Window> = match (b, c) {
+        (3, 2) => return bit2_window::<OP>(a, b, c, ints),
+        (4, 2) if all => std::rc::Rc::new(BitTernary::<OP, true>::new(&[a + 1, a + 2, a + 3, a])),
+        (4, 2) => std::rc::Rc::new(BitTernary::<OP, false>::new(&[a + 1, a + 2, a + 3, a])),
+        (5, 2) if all => std::rc::Rc::new(BitQuaternary::<OP, true>::new(&[a + 1, a + 2, a + 3, a + 4, a])),
+        (5, 2) => std::rc::Rc::new(BitQuaternary::<OP, false>::new(&[a + 1, a + 2, a + 3, a + 4, a])),
+        _ => return None,
     };
     Some(NativeOp { window, args: crate::specialize::CType::Number, result: crate::specialize::CType::Type(LType::Integer) })
 }
@@ -756,9 +780,9 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     let bit_lib = module(intern, vec![
         ("tobit", native!(pure window: bit1_window::<TOBIT>, |owner, args| bit_result(bit1::<TOBIT>(tobit(arg(&args, 0)))))),
         ("bnot", native!(pure window: bit1_window::<BNOT>, |owner, args| bit_result(bit1::<BNOT>(tobit(arg(&args, 0)))))),
-        ("band", native!(pure window: bit2_window::<BAND>, |owner, args| bit_result(args.iter().fold(-1, |x, &v| bit2::<BAND>(x, tobit(v)))))),
-        ("bor", native!(pure window: bit2_window::<BOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BOR>(x, tobit(v)))))),
-        ("bxor", native!(pure window: bit2_window::<BXOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BXOR>(x, tobit(v)))))),
+        ("band", native!(pure window: bitn_window::<BAND>, |owner, args| bit_result(args.iter().fold(-1, |x, &v| bit2::<BAND>(x, tobit(v)))))),
+        ("bor", native!(pure window: bitn_window::<BOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BOR>(x, tobit(v)))))),
+        ("bxor", native!(pure window: bitn_window::<BXOR>, |owner, args| bit_result(args.iter().fold(0, |x, &v| bit2::<BXOR>(x, tobit(v)))))),
         ("lshift", native!(pure window: bit2_window::<LSHIFT>, |owner, args| bit_result(bit2::<LSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
         ("rshift", native!(pure window: bit2_window::<RSHIFT>, |owner, args| bit_result(bit2::<RSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),
         ("arshift", native!(pure window: bit2_window::<ARSHIFT>, |owner, args| bit_result(bit2::<ARSHIFT>(tobit(arg(&args, 0)), tobit(arg(&args, 1)))))),

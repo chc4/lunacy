@@ -1,7 +1,8 @@
 -- The bit library's natives run as window ops where a call is known to be to
--- them (see Note [Native windows]): one result, from one or two arguments.
--- Other arities stay native calls. Each checksums every operation over
--- operands including negatives, fractions and shifts past 31.
+-- them (see Note [Native windows]): one result, from one or two arguments, or
+-- for band, bor and bxor up to four, all integers or not. Other arities stay
+-- native calls. Each checksums every operation over operands including
+-- negatives, fractions and shifts past 31.
 local bit = require("bit")
 local tobit, bnot, bswap = bit.tobit, bit.bnot, bit.bswap
 local band, bor, bxor = bit.band, bit.bor, bit.bxor
@@ -16,9 +17,12 @@ local function ops(n)
     sum = sum + band(x, y) % 1000 + bor(x, y) % 1000 + bxor(x, y) % 1000
     sum = sum + lshift(x, y) % 1000 + rshift(x, y) % 1000 + arshift(x, y) % 1000
     sum = sum + rol(x, y) % 1000 + ror(x, y) % 1000
-    -- Other shapes of call are native calls: three arguments, no results
-    -- kept, two results kept, every result passed on.
-    sum = sum + band(x, y, 255) + bor(x, y, 1) % 1000
+    -- Three and four arguments, of numbers and of integers only.
+    sum = sum + band(x, y, 255) + bor(x, y, 1) % 1000 + bxor(x, y, i, 7) % 1000
+    sum = sum + bor(i, i * 2, 3) + band(i, i * 3, 255, 127) + bxor(i, 5, i * 7, 1)
+    -- Other shapes of call are native calls: five arguments, no results kept,
+    -- two results kept, every result passed on.
+    sum = sum + bor(x, y, i, 1, 2) % 1000
     bxor(x, y)
     local p, q = band(x, 255)
     sum = sum + p + (q == nil and 1 or 0)
@@ -29,5 +33,5 @@ end
 print(ops(200), tobit(2^32 + 5.5), bnot(0), bswap(1))
 ops.__jit = 1
 print(ops(200), tobit(2^32 + 5.5), bnot(0), bswap(1))
--- EXPECT: 1233354	6	-1	16777216
--- EXPECT: 1233354	6	-1	16777216
+-- EXPECT: 1650626	6	-1	16777216
+-- EXPECT: 1650626	6	-1	16777216
