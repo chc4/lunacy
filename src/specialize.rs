@@ -742,12 +742,12 @@ impl Count {
     }
 }
 
-// `push_frame`, without the callstack's entry, for a call of R(A). `abs` is its `a | b << 16 | stack << 32` (A and B as
-// `Count::hold` holds them, `stack` the callee's `max_stack`). Requires nilling the callee's frame
-// if `FILLS`, or else the JIT code does. The callee isn't vararg. See Note [Frame ops].
-windowed!(frame PushFrame, [abs: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
-    let (a, b) = (A.lift(abs as u16), B.lift((abs >> 16) as u16));
-    state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), a, b, (abs >> 32) as u8, FILLS);
+// `push_frame`, without the callstack's entry, for a call of R(A), with CALL's B (`a` and `b` as
+// `Count::hold` holds them), of a callee whose `max_stack` is `stack`. Requires nilling the
+// callee's frame if `FILLS`, or else the JIT code does. The callee isn't vararg. See Note [Frame
+// ops].
+windowed!(frame PushFrame, [a: u16, b: u16, stack: u8], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
+    state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), A.lift(a), B.lift(b), stack, FILLS);
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
 
@@ -761,29 +761,32 @@ windowed!(frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, 
     state.tail_call(owner, a, b, CLOSES, VARARG);
 });
 
-// A `Ret` at `at` (a `PackedLocation`). `ab` is its `a | b << 16` (as `Count::hold` holds them),
-// and in the upper half, the id of what it returns (Note [Call continuations]); `effects` the
-// address of its function's effects, which it returns with the id (Note [Call effects]).
-// Closing upvalues if `CLOSES`, returning from a vararg function if `VARARG`.
-// See Note [Frame ops].
-windowed!(frame PopFrame, [at: u64, ab: u64, effects: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
-    let Location(BlockId(block), off) = Location::unpack(crate::vm::PackedLocation::from_bits(at as usize));
-    let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
-    // See Note [Call continuations].
-    let returned = || crate::vm::RETURNED | (unsafe { *(effects as *const u16) } as u64) << crate::vm::EFFECTS_SHIFT | ab >> 32;
-    state.exit = if state.jit_depth > 0 {
-        let _ = state.leave::<false>(owner, a, b, CLOSES, VARARG);
-        state.returned = returned();
-        state.returned
-    } else if state.callstack.is_empty() {
+// A `Ret` of R(A) and B (`a` and `b` as `Count::hold` holds them), returning `returns`, the id of
+// what it returns (Note [Call continuations]), with its function's effects, at the address
+// `effects` (Note [Call effects]); `at` (a `PackedLocation`) is where it is. Closing upvalues if
+// `CLOSES`, returning from a vararg function if `VARARG`. A return from a frame JIT code called
+// is the op; one from a frame with an entry, or the outermost, its cold path. See Note [Frame ops].
+windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+    if state.jit_depth > 0 {
+        let _ = state.leave::<false>(owner, A.lift(a), B.lift(b), CLOSES, VARARG);
+        // See Note [Call continuations].
+        state.returned = crate::vm::RETURNED | (unsafe { *(effects as *const u16) } as u64) << crate::vm::EFFECTS_SHIFT | returns as u64;
+        state.exit = state.returned;
+        false
+    } else {
+        true
+    }
+} rejoin {
+    state.exit = if state.callstack.is_empty() {
+        let Location(BlockId(block), off) = Location::unpack(crate::vm::PackedLocation::from_bits(at as usize));
         state.current_off = off as u16;
         ((-2i32 as u64) << 32) | block as u64
     } else {
-        match state.leave::<true>(owner, a, b, CLOSES, VARARG) {
+        match state.leave::<true>(owner, A.lift(a), B.lift(b), CLOSES, VARARG) {
             // See Note [Call continuations].
             Ok(Some(location)) => {
                 state.resume = location.pack().bits() as u64;
-                state.returned = returned();
+                state.returned = crate::vm::RETURNED | (unsafe { *(effects as *const u16) } as u64) << crate::vm::EFFECTS_SHIFT | returns as u64;
                 state.returned
             },
             // With a caller frame's entry, `leave` returns to it.

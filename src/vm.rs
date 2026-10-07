@@ -1911,7 +1911,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             witness_frame: self.witness_base,
             witness_top: self.witness_top,
         });
-        let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unreachable!() };
+        debug_assert!(matches!(self.vals[self.base + a].unbox(), LValue::LClosure(_)), "a call's frame of what isn't a Lua function");
+        // SAFETY: R(A) is a Lua function: the interpreter calls through this having found it is
+        // one, and JIT code past its call's version's guard of it.
+        let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unsafe { core::hint::unreachable_unchecked() } };
         debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "a call's frame size isn't its callee's");
         let next_stack = stack as usize;
         let next_base = self.base + a + 1;

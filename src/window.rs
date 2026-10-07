@@ -96,17 +96,17 @@ use crate::Owner;
 /// into rax even when rax carries an argument, and that load stays in the copy.
 pub const WINDOW: usize = 8;
 /// Number of hole statics available to captures.
-pub const MAX_HOLES: usize = 4;
+pub const MAX_HOLES: usize = 5;
 /// The hole past the captures' holes, whose value is the address of the site's
 /// record. See Note [Cold stencils].
 pub const SITE_HOLE: usize = MAX_HOLES;
 // `Captures` and `Regs` use literal lengths: with `generic_const_exprs` on, a named
 // const in a trait method signature makes `Window` dyn-incompatible.
 /// A window op's hole values.
-pub type Captures = SmallVec<[u64; 4]>;
+pub type Captures = SmallVec<[u64; 5]>;
 /// The register window's values.
 pub type Regs<'src, 'intern> = [LBoxed<'src, 'intern>; 8];
-const _: () = assert!(MAX_HOLES == 4 && WINDOW == 8);
+const _: () = assert!(MAX_HOLES == 5 && WINDOW == 8);
 
 // ---- holes / continuation / anchor ---------------------------------------
 
@@ -119,6 +119,8 @@ unsafe extern "C" {
     static __lunacy_hole2: *const ();
     #[linkage = "extern_weak"]
     static __lunacy_hole3: *const ();
+    #[linkage = "extern_weak"]
+    static __lunacy_hole4: *const ();
     /// The site hole: the address of the site's record, for its op's cold
     /// stencil. See Note [Cold stencils].
     #[linkage = "extern_weak"]
@@ -141,6 +143,7 @@ pub unsafe fn hole<const I: usize>() -> u64 {
             1 => __lunacy_hole1 as u64,
             2 => __lunacy_hole2 as u64,
             3 => __lunacy_hole3 as u64,
+            4 => __lunacy_hole4 as u64,
             SITE_HOLE => __lunacy_site as u64,
             _ => unresolved_window_hole__too_many_captures as u64,
         }
@@ -443,7 +446,8 @@ pub(crate) use bind_record;
 /// runs at `SKIP` 0 into an empty window, and after which the JIT code loads
 /// `base` again, if it needs it: its stencil takes only `state`, and passes on
 /// only `state`, so every other register is free for it, rather than kept for a
-/// window it has none of.
+/// window it has none of. It may have a `rejoin` block, whose body says whether
+/// to take it, as an op with operands may.
 macro_rules! windowed {
     (
         $(#[$meta:meta])*
@@ -455,6 +459,20 @@ macro_rules! windowed {
     ) => {
         $crate::window::windowed!(@sort
             [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [] __tag []]
+            [] [] [] (0usize)
+        );
+    };
+    (
+        $(#[$meta:meta])*
+        frame $name:ident,
+        [$($cap:ident : $cty:ty),* $(,)?],
+        [$($cp:ident : $cpt:ty),* $(,)?],
+        |$owner:ident, $state:ident, $base:ident| ()
+        $body:block
+        rejoin $rejoin:block
+    ) => {
+        $crate::window::windowed!(@sort
+            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [{ let () = $rejoin; 0 }] [rejoin] __tag []]
             [] [] [] (0usize)
         );
     };
@@ -1056,6 +1074,73 @@ macro_rules! windowed {
                 core::hint::black_box((state as *mut _, base, tag, w0, w1, w2, w3, w4, w5, w6, w7, x0, x1, x2, x3, x4, x5, x6, x7));
             }
     };
+    (@stencil frame, [$($cap:ident : $cty:ty),*] [$cold:block] [rejoin]) => {
+            /// The stencil, which only runs at `SKIP` 0.
+            fn __stencil_at(skip: usize) -> usize {
+                assert_eq!(skip, 0, "a frame op runs at SKIP 0");
+                Self::__stencil::<0> as *const () as usize
+            }
+
+            /// The stencil, at `SKIP` 0 into an empty window, branching into its
+            /// cold path as a window op's does: see `windowed!(frame ..)`, and
+            /// Note [Cold stencils].
+            pub extern "rust-preserve-none" fn __stencil<'b, 'src, 'intern, const SKIP: usize>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+            ) {
+                let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
+                let mut w = [$crate::lboxed::LBoxed::NIL; $crate::window::WINDOW];
+                $crate::window::bind_holes!(0; $($cap : $cty),*);
+                // The JIT lends this code the thread's owner. See `crate::forge_owner`.
+                let mut x = [0.0f64; $crate::window::WINDOW];
+                let taken = unsafe { Self::__window_taken($($cap,)* $crate::forge_owner(), &mut *state, base, $crate::lboxed::LBoxed::NUMBER_TAG, &mut w, &mut x, SKIP) };
+                if taken {
+                    become Self::__to_cold(state)
+                }
+                become Self::__next(state)
+            }
+
+            /// The continuation into the cold path, as a window op's.
+            #[inline(never)]
+            extern "rust-preserve-none" fn __to_cold<'b, 'src, 'intern>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+            ) {
+                // Unlike `__next`'s body, or LLVM merges the two.
+                core::hint::black_box((state as *mut _, 2u8));
+            }
+
+            /// The cold stencil, which only runs at `SKIP` 0.
+            fn __cold_at(skip: usize) -> usize {
+                assert_eq!(skip, 0, "a frame op runs at SKIP 0");
+                Self::__cold::<0> as *const () as usize
+            }
+
+            /// The cold stencil, shared by every copy, as a window op's: it takes
+            /// its captures from the site's record, and goes on where the record
+            /// has its exit go. See Note [Cold stencils].
+            #[inline(never)]
+            extern "rust-preserve-none" fn __cold<'b, 'src, 'intern, const SKIP: usize>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+            ) {
+                let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
+                let mut w = [$crate::lboxed::LBoxed::NIL; $crate::window::WINDOW];
+                let mut x = [0.0f64; $crate::window::WINDOW];
+                let site = state.cold_site;
+                $crate::window::bind_record!(site, 0; $($cap : $cty),*);
+                let exit = unsafe { Self::__window_cold($($cap,)* $crate::forge_owner(), &mut *state, base, $crate::lboxed::LBoxed::NUMBER_TAG, &mut w, &mut x, SKIP) };
+                // SAFETY: where the site's exit goes, in JIT code, which its copy
+                // continues to with only `state`, at the stack it jumped from.
+                let fall: extern "rust-preserve-none" fn(&'b mut $crate::vm::RunState<'src, 'intern>) = unsafe { core::mem::transmute(*site.add(exit)) };
+                become fall(state)
+            }
+
+            /// This op's `become` target, as for a window op's.
+            #[inline(never)]
+            extern "rust-preserve-none" fn __next<'b, 'src, 'intern>(
+                state: &'b mut $crate::vm::RunState<'src, 'intern>,
+            ) {
+                core::hint::black_box(state as *mut _);
+            }
+    };
     (@stencil frame, [$($cap:ident : $cty:ty),*] [] []) => {
             /// The stencil, which only runs at `SKIP` 0.
             fn __stencil_at(skip: usize) -> usize {
@@ -1190,6 +1275,7 @@ impl Image {
             "__lunacy_hole1" => Some(1),
             "__lunacy_hole2" => Some(2),
             "__lunacy_hole3" => Some(3),
+            "__lunacy_hole4" => Some(4),
             "__lunacy_site" => Some(SITE_HOLE),
             _ => None,
         };

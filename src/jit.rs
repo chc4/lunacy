@@ -2322,12 +2322,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // nilled here, a store a slot, but for a big one, which
                             // `PushFrame` nils, as it does past a count up to the top.
                             let packed_ret = Location(BlockId(id.0), off + 1).pack();
-                            let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
-                            let abs = hold(*a) | hold(*b) << 16 | (*stack as u64) << 32;
+                            let hold = crate::specialize::Count::hold;
+                            let (held_a, held_b) = (hold(*a), hold(*b));
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
                             let push = match nils {
-                                Some(_) => frame_op!(PushFrame [false,] (abs); *a, *b),
-                                None => frame_op!(PushFrame [true,] (abs); *a, *b),
+                                Some(_) => frame_op!(PushFrame [false,] (held_a, held_b, *stack); *a, *b),
+                                None => frame_op!(PushFrame [true,] (held_a, held_b, *stack); *a, *b),
                             };
                             jit_note!(self.jctx, ops, "        keep the caller's frame");
                             dynasm!(ops
@@ -2349,12 +2349,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; mov rcx, QWORD r12 => RunState.base
                                 ; lea r13, [rax + rcx * 8]
                             );
-                            let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
-                            for slot in nils.into_iter().flatten() {
-                                dynasm!(ops
-                                    ; .arch x64
-                                    ; mov QWORD [r13 + (slot * 8) as i32], nil
-                                );
+                            // Nil in rax once, free past the callee's base: each store of it, of
+                            // a slot near the base, is 4 bytes.
+                            let nils = nils.unwrap_or_default();
+                            if !nils.is_empty() {
+                                let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
+                                dynasm!(ops ; .arch x64 ; mov eax, nil);
+                            }
+                            for slot in nils {
+                                match i8::try_from(slot * 8) {
+                                    Ok(disp) => dynasm!(ops ; .arch x64 ; mov QWORD [BYTE r13 + disp], rax),
+                                    Err(_) => dynasm!(ops ; .arch x64 ; mov QWORD [DWORD r13 + (slot * 8) as i32], rax),
+                                }
                             }
                             // state is already in r12
                             match code {
@@ -2629,15 +2635,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // return (`RETURNED | effects << EFFECTS_SHIFT | id`), or for the
                     // outermost frame's, the exit. See Notes [Frame ops], [Call
                     // continuations] and [Call effects] in `specialize`.
-                    let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
+                    let hold = crate::specialize::Count::hold;
                     // With the id of what it returns. See Note [Call continuations] in `specialize`.
-                    let (at, ab) = (Location(BlockId(id.0), off).pack().bits() as u64, hold(*a as u16) | hold(*b) << 16 | (*returns as u64) << 32);
-                    let effects = *effects as u64;
+                    let (held_a, held_b, returns) = (hold(*a as u16), hold(*b), *returns);
+                    let (effects, at) = (*effects as u64, Location(BlockId(id.0), off).pack().bits() as u64);
                     let pop = match (*closes, *vararg) {
-                        (false, false) => frame_op!(PopFrame [false, false,] (at, ab, effects); *a as u16, *b),
-                        (false, true) => frame_op!(PopFrame [false, true,] (at, ab, effects); *a as u16, *b),
-                        (true, false) => frame_op!(PopFrame [true, false,] (at, ab, effects); *a as u16, *b),
-                        (true, true) => frame_op!(PopFrame [true, true,] (at, ab, effects); *a as u16, *b),
+                        (false, false) => frame_op!(PopFrame [false, false,] (held_a, held_b, returns, effects, at); *a as u16, *b),
+                        (false, true) => frame_op!(PopFrame [false, true,] (held_a, held_b, returns, effects, at); *a as u16, *b),
+                        (true, false) => frame_op!(PopFrame [true, false,] (held_a, held_b, returns, effects, at); *a as u16, *b),
+                        (true, true) => frame_op!(PopFrame [true, true,] (held_a, held_b, returns, effects, at); *a as u16, *b),
                     };
                     jit_note!(self.jctx, ops, "        PopFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &pop);
