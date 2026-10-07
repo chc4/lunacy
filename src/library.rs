@@ -6,7 +6,6 @@ use std::cell::{Cell, RefCell};
 use std::io::Write;
 
 use indexmap::IndexMap;
-use smallvec::{smallvec, SmallVec};
 
 use crate::gc::Gc;
 use crate::lboxed::LBoxed;
@@ -143,14 +142,16 @@ macro_rules! native {
     };
     (@fn $owner:ident, $args:ident, $body:expr) => {
         |mut seq, args, returns, $owner| {
-            let $args: SmallVec<[LBoxed<'_, '_>; 8]> = SmallVec::from_slice(args.ro(&seq));
-            let results: SmallVec<[LBoxed<'_, '_>; 4]> = $body;
+            // The arguments in place on the stack, read before the results are written.
+            let $args: &[LBoxed<'_, '_>] = args.ro(&seq);
+            let mut results: Vec<LBoxed<'_, '_>> = $body;
             let _ = &$owner;
             let returns = returns.rw(&mut seq);
-            for (slot, &result) in returns.iter_mut().zip(results.iter()) {
+            let count = results.len().min(returns.len());
+            for (slot, result) in returns.iter_mut().zip(results.drain(..)) {
                 *slot = result;
             }
-            Ok(results.len().min(returns.len()))
+            Ok(count)
         }
     };
 }
@@ -277,7 +278,7 @@ fn format(fmt: &[u8], args: &[LBoxed]) -> Vec<u8> {
 pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
     macro_rules! math1 {
         ($op:ident) => {
-            native!(pure window: math1_window::<$op>, |owner, args| smallvec![math1_boxed::<$op>(number(arg(&args, 0)))])
+            native!(pure window: math1_window::<$op>, |owner, args| vec![math1_boxed::<$op>(number(arg(&args, 0)))])
         };
     }
     vec![
@@ -293,7 +294,7 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
             // A whole number from a range, in the integer encoding where an i32
             // holds it: the code using it computes on an integer. See Note
             // [Narrowing] in `specialize`.
-            smallvec![match args.len() {
+            vec![match args.len() {
                 0 => LBoxed::from_double(r),
                 1 => LBoxed::from_number((r * number(args[0]).floor()).floor() + 1.0),
                 _ => {
@@ -305,10 +306,10 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
         ("randomseed", native!(pure |owner, args| {
             // Never zero, which xorshift stays at.
             RANDOM.with(|state| state.set(number(arg(&args, 0)).to_bits() ^ 0x9e37_79b9_7f4a_7c15 | 1));
-            smallvec![]
+            vec![]
         })),
-        ("max", native!(pure |owner, args| smallvec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::NEG_INFINITY, f64::max))])),
-        ("min", native!(pure |owner, args| smallvec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::INFINITY, f64::min))])),
+        ("max", native!(pure |owner, args| vec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::NEG_INFINITY, f64::max))])),
+        ("min", native!(pure |owner, args| vec![LBoxed::from_double(args.iter().map(|&v| number(v)).fold(f64::INFINITY, f64::min))])),
     ]
 }
 
@@ -450,8 +451,8 @@ unsafe fn checked_number(v: LBoxed) -> f64 {
     n
 }
 
-fn bit_result<'s, 'i>(x: i32) -> SmallVec<[LBoxed<'s, 'i>; 4]> {
-    smallvec![LBoxed::from_int(x)]
+fn bit_result<'s, 'i>(x: i32) -> Vec<LBoxed<'s, 'i>> {
+    vec![LBoxed::from_int(x)]
 }
 
 // The bit operations, by the `OP` of their window ops.
@@ -561,10 +562,10 @@ fn module_table<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&
 
 /// The library's globals, by name, to install in the global table.
 pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'s, 'i>, LValue<'s, 'i>)> {
-    let type_ = native!(pure |owner, args| smallvec![string(type_name(arg(&args, 0)).to_vec())]);
+    let type_ = native!(pure |owner, args| vec![string(type_name(arg(&args, 0)).to_vec())]);
     let tostring = native!(pure |owner, args| {
         let s = arg(&args, 0).unbox().as_string(owner).expect("a string form");
-        smallvec![LBoxed::box_lvalue(LValue::OwnedString(s))]
+        vec![LBoxed::box_lvalue(LValue::OwnedString(s))]
     });
     let tonumber = native!(pure |owner, args| {
         let v = arg(&args, 0);
@@ -581,19 +582,19 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             }
             _ => None,
         };
-        smallvec![parsed.map_or(LBoxed::NIL, LBoxed::from_double)]
+        vec![parsed.map_or(LBoxed::NIL, LBoxed::from_double)]
     });
 
     // Indexing a string reads it, through caches. See Note [String methods] in
     // `specialize`.
     let string_lib = module_table(intern, vec![
-        ("lower", native!(pure |owner, args| smallvec![string(arg_bytes(&args, 0).to_ascii_lowercase())])),
-        ("upper", native!(pure |owner, args| smallvec![string(arg_bytes(&args, 0).to_ascii_uppercase())])),
-        ("len", native!(pure |owner, args| smallvec![LBoxed::from_int(arg_bytes(&args, 0).len() as i32)])),
+        ("lower", native!(pure |owner, args| vec![string(arg_bytes(&args, 0).to_ascii_lowercase())])),
+        ("upper", native!(pure |owner, args| vec![string(arg_bytes(&args, 0).to_ascii_uppercase())])),
+        ("len", native!(pure |owner, args| vec![LBoxed::from_int(arg_bytes(&args, 0).len() as i32)])),
         ("sub", native!(pure |owner, args| {
             let s = arg_bytes(&args, 0);
             let range = span(s.len(), number_or(arg(&args, 1), 1.0), number_or(arg(&args, 2), -1.0));
-            smallvec![string(s[range].to_vec())]
+            vec![string(s[range].to_vec())]
         })),
         ("byte", native!(pure |owner, args| {
             let s = arg_bytes(&args, 0);
@@ -601,30 +602,30 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             let range = span(s.len(), i, number_or(arg(&args, 2), i));
             s[range].iter().map(|&b| LBoxed::from_int(b as i32)).collect()
         })),
-        ("char", native!(pure |owner, args| smallvec![string(args.iter().map(|&b| number(b) as u8).collect())])),
+        ("char", native!(pure |owner, args| vec![string(args.iter().map(|&b| number(b) as u8).collect())])),
         ("rep", native!(pure |owner, args| {
             let s = arg_bytes(&args, 0);
             let n = number(arg(&args, 1)).max(0.0) as usize;
             let out = s.repeat(n);
-            smallvec![string(out)]
+            vec![string(out)]
         })),
-        ("format", native!(pure |owner, args| smallvec![string(format(&arg_bytes(&args, 0), args.get(1..).unwrap_or(&[])))])),
+        ("format", native!(pure |owner, args| vec![string(format(&arg_bytes(&args, 0), args.get(1..).unwrap_or(&[])))])),
         // See Note [Patterns] in `patterns`.
         ("find", native!(pure |owner, args| {
             let (s, p) = (arg_bytes(&args, 0), arg_bytes(&args, 1));
             let init = init(s.len(), arg(&args, 2));
             if arg(&args, 3).truthy() || !patterns::has_specials(&p) {
                 match patterns::find_plain(&s[init..], &p) {
-                    Some(at) => smallvec![LBoxed::from_int((init + at + 1) as i32), LBoxed::from_int((init + at + p.len()) as i32)],
-                    None => smallvec![LBoxed::NIL],
+                    Some(at) => vec![LBoxed::from_int((init + at + 1) as i32), LBoxed::from_int((init + at + p.len()) as i32)],
+                    None => vec![LBoxed::NIL],
                 }
             } else {
                 let found = patterns::find(&s, &p, init, |found| {
-                    let mut results: SmallVec<[LBoxed<'_, '_>; 4]> = smallvec![LBoxed::from_int(found.range.start as i32 + 1), LBoxed::from_int(found.range.end as i32)];
+                    let mut results: Vec<LBoxed<'_, '_>> = vec![LBoxed::from_int(found.range.start as i32 + 1), LBoxed::from_int(found.range.end as i32)];
                     results.extend(found.explicit()?.into_iter().map(|c| capture(&s, c)));
                     Ok(results)
                 });
-                found.map_err(error_value)?.unwrap_or_else(|| smallvec![LBoxed::NIL])
+                found.map_err(error_value)?.unwrap_or_else(|| vec![LBoxed::NIL])
             }
         })),
         ("match", native!(pure |owner, args| {
@@ -632,7 +633,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             let found = patterns::find(&s, &p, init(s.len(), arg(&args, 2)), |found| {
                 Ok(found.captures()?.into_iter().map(|c| capture(&s, c)).collect())
             });
-            found.map_err(error_value)?.unwrap_or_else(|| smallvec![LBoxed::NIL])
+            found.map_err(error_value)?.unwrap_or_else(|| vec![LBoxed::NIL])
         })),
         ("gsub", native!(pure |owner, args| {
             let (s, p, replacement) = (arg_bytes(&args, 0), arg_bytes(&args, 1), arg(&args, 2));
@@ -659,7 +660,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                 _ => return Err(error_value("bad argument #3 to 'gsub' (string/function/table expected)".into())),
             };
             let (out, n) = replaced.map_err(error_value)?;
-            smallvec![string(out), LBoxed::from_int(n as i32)]
+            vec![string(out), LBoxed::from_int(n as i32)]
         })),
     ], true);
 
@@ -672,7 +673,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             kind: 0,
             metatable: None,
         };
-        smallvec![LBoxed::box_lvalue(LValue::Table(Tc::new(t)))]
+        vec![LBoxed::box_lvalue(LValue::Table(Tc::new(t)))]
     });
     let table_clear = native!(|owner, args| {
         let t = table(arg(&args, 0));
@@ -681,7 +682,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         t.kind = 0;
         t.clear_hash();
         t.epoch += 1;
-        smallvec![]
+        vec![]
     });
     let table_lib = module(intern, vec![
         ("new", table_new.clone()),
@@ -709,7 +710,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                 }
                 t.set_number(owner, pos as f64, value);
             }
-            smallvec![]
+            vec![]
         })),
         ("remove", native!(|owner, args| {
             let t = table(arg(&args, 0));
@@ -719,9 +720,9 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                 let removed = tab.array.remove(at - 1);
                 // See Note [Array length].
                 tab.trim();
-                smallvec![removed]
+                vec![removed]
             } else {
-                smallvec![]
+                vec![]
             }
         })),
         ("concat", native!(pure |owner, args| {
@@ -736,20 +737,20 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
                 }
                 out.extend_from_slice(&bytes(&item));
             }
-            smallvec![string(out)]
+            vec![string(out)]
         })),
     ]);
 
     let io_lib = module(intern, vec![
         ("write", native!(pure |owner, args| {
             let mut out = std::io::stdout().lock();
-            for &v in &args {
+            for &v in args {
                 out.write_all(&bytes(&v)).expect("writing stdout");
             }
-            smallvec![]
+            vec![]
         })),
         // The benchmarks' `io.write` that discards its output.
-        ("write_devnull", native!(pure |owner, args| smallvec![])),
+        ("write_devnull", native!(pure |owner, args| vec![])),
     ]);
 
     let bit_lib = module(intern, vec![
@@ -784,7 +785,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             _ => Err(()),
         };
         match metatable {
-            Ok(metatable) => smallvec![LBoxed::box_lvalue(LValue::Userdata(Tc::new(Userdata::new(metatable))))],
+            Ok(metatable) => vec![LBoxed::box_lvalue(LValue::Userdata(Tc::new(Userdata::new(metatable))))],
             Err(()) => return Err(error_value("bad argument #1 to 'newproxy' (boolean or proxy expected)".into())),
         }
     });
@@ -808,7 +809,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         t.barrier_back();
         t.rw(owner).metatable = metatable;
         t.rw(owner).epoch += 1;
-        smallvec![arg(&args, 0)]
+        vec![arg(&args, 0)]
     });
     // Lua's `getmetatable`: a table's or a userdata's metatable, or its
     // `__metatable` field if it has one. A string has none here: its fields are the
@@ -819,7 +820,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             LValue::Userdata(u) => u.ro(owner).metatable().cloned(),
             _ => None,
         };
-        smallvec![match metatable {
+        vec![match metatable {
             Some(mt) => match mt.get_string(owner, b"__metatable") {
                 protected if protected.bits() != LBoxed::NIL.bits() => protected,
                 _ => LBoxed::box_lvalue(LValue::Table(mt)),
@@ -842,7 +843,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let found = MODULES.with_borrow(|modules| modules.iter().find(|(m, _)| m.as_bytes() == name).map(|(_, v)| *v));
         let Some(module) = found else { panic!("require: no built-in module {:?}", String::from_utf8_lossy(&name)) };
         // SAFETY: the value is alive, held by the global table; see `MODULES`.
-        smallvec![unsafe { std::mem::transmute::<LBoxed<'static, 'static>, LBoxed<'_, '_>>(module) }]
+        vec![unsafe { std::mem::transmute::<LBoxed<'static, 'static>, LBoxed<'_, '_>>(module) }]
     });
 
     let erase = |v: &LValue<'s, 'i>| {
