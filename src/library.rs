@@ -406,11 +406,16 @@ fn math1<const OP: u8>(x: f64) -> f64 {
     }
 }
 
-/// `math1::<OP>`'s result, a double like every number a native computes. See
-/// Note [Integers] in `specialize`.
+/// `math1::<OP>`'s result, a double like every number a native computes, but
+/// floor's and ceil's: a whole number, in the integer encoding where an i32
+/// holds it, so the code using it computes on an integer. See Note [Narrowing]
+/// in `specialize`.
 #[inline(always)]
 fn math1_boxed<'s, 'i, const OP: u8>(x: f64) -> LBoxed<'s, 'i> {
-    LBoxed::from_double(math1::<OP>(x))
+    match OP {
+        FLOOR | CEIL => LBoxed::from_number(math1::<OP>(x)),
+        _ => LBoxed::from_double(math1::<OP>(x)),
+    }
 }
 
 crate::window::windowed!(MathUnary, [], [OP: u8, X: bool], |owner, state, base| (x, out r) {
@@ -430,7 +435,10 @@ fn math1_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option
     } else {
         std::rc::Rc::new(MathUnary::<OP, false>::new(&operands))
     };
-    let result = crate::specialize::CType::Type(LType::Double);
+    let result = match OP {
+        FLOOR | CEIL => crate::specialize::CType::Number,
+        _ => crate::specialize::CType::Type(LType::Double),
+    };
     Some(NativeOp { window, args: crate::specialize::CType::Number, result })
 }
 
