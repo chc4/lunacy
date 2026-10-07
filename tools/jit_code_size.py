@@ -7,6 +7,8 @@ residuals (region prologues, window loads, constant pools) by what it does.
     jit_code_size.py [working/jit_disasm.txt] [--top N] [--function LINE]
 
 `--function` counts only the code of the function defined at that line.
+`--by-pc` also prints, per function and pc, how many blocks the JIT emitted
+there and their bytes.
 """
 import argparse
 import re
@@ -26,6 +28,7 @@ def main():
     ap.add_argument('disasm', nargs='?', default='working/jit_disasm.txt')
     ap.add_argument('--top', type=int, default=20)
     ap.add_argument('--function', help="only the function defined at this line")
+    ap.add_argument('--by-pc', action='store_true', help='blocks and bytes per function and pc')
     args = ap.parse_args()
 
     by_function, by_block, by_kind, uses, blocks_of = Counter(), Counter(), Counter(), Counter(), {}
@@ -72,6 +75,14 @@ def main():
     for k, n in by_kind.most_common(args.top):
         each = f'  {uses[k]} uses, {n / uses[k]:.0f} bytes each' if uses[k] else ''
         print(f'  {n:>7} bytes {100 * n / total:5.1f}%  {k}{each}')
+    if args.by_pc:
+        print('\nby pc (function, pc: blocks, bytes):')
+        per_pc = {}
+        for (f, _, pc), n in by_block.items():
+            blocks, size = per_pc.get((f, pc), (0, 0))
+            per_pc[(f, pc)] = (blocks + 1, size + n)
+        for (f, pc), (blocks, size) in sorted(per_pc.items(), key=lambda item: (item[0][0], int(item[0][1]))):
+            print(f'  :{f} pc {pc:>4}: {blocks:>3} blocks {size:>6} bytes')
     print(f'\nlargest blocks (function, block, pc):')
     for b, n in by_block.most_common(args.top):
         print(f'  {n:>7} bytes  :{b[0]} block {b[1]} pc {b[2]}')

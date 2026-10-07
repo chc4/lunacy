@@ -8,8 +8,11 @@ from each.
 
 With `--live`, instead the versions each run has at its end (`block_summary`),
 per function and pc: how many each has, and the contexts only one of them has.
+`--lines OLD:NEW,...` compares the function at line OLD of the old trace as
+the one at line NEW of the new, for a function the two runs load from
+different places.
 
-    version_diff.py OLD.fxt NEW.fxt [--context N] [--live]
+    version_diff.py OLD.fxt NEW.fxt [--context N] [--live [--lines OLD:NEW,...]]
 """
 import argparse
 import re
@@ -31,19 +34,20 @@ def events(path):
     return sorted(versions + contracts, key=lambda e: e[0])
 
 
-def live(path):
+def live(path, lines=None):
     tp = TraceProcessor(trace=path, config=TraceProcessorConfig(bin_path=shutil.which('trace_processor_shell')))
     rows = tp.query("SELECT EXTRACT_ARG(arg_set_id, 'line') AS line, EXTRACT_ARG(arg_set_id, 'pc') AS pc, "
                     "EXTRACT_ARG(arg_set_id, 'context') AS context FROM slice "
                     "WHERE category = 'spec' AND name = 'block_summary' AND EXTRACT_ARG(arg_set_id, 'line') != 0")
     versions = {}
     for r in rows:
-        versions.setdefault((r.line, r.pc), []).append(re.sub(r'0x[0-9a-f]+', '0x_', r.context))
+        line = lines.get(r.line, r.line) if lines else r.line
+        versions.setdefault((line, r.pc), []).append(re.sub(r'0x[0-9a-f]+', '0x_', r.context))
     return versions
 
 
 def compare_live(old, new):
-    for at in sorted(set(old) | set(new)):
+    for at in sorted(set(old) | set(new), key=lambda at: (str(at[0]), at[1])):
         o, n = sorted(old.get(at, [])), sorted(new.get(at, []))
         if o == n:
             continue
@@ -62,9 +66,13 @@ def main():
     ap.add_argument('new')
     ap.add_argument('--context', type=int, default=6)
     ap.add_argument('--live', action='store_true')
+    ap.add_argument('--lines', help='OLD:NEW,... line pairs naming one function in each trace')
     args = ap.parse_args()
     if args.live:
-        compare_live(live(args.old), live(args.new))
+        pairs = [pair.split(':') for pair in args.lines.split(',')] if args.lines else []
+        old_lines = {int(o): f'{o}:{n}' for o, n in pairs}
+        new_lines = {int(n): f'{o}:{n}' for o, n in pairs}
+        compare_live(live(args.old, old_lines), live(args.new, new_lines))
         return
     old, new = events(args.old), events(args.new)
     key = lambda e: e[1:4] + (re.sub(r'0x[0-9a-f]+', '0x_', e[5]),)

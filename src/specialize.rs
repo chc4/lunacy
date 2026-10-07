@@ -2921,12 +2921,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         for (id, block) in self.blocks.iter().enumerate() {
             let context = block.context.as_ref().map(|c| c.tostring(owner)).unwrap_or_default();
+            let ids = |id: fn(&Residual) -> Option<u64>| block.instructions.iter().filter_map(id).map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+            let returns = ids(|residual| match residual { Residual::Ret(_, _, _, _, _, id, _) => Some(*id as u64), _ => None });
+            let returned_from = ids(|residual| match residual { Residual::ReturnedFrom(from) => Some(from & UNKNOWN_RETURN as u64), _ => None });
             let mut args: Vec<(&str, crate::tracing::TraceValue)> = vec![
                 ("block", id.into()),
                 ("line", lines.get(&BlockId(id)).copied().unwrap_or(0).into()),
                 ("pc", block.pc.into()),
                 ("residuals", block.instructions.len().into()),
                 ("context", context.as_str().into()),
+                ("returns", returns.as_str().into()),
+                ("returned_from", returned_from.as_str().into()),
+                ("unreachable", (self.unreachable.contains(&BlockId(id)) as u64).into()),
             ];
             #[cfg(feature = "jit")]
             {
