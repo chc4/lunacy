@@ -384,6 +384,10 @@ crate::window::windowed!(guard InArrayK, [k: i32], [], |owner, state, base| (tab
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(k) < tab.ro(owner).array.len()
 });
+// Whether an integer is `k`: a promote's guard. See Note [Green values] in `specialize`.
+crate::window::windowed!(guard EqualsK, [k: i32], [], |owner, state, base| (value) {
+    value.as_int() == k
+});
 // And whether the element there isn't nil.
 crate::window::windowed!(guard InArrayHeld, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };

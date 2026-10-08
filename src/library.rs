@@ -666,6 +666,29 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
 /// `string.byte`'s generator: for `byte(s, i, j)` keeping one to four results, of a string and
 /// integer positions, its results read where they are in range, as integers; any other call is
 /// the native's. See Note [Native generators].
+/// `jit.promote`'s generator: for `promote(v)` keeping one result, of an integer (a whole double
+/// narrowed), `v` promoted, its value moved into the result's slot; any other call is the
+/// native's, which returns its argument. See Note [Green values] in `specialize`.
+fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp, PROMOTE_VALUES};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 2 && c == 2 {
+            yield YieldOp::Narrow(a + 1);
+            if (yield YieldOp::Guard(a + 1, LType::Integer)) == ResumeArg::Matched {
+                for _ in 0..PROMOTE_VALUES {
+                    if let ResumeArg::Integer(_) = (yield YieldOp::Promote(a + 1)) {
+                        yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::Move::new(&[a + 1, a])));
+                        yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
+                        return ResumeArg::Start;
+                    }
+                }
+            }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
 fn byte_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     use crate::window::Window;
@@ -1000,6 +1023,13 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         // SAFETY: only the lifetimes change; see `MODULES`.
         unsafe { std::mem::transmute::<LBoxed<'s, 'i>, LBoxed<'static, 'static>>(boxed) }
     };
+    // `jit.promote(v)`: `v`, and the code after it specialized to its value. See Note [Green
+    // values] in `specialize`. A global only: `require("jit")` is LuaJIT's, which code
+    // probes for.
+    let jit_lib = module(intern, vec![
+        ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
+    ]);
+
     MODULES.with_borrow_mut(|modules| {
         *modules = vec![("bit", erase(&bit_lib)), ("table.new", erase(&table_new)), ("table.clear", erase(&table_clear))];
     });
@@ -1019,5 +1049,6 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "table"), table_lib),
         (InternString::intern(intern, "io"), io_lib),
         (InternString::intern(intern, "bit"), bit_lib),
+        (InternString::intern(intern, "jit"), jit_lib),
     ]
 }

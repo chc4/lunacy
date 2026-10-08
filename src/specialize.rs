@@ -235,6 +235,8 @@ pub enum YieldOp {
                               // CONSTANT[idx] is of the expected CType
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
+    Promote(usize), // Resumed with Integer(v) where STACK[idx], an integer, is guarded equal to v,
+                    // the path then green with v, or Failed where it isn't. See Note [Green values]
     OptimisticExec(Rc<dyn Window>), // An op with a cold path, which selects 0 on its hot path and
                                     // 1 on its cold. Resumed with Matched on the hot path, and
                                     // Failed on the cold. See Note [Optimistic ops]
@@ -1673,6 +1675,12 @@ fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected
 
 /// The versions of a pc before jumps to it reuse one. See Note [Version compatibility].
 const MAX_VERSIONS: usize = 3;
+/// The values one version of a promote tests before it returns its argument
+/// unspecialized. See Note [Green values].
+pub const PROMOTE_VALUES: usize = 8;
+/// The values a promote has versions for, past which it promotes no other.
+/// See Note [Green values].
+const PROMOTE_GREENS: usize = 512;
 /// The versions of a pc, or of a point in its instruction, past which
 /// specialization panics. See Note [Version compatibility].
 const HARD_MAX_VERSIONS: usize = 16;
@@ -1689,7 +1697,38 @@ pub struct Context {
     pub fragile: SmallVec<[Fact; 2]>,
     /// The inlined call whose callee's frame this is, if it is one. See Note [Inlined calls].
     pub inline: Option<Rc<InlineFrame>>,
+    /// The value each promote this path last passed through promoted, by the
+    /// promote's pc, in pc order. See Note [Green values].
+    pub greens: SmallVec<[(Pc, i32); 2]>,
 }
+
+// Note [Green values]
+// ~~~~~~~~~~~~~~~~~~~~
+// `jit.promote(v)` returns `v`, and specializes the code after it to `v`'s value, as a meta-tracer's
+// green variables do: an interpreter written in Lua promotes its program counter and the
+// instruction there, and its dispatch loop's code is compiled once per guest instruction, the
+// guest's control flow its edges.
+//
+// A promote ends its block in a thunk. Forced, it guards its argument equal to the integer it holds
+// then (`EqualsK`), and the code past the guard is a version for that value: the context records
+// it in `greens`, by the promote's pc. The guard's other way promotes again, so a site seeing
+// several values tests them in turn, up to `PROMOTE_VALUES`, past which it returns its argument
+// unspecialized. A promote whose argument the context knows is a constant needs no guard.
+//
+// A site's values are bounded too: it has versions for the first `PROMOTE_GREENS` values it sees,
+// and returns any other unspecialized. Code past a promote is compiled once per value, so
+// promoting what takes many values, as a loop's counter, costs a version per value up to there;
+// an interpreter's program counter takes one per guest instruction.
+//
+// A green isn't a fact about a slot: it says which value the path's last pass through a promote
+// had, and holds until the path passes through it again, whatever is written since. So it is
+// part of a version's identity, as an inlined frame is (`same_point`): versions with different
+// greens are never compared, joined or counted together, and `MAX_VERSIONS` bounds each green's
+// versions apart. That is what makes a loop over an interpreter's instructions one per guest
+// instruction: the loop's back edge, though it overwrote the promoted program counter, still
+// carries the green of the instruction just run, so the loop's head has a version per guest
+// instruction, and the promote there tests only the values seen after that instruction, most
+// often one. Greens are per activation: a function's entry has none.
 
 // Note [Array kinds]
 // ~~~~~~~~~~~~~~~~~~
@@ -2160,14 +2199,31 @@ impl Context {
             top: None,
             fragile: SmallVec::new(),
             inline: None,
+            greens: SmallVec::new(),
+        }
+    }
+
+    /// Whether `self` and `other` are at the same point of the code: in the same
+    /// inlined call, past the same promoted values. Versions at different points
+    /// are never compared. See Note [Green values].
+    fn same_point(&self, other: &Context) -> bool {
+        self.inline == other.inline && self.greens == other.greens
+    }
+
+    /// The path's green for the promote at `site`, now `value`. See Note [Green values].
+    fn green(&mut self, site: Pc, value: i32) {
+        match self.greens.binary_search_by_key(&site, |&(at, _)| at) {
+            Ok(i) => self.greens[i].1 = value,
+            Err(i) => self.greens.insert(i, (site, value)),
         }
     }
 
     fn tostring(&self, owner: &Owner) -> String {
-        format!("context([{}], hkeys: {}, fragile: {:?})",
+        format!("context([{}], hkeys: {}, fragile: {:?}{})",
             self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
             self.hkeys.iter().map(|hk| hk.tostring(owner)).intersperse(",".to_string()).collect::<String>(),
             self.fragile,
+            if self.greens.is_empty() { String::new() } else { format!(", greens: {:?}", self.greens) },
         )
     }
 
@@ -2304,7 +2360,7 @@ impl Context {
 
     /// Whether `self` and `other` differ at most in fragile information.
     fn alike(&self, other: &Context) -> bool {
-        self.types == other.types && self.hkeys == other.hkeys && self.top == other.top && self.inline == other.inline
+        self.types == other.types && self.hkeys == other.hkeys && self.top == other.top && self.same_point(other)
     }
 
     /// The type of slot `idx`: unknown past the end.
@@ -2315,7 +2371,7 @@ impl Context {
     /// Whether a block specialized to `self` is correct in `other`. See Note
     /// [Version compatibility].
     fn accepts(&self, other: &Context) -> bool {
-        self.inline == other.inline && self.hkeys.iter().enumerate().all(|(i, hkey)| {
+        self.same_point(other) && self.hkeys.iter().enumerate().all(|(i, hkey)| {
             hkey.orphan() || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
         })
             && (self.top.is_none() || self.top == other.top)
@@ -2627,6 +2683,8 @@ pub struct Specializer<'src, 'intern> {
     /// Each function's calls a continuation inlined, by the call's point and the callee: the
     /// entry contexts it decided on. See Note [Inlined calls].
     inlined: HashMap<(LProto<'src, 'intern>, SubPc, LProto<'src, 'intern>), Vec<Context>, rustc_hash::FxBuildHasher>,
+    /// Each promote's values that have versions, by its function and pc. See Note [Green values].
+    promoted: HashMap<(LProto<'src, 'intern>, Pc), std::collections::HashSet<i32, rustc_hash::FxBuildHasher>, rustc_hash::FxBuildHasher>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -2661,6 +2719,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             trimming: Vec::new(),
             rebuilt: Default::default(),
             decided: Default::default(),
+            promoted: Default::default(),
             inlined: Default::default(),
             unreachable: Default::default(),
             #[cfg(feature = "jit")]
@@ -2726,7 +2785,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ectx.clone().adopt(owner, &ctx);
             return exists;
         }
-        let count: Vec<_> = self.versions.get(&self.proto).unwrap().iter().filter(|((epc, ty), block)| *epc == pc && ty.inline == ctx.inline).collect();
+        let count: Vec<_> = self.versions.get(&self.proto).unwrap().iter().filter(|((epc, ty), block)| *epc == pc && ty.same_point(&ctx)).collect();
         if count.len() >= HARD_MAX_VERSIONS {
             panic!("too many versions: {:#?}", count);
         }
@@ -2773,13 +2832,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.unreachable.remove(&exists);
             return (exists, "exact", None);
         }
-        if self.versions_at(owner, subpc, &ctx.inline) >= MAX_VERSIONS {
+        if self.versions_at(owner, subpc, &ctx) >= MAX_VERSIONS {
             self.evict(owner, subpc);
         }
         let versions = self.versions.get(&self.proto).unwrap();
         let existing: Vec<(Rc<Context>, BlockId)> = versions
             .iter()
-            .filter(|((epc, ectx), _)| *epc == subpc && ectx.inline == ctx.inline)
+            .filter(|((epc, ectx), _)| *epc == subpc && ectx.same_point(&ctx))
             .map(|((_, ectx), block)| (ectx.clone(), *block))
             .collect();
         // Versions differing only in fragile information are, kind by kind of
@@ -2849,10 +2908,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         (self.block(owner, pc, joined.clone()), "joined-new", Some(joined))
     }
 
-    /// How many versions the running function has at `pc` for the inlined call `inline`, or for
-    /// its calls. See Note [Inlined calls].
-    fn versions_at(&self, owner: &Owner, pc: SubPc, inline: &Option<Rc<InlineFrame>>) -> usize {
-        self.versions.get(&self.proto).map_or(0, |versions| versions.keys().filter(|(at, ctx)| *at == pc && ctx.inline == *inline).count())
+    /// How many versions the running function has at `pc` at the same point as `ctx`: for its
+    /// inlined call, or for its calls, past its greens. See Notes [Inlined calls] and [Green
+    /// values].
+    fn versions_at(&self, owner: &Owner, pc: SubPc, ctx: &Context) -> usize {
+        self.versions.get(&self.proto).map_or(0, |versions| versions.keys().filter(|(at, ectx)| *at == pc && ectx.same_point(ctx)).count())
     }
 
     /// Forget the versions at `pc` of the running function the trimming found unreachable, which
@@ -2931,7 +2991,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut conflicting: SmallVec<[(u8, usize); 2]> = SmallVec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         for ((epc, ectx), _block) in self.versions.get(&proto).unwrap() {
-            if *epc != pc || ectx.inline != ctx.inline {
+            if *epc != pc || !ectx.same_point(&ctx) {
                 continue;
             }
             // A version whose slot holding a constant holds another type here: the constant is
@@ -3210,7 +3270,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// how many of the requested context's shapes the join lost.
     #[cfg(feature = "tracing")]
     fn trace_version(&self, owner: &Owner, pc: Pc, requested: &Context, block: BlockId, outcome: &str, joined: Option<&Context>) {
-        let versions = self.versions_at(owner, SubPc::new(pc), &requested.inline);
+        let versions = self.versions_at(owner, SubPc::new(pc), requested);
         let context = requested.tostring(owner);
         let joined_context = joined.map(|j| j.tostring(owner)).unwrap_or_default();
         let shapes_dropped = joined.map_or(0, |j| {
@@ -3605,6 +3665,45 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
             vm.blocks[block.0].instructions.push(fail);
             vm.blocks[block.0].instructions.push(pass);
+        })))
+    }
+
+    /// Whether the promote at `site` of the running function has, or may have, a version for
+    /// `value`: one of the first `PROMOTE_GREENS` values it sees. See Note [Green values].
+    fn promotes(&mut self, site: Pc, value: i32) -> bool {
+        let values = self.promoted.entry((self.proto, site)).or_default();
+        values.contains(&value) || (values.len() < PROMOTE_GREENS && values.insert(value))
+    }
+
+    /// The thunk a `Promote` of `slot` ends its block in: forced, it guards the
+    /// slot equal to the integer it holds, and continues past the guard green
+    /// with it, the guard's other way promoting again. See Note [Green values].
+    fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let LValue::Integer(value) = state.vals[state.base + slot].unbox() else { unreachable!("a promote's argument is an integer") };
+            if !vm.promotes(pc.0, value) {
+                let rest = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
+                vm.jump_thunk(block_id, thunk_pc, rest);
+                return;
+            }
+            let test: Rc<dyn Window> = Rc::new(crate::generators::EqualsK::new(value, &[slot]));
+            // In place, unless the thunk's JIT code can only be patched to a jump.
+            // See Note [Thunk patching].
+            let block = if vm.compiled(block_id) {
+                let guard_block = vm.new_block(pc.0);
+                vm.jump_thunk(block_id, thunk_pc, guard_block);
+                vm.blocks[guard_block.0].instructions.push(Residual::GuardDynamic(test));
+                guard_block
+            } else {
+                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test);
+                block_id
+            };
+            let mut green = thunk_ctx.clone();
+            Rc::make_mut(&mut green).green(pc.0, value);
+            let pass = vm.subblock(owner, pc.next_true(), green, thunk_coro.clone(), ResumeArg::Integer(value));
+            let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
+            vm.blocks[block.0].instructions.push(Residual::Thunk(fail));
+            vm.blocks[block.0].instructions.push(Residual::Jump(pass));
         })))
     }
 
@@ -4889,6 +4988,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Decided(passed)) => {
                     (pc, arg) = if passed { (pc.next_true(), ResumeArg::Matched) } else { (pc.next_false(), ResumeArg::Failed) };
+                },
+                CoroutineState::Yielded(YieldOp::Promote(slot)) => match ctx.constant(slot) {
+                    Some(value) if self.promotes(pc.0, value) => {
+                        ctx.rely(owner, Fragile::Constant { slot, value }.key());
+                        Rc::make_mut(&mut ctx).green(pc.0, value);
+                        pc = pc.next_true();
+                        arg = ResumeArg::Integer(value);
+                    }
+                    Some(_) => {
+                        pc = pc.next_false();
+                        arg = ResumeArg::Failed;
+                    }
+                    None if self.promoted.get(&(self.proto, pc.0)).is_some_and(|values| values.len() >= PROMOTE_GREENS) => {
+                        pc = pc.next_false();
+                        arg = ResumeArg::Failed;
+                    }
+                    None => {
+                        let thunk = Residual::Thunk(self.make_promote_thunk(block_id, coro.clone(), slot, pc, ctx.clone()));
+                        self.end_block(block_id);
+                        self.blocks[block_id.0].instructions.push(thunk);
+                        return None;
+                    }
                 },
                 CoroutineState::Yielded(YieldOp::GuardDynamic(test)) => {
                     assert!(test.accesses().iter().all(|access| *access == Access::Read), "{}: a guard's test has no outputs", test.name());
