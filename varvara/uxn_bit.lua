@@ -12,6 +12,9 @@ local floor = math.floor
 
 local M = {}
 
+-- lunacy's `jit.promote`, where the Lua has it. See `eval`.
+local promote = jit and jit.promote
+
 local function signed(byte)
   return byte - lshift(band(byte, 0x80), 1)
 end
@@ -487,14 +490,28 @@ function M.new()
     dei, deo = read, write
   end
 
-  -- Run from `addr` until BRK.
-  function vm.eval(addr)
-    local pc = addr
-    repeat
-      local ins = ram[pc]
-      pc = band(pc + 1, 65535)
-      if ret[ins] then pc = op[ins](rst, wst, pc) else pc = op[ins](wst, rst, pc) end
-    until not pc
+  -- Run from `addr` until BRK. Where the Lua has `jit.promote` (lunacy), the
+  -- program counter and the instruction there are promoted, so the loop is
+  -- compiled once per guest instruction, its operation's call to one function.
+  if promote then
+    function vm.eval(addr)
+      local pc = addr
+      repeat
+        pc = promote(pc)
+        local ins = promote(ram[pc])
+        pc = band(pc + 1, 65535)
+        if ret[ins] then pc = op[ins](rst, wst, pc) else pc = op[ins](wst, rst, pc) end
+      until not pc
+    end
+  else
+    function vm.eval(addr)
+      local pc = addr
+      repeat
+        local ins = ram[pc]
+        pc = band(pc + 1, 65535)
+        if ret[ins] then pc = op[ins](rst, wst, pc) else pc = op[ins](wst, rst, pc) end
+      until not pc
+    end
   end
 
   -- Load a ROM, a string, at the program's start, 0x100.
