@@ -384,6 +384,15 @@ crate::window::windowed!(guard InArrayK, [k: i32], [], |owner, state, base| (tab
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(k) < tab.ro(owner).array.len()
 });
+// And whether the element there isn't nil.
+crate::window::windowed!(guard InArrayHeld, [], [], |owner, state, base| (table, key) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    tab.ro(owner).array.get(integer_slot(key.as_int())).is_some_and(|v| !v.is_nil())
+});
+crate::window::windowed!(guard InArrayHeldK, [k: i32], [], |owner, state, base| (table) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    tab.ro(owner).array.get(integer_slot(k)).is_some_and(|v| !v.is_nil())
+});
 
 
 /// R(A) := R(B)[RK(C)] for any table, userdata or string and key, through
@@ -497,10 +506,25 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 (Some(None), ResumeArg::Matched) => Some((Rc::new(GetTableInteger::new(&[b, c, a])), Rc::new(GetTableIntegerChain::new(&[b, c, a])))),
                 _ => None,
             };
+            // The chain's cold way looks the key up again, in the table and key the
+            // load read; a load into either's register has overwritten it by then. So
+            // that load first tests that it finds no nil, writing nothing.
+            let overwrites = a == b || (c & 0x100 == 0 && a == c);
             if let Some((plain, chain)) = load {
                 // As one step each way, as the nil test is. See Note [Subblocks].
                 if !chains {
                     yield YieldOp::Decided(true);
+                    arg = yield YieldOp::ExecWindow(plain);
+                } else if overwrites {
+                    let held: Rc<dyn Window> = match integer {
+                        Some(Some(k)) => Rc::new(InArrayHeldK::new(k, &[b])),
+                        _ => Rc::new(InArrayHeld::new(&[b, c])),
+                    };
+                    if (yield YieldOp::GuardDynamic(held)) != ResumeArg::Matched {
+                        arg = yield YieldOp::Exec(gettable(a, b, c));
+                        yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
+                        return arg;
+                    }
                     arg = yield YieldOp::ExecWindow(plain);
                 } else if (yield YieldOp::OptimisticExec(chain)) != ResumeArg::Matched {
                     arg = yield YieldOp::Exec(gettable(a, b, c));
