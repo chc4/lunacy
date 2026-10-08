@@ -472,15 +472,24 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 ResumeArg::Matched => Some(None),
                 _ => None,
             };
+            // A nil element of a table with a metatable is its `__index`'s: an array
+            // of a kind that isn't nil holds none. See Note [Table metatables] in
+            // `specialize`.
+            let holds = matches!(yield YieldOp::ArrayKind(b), ResumeArg::Type(CType::Type(t)) if t != LType::Nil);
+            // A nil element looks the key up again, in the table and key the load read;
+            // a load into either's register has overwritten it by then. So that load,
+            // unless the array holds no nil, tests the element there isn't nil in
+            // place of only that it's in the array part, and is plain past the test.
+            let overwrites = a == b || (c & 0x100 == 0 && a == c);
+            let held = overwrites && !holds;
             let in_array = match integer {
+                Some(Some(k)) if held => yield YieldOp::GuardDynamic(Rc::new(InArrayHeldK::new(k, &[b]))),
+                Some(None) if held => yield YieldOp::GuardDynamic(Rc::new(InArrayHeld::new(&[b, c]))),
                 Some(Some(k)) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[b]))),
                 Some(None) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[b, c]))),
                 None => yield YieldOp::Decided(false),
             };
-            // A nil element of a table with a metatable is its `__index`'s: an array
-            // of a kind that isn't nil holds none. See Note [Table metatables] in
-            // `specialize`.
-            let chains = !(in_array == ResumeArg::Matched && matches!(yield YieldOp::ArrayKind(b), ResumeArg::Type(CType::Type(t)) if t != LType::Nil));
+            let chains = !(in_array == ResumeArg::Matched && (holds || held));
             windowed!(GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(k)];
@@ -510,25 +519,10 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 (Some(None), ResumeArg::Matched) => Some((Rc::new(GetTableInteger::new(&[b, c, a])), Rc::new(GetTableIntegerChain::new(&[b, c, a])))),
                 _ => None,
             };
-            // The chain's cold way looks the key up again, in the table and key the
-            // load read; a load into either's register has overwritten it by then. So
-            // that load first tests that it finds no nil, writing nothing.
-            let overwrites = a == b || (c & 0x100 == 0 && a == c);
             if let Some((plain, chain)) = load {
                 // As one step each way, as the nil test is. See Note [Subblocks].
                 if !chains {
                     yield YieldOp::Decided(true);
-                    arg = yield YieldOp::ExecWindow(plain);
-                } else if overwrites {
-                    let held: Rc<dyn Window> = match integer {
-                        Some(Some(k)) => Rc::new(InArrayHeldK::new(k, &[b])),
-                        _ => Rc::new(InArrayHeld::new(&[b, c])),
-                    };
-                    if (yield YieldOp::GuardDynamic(held)) != ResumeArg::Matched {
-                        arg = yield YieldOp::Exec(gettable(a, b, c));
-                        yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
-                        return arg;
-                    }
                     arg = yield YieldOp::ExecWindow(plain);
                 } else if (yield YieldOp::OptimisticExec(chain)) != ResumeArg::Matched {
                     arg = yield YieldOp::Exec(gettable(a, b, c));
