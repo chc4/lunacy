@@ -616,6 +616,29 @@ hyperfine-uxn benchmark times='1': unsafe-compile interpreter-compile _raven
         "${raven[@]}"
     python3 tools/bench_history.py record working/hyperfine-$b-{{times}}.json --benchmark $b --arg {{times}}
 
+# A ROM's uxn_* and uxn_bit_* benchmarks side by side (`rom` as varvara/roms
+# names it): what computing with the bit library does on each Lua that has it,
+# LuaJIT, Luau and lunacy's release and unsafe builds (with UXN_JIT_SIZE), in
+# working/hyperfine-uxn-bit-<rom>.md.
+hyperfine-uxn-bit rom: unsafe-compile
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --bin bench
+    commands=()
+    for b in uxn_{{rom}} uxn_bit_{{rom}}; do
+        just _luac $b
+        just _luajitc $b
+        just _luauc $b
+        commands+=(-n "$b luau" "luau -O2 working/$b.luau -a 1"
+            -n "$b luau --codegen" "luau -O2 --codegen working/$b.luau -a 1"
+            -n "$b luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin 1"
+            -n "$b luajit" "luajit bench.lua -- working/$b.luajit.bin 1"
+            -n "$b release" "env LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} ./target/release/bench working/$b.bin 1"
+            -n "$b unsafe" "env LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} ./target/unsafe/bench working/$b.bin 1")
+    done
+    taskset -c {{CPU}} hyperfine -N --warmup {{WARMUP}} --export-markdown working/hyperfine-uxn-bit-{{rom}}.md \
+        --export-json working/hyperfine-uxn-bit-{{rom}}.json "${commands[@]}"
+
 # `hyperfine-uxn` over UXN_HYPERFINES.
 UXN_HYPERFINES := "uxn_fib:1 uxn_tak:1 uxn_mandelbrot:1 uxn_bunnymark:1 uxn_bit_fib:1 uxn_bit_tak:1 uxn_bit_mandelbrot:1 uxn_bit_bunnymark:1"
 hyperfines-uxn:
