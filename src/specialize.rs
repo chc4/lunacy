@@ -771,11 +771,10 @@ impl Count {
 }
 
 // `push_frame`, without the callstack's entry, for a call of R(A), with CALL's B (`a` and `b` as
-// `Count::hold` holds them), of a callee whose `max_stack` is `stack`. Requires nilling the
-// callee's frame if `FILLS`, or else the JIT code does. The callee isn't vararg. See Note [Frame
-// ops].
-windowed!(frame PushFrame, [a: u16, b: u16, stack: u8], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
-    state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), A.lift(a), B.lift(b), stack, FILLS);
+// `Count::hold` holds them). Requires nilling the callee's frame if `FILLS`, or else the JIT code
+// does. The callee isn't vararg. See Note [Frame ops].
+windowed!(frame PushFrame, [a: u16, b: u16], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
+    state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), A.lift(a), B.lift(b), FILLS);
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
 
@@ -825,16 +824,9 @@ windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64],
 
 // `shift_frame` without the callstack's entry, for an inlined call of `callee`, R(A), with CALL's B
 // (`a` and `b` as `Count::hold` holds them), of a callee whose `max_stack` is `stack`, keeping the
-// window: the JIT code nils the callee's frame. Its cold path makes the stack long enough first.
-// See Notes [Inlined calls] and [Count case analysis].
+// window: the JIT code nils the callee's frame. See Notes [Inlined calls] and [Count case
+// analysis].
 windowed!(ShiftFrame, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
-    if state.base + A.lift(a) + 1 + stack as usize > state.vals.len() {
-        true
-    } else {
-        state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false);
-        false
-    }
-} rejoin {
     state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false);
 });
 
@@ -1028,6 +1020,11 @@ pub enum CallEntry {
 // from that context, with the results' types, less what the callee's code may have falsified (its
 // effects, applied as a continuation applies a callee's; Note [Call effects]), with no guard on the
 // return between.
+//
+// A function's frames hold the frames of the calls inlined into it, to any depth: its frame size
+// grows with each call inlined, so every frame of it a call makes, and the collector's live
+// extent, has room for them, and making an inlined callee's frame never lengthens the stack. As it
+// grows the stack is lengthened under its frames already running.
 //
 // The decision is kept with the callee's entry context, by the call's point and the callee. Code
 // after an inlined call is compiled anew whenever the callee's return gives the caller a context
@@ -3983,7 +3980,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         known.inline = None;
                         if vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known))) {
                             vm.blocks[block.0].instructions.extend(layout);
-                            let shift = vm.inline_call(owner, block, callee, a, b, entry);
+                            let shift = vm.inline_call(owner, state, block, callee, a, b, entry);
                             vm.blocks[block.0].instructions.push(Residual::Jump(shift));
                             return;
                         }
@@ -4103,7 +4100,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
     /// callee's frame in, then goes on to its version for `entry`. See Note [Inlined calls].
-    fn inline_call(&mut self, owner: &mut Owner, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context) -> BlockId {
+    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context) -> BlockId {
+        // The outermost function's frame holds the callee's.
+        let mut outermost = entry.inline.as_ref().expect("an inlined call's frame");
+        while let Some(frame) = &outermost.caller.inline {
+            outermost = frame;
+        }
+        if unsafe { (*outermost.proto).frame_size.grow(inline_offset(&entry) + (*callee).max_stack as usize) } {
+            state.fit_frames(owner);
+        }
         #[cfg(feature = "tracing")]
         let (_line, _entry, _after) = (self.traced_line(owner), entry.tostring(owner), entry.inline.as_ref().map_or(0, |frame| frame.after));
         let caller = self.proto;
@@ -4151,7 +4156,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let mut decided = entry.clone();
                 decided.inline = None;
                 vm.inlined.entry((vm.proto, call.pc, call.callee as LProto<'_, '_>)).or_default().push(decided);
-                let shift = vm.inline_call(owner, call.block, call.callee, a, call.b, entry);
+                let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry);
                 vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
             }
             // In place, as for a call thunk. See Note [Thunk patching].

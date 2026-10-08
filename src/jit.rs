@@ -2580,8 +2580,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let (held_a, held_b) = (hold(*a), hold(*b));
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
                             let push = match nils {
-                                Some(_) => frame_op!(PushFrame [false,] (held_a, held_b, *stack); *a, *b),
-                                None => frame_op!(PushFrame [true,] (held_a, held_b, *stack); *a, *b),
+                                Some(_) => frame_op!(PushFrame [false,] (held_a, held_b); *a, *b),
+                                None => frame_op!(PushFrame [true,] (held_a, held_b); *a, *b),
                             };
                             jit_note!(self.jctx, ops, "        keep the caller's frame");
                             dynasm!(ops

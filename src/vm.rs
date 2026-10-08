@@ -1527,15 +1527,18 @@ pub const EFFECTS_SHIFT: u32 = 20;
 
 // Note [Stack frames]
 // ~~~~~~~~~~~~~~~~~~~~
-// A call frame occupies `max_stack` slots of the register file (`vals`) from its
-// `base`; `RunState::top` is its dynamic Lua top (the variable-count-span cursor).
+// A call frame occupies its function's frame size (`FrameSize`) of slots of the register file
+// (`vals`) from its `base`: its `max_stack` registers, and past them the frames of the calls
+// inlined into it (Note [Inlined calls] in `specialize`). `RunState::top` is its dynamic Lua top
+// (the variable-count-span cursor), which starts past its registers.
 // `call_lua` records the caller's state and the callee's function slot in a
 // `CallstackEntry` and makes the stack long enough for the callee's frame; a return pops it and restores that state
 // (`leave`), and the caller takes the results (`arrive`). See Note [Returns].
 //
 // The stack's length is the most any frame has reached since the GC last marked
 // it, not what is live. The GC marks the stack up to its live extent
-// (`RunState::live_extent`): the most of each live frame's `base + max_stack`,
+// (`RunState::live_extent`): the most of each live frame's base plus its frame size (an inlined
+// call's, its `max_stack`: the frame of the function inlining it holds what it inlines),
 // the running one's and each caller's in the callstack, and of the top, which is
 // past them while results a call returned all of (C = 0) are still to be
 // consumed. It is computed when the GC runs, from the callstack, rather than
@@ -1545,9 +1548,9 @@ pub const EFFECTS_SHIFT: u32 = 20;
 // Marking the stack shrinks it to its live extent (`RunState::mark`), and the
 // GC marks the roots again, the mutator stopped, before it sweeps: so a slot
 // whose value the GC doesn't mark, which it may free, is past the stack's end
-// by then. The stack grows back only by a callee's frame, which a call nils past
-// the arguments the caller wrote (`push_frame`). So every slot of the stack
-// names something live.
+// by then. The stack grows back only by a callee's frame, past the arguments the caller wrote,
+// whose slots a call nils (`push_frame`), and so by the slots a function's frames take as its
+// frame size grows (`RunState::fit_frames`). So every slot of the stack names something live.
 
 // Note [Vararg frames]
 // ~~~~~~~~~~~~~~~~~~~~
@@ -1887,33 +1890,62 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     {
         let LValue::LClosure(lclos) = self.vals[self.base + a as usize].unbox() else { unreachable!() };
         let proto = unsafe { &*lclos.ro(owner).prototype };
-        let (stack, vararg, params) = (proto.max_stack, proto.is_vararg != 0, proto.param_count as usize);
+        let (vararg, params, frame) = (proto.is_vararg != 0, proto.param_count as usize, proto.frame_size.get());
         let (a, b) = (a as usize, b as usize);
         // The arguments' end, before the frame is pushed.
         let passed = if b == 0 { self.top } else { self.base + a + b };
-        let stack = self.push_frame::<true>(owner, ret, a, b, stack, true);
+        let stack = self.push_frame::<true>(owner, ret, a, b, true);
         if vararg {
             let func = self.base - 1;
             self.callstack.last_mut().expect("the frame just pushed").func = core::mem::MaybeUninit::new(func);
-            self.move_past_varargs(passed, params, stack);
+            self.move_past_varargs(passed, params, stack, frame);
         }
         stack
     }
 
+    /// Make the stack at least `end` slots long, nilling those it adds. See Note [Stack frames].
+    fn lengthen_nilled(&mut self, end: usize) {
+        let len = self.vals.len();
+        if end > len {
+            self.vals.lengthen(end);
+            self.nil_slots(len, end);
+        }
+    }
+
+    /// Make the stack long enough for every live frame, the running one's and each caller's, as
+    /// their functions' frame sizes say: one grew as a call inlined into its function. See Notes
+    /// [Stack frames] and [Inlined calls] in `specialize`.
+    pub fn fit_frames(&mut self, owner: &Owner) {
+        debug_assert_eq!(self.jit_depth, 0, "frames JIT code called have no entries to fit");
+        let end = self.frames_end(owner);
+        self.lengthen_nilled(end);
+    }
+
+    /// The most of each live frame's end, the running one's and each caller's in the callstack: its
+    /// base plus its function's frame size, or for an inlined call's frame, its `max_stack`, as the
+    /// frame of the function inlining it holds whatever it inlines in turn. See Note [Stack frames].
+    fn frames_end(&self, owner: &Owner) -> usize {
+        let frames = self.callstack.iter().map(|call| (call.frame, &call.clos)).chain([(self.base, &self.clos)]);
+        // A frame is an inlined call's if the entry below it, its caller's, returns to inlining code.
+        let inlined = [false].into_iter().chain(self.callstack.iter().map(|call| matches!(call.ret, Return::Inlined)));
+        frames.zip(inlined).map(|((base, clos), inlined)| {
+            let proto = unsafe { &*clos.ro(owner).prototype };
+            base + if inlined { proto.max_stack as usize } else { proto.frame_size.get() }
+        }).fold(0, usize::max)
+    }
+
     /// Make the frame just pushed for a vararg function, whose arguments end at
     /// `passed`, start past them: the extra ones, past its `params` fixed ones,
-    /// stay below it, and it starts with a copy of the fixed ones. See Note
-    /// [Vararg frames].
-    fn move_past_varargs(&mut self, passed: usize, params: usize, stack: usize) {
+    /// stay below it, and it starts with a copy of the fixed ones. Its function
+    /// has `stack` registers and a frame size of `frame`. See Note [Vararg frames].
+    fn move_past_varargs(&mut self, passed: usize, params: usize, stack: usize, frame: usize) {
         let args = passed - self.base;
         if args <= params {
             return;
         }
         let base = passed;
         let end = base + stack;
-        if end > self.vals.len() {
-            self.vals.lengthen(end);
-        }
+        self.lengthen_nilled(base + frame);
         for i in 0..params {
             self.vals[base + i] = self.vals[self.base + i];
         }
@@ -1928,15 +1960,16 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// The callee's frame past its arguments is nil when it starts, as Lua's
     /// is: luac emits no LOADNIL for a local declared at a function's first
     /// instruction. With `fills`, this nils it; without, the caller does, before
-    /// anything reads the stack or marks it. `stack` is the callee's
-    /// `max_stack`, which the caller knows.
+    /// anything reads the stack or marks it. The stack is made long enough for
+    /// its frame size, read now, as it may have grown since the call was laid
+    /// out. Returns its `max_stack`.
     ///
     /// With `ENTRY`, the caller's state is recorded in a `CallstackEntry`
     /// returning to `ret`; without, for a call from JIT code of a function that
     /// isn't vararg, the frame is only counted (`jit_depth`), the caller keeping
     /// that state, and `ret` is unused. See Note [Frame ops] in `specialize`.
     #[inline(always)]
-    pub fn push_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, stack: u8, fills: bool) -> usize {
+    pub fn push_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, fills: bool) -> usize {
         let entry = ENTRY.then(|| CallstackEntry {
             clos: self.clos.clone(),
             ret: Return::To(Location::unpack(ret)),
@@ -1950,8 +1983,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         // SAFETY: R(A) is a Lua function: the interpreter calls through this having found it is
         // one, and JIT code past its call's version's guard of it.
         let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unsafe { core::hint::unreachable_unchecked() } };
-        debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "a call's frame size isn't its callee's");
-        let next_stack = stack as usize;
+        let proto = unsafe { &*lclos.ro(owner).prototype };
+        let (next_stack, frame) = (proto.max_stack as usize, proto.frame_size.get());
         let next_base = self.base + a + 1;
         // Its arguments are `b - 1` values, or up to the top, which the caller
         // wrote; the rest of its frame is nilled, so the stack only needs to be
@@ -1959,9 +1992,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let passed = if b == 0 { self.top } else { next_base + b - 1 };
         let end = next_base + next_stack;
         debug_assert!(passed <= self.vals.len(), "arguments past the stack");
-        if end > self.vals.len() {
-            self.vals.lengthen(end);
-        }
+        self.lengthen_nilled(next_base + frame);
         if fills && passed < end {
             self.nil_slots(passed, end);
         }
@@ -1979,9 +2010,11 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
     /// The frame of an inlined call of R(A), `callee`, with CALL's B, of a callee whose `max_stack`
     /// is `stack`, made as `push_frame` makes a frame, nilled past its arguments if `fills`, or else
-    /// by the JIT code. With `ENTRY`, its entry returns to the code inlining it
-    /// (`Return::Inlined`); without, in JIT code, it is only counted (`jit_depth`), the JIT code
-    /// keeping what its entry would hold. See Note [Inlined calls] in `specialize`.
+    /// by the JIT code. The stack is already long enough: the frame is within the frame size of the
+    /// function inlining it. With `ENTRY`, its entry returns to the code inlining it
+    /// (`Return::Inlined`), and its top starts past its registers; without, in JIT code, it is only
+    /// counted (`jit_depth`), the JIT code keeping what its entry would hold, and its top is left,
+    /// as code reading it sets it first. See Note [Inlined calls] in `specialize`.
     #[inline(always)]
     pub fn shift_frame<const ENTRY: bool>(&mut self, owner: &Owner, callee: LBoxed<'src, 'intern>, a: usize, b: usize, stack: u8, fills: bool) {
         debug_assert!(matches!(callee.unbox(), LValue::LClosure(_)), "an inlined call of what isn't a Lua function");
@@ -1991,9 +2024,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let next_base = self.base + a + 1;
         let passed = if b == 0 { self.top } else { next_base + b - 1 };
         let end = next_base + stack as usize;
-        if end > self.vals.len() {
-            self.vals.lengthen(end);
-        }
+        debug_assert!(end <= self.vals.len(), "an inlined call's frame past the stack");
         if fills && passed < end {
             self.nil_slots(passed, end);
         }
@@ -2011,7 +2042,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             self.jit_depth += 1;
         }
         self.base = next_base;
-        self.top = end;
+        if ENTRY {
+            self.top = end;
+        }
         self.witness_base = self.witness_top;
     }
 
@@ -2195,7 +2228,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let count = if b == 0 { self.top - from } else { b };
         let LValue::LClosure(lclos) = self.vals[from].unbox() else { unreachable!("a tail call of what isn't a Lua function") };
         let proto = unsafe { &*lclos.ro(owner).prototype };
-        let (stack, callee_vararg, params) = (proto.max_stack as usize, proto.is_vararg != 0, proto.param_count as usize);
+        let (stack, callee_vararg, params, frame) = (proto.max_stack as usize, proto.is_vararg != 0, proto.param_count as usize, proto.frame_size.get());
         let next_base = match self.callstack.last() {
             // A frame JIT code called is no vararg function's, and its entry isn't there to
             // record a vararg callee's function slot. See Note [Frame ops] in `specialize`.
@@ -2224,9 +2257,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         };
         let passed = next_base + count - 1;
         let end = next_base + stack;
-        if end > self.vals.len() {
-            self.vals.lengthen(end);
-        }
+        self.lengthen_nilled(next_base + frame);
         if passed < end {
             self.nil_slots(passed, end);
         }
@@ -2241,7 +2272,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             entry.func = if callee_vararg { core::mem::MaybeUninit::new(next_base - 1) } else { core::mem::MaybeUninit::uninit() };
         }
         if callee_vararg {
-            self.move_past_varargs(passed, params, stack);
+            self.move_past_varargs(passed, params, stack, frame);
         }
         stack
     }
@@ -2267,17 +2298,14 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     }
 
     /// The stack's live extent, which the GC marks: the most of each live
-    /// frame's `base + max_stack`, the running one's and each caller's, and of
-    /// the top. See Note [Stack frames].
+    /// frame's end (`frames_end`) and of the top. See Note [Stack frames].
     pub fn live_extent(&self, owner: &Owner) -> usize {
         // Frames JIT code called have no entries to say where theirs end: the whole stack, which
         // each made long enough for its frame.
         if self.jit_depth > 0 {
             return self.vals.len();
         }
-        let end = |base: usize, clos: &Tc<LClosure<'src, 'intern>>| base + unsafe { (*clos.ro(owner).prototype).max_stack as usize };
-        let running = end(self.base, &self.clos).max(self.top);
-        let extent = self.callstack.iter().map(|call| end(call.frame, &call.clos)).fold(running, usize::max);
+        let extent = self.frames_end(owner).max(self.top);
         debug_assert!(extent <= self.vals.len(), "a live frame past the stack");
         extent
     }
@@ -2638,7 +2666,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         where 'src: 'lua
     {
         args.resize_with(unsafe {
-            (*clos.ro(owner).prototype).max_stack as usize
+            (*clos.ro(owner).prototype).frame_size.get()
         }, || LBoxed::NIL);
         let mut spec = Specializer::new(clos.ro(owner).prototype);
         let strings = _G.get_string(owner, b"string").as_table().expect("the string library");
