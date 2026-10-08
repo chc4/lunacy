@@ -46,14 +46,18 @@ def counts(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('dirs', nargs='+')
-    ap.add_argument('--lines', default='', help='comma-separated function lines (func_<line>.dot)')
+    ap.add_argument('--lines', default='', help='comma-separated function lines: their dumps, func_<line>.dot and func_<line>_<n>.dot')
     args = ap.parse_args()
     dirs = [Path(d) for d in args.dirs]
-    lines = [int(l) for l in args.lines.split(',')] if args.lines else sorted(
-        {int(re.search(r'\d+', p.name).group()) for d in dirs for p in d.glob('func_*.dot')})
-    for line in lines:
-        runs = [counts(d / f'func_{line}.dot') if (d / f'func_{line}.dot').exists() else None for d in dirs]
-        print(f'func_{line}: versioned blocks ' + ' / '.join('-' if r is None else str(r[0]) for r in runs))
+    # A dump's name: func_<line>, or func_<line>_<n> for the nth function on a line.
+    order = lambda name: tuple(int(n) for n in re.findall(r'\d+', name))
+    names = sorted({p.stem for d in dirs for p in d.glob('func_*.dot')}, key=order)
+    if args.lines:
+        wanted = {int(l) for l in args.lines.split(',')}
+        names = [name for name in names if order(name)[0] in wanted]
+    for name in names:
+        runs = [counts(d / f'{name}.dot') if (d / f'{name}.dot').exists() else None for d in dirs]
+        print(f'{name}: versioned blocks ' + ' / '.join('-' if r is None else str(r[0]) for r in runs))
         for kind in KINDS:
             cells = ['-' if r is None else f'{r[1][kind]} (x{r[2][kind]})' for r in runs]
             if any(r is not None and r[1][kind] for r in runs):

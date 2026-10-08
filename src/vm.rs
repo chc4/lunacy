@@ -2642,12 +2642,25 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             crate::tracing::flush();
         }
 
-        // Into `LUNACY_GRAPH_DIR`, or the working directory.
+        // Every function the chunk defines, nested ones too, into
+        // `LUNACY_GRAPH_DIR` or the working directory, as func_<line>, or
+        // func_<line>_<n> for the nth past the first defined on one line.
         #[cfg(feature = "graph")]
-        for proto in unsafe { &(*self.top_level).prototypes.items } {
+        {
             let dir = std::env::var("LUNACY_GRAPH_DIR").unwrap_or_else(|_| ".".into());
-            let outfile = format!("{dir}/func_{}.pdf", proto.line_defined);
-            spec.dump(owner, proto, outfile.as_str());
+            let mut on_line: HashMap<usize, usize> = HashMap::new();
+            let mut pending: Vec<_> = unsafe { (*self.top_level).prototypes.items.iter().collect() };
+            pending.reverse();
+            while let Some(proto) = pending.pop() {
+                let seen = on_line.entry(proto.line_defined as usize).or_default();
+                let outfile = match *seen {
+                    0 => format!("{dir}/func_{}.pdf", proto.line_defined),
+                    n => format!("{dir}/func_{}_{}.pdf", proto.line_defined, n + 1),
+                };
+                *seen += 1;
+                spec.dump(owner, proto, outfile.as_str());
+                pending.extend(proto.prototypes.items.iter().rev());
+            }
         }
         let _ = (&spec, &state);
 
