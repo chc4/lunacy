@@ -13,7 +13,7 @@ The specializer's are also views, one column per argument:
       each of its fragile facts was introduced (`fact <- block@offset,...`).
   spec_block(ts, block, line, pc, context)
       each version compiled.
-  block_summary(block, line, pc, residuals, context, hotness, jitted, returns, returned_from, unreachable)
+  block_summary(block, line, pc, residuals, code, context, hotness, jitted, returns, returned_from, unreachable)
       every block at the end of the run (line 0 for one no version names),
       with the return ids its returns return with, those its call
       continuations guard on (comma separated), and whether the trimming
@@ -89,7 +89,7 @@ from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 VIEWS = {
     'spec_version': ['line', 'pc', 'outcome', 'block', 'versions', 'context', 'joined', 'shapes_dropped', 'origins'],
     'spec_block': ['block', 'line', 'pc', 'context'],
-    'block_summary': ['block', 'line', 'pc', 'residuals', 'context', 'hotness', 'jitted', 'returns', 'returned_from', 'unreachable'],
+    'block_summary': ['block', 'line', 'pc', 'residuals', 'code', 'context', 'hotness', 'jitted', 'returns', 'returned_from', 'unreachable'],
     'alloc_step': ['trace', 'step', 'line', 'block', 'pc', 'off'],
     'alloc_start': ['trace', 'step', 'rise', 'arrives', 'worth', 'entry'],
     'alloc_op': ['trace', 'step', 'name', 'before', 'worth', 'skip', 'emits', 'after'],

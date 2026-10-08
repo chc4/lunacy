@@ -1763,9 +1763,12 @@ pub struct Context {
 // widen its kind, which no guard then tests.
 //
 // Every store into an array part widens its kind, but for a value of a kind the context knows the
-// array has, or an element of the same array, which its kind covers. A store may be into any table
-// the context knows the kind of, through another slot, so it keeps only the known kinds of the
-// value's representation; an element stored back into its own array changes no kind.
+// array has, or an element of the same array, which its kind covers. A store that widens may be
+// into any table the context knows the kind of, through another slot, so it keeps only the known
+// kinds of the value's representation. One that doesn't changes no table's kind, so it keeps every
+// known kind: an array keeps its kind, and one known to be of another kind isn't the one stored
+// into, as an array part has one kind. This is the type-based alias analysis kinds give: stores
+// into an array of integers leave what is known of arrays of booleans or functions.
 
 // Note [Fragile information]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3402,7 +3405,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// Every block, for the trace (`spec`/`block_summary`, see
     /// `tools/trace_sql.py`): its function's line (0 for a block no version
-    /// names, as a thunk's layout), pc, context, residuals and, with the JIT,
+    /// names, as a thunk's layout), pc, context, residuals (how many, and as
+    /// `code`, as the `graph` feature's dump shows them) and, with the JIT,
     /// hotness left and whether it has code.
     #[cfg(feature = "tracing")]
     pub fn trace_blocks(&self, owner: &Owner) {
@@ -3416,11 +3420,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let ids = |id: fn(&Residual) -> Option<u64>| block.instructions.iter().filter_map(id).map(|id| id.to_string()).collect::<Vec<_>>().join(",");
             let returns = ids(|residual| match residual { Residual::Ret(_, _, _, _, _, id, _) => Some(*id as u64), _ => None });
             let returned_from = ids(|residual| match residual { Residual::ReturnedFrom(from) => Some(from & UNKNOWN_RETURN as u64), _ => None });
+            let code = block.instructions.iter().map(|residual| residual.to_string()).collect::<Vec<_>>().join("; ");
             let mut args: Vec<(&str, crate::tracing::TraceValue)> = vec![
                 ("block", id.into()),
                 ("line", lines.get(&BlockId(id)).copied().unwrap_or(0).into()),
                 ("pc", block.pc.into()),
                 ("residuals", block.instructions.len().into()),
+                ("code", code.as_str().into()),
                 ("context", context.as_str().into()),
                 ("returns", returns.as_str().into()),
                 ("returned_from", returned_from.as_str().into()),

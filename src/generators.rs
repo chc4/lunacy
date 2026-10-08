@@ -782,7 +782,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     with_widen!(how, make)
                 }
             });
-            if !own {
+            // A store that widens no kind falsifies no table's: its own keeps its kind, and a
+            // table of another known kind isn't the one stored into. See Note [Array kinds] in
+            // `specialize`.
+            if widen {
                 yield YieldOp::Effect(Effect::ArrayStore(stored));
             }
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
@@ -816,7 +819,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     with_widen!(how, make)
                 }
             });
-            if !own {
+            // A store that widens no kind falsifies no table's: its own keeps its kind, and a
+            // table of another known kind isn't the one stored into. See Note [Array kinds] in
+            // `specialize`.
+            if widen {
                 yield YieldOp::Effect(Effect::ArrayStore(stored));
             }
         } else if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = (yield YieldOp::GuardCType(b, CType::Number)) {
