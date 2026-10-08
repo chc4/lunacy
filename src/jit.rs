@@ -475,7 +475,10 @@ const COPIES: bool = !cfg!(debug_assertions) && !cfg!(feature = "immediate_jit")
 #[derive(Default)]
 pub struct Stencils {
     image: Option<Result<Image, StencilError>>,
-    bodies: HashMap<(usize, usize), (usize, Result<Rc<Body>, StencilError>), FxBuildHasher>,
+    /// Each stencil's body, by the stencil's address, its cold stencil's and its fall-through exit:
+    /// ops whose hot stencils are the same code, which the compiler gives one address, can have
+    /// different cold paths, which their bodies jump to.
+    bodies: HashMap<(usize, Option<usize>, usize), (usize, Result<Rc<Body>, StencilError>), FxBuildHasher>,
     /// Each window op the JIT has compiled, by address, and the op it copies
     /// for it (see `effective`); the op kept so its address isn't reused.
     twins: HashMap<usize, (Rc<dyn Window>, Rc<dyn Window>), FxBuildHasher>,
@@ -506,7 +509,7 @@ impl Stencils {
         }
         let image = self.image.get_or_insert_with(Image::load).as_ref().map_err(Clone::clone)?;
         self.bodies
-            .entry((op.stencil(skip), fall_exit))
+            .entry((op.stencil(skip), op.cold(skip), fall_exit))
             .or_insert_with(|| {
                 let body = unsafe { stencil_body(image, op, skip, fall_exit) }
                     .map(Rc::new)
@@ -520,7 +523,7 @@ impl Stencils {
     /// Each stencil copied: its address, `SKIP`, and the body splatted.
     #[cfg(feature = "jit_disasm")]
     fn copied(&self) -> impl Iterator<Item = (usize, usize, &Body)> {
-        self.bodies.iter().filter_map(|(&(addr, _), (skip, body))| Some((addr, *skip, &**body.as_ref().ok()?)))
+        self.bodies.iter().filter_map(|(&(addr, _, _), (skip, body))| Some((addr, *skip, &**body.as_ref().ok()?)))
     }
 }
 
