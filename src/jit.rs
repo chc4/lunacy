@@ -428,6 +428,8 @@ struct Pool {
     /// The region's exit for code each number of inlined calls deep: writing those calls'
     /// entries, then leaving. See Note [Inlined calls] in `specialize`.
     exits: Vec<DynamicLabel>,
+    /// The most inlined calls deep the region's code is, past which it has no exits.
+    deepest: usize,
 }
 
 /// Code a region lays out after its blocks, off its hot paths.
@@ -1541,7 +1543,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.reserve(ops.offset().0 - stubs.0);
 
         let epilogue = ops.offset();
-        for depth in (1..pool.exits.len()).rev() {
+        for depth in (1..=pool.deepest).rev() {
             jit_note!(self.jctx, ops, "exit {depth} inlined calls deep: their entries written");
             dynasm!(ops ; .arch x64 ; =>pool.exits[depth] ; mov rbx, rax);
             for _ in 0..depth {
@@ -2011,6 +2013,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // [Inlined calls] in `specialize`.
         let depth = core::cell::Cell::new(depth);
         let exits = pool.exits.clone();
+        pool.deepest = pool.deepest.max(depth.get());
         // The address `JitHelper::dynamic_call` gets: this code only runs while
         // `self`, which owns it, is alive and in place.
         let spec = &*self as *const Self as i64;
@@ -2777,6 +2780,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov QWORD [rsp], r13
                     );
                     depth.set(depth.get() + 1);
+                    pool.deepest = pool.deepest.max(depth.get());
                     let nils = nils.unwrap_or_default();
                     if !nils.is_empty() {
                         let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
