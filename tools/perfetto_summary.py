@@ -71,15 +71,16 @@ def verify_trace(filename):
                     extract_arg(slice.arg_set_id, 'source') as source,
                     extract_arg(slice.arg_set_id, 'line') as line,
                     extract_arg(slice.arg_set_id, 'block_id') as block,
+                    extract_arg(slice.arg_set_id, 'off') as off,
                     count(*) as cnt
                 FROM slice
                 WHERE slice.category = 'jit' AND slice.name = 'bailout'
-                GROUP BY reason, source, line, block
+                GROUP BY reason, source, line, block, off
                 ORDER BY cnt DESC
                 LIMIT 20
             """)
             for row in qr:
-                print(f"{row.cnt:>10} | {str(row.reason):<30} | {row.source}:{row.line} block {row.block}")
+                print(f"{row.cnt:>10} | {str(row.reason):<30} | {row.source}:{row.line} block {row.block} at {row.off}")
         else:
             print("Trace loaded but seems empty of slices/tracks.")
 

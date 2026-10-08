@@ -5432,6 +5432,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// at), and the function and block.
     #[cfg(feature = "tracing")]
     fn trace_bailout(&self, owner: &Owner, state: &RunState<'src, 'intern>, off: isize, block: usize) {
+        // A return continues its caller where `resume` says, the block it is in, and the
+        // residual at which, `off`.
+        let (block, at) = match off {
+            -5 => {
+                let Location(BlockId(block), at) = Location::unpack(crate::vm::PackedLocation::from_bits(state.resume as usize));
+                (block, at)
+            }
+            _ => (block, state.current_off as usize),
+        };
         let reason = match off {
             -1 => "trap".to_string(),
             -2 => "return from the entry frame".to_string(),
@@ -5446,6 +5455,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         crate::tracing::instant("jit", "bailout", &[
             ("reason", reason.as_str().into()),
             ("block_id", block.into()),
+            ("off", at.into()),
             ("source", source.as_str().into()),
             ("line", (line as u64).into()),
         ]);
