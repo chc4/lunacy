@@ -757,6 +757,17 @@ jit-size-vs ref: (jit-size-rev ref) jit-sizes
 bench: hyperfines jit-sizes bench-history bench-bars
 
 # `hyperfine-full` over HYPERFINES.
+# Every HYPERFINES run in the unsafe build without and with `knob`, an
+# environment assignment (`LUNACY_NO_INLINE=1`), and the change in each's
+# median (tools/knob_table.py); a run that fails is skipped. Its json in
+# working/knob/.
+hyperfines-knob knob: unsafe-compile
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf working/knob && mkdir -p working/knob
+    for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-json working/knob/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{knob}}" "env {{knob}} ./target/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
+    python3 tools/knob_table.py working/knob/*.json
+
 hyperfines-full:
     #!/usr/bin/env bash
     set -euo pipefail
