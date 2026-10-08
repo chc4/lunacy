@@ -414,6 +414,27 @@ impl WindowAlloc {
         self.cache.dirty.iter().map(|&slot| self.cache.store(slot)).collect()
     }
 
+    /// A `Move` from `src`, which a register holds, to `dst`, as a rename: that register holds
+    /// `dst`'s value from then on, dirty, and no register `src`'s, which is stored first if
+    /// `store`. No code but the store.
+    pub fn rename(&mut self, src: usize, dst: usize, store: bool) -> SmallVec<[Emit; 16]> {
+        let reg = self.cache.position(src).expect("a renamed value in a register");
+        let mut emits = SmallVec::new();
+        if store {
+            emits.push(self.cache.store(src));
+        }
+        let unboxed = bit(self.cache.unboxed, reg);
+        for r in 0..WINDOW {
+            if self.cache.regs[r].is_some_and(|slot| slot == src || slot == dst) {
+                self.cache.set(r, None, false);
+            }
+        }
+        self.cache.dirty.retain(|slot| *slot != src && *slot != dst);
+        self.cache.set(reg, Some(dst), unboxed);
+        self.cache.dirty.push(dst);
+        emits
+    }
+
     /// Drop `slots` from the window without storing them: their values are dead.
     pub fn forget(&mut self, slots: &Slots) {
         for reg in 0..WINDOW {
@@ -550,6 +571,16 @@ impl WindowAlloc {
 
 /// A step of a trace, for [`plan_trace`]: its blocks' residuals, as planning
 /// sees them.
+/// The `SKIP` a plan places a `Move` renamed at (see `WindowAlloc::rename`): its source's value
+/// stored first, or not.
+pub const RENAME_STORE: usize = 255;
+pub const RENAME: usize = 254;
+
+/// Whether `op` is a `Move`, `R(to) := R(from)`, which the window can do as a rename.
+fn is_move(op: &dyn Window) -> bool {
+    op.name() == "Move" && op.accesses() == [Access::Read, Access::Write]
+}
+
 /// An op as the window sees it: its operands' slots counted from the base of the frame of the
 /// code the window is of, which the op's own frame is `offset` slots past when the op is code
 /// inlined into it. See Note [Inlined calls] in `specialize`.
@@ -701,6 +732,15 @@ impl Ahead {
         Some((true, leave - at))
     }
 
+    /// Whether `slot`'s value after step `at` is dead: overwritten before anything reads it, the
+    /// stack included.
+    fn dead(&self, slot: usize, at: usize) -> bool {
+        let events = &self.events[slot];
+        let Some(&(step, read)) = events.get(events.partition_point(|e| e.0 <= at)) else { return false };
+        let after = |of: &[usize]| of.get(of.partition_point(|&s| s <= at)).is_none_or(|&s| s > step);
+        !read && after(&self.flushes) && after(&self.leaves[slot]) && !self.backs.iter().any(|&(back, _)| back > at && back < step)
+    }
+
     /// How far after step `at` keeping `slot` in a register next pays off,
     /// `dirty` or not, if it does: its next event, unless a flush comes first,
     /// if that is a read, or an overwrite of a dirty value.
@@ -820,6 +860,20 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 plan.unboxed[step] = unboxed;
                 plan.dirty[step] = dirty;
             }
+            Step::Op(op, usable) if let Some(store) = renames(&alloc, &ahead, step, op) => {
+                let emits = alloc.rename(op.slots()[0], op.slots()[1], store);
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("alloc", "op", &[
+                    ("trace", trace.into()),
+                    ("step", step.into()),
+                    ("name", "Move renamed".into()),
+                    ("emits", emits.iter().map(|emit| emit.to_string()).collect::<Vec<_>>().join("; ").as_str().into()),
+                    ("after", format!("{}", alloc.cache()).as_str().into()),
+                ]);
+                let _ = (emits, usable);
+                plan.windows[step] = *alloc.cache().regs();
+                plan.skips[step] = if store { RENAME_STORE } else { RENAME };
+            }
             Step::Op(op, usable) => {
                 let (want, skip) = place(&alloc, &ahead, step, op, usable);
                 #[cfg(feature = "tracing")]
@@ -862,6 +916,21 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
         }
     }
     plan
+}
+
+/// Whether the op at `step` is a `Move` the window does as a rename, and if so whether its
+/// source's value is stored first: its source in a register that no read of it after pays for
+/// keeping, stored unless dead.
+fn renames(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> Option<bool> {
+    if !is_move(op.op) {
+        return None;
+    }
+    let (src, dst) = (op.slots()[0], op.slots()[1]);
+    alloc.cache().position(src)?;
+    if src == dst || ahead.pays(src, step, false).is_some() {
+        return None;
+    }
+    Some(alloc.cache().dirty.contains(&src) && !ahead.dead(src, step))
 }
 
 /// Where the op at `step` runs, and the window it wants: its inputs in its

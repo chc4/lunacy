@@ -10,7 +10,7 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::specialize::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, EXITS, WINDOW};
-use crate::window_alloc::Framed;
+use crate::window_alloc::{Framed, RENAME, RENAME_STORE};
 use crate::window_alloc::{plan_trace, Cache, ALLOCATED, Emit, Packed, Placement, Rise, Step, WindowAlloc, SCRATCH};
 use crate::trace::{Block as TraceBlock, Event, Loops, Policy, Region, Slots};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
@@ -704,6 +704,36 @@ fn inline_kills(res: &Residual, offset: usize) -> Slots {
         (base + b as usize - 1..base + stack as usize).for_each(|slot| kills.insert(slot));
     }
     kills
+}
+
+/// For an `InlineReturn` keeping the window at `off`, the residual after the window ops moving its
+/// results, where the callee's frame's values die, and the slot of the caller's frame past its
+/// results, from which they all do: the caller's temporaries past a call's results are dead. See
+/// Note [Inlined calls] in `specialize`.
+fn results_end(residuals: &[Residual], off: usize) -> Option<(usize, usize)> {
+    let res = &residuals[off];
+    let Residual::InlineReturn { call, .. } = res else { return None };
+    if !keeps_frame(res) {
+        return None;
+    }
+    let (mut at, mut end) = (off + 1, *call as usize);
+    while let Some(Residual::ExecWindow(w)) = residuals.get(at) {
+        match w.name() {
+            "Move" => end = end.max(w.operands()[1] + 1),
+            "LoadNil" => end = end.max(w.operands()[0] + 1),
+            "SetTop" => {}
+            _ => break,
+        }
+        at += 1;
+    }
+    Some((at, end))
+}
+
+/// The slots, as the window names them at `offset`, from `end` on.
+fn slots_from(end: usize, offset: usize) -> Slots {
+    let mut slots = Slots::default();
+    (offset + end..256).for_each(|slot| slots.insert(slot));
+    slots
 }
 
 /// Whether an `InlineReturn` keeps the window: its results moved by the window ops after it, and
@@ -1886,7 +1916,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let mut events = Vec::new();
                     let mut offset = offset;
                     let residuals = &self.blocks[block.0].instructions;
+                    let mut dies = None;
                     for (off, res) in residuals[..runs_to(residuals)].iter().enumerate() {
+                        if let Some((_, end)) = dies.filter(|&(at, _)| at == off) {
+                            events.extend(slots_from(end, offset).iter().map(Event::Write));
+                        }
+                        dies = results_end(residuals, off).or(dies);
                         let at = offset;
                         offset = offset_past(res, offset);
                         match res {
@@ -2021,7 +2056,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             })));
             let mut of = vec![None; block.instructions.len()];
             let mut offset = offsets[b];
+            let mut dies = None;
             for (off, res) in block.instructions[..runs_to(&block.instructions)].iter().enumerate() {
+                if let Some((_, end)) = dies.filter(|&(at, _)| at == off) {
+                    steps.push(Step::Kill(slots_from(end, offset)));
+                }
+                dies = results_end(&block.instructions, off).or(dies);
                 let at = offset;
                 offset = offset_past(res, offset);
                 match res {
@@ -2302,7 +2342,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_));
         let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. });
         let end = runs_to(&block.instructions);
+        let mut dies = None;
         for (off, res) in block.instructions[..end].iter().enumerate() {
+            if let Some((_, end)) = dies.filter(|&(at, _)| at == off) {
+                alloc.forget(&slots_from(end, offset.get()));
+            }
+            dies = results_end(&block.instructions, off).or(dies);
             debug!("JIT operation {res:?}");
             window_dump!(self.jctx, "  {off:3} {res}");
             jit_note!(self.jctx, ops, "  {off:3} {res}");
@@ -3031,6 +3076,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let w = &w;
                     let stencils = &mut self.jctx.stencils;
                     let emits = match plans.get(&id) {
+                        // A `Move` planned as a rename. See `WindowAlloc::rename`.
+                        Some(plan) if plan.placed[off].is_some_and(|(skip, _)| skip as usize >= RENAME) => {
+                            let framed = Framed::new(&**w, offset.get());
+                            let store = plan.placed[off].is_some_and(|(skip, _)| skip as usize == RENAME_STORE);
+                            Some(alloc.rename(framed.slots()[0], framed.slots()[1], store))
+                        }
                         Some(plan) => plan.placed[off].map(|(skip, want)| {
                             let mut emits = alloc.reconcile(&want.unpack(), &Framed::new(&**w, offset.get()), skip as usize);
                             emits.extend(alloc.op(&Framed::new(&**w, offset.get()), [skip as usize]).expect("a placed op runs at its SKIP"));
