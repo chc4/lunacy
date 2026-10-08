@@ -691,7 +691,7 @@ fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
     }
     let hold = crate::specialize::Count::hold;
     let (held_a, held_b) = (hold(a), hold(b));
-    Some(window_op!(ShiftFrame [] (held_a, held_b, stack) [&[a as usize]]; a, b))
+    Some(window_op!(ShiftFrame [] (held_a as u64, held_b as u64, stack) [&[a as usize]]; a, b))
 }
 
 /// The slots, as the window names them at `offset`, that an `Inline`'s window op kills: the
@@ -3211,10 +3211,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }; break; }
             if shifted.is_some() {
                 let &Residual::Inline { a, b, stack } = call else { unreachable!() };
+                // The window op keeps r13, the caller's base pointer, and the stack, which the
+                // callee's frame is within, stays where it is.
                 jit_note!(self.jctx, ops, "        enter the callee's frame");
                 dynasm!(ops
                     ; .arch x64
-                    ; mov r13, QWORD [rsp + (crate::vm::INLINE_KEPT * 8) as i32]
                     ; add r13, (a as i32 + 1) * 8
                     ; mov QWORD [rsp], r13
                 );

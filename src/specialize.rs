@@ -759,13 +759,14 @@ impl Count {
         value.saturating_sub(3)
     }
 
-    /// The value, of this count, a hole holding `held` (`hold`) stands for.
-    pub fn lift(self, held: u16) -> usize {
+    /// The value, of this count, a hole holding `held` (`hold`) stands for: a hole of any width, as
+    /// wide as one load of it is.
+    pub fn lift(self, held: impl Into<u64>) -> usize {
         match self {
             Count::Zero => 0,
             Count::One => 1,
             Count::Two => 2,
-            Count::Many => held as usize + 3,
+            Count::Many => held.into() as usize + 3,
         }
     }
 }
@@ -826,7 +827,7 @@ windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64],
 // (`a` and `b` as `Count::hold` holds them), of a callee whose `max_stack` is `stack`, keeping the
 // window: the JIT code nils the callee's frame. See Notes [Inlined calls] and [Count case
 // analysis].
-windowed!(ShiftFrame, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
+windowed!(ShiftFrame, [a: u64, b: u64, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
     state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false);
 });
 
