@@ -15,6 +15,7 @@ copy, and the JIT's by block. `--out` writes the disassembly of every range with
 instruction with its count. `--op` sums the copies of what one note names
 (`PushFrame`, `window(GetTableInteger`) instruction by instruction, over the
 copies of the same code, and prints each code with its first copy's text.
+`--blocks-of` splits the samples of what one note names by block.
 """
 import argparse
 import re
@@ -64,6 +65,7 @@ def main():
     ap.add_argument('samples')
     ap.add_argument('--out', help='write the sampled ranges\' disassembly, with counts, here')
     ap.add_argument('--op', help='sum the copies of what this note names, by instruction')
+    ap.add_argument('--blocks-of', help='the samples of what this note names, by block')
     ap.add_argument('--top', type=int, default=25)
     args = ap.parse_args()
 
@@ -107,6 +109,16 @@ def main():
     print(f'\nJIT samples by block:')
     for k, n in by_block.most_common(args.top):
         print(f'  {n:7} {100 * n / total:5.1f}%  {k}')
+
+    if args.blocks_of:
+        of = Counter()
+        for i, n in counts.items():
+            notes = insts[i][3]
+            if notes and args.blocks_of in notes[-1]:
+                of[next((note for note in notes if note.startswith('block ')), '(no block)')] += n
+        print(f'\n{args.blocks_of}: {sum(of.values())} samples, by block:')
+        for k, n in of.most_common(args.top):
+            print(f'  {n:7} {100 * n / total:5.1f}%  {k}')
 
     if args.op:
         # A copy is a run of instructions under one note naming `op`; copies of

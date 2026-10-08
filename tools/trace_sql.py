@@ -105,19 +105,24 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return')}
 
 
+def connect(trace):
+    """A trace processor on `trace`, with the views above."""
+    tp = TraceProcessor(trace=trace, config=TraceProcessorConfig(bin_path=shutil.which('trace_processor_shell')))
+    for view, columns in VIEWS.items():
+        extracted = ', '.join(f"EXTRACT_ARG(arg_set_id, '{c}') AS {c}" for c in columns)
+        category, name = EVENTS[view]
+        tp.query(f"CREATE PERFETTO VIEW {view} AS SELECT ts, {extracted} FROM slice "
+                 f"WHERE category = '{category}' AND name = '{name}'")
+    return tp
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('query')
     ap.add_argument('--trace', default='working/lunacy.fxt')
     args = ap.parse_args()
 
-    tp = TraceProcessor(trace=args.trace, config=TraceProcessorConfig(bin_path=shutil.which('trace_processor_shell')))
-    for view, columns in VIEWS.items():
-        extracted = ', '.join(f"EXTRACT_ARG(arg_set_id, '{c}') AS {c}" for c in columns)
-        category, name = EVENTS[view]
-        tp.query(f"CREATE PERFETTO VIEW {view} AS SELECT ts, {extracted} FROM slice "
-                 f"WHERE category = '{category}' AND name = '{name}'")
-    result = tp.query(args.query)
+    result = connect(args.trace).query(args.query)
     rows = [row for row in result]
     if not rows:
         print('(no rows)')

@@ -1029,6 +1029,13 @@ pub enum CallEntry {
 // effects, applied as a continuation applies a callee's; Note [Call effects]), with no guard on the
 // return between.
 //
+// The decision is kept with the callee's entry context, by the call's point and the callee. Code
+// after an inlined call is compiled anew whenever the callee's return gives the caller a context
+// of its own, laying out the calls after it again; a call laid out at a decided point, whose
+// callee's entry context the decided one accepts, inlines from the first, with no call made
+// first. A call whose entry the decided ones don't accept, as one specialized to other types, is
+// decided again by its own continuation.
+//
 // At runtime the callee's frame is made and left as a call's (`Inline`, `InlineReturn`). In the
 // interpreter its entry in the callstack returns to the code inlining it (`Return::Inlined`), not
 // to a residual: to the interpreter, the collector and unwinding it is a frame as any other. JIT
@@ -1059,13 +1066,17 @@ pub struct InlineFrame {
     pub c: u16,
     pub effects: Effects,
     pub depth: u8,
+    /// The upvalue the callee's closure was loaded from, if the caller knows. See Note [Upvalue
+    /// paths].
+    pub closure: Option<UpvaluePath>,
 }
 
 /// A Lua call laid out, which its continuation may inline: the block and offset of its `LuaCall`,
-/// the callee's prototype, the context at the call and its B. See Note [Inlined calls].
+/// its point, the callee's prototype, the context at the call and its B. See Note [Inlined calls].
 struct InlineCall {
     block: BlockId,
     off: usize,
+    pc: SubPc,
     callee: LProto<'static, 'static>,
     calling: Rc<Context>,
     b: usize,
@@ -1131,6 +1142,14 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
         };
         if let Some(fragile) = fragile.filter(|fragile| entry.types[fragile.key().1] != CType::Type(LType::Nil)) {
             entry.introduce(Fact { fragile, origins: fact.origins.clone() });
+        }
+    }
+    // See Note [Upvalue paths].
+    if let Some(closure) = &frame.closure {
+        for fact in &caller.fragile {
+            if let Fragile::Upvalue { upvalue, ctype } = &fact.fragile && let Some(upvalue) = upvalue.rebase(closure) {
+                entry.assume(Fragile::Upvalue { upvalue, ctype: ctype.clone() });
+            }
         }
     }
     entry.inline = Some(Rc::new(frame));
@@ -1763,17 +1782,77 @@ impl std::fmt::Display for Kind {
     }
 }
 
+/// Which upvalue a fact is of: the running function's upvalue, or an upvalue of the closure
+/// another one holds. See Note [Upvalue paths].
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum UpvaluePath {
+    Own(u8),
+    Of(Rc<UpvaluePath>, u8),
+}
+
+impl UpvaluePath {
+    /// Unique among paths: an upvalue index fits a byte, and a path is as long as the inlined
+    /// calls it crosses.
+    fn key(&self) -> usize {
+        match self {
+            UpvaluePath::Own(j) => *j as usize + 1,
+            UpvaluePath::Of(closure, n) => closure.key() << 8 | (*n as usize + 1),
+        }
+    }
+
+    /// Whether a fact of this path holds after the running function's upvalue `set` is set: only
+    /// of another of its own, as a cell any closure's upvalue names may be that one.
+    fn survives_set(&self, set: usize) -> bool {
+        matches!(self, UpvaluePath::Own(j) if *j as usize != set)
+    }
+
+    /// This path from the function whose closure `closure` holds, which it names an upvalue of.
+    fn rebase(&self, closure: &UpvaluePath) -> Option<UpvaluePath> {
+        match self {
+            UpvaluePath::Own(_) => None,
+            UpvaluePath::Of(of, n) if **of == *closure => Some(UpvaluePath::Own(*n)),
+            UpvaluePath::Of(of, n) => of.rebase(closure).map(|of| UpvaluePath::Of(Rc::new(of), *n)),
+        }
+    }
+
+    /// This path, of the function whose closure `closure` holds, from the function `closure` is
+    /// of.
+    fn under(&self, closure: &UpvaluePath) -> UpvaluePath {
+        match self {
+            UpvaluePath::Own(n) => UpvaluePath::Of(Rc::new(closure.clone()), *n),
+            UpvaluePath::Of(of, n) => UpvaluePath::Of(Rc::new(of.under(closure)), *n),
+        }
+    }
+}
+
+// Note [Upvalue paths]
+// ~~~~~~~~~~~~~~~~~~~~
+// Facts about upvalues name the upvalue by a path from the running function: its own upvalue j, or
+// upvalue n of the closure another path's upvalue holds. The closure isn't known, only its
+// prototype (what its identity guard compares), so a fact can't name its cells, only where it is.
+//
+// A set of the running function's own upvalue j falsifies the facts of paths through j, and of
+// every path through another closure: cells are shared, and any of them may be j's. Setting
+// another closure's upvalue is a call, whose effects say whether it set any (Note [Call effects]).
+//
+// Paths carry facts across inlined calls (Note [Inlined calls]). Where the caller knows which of
+// its upvalues' paths the callee's closure was loaded from, the callee enters knowing as its own
+// the caller's facts about that closure's upvalues, and its return gives the caller what it then
+// knows of its own, as paths through that closure, unless it set some upvalue. A caller making
+// several calls of one closure it loads from one upvalue learns at its first inlined call what
+// every later one then knows.
+
 /// Speculation the specializer assumes without a guard. See Note [Fragile
 /// information].
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Fragile {
     /// Stack slot `slot` holds the value upvalue `upvalue` held when loaded
     /// into it.
-    Holds { slot: usize, upvalue: usize },
+    Holds { slot: usize, upvalue: UpvaluePath },
     /// Upvalue `upvalue` holds a value of `ctype`, which a guard found in a
     /// slot holding its value: for a function past its identity guard, which.
     /// Every slot holding its value is of `ctype`.
-    Upvalue { upvalue: usize, ctype: CType },
+    Upvalue { upvalue: UpvaluePath, ctype: CType },
     /// Stack slot `slot` holds a value loaded from the array part of the table
     /// in slot `table`. See Note [Array kinds].
     ElementOf { slot: usize, table: usize },
@@ -1879,7 +1958,7 @@ impl Fragile {
     fn key(&self) -> (u8, usize) {
         match self {
             Fragile::Holds { slot, .. } => (0, *slot),
-            Fragile::Upvalue { upvalue, .. } => (1, *upvalue),
+            Fragile::Upvalue { upvalue, .. } => (1, upvalue.key()),
             Fragile::ElementOf { slot, .. } => (2, *slot),
             Fragile::Kind { table, .. } => (3, *table),
             Fragile::Constant { slot, .. } => (4, *slot),
@@ -1892,7 +1971,7 @@ impl Fragile {
             (_, Effect::Opaque) => false,
             (Fragile::Holds { slot, .. }, Effect::Write(written)) => written != *slot,
             (Fragile::Holds { .. }, Effect::WriteAny) => false,
-            (Fragile::Holds { upvalue, .. } | Fragile::Upvalue { upvalue, .. }, Effect::SetUpvalue(set)) => set != *upvalue,
+            (Fragile::Holds { upvalue, .. } | Fragile::Upvalue { upvalue, .. }, Effect::SetUpvalue(set)) => upvalue.survives_set(set),
             (Fragile::Holds { .. } | Fragile::Upvalue { .. }, Effect::AnyUpvalue) => false,
             (Fragile::ElementOf { .. } | Fragile::Kind { .. }, Effect::AnyUpvalue) => true,
             (Fragile::Upvalue { .. }, Effect::Write(_) | Effect::WriteAny) => true,
@@ -2122,19 +2201,19 @@ impl Context {
     }
 
     /// The upvalue whose value slot `slot` holds, if known.
-    fn holds(&self, slot: usize) -> Option<usize> {
+    fn holds(&self, slot: usize) -> Option<UpvaluePath> {
         self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Holds { slot: held, upvalue } if *held == slot => Some(*upvalue),
+            Fragile::Holds { slot: held, upvalue } if *held == slot => Some(upvalue.clone()),
             _ => None,
         })
     }
 
     /// Assume upvalue `upvalue` holds a value of `ctype`, as does each slot
     /// holding its value, unless the slot's type already tells more.
-    fn learn_upvalue(&mut self, upvalue: usize, ctype: CType) {
+    fn learn_upvalue(&mut self, upvalue: UpvaluePath, ctype: CType) {
         for fact in &self.fragile {
-            if let Fragile::Holds { slot, upvalue: held } = fact.fragile && held == upvalue && self.types[slot].accepts(&ctype) {
-                self.types[slot] = ctype.clone();
+            if let Fragile::Holds { slot, upvalue: held } = &fact.fragile && *held == upvalue && self.types[*slot].accepts(&ctype) {
+                self.types[*slot] = ctype.clone();
             }
         }
         self.assume(Fragile::Upvalue { upvalue, ctype });
@@ -2183,17 +2262,18 @@ impl Context {
         })
     }
 
+    /// A slot holding the running function's upvalue `upvalue`'s value, if known.
     fn held(&self, upvalue: usize) -> Option<usize> {
         self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Holds { slot, upvalue: held } if *held == upvalue => Some(*slot),
+            Fragile::Holds { slot, upvalue: UpvaluePath::Own(held) } if *held as usize == upvalue => Some(*slot),
             _ => None,
         })
     }
 
-    /// The type of upvalue `upvalue`'s value, if known.
+    /// The type of the running function's upvalue `upvalue`'s value, if known.
     fn upvalue(&self, upvalue: usize) -> Option<&CType> {
         self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Upvalue { upvalue: known, ctype } if *known == upvalue => Some(ctype),
+            Fragile::Upvalue { upvalue: UpvaluePath::Own(known), ctype } if *known as usize == upvalue => Some(ctype),
             _ => None,
         })
     }
@@ -2525,6 +2605,9 @@ pub struct Specializer<'src, 'intern> {
     /// Each function's points a contraction rebuilt an origin at, with how: code compiled there
     /// again takes the same answer. See Note [Contraction].
     decided: std::collections::HashMap<LProto<'src, 'intern>, std::collections::HashMap<SubPc, ResumeArg, rustc_hash::FxBuildHasher>, InternedHasher>,
+    /// Each function's calls a continuation inlined, by the call's point and the callee: the
+    /// entry contexts it decided on. See Note [Inlined calls].
+    inlined: HashMap<(LProto<'src, 'intern>, SubPc, LProto<'src, 'intern>), Vec<Context>, rustc_hash::FxBuildHasher>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -2537,6 +2620,9 @@ impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
         }
         for types in &self.returns {
             types.iter().for_each(|ty| ty.mark(owner));
+        }
+        for entries in self.inlined.values() {
+            entries.iter().for_each(|entry| entry.mark(owner));
         }
     }
 }
@@ -2556,6 +2642,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             trimming: Vec::new(),
             rebuilt: Default::default(),
             decided: Default::default(),
+            inlined: Default::default(),
             unreachable: Default::default(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
@@ -3737,8 +3824,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 forced_mut.hkeys[href.0 as usize].known_type = Some(Kind::Of(found_field));
             }
             let holds = forced_mut.holds(idx);
-            if let Some(upvalue) = holds {
-                forced_mut.learn_upvalue(upvalue, found.clone());
+            if let Some(upvalue) = &holds {
+                forced_mut.learn_upvalue(upvalue.clone(), found.clone());
             }
             debug!("forcing thunk with {} == {}", found, expected);
             // Continued as a guard the context answers would be, so the ways
@@ -3811,6 +3898,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, frame: &InlineFrame, a: usize, b: usize) -> BlockId {
         let mut known = frame.caller.clone();
         frame.effects.apply(owner, &mut known, &frame.captured);
+        // See Note [Upvalue paths].
+        if let Some(closure) = frame.closure.as_ref().filter(|_| frame.effects.0 & Effects::UPVALUE.0 == 0) {
+            for fact in &ctx.fragile {
+                if let Fragile::Upvalue { upvalue, ctype } = &fact.fragile {
+                    known.assume(Fragile::Upvalue { upvalue: upvalue.under(closure), ctype: ctype.clone() });
+                }
+            }
+        }
         let (call, c) = (frame.a as usize, frame.c as usize);
         let returned = (b != 0).then(|| b - 1);
         let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
@@ -3877,14 +3972,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         layout.push(Residual::LuaGuard { idx: a, ptr: proto.cast() });
                         layout.push(next(vm));
                     }
+                    // A call a continuation decided to inline in a context its callee's entry
+                    // accepts this one's in inlines from the first. See Note [Inlined calls].
+                    if let Some((ctx, captured, after_pc)) = &continuation
+                        && inlines(&calling, unsafe { &*vm.proto }, unsafe { &*proto }, a)
+                    {
+                        let callee = proto as LProto<'static, 'static>;
+                        let entry = Self::inline_frame(&calling, callee, ctx, captured, vm.proto as LProto<'static, 'static>, *after_pc, a, b, c);
+                        let mut known = entry.clone();
+                        known.inline = None;
+                        if vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known))) {
+                            vm.blocks[block.0].instructions.extend(layout);
+                            let shift = vm.inline_call(owner, block, callee, a, b, entry);
+                            vm.blocks[block.0].instructions.push(Residual::Jump(shift));
+                            return;
+                        }
+                    }
                     let (stack, vararg) = unsafe { ((*proto).max_stack, (*proto).is_vararg != 0) };
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let off = vm.blocks[block.0].instructions.len() + layout.len();
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg });
-                    if let Some((ctx, captured, pc)) = &continuation {
+                    if let Some((ctx, captured, after_pc)) = &continuation {
                         // See Notes [Call continuations] and [Inlined calls].
-                        let call = InlineCall { block, off, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
-                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), *pc, a, c, after.clone(), Some(Rc::new(call)), 0, true)));
+                        let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
+                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), *after_pc, a, c, after.clone(), Some(Rc::new(call)), 0, true)));
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -3971,6 +4082,51 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
+    /// The entry context of the inlined call of R(A) with B and C in `calling`, of `callee`, by the
+    /// function `proto`, which continues at `after` from `caller`, the context before the call
+    /// less the callee's frame (`captured` its slots below the call its closures captured). See
+    /// Note [Inlined calls].
+    fn inline_frame(calling: &Context, callee: LProto<'static, 'static>, caller: &Context, captured: &Rc<[usize]>, proto: LProto<'static, 'static>, after: Pc, a: usize, b: usize, c: usize) -> Context {
+        let frame = InlineFrame {
+            caller: caller.clone(),
+            captured: captured.clone(),
+            proto,
+            after,
+            a: a as u16,
+            c: c as u16,
+            effects: Effects::NONE,
+            depth: calling.inline.as_ref().map_or(1, |frame| frame.depth + 1),
+            closure: calling.holds(a),
+        };
+        inline_entry(calling, unsafe { &*callee }, a, b, frame)
+    }
+
+    /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
+    /// callee's frame in, then goes on to its version for `entry`. See Note [Inlined calls].
+    fn inline_call(&mut self, owner: &mut Owner, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context) -> BlockId {
+        #[cfg(feature = "tracing")]
+        let (_line, _entry, _after) = (self.traced_line(owner), entry.tostring(owner), entry.inline.as_ref().map_or(0, |frame| frame.after));
+        let caller = self.proto;
+        self.set_current(callee as LProto<'_, '_>);
+        self.versions.entry(self.proto).or_insert_with(|| HashMap::default());
+        let version = self.version(owner, 0, Rc::new(entry));
+        self.set_current(caller);
+        let shift = self.new_block(self.blocks[block.0].pc);
+        let stack = unsafe { (*callee).max_stack };
+        self.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: b as u16, stack }, Residual::Jump(version)]);
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("spec", "inline", &[
+            ("line", _line.into()),
+            ("callee", (unsafe { (*callee).line_defined } as u64).into()),
+            ("after", _after.into()),
+            ("call_block", block.0.into()),
+            ("shift", shift.0.into()),
+            ("entry", version.0.into()),
+            ("context", _entry.as_str().into()),
+        ]);
+        shift
+    }
+
     /// The thunk a Lua function's call continues at, in `block_id`, or, not
     /// `appends`, a continuation guard's failure is: run, just after a return,
     /// it lays out a guard on that return, chaining a thunk for the next onto
@@ -3991,38 +4147,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 && matches!(vm.blocks[call.block.0].instructions.get(call.off), Some(Residual::LuaCall { .. }))
                 && inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee }, a)
             {
-                let frame = InlineFrame {
-                    caller: (*ctx).clone(),
-                    captured: captured.clone(),
-                    proto: vm.proto as LProto<'static, 'static>,
-                    after: pc,
-                    a: a as u16,
-                    c: c as u16,
-                    effects: Effects::NONE,
-                    depth: call.calling.inline.as_ref().map_or(1, |frame| frame.depth + 1),
-                };
-                let entry = inline_entry(&call.calling, unsafe { &*call.callee }, a, call.b, frame);
-                #[cfg(feature = "tracing")]
-                let (_line, _entry) = (vm.traced_line(owner), entry.tostring(owner));
-                let caller = vm.proto;
-                vm.set_current(call.callee as LProto<'_, '_>);
-                vm.versions.entry(vm.proto).or_insert_with(|| HashMap::default());
-                let callee = vm.version(owner, 0, Rc::new(entry));
-                vm.set_current(caller);
-                let shift = vm.new_block(vm.blocks[call.block.0].pc);
-                let stack = unsafe { (*call.callee).max_stack };
-                vm.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: call.b as u16, stack }, Residual::Jump(callee)]);
+                let entry = Self::inline_frame(&call.calling, call.callee, &ctx, &captured, vm.proto as LProto<'static, 'static>, pc, a, call.b, c);
+                let mut decided = entry.clone();
+                decided.inline = None;
+                vm.inlined.entry((vm.proto, call.pc, call.callee as LProto<'_, '_>)).or_default().push(decided);
+                let shift = vm.inline_call(owner, call.block, call.callee, a, call.b, entry);
                 vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
-                #[cfg(feature = "tracing")]
-                crate::tracing::instant("spec", "inline", &[
-                    ("line", _line.into()),
-                    ("callee", (unsafe { (*call.callee).line_defined } as u64).into()),
-                    ("after", pc.into()),
-                    ("call_block", call.block.0.into()),
-                    ("shift", shift.0.into()),
-                    ("entry", callee.0.into()),
-                    ("context", _entry.as_str().into()),
-                ]);
             }
             // In place, as for a call thunk. See Note [Thunk patching].
             let block = if !appends || vm.compiled(block_id) {
@@ -4773,7 +4903,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, known.unwrap_or(CType::Unknown))]);
-                    ctx.assume(Fragile::Holds { slot, upvalue });
+                    ctx.assume(Fragile::Holds { slot, upvalue: UpvaluePath::Own(upvalue as u8) });
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
                     self.blocks[block_id.0].allocates = true;
