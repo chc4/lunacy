@@ -1894,7 +1894,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let (a, b) = (a as usize, b as usize);
         // The arguments' end, before the frame is pushed.
         let passed = if b == 0 { self.top } else { self.base + a + b };
-        let stack = self.push_frame::<true>(owner, ret, a, b, true);
+        let stack = self.push_frame::<true>(owner, ret, a, b, 0, true);
         if vararg {
             let func = self.base - 1;
             self.callstack.last_mut().expect("the frame just pushed").func = core::mem::MaybeUninit::new(func);
@@ -1961,15 +1961,15 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// is: luac emits no LOADNIL for a local declared at a function's first
     /// instruction. With `fills`, this nils it; without, the caller does, before
     /// anything reads the stack or marks it. The stack is made long enough for
-    /// its frame size, read now, as it may have grown since the call was laid
-    /// out. Returns its `max_stack`.
+    /// its frame size: `frame`, or with 0, read from the callee. Returns its
+    /// `max_stack`.
     ///
     /// With `ENTRY`, the caller's state is recorded in a `CallstackEntry`
     /// returning to `ret`; without, for a call from JIT code of a function that
     /// isn't vararg, the frame is only counted (`jit_depth`), the caller keeping
     /// that state, and `ret` is unused. See Note [Frame ops] in `specialize`.
     #[inline(always)]
-    pub fn push_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, fills: bool) -> usize {
+    pub fn push_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, frame: usize, fills: bool) -> usize {
         let entry = ENTRY.then(|| CallstackEntry {
             clos: self.clos.clone(),
             ret: Return::To(Location::unpack(ret)),
@@ -1984,7 +1984,8 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         // one, and JIT code past its call's version's guard of it.
         let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unsafe { core::hint::unreachable_unchecked() } };
         let proto = unsafe { &*lclos.ro(owner).prototype };
-        let (next_stack, frame) = (proto.max_stack as usize, proto.frame_size.get());
+        debug_assert!(frame == 0 || frame == proto.frame_size.get(), "a call's frame size isn't its callee's");
+        let (next_stack, frame) = (proto.max_stack as usize, if frame == 0 { proto.frame_size.get() } else { frame });
         let next_base = self.base + a + 1;
         // Its arguments are `b - 1` values, or up to the top, which the caller
         // wrote; the rest of its frame is nilled, so the stack only needs to be

@@ -772,10 +772,12 @@ impl Count {
 }
 
 // `push_frame`, without the callstack's entry, for a call of R(A), with CALL's B (`a` and `b` as
-// `Count::hold` holds them). Requires nilling the callee's frame if `FILLS`, or else the JIT code
-// does. The callee isn't vararg. See Note [Frame ops].
-windowed!(frame PushFrame, [a: u16, b: u16], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
-    state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), A.lift(a), B.lift(b), FILLS);
+// `Count::hold` holds them), of a callee whose frame size is `frame`, or 0 to read it from the
+// callee: the JIT code's copy's own, which the JIT patches as it grows. Requires nilling the
+// callee's frame if `FILLS`, or else the JIT code does. The callee isn't vararg. See Notes [Frame
+// ops] and [Inlined calls].
+windowed!(frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
+    state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), A.lift(a), B.lift(b), frame as usize, FILLS);
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
 
@@ -953,9 +955,9 @@ pub enum Residual {
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
     /// A call to the Lua function in R(A), The target `entry` is a prototype a `LuaGuard` or the
-    /// context knows. Sizes the newly pushed frame to `stack` slots (the prototype's `max_stack`).
-    /// `vararg` if the prototype is vararg (Note [Vararg frames]). See Note [Call sites].
-    LuaCall { entry: CallEntry, a: u16, b: u16, c: u16, stack: u8, vararg: bool },
+    /// context knows, `callee`, whose `max_stack` is `stack`. `vararg` if the prototype is vararg
+    /// (Note [Vararg frames]). See Note [Call sites].
+    LuaCall { entry: CallEntry, a: u16, b: u16, c: u16, stack: u8, vararg: bool, callee: LProto<'static, 'static> },
     /// A tail call of the Lua function in R(A), `entry` as a `LuaCall`'s: its frame replaces the
     /// running function's, which closes its open upvalues if `closes` (as `Ret`) and is vararg if
     /// `vararg`. The running function's `effects` are joined into the callee's
@@ -1025,7 +1027,8 @@ pub enum CallEntry {
 // A function's frames hold the frames of the calls inlined into it, to any depth: its frame size
 // grows with each call inlined, so every frame of it a call makes, and the collector's live
 // extent, has room for them, and making an inlined callee's frame never lengthens the stack. As it
-// grows the stack is lengthened under its frames already running.
+// grows the stack is lengthened under its frames already running, and JIT code's calls of the
+// function, which hold its size, are patched to the new one.
 //
 // The decision is kept with the callee's entry context, by the call's point and the callee. Code
 // after an inlined call is compiled anew whenever the callee's return gives the caller a context
@@ -3989,7 +3992,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let (stack, vararg) = unsafe { ((*proto).max_stack, (*proto).is_vararg != 0) };
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let off = vm.blocks[block.0].instructions.len() + layout.len();
-                    layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg });
+                    layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg, callee: proto as LProto<'static, 'static> });
                     if let Some((ctx, captured, after_pc)) = &continuation {
                         // See Notes [Call continuations] and [Inlined calls].
                         let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
@@ -4109,6 +4112,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         if unsafe { (*outermost.proto).frame_size.grow(inline_offset(&entry) + (*callee).max_stack as usize) } {
             state.fit_frames(owner);
+            #[cfg(feature = "jit")]
+            self.jctx.frame_grew(outermost.proto as usize, unsafe { (*outermost.proto).frame_size.get() });
         }
         #[cfg(feature = "tracing")]
         let (_line, _entry, _after) = (self.traced_line(owner), entry.tostring(owner), entry.inline.as_ref().map_or(0, |frame| frame.after));
@@ -5351,7 +5356,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     w.interp(owner, &mut state);
                     off += if state.select == 1 { 2 } else { 1 };
                 },
-                &Residual::LuaCall { ref entry, a, b, c, stack, vararg } => {
+                &Residual::LuaCall { ref entry, a, b, c, stack, vararg, callee: called } => {
                     let entry = entry.clone();
                     let (caller, call) = (id, off);
                     off += 1;
@@ -5367,7 +5372,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             self.versions.entry(callee.ro(owner).prototype).or_insert_with(|| HashMap::default());
                             let block = self.version(owner, 0, ctx);
                             self.set_current(callee.ro(owner).prototype);
-                            self.blocks[caller.0].instructions[call] = Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, stack, vararg };
+                            self.blocks[caller.0].instructions[call] = Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, stack, vararg, callee: called };
                             block
                         },
                     };

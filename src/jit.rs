@@ -476,6 +476,13 @@ impl Pool {
         })
     }
 
+    /// The label of a new entry holding `value`, shared with no other, to be patched.
+    fn own(&mut self, ops: &mut Assembler, value: u64) -> DynamicLabel {
+        let label = ops.new_dynamic_label();
+        self.entries.push((label, PoolEntry::Value(value)));
+        label
+    }
+
     /// The label of a new entry holding the absolute address of `target`.
     fn address(&mut self, ops: &mut Assembler, target: DynamicLabel) -> DynamicLabel {
         let label = ops.new_dynamic_label();
@@ -746,9 +753,16 @@ fn keeps_frame(res: &Residual) -> bool {
 /// A frame op's stencil, copied at `SKIP` 0, or, in a build that copies none, a
 /// call running its body. See Note [Frame ops] in `specialize`.
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
+    emit_frame_op_owning(ops, stencils, pool, op, None);
+}
+
+/// `emit_frame_op`, the value of its hole `own` in a pool entry of its copy's own, whose label it
+/// returns, if it copied the stencil and the stencil loads it.
+fn emit_frame_op_owning(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>, own: Option<usize>) -> Option<DynamicLabel> {
+    let mut owned = None;
     match stencils.body(&**op, 0, 0) {
         Ok(body) => {
-            splat(ops, &body, op.name(), &op.captures(), pool, None, Unalign::Target);
+            owned = splat_owning(ops, &body, op.name(), &op.captures(), pool, None, Unalign::Target, own);
         }
         // Debug builds' stencils can keep what optimized ones fold away, but an
         // optimized frame op the copier rejects is a bug to fix.
@@ -767,6 +781,7 @@ fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, 
     }
     // A frame op's stencil keeps no window, the pinned tag's register included.
     emit_pin(ops);
+    owned
 }
 
 /// How a copy between `sub rsp, 8` and `add rsp, 8` leaves from its middle by
@@ -783,7 +798,16 @@ enum Unalign {
 /// Copy `body`, its other exit, the one it doesn't fall through to, going to
 /// `other`, its cold path's exits too. See Note [Window exits] in `window`.
 fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool, other: Option<DynamicLabel>, unalign: Unalign) {
+    splat_owning(ops, body, name, captures, pool, other, unalign, None);
+}
+
+/// `splat`, the value of hole `own` in a pool entry of the copy's own, not shared with any other,
+/// so that it can be patched: its label, if the body loads it.
+fn splat_owning(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool, other: Option<DynamicLabel>, unalign: Unalign, own: Option<usize>) -> Option<DynamicLabel> {
+    let mut owned = None;
     enum Site {
+        /// Hole `own`'s value.
+        Owned(u64),
         Value(u64),
         Absolute(usize),
         /// Where exit 0 goes.
@@ -820,6 +844,7 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
     let mut sites: SmallVec<[(usize, usize, Site); 8]> = SmallVec::new();
     sites.extend(body.holes.iter().map(|&(r, i)| match i {
         crate::window::SITE_HOLE => (r.end, r.field, Site::Record),
+        i if Some(i) == own => (r.end, r.field, Site::Owned(captures[i])),
         i => (r.end, r.field, Site::Value(captures[i])),
     }));
     sites.extend(body.relocations().iter().map(|r| (r.end, r.field, Site::Absolute(r.target))));
@@ -845,6 +870,10 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
             }
             Site::Value(value) => {
                 let entry = pool.value(ops, value);
+                ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
+            }
+            Site::Owned(value) => {
+                let entry = *owned.get_or_insert_with(|| pool.own(ops, value));
                 ops.dynamic_relocation(entry, 0, field_offset, 0, rel32(RelocationKind::Relative));
             }
             Site::Exit0Address => {
@@ -879,6 +908,7 @@ fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captur
             ; =>after
         );
     }
+    owned
 }
 
 /// The JIT code buffer's size. `immediate_jit` compiles every block that runs,
@@ -913,6 +943,12 @@ pub struct JitContext {
     thunk_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
     /// The thunk sites of the region being compiled, by offset in it.
     region_sites: Vec<(BlockId, usize, usize, Cache)>,
+    /// Where each call JIT code makes of a function holds the function's frame size, by the
+    /// function's prototype's address: patched as it grows. See Note [Inlined calls] in
+    /// `specialize`.
+    frame_sites: HashMap<usize, Vec<usize>, FxBuildHasher>,
+    /// The frame size entries of the region being compiled: the prototype and the entry.
+    region_frames: Vec<(usize, DynamicLabel)>,
     /// The loop headers of the region being compiled, which start aligned
     /// (`LOOP_ALIGN`) with feature `align_loops`.
     region_headers: std::collections::HashSet<BlockId, FxBuildHasher>,
@@ -1280,6 +1316,8 @@ impl JitContext {
             pending: BTreeMap::new(),
             thunk_sites: HashMap::default(),
             region_sites: Vec::new(),
+            frame_sites: HashMap::default(),
+            region_frames: Vec::new(),
             region_headers: Default::default(),
             #[cfg(feature = "tracing")]
             traced_line: 0,
@@ -1453,6 +1491,14 @@ impl JitContext {
         unsafe { core::slice::from_raw_parts_mut(ptr, contents.len()).copy_from_slice(contents) };
         self.memory.set(mutable.make_exec().unwrap());
         Some(ptr)
+    }
+
+    /// The function of the prototype at `proto`'s frame size is now `size`: JIT code's calls of it
+    /// hold that. See Note [Inlined calls] in `specialize`.
+    pub fn frame_grew(&mut self, proto: usize, size: usize) {
+        for at in self.frame_sites.get(&proto).cloned().unwrap_or_default() {
+            self.patch(at, &(size as u64).to_le_bytes());
+        }
     }
 
     /// Overwrite committed code at `at` with `bytes`.
@@ -1710,8 +1756,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.reserve(ops.offset().0 - pool_start.0);
 
         debug!("drained pending");
+        let frames: Vec<(usize, usize)> = std::mem::take(&mut self.jctx.region_frames).into_iter()
+            .map(|(proto, entry)| (proto, ops.labels().resolve_dynamic(entry).expect("a frame size's entry placed").0))
+            .collect();
         let buf = ops.finalize().unwrap();
         let Some(slab) = self.jctx.commit(base, buf.as_slice()) else { panic!() };
+        for (proto, at) in frames {
+            self.jctx.frame_sites.entry(proto).or_default().push(slab as usize + at);
+        }
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
         for (block, off, at, window) in std::mem::take(&mut self.jctx.region_sites) {
             self.jctx.thunk_sites.insert((block, off), ThunkSite { at: slab as usize + at, window });
@@ -2545,7 +2597,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; no_trap:
                     );
                 },
-                Residual::LuaCall { entry, a, b, c, stack, vararg } => {
+                Residual::LuaCall { entry, a, b, c, stack, vararg, callee } => {
                     // The callee's version's code, if the call has found the version
                     // and it has some; a version with none yet is linked when it has
                     // some (Note [Call linking]); else the call goes as one to a
@@ -2579,10 +2631,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let hold = crate::specialize::Count::hold;
                             let (held_a, held_b) = (hold(*a), hold(*b));
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
-                            let push = match nils {
-                                Some(_) => frame_op!(PushFrame [false,] (held_a, held_b); *a, *b),
-                                None => frame_op!(PushFrame [true,] (held_a, held_b); *a, *b),
+                            // The callee's frame size, which the copy holds in an entry of its own
+                            // that the JIT patches as the size grows; with no copy, the op reads it.
+                            // See Note [Inlined calls] in `specialize`.
+                            let push = |frame: u64| match nils {
+                                Some(_) => frame_op!(PushFrame [false,] (held_a, held_b, frame); *a, *b),
+                                None => frame_op!(PushFrame [true,] (held_a, held_b, frame); *a, *b),
                             };
+                            let mut push = push(unsafe { (**callee).frame_size.get() } as u64);
+                            if self.jctx.stencils.body(&*push, 0, 0).is_err() {
+                                push = match nils {
+                                    Some(_) => frame_op!(PushFrame [false,] (held_a, held_b, 0u64); *a, *b),
+                                    None => frame_op!(PushFrame [true,] (held_a, held_b, 0u64); *a, *b),
+                                };
+                            }
                             jit_note!(self.jctx, ops, "        keep the caller's frame");
                             dynasm!(ops
                                 ; .arch x64
@@ -2592,7 +2654,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; push QWORD r12 => RunState.witness_top
                             );
                             jit_note!(self.jctx, ops, "        PushFrame");
-                            emit_frame_op(ops, &mut self.jctx.stencils, pool, &push);
+                            if let Some(entry) = emit_frame_op_owning(ops, &mut self.jctx.stencils, pool, &push, Some(2)) {
+                                self.jctx.region_frames.push((*callee as usize, entry));
+                            }
                             self.jctx.frame_ops.push(push);
                             jit_note!(self.jctx, ops, "        enter the callee");
                             dynasm!(ops
