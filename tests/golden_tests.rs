@@ -13,6 +13,9 @@ thread_local! {
     // The metatable of `make_userdata`'s userdata, as its bits: a native captures nothing. The
     // global `userdata_metatable` holds it too, which keeps it alive.
     static USERDATA_METATABLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // The metatable of `make_counter`'s userdata, as `USERDATA_METATABLE`; the global
+    // `counter_metatable` holds it.
+    static COUNTER_METATABLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // The owner is per-thread (a second `Owner::new()` on a thread panics), so a shared
     // `static` cell — which would have to be `Sync` — can't hold it; each test thread gets
     // its own capture buffer instead.
@@ -141,6 +144,31 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
                 Ok(1)
             })));
             _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "make_userdata")), make_userdata, s.intern());
+
+            // `make_counter()`: a userdata whose data is a count, from 0, which its
+            // method `bump` adds one to and returns, as a library's objects keep
+            // native state.
+            let mut index = vm::Table::new(0, 1);
+            index.insert_lvalue(vm::InternString::intern(s.intern(), "bump"), vm::LValue::NClosure(vm::NClosure::new(|mut seq, args, returns, owner| {
+                let vm::LValue::Userdata(counter) = args.ro(&seq)[0].unbox() else { return Err(vm::LBoxed::NIL) };
+                let count = counter.ro(owner).data::<std::cell::Cell<i32>>().expect("a counter's count");
+                count.set(count.get() + 1);
+                returns.rw(&mut seq).iter_mut().next().map(|r| *r = vm::LBoxed::from_int(count.get()));
+                Ok(1)
+            })));
+            let mut metatable = vm::Table::new(0, 1);
+            metatable.insert_lvalue(vm::InternString::intern(s.intern(), "__index"), vm::LValue::Table(vm::Tc::new(index)));
+            let metatable = vm::LBoxed::box_lvalue(vm::LValue::Table(vm::Tc::new(metatable)));
+            COUNTER_METATABLE.with(|bits| bits.set(metatable.bits()));
+            _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "counter_metatable")), metatable, s.intern());
+            let make_counter = vm::LBoxed::box_lvalue(vm::LValue::NClosure(vm::NClosure::pure(|mut seq, _args, returns, _owner| {
+                // Safety: the global `counter_metatable` keeps it alive.
+                let metatable = unsafe { vm::LBoxed::from_bits(COUNTER_METATABLE.with(|bits| bits.get())) }.as_table();
+                let counter = vm::LValue::Userdata(vm::Tc::new(vm::Userdata::with_data(metatable, std::cell::Cell::new(0i32))));
+                returns.rw(&mut seq).iter_mut().next().map(|r| *r = vm::LBoxed::box_lvalue(counter));
+                Ok(1)
+            })));
+            _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "make_counter")), make_counter, s.intern());
 
             let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
             let args = vec![].into();

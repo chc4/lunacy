@@ -446,14 +446,33 @@ impl std::hash::BuildHasher for InternedHasher {
 /// A userdata: a value with an identity and a metatable, and no contents Lua
 /// can read. Its metatable is fixed when it's made, which compiled code reading
 /// its fields relies on. See Note [Userdata fields] in `specialize`.
-#[derive(Debug)]
+///
+/// A native making one can give it data of its own, which the natives taking it
+/// read (`data`), and which is dropped with it. The GC doesn't trace the data, so
+/// it holds no Lua values.
 pub struct Userdata<'src, 'intern> {
     metatable: Option<Tc<Table<'src, 'intern>>>,
+    data: Option<Box<dyn std::any::Any>>,
+}
+
+impl<'src, 'intern> Debug for Userdata<'src, 'intern> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Userdata").field("metatable", &self.metatable).field("data", &self.data.is_some()).finish()
+    }
 }
 
 impl<'src, 'intern> Userdata<'src, 'intern> {
     pub fn new(metatable: Option<Tc<Table<'src, 'intern>>>) -> Self {
-        Userdata { metatable }
+        Userdata { metatable, data: None }
+    }
+
+    pub fn with_data<T: std::any::Any>(metatable: Option<Tc<Table<'src, 'intern>>>, data: T) -> Self {
+        Userdata { metatable, data: Some(Box::new(data)) }
+    }
+
+    /// Its data, if it has data of type `T`.
+    pub fn data<T: std::any::Any>(&self) -> Option<&T> {
+        self.data.as_ref()?.downcast_ref()
     }
 
     pub fn metatable(&self) -> Option<&Tc<Table<'src, 'intern>>> {
