@@ -1154,12 +1154,21 @@ fn emit_type_test(ops: &mut Assembler, v: u8, expected: LType, numeric: bool, pa
     }
 }
 
-/// A type guard tested inline, in the window register caching its slot.
+/// A guard tested inline, in the window register caching its slot: a type guard, or a function's
+/// identity guard.
 fn inline_guard(res: &Residual) -> bool {
     matches!(res, Residual::Guard {
         expected: LType::Integer | LType::Double | LType::Nil | LType::Bool | LType::Table | LType::Closure | LType::String | LType::Userdata,
         ..
-    } | Residual::NumericGuard { .. })
+    } | Residual::NumericGuard { .. } | Residual::LuaGuard { .. } | Residual::NativeGuard { .. })
+}
+
+/// The slot an inline guard tests.
+fn guarded_slot(res: &Residual) -> usize {
+    match res {
+        Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } | Residual::LuaGuard { idx, .. } | Residual::NativeGuard { idx, .. } => *idx,
+        res => unreachable!("not a guard: {res}"),
+    }
 }
 
 /// The `SKIP`s a window op's stencil can be copied at: none where stencils
@@ -1930,7 +1939,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot + at)));
                                 events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot + at)));
                             }
-                            Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => events.push(Event::Read(*idx + at)),
+                            res if inline_guard(res) => events.push(Event::Read(guarded_slot(res) + at)),
                             Residual::Inline { a, .. } if !skips[off].is_empty() => {
                                 events.push(Event::Read(*a as usize + at));
                                 events.extend(inline_kills(res, at).iter().map(Event::Write));
@@ -2069,7 +2078,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         of[off] = Some(steps.len());
                         steps.push(Step::Op(Framed::new(&**windows[b][off].as_ref().expect("a window op"), at), skips[b][off].clone()));
                     }
-                    Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => steps.push(Step::Read(*idx + at)),
+                    res if inline_guard(res) => steps.push(Step::Read(guarded_slot(res) + at)),
                     Residual::Inline { .. } if !skips[b][off].is_empty() => {
                         of[off] = Some(steps.len());
                         steps.push(Step::Op(Framed::new(&**windows[b][off].as_ref().expect("a window op"), at), skips[b][off].clone()));
@@ -2389,14 +2398,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let res = shifted.as_ref().unwrap_or(res);
             loop { match res {
-                Residual::Guard { idx, expected } | Residual::NumericGuard { idx, expected } if inline_guard(res) => {
-                    let numeric = matches!(res, Residual::NumericGuard { .. });
-                    // NuN-boxed type check of the value in `STACK[idx]`: in the window
-                    // register caching it, or else loaded from its stack home. A
-                    // *match* jumps to the success continuation at `off + 2`, a
-                    // *mismatch* falls through to the failure edge at `off + 1`,
-                    // both with the window live. `v` holds the value: its window
-                    // register, or else r10.
+                res if inline_guard(res) => {
+                    // A check of the value in `STACK[idx]`: in the window register caching
+                    // it, or else loaded from its stack home. A *match* jumps to the
+                    // success continuation at `off + 2`, a *mismatch* falls through to the
+                    // failure edge at `off + 1`, both with the window live. `v` holds the
+                    // value: its window register, or else r10.
+                    let idx = &guarded_slot(res);
                     let v = match alloc.register_of(*idx + offset.get()) {
                         // Unboxed, boxed into r10 for the test, the window as it was.
                         Some(reg) if alloc.cache().loc(reg).unboxed => {
@@ -2423,7 +2431,34 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             10 // r10
                         }
                     };
-                    emit_type_test(ops, v, *expected, numeric, insts[off + 2]);
+                    match res {
+                        Residual::Guard { expected, .. } => emit_type_test(ops, v, *expected, false, insts[off + 2]),
+                        Residual::NumericGuard { expected, .. } => emit_type_test(ops, v, *expected, true, insts[off + 2]),
+                        // The value is a raw `Gc` (GcInner base) of the `LClosure` (`GcInner.val`,
+                        // valid since TCell is transparent), whose `prototype` is the identity.
+                        Residual::LuaGuard { ptr, .. } => {
+                            let prototype = (core::mem::offset_of!(GcInner<TLCell<TlcOwner, LClosure<'src, 'intern>>>, val)
+                                + core::mem::offset_of!(LClosure<'src, 'intern>, prototype)) as i32;
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rax, QWORD (*ptr as i64)
+                                ; cmp rax, QWORD [Rq(v) + prototype]
+                                ; jz =>insts[off + 2]
+                            );
+                        }
+                        // The value is a raw (leaked) `NClosureCell` pointer, whose `native` fn
+                        // pointer is the identity.
+                        Residual::NativeGuard { ptr, .. } => {
+                            let native = core::mem::offset_of!(NClosureCell, native) as i32;
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov rax, QWORD (*ptr as i64)
+                                ; cmp rax, QWORD [Rq(v) + native]
+                                ; jz =>insts[off + 2]
+                            );
+                        }
+                        res => unreachable!("not an inline guard: {res}"),
+                    }
                 },
                 Residual::GuardWitness { href, expected } => {
                     // A `Guard` of hash key `href`'s field: its value, through the
@@ -2455,32 +2490,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; call extern (JitHelper::check_guard as *const () as usize)
                         ; test al, 1 // a returned bool is bit 0: the rest of al may not be zero
                         ; jnz =>insts[off + 2]
-                        // Fail: fallthrough to next (off + 1)
-                    );
-                },
-                Residual::NativeGuard { idx, ptr } => {
-                    // The value is a raw (leaked) `NClosureCell` pointer; load its
-                    // `native` fn pointer and compare to the specialized target.
-                    dynasm!(ops
-                        ; .arch x64
-                        ; mov rax, QWORD r13 => LBoxed<'src, 'intern>[*idx as i32]
-                        ; mov rcx, QWORD (*ptr as i64)
-                        ; cmp rcx, QWORD rax => NClosureCell.native
-                        ; jz =>insts[off + 2]
-                        // Fail: fallthrough to next (off + 1)
-                    );
-                },
-                Residual::LuaGuard { idx, ptr } => {
-                    // The value is a raw `Gc` (GcInner base); step to the inner
-                    // `LClosure` (`GcInner.val`, valid since TCell is transparent)
-                    // and compare its `prototype` to the specialized identity.
-                    dynasm!(ops
-                        ; .arch x64
-                        ; mov rax, QWORD r13 => LBoxed<'src, 'intern>[*idx as i32]
-                        ; lea rax, rax => GcInner<TLCell<TlcOwner, LClosure<'src, 'intern>>>.val
-                        ; mov rcx, QWORD (*ptr as i64)
-                        ; cmp rcx, QWORD rax => LClosure<'src, 'intern>.prototype
-                        ; jz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)
                     );
                 },
