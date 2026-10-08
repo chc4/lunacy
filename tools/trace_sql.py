@@ -63,6 +63,13 @@ The specializer's are also views, one column per argument:
   contract_refused(ts, line, origins, how, reason)
       a queued contraction dropped: a fact `used` since, an origin `compiled`,
       or every origin `rebuilt` already.
+  inline(ts, line, callee, after, call_block, shift, entry, context)
+      a call in the function at `line` inlined, its continuation at pc `after`,
+      of the function defined at `callee`: the call's block, the block moving
+      to the callee's frame, and the callee's entry block and its context.
+  inline_return(ts, line, callee, after, block, context)
+      the code after an inlined call, of the function at `line` at pc `after`,
+      for a return in the inlined callee's code: its block and context.
 
     tools/trace_sql.py [--trace working/lunacy.fxt] QUERY
 (in the devshell, whose `trace_processor_shell` it runs; `just trace-sql`)
@@ -86,13 +93,16 @@ VIEWS = {
     'encoding': ['line', 'pc', 'block', 'encoding'],
     'narrow': ['line', 'slot', 'block', 'origins', 'queued'],
     'evicted': ['line', 'pc', 'blocks'],
+    'inline': ['line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
+    'inline_return': ['line', 'callee', 'after', 'block', 'context'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
           'contractible': ('spec', 'contractible'), 'contract': ('spec', 'contract'),
           'contract_deferred': ('spec', 'contract_deferred'), 'contract_refused': ('spec', 'contract_refused'),
           'unreachable': ('spec', 'unreachable'), 'encoding': ('spec', 'encoding'),
-          'narrow': ('spec', 'narrow'), 'evicted': ('spec', 'evicted')}
+          'narrow': ('spec', 'narrow'), 'evicted': ('spec', 'evicted'),
+          'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return')}
 
 
 def main():

@@ -1369,7 +1369,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Some(policy) => {
                     #[cfg(feature = "tracing")]
                     {
-                        self.jctx.traced_line = unsafe { (*self.clos.ro(owner).prototype).line_defined } as usize;
+                        self.jctx.traced_line = unsafe { (*self.proto).line_defined } as usize;
                     }
                     plans = self.plan_region(id, policy, linked.as_ref());
                     plans[&id].entry_window(linked.as_ref().unwrap_or(&Cache::default()))
@@ -1541,7 +1541,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
 
         let (source, line) = {
-            let proto = self.clos.ro(owner).prototype;
+            let proto = self.proto;
             let source = unsafe { String::from_utf8_lossy((*proto).source.data).to_string().replace("\0", "") };
             let line = unsafe { (*proto).line_defined };
             (source, line)
@@ -2658,16 +2658,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp ->exit_jit
                     );
                 },
-                Residual::Inline { a, b, stack, witnesses } => {
+                Residual::Inline { a, b, stack } => {
                     // The callee's frame, moved to by `ShiftFrame`, which keeps no register but
                     // `state`'s; and the base pointer with it, from the region's copy of it on the
                     // native stack, which the code after a call takes it back from, moved too.
                     // Past a fixed count of arguments the frame is nilled here, as for a
                     // `LuaCall`. See Note [Inlined calls] in `specialize`.
                     let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
-                    let shift: Rc<dyn Window> = match nils {
-                        Some(_) => Rc::new(crate::specialize::ShiftFrame::<false>::new(*a, *b, *stack, *witnesses, &[])),
-                        None => Rc::new(crate::specialize::ShiftFrame::<true>::new(*a, *b, *stack, *witnesses, &[])),
+                    let hold = crate::specialize::Count::hold;
+                    let (held_a, held_b) = (hold(*a), hold(*b));
+                    let shift = match nils {
+                        Some(_) => frame_op!(ShiftFrame [false,] (held_a, held_b, *stack); *a, *b),
+                        None => frame_op!(ShiftFrame [true,] (held_a, held_b, *stack); *a, *b),
                     };
                     jit_note!(self.jctx, ops, "        ShiftFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &shift);
@@ -2690,17 +2692,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     }
                 },
-                Residual::InlineReturn { a, b, closes, call, witnesses, stack, returns, effects } => {
+                Residual::InlineReturn { a, b, closes, call } => {
                     // The caller's frame, moved back to by `UnshiftFrame`, and the base pointer
-                    // with it, as for `Inline`; then the return, for the continuation's guard,
-                    // where a call's code has it. See Notes [Inlined calls] and [Call
-                    // continuations] in `specialize`.
+                    // with it, as for `Inline`. See Note [Inlined calls] in `specialize`.
                     let call = *call;
-                    let frame = *a as u64 | (*b as u64) << 16 | (call as u64) << 32 | (*stack as u64) << 48;
-                    let (witnesses, returns, effects) = (*witnesses, *returns, *effects as u64);
-                    let unshift: Rc<dyn Window> = match closes {
-                        false => Rc::new(crate::specialize::UnshiftFrame::<false>::new(frame, witnesses, returns, effects, &[])),
-                        true => Rc::new(crate::specialize::UnshiftFrame::<true>::new(frame, witnesses, returns, effects, &[])),
+                    let hold = crate::specialize::Count::hold;
+                    let (held_a, held_b) = (hold(*a), hold(*b));
+                    let unshift = match closes {
+                        false => frame_op!(UnshiftFrame [false,] (held_a, held_b); *a, *b),
+                        true => frame_op!(UnshiftFrame [true,] (held_a, held_b); *a, *b),
                     };
                     jit_note!(self.jctx, ops, "        UnshiftFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &unshift);
@@ -2710,7 +2710,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov r13, QWORD [rsp - 0]
                         ; sub r13, (call as i32 + 1) * 8
                         ; mov QWORD [rsp], r13
-                        ; mov rax, QWORD r12 => RunState.returned
                     );
                 },
                 Residual::Branch { hot, cold } => {

@@ -158,9 +158,17 @@ impl From<usize> for TraceValue<'static> {
 
 static TRACER: OnceLock<Mutex<Tracer>> = OnceLock::new();
 
+/// Start tracing to `path`. A panic flushes the trace first, so a failing run leaves the events
+/// up to its failure.
 pub fn init(path: &str) {
     let tracer = Tracer::new(path);
-    let _ = TRACER.set(Mutex::new(tracer));
+    if TRACER.set(Mutex::new(tracer)).is_ok() {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            flush();
+            hook(info);
+        }));
+    }
 }
 
 pub fn instant(category: &str, name: &str, args: &[(&str, TraceValue)]) {

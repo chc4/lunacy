@@ -1564,12 +1564,21 @@ pub const EFFECTS_SHIFT: u32 = 20;
 // callee is known) and at its returns. The outermost frame, a chunk, has no extra
 // arguments.
 
+/// Where a frame returns to: the residual after its call in its caller's code, or, for an inlined
+/// call's frame, the code inlining it, which the running frame JIT code called at `depth` (0 for
+/// none) entered it from. See Note [Inlined calls] in `specialize`.
+#[derive(Debug)]
+pub enum Return {
+    To(Location),
+    Inlined { depth: usize },
+}
+
 /// A frame's caller's state, restored when it returns, and, for a vararg
 /// function's frame, its function's slot. See Note [Stack frames].
 #[derive(Debug)]
 pub struct CallstackEntry<'src, 'intern> {
     pub clos: Tc<LClosure<'src, 'intern>>,
-    pub ret: Location,
+    pub ret: Return,
     pub frame: usize,
     /// The slot of the frame's function, where its results go: initialized in
     /// exactly the entries of vararg functions' frames. `call_lua` pushes every
@@ -1582,6 +1591,14 @@ pub struct CallstackEntry<'src, 'intern> {
 }
 
 impl<'src, 'intern> CallstackEntry<'src, 'intern> {
+    /// Where this entry's frame returns to, unless it is an inlined call's.
+    pub fn returns_to(&self) -> Option<&Location> {
+        match &self.ret {
+            Return::To(location) => Some(location),
+            Return::Inlined { .. } => None,
+        }
+    }
+
     /// The slot of the function of this entry's frame.
     ///
     /// # Safety
@@ -1703,6 +1720,9 @@ pub struct RunState<'src, 'intern> {
     pub pc: usize,
     pub _G: Tc<Table<'src, 'intern>>,
     pub clos: Tc<LClosure<'src, 'intern>>,
+    /// The run's outermost frame's closure, which has no function's slot to keep it while it calls
+    /// from JIT code. See Note [Frame ops] in `specialize`.
+    pub entry: Tc<LClosure<'src, 'intern>>,
     pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Tc<Upvalue<'src, 'intern>>>)>,
     pub callstack: FVec<CallstackEntry<'src, 'intern>>,
     pub counters: PerfCounters,
@@ -1915,7 +1935,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     pub fn push_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, stack: u8, fills: bool) -> usize {
         let entry = ENTRY.then(|| CallstackEntry {
             clos: self.clos.clone(),
-            ret: Location::unpack(ret),
+            ret: Return::To(Location::unpack(ret)),
             frame: self.base,
             // Set by `call_lua` if the function is vararg.
             func: core::mem::MaybeUninit::uninit(),
@@ -1954,11 +1974,11 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     }
 
     /// The frame of an inlined call of R(A), with CALL's B, of a callee whose `max_stack` is
-    /// `stack`: the running frame moves to the callee's, with no callstack entry, its hash
-    /// witnesses past the caller's first `witnesses`, as `push_frame` makes a frame, nilled past
-    /// its arguments if `fills`, or else by the JIT code. See Note [Inlined calls] in `specialize`.
+    /// `stack`, made as `push_frame` makes a frame, nilled past its arguments if `fills`, or else
+    /// by the JIT code; its entry returns to the code inlining it (`Return::Inlined`). See Note
+    /// [Inlined calls] in `specialize`.
     #[inline(always)]
-    pub fn shift_frame(&mut self, owner: &Owner, a: usize, b: usize, stack: u8, witnesses: usize, fills: bool) {
+    pub fn shift_frame(&mut self, owner: &Owner, a: usize, b: usize, stack: u8, fills: bool) {
         debug_assert!(matches!(self.vals[self.base + a].unbox(), LValue::LClosure(_)), "an inlined call of what isn't a Lua function");
         // SAFETY: R(A) is a Lua function, past its call's guard of it.
         let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unsafe { core::hint::unreachable_unchecked() } };
@@ -1972,40 +1992,38 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         if fills && passed < end {
             self.nil_slots(passed, end);
         }
+        self.callstack.push(CallstackEntry {
+            clos: core::mem::replace(&mut self.clos, lclos),
+            ret: Return::Inlined { depth: self.jit_depth },
+            frame: self.base,
+            func: core::mem::MaybeUninit::uninit(),
+            witness_frame: self.witness_base,
+            witness_top: self.witness_top,
+        });
         self.base = next_base;
         self.top = end;
-        self.witness_base += witnesses;
-        self.witness_top = self.witness_top.max(self.witness_base);
-        self.clos = lclos;
+        self.witness_base = self.witness_top;
     }
 
-    /// The return, RETURN A B, of the frame `shift_frame` made for an inlined call of the
-    /// caller's R(`call`): closing its open upvalues if `closes`, its results to its function's
-    /// slot, as `leave` moves them, and the caller's frame running again, its closure in its own
-    /// function's slot, the stack long enough for it, `stack` slots: the collector may have
-    /// shrunk it to the callee's frame, and what it grows back by is nilled, as a call nils its
-    /// callee's frame (Note [Stack frames]). `witnesses` is `shift_frame`'s. See Note [Inlined
-    /// calls] in `specialize`.
+    /// The return, RETURN A B, of the frame `shift_frame` made for an inlined call: closing its
+    /// open upvalues if `closes`, its results to its function's slot, as `leave` moves them, and
+    /// its entry popped, the caller's frame running again. See Note [Inlined calls] in
+    /// `specialize`.
     #[inline(always)]
-    pub fn unshift_frame(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, call: usize, witnesses: usize, stack: u8) {
+    pub fn unshift_frame(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) {
         if closes && !self.upvals.is_empty() {
             self.close_upvalues(owner);
         }
         let from = self.base + a;
         let count = if b == 0 { self.top - from } else { b - 1 };
         self.move_results(from, count, self.base - 1);
-        self.base -= call + 1;
-        self.witness_base -= witnesses;
-        let (end, len) = (self.base + stack as usize, self.vals.len());
-        if end > len {
-            self.vals.lengthen(end);
-            self.nil_slots(len, end);
-        }
-        debug_assert!(matches!(self.vals[self.base - 1].unbox(), LValue::LClosure(_)), "an inlined call's caller with no closure in its function's slot");
-        // SAFETY: the caller isn't vararg, so its function's slot is just below its base (Note
-        // [Vararg frames]), and holds it while it runs.
-        let LValue::LClosure(caller) = self.vals[self.base - 1].unbox() else { unsafe { core::hint::unreachable_unchecked() } };
-        self.clos = caller;
+        debug_assert!(matches!(self.callstack.last(), Some(CallstackEntry { ret: Return::Inlined { .. }, .. })), "an inlined call's return to a frame it didn't make");
+        // SAFETY: the running frame is the inlined call's, whose entry `shift_frame` pushed.
+        let CallstackEntry { clos, frame, witness_frame, witness_top, .. } = unsafe { self.callstack.pop().unwrap_unchecked() };
+        self.clos = clos;
+        self.base = frame;
+        self.witness_base = witness_frame;
+        self.witness_top = witness_top;
     }
 
     /// VARARG A B in the running frame, of a vararg function with `params`
@@ -2105,6 +2123,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
                     self.base - 1
                 };
                 let CallstackEntry { clos, ret, frame, witness_frame, witness_top, .. } = entry;
+                debug_assert!(matches!(ret, Return::To(_)), "a call's return to an inlined call's frame");
+                // SAFETY: an inlined call's frame returns through `unshift_frame`, never here.
+                let Return::To(ret) = ret else { unsafe { core::hint::unreachable_unchecked() } };
                 self.move_results(from, count, to);
                 self.clos = clos;
                 self.base = frame;
@@ -2256,20 +2277,33 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             self.unwound = self.jit_depth;
         }
         let index = self.callstack.len() + self.jit_depth - 1;
-        let entry = CallstackEntry { clos, ret: Location::unpack(ret), frame, func: core::mem::MaybeUninit::uninit(), witness_frame, witness_top };
+        let entry = CallstackEntry { clos, ret: Return::To(Location::unpack(ret)), frame, func: core::mem::MaybeUninit::uninit(), witness_frame, witness_top };
         // SAFETY: `index` is within the room made above, past the length, and written once: each
         // frame JIT code called is at its own depth.
         unsafe { self.callstack.as_mut_ptr().add(index).write(entry) };
         self.jit_depth -= 1;
     }
 
-    /// Take the entries `unwind_jit_frame` wrote into the callstack, once JIT code has exited.
+    /// Take the entries `unwind_jit_frame` wrote into the callstack, once JIT code has exited: each
+    /// before the entries of the inlined calls its frame and those it called made, which are the
+    /// callstack's last, as those frames make no other. See Note [Inlined calls] in `specialize`.
     pub fn finish_unwinding(&mut self) {
         assert_eq!(self.jit_depth, 0, "JIT code exited with frames it called still running");
+        let len = self.callstack.len();
+        let inlined = self.callstack.iter().rev().take_while(|entry| matches!(entry.ret, Return::Inlined { depth } if depth > 0)).count();
         // SAFETY: `unwind_jit_frame` wrote each of them, from the outermost frame JIT code called
         // in.
-        let len = self.callstack.len() + self.unwound;
-        unsafe { self.callstack.set_len(len) };
+        unsafe { self.callstack.set_len(len + self.unwound) };
+        if inlined > 0 {
+            let called: Vec<_> = self.callstack.drain(len..).collect();
+            let mut at = len - inlined;
+            for (i, entry) in called.into_iter().enumerate() {
+                let depth = i + 1;
+                at += self.callstack[at..].iter().position(|entry| matches!(entry.ret, Return::Inlined { depth: pushed } if pushed >= depth)).unwrap_or(self.callstack.len() - at);
+                self.callstack.insert(at, entry);
+                at += 1;
+            }
+        }
         self.unwound = 0;
     }
 
@@ -2340,6 +2374,7 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
         }
         self.vals.truncate(extent);
         self.clos.mark(owner);
+        self.entry.mark(owner);
         self._G.mark(owner);
         self.strings.mark(owner);
         if let Some(error) = &self.error {
@@ -2580,7 +2615,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         args.resize_with(unsafe {
             (*clos.ro(owner).prototype).max_stack as usize
         }, || LBoxed::NIL);
-        let mut spec = Specializer::new(clos.clone());
+        let mut spec = Specializer::new(clos.ro(owner).prototype);
         let strings = _G.get_string(owner, b"string").as_table().expect("the string library");
         let mut state = {
             let mut vals = args;
@@ -2602,6 +2637,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 witness_top: 0,
                 pc,
                 _G,
+                entry: clos.clone(),
                 clos,
                 vals,
                 upvals,
@@ -2633,7 +2669,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let entry = state.clos.clone();
         let ctx = Rc::new(Context::new(state.vals.len()));
         spec.versions.entry(entry.ro(owner).prototype).or_insert_with(|| HashMap::default());
-        spec.set_current(entry);
+        spec.set_current(entry.ro(owner).prototype);
         let block = spec.version(owner, 0, ctx);
         let (mut state, r_vals) = spec.run(gc, owner, block, state);
         // Its frame is gone, as a returning function's is: the closures it made

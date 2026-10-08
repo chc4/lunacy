@@ -19,9 +19,6 @@ test:
     cargo test --features "gc_sanitize"
     # Interpreter GC stress test
     cargo test --features "gc_stress gc_sanitize"
-    # Golden suite with every block JIT compiled on first run (window ops run
-    # through their interpreter path: `immediate_jit` copies no stencils)
-    cargo test --features "immediate_jit gc_sanitize" --test golden_tests
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     cargo test --test gc_reset_frees
 
@@ -32,9 +29,7 @@ test:
 # tests also run in `just test` (debug); this runs them against optimized
 # stencils, then the golden suite with `check_windows`: every window op the
 # interpreter executes is also copy&patched and run natively, and the results
-# must match. Then the golden suite with every block JIT compiled, optimized
-# (`immediate_jit` copies no stencils, so window ops run through their
-# interpreter path under the JIT's register allocation). (At opt-level 0,
+# must match. (At opt-level 0,
 # `NumericRR` keeps a jump table from the unfolded `match OP`, which the
 # copier rejects: the check skips it and the JIT calls into the interpreter.)
 STENCIL_OPT := "--release"
@@ -42,7 +37,6 @@ STENCIL_OPT := "--release"
 test-stencils:
     cargo test --features check_windows --lib window:: {{STENCIL_OPT}}
     cargo test --features check_windows --test golden_tests {{STENCIL_OPT}}
-    cargo test --features immediate_jit --test golden_tests {{STENCIL_OPT}}
 
 # A benchmark's run traced (feature `tracing`) to working/lunacy.fxt, a
 # Perfetto trace (https://ui.perfetto.dev opens it), and summarized with
@@ -53,6 +47,15 @@ trace benchmark times='10' features='unsafe':
     cargo build --profile unsafe --no-default-features --features "{{features}} tracing" --bin bench \
         --target-dir target/tracing -Z build-std="core,std,panic_abort"
     cd working && ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
+    python3 tools/perfetto_summary.py working/lunacy.fxt
+
+# A golden test's run traced (feature `tracing`), as `trace` traces a
+# benchmark's: lua_tests/<name>.lua in the golden harness, built in release with
+# `features`, to working/lunacy.fxt, then summarized. A failing run still
+# leaves its trace.
+trace-golden name features='check_windows':
+    -LUNACY_GOLDEN={{name}} cargo test --release --features "{{features}} tracing" --test golden_tests test_golden
+    mv lunacy.fxt working/lunacy.fxt
     python3 tools/perfetto_summary.py working/lunacy.fxt
 
 # `trace`'s summary of working/lunacy.fxt again.
@@ -148,6 +151,15 @@ jit-disasm benchmark times='10' features='unsafe':
 # function, by kind of residual, and the largest blocks, from its annotated
 # disassembly (`jit-disasm`).
 jit-code-size benchmark times='10': (jit-disasm benchmark times)
+    python3 tools/jit_code_size.py working/jit_disasm.txt
+
+# A golden test's JIT code, in bytes, as `jit-code-size` measures a benchmark's:
+# lua_tests/<name>.lua run by the release build.
+jit-code-size-test name:
+    just _luac-test {{name}}
+    rm -f working/jit_disasm.txt
+    cd working && cargo run --release --features jit_disasm --bin lunacy \
+        --target-dir ../target/jit_disasm -- {{name}}.bin > /dev/null
     python3 tools/jit_code_size.py working/jit_disasm.txt
 
 # How much machine code LuaJIT's JIT generates for a benchmark, and whether it

@@ -156,7 +156,7 @@ impl std::fmt::Display for Residual {
             Residual::Branch { .. } => write!(f, "branch"),
             Residual::Ret(..) => write!(f, "ret"),
             Residual::Inline { a, b, .. } => write!(f, "inline({}, {})", a, b),
-            Residual::InlineReturn { a, b, call, .. } => write!(f, "inline_ret({}, {}, {})", a, b, call),
+            Residual::InlineReturn { a, b, .. } => write!(f, "inline_ret({}, {})", a, b),
             Residual::GC => write!(f, "gc"),
         }
     }
@@ -713,7 +713,10 @@ impl After {
 // interpreter's call path, while frames JIT code called are running, goes to the interpreter
 // instead, which makes the callstack whole first. The frames JIT code called stay rooted for the
 // collector without entries: each one's closure is in its function's slot, in its caller's frame,
-// and while any runs, the collector marks the whole stack (Note [Stack frames] in `vm`).
+// and while any runs, the collector marks the whole stack (Note [Stack frames] in `vm`). So is the
+// closure of each frame that called one, which its call keeps on the native stack, but for the
+// run's outermost frame, which has no function's slot: the run's state keeps that one
+// (`RunState::entry`).
 //
 // JIT code runs the interpreter's own frame maintenance functions, not a copy of the logic. Each
 // one is ran as a window op, copied into the JIT code, which means that the size of each function
@@ -820,22 +823,18 @@ windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64],
     };
 });
 
-// `shift_frame` for an inlined call of R(A) with CALL's B, of a callee whose `max_stack` is
-// `stack`, its hash witnesses past the caller's first `witnesses`. Nilling the callee's frame if
-// `FILLS`, or else the JIT code does. See Note [Inlined calls].
-windowed!(frame ShiftFrame, [a: u16, b: u16, stack: u8, witnesses: u16], [FILLS: bool], |owner, state, base| () {
-    state.shift_frame(owner, a as usize, b as usize, stack, witnesses as usize, FILLS);
+// `shift_frame` for an inlined call of R(A) with CALL's B (`a` and `b` as `Count::hold` holds
+// them), of a callee whose `max_stack` is `stack`. Nilling the callee's frame if `FILLS`, or else
+// the JIT code does. See Notes [Inlined calls] and [Count case analysis].
+windowed!(frame ShiftFrame, [a: u16, b: u16, stack: u8], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
+    state.shift_frame(owner, A.lift(a), B.lift(b), stack, FILLS);
 });
 
-// `unshift_frame` for an inlined callee's RETURN A B, closing its frame's open upvalues if
-// `CLOSES`, of the call of the caller's R(`call`), back to the caller's frame of `stack` slots:
-// `frame` is `a | b << 16 | call << 32 | stack << 48`. `witnesses` is its `ShiftFrame`'s. The
-// return is left as `PopFrame` leaves it, with `returns` and `effects`. See Note [Inlined calls].
-windowed!(frame UnshiftFrame, [frame: u64, witnesses: u16, returns: u32, effects: u64], [CLOSES: bool], |owner, state, base| () {
-    let (a, b, call, stack) = (frame as u16 as usize, (frame >> 16) as u16 as usize, (frame >> 32) as u16 as usize, (frame >> 48) as u8);
-    state.unshift_frame(owner, a, b, CLOSES, call, witnesses as usize, stack);
-    // See Note [Call continuations].
-    state.returned = crate::vm::RETURNED | (unsafe { *(effects as *const u16) } as u64) << crate::vm::EFFECTS_SHIFT | returns as u64;
+// `unshift_frame` for an inlined callee's RETURN A B (`a` and `b` as `Count::hold` holds them),
+// closing its frame's open upvalues if `CLOSES`. See Notes [Inlined calls] and [Count case
+// analysis].
+windowed!(frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, A: Count, B: Count], |owner, state, base| () {
+    state.unshift_frame(owner, A.lift(a), B.lift(b), CLOSES);
 });
 
 // Whether a table's array part has kind `kind`, testing an element loaded from it in place of
@@ -965,14 +964,12 @@ pub enum Residual {
     /// continuations].
     Arrived { a: u16, c: u16, returned: u16 },
     LuaGuard { idx: usize, ptr: *const () },
-    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`, its
-    /// hash witnesses past the caller's first `witnesses`. See Note [Inlined calls].
-    Inline { a: u16, b: u16, stack: u8, witnesses: u16 },
+    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`. See
+    /// Note [Inlined calls].
+    Inline { a: u16, b: u16, stack: u8 },
     /// An inlined callee's RETURN A B, which closes its frame's open upvalues if `closes`: its
-    /// results to the call's R(A) and the caller's frame back, of `stack` slots, the return left
-    /// as a `Ret` leaves it, with `returns` and `effects`. `call` and `witnesses` are its
-    /// `Inline`'s A and `witnesses`. See Note [Inlined calls].
-    InlineReturn { a: u16, b: u16, closes: bool, call: u16, witnesses: u16, stack: u8, returns: u32, effects: *const Cell<Effects> },
+    /// results to the call's R(A), `call`, and the caller's frame back. See Note [Inlined calls].
+    InlineReturn { a: u16, b: u16, closes: bool, call: u16 },
     GC,
 }
 
@@ -1007,37 +1004,50 @@ pub enum CallEntry {
 
 // Note [Inlined calls]
 // ~~~~~~~~~~~~~~~~~~~~
-// A call site can compile a small Lua callee's code into its caller's, in a frame of the callee's
-// own that has no callstack entry. Past the callee's identity guard, the running frame moves up to
-// the callee's (`Inline`): its base past R(A), its closure R(A), and its hash witnesses past the
-// caller's, so that every residual of the callee's code runs in it as in a frame of its own. Each
-// RETURN of the callee's code moves its results to R(A) and the frame back (`InlineReturn`), the
-// caller's closure found in its own function's slot, and leaves the return as a return does, for
-// the call site's continuation, which guards on it as on any call's (Note [Call continuations]).
+// A call of a small Lua function can compile the callee's code into its caller's. The call's
+// continuation, forced once the call has returned, decides to: from then on the call site jumps to
+// the callee's code in place of its call. That code is compiled from the context the caller had at
+// the call, renumbered from the callee's frame's base, and carries the caller's context before the
+// call with it. Each of the callee's returns continues compiling the caller's code after the call
+// from that context, with the results' types, less what the callee's code may have falsified (its
+// effects, applied as a continuation applies a callee's; Note [Call effects]), with no guard on the
+// return between.
 //
-// The inlined frame is kept nowhere but in the code: where it starts is static, and so is undoing
-// it. So the callstack and the stack's live extent (Note [Stack frames] in `vm`) are as they are
-// in the caller's frame, and whatever leaves the callee's code sees the callee's frame running
-// with the caller's callstack: an exit continues in the interpreter at the residual it left at, a
-// call from the callee's code makes an entry for the callee's frame, and an error unwinds past it
-// as past the caller's code.
+// At runtime the callee's frame is made and left as a call's (`Inline`, `InlineReturn`), but its
+// entry in the callstack returns to the code inlining it (`Return::Inlined`), not to a residual:
+// to the interpreter, the collector and unwinding it is a frame as any other. An inlined call's
+// entry pushed by a frame JIT code called, which has no entry of its own until a bailout writes it,
+// records that frame's depth, so that the bailout's entries go before it (`finish_unwinding`).
 //
-// The callee's code is its versions for the site (`InlineSite`), which their contexts name, apart
-// from its versions for its calls and for other sites. Calls in inlined code inline in turn, to
-// `MAX_INLINE_DEPTH` sites deep. A site inlines a callee that is small, with no loop, tail call or
-// VARARG, from a caller that isn't vararg, whose closure is then in its function's slot (Note
-// [Vararg frames] in `vm`); `LUNACY_NO_INLINE` turns inlining off, to compare.
+// The callee's code is its versions for the inlined call, which their contexts carry
+// (`InlineFrame`), apart from its versions for its calls and for other inlined calls. Calls in
+// inlined code inline in turn, to `MAX_INLINE_DEPTH` deep. A callee inlines if it is small, with no
+// loop, tail call or VARARG; `LUNACY_NO_INLINE` turns inlining off, to compare.
 
-/// An inlined call's site: the block its continuation is in, the call's A, how many hash keys its
-/// caller's context had, its caller's `max_stack`, and how many sites deep it is. See Note
+/// An inlined call, for its callee's code: the caller's context before the call, its captured
+/// slots below the call, and its prototype; the pc after the call, its A and C; what the callee's
+/// code may have done to the caller so far; and how many inlined calls deep it is. See Note
 /// [Inlined calls].
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct InlineSite {
-    pub after: BlockId,
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct InlineFrame {
+    pub caller: Context,
+    pub captured: Rc<[usize]>,
+    pub proto: LProto<'static, 'static>,
+    pub after: Pc,
     pub a: u16,
-    pub witnesses: u16,
-    pub stack: u8,
+    pub c: u16,
+    pub effects: Effects,
     pub depth: u8,
+}
+
+/// A Lua call laid out, which its continuation may inline: the block and offset of its `LuaCall`,
+/// the callee's prototype, the context at the call and its B. See Note [Inlined calls].
+struct InlineCall {
+    block: BlockId,
+    off: usize,
+    callee: LProto<'static, 'static>,
+    calling: Rc<Context>,
+    b: usize,
 }
 
 /// How many inlined calls deep code can be. See Note [Inlined calls].
@@ -1051,13 +1061,11 @@ fn inlining() -> bool {
     *INLINES
 }
 
-/// Whether a call in `caller`, a function of the context `calling`, inlines `callee`. See Note
-/// [Inlined calls].
+/// Whether a call in `caller`, of the context `calling`, inlines `callee`. See Note [Inlined calls].
 fn inlines<C>(calling: &Context, caller: &crate::chunk::FunctionBlock<'_, C>, callee: &crate::chunk::FunctionBlock<'_, C>) -> bool {
     let code = &callee.instructions.items;
     inlining()
-        && calling.site.map_or(0, |site| site.depth) < MAX_INLINE_DEPTH
-        && caller.is_vararg == 0
+        && calling.inline.as_ref().map_or(0, |frame| frame.depth) < MAX_INLINE_DEPTH
         && callee.is_vararg == 0
         && !core::ptr::eq(caller, callee)
         && code.len() <= MAX_INLINE_SIZE
@@ -1068,6 +1076,27 @@ fn inlines<C>(calling: &Context, caller: &crate::chunk::FunctionBlock<'_, C>, ca
         })
 }
 
+/// The context an inlined call in `caller`, of R(A) with operand B, enters the callee `proto`
+/// with: the entry context a call has, and the caller's facts about the callee's arguments,
+/// renumbered from its base, for the inlined call `frame`. See Note [Inlined calls].
+fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize, frame: InlineFrame) -> Context {
+    let mut entry = entry_context(caller, proto, a, b);
+    let params = a + 1..a + 1 + (proto.param_count as usize).min(entry.types.len());
+    let shifted = |slot: usize| params.contains(&slot).then(|| slot - a - 1);
+    for fact in &caller.fragile {
+        let fragile = match fact.fragile {
+            Fragile::Constant { slot, value } => shifted(slot).map(|slot| Fragile::Constant { slot, value }),
+            Fragile::Kind { table, kind } => shifted(table).map(|table| Fragile::Kind { table, kind }),
+            Fragile::ElementOf { slot, table } => shifted(slot).zip(shifted(table)).map(|(slot, table)| Fragile::ElementOf { slot, table }),
+            Fragile::Holds { .. } | Fragile::Upvalue { .. } => None,
+        };
+        if let Some(fragile) = fragile.filter(|fragile| entry.types[fragile.key().1] != CType::Type(LType::Nil)) {
+            entry.introduce(Fact { fragile, origins: fact.origins.clone() });
+        }
+    }
+    entry.inline = Some(Rc::new(frame));
+    entry
+}
 /// The context a call in `caller`, of R(A) with operand B, enters the callee
 /// `proto` with. See Note [Call sites].
 fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize) -> Context {
@@ -1582,7 +1611,7 @@ pub struct Context {
     /// order. See Note [Fragile information].
     pub fragile: SmallVec<[Fact; 2]>,
     /// The inlined call whose callee's frame this is, if it is one. See Note [Inlined calls].
-    pub site: Option<InlineSite>,
+    pub inline: Option<Rc<InlineFrame>>,
 }
 
 // Note [Array kinds]
@@ -1871,7 +1900,7 @@ impl Fragile {
 /// What a callee did that its caller can see, a join as a set of bits. See
 /// Note [Call effects].
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Effects(pub u16);
 
 impl Effects {
@@ -1979,6 +2008,9 @@ impl Mark for Context {
                 ctype.mark(owner);
             }
         }
+        if let Some(frame) = &self.inline {
+            frame.caller.mark(owner);
+        }
     }
 }
 
@@ -1990,7 +2022,7 @@ impl Context {
             hkeys: vec![],
             top: None,
             fragile: SmallVec::new(),
-            site: None,
+            inline: None,
         }
     }
 
@@ -2018,6 +2050,18 @@ impl Context {
     /// Drop the facts `effect` may falsify. See Note [Fragile information].
     fn effect(&mut self, effect: Effect) {
         self.fragile.retain(|fact| fact.survives(effect));
+        self.inlined(Effects::of(effect));
+    }
+
+    /// Add `effects` to what the callee's code this is the context of may have done to its
+    /// caller, if it is an inlined call's. See Note [Inlined calls].
+    fn inlined(&mut self, effects: Effects) {
+        if let Some(frame) = &mut self.inline {
+            let joined = frame.effects.join(effects);
+            if joined != frame.effects {
+                Rc::make_mut(frame).effects = joined;
+            }
+        }
     }
 
     /// The kind of the array part of the table in slot `table`, if known. See
@@ -2122,7 +2166,7 @@ impl Context {
 
     /// Whether `self` and `other` differ at most in fragile information.
     fn alike(&self, other: &Context) -> bool {
-        self.types == other.types && self.hkeys == other.hkeys && self.top == other.top && self.site == other.site
+        self.types == other.types && self.hkeys == other.hkeys && self.top == other.top && self.inline == other.inline
     }
 
     /// The type of slot `idx`: unknown past the end.
@@ -2133,7 +2177,7 @@ impl Context {
     /// Whether a block specialized to `self` is correct in `other`. See Note
     /// [Version compatibility].
     fn accepts(&self, other: &Context) -> bool {
-        self.site == other.site && self.hkeys.iter().enumerate().all(|(i, hkey)| {
+        self.inline == other.inline && self.hkeys.iter().enumerate().all(|(i, hkey)| {
             hkey.orphan() || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
         })
             && (self.top.is_none() || self.top == other.top)
@@ -2378,6 +2422,7 @@ impl Context {
     }
 
     pub fn set_hazards(&mut self, keep: Option<usize>, href: Option<HashRef>) {
+        self.inlined(Effects::HASH);
         let mut invalidate: Vec<usize> = (0..self.hkeys.len()).collect();
         if let Some(href) = href {
             // If we know we wrote to an href, then we can set hazards only on hkeys
@@ -2403,7 +2448,8 @@ impl Context {
 
 pub struct Specializer<'src, 'intern> {
     pub blocks: Vec<Block>,
-    pub clos: Tc<LClosure<'src, 'intern>>,
+    /// The function being specialized, or run: the prototype of the running frame's closure.
+    pub proto: LProto<'src, 'intern>,
     #[cfg(feature = "jit")]
     pub jctx: JitContext,
 
@@ -2444,7 +2490,6 @@ pub struct Specializer<'src, 'intern> {
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
     fn mark(&self, owner: &Owner) {
-        self.clos.mark(owner);
         for (proto, versions) in &self.versions {
             for (key, blockid) in versions {
                 let (subpc, context) = key.deref();
@@ -2458,7 +2503,7 @@ impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
-    pub fn new(clos: Tc<LClosure<'src, 'intern>>) -> Self {
+    pub fn new(proto: LProto<'src, 'intern>) -> Self {
         Self {
             blocks: Vec::new(),
             global_caches: Vec::new(),
@@ -2475,7 +2520,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             unreachable: Default::default(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
-            clos,
+            proto,
         }
     }
 
@@ -2490,7 +2535,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Add `effects` to those of the function being specialized. See Note
     /// [Call effects].
     fn join_effects(&mut self, owner: &Owner, effects: Effects) {
-        let cell = self.effects_of(self.clos.ro(owner).prototype);
+        let cell = self.effects_of(self.proto);
         cell.set(cell.get().join(effects));
     }
 
@@ -2511,7 +2556,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let block_id = self.new_block(entry);
         self.blocks[block_id.0].context = Some(ctx.clone());
         let subpc: SubPc = SubPc::new(entry);
-        self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().insert((subpc, ctx.clone()), block_id);
+        self.versions.get_mut(&self.proto).unwrap().insert((subpc, ctx.clone()), block_id);
         #[cfg(feature = "tracing")]
         {
             let context = ctx.tostring(owner);
@@ -2527,22 +2572,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
-        if let Some(((_, ectx), &exists)) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get_key_value(&(pc, ctx.clone())) {
+        if let Some(((_, ectx), &exists)) = self.versions.get(&self.proto).unwrap().get_key_value(&(pc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
             return exists;
         }
         let ctx = self.contractible(owner, pc, ctx);
-        if let Some(((_, ectx), &exists)) = self.versions.get(&self.clos.ro(owner).prototype).unwrap().get_key_value(&(pc, ctx.clone())) {
+        if let Some(((_, ectx), &exists)) = self.versions.get(&self.proto).unwrap().get_key_value(&(pc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
             return exists;
         }
-        let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((epc, ty), block)| *epc == pc && ty.site == ctx.site).collect();
+        let count: Vec<_> = self.versions.get(&self.proto).unwrap().iter().filter(|((epc, ty), block)| *epc == pc && ty.inline == ctx.inline).collect();
         if count.len() >= HARD_MAX_VERSIONS {
             panic!("too many versions: {:#?}", count);
         }
         // Finish the remainder of the coroutine
         let new_block = self.new_block(pc.0);
-        self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().insert((pc, ctx.clone()), new_block);
+        self.versions.get_mut(&self.proto).unwrap().insert((pc, ctx.clone()), new_block);
         if let Some((succ_next, succ_ty, succ_ret)) = self.compile_one(owner, pc, ctx, coro, arg, new_block) {
             // And continue compiling the block
             self.compile(owner, succ_next, succ_ty, new_block);
@@ -2570,26 +2615,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// `joined-new`, that join compiled.
     fn choose_version(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>) -> (BlockId, &'static str, Option<Rc<Context>>) {
         let subpc = SubPc::new(pc);
-        let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
+        let versions = self.versions.get(&self.proto).unwrap();
         if let Some(((_, ectx), &exists)) = versions.get_key_value(&(subpc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
             self.unreachable.remove(&exists);
             return (exists, "exact", None);
         }
         let ctx = self.contractible(owner, subpc, ctx);
-        let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
+        let versions = self.versions.get(&self.proto).unwrap();
         if let Some(((_, ectx), &exists)) = versions.get_key_value(&(subpc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
             self.unreachable.remove(&exists);
             return (exists, "exact", None);
         }
-        if self.versions_at(owner, subpc, ctx.site) >= MAX_VERSIONS {
+        if self.versions_at(owner, subpc, &ctx.inline) >= MAX_VERSIONS {
             self.evict(owner, subpc);
         }
-        let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
+        let versions = self.versions.get(&self.proto).unwrap();
         let existing: Vec<(Rc<Context>, BlockId)> = versions
             .iter()
-            .filter(|((epc, ectx), _)| *epc == subpc && ectx.site == ctx.site)
+            .filter(|((epc, ectx), _)| *epc == subpc && ectx.inline == ctx.inline)
             .map(|((_, ectx), block)| (ectx.clone(), *block))
             .collect();
         // Versions differing only in fragile information are, kind by kind of
@@ -2659,10 +2704,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         (self.block(owner, pc, joined.clone()), "joined-new", Some(joined))
     }
 
-    /// How many versions the running function has at `pc` for the inlined call `site`, or for its
-    /// calls. See Note [Inlined calls].
-    fn versions_at(&self, owner: &Owner, pc: SubPc, site: Option<InlineSite>) -> usize {
-        self.versions.get(&self.clos.ro(owner).prototype).map_or(0, |versions| versions.keys().filter(|(at, ctx)| *at == pc && ctx.site == site).count())
+    /// How many versions the running function has at `pc` for the inlined call `inline`, or for
+    /// its calls. See Note [Inlined calls].
+    fn versions_at(&self, owner: &Owner, pc: SubPc, inline: &Option<Rc<InlineFrame>>) -> usize {
+        self.versions.get(&self.proto).map_or(0, |versions| versions.keys().filter(|(at, ctx)| *at == pc && ctx.inline == *inline).count())
     }
 
     /// Forget the versions at `pc` of the running function the trimming found unreachable, which
@@ -2670,7 +2715,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn evict(&mut self, owner: &Owner, pc: SubPc) {
         let unreachable = &mut self.unreachable;
         let mut _evicted: Vec<usize> = Vec::new();
-        self.versions.get_mut(&self.clos.ro(owner).prototype).unwrap().retain(|(at, _), block| {
+        self.versions.get_mut(&self.proto).unwrap().retain(|(at, _), block| {
             let evict = *at == pc && unreachable.remove(block);
             if evict {
                 _evicted.push(block.0);
@@ -2691,7 +2736,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// contraction: no code relied on them, and the join's version is the one the code after them
     /// gets. See Note [Contraction].
     fn contract_joined(&mut self, owner: &mut Owner, pc: SubPc, existing: &[(Rc<Context>, BlockId)], joined: &Context) {
-        let proto = self.clos.ro(owner).prototype;
+        let proto = self.proto;
         let mut origins: Vec<Origin> = Vec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         for (ectx, block) in existing {
@@ -2736,12 +2781,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// dropped: what `ctx` is then left with is the context the version
     /// contracted to. See Note [Contraction].
     fn contractible(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>) -> Rc<Context> {
-        let proto = self.clos.ro(owner).prototype;
+        let proto = self.proto;
         let mut origins: Vec<Origin> = Vec::new();
         let mut conflicting: SmallVec<[(u8, usize); 2]> = SmallVec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         for ((epc, ectx), _block) in self.versions.get(&proto).unwrap() {
-            if *epc != pc || ectx.site != ctx.site {
+            if *epc != pc || ectx.inline != ctx.inline {
                 continue;
             }
             // A version whose slot holding a constant holds another type here: the constant is
@@ -2826,14 +2871,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// How a contraction rebuilt the origin at `pc` of the running function, if one did: code
     /// compiled there again takes the same answer. See Note [Contraction].
     fn decision(&self, owner: &Owner, pc: SubPc) -> Option<ResumeArg> {
-        self.decided.get(&self.clos.ro(owner).prototype)?.get(&pc).cloned()
+        self.decided.get(&self.proto)?.get(&pc).cloned()
     }
 
     /// Rebuild the queued origins of the running function that nothing runs past, the interpreter
     /// at `at` or a frame returning: each becomes a thunk compiling the code from there again, and
     /// the blocks the code it replaced reached are to be trimmed. See Note [Contraction].
     fn rebuild_queued(&mut self, owner: &mut Owner, state: &RunState<'src, 'intern>, at: &Location) {
-        let proto = self.clos.ro(owner).prototype;
+        let proto = self.proto;
         for (of, origins, how) in std::mem::take(&mut self.contractions) {
             if of != proto {
                 self.contractions.push((of, origins, how));
@@ -2868,7 +2913,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let live: Vec<Origin> = origins.iter().filter(|origin| owner.ro(origin).rebuild.is_some()).cloned().collect();
             let past = |origin: &OriginState, Location(block, off): &Location| *block == origin.block && *off >= origin.offset;
-            if live.iter().any(|origin| past(owner.ro(origin), at) || state.callstack.iter().any(|entry| past(owner.ro(origin), &entry.ret))) {
+            if live.iter().any(|origin| past(owner.ro(origin), at) || state.callstack.iter().filter_map(|entry| entry.returns_to()).any(|ret| past(owner.ro(origin), ret))) {
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("spec", "contract_deferred", &[
                     ("line", self.traced_line(owner).into()),
@@ -2944,7 +2989,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         type Blocks = std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>;
         // Where what runs goes on from: the code running and a frame returning from where they are.
         let running: Vec<(BlockId, usize)> = std::iter::once((at.0, at.1))
-            .chain(state.callstack.iter().map(|entry| (entry.ret.0, entry.ret.1)))
+            .chain(state.callstack.iter().filter_map(|entry| entry.returns_to()).map(|ret| (ret.0, ret.1)))
             .chain(state.handlers.iter().map(|handler| (handler.after, 0)))
             .collect();
         let mut reached = Blocks::default();
@@ -3012,7 +3057,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The source line of the function being specialized, for traces.
     #[cfg(feature = "tracing")]
     fn traced_line(&self, owner: &Owner) -> u64 {
-        Vm::info(self.clos.ro(owner).prototype).1 as u64
+        Vm::info(self.proto).1 as u64
     }
 
     /// `version`'s choice, for the trace (`spec`/`version`, see
@@ -3020,7 +3065,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// how many of the requested context's shapes the join lost.
     #[cfg(feature = "tracing")]
     fn trace_version(&self, owner: &Owner, pc: Pc, requested: &Context, block: BlockId, outcome: &str, joined: Option<&Context>) {
-        let versions = self.versions_at(owner, SubPc::new(pc), requested.site);
+        let versions = self.versions_at(owner, SubPc::new(pc), &requested.inline);
         let context = requested.tostring(owner);
         let joined_context = joined.map(|j| j.tostring(owner)).unwrap_or_default();
         let shapes_dropped = joined.map_or(0, |j| {
@@ -3081,12 +3126,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Return a specialized block for a given PC and context, compiling a new one if necessary
     pub fn find(&mut self, owner: &mut Owner, pc: SubPc, ctx: &Rc<Context>) -> Option<BlockId>
     {
-        self.versions.get(&self.clos.ro(owner).prototype).unwrap().get(&(pc, ctx.clone())).cloned()
+        self.versions.get(&self.proto).unwrap().get(&(pc, ctx.clone())).cloned()
     }
 
     pub fn compile(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
         loop {
-            let inst = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap().instructions.items[pc].clone() };
+            let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[pc].clone() };
             // Only a call uses the top the instruction before left. See Note [Known top].
             if ctx.top.is_some() && !matches!(inst.0.Opcode(), Opcode::CALL | Opcode::TAILCALL) {
                 Rc::make_mut(&mut ctx).top = None;
@@ -3125,7 +3170,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::VARARG => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    let params = unsafe { (*self.clos.ro(owner).prototype).param_count as usize };
+                    let params = unsafe { (*self.proto).param_count as usize };
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_vararg(a as usize, b as usize, params)), ResumeArg::Start, block_id)
                 },
                 Opcode::JMP => {
@@ -3147,7 +3192,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let c: LValue<'src, 'intern> = unsafe { (&(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize]).into() };
+                    let c: LValue<'src, 'intern> = unsafe { (&(&(*self.proto).constants.items)[bx as usize]).into() };
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadk(bx, c.typeof_(), a as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LOADNIL => {
@@ -3181,7 +3226,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::CLOSURE => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let proto = unsafe { &*self.clos.ro(owner).prototype };
+                    let proto = unsafe { &*self.proto };
                     let count = proto.prototypes.items[bx as usize].upval_count as usize;
                     let upvalues = proto.instructions.items[pc + 1..pc + 1 + count].iter()
                         .map(|pseudo| (pseudo.0.Opcode(), crate::vm::AB::unpack(pseudo.0).1 as usize))
@@ -3201,13 +3246,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
+                    let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let kst = unsafe { &(&(*self.clos.ro(owner).prototype).constants.items)[bx as usize] };
+                    let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
                     self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETTABLE => {
@@ -3231,7 +3276,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::TAILCALL => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.end_block(block_id);
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     let closes = !captured_slots(unsafe { &*proto }).is_empty();
                     let vararg = unsafe { (*proto).is_vararg != 0 };
                     let effects: *const Cell<Effects> = self.effects_of(proto);
@@ -3243,7 +3288,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Opcode::RETURN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.end_block(block_id);
-                    let proto = unsafe { &*self.clos.ro(owner).prototype };
+                    let proto = unsafe { &*self.proto };
                     let closes = !captured_slots(proto).is_empty();
                     // What it returns, for the continuations of the calls it returns to. Of the
                     // callee's frame, a table's shape means nothing to them. See Note [Call
@@ -3259,10 +3304,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         },
                     };
                     let effects: *const Cell<Effects> = self.effects_of(proto);
-                    // An inlined callee's returns to its call's continuation. See Note [Inlined calls].
-                    if let Some(site) = ctx.site {
-                        self.blocks[block_id.0].instructions.push(Residual::InlineReturn { a: a as u16, b, closes, call: site.a, witnesses: site.witnesses, stack: site.stack, returns, effects });
-                        self.blocks[block_id.0].instructions.push(Residual::Jump(site.after));
+                    // An inlined callee's returns to the code after its call. See Note [Inlined calls].
+                    if let Some(frame) = ctx.inline.clone() {
+                        let after = self.inline_return(owner, &ctx, &frame, a as usize, b as usize);
+                        self.blocks[block_id.0].instructions.push(Residual::InlineReturn { a: a as u16, b, closes, call: frame.a });
+                        if b == 0 {
+                            self.blocks[block_id.0].instructions.push(Residual::Arrive { a: frame.a, c: frame.c });
+                        } else {
+                            self.blocks[block_id.0].instructions.push(Residual::Arrived { a: frame.a, c: frame.c, returned: b - 1 });
+                        }
+                        self.blocks[block_id.0].instructions.push(Residual::Jump(after));
                     } else {
                         self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0, returns, effects));
                     }
@@ -3274,7 +3325,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         unreachable!("{:?}", x)
                     }
                     panic!("{:?}", x);
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     let vararg = unsafe { (*proto).is_vararg != 0 };
                     let effects: *const Cell<Effects> = self.effects_of(proto);
                     self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, vararg, UNKNOWN_RETURN, effects)); None
@@ -3295,7 +3346,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn edge(&mut self, owner: &mut Owner, ctx: &Context, target: BlockId) -> BlockId {
         let Some(entered) = self.blocks[target.0].context.clone() else { return target };
         let pc = self.blocks[target.0].pc;
-        let live = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
+        let live = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
         let mut jumping = ctx.clone();
         forget_dead(owner, &mut jumping, live);
         assert!(entered.accepts(&jumping), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
@@ -3317,7 +3368,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// loaded from, which lets paths that differ only in them share the target's
     /// version.
     fn jumping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
-        let in_scope = unsafe { self.clos.ro(owner).prototype.as_ref().unwrap() }.locals_in_scope(dest_pc);
+        let in_scope = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(dest_pc);
         if let Some(in_scope) = in_scope.filter(|&in_scope| forgets(&ctx, in_scope)) {
             forget_dead(owner, Rc::make_mut(&mut ctx), in_scope);
         }
@@ -3453,7 +3504,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ("queued", (queues as u64).into()),
             ]);
             if queues {
-                self.contractions.push((self.clos.ro(owner).prototype, origins, ResumeArg::Matched));
+                self.contractions.push((self.proto, origins, ResumeArg::Matched));
             }
         }
         self.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::NarrowK::new(value, &[slot]))));
@@ -3476,7 +3527,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // In place, unless the thunk's JIT code can only be patched to a jump (Note [Thunk
                 // patching] in `jit`). Nothing returns into the residuals after it, which it
                 // truncates: the rebuild waited until nothing ran past it.
-                assert!(!state.callstack.iter().any(|entry| entry.ret.0 == block && entry.ret.1 > thunk_pc), "a frame returns past a rebuilt origin");
+                assert!(!state.callstack.iter().filter_map(|entry| entry.returns_to()).any(|ret| ret.0 == block && ret.1 > thunk_pc), "a frame returns past a rebuilt origin");
                 let at = if vm.compiled(block) {
                     let at = vm.new_block(pc.0);
                     vm.jump_thunk(block, thunk_pc, at);
@@ -3552,7 +3603,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let Some(origin) = asked.clone().filter(|origin| owner.ro(origin).rebuild.is_some()) else { return };
             let queued = vm.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, &origin)));
             if !queued {
-                vm.contractions.push((vm.clos.ro(owner).prototype, vec![origin], ResumeArg::Type(CType::Type(LType::Double))));
+                vm.contractions.push((vm.proto, vec![origin], ResumeArg::Type(CType::Type(LType::Double))));
             }
         })))
     }
@@ -3700,15 +3751,43 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    /// The thunk after an `Inline`, in `block_id`, whose callee's code is its version for `entry`,
-    /// a context of the call's site: run in the callee's frame, it becomes a jump to that version,
-    /// compiled if need be. See Note [Inlined calls].
-    fn make_inline_thunk(&self, block_id: BlockId, entry: Rc<Context>) -> ThunkRef {
-        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, _state: &mut RunState, thunk_pc: usize| {
-            vm.versions.entry(vm.clos.ro(owner).prototype).or_insert_with(|| HashMap::default());
-            let callee = vm.version(owner, 0, entry.clone());
-            vm.jump_thunk(block_id, thunk_pc, callee);
-        })))
+    /// The caller's code after the inlined call `frame`, for a return in the callee's code, in
+    /// `ctx`, of RETURN A B: compiled from the caller's context before the call, less what the
+    /// callee's code may have done to it, with the results' types. See Note [Inlined calls].
+    fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, frame: &InlineFrame, a: usize, b: usize) -> BlockId {
+        let mut known = frame.caller.clone();
+        frame.effects.apply(owner, &mut known, &frame.captured);
+        let (call, c) = (frame.a as usize, frame.c as usize);
+        let returned = (b != 0).then(|| b - 1);
+        let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
+        let slots = known.types.len();
+        for i in (0..count).filter(|i| call + i < slots) {
+            known.types[call + i] = match returned {
+                Some(returned) if i < returned => match ctx.slot(a + i) {
+                    CType::Shape(of, _) => CType::Type(of),
+                    ctype => ctype,
+                },
+                Some(_) => CType::Type(LType::Nil),
+                None => CType::Unknown,
+            };
+        }
+        known.top = if c == 0 { returned.map(|returned| call + returned) } else { None };
+        let callee = self.proto;
+        #[cfg(feature = "tracing")]
+        let (_callee, _known) = (self.traced_line(owner), known.tostring(owner));
+        self.set_current(frame.proto as LProto<'_, '_>);
+        self.join_effects(owner, frame.effects);
+        let after = self.version(owner, frame.after, Rc::new(known));
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("spec", "inline_return", &[
+            ("line", self.traced_line(owner).into()),
+            ("callee", _callee.into()),
+            ("after", frame.after.into()),
+            ("block", after.0.into()),
+            ("context", _known.as_str().into()),
+        ]);
+        self.set_current(callee);
+        after
     }
 
     /// The thunk a call to R(A) of the context `calling`, continuing at
@@ -3745,25 +3824,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         layout.push(next(vm));
                     }
                     let (stack, vararg) = unsafe { ((*proto).max_stack, (*proto).is_vararg != 0) };
-                    // See Note [Inlined calls].
-                    if let Some((before, captured, after_pc)) = &continuation && inlines(&calling, unsafe { &*vm.clos.ro(owner).prototype }, unsafe { &*proto }) {
-                        let returned = vm.new_block(vm.blocks[block.0].pc);
-                        let thunk = vm.make_continuation_thunk(returned, before.clone(), captured.clone(), *after_pc, a, c, after.clone(), 0, true);
-                        vm.blocks[returned.0].instructions.push(Residual::Thunk(thunk));
-                        let caller_stack = unsafe { (*vm.clos.ro(owner).prototype).max_stack };
-                        let site = InlineSite { after: returned, a: a16, witnesses: calling.hkeys.len() as u16, stack: caller_stack, depth: calling.site.map_or(1, |site| site.depth + 1) };
-                        let mut entry = entry_context(&calling, unsafe { &*proto }, a, b);
-                        entry.site = Some(site);
-                        layout.push(Residual::Inline { a: a16, b: b16, stack, witnesses: site.witnesses });
-                        layout.push(Residual::Thunk(vm.make_inline_thunk(block, Rc::new(entry))));
-                        vm.blocks[block.0].instructions.extend(layout);
-                        return;
-                    }
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
+                    let off = vm.blocks[block.0].instructions.len() + layout.len();
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg });
                     if let Some((ctx, captured, pc)) = &continuation {
-                        // See Note [Call continuations].
-                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), *pc, a, c, after.clone(), 0, true)));
+                        // See Notes [Call continuations] and [Inlined calls].
+                        let call = InlineCall { block, off, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
+                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), *pc, a, c, after.clone(), Some(Rc::new(call)), 0, true)));
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -3861,8 +3928,48 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// (`identities`). Past that, or for a return that doesn't know what it
     /// returns, the results, and `after` (as `After::block`). See Notes [Call continuations] and
     /// [Call effects].
-    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, pc: Pc, a: usize, c: usize, after: After, identities: usize, appends: bool) -> ThunkRef {
+    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, pc: Pc, a: usize, c: usize, after: After, inline: Option<Rc<InlineCall>>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            // The call it continues, laid out just before it, inlined from now on: this return,
+            // from its frame, continues as any other. See Note [Inlined calls].
+            if let Some(call) = &inline
+                && !vm.compiled(call.block)
+                && matches!(vm.blocks[call.block.0].instructions.get(call.off), Some(Residual::LuaCall { .. }))
+                && inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee })
+            {
+                let frame = InlineFrame {
+                    caller: (*ctx).clone(),
+                    captured: captured.clone(),
+                    proto: vm.proto as LProto<'static, 'static>,
+                    after: pc,
+                    a: a as u16,
+                    c: c as u16,
+                    effects: Effects::NONE,
+                    depth: call.calling.inline.as_ref().map_or(1, |frame| frame.depth + 1),
+                };
+                let entry = inline_entry(&call.calling, unsafe { &*call.callee }, a, call.b, frame);
+                #[cfg(feature = "tracing")]
+                let (_line, _entry) = (vm.traced_line(owner), entry.tostring(owner));
+                let caller = vm.proto;
+                vm.set_current(call.callee as LProto<'_, '_>);
+                vm.versions.entry(vm.proto).or_insert_with(|| HashMap::default());
+                let callee = vm.version(owner, 0, Rc::new(entry));
+                vm.set_current(caller);
+                let shift = vm.new_block(vm.blocks[call.block.0].pc);
+                let stack = unsafe { (*call.callee).max_stack };
+                vm.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: call.b as u16, stack }, Residual::Jump(callee)]);
+                vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("spec", "inline", &[
+                    ("line", _line.into()),
+                    ("callee", (unsafe { (*call.callee).line_defined } as u64).into()),
+                    ("after", pc.into()),
+                    ("call_block", call.block.0.into()),
+                    ("shift", shift.0.into()),
+                    ("entry", callee.0.into()),
+                    ("context", _entry.as_str().into()),
+                ]);
+            }
             // In place, as for a call thunk. See Note [Thunk patching].
             let block = if !appends || vm.compiled(block_id) {
                 let block = vm.new_block(vm.blocks[block_id.0].pc);
@@ -3898,7 +4005,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // and the results are usually in temporaries it reads.
                     let version = vm.version(owner, pc, Rc::new(known));
                     layout.push(Residual::ReturnedFrom(returned));
-                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), pc, a, c, after.clone(), identities + 1, false)));
+                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), pc, a, c, after.clone(), None, identities + 1, false)));
                     layout.push(Residual::Arrived { a: a16, c: c16, returned: results.len() as u16 });
                     layout.push(Residual::Jump(version));
                 },
@@ -4221,33 +4328,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             arg = ResumeArg::Start;
             'machine: loop { match state {
                 CoroutineState::Yielded(YieldOp::TypeofK(k)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     arg = ResumeArg::Type(constant_ctype(unsafe { &(&(*proto).constants.items)[k] }));
                 },
                 CoroutineState::Yielded(YieldOp::IntegerK(k)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     let crate::chunk::Constant::Number(n) = (unsafe { &(&(*proto).constants.items)[k] }) else { unreachable!() };
                     assert!(is_integer(n.0), "{} isn't an integer", n.0);
                     arg = ResumeArg::Integer(n.0 as i32);
                 },
                 CoroutineState::Yielded(YieldOp::IntegralK(k)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     arg = if integral_constant(unsafe { &(&(*proto).constants.items)[k] }) { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
                 CoroutineState::Yielded(YieldOp::NumberK(k)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     let crate::chunk::Constant::Number(n) = (unsafe { &(&(*proto).constants.items)[k] }) else { unreachable!() };
                     // Its NaN canonicalized, as boxing it would.
                     // See Note [Arithmetic NaNs].
                     arg = ResumeArg::Number(if n.0.is_nan() { f64::NAN } else { n.0 });
                 },
                 CoroutineState::Yielded(YieldOp::BoxedK(k)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     arg = ResumeArg::Boxed(LBoxed::from(unsafe { &(&(*proto).constants.items)[k] }).bits());
                 },
                 op @ CoroutineState::Yielded(YieldOp::Typeof(idx) | YieldOp::TypeofRk(idx)) => {
                     if let CoroutineState::Yielded(YieldOp::TypeofRk(key)) = op {
-                        let proto = self.clos.ro(owner).prototype;
+                        let proto = self.proto;
                         if (key & 0x100)!=0 {
                             let k_const = key & (0xff);
                             arg = ResumeArg::Type(constant_ctype(unsafe { &(&(*proto).constants.items)[k_const as usize] }));
@@ -4276,12 +4383,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     continue 'machine;
                 },
                 CoroutineState::Yielded(YieldOp::IsKey(k, name)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     let constant = unsafe { &(&(*proto).constants.items)[k] };
                     arg = if matches!(constant, crate::chunk::Constant::String(s) if s.as_bytes() == name) { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
                 CoroutineState::Yielded(YieldOp::HashKey(place, key, chains)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     // The constant key.
                     let k_const = ((key & 0x100) != 0).then_some(key & 0xff);
                     // Only cache string keys
@@ -4381,7 +4488,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     return None;
                 },
                 CoroutineState::Yielded(YieldOp::GuardRk(rk, ref expected)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     if (rk & 0x100)!=0 {
                         let r_const = rk & (0xff);
                         let ty = constant_ctype_for(unsafe { &(&(*proto).constants.items)[r_const as usize] }, &CType::Type(*expected));
@@ -4403,7 +4510,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::GuardCType(rk, ref expected)) => {
                     let known = if (rk & 0x100) != 0 {
-                        let proto = self.clos.ro(owner).prototype;
+                        let proto = self.proto;
                         constant_ctype_for(unsafe { &(&(*proto).constants.items)[rk & 0xff] }, expected)
                     } else {
                         ctx.types[rk].clone()
@@ -4690,7 +4797,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // Any other call may run a closure, which reads and writes the
                             // slots it captured. See Note [Captured slots].
                             let captured = if !pure {
-                                captured_slots(unsafe { &*self.clos.ro(owner).prototype })
+                                captured_slots(unsafe { &*self.proto })
                             } else {
                                 vec![]
                             };
@@ -4765,7 +4872,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Rc::make_mut(&mut ctx).set_types(owner, ty_effects.drain(..).map(|(idx, ty)| (idx, CType::Type(ty))).collect())
                 },
                 CoroutineState::Yielded(YieldOp::GlobalCache(k)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     let key = LCanon::constant(unsafe { &(&(*proto).constants.items)[k] });
                     // A constant lives as long as its prototype, which the specializer's
                     // blocks do too.
@@ -4775,7 +4882,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.global_caches.push(cache);
                 },
                 CoroutineState::Yielded(YieldOp::SetKeyHazards(k)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     let key: &LConstant<'static, 'static> = unsafe { core::mem::transmute(&(&(*proto).constants.items)[k]) };
                     Rc::make_mut(&mut ctx).set_key_hazards(key);
                     // A store into the environment's hash part. See Note [Call effects].
@@ -4799,13 +4906,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = how;
                 },
                 CoroutineState::Yielded(YieldOp::EncodeK(_, k)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     if let crate::chunk::Constant::Number(n) = unsafe { &(&(*proto).constants.items)[k] } && is_integer(n.0) {
                         loading = Some(self.origin(block_id, coro.clone(), pc, ctx.clone()));
                     }
                 },
                 CoroutineState::Yielded(YieldOp::HoldsK(slot, k)) => {
-                    let proto = self.clos.ro(owner).prototype;
+                    let proto = self.proto;
                     if let crate::chunk::Constant::Number(n) = unsafe { &(&(*proto).constants.items)[k] } && is_integer(n.0) {
                         let origin = loading.take().expect("a constant's load yields EncodeK first");
                         Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Constant { slot, value: n.0 as i32 }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
@@ -4901,7 +5008,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     let next_off = (ret >> 32) as i32 as isize;
                     let next_id = (ret & 0xFFFFFFFF) as usize;
-                    self.clos = state.clos.clone();
+                    self.proto = state.clos.ro(owner).prototype;
 
                     #[cfg(feature = "tracing")]
                     self.trace_bailout(owner, &state, next_off, next_id);
@@ -5057,14 +5164,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // The closure called, which may be another of the prototype the
                     // guard checked.
                     let callee = state.clos.clone();
-                    self.set_current(callee.clone());
+                    self.set_current(callee.ro(owner).prototype);
                     let block = match entry {
                         CallEntry::Block(block) => block,
                         // Found now, once. See Note [Call sites].
                         CallEntry::Context(ctx) => {
                             self.versions.entry(callee.ro(owner).prototype).or_insert_with(|| HashMap::default());
                             let block = self.version(owner, 0, ctx);
-                            self.set_current(callee.clone());
+                            self.set_current(callee.ro(owner).prototype);
                             self.blocks[caller.0].instructions[call] = Residual::LuaCall { entry: CallEntry::Block(block), a, b, c, stack, vararg };
                             block
                         },
@@ -5081,14 +5188,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     unsafe { (*callee_effects).set((*callee_effects).get().join((*effects).get())) };
                     state.tail_call(owner, a as usize, b as usize, closes, vararg);
                     let callee = state.clos.clone();
-                    self.set_current(callee.clone());
+                    self.set_current(callee.ro(owner).prototype);
                     let block = match entry {
                         CallEntry::Block(block) => block,
                         // Found now, once. See Note [Call sites].
                         CallEntry::Context(ctx) => {
                             self.versions.entry(callee.ro(owner).prototype).or_insert_with(|| HashMap::default());
                             let block = self.version(owner, 0, ctx);
-                            self.set_current(callee.clone());
+                            self.set_current(callee.ro(owner).prototype);
                             self.blocks[caller.0].instructions[call] = Residual::TailCall { entry: CallEntry::Block(block), a, b, closes, vararg, effects, callee_effects };
                             block
                         },
@@ -5113,10 +5220,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // generic.
                         let ctx = Rc::new(Context::new(next_stack));
                         self.versions.entry(lclos.ro(owner).prototype).or_insert_with(|| HashMap::default());
-                        self.set_current(lclos.clone());
+                        self.set_current(lclos.ro(owner).prototype);
                         let block = self.version(owner, 0, ctx);
                         debug!("{:?} {block:?}", self.blocks);
-                        self.set_current(lclos.clone());
+                        self.set_current(lclos.ro(owner).prototype);
                         id = block;
                         off = 0;
                         continue;
@@ -5138,18 +5245,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     id = target;
                     off = 0;
                 },
-                &Residual::Inline { a, b, stack, witnesses } => {
+                &Residual::Inline { a, b, stack } => {
                     off += 1;
-                    state.shift_frame(owner, a as usize, b as usize, stack, witnesses as usize, true);
-                    self.set_current(state.clos.clone());
+                    state.shift_frame(owner, a as usize, b as usize, stack, true);
+                    self.set_current(state.clos.ro(owner).prototype);
                 },
-                &Residual::InlineReturn { a, b, closes, call, witnesses, stack, returns, effects } => {
+                &Residual::InlineReturn { a, b, closes, .. } => {
                     off += 1;
-                    state.unshift_frame(owner, a as usize, b as usize, closes, call as usize, witnesses as usize, stack);
-                    // See Note [Call continuations].
-                    let effects = unsafe { (*effects).get() }.0 as u64;
-                    state.returned = crate::vm::RETURNED | effects << crate::vm::EFFECTS_SHIFT | returns as u64;
-                    self.set_current(state.clos.clone());
+                    state.unshift_frame(owner, a as usize, b as usize, closes);
+                    self.set_current(state.clos.ro(owner).prototype);
                 },
                 Residual::Thunk(thunk) => {
                     debug!("thunk {:?}", thunk);
@@ -5174,7 +5278,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // See Note [Call continuations].
                             let effects = unsafe { (*effects).get() }.0 as u64;
                             state.returned = crate::vm::RETURNED | effects << crate::vm::EFFECTS_SHIFT | returns as u64;
-                            self.set_current(state.clos.clone());
+                            self.set_current(state.clos.ro(owner).prototype);
                             id = block;
                             off = disp;
                         },
@@ -5235,7 +5339,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         if handler.c == 0 {
             state.top = handler.slot + 2;
         }
-        self.set_current(state.clos.clone());
+        self.set_current(state.clos.ro(owner).prototype);
         handler.after
     }
 
@@ -5287,8 +5391,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         ]);
     }
 
-    pub fn set_current(&mut self, clos: Tc<LClosure<'src, 'intern>>) {
-        self.clos = clos;
+    pub fn set_current(&mut self, proto: LProto<'src, 'intern>) {
+        self.proto = proto;
     }
 
     pub fn count(&self) -> usize {
