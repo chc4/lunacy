@@ -155,6 +155,8 @@ impl std::fmt::Display for Residual {
             Residual::Select(targets) => write!(f, "select"),
             Residual::Branch { .. } => write!(f, "branch"),
             Residual::Ret(..) => write!(f, "ret"),
+            Residual::Inline { a, b, .. } => write!(f, "inline({}, {})", a, b),
+            Residual::InlineReturn { a, b, call, .. } => write!(f, "inline_ret({}, {}, {})", a, b, call),
             Residual::GC => write!(f, "gc"),
         }
     }
@@ -818,6 +820,24 @@ windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64],
     };
 });
 
+// `shift_frame` for an inlined call of R(A) with CALL's B, of a callee whose `max_stack` is
+// `stack`, its hash witnesses past the caller's first `witnesses`. Nilling the callee's frame if
+// `FILLS`, or else the JIT code does. See Note [Inlined calls].
+windowed!(frame ShiftFrame, [a: u16, b: u16, stack: u8, witnesses: u16], [FILLS: bool], |owner, state, base| () {
+    state.shift_frame(owner, a as usize, b as usize, stack, witnesses as usize, FILLS);
+});
+
+// `unshift_frame` for an inlined callee's RETURN A B, closing its frame's open upvalues if
+// `CLOSES`, of the call of the caller's R(`call`), back to the caller's frame of `stack` slots:
+// `frame` is `a | b << 16 | call << 32 | stack << 48`. `witnesses` is its `ShiftFrame`'s. The
+// return is left as `PopFrame` leaves it, with `returns` and `effects`. See Note [Inlined calls].
+windowed!(frame UnshiftFrame, [frame: u64, witnesses: u16, returns: u32, effects: u64], [CLOSES: bool], |owner, state, base| () {
+    let (a, b, call, stack) = (frame as u16 as usize, (frame >> 16) as u16 as usize, (frame >> 32) as u16 as usize, (frame >> 48) as u8);
+    state.unshift_frame(owner, a, b, CLOSES, call, witnesses as usize, stack);
+    // See Note [Call continuations].
+    state.returned = crate::vm::RETURNED | (unsafe { *(effects as *const u16) } as u64) << crate::vm::EFFECTS_SHIFT | returns as u64;
+});
+
 // Whether a table's array part has kind `kind`, testing an element loaded from it in place of
 // the element's own tag. See Note [Array kinds].
 windowed!(guard KindIs, [kind: LType], [], |owner, state, base| (table) {
@@ -945,6 +965,14 @@ pub enum Residual {
     /// continuations].
     Arrived { a: u16, c: u16, returned: u16 },
     LuaGuard { idx: usize, ptr: *const () },
+    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`, its
+    /// hash witnesses past the caller's first `witnesses`. See Note [Inlined calls].
+    Inline { a: u16, b: u16, stack: u8, witnesses: u16 },
+    /// An inlined callee's RETURN A B, which closes its frame's open upvalues if `closes`: its
+    /// results to the call's R(A) and the caller's frame back, of `stack` slots, the return left
+    /// as a `Ret` leaves it, with `returns` and `effects`. `call` and `witnesses` are its
+    /// `Inline`'s A and `witnesses`. See Note [Inlined calls].
+    InlineReturn { a: u16, b: u16, closes: bool, call: u16, witnesses: u16, stack: u8, returns: u32, effects: *const Cell<Effects> },
     GC,
 }
 
@@ -976,6 +1004,69 @@ pub enum CallEntry {
 // target too early. Any version accepting the entry context will do, so the call itself needs no
 // further guard. JIT code calls that version's code directly, once it has some. See Note [Call
 // linking] for how JIT code reaches it.
+
+// Note [Inlined calls]
+// ~~~~~~~~~~~~~~~~~~~~
+// A call site can compile a small Lua callee's code into its caller's, in a frame of the callee's
+// own that has no callstack entry. Past the callee's identity guard, the running frame moves up to
+// the callee's (`Inline`): its base past R(A), its closure R(A), and its hash witnesses past the
+// caller's, so that every residual of the callee's code runs in it as in a frame of its own. Each
+// RETURN of the callee's code moves its results to R(A) and the frame back (`InlineReturn`), the
+// caller's closure found in its own function's slot, and leaves the return as a return does, for
+// the call site's continuation, which guards on it as on any call's (Note [Call continuations]).
+//
+// The inlined frame is kept nowhere but in the code: where it starts is static, and so is undoing
+// it. So the callstack and the stack's live extent (Note [Stack frames] in `vm`) are as they are
+// in the caller's frame, and whatever leaves the callee's code sees the callee's frame running
+// with the caller's callstack: an exit continues in the interpreter at the residual it left at, a
+// call from the callee's code makes an entry for the callee's frame, and an error unwinds past it
+// as past the caller's code.
+//
+// The callee's code is its versions for the site (`InlineSite`), which their contexts name, apart
+// from its versions for its calls and for other sites. Calls in inlined code inline in turn, to
+// `MAX_INLINE_DEPTH` sites deep. A site inlines a callee that is small, with no loop, tail call or
+// VARARG, from a caller that isn't vararg, whose closure is then in its function's slot (Note
+// [Vararg frames] in `vm`); `LUNACY_NO_INLINE` turns inlining off, to compare.
+
+/// An inlined call's site: the block its continuation is in, the call's A, how many hash keys its
+/// caller's context had, its caller's `max_stack`, and how many sites deep it is. See Note
+/// [Inlined calls].
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct InlineSite {
+    pub after: BlockId,
+    pub a: u16,
+    pub witnesses: u16,
+    pub stack: u8,
+    pub depth: u8,
+}
+
+/// How many inlined calls deep code can be. See Note [Inlined calls].
+const MAX_INLINE_DEPTH: u8 = 2;
+/// The most instructions a callee inlined has. See Note [Inlined calls].
+const MAX_INLINE_SIZE: usize = 32;
+
+/// Whether calls inline: unless `LUNACY_NO_INLINE` is set, to compare. See Note [Inlined calls].
+fn inlining() -> bool {
+    static INLINES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUNACY_NO_INLINE").is_none());
+    *INLINES
+}
+
+/// Whether a call in `caller`, a function of the context `calling`, inlines `callee`. See Note
+/// [Inlined calls].
+fn inlines<C>(calling: &Context, caller: &crate::chunk::FunctionBlock<'_, C>, callee: &crate::chunk::FunctionBlock<'_, C>) -> bool {
+    let code = &callee.instructions.items;
+    inlining()
+        && calling.site.map_or(0, |site| site.depth) < MAX_INLINE_DEPTH
+        && caller.is_vararg == 0
+        && callee.is_vararg == 0
+        && !core::ptr::eq(caller, callee)
+        && code.len() <= MAX_INLINE_SIZE
+        && code.iter().all(|inst| match inst.0.Opcode() {
+            Opcode::TAILCALL | Opcode::VARARG | Opcode::FORPREP | Opcode::FORLOOP | Opcode::TFORLOOP => false,
+            Opcode::JMP => crate::vm::sBx::unpack(inst.0) >= 0,
+            _ => true,
+        })
+}
 
 /// The context a call in `caller`, of R(A) with operand B, enters the callee
 /// `proto` with. See Note [Call sites].
@@ -1471,7 +1562,8 @@ fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected
 // instruction (a subblock) depends on that generator's own state as well as on
 // its context, so it is only entered from the same context. Every cycle goes
 // through a jump, so bounding the versions jumps enter bounds the subblocks;
-// `HARD_MAX_VERSIONS` enforces it.
+// `HARD_MAX_VERSIONS` enforces it. The versions of a pc for an inlined call's
+// site are bounded apart from its others (Note [Inlined calls]).
 
 /// The versions of a pc before jumps to it reuse one. See Note [Version compatibility].
 const MAX_VERSIONS: usize = 3;
@@ -1489,6 +1581,8 @@ pub struct Context {
     /// What the specializer assumes and no guard checks, in `Fragile::key`
     /// order. See Note [Fragile information].
     pub fragile: SmallVec<[Fact; 2]>,
+    /// The inlined call whose callee's frame this is, if it is one. See Note [Inlined calls].
+    pub site: Option<InlineSite>,
 }
 
 // Note [Array kinds]
@@ -1896,6 +1990,7 @@ impl Context {
             hkeys: vec![],
             top: None,
             fragile: SmallVec::new(),
+            site: None,
         }
     }
 
@@ -2027,7 +2122,7 @@ impl Context {
 
     /// Whether `self` and `other` differ at most in fragile information.
     fn alike(&self, other: &Context) -> bool {
-        self.types == other.types && self.hkeys == other.hkeys && self.top == other.top
+        self.types == other.types && self.hkeys == other.hkeys && self.top == other.top && self.site == other.site
     }
 
     /// The type of slot `idx`: unknown past the end.
@@ -2038,7 +2133,7 @@ impl Context {
     /// Whether a block specialized to `self` is correct in `other`. See Note
     /// [Version compatibility].
     fn accepts(&self, other: &Context) -> bool {
-        self.hkeys.iter().enumerate().all(|(i, hkey)| {
+        self.site == other.site && self.hkeys.iter().enumerate().all(|(i, hkey)| {
             hkey.orphan() || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
         })
             && (self.top.is_none() || self.top == other.top)
@@ -2441,7 +2536,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ectx.clone().adopt(owner, &ctx);
             return exists;
         }
-        let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((epc, ty), block)| *epc == pc).collect();
+        let count: Vec<_> = self.versions.get(&self.clos.ro(owner).prototype).unwrap().iter().filter(|((epc, ty), block)| *epc == pc && ty.site == ctx.site).collect();
         if count.len() >= HARD_MAX_VERSIONS {
             panic!("too many versions: {:#?}", count);
         }
@@ -2488,13 +2583,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.unreachable.remove(&exists);
             return (exists, "exact", None);
         }
-        if self.versions_at(owner, subpc) >= MAX_VERSIONS {
+        if self.versions_at(owner, subpc, ctx.site) >= MAX_VERSIONS {
             self.evict(owner, subpc);
         }
         let versions = self.versions.get(&self.clos.ro(owner).prototype).unwrap();
         let existing: Vec<(Rc<Context>, BlockId)> = versions
             .iter()
-            .filter(|((epc, _), _)| *epc == subpc)
+            .filter(|((epc, ectx), _)| *epc == subpc && ectx.site == ctx.site)
             .map(|((_, ectx), block)| (ectx.clone(), *block))
             .collect();
         // Versions differing only in fragile information are, kind by kind of
@@ -2564,9 +2659,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         (self.block(owner, pc, joined.clone()), "joined-new", Some(joined))
     }
 
-    /// How many versions the running function has at `pc`.
-    fn versions_at(&self, owner: &Owner, pc: SubPc) -> usize {
-        self.versions.get(&self.clos.ro(owner).prototype).map_or(0, |versions| versions.keys().filter(|(at, _)| *at == pc).count())
+    /// How many versions the running function has at `pc` for the inlined call `site`, or for its
+    /// calls. See Note [Inlined calls].
+    fn versions_at(&self, owner: &Owner, pc: SubPc, site: Option<InlineSite>) -> usize {
+        self.versions.get(&self.clos.ro(owner).prototype).map_or(0, |versions| versions.keys().filter(|(at, ctx)| *at == pc && ctx.site == site).count())
     }
 
     /// Forget the versions at `pc` of the running function the trimming found unreachable, which
@@ -2645,7 +2741,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut conflicting: SmallVec<[(u8, usize); 2]> = SmallVec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         for ((epc, ectx), _block) in self.versions.get(&proto).unwrap() {
-            if *epc != pc {
+            if *epc != pc || ectx.site != ctx.site {
                 continue;
             }
             // A version whose slot holding a constant holds another type here: the constant is
@@ -2924,7 +3020,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// how many of the requested context's shapes the join lost.
     #[cfg(feature = "tracing")]
     fn trace_version(&self, owner: &Owner, pc: Pc, requested: &Context, block: BlockId, outcome: &str, joined: Option<&Context>) {
-        let versions = self.versions.get(&self.clos.ro(owner).prototype).map_or(0, |v| v.keys().filter(|(epc, _)| *epc == SubPc::new(pc)).count());
+        let versions = self.versions_at(owner, SubPc::new(pc), requested.site);
         let context = requested.tostring(owner);
         let joined_context = joined.map(|j| j.tostring(owner)).unwrap_or_default();
         let shapes_dropped = joined.map_or(0, |j| {
@@ -3163,7 +3259,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         },
                     };
                     let effects: *const Cell<Effects> = self.effects_of(proto);
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0, returns, effects)); None
+                    // An inlined callee's returns to its call's continuation. See Note [Inlined calls].
+                    if let Some(site) = ctx.site {
+                        self.blocks[block_id.0].instructions.push(Residual::InlineReturn { a: a as u16, b, closes, call: site.a, witnesses: site.witnesses, stack: site.stack, returns, effects });
+                        self.blocks[block_id.0].instructions.push(Residual::Jump(site.after));
+                    } else {
+                        self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0, returns, effects));
+                    }
+                    None
                 },
                 x => {
                     #[cfg(debug_assertions)]
@@ -3597,6 +3700,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
+    /// The thunk after an `Inline`, in `block_id`, whose callee's code is its version for `entry`,
+    /// a context of the call's site: run in the callee's frame, it becomes a jump to that version,
+    /// compiled if need be. See Note [Inlined calls].
+    fn make_inline_thunk(&self, block_id: BlockId, entry: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, _state: &mut RunState, thunk_pc: usize| {
+            vm.versions.entry(vm.clos.ro(owner).prototype).or_insert_with(|| HashMap::default());
+            let callee = vm.version(owner, 0, entry.clone());
+            vm.jump_thunk(block_id, thunk_pc, callee);
+        })))
+    }
+
     /// The thunk a call to R(A) of the context `calling`, continuing at
     /// `after` (as `After::block`), ends its block in, or, not `appends`, a guard's failure is: run,
     /// it lays out a call for the function in R(A), guarding its identity and
@@ -3630,8 +3744,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         layout.push(Residual::LuaGuard { idx: a, ptr: proto.cast() });
                         layout.push(next(vm));
                     }
-                    let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let (stack, vararg) = unsafe { ((*proto).max_stack, (*proto).is_vararg != 0) };
+                    // See Note [Inlined calls].
+                    if let Some((before, captured, after_pc)) = &continuation && inlines(&calling, unsafe { &*vm.clos.ro(owner).prototype }, unsafe { &*proto }) {
+                        let returned = vm.new_block(vm.blocks[block.0].pc);
+                        let thunk = vm.make_continuation_thunk(returned, before.clone(), captured.clone(), *after_pc, a, c, after.clone(), 0, true);
+                        vm.blocks[returned.0].instructions.push(Residual::Thunk(thunk));
+                        let caller_stack = unsafe { (*vm.clos.ro(owner).prototype).max_stack };
+                        let site = InlineSite { after: returned, a: a16, witnesses: calling.hkeys.len() as u16, stack: caller_stack, depth: calling.site.map_or(1, |site| site.depth + 1) };
+                        let mut entry = entry_context(&calling, unsafe { &*proto }, a, b);
+                        entry.site = Some(site);
+                        layout.push(Residual::Inline { a: a16, b: b16, stack, witnesses: site.witnesses });
+                        layout.push(Residual::Thunk(vm.make_inline_thunk(block, Rc::new(entry))));
+                        vm.blocks[block.0].instructions.extend(layout);
+                        return;
+                    }
+                    let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg });
                     if let Some((ctx, captured, pc)) = &continuation {
                         // See Note [Call continuations].
@@ -5010,6 +5138,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     id = target;
                     off = 0;
                 },
+                &Residual::Inline { a, b, stack, witnesses } => {
+                    off += 1;
+                    state.shift_frame(owner, a as usize, b as usize, stack, witnesses as usize, true);
+                    self.set_current(state.clos.clone());
+                },
+                &Residual::InlineReturn { a, b, closes, call, witnesses, stack, returns, effects } => {
+                    off += 1;
+                    state.unshift_frame(owner, a as usize, b as usize, closes, call as usize, witnesses as usize, stack);
+                    // See Note [Call continuations].
+                    let effects = unsafe { (*effects).get() }.0 as u64;
+                    state.returned = crate::vm::RETURNED | effects << crate::vm::EFFECTS_SHIFT | returns as u64;
+                    self.set_current(state.clos.clone());
+                },
                 Residual::Thunk(thunk) => {
                     debug!("thunk {:?}", thunk);
                     // Forcing it replaces it: it runs from its own reference.
@@ -5071,10 +5212,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             panic!("error: {}", message.unwrap_or_else(|| format!("{:?}", error.unbox())));
         };
         if state.callstack.len() > handler.depth {
-            // The call's function's frame starts where the frame above its own
-            // entry was called from, or is the running one.
-            let callee = state.callstack.get(handler.depth + 1).map_or(state.base, |entry| entry.frame);
-            state.close_upvalues_from(owner, callee);
+            // The call's function's frame, and every frame it called, inlined or not, are past
+            // the function's slot. See Note [Inlined calls].
+            state.close_upvalues_from(owner, handler.slot + 1);
             let entry = &state.callstack[handler.depth];
             let (clos, frame, witness_frame, witness_top) = (entry.clos.clone(), entry.frame, entry.witness_frame, entry.witness_top);
             state.callstack.truncate(handler.depth);

@@ -1953,6 +1953,61 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
+    /// The frame of an inlined call of R(A), with CALL's B, of a callee whose `max_stack` is
+    /// `stack`: the running frame moves to the callee's, with no callstack entry, its hash
+    /// witnesses past the caller's first `witnesses`, as `push_frame` makes a frame, nilled past
+    /// its arguments if `fills`, or else by the JIT code. See Note [Inlined calls] in `specialize`.
+    #[inline(always)]
+    pub fn shift_frame(&mut self, owner: &Owner, a: usize, b: usize, stack: u8, witnesses: usize, fills: bool) {
+        debug_assert!(matches!(self.vals[self.base + a].unbox(), LValue::LClosure(_)), "an inlined call of what isn't a Lua function");
+        // SAFETY: R(A) is a Lua function, past its call's guard of it.
+        let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unsafe { core::hint::unreachable_unchecked() } };
+        debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "an inlined call's frame size isn't its callee's");
+        let next_base = self.base + a + 1;
+        let passed = if b == 0 { self.top } else { next_base + b - 1 };
+        let end = next_base + stack as usize;
+        if end > self.vals.len() {
+            self.vals.lengthen(end);
+        }
+        if fills && passed < end {
+            self.nil_slots(passed, end);
+        }
+        self.base = next_base;
+        self.top = end;
+        self.witness_base += witnesses;
+        self.witness_top = self.witness_top.max(self.witness_base);
+        self.clos = lclos;
+    }
+
+    /// The return, RETURN A B, of the frame `shift_frame` made for an inlined call of the
+    /// caller's R(`call`): closing its open upvalues if `closes`, its results to its function's
+    /// slot, as `leave` moves them, and the caller's frame running again, its closure in its own
+    /// function's slot, the stack long enough for it, `stack` slots: the collector may have
+    /// shrunk it to the callee's frame, and what it grows back by is nilled, as a call nils its
+    /// callee's frame (Note [Stack frames]). `witnesses` is `shift_frame`'s. See Note [Inlined
+    /// calls] in `specialize`.
+    #[inline(always)]
+    pub fn unshift_frame(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, call: usize, witnesses: usize, stack: u8) {
+        if closes && !self.upvals.is_empty() {
+            self.close_upvalues(owner);
+        }
+        let from = self.base + a;
+        let count = if b == 0 { self.top - from } else { b - 1 };
+        self.move_results(from, count, self.base - 1);
+        self.base -= call + 1;
+        self.witness_base -= witnesses;
+        let (end, len) = (self.base + stack as usize, self.vals.len());
+        if end > len {
+            self.vals.lengthen(end);
+            self.nil_slots(len, end);
+        }
+        debug_assert!(matches!(self.vals[self.base - 1].unbox(), LValue::LClosure(_)), "an inlined call's caller with no closure in its function's slot");
+        // SAFETY: the caller isn't vararg, so its function's slot is just below its base (Note
+        // [Vararg frames]), and holds it while it runs.
+        let LValue::LClosure(caller) = self.vals[self.base - 1].unbox() else { unsafe { core::hint::unreachable_unchecked() } };
+        self.clos = caller;
+    }
+
     /// VARARG A B in the running frame, of a vararg function with `params`
     /// fixed parameters: its extra arguments to R(A) on, `b - 1` of them padded
     /// with nil, or with B = 0 all, the top just past them. See Note [Vararg

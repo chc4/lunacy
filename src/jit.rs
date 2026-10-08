@@ -2655,6 +2655,61 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp ->exit_jit
                     );
                 },
+                Residual::Inline { a, b, stack, witnesses } => {
+                    // The callee's frame, moved to by `ShiftFrame`, which keeps no register but
+                    // `state`'s; and the base pointer with it, from the region's copy of it on the
+                    // native stack, which the code after a call takes it back from, moved too.
+                    // Past a fixed count of arguments the frame is nilled here, as for a
+                    // `LuaCall`. See Note [Inlined calls] in `specialize`.
+                    let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
+                    let shift: Rc<dyn Window> = match nils {
+                        Some(_) => Rc::new(crate::specialize::ShiftFrame::<false>::new(*a, *b, *stack, *witnesses, &[])),
+                        None => Rc::new(crate::specialize::ShiftFrame::<true>::new(*a, *b, *stack, *witnesses, &[])),
+                    };
+                    jit_note!(self.jctx, ops, "        ShiftFrame");
+                    emit_frame_op(ops, &mut self.jctx.stencils, pool, &shift);
+                    self.jctx.frame_ops.push(shift);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov r13, QWORD [rsp - 0]
+                        ; add r13, (*a as i32 + 1) * 8
+                        ; mov QWORD [rsp], r13
+                    );
+                    let nils = nils.unwrap_or_default();
+                    if !nils.is_empty() {
+                        let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
+                        dynasm!(ops ; .arch x64 ; mov eax, nil);
+                    }
+                    for slot in nils {
+                        match i8::try_from(slot * 8) {
+                            Ok(disp) => dynasm!(ops ; .arch x64 ; mov QWORD [BYTE r13 + disp], rax),
+                            Err(_) => dynasm!(ops ; .arch x64 ; mov QWORD [DWORD r13 + (slot * 8) as i32], rax),
+                        }
+                    }
+                },
+                Residual::InlineReturn { a, b, closes, call, witnesses, stack, returns, effects } => {
+                    // The caller's frame, moved back to by `UnshiftFrame`, and the base pointer
+                    // with it, as for `Inline`; then the return, for the continuation's guard,
+                    // where a call's code has it. See Notes [Inlined calls] and [Call
+                    // continuations] in `specialize`.
+                    let call = *call;
+                    let frame = *a as u64 | (*b as u64) << 16 | (call as u64) << 32 | (*stack as u64) << 48;
+                    let (witnesses, returns, effects) = (*witnesses, *returns, *effects as u64);
+                    let unshift: Rc<dyn Window> = match closes {
+                        false => Rc::new(crate::specialize::UnshiftFrame::<false>::new(frame, witnesses, returns, effects, &[])),
+                        true => Rc::new(crate::specialize::UnshiftFrame::<true>::new(frame, witnesses, returns, effects, &[])),
+                    };
+                    jit_note!(self.jctx, ops, "        UnshiftFrame");
+                    emit_frame_op(ops, &mut self.jctx.stencils, pool, &unshift);
+                    self.jctx.frame_ops.push(unshift);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov r13, QWORD [rsp - 0]
+                        ; sub r13, (call as i32 + 1) * 8
+                        ; mov QWORD [rsp], r13
+                        ; mov rax, QWORD r12 => RunState.returned
+                    );
+                },
                 Residual::Branch { hot, cold } => {
                     match fused.take() {
                         // The op falls through to exit 0, the hot way; exit 1, its cold
