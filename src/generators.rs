@@ -1148,7 +1148,13 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 crate::window::windowed!(ModRK, [k: i32], [], |owner, state, base| (lhs, out dest) {
                     *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<{ Opcode::MOD }>(lhs.as_int(), k)));
                 });
+                // MOD by a positive power of two is a mask: floored, the remainder of a
+                // two's complement integer by 2^n is its low n bits, negative or not.
+                crate::window::windowed!(MaskRK, [mask: i32], [], |owner, state, base| (lhs, out dest) {
+                    *dest = LBoxed::from_int(lhs.as_int() & mask);
+                });
                 Some(match opcode == Opcode::MOD && k != 0 {
+                    true if k > 0 && k & (k - 1) == 0 => (Rc::new(MaskRK::new(k - 1, &[lhs, dest])) as Rc<dyn Window>, false, None),
                     true => (Rc::new(ModRK::new(k, &[lhs, dest])) as Rc<dyn Window>, false, None),
                     false => {
                         let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| integer_fits(opcode, unsafe { state.vals[state.base + lhs].as_int() }, k)));
