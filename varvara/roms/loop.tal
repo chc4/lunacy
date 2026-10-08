@@ -1,0 +1,11 @@
+( A loop of 128 iterations doing nothing, for looking at how an emulator compiles one. )
+
+|0100
+
+@on-reset ( -> )
+	#0080
+	&loop ( count* -- )
+		#0001 SUB2 DUP2 ORA ?&loop
+	POP2
+	#800f DEO
+	BRK

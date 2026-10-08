@@ -1,7 +1,8 @@
 These Uxntal programs are from the [`uxn` repository](https://git.sr.ht/~rabbits/uxn/),
 commit [`3a696f8f`](https://git.sr.ht/~rabbits/uxn/commit/3a696f8fa9931857e99e50074c6994649ee62d37),
 whose ROMs [Raven](https://github.com/mkeeter/raven) tests against: `uxnasm`
-assembles each to the same bytes as Raven's copy of its ROM.
+assembles each to the same bytes as Raven's copy of its ROM. `loop.tal` is
+lunacy's own: a minimal loop, for looking at how an emulator compiles one.
 
 The `uxn` repository is released under the MIT license:
 
