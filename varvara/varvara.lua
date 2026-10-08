@@ -4,11 +4,14 @@
 -- a ROM writing to the audio or file devices' ports only sets them, as if the
 -- device were absent.
 --
--- `new(rom, write, clock)` makes one with `rom`, a string, loaded: `write(stream,
--- byte)` takes its console output, stream 1 its standard output and 2 its
--- standard error, and `clock()` is the time its datetime device reads, a table
--- as `os.date("*t")` makes (by default `os.date`'s time, where the Lua has
--- it; without a clock, the datetime ports read as they were set). The host
+-- `new(rom, write, clock, bitwise)` makes one with `rom`, a string, loaded:
+-- `write(stream, byte)` takes its console output, stream 1 its standard output
+-- and 2 its standard error, and `clock()` is the time its datetime device
+-- reads, a table as `os.date("*t")` makes (by default `os.date`'s time, where
+-- the Lua has it; without a clock, the datetime ports read as they were set).
+-- A `bitwise` one computes with the bit library (`bit`, or Luau's `bit32`): its
+-- CPU is uxn_bit.lua's, and its sprites and device flags are decoded by masks
+-- and shifts. Either runs any ROM the same. The host
 -- then runs it: `boot` runs its reset vector, then `frame` its screen vector 60
 -- times a second, and the input functions their devices' vectors.
 
@@ -37,16 +40,22 @@ M.CONSOLE_STDIN, M.CONSOLE_ARG, M.CONSOLE_EOA, M.CONSOLE_END = 1, 2, 3, 4
 -- Expansion memory's pages, the program's included.
 local RAM_PAGES = 16
 
--- Whether bit `bit` (a power of two) of byte `b` is set.
-local function has(b, bit)
-  return b % (bit * 2) >= bit
-end
-
-function M.new(rom, write, clock)
+function M.new(rom, write, clock, bitwise)
   if clock == nil and os and os.date then
     clock = function() return os.date("*t") end
   end
-  local vm = uxn.new()
+  -- The bit library, for a machine that is `bitwise`.
+  local bit = bitwise and (bit or bit32)
+  local vm = (bitwise and require("uxn_bit") or uxn).new()
+
+  -- Whether bit `mask` (a power of two) of byte `b` is set.
+  local has
+  if bitwise then
+    local band = bit.band
+    has = function(b, mask) return band(b, mask) ~= 0 end
+  else
+    has = function(b, mask) return b % (mask * 2) >= mask end
+  end
   local ram, wst, rst = vm.ram, vm.wst, vm.rst
   local dev = {}
   for i = 0, 255 do dev[i] = 0 end
@@ -213,21 +222,43 @@ function M.new(rom, write, clock)
 
   -- An 8x8 sprite from `at` in RAM, at x1, y1, its rows and columns in the
   -- order `fx` and `fy` (1, or -1 to flip), in 1 or 2 bits a pixel.
-  local function sprite(layer, at, x1, y1, color, fx, fy, twobpp)
-    local opaque = OPAQUE[color]
-    for j = 0, 7 do
-      local py = fy > 0 and (y1 + j) % 65536 or (y1 + 7 - j) % 65536
-      if py < height then
-        local lo = ram[(at + j) % 65536]
-        local hi = twobpp and ram[(at + j + 8) % 65536] or 0
-        local row = py * width
-        -- From the low bit, the sprite's rightmost pixel.
-        for i = 0, 7 do
-          local px = fx > 0 and (x1 + 7 - i) % 65536 or (x1 + i) % 65536
-          local lo_bit, hi_bit = lo % 2, hi % 2
-          local ch = lo_bit + 2 * hi_bit
-          lo, hi = (lo - lo_bit) / 2, (hi - hi_bit) / 2
-          if px < width and (opaque or ch ~= 0) then layer[row + px] = BLENDING[ch][color] end
+  local sprite
+  if bitwise then
+    local band, bor, lshift, rshift = bit.band, bit.bor, bit.lshift, bit.rshift
+    sprite = function(layer, at, x1, y1, color, fx, fy, twobpp)
+      local opaque = OPAQUE[color]
+      for j = 0, 7 do
+        local py = fy > 0 and band(y1 + j, 65535) or band(y1 + 7 - j, 65535)
+        if py < height then
+          local lo = ram[band(at + j, 65535)]
+          local hi = twobpp and ram[band(at + j + 8, 65535)] or 0
+          local row = py * width
+          -- From the low bit, the sprite's rightmost pixel.
+          for i = 0, 7 do
+            local px = fx > 0 and band(x1 + 7 - i, 65535) or band(x1 + i, 65535)
+            local ch = bor(band(rshift(lo, i), 1), lshift(band(rshift(hi, i), 1), 1))
+            if px < width and (opaque or ch ~= 0) then layer[row + px] = BLENDING[ch][color] end
+          end
+        end
+      end
+    end
+  else
+    sprite = function(layer, at, x1, y1, color, fx, fy, twobpp)
+      local opaque = OPAQUE[color]
+      for j = 0, 7 do
+        local py = fy > 0 and (y1 + j) % 65536 or (y1 + 7 - j) % 65536
+        if py < height then
+          local lo = ram[(at + j) % 65536]
+          local hi = twobpp and ram[(at + j + 8) % 65536] or 0
+          local row = py * width
+          -- From the low bit, the sprite's rightmost pixel.
+          for i = 0, 7 do
+            local px = fx > 0 and (x1 + 7 - i) % 65536 or (x1 + i) % 65536
+            local lo_bit, hi_bit = lo % 2, hi % 2
+            local ch = lo_bit + 2 * hi_bit
+            lo, hi = (lo - lo_bit) / 2, (hi - hi_bit) / 2
+            if px < width and (opaque or ch ~= 0) then layer[row + px] = BLENDING[ch][color] end
+          end
         end
       end
     end

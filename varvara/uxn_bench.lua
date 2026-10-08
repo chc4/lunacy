@@ -1,5 +1,7 @@
--- What the uxn_* benchmarks share: running a ROM on the Lua Varvara emulator
--- (varvara.lua) as they check it.
+-- The uxn_* benchmarks: Uxntal programs (varvara/roms) on the Lua Varvara
+-- emulator (varvara.lua), each checking what its program does. `run(name, n,
+-- bitwise)` runs program `name` `n` times, each on a new machine, which is
+-- `bitwise` for the uxn_bit_* benchmarks (see `varvara.new`).
 
 local varvara = require("varvara")
 
@@ -12,18 +14,18 @@ local function clock() return CLOCK end
 
 -- A Varvara machine running `rom`, and its console's standard output and
 -- standard error so far, each a function returning it as a string.
-function M.machine(rom)
+local function machine(rom, bitwise)
   local out = { {}, {} }
   local emu = varvara.new(rom, function(stream, byte)
     local buffer = out[stream]
     buffer[#buffer + 1] = string.char(byte)
-  end, clock)
+  end, clock, bitwise)
   return emu, function() return table.concat(out[1]) end, function() return table.concat(out[2]) end
 end
 
 -- How many of the screen's pixels have each palette index, 0 to 3 (the
 -- foreground's where it isn't 0, else the background's), as "n0 n1 n2 n3".
-function M.histogram(emu)
+local function histogram(emu)
   local width, height, fg, bg = emu.screen()
   local counts = { [0] = 0, 0, 0, 0 }
   for i = 0, width * height - 1 do
@@ -35,10 +37,61 @@ function M.histogram(emu)
 end
 
 -- Fails the benchmark with what it got if `got` isn't `expected`.
-function M.check(what, got, expected)
+local function check(what, got, expected)
   if got ~= expected then
     error(string.format("%s: got %q, expected %q", what, got, expected))
   end
+end
+
+local FIB_OUTPUT
+do
+  local lines, a, b = {}, 1, 1
+  for i = 1, 24 do
+    lines[i] = string.format("%d %d %d\n", i, a, a)
+    a, b = b, a + b
+  end
+  FIB_OUTPUT = table.concat(lines)
+end
+
+-- Each program, run once on a new machine.
+local PROGRAMS = {
+  -- fib.tal: for 1 to 24, the number, its Fibonacci number by recursion and by
+  -- tail recursion, printed in decimal on the console. Calls and the return
+  -- stack.
+  fib = function(bitwise)
+    local emu, stdout = machine(require("roms.fib"), bitwise)
+    emu.boot(false)
+    check("fib.tal's output", stdout(), FIB_OUTPUT)
+  end,
+  -- tak.tal: tak(24, 20, 11) in bytes, which prints its stacks, the result on
+  -- top of the working stack. Deep recursion through the return stack.
+  tak = function(bitwise)
+    local emu, _, stderr = machine(require("roms.tak"), bitwise)
+    emu.boot(false)
+    check("tak.tal's stacks", stderr(), "WST 00 00 00 00 00 00 00|0c < \nRST 00 00 00 00 00 00 00 00|< \n")
+  end,
+  -- mandelbrot.tal: the set in fixed point, a pixel at a time, on the screen.
+  -- Arithmetic on shorts, and the screen device's pixel port.
+  mandelbrot = function(bitwise)
+    local emu = machine(require("roms.mandelbrot"), bitwise)
+    emu.boot(false)
+    check("mandelbrot.tal's screen", histogram(emu), "58933 38765 8062 3104")
+  end,
+  -- bunnymark.tal: 300 frames with the mouse's button held, which adds a bunny
+  -- each frame, every frame clearing the screen and drawing each bunny's
+  -- sprite where it bounces to. The screen device's fill and sprites.
+  bunnymark = function(bitwise)
+    local emu = machine(require("roms.bunnymark"), bitwise)
+    emu.boot(false)
+    emu.mouse(0, 0, 1)
+    for _ = 1, 300 do emu.frame() end
+    check("bunnymark.tal's screen", histogram(emu), "140277 6083 14331 3149")
+  end,
+}
+
+function M.run(name, n, bitwise)
+  local program = PROGRAMS[name]
+  for _ = 1, n do program(bitwise) end
 end
 
 return M

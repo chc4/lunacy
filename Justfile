@@ -572,8 +572,10 @@ _raven:
     cd target/raven && cargo build -q --release -p raven-cli --features native,tailcall
 
 # The uxn_* benchmarks run a Uxn ROM (varvara/roms) on the Lua Varvara emulator
-# (varvara/), which needs more JIT code than lunacy's default buffer holds: their
-# lunacy builds get LUNACY_JIT_SIZE bytes.
+# (varvara/), the uxn_bit_* ones on its bitwise machine, which needs the bit
+# library (Lua 5.1 and 5.5 have none, so their runs fail). The emulator needs
+# more JIT code than lunacy's default buffer holds: their lunacy builds get
+# LUNACY_JIT_SIZE bytes.
 UXN_JIT_SIZE := "16777216"
 
 # `hyperfine-full` of a uxn_* benchmark, lunacy's builds with UXN_JIT_SIZE, and
@@ -591,8 +593,10 @@ hyperfine-uxn benchmark times='1': unsafe-compile interpreter-compile _raven
     cargo build --release --bin bench
     jit="LUNACY_JIT_SIZE={{UXN_JIT_SIZE}}"
     raven=()
-    rom=working/roms/${b#uxn_}.rom
-    if [ {{times}} = 1 ] && [ $b != uxn_bunnymark ]; then
+    # uxn_<rom> or uxn_bit_<rom>.
+    name=${b#uxn_}; name=${name#bit_}
+    rom=working/roms/$name.rom
+    if [ {{times}} = 1 ] && [ $name != bunnymark ]; then
         for backend in interpreter tailcall native; do
             raven+=(-n "raven $backend" "target/raven/target/release/raven-cli --backend $backend --quit $rom")
         done
@@ -613,7 +617,7 @@ hyperfine-uxn benchmark times='1': unsafe-compile interpreter-compile _raven
     python3 tools/bench_history.py record working/hyperfine-$b-{{times}}.json --benchmark $b --arg {{times}}
 
 # `hyperfine-uxn` over UXN_HYPERFINES.
-UXN_HYPERFINES := "uxn_fib:1 uxn_tak:1 uxn_mandelbrot:1 uxn_bunnymark:1"
+UXN_HYPERFINES := "uxn_fib:1 uxn_tak:1 uxn_mandelbrot:1 uxn_bunnymark:1 uxn_bit_fib:1 uxn_bit_tak:1 uxn_bit_mandelbrot:1 uxn_bit_bunnymark:1"
 hyperfines-uxn:
     #!/usr/bin/env bash
     set -euo pipefail
