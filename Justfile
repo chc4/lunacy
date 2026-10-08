@@ -10,6 +10,11 @@ CPU := "2"
 # Every test: `test`, then `test-stencils`.
 tests: test test-stencils
 
+# The library's unit tests whose names contain `filter`, as `test` runs them:
+# quicker than the whole suite while iterating.
+unit filter:
+    cargo test --features "gc_sanitize" --lib {{filter}}
+
 # Run lunacy against the golden testcases
 [env("RUST_BACKTRACE","1")]
 test:

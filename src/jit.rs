@@ -2101,7 +2101,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         }
                     }
-                    Residual::Thunk(_) => {}
+                    Residual::Thunk(_) => steps.push(Step::Leave),
                     _ => steps.push(Step::Flush),
                 }
             }

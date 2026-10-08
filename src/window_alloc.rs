@@ -622,6 +622,9 @@ pub enum Step<'a> {
     /// is entered with them: the trace's own continuation if `hot`, else a
     /// side exit (with none, into a block that never ran).
     Exit { hot: bool, reads: Slots },
+    /// A thunk the trace may leave through, storing the window: the code it lays out may read
+    /// any slot.
+    Leave,
 }
 
 /// An edge into more frequent code than it leaves: the slots live into the
@@ -660,27 +663,40 @@ struct Ahead {
     flushes: Vec<usize>,
     /// Each jump back into the trace, `(back, start)`.
     backs: Vec<(usize, usize)>,
+    /// The steps that may leave the trace to code reading any slot from the stack: an exit, a
+    /// thunk, an op that can exit.
+    blind: Vec<usize>,
 }
 
 impl Ahead {
     fn new(steps: &[Step]) -> Ahead {
-        let mut ahead = Ahead { events: vec![Vec::new(); 256], forms: vec![Vec::new(); 256], leaves: vec![Vec::new(); 256], flushes: Vec::new(), backs: Vec::new() };
+        let mut ahead = Ahead { events: vec![Vec::new(); 256], forms: vec![Vec::new(); 256], leaves: vec![Vec::new(); 256], flushes: Vec::new(), backs: Vec::new(), blind: Vec::new() };
         for (step, s) in steps.iter().enumerate() {
             match s {
                 Step::Op(op, _) => {
-                    for (i, (&slot, &access)) in op.slots().iter().zip(op.op.accesses()).enumerate() {
-                        if access.reads() {
-                            ahead.events[slot].push((step, true));
-                            ahead.forms[slot].push((step, bit(op.op.doubles(), i)));
-                        }
-                        if access.writes() {
-                            ahead.events[slot].push((step, false));
-                        }
+                    if op.op.selects() || op.op.exit1().is_some() || (0..WINDOW).any(|skip| op.op.cold(skip).is_some()) {
+                        ahead.blind.push(step);
+                    }
+                    // Its reads before its writes, whatever order its operands are declared in.
+                    let operands = op.slots().iter().zip(op.op.accesses()).enumerate();
+                    for (i, (&slot, _)) in operands.clone().filter(|(_, (_, access))| access.reads()) {
+                        ahead.events[slot].push((step, true));
+                        ahead.forms[slot].push((step, bit(op.op.doubles(), i)));
+                    }
+                    for (_, (&slot, _)) in operands.filter(|(_, (_, access))| access.writes()) {
+                        ahead.events[slot].push((step, false));
                     }
                 }
                 Step::Read(slot) => ahead.events[*slot].push((step, true)),
-                Step::Exit { hot: true, reads } => reads.iter().for_each(|slot| ahead.events[slot].push((step, true))),
-                Step::Exit { hot: false, reads } => reads.iter().for_each(|slot| ahead.leaves[slot].push(step)),
+                Step::Exit { hot: true, reads } => {
+                    reads.iter().for_each(|slot| ahead.events[slot].push((step, true)));
+                    ahead.blind.push(step);
+                }
+                Step::Exit { hot: false, reads } => {
+                    reads.iter().for_each(|slot| ahead.leaves[slot].push(step));
+                    ahead.blind.push(step);
+                }
+                Step::Leave => ahead.blind.push(step),
                 Step::Flush => ahead.flushes.push(step),
                 Step::Kill(slots) => slots.iter().for_each(|slot| ahead.events[slot].push((step, false))),
                 Step::Back(start) => ahead.backs.push((step, *start)),
@@ -733,12 +749,13 @@ impl Ahead {
     }
 
     /// Whether `slot`'s value after step `at` is dead: overwritten before anything reads it, the
-    /// stack included.
+    /// stack included, as code the trace leaves to may.
     fn dead(&self, slot: usize, at: usize) -> bool {
         let events = &self.events[slot];
         let Some(&(step, read)) = events.get(events.partition_point(|e| e.0 <= at)) else { return false };
         let after = |of: &[usize]| of.get(of.partition_point(|&s| s <= at)).is_none_or(|&s| s > step);
-        !read && after(&self.flushes) && after(&self.leaves[slot]) && !self.backs.iter().any(|&(back, _)| back > at && back < step)
+        !read && after(&self.flushes) && after(&self.leaves[slot]) && after(&self.blind)
+            && !self.backs.iter().any(|&(back, _)| back > at && back < step)
     }
 
     /// How far after step `at` keeping `slot` in a register next pays off,
@@ -775,7 +792,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
     let _ = trace;
     assert!(width <= WINDOW);
     let mut ahead = Ahead::new(steps);
-    let trivial = steps.iter().all(|s| matches!(s, Step::Start(_) | Step::Back(_) | Step::Exit { .. }));
+    let trivial = steps.iter().all(|s| matches!(s, Step::Start(_) | Step::Back(_) | Step::Exit { .. } | Step::Leave));
     let mut plan = TracePlan {
         windows: vec![[None; WINDOW]; steps.len()],
         skips: vec![0; steps.len()],
@@ -912,7 +929,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 let _ = hot;
                 plan.exits[step] = Some(alloc.cache().clone());
             }
-            Step::Read(_) | Step::Back(_) => {}
+            Step::Read(_) | Step::Back(_) | Step::Leave => {}
         }
     }
     plan
@@ -1059,6 +1076,9 @@ mod tests {
         *v = i;
         core::hint::black_box((l, s));
     });
+    windowed!(Move, [], [], |owner, state, base| (a, out d) {
+        *d = a;
+    });
 
     /// A test op that takes and gives the operands of `1` unboxed.
     #[derive(Debug)]
@@ -1096,6 +1116,8 @@ mod tests {
         Out(usize),
         /// A for loop step, `(idx, limit, step, out var)`.
         Loop(usize, usize, usize, usize),
+        /// A move, `(a, out d)`, which a plan may do as a rename.
+        Move(usize, usize),
     }
 
     /// Executes allocator output on symbolic values (slot, version), each
@@ -1179,6 +1201,7 @@ mod tests {
                     TestOp::Store(a, b, c) => Box::new(Store::new(&[a, b, c])),
                     TestOp::Out(d) => Box::new(Out::new(&[d])),
                     TestOp::Loop(i, l, s, v) => Box::new(Loop::new(&[i, l, s, v])),
+                    TestOp::Move(a, d) => Box::new(Move::new(&[a, d])),
                 };
                 match doubles(i) & ((1 << w.arity()) - 1) {
                     0 => w,
@@ -1263,7 +1286,7 @@ mod tests {
     fn exhaustive_small_runs() {
         let arity = |op: &TestOp| match op {
             TestOp::Bin(..) | TestOp::BinFirst(..) | TestOp::Store(..) => 3,
-            TestOp::Get(..) | TestOp::Set(..) => 2,
+            TestOp::Get(..) | TestOp::Set(..) | TestOp::Move(..) => 2,
             TestOp::Out(..) => 1,
             TestOp::Loop(..) => 4,
         };
@@ -1295,6 +1318,7 @@ mod tests {
                         TestOp::Store(..) => TestOp::Store(next(), next(), next()),
                         TestOp::Out(..) => U(next()),
                         TestOp::Loop(..) => L(next(), next(), next(), next()),
+                        TestOp::Move(..) => TestOp::Move(next(), next()),
                     })
                     .collect();
                 let width = ops.iter().map(arity).max().unwrap().max(4);
@@ -1339,7 +1363,7 @@ mod tests {
             let mut starts = vec![0];
             for _ in 0..1 + rng.below(24) {
                 let step = kinds.len() + 1;
-                let k = rng.below(14);
+                let k = rng.below(16);
                 let mut slot = || rng.below(6);
                 match k {
                     0 | 4 => {
@@ -1350,6 +1374,7 @@ mod tests {
                     2 => kinds.push((3, 0)),
                     3 => kinds.push((4, slot())),
                     5 => kinds.push((6, starts[slot() % starts.len()])),
+                    14 => kinds.push((7, 0)),
                     k => {
                         ops.push(match k {
                             6..=8 => B(slot(), slot(), slot()),
@@ -1357,7 +1382,8 @@ mod tests {
                             10 => G(slot(), slot()),
                             11 => S(slot(), slot()),
                             12 => U(slot()),
-                            _ => L(slot(), slot(), slot(), slot()),
+                            13 => L(slot(), slot(), slot(), slot()),
+                            _ => TestOp::Move(slot(), slot()),
                         });
                         kinds.push((0, 0));
                     }
@@ -1379,6 +1405,7 @@ mod tests {
                     3 => Step::Exit { hot: rng.below(2) == 0, reads: some_slots(&mut rng) },
                     4 => Step::Read(arg),
                     5 => Step::Start(Some(Rise { reads: some_slots(&mut rng), writes: some_slots(&mut rng) })),
+                    7 => Step::Leave,
                     _ => Step::Back(arg),
                 }))
                 .collect();
@@ -1397,89 +1424,119 @@ mod tests {
                 window
             };
             let hint = some_window(&mut rng);
-            let plan = plan_trace(&steps, width, &hint, 0);
-            let mut machine = Machine::default();
-            for &slot in &hint.dirty {
-                machine.current.insert(slot, 1);
-            }
-            machine.holding(&hint);
-            let mut alloc = WindowAlloc { width, cache: hint };
-            let mut entries = HashMap::new();
-            for (step, s) in steps.iter().enumerate() {
-                match s {
-                    Step::Start(rise) => {
-                        let from = if rise.is_some() { Cache::default() } else { alloc.cache().clone() };
-                        let entry = Cache::entry(plan.windows[step], plan.unboxed[step], &from, &plan.dirty[step]);
-                        for emit in alloc.transfer(&entry) {
-                            machine.exec(emit, None);
-                        }
-                        entries.insert(step, entry.clone());
-                        alloc = WindowAlloc { width, cache: entry };
-                    }
-                    Step::Op(op, _) => {
-                        for emit in alloc.reconcile(&plan.windows[step], op, plan.skips[step]) {
-                            machine.exec(emit, None);
-                        }
-                        for emit in alloc.op(op, [plan.skips[step]]).unwrap() {
-                            machine.exec(emit, Some(op.op));
-                        }
-                    }
-                    Step::Flush => {
-                        for emit in alloc.flush() {
-                            machine.exec(emit, None);
-                        }
-                    }
-                    Step::Back(start) => {
-                        let entry = &entries[start];
-                        let mut taken = machine.clone();
-                        for emit in alloc.transfer(entry) {
-                            taken.exec(emit, None);
-                        }
-                        taken.check(entry, &format!("back edge at step {step} of {ops:?}"));
-                        for (&slot, &version) in taken.current.iter().filter(|(slot, _)| !entry.dirty.contains(slot)) {
-                            assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the back edge at step {step} of {ops:?}");
-                        }
-                    }
-                    Step::Exit { .. } => {
-                        let mut taken = machine.clone();
-                        for emit in alloc.stores() {
-                            taken.exec(emit, None);
-                        }
-                        for (&slot, &version) in &taken.current {
-                            assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the exit at step {step} of {ops:?}");
-                        }
-                        // The exit into a thunk-only block, a trivial trace
-                        // planned from the window the plan leaves here: its
-                        // thunk's exit, and the thunk linked into a block
-                        // entered with any window, lose no write.
-                        let trivial = plan_trace(&[Step::Start(None)], width, plan.exits[step].as_ref().unwrap(), 0);
-                        let entry = Cache::entry(trivial.windows[0], trivial.unboxed[0], alloc.cache(), &trivial.dirty[0]);
-                        let mut linked = machine.clone();
-                        for emit in alloc.transfer(&entry) {
-                            linked.exec(emit, None);
-                        }
-                        let thunk = WindowAlloc { width, cache: entry };
-                        let mut exited = linked.clone();
-                        for emit in thunk.stores() {
-                            exited.exec(emit, None);
-                        }
-                        for (&slot, &version) in &exited.current {
-                            assert_eq!(Machine::version(&exited.memory, slot), version, "slot {slot} stale at the thunk after step {step} of {ops:?}");
-                        }
-                        let target = some_window(&mut rng);
-                        for emit in thunk.transfer(&target) {
-                            linked.exec(emit, None);
-                        }
-                        linked.check(&target, &format!("link after step {step} of {ops:?}"));
-                        for (&slot, &version) in linked.current.iter().filter(|(slot, _)| !target.dirty.contains(slot)) {
-                            assert_eq!(Machine::version(&linked.memory, slot), version, "slot {slot} lost by the link after step {step} of {ops:?} into {target:?}");
-                        }
-                    }
-                    Step::Read(_) => {}
-                    Step::Kill(_) => unreachable!("a test trace kills no slot"),
+            // A failure names its trace: its ops, its steps' kinds, and the window it starts from.
+            let case = format!("{ops:?}, steps {kinds:?}, from {hint}");
+            let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let plan = plan_trace(&steps, width, &hint, 0);
+                let mut machine = Machine::default();
+                for &slot in &hint.dirty {
+                    machine.current.insert(slot, 1);
                 }
+                machine.holding(&hint);
+                let mut alloc = WindowAlloc { width, cache: hint };
+                let mut entries = HashMap::new();
+                for (step, s) in steps.iter().enumerate() {
+                    match s {
+                        Step::Start(rise) => {
+                            let from = if rise.is_some() { Cache::default() } else { alloc.cache().clone() };
+                            let entry = Cache::entry(plan.windows[step], plan.unboxed[step], &from, &plan.dirty[step]);
+                            for emit in alloc.transfer(&entry) {
+                                machine.exec(emit, None);
+                            }
+                            entries.insert(step, entry.clone());
+                            alloc = WindowAlloc { width, cache: entry };
+                        }
+                        // A move planned as a rename: its source's register holds the
+                        // destination's new value.
+                        Step::Op(op, _) if plan.skips[step] >= RENAME => {
+                            let (src, dst) = (op.slots()[0], op.slots()[1]);
+                            let loc = alloc.cache().loc(alloc.cache().position(src).expect("a renamed value in a register"));
+                            for emit in alloc.rename(src, dst, plan.skips[step] == RENAME_STORE) {
+                                machine.exec(emit, None);
+                            }
+                            let version = Machine::version(&machine.current, dst) + 1;
+                            machine.current.insert(dst, version);
+                            *machine.half(loc) = Some((dst, version));
+                        }
+                        Step::Op(op, _) => {
+                            for emit in alloc.reconcile(&plan.windows[step], op, plan.skips[step]) {
+                                machine.exec(emit, None);
+                            }
+                            for emit in alloc.op(op, [plan.skips[step]]).unwrap() {
+                                machine.exec(emit, Some(op.op));
+                            }
+                        }
+                        // Leaving through a thunk, which stores the window.
+                        Step::Leave => {
+                            let mut taken = machine.clone();
+                            for emit in alloc.stores() {
+                                taken.exec(emit, None);
+                            }
+                            for (&slot, &version) in &taken.current {
+                                assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the thunk at step {step} of {ops:?}");
+                            }
+                        }
+                        Step::Flush => {
+                            for emit in alloc.flush() {
+                                machine.exec(emit, None);
+                            }
+                        }
+                        Step::Back(start) => {
+                            let entry = &entries[start];
+                            let mut taken = machine.clone();
+                            for emit in alloc.transfer(entry) {
+                                taken.exec(emit, None);
+                            }
+                            taken.check(entry, &format!("back edge at step {step} of {ops:?}"));
+                            for (&slot, &version) in taken.current.iter().filter(|(slot, _)| !entry.dirty.contains(slot)) {
+                                assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the back edge at step {step} of {ops:?}");
+                            }
+                        }
+                        Step::Exit { .. } => {
+                            let mut taken = machine.clone();
+                            for emit in alloc.stores() {
+                                taken.exec(emit, None);
+                            }
+                            for (&slot, &version) in &taken.current {
+                                assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the exit at step {step} of {ops:?}");
+                            }
+                            // The exit into a thunk-only block, a trivial trace
+                            // planned from the window the plan leaves here: its
+                            // thunk's exit, and the thunk linked into a block
+                            // entered with any window, lose no write.
+                            let trivial = plan_trace(&[Step::Start(None)], width, plan.exits[step].as_ref().unwrap(), 0);
+                            let entry = Cache::entry(trivial.windows[0], trivial.unboxed[0], alloc.cache(), &trivial.dirty[0]);
+                            let mut linked = machine.clone();
+                            for emit in alloc.transfer(&entry) {
+                                linked.exec(emit, None);
+                            }
+                            let thunk = WindowAlloc { width, cache: entry };
+                            let mut exited = linked.clone();
+                            for emit in thunk.stores() {
+                                exited.exec(emit, None);
+                            }
+                            for (&slot, &version) in &exited.current {
+                                assert_eq!(Machine::version(&exited.memory, slot), version, "slot {slot} stale at the thunk after step {step} of {ops:?}");
+                            }
+                            let target = some_window(&mut rng);
+                            for emit in thunk.transfer(&target) {
+                                linked.exec(emit, None);
+                            }
+                            linked.check(&target, &format!("link after step {step} of {ops:?}"));
+                            for (&slot, &version) in linked.current.iter().filter(|(slot, _)| !target.dirty.contains(slot)) {
+                                assert_eq!(Machine::version(&linked.memory, slot), version, "slot {slot} lost by the link after step {step} of {ops:?} into {target:?}");
+                            }
+                        }
+                        Step::Read(_) => {}
+                        Step::Kill(_) => unreachable!("a test trace kills no slot"),
+                    }
+                }
+                finish(alloc, machine, &ops);
+            }));
+            if let Err(panic) = replayed {
+                eprintln!("failing trace: {case}");
+                std::panic::resume_unwind(panic);
             }
-            finish(alloc, machine, &ops);
         }
     }
 
