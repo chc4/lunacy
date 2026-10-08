@@ -7,15 +7,20 @@ WARMUP := "3"
 # run never migrates onto a core that has not ramped up.
 CPU := "2"
 # A lock every run that times or samples code holds while it runs (`flock`), so
-# that no two of them, from any checkout or agent on the machine, run at once
-# and skew each other: a run waits for the one before it. Only the commands
-# that measure take it, not the builds before them, and never a recipe calling
-# another, which would wait on itself.
+# that nothing else from any checkout or agent on the machine runs with it and
+# skews it: a timed or sampled run holds it alone, and each build, test or run
+# through cargo shares it (`SHARED`), so a measurement waits for those and they
+# wait for it. Each command takes it, never a recipe calling another, which
+# would wait on itself; `cargo watch`, which never ends, doesn't.
 BENCH_LOCK := env_var_or_default("LUNACY_BENCH_LOCK", "/tmp/lunacy-bench.lock")
 # The prefix of a timed command: the lock, then pinned to `CPU`.
 TIMED := "flock " + BENCH_LOCK + " taskset -c " + CPU
 # The prefix of a sampled command: the lock.
 SAMPLED := "flock " + BENCH_LOCK
+# The prefix of a build, test or other run that loads the machine without
+# measuring: the lock shared, so that any number run together, but none while a
+# timed or sampled run holds it, nor one while they do.
+SHARED := "flock -s " + BENCH_LOCK
 
 # Every test: `test`, then `test-stencils`.
 tests: test test-stencils
@@ -23,19 +28,19 @@ tests: test test-stencils
 # The library's unit tests whose names contain `filter`, as `test` runs them:
 # quicker than the whole suite while iterating.
 unit filter:
-    cargo test --features "gc_sanitize" --lib {{filter}}
+    {{SHARED}} cargo test --features "gc_sanitize" --lib {{filter}}
 
 # Run lunacy against the golden testcases
 [env("RUST_BACKTRACE","1")]
 test:
     # GC correctness tests
-    cargo test "gc::" --features "gc_test,gc_sanitize" -- --test-threads 1
+    {{SHARED}} cargo test "gc::" --features "gc_test,gc_sanitize" -- --test-threads 1
     # Normal interpreter tests
-    cargo test --features "gc_sanitize"
+    {{SHARED}} cargo test --features "gc_sanitize"
     # Interpreter GC stress test
-    cargo test --features "gc_stress gc_sanitize"
+    {{SHARED}} cargo test --features "gc_stress gc_sanitize"
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
-    cargo test --test gc_reset_frees
+    {{SHARED}} cargo test --test gc_reset_frees
 
 # Copy&patch window stencils (src/window.rs) as the JIT will use them: built
 # in release, so the stencils checked are the ones the JIT copies (a build
@@ -50,8 +55,8 @@ test:
 STENCIL_OPT := "--release"
 [env("RUST_BACKTRACE","1")]
 test-stencils:
-    cargo test --features check_windows --lib window:: {{STENCIL_OPT}}
-    cargo test --features check_windows --test golden_tests {{STENCIL_OPT}}
+    {{SHARED}} cargo test --features check_windows --lib window:: {{STENCIL_OPT}}
+    {{SHARED}} cargo test --features check_windows --test golden_tests {{STENCIL_OPT}}
 
 # A benchmark's run traced (feature `tracing`) to working/lunacy.fxt, a
 # Perfetto trace (https://ui.perfetto.dev opens it), and summarized with
@@ -59,7 +64,7 @@ test-stencils:
 # by where they are. Built as the benchmarks are timed: the unsafe profile.
 trace benchmark times='10' features='unsafe':
     just _luac {{benchmark}}
-    cargo build --profile unsafe --no-default-features --features "{{features}} tracing" --bin bench \
+    {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} tracing" --bin bench \
         --target-dir target/tracing -Z build-std="core,std,panic_abort"
     cd working && ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
     python3 tools/perfetto_summary.py working/lunacy.fxt
@@ -69,7 +74,7 @@ trace benchmark times='10' features='unsafe':
 # `features`, to working/lunacy.fxt, then summarized. A failing run still
 # leaves its trace.
 trace-golden name features='check_windows':
-    -LUNACY_GOLDEN={{name}} cargo test --release --features "{{features}} tracing" --test golden_tests test_golden
+    -LUNACY_GOLDEN={{name}} {{SHARED}} cargo test --release --features "{{features}} tracing" --test golden_tests test_golden
     mv lunacy.fxt working/lunacy.fxt
     python3 tools/perfetto_summary.py working/lunacy.fxt
 
@@ -87,7 +92,7 @@ trace-sql query:
 # output, in one debug build with `test`'s golden suite's features: quicker than
 # the whole suite while iterating.
 golden +names:
-    LUNACY_GOLDEN={{replace(names, " ", ",")}} cargo test --features gc_sanitize --test golden_tests test_golden
+    LUNACY_GOLDEN={{replace(names, " ", ",")}} {{SHARED}} cargo test --features gc_sanitize --test golden_tests test_golden
 
 # Golden tests, each against its expected output, under the default build,
 # immediate_jit, no_dynamic_guards and both (tools/golden_builds.py).
@@ -101,7 +106,7 @@ golden-builds +tests:
 window-runs benchmark times='20':
     just _luac {{benchmark}}
     rm -f working/func_*.dot working/func_*.pdf
-    cd working && cargo run --release --no-default-features --features graph --bin bench -- {{benchmark}}.bin {{times}}
+    cd working && {{SHARED}} cargo run --release --no-default-features --features graph --bin bench -- {{benchmark}}.bin {{times}}
     python3 tools/window_runs.py working/func_*.dot
 
 # The JIT's window allocation for a benchmark, in working/window_dump.txt: each compiled
@@ -126,11 +131,11 @@ window-dump benchmark times='20' ref='' build='release':
         flags=(--release --features window_dump)
     fi
     if [ -z "{{ref}}" ]; then
-        cd working && cargo run "${flags[@]}" --bin bench -- {{benchmark}}.bin {{times}}
+        cd working && {{SHARED}} cargo run "${flags[@]}" --bin bench -- {{benchmark}}.bin {{times}}
     else
         just _compare-worktree {{ref}}
         bin=$(realpath working/{{benchmark}}.bin)
-        (cd target/compare/{{ref}} && cargo run "${flags[@]}" --bin bench -- $bin {{times}})
+        (cd target/compare/{{ref}} && {{SHARED}} cargo run "${flags[@]}" --bin bench -- $bin {{times}})
     fi
 
 # The size of each window op's stencil a benchmark's JIT code copies, in the
@@ -140,10 +145,10 @@ window-dump benchmark times='20' ref='' build='release':
 # working/stencil_sizes-unsafe.txt.
 stencil-sizes benchmark='queens' times='10':
     just _luac {{benchmark}}
-    cd working && cargo run --release --features jit_disasm --bin bench --target-dir ../target/jit_disasm \
+    cd working && {{SHARED}} cargo run --release --features jit_disasm --bin bench --target-dir ../target/jit_disasm \
         -- {{benchmark}}.bin {{times}} > /dev/null
     mv working/stencil_sizes.txt working/stencil_sizes-release.txt
-    cd working && cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
+    cd working && {{SHARED}} cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
         --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- {{benchmark}}.bin {{times}} > /dev/null
     mv working/stencil_sizes.txt working/stencil_sizes-unsafe.txt
     head -25 working/stencil_sizes-unsafe.txt
@@ -152,8 +157,8 @@ stencil-sizes benchmark='queens' times='10':
 # release and unsafe builds, and every stencil's assembly in
 # working/stencils-release.s and working/stencils-unsafe.s.
 stencil-cold: unsafe-compile
-    cargo build --release --bin bench
-    cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
+    {{SHARED}} cargo build --release --bin bench
+    {{SHARED}} cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
     mkdir -p working
     python3 tools/stencil_cold.py target/release/bench --dump working/stencils-release.s
     python3 tools/stencil_cold.py target/unsafe/bench --dump working/stencils-unsafe.s
@@ -164,7 +169,7 @@ stencil-cold: unsafe-compile
 # builds, with `features` (by default the unsafe build's).
 jit-disasm benchmark times='10' features='unsafe':
     just _luac {{benchmark}}
-    cd working && cargo run --profile unsafe --no-default-features --features "{{features}} jit_disasm" --bin bench \
+    cd working && {{SHARED}} cargo run --profile unsafe --no-default-features --features "{{features}} jit_disasm" --bin bench \
         --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- {{benchmark}}.bin {{times}} > /dev/null
     @echo working/jit_disasm.txt
 
@@ -180,7 +185,7 @@ jit-code-size benchmark times='10': (jit-disasm benchmark times)
 jit-code-size-test name:
     just _luac-test {{name}}
     rm -f working/jit_disasm.txt
-    cd working && cargo run --profile unsafe --no-default-features --features "unsafe magic jit_disasm" --bin lunacy \
+    cd working && {{SHARED}} cargo run --profile unsafe --no-default-features --features "unsafe magic jit_disasm" --bin lunacy \
         --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- {{name}}.bin > /dev/null
     python3 tools/jit_code_size.py working/jit_disasm.txt
 
@@ -200,7 +205,7 @@ luajit-mcode benchmark times='10':
 # disassembly with counts in working/jit_samples.txt.
 jit-profile benchmark times='10' op='' period='20000' features='unsafe':
     just _luac {{benchmark}}
-    cargo build --profile unsafe --no-default-features --features "{{features}} perf jit_disasm" --bin bench \
+    {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} perf jit_disasm" --bin bench \
         --target-dir target/jit_disasm -Z build-std="core,std,panic_abort"
     cd working && {{SAMPLED}} perf record -e ibs_op// -c {{period}} -o jit-profile.data ../target/jit_disasm/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
     cd working && perf script -i jit-profile.data -F ip,sym > jit-profile.samples
@@ -216,7 +221,7 @@ window-dump-save benchmark name times='20':
 # A lua_tests program's window allocation under streaming allocation and each
 # trace-building policy, as bench/window_dumps/<name>.<policy>.txt.
 window-dump-policies name: (_luac-test name)
-    cargo build --release --features window_dump --bin lunacy
+    {{SHARED}} cargo build --release --features window_dump --bin lunacy
     mkdir -p bench/window_dumps
     for policy in streaming single unidirectional bidirectional; do (cd working && LUNACY_TRACES=$policy ../target/release/lunacy {{name}}.bin > /dev/null) && cp working/window_dump.txt bench/window_dumps/{{name}}.$policy.txt; done
 
@@ -224,7 +229,7 @@ window-dump-policies name: (_luac-test name)
 # streaming allocation and unidirectional traces, from their window dumps; a
 # benchmark that fails (lunacy lacks some of Lua) says why.
 window-dump-compare times +benchmarks:
-    cargo build --release --features window_dump --bin bench
+    {{SHARED}} cargo build --release --features window_dump --bin bench
     for b in {{benchmarks}}; do just _luac $b || continue; for policy in streaming unidirectional; do if (cd working && LUNACY_TRACES=$policy timeout 600 ../target/release/bench $b.bin {{times}} > /dev/null 2> ../target/window-dump-compare.err); then python3 tools/window_dump_stats.py --raw working/window_dump.txt | tail -1 | sed "s|^working/window_dump.txt|$b $policy|"; else echo "$b $policy: failed: $(grep -A1 -m1 panicked target/window-dump-compare.err | tail -1)"; fi; done; done
 
 # The loads, stores and moves in window dumps, over all blocks and hot ones.
@@ -234,23 +239,23 @@ window-dump-stats *dumps='bench/window_dumps/*.txt':
 [env("RUST_LOG", "debug")]
 [env("RUST_BACKTRACE","1")]
 test-debug:
-    cargo test --features "gc_sanitize" -- --nocapture
+    {{SHARED}} cargo test --features "gc_sanitize" -- --nocapture
 
 watch:
     cargo watch -- cargo test
 
 [env("RUST_LOG", "debug")]
 debug name: (_luac-test name)
-    cd working && time cargo run --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
+    cd working && time {{SHARED}} cargo run --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
 
 debug-jit name: (_luac-test name)
-    cd working && time cargo run --no-default-features --features "{{TEST_FEATURES}} immediate_jit" --bin lunacy -- {{name}}.bin
+    cd working && time {{SHARED}} cargo run --no-default-features --features "{{TEST_FEATURES}} immediate_jit" --bin lunacy -- {{name}}.bin
 
 release name: (_luac-test name)
-    cd working && time cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
+    cd working && time {{SHARED}} cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
 
 gdb-test name: (_luac-test name)
-    cargo build --release --bin lunacy
+    {{SHARED}} cargo build --release --bin lunacy
     gdb --args ./target/release/lunacy working/{{name}}.bin
 
 # Compile lua_tests/<name>.lua to working/<name>.bin.
@@ -293,27 +298,27 @@ _luauc benchmark:
 
 run benchmark:
     just _luac {{benchmark}}
-    time cargo run --release --bin bench -- working/{{benchmark}}.bin
+    time {{SHARED}} cargo run --release --bin bench -- working/{{benchmark}}.bin
 
 [env("RUST_LOG", "debug")]
 run-debug benchmark:
     just _luac {{benchmark}}
-    time cargo run --bin bench -- working/{{benchmark}}.bin
+    time {{SHARED}} cargo run --bin bench -- working/{{benchmark}}.bin
 
 # <name>.lua's residual graphs, as working/func_<line>.dot and .pdf.
 graph name:
     mkdir -p working
     luac5.1 -o working/{{name}}.bin {{name}}.lua
-    cd working && cargo run --features graph --bin lunacy -- {{name}}.bin
+    cd working && {{SHARED}} cargo run --features graph --bin lunacy -- {{name}}.bin
 # lua_tests/<name>.lua's residual graphs as the golden test runner runs it
 # (with its globals, such as `make_userdata`), in working/graphs/<name>.
 graph-golden name:
     mkdir -p working/graphs/{{name}}
-    LUNACY_GOLDEN={{name}} LUNACY_GRAPH_DIR=$PWD/working/graphs/{{name}} cargo test --features graph --test golden_tests test_golden
+    LUNACY_GOLDEN={{name}} LUNACY_GRAPH_DIR=$PWD/working/graphs/{{name}} {{SHARED}} cargo test --features graph --test golden_tests test_golden
 graph-release name:
     mkdir -p working
     luac5.1 -o working/{{name}}.bin {{name}}.lua
-    cd working && cargo run --release --features graph --bin lunacy -- {{name}}.bin
+    cd working && {{SHARED}} cargo run --release --features graph --bin lunacy -- {{name}}.bin
 # A benchmark's residual graphs with and without dynamic guards (feature
 # `no_dynamic_guards`, Note [Dynamic guards]), in
 # target/graphs/<benchmark>/{guards,no_guards}, and their blocks compared.
@@ -324,7 +329,7 @@ graph-guards benchmark times='10':
     for variant in guards no_guards; do
         features=graph
         if [ $variant = no_guards ]; then features="graph no_dynamic_guards"; fi
-        cargo build --release --features "$features" --bin bench --target-dir target/graph-$variant
+        {{SHARED}} cargo build --release --features "$features" --bin bench --target-dir target/graph-$variant
         dir=target/graphs/{{benchmark}}/$variant
         rm -rf $dir && mkdir -p $dir
         (cd $dir && ../../../graph-$variant/release/bench ../../../../working/{{benchmark}}.bin {{times}} > /dev/null)
@@ -343,9 +348,9 @@ graph-vs ref benchmark times='10':
     #!/usr/bin/env bash
     set -euo pipefail
     just _luac {{benchmark}}
-    cargo build --release --features graph --bin bench --target-dir target/graph-current
+    {{SHARED}} cargo build --release --features graph --bin bench --target-dir target/graph-current
     just _compare-worktree {{ref}}
-    (cd target/compare/{{ref}} && cargo build --release --features graph --bin bench --target-dir target/graph)
+    (cd target/compare/{{ref}} && {{SHARED}} cargo build --release --features graph --bin bench --target-dir target/graph)
     bin=$(realpath working/{{benchmark}}.bin)
     for variant in current {{ref}}; do
         exe=$(realpath target/graph-current/release/bench)
@@ -364,7 +369,7 @@ graphs-vs ref:
 gdb name:
     mkdir -p working
     luac5.1 -o working/{{name}}.bin {{name}}.lua
-    cargo build --release --bin lunacy
+    {{SHARED}} cargo build --release --bin lunacy
     gdb --args ./target/release/lunacy working/{{name}}.bin
 
 
@@ -374,7 +379,7 @@ baseline benchmark times='10':
 
 gdb-benchmark benchmark:
     just _luac {{benchmark}}
-    cargo build --release --bin bench
+    {{SHARED}} cargo build --release --bin bench
     gdb --args ./target/release/bench working/{{benchmark}}.bin
 
 # Profile a benchmark, built with the `flamegraph` profile (the unsafe build with
@@ -394,14 +399,14 @@ flamegraph benchmark times='10' ref='' freq='997' features='unsafe perf':
     # `-Z build-std`, which `cargo flamegraph` takes from the environment.
     export CARGO_UNSTABLE_BUILD_STD=core,std,panic_abort
     if [ -z "{{ref}}" ]; then
-        (cd working && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "{{features}}" --bin bench -- {{benchmark}}.bin {{times}})
+        (cd working && {{SAMPLED}} cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "{{features}}" --bin bench -- {{benchmark}}.bin {{times}})
         firefox -new-tab working/flamegraph.svg || true
     else
         dir=target/compare/{{ref}}
         just _compare-worktree {{ref}}
         bin=$(realpath working/{{benchmark}}.bin)
         svg=$(realpath working)/flamegraph-{{ref}}.svg
-        (cd $dir && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "{{features}}" --bin bench -o $svg -- $bin {{times}})
+        (cd $dir && {{SAMPLED}} cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "{{features}}" --bin bench -o $svg -- $bin {{times}})
     fi
 
 # `flamegraph` of revision `ref` (as for `hyperfine-vs`) and of this checkout on
@@ -419,9 +424,9 @@ flamegraph-vs ref benchmark times='10' freq='997' top='25':
     bin=$(realpath working/{{benchmark}}.bin)
     dir=target/compare/{{ref}}
     just _compare-worktree {{ref}}
-    (cd $dir && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o $here/flamegraph-{{benchmark}}-{{ref}}.svg -- $bin {{times}})
+    (cd $dir && {{SAMPLED}} cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o $here/flamegraph-{{benchmark}}-{{ref}}.svg -- $bin {{times}})
     mv $dir/perf.data working/perf-{{benchmark}}-{{ref}}.data
-    (cd working && cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o flamegraph-{{benchmark}}.svg -- {{benchmark}}.bin {{times}})
+    (cd working && {{SAMPLED}} cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -o flamegraph-{{benchmark}}.svg -- {{benchmark}}.bin {{times}})
     mv working/perf.data working/perf-{{benchmark}}.data
     # `head` closing the pipe early isn't a failure.
     set +o pipefail
@@ -439,7 +444,7 @@ flamegraph-vs ref benchmark times='10' freq='997' top='25':
 flamegraphs freq='19997':
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -Z build-std="core,std,panic_abort"
+    {{SHARED}} cargo build --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -Z build-std="core,std,panic_abort"
     profiles=()
     for run in {{HYPERFINES}}; do
         benchmark=${run%:*}; times=${run#*:}
@@ -455,7 +460,7 @@ benchmarks: (run "binarytrees") (run "life") (run "nbody")
 # Interpreter: no JIT, every closure run by the specializer's interpreter loop.
 INTERPRETER_FEATURES := "magic"
 interpreter-compile:
-    cargo build --release --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin bench --bin lunacy --target-dir ./target/interpreter
+    {{SHARED}} cargo build --release --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin bench --bin lunacy --target-dir ./target/interpreter
 interpreter benchmark: interpreter-compile
     just _luac {{benchmark}}
     time ./target/interpreter/release/bench working/{{benchmark}}.bin
@@ -477,16 +482,16 @@ stencil-asm op ref='':
         dir=target/compare/{{ref}}
         just _compare-worktree {{ref}}
     fi
-    (cd $dir && cargo build --profile unsafe --no-default-features --features unsafe --bin bench -Z build-std="core,std,panic_abort")
+    (cd $dir && {{SHARED}} cargo build --profile unsafe --no-default-features --features unsafe --bin bench -Z build-std="core,std,panic_abort")
     # Demangled by the `demangle` bin: objdump's -C leaves v0 symbols with enum
     # const generics mangled.
-    cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
+    {{SHARED}} cargo build --release --features jit_disasm --bin demangle --target-dir target/jit_disasm
     demangle=target/jit_disasm/release/demangle
     read start size < <(objdump -t $dir/target/unsafe/bench | $demangle | awk -v op='{{op}}>::__stencil::<0>' 'substr($0, length($0) - length(op) + 1) == op {print $1, $5}')
     objdump -d --no-show-raw-insn --start-address=0x$start --stop-address=$((0x$start + 0x$size)) $dir/target/unsafe/bench | $demangle | grep -E '^ +[0-9a-f]+:'
 
 unsafe-compile:
-    cargo build --profile unsafe --no-default-features --features unsafe --bin bench \
+    {{SHARED}} cargo build --profile unsafe --no-default-features --features unsafe --bin bench \
         -Z build-std="core,std,panic_abort"
 unsafe benchmark: unsafe-compile
     just _luac {{benchmark}}
@@ -503,7 +508,7 @@ gdb-unsafe benchmark: unsafe-compile
 hyperfine benchmark times='10': unsafe-compile
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
-    cargo build --release --bin bench
+    {{SHARED}} cargo build --release --bin bench
     # A build whose run fails (e.g. past the JIT buffer's end) is still timed,
     # and left out of the history for its exit code.
     {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
@@ -523,7 +528,7 @@ hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
     just _luajitc {{benchmark}}
     just _lua55c {{benchmark}}
     just _luauc {{benchmark}}
-    cargo build --release --bin bench
+    {{SHARED}} cargo build --release --bin bench
     # A command failing (lua5.1, lua5.5 and Luau lack the bit library) is timed,
     # and left out of the history for its exit code.
     {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
@@ -543,7 +548,7 @@ hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
 # (LUNACY_TRACES; see docs/trace-register-allocation.md).
 hyperfine-traces benchmark times='10' policies='streaming,single,unidirectional,bidirectional':
     just _luac {{benchmark}}
-    cargo build --release --bin bench
+    {{SHARED}} cargo build --release --bin bench
     {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
         "LUNACY_TRACES={policy} ./target/release/bench working/{{benchmark}}.bin {{times}}"
 # `hyperfine-traces` over the benchmarks lunacy runs, each run enough times for
@@ -556,7 +561,7 @@ hyperfines-traces policies='streaming,unidirectional,bidirectional': (hyperfine-
 # target/alloc-stats-<benchmark>-<policy>.txt.
 alloc-stats benchmark times='10' policies='streaming unidirectional':
     just _luac {{benchmark}}
-    cargo build --release --features alloc_stats --bin bench
+    {{SHARED}} cargo build --release --features alloc_stats --bin bench
     for policy in {{policies}}; do LUNACY_TRACES=$policy ./target/release/bench working/{{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-$policy.txt; echo "target/alloc-stats-{{benchmark}}-$policy.txt"; done
 
 # Revision `ref` checked out in a detached worktree, target/compare/<ref>, kept
@@ -576,10 +581,10 @@ _compare-worktree ref:
 # revision `ref`'s, in a detached worktree under target/compare/ (kept for
 # reruns, its submodules linked to this checkout's).
 _build-vs ref:
-    cargo build --release --bin bench
+    {{SHARED}} cargo build --release --bin bench
     just unsafe-compile
     just _compare-worktree {{ref}}
-    cd target/compare/{{ref}} && cargo build --release --bin bench && just unsafe-compile
+    cd target/compare/{{ref}} && {{SHARED}} cargo build --release --bin bench && just unsafe-compile
 
 # Compare this checkout's release and unsafe builds against revision `ref`'s on
 # one benchmark (built as `_build-vs` builds them).
@@ -601,7 +606,7 @@ bench-rev ref:
     #!/usr/bin/env bash
     set -euo pipefail
     just _compare-worktree {{ref}}
-    (cd target/compare/{{ref}} && cargo build --release --bin bench && just unsafe-compile)
+    (cd target/compare/{{ref}} && {{SHARED}} cargo build --release --bin bench && just unsafe-compile)
     for run in {{HYPERFINES}}; do
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark
@@ -624,7 +629,7 @@ bench-history:
 # unsafe build's panics have no message), with how each ended and its error
 # (tools/bench_blockers.py).
 bench-blockers:
-    cargo build --release --bin bench
+    {{SHARED}} cargo build --release --bin bench
     python3 tools/bench_blockers.py --exclude "{{HYPERFINES}}"
 
 # The latest commit's times from the benchmark history as a grouped bar chart,
@@ -654,14 +659,14 @@ perf-stats-vs ref runs='3' profile='unsafe': (_build-vs ref)
 # `feature` on one benchmark: the feature's build is in target/features/<feature>.
 hyperfine-feature feature benchmark times='10':
     just _luac {{benchmark}}
-    cargo build --release --bin bench
-    cargo build --release --features {{feature}} --bin bench --target-dir target/features/{{feature}}
+    {{SHARED}} cargo build --release --bin bench
+    {{SHARED}} cargo build --release --features {{feature}} --bin bench --target-dir target/features/{{feature}}
     {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
         -n default "./target/release/bench working/{{benchmark}}.bin {{times}}" \
         -n {{feature}} "target/features/{{feature}}/release/bench working/{{benchmark}}.bin {{times}}"
 hyperfine-jit benchmark:
     just _luac {{benchmark}}
-    cargo build --release --bin bench
+    {{SHARED}} cargo build --release --bin bench
     {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-jit.md \
         "./target/release/bench working/{{benchmark}}.bin"
 hyperfine-unsafe benchmark: unsafe-compile
@@ -686,7 +691,7 @@ bench-runs fraction='0.1' *benchmarks:
 store-types:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release --features store_types --bin bench --target-dir target/store_types
+    {{SHARED}} cargo build --release --features store_types --bin bench --target-dir target/store_types
     for run in {{HYPERFINES}}; do
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark > /dev/null
@@ -734,7 +739,7 @@ _jit-sizes dir ref='':
         (cd {{dir}} && just _luac $benchmark > /dev/null)
         [ -f {{dir}}/working/$benchmark.bin ] || mv {{dir}}/$benchmark.bin {{dir}}/working/
         rm -f {{dir}}/working/jit_disasm.txt
-        if (cd {{dir}}/working && cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
+        if (cd {{dir}}/working && {{SHARED}} cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
                 --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- $benchmark.bin $times) \
                 > working/jit-size-$benchmark.log 2>&1; then
             python3 tools/bench_history.py record-size {{dir}}/working/jit_disasm.txt --benchmark $benchmark --arg $times {{ if ref == "" { "" } else { "--ref " + ref } }} \
@@ -799,7 +804,7 @@ hyperfine-features benchmark times +sets:
     commands=()
     for set in {{sets}}; do
         features=$set; if [ $set = none ]; then features=""; fi
-        cargo build --release --bin bench --features "$features"
+        {{SHARED}} cargo build --release --bin bench --features "$features"
         mkdir -p target/features/$set && cp target/release/bench target/features/$set/bench
         commands+=(-n $set "target/features/$set/bench working/{{benchmark}}.bin {{times}}")
     done
