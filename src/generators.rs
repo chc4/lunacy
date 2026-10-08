@@ -472,6 +472,8 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 ResumeArg::Matched => Some(None),
                 _ => None,
             };
+            // Where the table is, asked before a load into its register overwrites it.
+            let ResumeArg::Subject(table_subject) = (yield YieldOp::Subject(b)) else { unreachable!() };
             // A nil element of a table with a metatable is its `__index`'s: an array
             // of a kind that isn't nil holds none. See Note [Table metatables] in
             // `specialize`.
@@ -529,7 +531,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
                     return arg;
                 }
-                yield YieldOp::ArrayType(a, b);
+                yield YieldOp::ArrayType(a, table_subject);
             } else {
                 // Any other key: through `gettable`.
                 arg = yield YieldOp::Exec(gettable(a, b, c));
@@ -1793,16 +1795,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
     #[coroutine]
     move |mut arg: ResumeArg| {
         windowed!(GetUpval, [index: usize], [], |owner, state, base| (out dest) {
-            let upval = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {
-                Upvalue::Open(o) => {
-                    // The running closure's upvalues were captured by an enclosing
-                    // function, so an open one is a slot of an enclosing frame, not
-                    // one of this frame's (which the window may cache).
-                    debug_assert!(*o < state.base, "open upvalue in the running frame");
-                    state.vals[*o as usize]
-                },
-                Upvalue::Closed(c) => *c.ro(owner),
-            };
+            let upval = state.upvalue(owner, index);
             debug!("upval {:?}", &upval);
             *dest = upval;
         });

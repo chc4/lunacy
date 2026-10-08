@@ -1805,6 +1805,21 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         self.close_upvalues_from(owner, self.base)
     }
 
+    /// The value of the running closure's upvalue `index`.
+    #[inline(always)]
+    pub fn upvalue(&self, owner: &Owner, index: usize) -> LBoxed<'src, 'intern> {
+        match self.clos.ro(owner).upvalues[index].deref().ro(owner) {
+            // The running closure's upvalues were captured by an enclosing function,
+            // so an open one is a slot of an enclosing frame, not one of this frame's
+            // (which the window may cache).
+            Upvalue::Open(o) => {
+                debug_assert!(*o < self.base, "open upvalue in the running frame");
+                self.vals[*o as usize]
+            },
+            Upvalue::Closed(c) => *c.ro(owner),
+        }
+    }
+
     /// Close every upvalue open into a slot from `from` up.
     pub fn close_upvalues_from(&mut self, owner: &mut Owner, from: usize)
     {

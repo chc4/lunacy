@@ -272,8 +272,11 @@ pub enum YieldOp {
                       // knows it, else Failed. See Note [Array kinds]
     IsElementOf(usize, usize), // Resumed with Matched if STACK[a] was loaded from STACK[b]'s array
                                // part, else Failed. See Note [Array kinds]
-    ArrayType(usize, usize), // Inform the executor that STACK[a] was loaded from STACK[b]'s array
-                             // part: its type is the array's kind, if known. See Note [Array kinds]
+    ArrayType(usize, Subject), // Inform the executor that STACK[a] was loaded from the array part
+                               // of the table in a subject (as `Subject` answered before the
+                               // load): its type is the array's kind, if known. See Note [Array kinds]
+    Subject(usize), // Resumed with Subject: the upvalue STACK[idx] holds the value of, if the
+                    // context knows, else the slot. See Note [Upvalue paths]
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
                                // See Note [Field types]
     LoadUpvalue(usize, usize), // Infrom the executor that STACK[idx]'s type is the same as an UPVALUE[b].
@@ -388,6 +391,7 @@ impl std::fmt::Debug for Fits {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResumeArg {
+    Subject(Subject),
     Start,
     Matched,
     MatchedConst(usize),
@@ -855,6 +859,11 @@ windowed!(guard KindIs, [kind: LType], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).kind == kind.bit()
 });
+// The same of the table in the running closure's upvalue `index`.
+windowed!(guard UpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| () {
+    let LValue::Table(tab) = state.upvalue(owner, index).unbox() else { unreachable!() };
+    tab.ro(owner).kind == kind.bit()
+});
 
 // `arrive` for the call of R(A) before it. `ac` is its `a | c << 16` (as `Count::hold` holds
 // them).
@@ -1155,13 +1164,14 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
     let params = a + 1..a + 1 + (proto.param_count as usize).min(entry.types.len());
     let shifted = |slot: usize| params.contains(&slot).then(|| slot - a - 1);
     for fact in &caller.fragile {
-        let fragile = match fact.fragile {
-            Fragile::Constant { slot, value } => shifted(slot).map(|slot| Fragile::Constant { slot, value }),
-            Fragile::Kind { table, kind } => shifted(table).map(|table| Fragile::Kind { table, kind }),
-            Fragile::ElementOf { slot, table } => shifted(slot).zip(shifted(table)).map(|(slot, table)| Fragile::ElementOf { slot, table }),
+        let fragile = match &fact.fragile {
+            Fragile::Constant { slot, value } => shifted(*slot).map(|slot| Fragile::Constant { slot, value: *value }),
+            // See Note [Upvalue paths].
+            Fragile::Kind { table, kind } => table.into_callee(shifted, frame.closure.as_ref()).map(|table| Fragile::Kind { table, kind: *kind }),
+            Fragile::ElementOf { slot, table } => shifted(*slot).zip(table.into_callee(shifted, frame.closure.as_ref())).map(|(slot, table)| Fragile::ElementOf { slot, table }),
             Fragile::Holds { .. } | Fragile::Upvalue { .. } => None,
         };
-        if let Some(fragile) = fragile.filter(|fragile| entry.types[fragile.key().1] != CType::Type(LType::Nil)) {
+        if let Some(fragile) = fragile.filter(|fragile| fragile.slot().is_none_or(|slot| entry.types[slot] != CType::Type(LType::Nil))) {
             entry.introduce(Fact { fragile, origins: fact.origins.clone() });
         }
     }
@@ -1745,7 +1755,8 @@ pub struct Context {
 // only widened since, and the kind is known after (`Kind`). An array that isn't of the element's
 // representation has the element tested, as any value. A loop's first iteration learns the kinds
 // of the arrays it reads elements of, so its later iterations, versioned for what the back edges
-// carry, read them unguarded.
+// carry, read them unguarded. The kind of a table an upvalue holds is known as the upvalue's, so
+// it holds past each load of the upvalue (Note [Upvalue paths]).
 //
 // A guard finding out the representation of an element of a mixed array knows that too
 // (a `Mixed` kind): it stays mixed however it is stored into, and a store into it needn't
@@ -1883,6 +1894,78 @@ impl UpvaluePath {
     }
 }
 
+/// What a fact is about: a slot of the running function's frame, or an upvalue by its path. How a
+/// fact about one holds up is its subject's: what falsifies it (`survives`), and how it crosses an
+/// inlined call (`into_callee`, `into_caller`). See Note [Upvalue paths].
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum Subject {
+    Slot(usize),
+    Upvalue(UpvaluePath),
+}
+
+impl Subject {
+    /// Unique among subjects.
+    fn key(&self) -> usize {
+        match self {
+            Subject::Slot(slot) => slot << 1,
+            Subject::Upvalue(upvalue) => upvalue.key() << 1 | 1,
+        }
+    }
+
+    /// The slot it is, if it is one.
+    fn slot(&self) -> Option<usize> {
+        match self {
+            Subject::Slot(slot) => Some(*slot),
+            Subject::Upvalue(_) => None,
+        }
+    }
+
+    /// Whether the subject still holds the value it did before `effect`.
+    fn survives(&self, effect: Effect) -> bool {
+        match self {
+            Subject::Slot(slot) => slot_survives(*slot, effect),
+            Subject::Upvalue(upvalue) => upvalue_survives(upvalue, effect),
+        }
+    }
+
+    /// The subject in the frame of the callee of an inlined call: a slot of the caller's that is
+    /// an argument, as `shifted` renumbers it, or an upvalue of the callee's closure, which the
+    /// caller loaded from `closure`.
+    fn into_callee(&self, shifted: impl Fn(usize) -> Option<usize>, closure: Option<&UpvaluePath>) -> Option<Subject> {
+        match self {
+            Subject::Slot(slot) => shifted(*slot).map(Subject::Slot),
+            Subject::Upvalue(upvalue) => closure.and_then(|closure| upvalue.rebase(closure)).map(Subject::Upvalue),
+        }
+    }
+
+    /// The subject, of the callee of an inlined call, in its caller's frame, which loaded the
+    /// callee's closure from `closure`: an upvalue of the closure. The callee's slots die with it.
+    fn into_caller(&self, closure: &UpvaluePath) -> Option<Subject> {
+        match self {
+            Subject::Slot(_) => None,
+            Subject::Upvalue(upvalue) => Some(Subject::Upvalue(upvalue.under(closure))),
+        }
+    }
+}
+
+/// Whether slot `slot` still holds the value it did before `effect`.
+fn slot_survives(slot: usize, effect: Effect) -> bool {
+    match effect {
+        Effect::Write(written) => written != slot,
+        Effect::WriteAny | Effect::Opaque => false,
+        Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_) => true,
+    }
+}
+
+/// Whether upvalue `upvalue` still holds the value it did before `effect`.
+fn upvalue_survives(upvalue: &UpvaluePath, effect: Effect) -> bool {
+    match effect {
+        Effect::SetUpvalue(set) => upvalue.survives_set(set),
+        Effect::AnyUpvalue | Effect::Opaque => false,
+        Effect::Write(_) | Effect::WriteAny | Effect::ArrayStore(_) => true,
+    }
+}
+
 // Note [Upvalue paths]
 // ~~~~~~~~~~~~~~~~~~~~
 // Facts about upvalues name the upvalue by a path from the running function: its own upvalue j, or
@@ -1899,6 +1982,14 @@ impl UpvaluePath {
 // knows of its own, as paths through that closure, unless it set some upvalue. A caller making
 // several calls of one closure it loads from one upvalue learns at its first inlined call what
 // every later one then knows.
+//
+// A fact's subject is a slot or an upvalue (`Subject`), which says what falsifies the fact and how
+// it crosses an inlined call, so a kind of fact about either gets those from it. What a slot
+// holding an upvalue's value (`Holds`) learns, its upvalue learns too, and a load of the upvalue
+// into a slot gives the slot what is known of the upvalue: its type (`Upvalue`), and the kind of
+// its table's array part (`Kind`). So a table an upvalue holds, loaded again each time it's used,
+// keeps the kind a guard found once, until the upvalue is set or a store into some array part
+// widens kinds.
 
 /// Speculation the specializer assumes without a guard. See Note [Fragile
 /// information].
@@ -1912,11 +2003,11 @@ pub enum Fragile {
     /// Every slot holding its value is of `ctype`.
     Upvalue { upvalue: UpvaluePath, ctype: CType },
     /// Stack slot `slot` holds a value loaded from the array part of the table
-    /// in slot `table`. See Note [Array kinds].
-    ElementOf { slot: usize, table: usize },
-    /// The array part of the table in slot `table` has kind `kind`. See Note
+    /// in `table`. See Note [Array kinds].
+    ElementOf { slot: usize, table: Subject },
+    /// The array part of the table in `table` has kind `kind`. See Note
     /// [Array kinds].
-    Kind { table: usize, kind: Kind },
+    Kind { table: Subject, kind: Kind },
     /// Stack slot `slot` holds a number constant an i32 holds exactly,
     /// `value`. See Note [Narrowing].
     Constant { slot: usize, value: i32 },
@@ -2018,35 +2109,36 @@ impl Fragile {
             Fragile::Holds { slot, .. } => (0, *slot),
             Fragile::Upvalue { upvalue, .. } => (1, upvalue.key()),
             Fragile::ElementOf { slot, .. } => (2, *slot),
-            Fragile::Kind { table, .. } => (3, *table),
+            Fragile::Kind { table, .. } => (3, table.key()),
             Fragile::Constant { slot, .. } => (4, *slot),
         }
     }
 
-    /// Whether the fact still holds after `effect`.
+    /// The slot the fact is about, if it is about one.
+    fn slot(&self) -> Option<usize> {
+        match self {
+            Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } => Some(*slot),
+            Fragile::Kind { table, .. } => table.slot(),
+            Fragile::Upvalue { .. } => None,
+        }
+    }
+
+    /// Whether the fact still holds after `effect`: while the places it is about hold the
+    /// values they did, and for a kind, past the stores into some array.
     fn survives(&self, effect: Effect) -> bool {
-        match (self, effect) {
-            (_, Effect::Opaque) => false,
-            (Fragile::Holds { slot, .. }, Effect::Write(written)) => written != *slot,
-            (Fragile::Holds { .. }, Effect::WriteAny) => false,
-            (Fragile::Holds { upvalue, .. } | Fragile::Upvalue { upvalue, .. }, Effect::SetUpvalue(set)) => upvalue.survives_set(set),
-            (Fragile::Holds { .. } | Fragile::Upvalue { .. }, Effect::AnyUpvalue) => false,
-            (Fragile::ElementOf { .. } | Fragile::Kind { .. }, Effect::AnyUpvalue) => true,
-            (Fragile::Upvalue { .. }, Effect::Write(_) | Effect::WriteAny) => true,
-            (Fragile::Holds { .. } | Fragile::Upvalue { .. }, Effect::ArrayStore(_)) => true,
-            (Fragile::ElementOf { slot, table }, Effect::Write(written)) => written != *slot && written != *table,
-            (Fragile::Kind { table, .. }, Effect::Write(written)) => written != *table,
-            (Fragile::ElementOf { .. } | Fragile::Kind { .. }, Effect::WriteAny) => false,
-            (Fragile::ElementOf { .. } | Fragile::Kind { .. }, Effect::SetUpvalue(_)) => true,
+        match self {
+            Fragile::Holds { slot, upvalue } => slot_survives(*slot, effect) && upvalue_survives(upvalue, effect),
+            Fragile::Upvalue { upvalue, .. } => upvalue_survives(upvalue, effect),
             // The value stays where it was loaded from.
-            (Fragile::ElementOf { .. }, Effect::ArrayStore(_)) => true,
+            Fragile::ElementOf { slot, table } => slot_survives(*slot, effect) && table.survives(effect),
             // Any table may be the one stored into: one of kind `kind` keeps it
             // only for a value of that kind, and a mixed one stays mixed.
-            (Fragile::Kind { kind, .. }, Effect::ArrayStore(stored)) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
+            Fragile::Kind { table, kind } => table.survives(effect) && match effect {
+                Effect::ArrayStore(stored) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
+                _ => true,
+            },
             // Only its slot holds it.
-            (Fragile::Constant { slot, .. }, Effect::Write(written)) => written != *slot,
-            (Fragile::Constant { .. }, Effect::WriteAny) => false,
-            (Fragile::Constant { .. }, Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_)) => true,
+            Fragile::Constant { slot, .. } => slot_survives(*slot, effect),
         }
     }
 }
@@ -2260,17 +2352,32 @@ impl Context {
     /// The kind of the array part of the table in slot `table`, if known. See
     /// Note [Array kinds].
     fn array_kind(&self, table: usize) -> Option<Kind> {
+        self.subject_kind(&Subject::Slot(table))
+    }
+
+    /// The kind of the array part of the table in `table`, if known.
+    fn subject_kind(&self, table: &Subject) -> Option<Kind> {
         self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Kind { table: known, kind } if *known == table => Some(*kind),
+            Fragile::Kind { table: known, kind } if known == table => Some(*kind),
             _ => None,
         })
     }
 
-    /// The slot of the table whose array part slot `slot`'s value was loaded
+    /// Assume the array part of the table in `table` has kind `kind`, and if
+    /// that's a slot holding an upvalue's value, the upvalue's table's too. See
+    /// Notes [Array kinds] and [Upvalue paths].
+    fn learn_kind(&mut self, table: Subject, kind: Kind) {
+        if let Subject::Slot(slot) = table && let Some(upvalue) = self.holds(slot) {
+            self.assume(Fragile::Kind { table: Subject::Upvalue(upvalue), kind });
+        }
+        self.assume(Fragile::Kind { table, kind });
+    }
+
+    /// Where the table is whose array part slot `slot`'s value was loaded
     /// from, if known. See Note [Array kinds].
-    fn element_of(&self, slot: usize) -> Option<usize> {
+    fn element_of(&self, slot: usize) -> Option<Subject> {
         self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::ElementOf { slot: loaded, table } if *loaded == slot => Some(*table),
+            Fragile::ElementOf { slot: loaded, table } if *loaded == slot => Some(table.clone()),
             _ => None,
         })
     }
@@ -3912,14 +4019,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // representation: the array's kind is tested in place of the
             // element's, and is known after. See Note [Array kinds].
             // The runtime kind of the array the element was loaded from.
-            let array = thunk_ctx.element_of(idx).map(|table| {
-                let LValue::Table(tab) = state.vals[state.base + table].unbox() else { unreachable!("an element of a slot not holding a table") };
-                (table, tab.ro(owner).kind)
+            // An upvalue's table is read from the running closure's own upvalue; one
+            // through another closure isn't, and its element is tested as any value.
+            let array = thunk_ctx.element_of(idx).and_then(|table| {
+                let value = match &table {
+                    Subject::Slot(slot) => state.vals[state.base + slot],
+                    Subject::Upvalue(UpvaluePath::Own(j)) => state.upvalue(owner, *j as usize),
+                    Subject::Upvalue(UpvaluePath::Of(..)) => return None,
+                };
+                let LValue::Table(tab) = value.unbox() else { unreachable!("an element of an array part not of a table") };
+                Some((table, tab.ro(owner).kind))
             });
-            let kind_of = array.filter(|&(_, kind)| kind == found_field.bit()).map(|(table, _)| table);
+            let kind_of = array.as_ref().filter(|(_, kind)| *kind == found_field.bit()).map(|(table, _)| table.clone());
             // A value the context knows is a number only has its encoding tested.
-            let guard = if let Some(table) = kind_of {
-                Residual::GuardDynamic(Rc::new(KindIs::new(found_field, &[table])))
+            let guard = if let Some(table) = &kind_of {
+                Residual::GuardDynamic(match table {
+                    Subject::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot])),
+                    Subject::Upvalue(UpvaluePath::Own(j)) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
+                    Subject::Upvalue(UpvaluePath::Of(..)) => unreachable!("a kind read through another closure"),
+                })
             } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
             } else {
@@ -3929,11 +4047,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
             forced_mut.types[idx] = found.clone();
             if let Some(table) = kind_of {
-                forced_mut.assume(Fragile::Kind { table, kind: Kind::Of(found_field) });
+                forced_mut.learn_kind(table, Kind::Of(found_field));
             }
             // An array of two representations or more stays mixed.
-            if let Some((table, _)) = array.filter(|&(_, kind)| kind.count_ones() > 1) {
-                forced_mut.assume(Fragile::Kind { table, kind: Kind::Mixed });
+            if let Some((table, _)) = array.filter(|(_, kind)| kind.count_ones() > 1) {
+                forced_mut.learn_kind(table, Kind::Mixed);
             }
             // A slot holding an upvalue's value tells of the upvalue: the type the
             // guard found, and past a function's identity guard below, which
@@ -4019,8 +4137,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // See Note [Upvalue paths].
         if let Some(closure) = frame.closure.as_ref().filter(|_| frame.effects.0 & Effects::UPVALUE.0 == 0) {
             for fact in &ctx.fragile {
-                if let Fragile::Upvalue { upvalue, ctype } = &fact.fragile {
-                    known.assume(Fragile::Upvalue { upvalue: upvalue.under(closure), ctype: ctype.clone() });
+                match &fact.fragile {
+                    Fragile::Upvalue { upvalue, ctype } => known.assume(Fragile::Upvalue { upvalue: upvalue.under(closure), ctype: ctype.clone() }),
+                    Fragile::Kind { table, kind } => if let Some(table) = table.into_caller(closure) {
+                        known.assume(Fragile::Kind { table, kind: *kind });
+                    },
+                    _ => {},
                 }
             }
         }
@@ -5087,13 +5209,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                 },
                 CoroutineState::Yielded(YieldOp::IsElementOf(slot, table)) => {
-                    arg = if ctx.element_of(slot) == Some(table) { ResumeArg::Matched } else { ResumeArg::Failed };
+                    // The table in slot `table`, or in the upvalue whose value the slot holds.
+                    let same = |of: &Subject| *of == Subject::Slot(table) || ctx.holds(table).is_some_and(|upvalue| *of == Subject::Upvalue(upvalue));
+                    arg = if ctx.element_of(slot).is_some_and(|of| same(&of)) { ResumeArg::Matched } else { ResumeArg::Failed };
+                },
+                CoroutineState::Yielded(YieldOp::Subject(slot)) => {
+                    arg = ResumeArg::Subject(ctx.holds(slot).map_or(Subject::Slot(slot), Subject::Upvalue));
                 },
                 CoroutineState::Yielded(YieldOp::ArrayType(slot, table)) => {
-                    let kind = ctx.array_kind(table);
+                    let kind = ctx.subject_kind(&table);
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, kind.map_or(CType::Unknown, Kind::ctype))]);
-                    if kind.is_none() && slot != table {
+                    // A load into its table's slot has overwritten the table there.
+                    if kind.is_none() && table.slot() != Some(slot) {
                         ctx.assume(Fragile::ElementOf { slot, table });
                     }
                 },
@@ -5161,7 +5289,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, known.unwrap_or(CType::Unknown))]);
-                    ctx.assume(Fragile::Holds { slot, upvalue: UpvaluePath::Own(upvalue as u8) });
+                    let path = UpvaluePath::Own(upvalue as u8);
+                    if let Some(kind) = ctx.subject_kind(&Subject::Upvalue(path.clone())) {
+                        ctx.assume(Fragile::Kind { table: Subject::Slot(slot), kind });
+                    }
+                    ctx.assume(Fragile::Holds { slot, upvalue: path });
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
                     self.blocks[block_id.0].allocates = true;
