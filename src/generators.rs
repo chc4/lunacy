@@ -698,6 +698,18 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             ResumeArg::Matched => Some(None),
             _ => None,
         };
+        // A whole number stored at an integer key, into the array part or appended to it, is
+        // narrowed: a constant is stored in the integer encoding, and a slot a fact says holds one
+        // is narrowed first. See Note [Narrowing] in `specialize`.
+        let narrowed = if integer.is_some() && c & 0x100 != 0 && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
+            let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
+            Some(k)
+        } else {
+            None
+        };
+        if integer.is_some() && c & 0x100 == 0 {
+            yield YieldOp::NarrowConstant(c);
+        }
         let in_array = match integer {
             Some(Some(k)) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[a]))),
             Some(None) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[a, b]))),
@@ -705,8 +717,12 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         };
         // A constant value's boxed value is the op's hole.
         let constant = if c & 0x100 != 0 && matches!(in_array, ResumeArg::Matched) {
-            let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
-            Some(bits)
+            if let Some(k) = narrowed {
+                Some(LBoxed::from_int(k).bits())
+            } else {
+                let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
+                Some(bits)
+            }
         } else {
             None
         };
@@ -733,7 +749,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // out by the store if the context doesn't know it (`None`). See Note
         // [Array kinds].
         let ResumeArg::Type(stored) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-        let stored = stored.as_ltype();
+        let stored = if narrowed.is_some() { Some(LType::Integer) } else { stored.as_ltype() };
         // A value of the array's known kind keeps it, and so does one of its
         // elements: the store needn't widen it, and an element changes no kind.
         let own = c & 0x100 == 0 && (yield YieldOp::IsElementOf(c, a)) == ResumeArg::Matched;
@@ -838,9 +854,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                             Err(lv) => lv.unbox(),
                         };
                         let Some(kb) = kb.as_f64() else { unreachable!() };
-                        let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                            Ok(c) => LBoxed::from(c),
-                            Err(lv) => *lv,
+                        let kc: LBoxed = match (narrowed, Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16)) {
+                            (Some(k), _) => LBoxed::from_int(k),
+                            (None, Ok(c)) => LBoxed::from(c),
+                            (None, Err(lv)) => *lv,
                         };
                         let LValue::Table(mut t) = state.vals[state.base + a].unbox() else { unreachable!() };
                         t.set_widening::<$W>(owner, LBoxed::from_number(kb), kc, state.intern);

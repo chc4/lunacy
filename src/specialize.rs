@@ -1536,7 +1536,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // written. Where it is never used, the code it was carried through is contracted (Note
 // [Contraction]). A slot holding such a constant is narrowed statically too where it escapes into
 // an upvalue, captured by a closure or stored into one: a whole number kept there is most likely
-// used as an integer, and is one for every reader. So is an argument of a native's window op (Note
+// used as an integer, and is one for every reader. So is one stored into a table's array part, as a constant or a
+// slot holding one: an array a program fills with whole constants is then of the integer kind,
+// and so of one kind with the integers it later stores. So is an argument of a native's window op (Note
 // [Native windows] in `library`), which the op alone reads: the op then reads it as an integer, as
 // it picks its form by which arguments are. A store into a table isn't narrowed: values reach a
 // table's elements from many stores, constants stored from the constant table and copies among
