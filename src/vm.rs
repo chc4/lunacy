@@ -1977,16 +1977,16 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
-    /// The frame of an inlined call of R(A), with CALL's B, of a callee whose `max_stack` is
-    /// `stack`, made as `push_frame` makes a frame, nilled past its arguments if `fills`, or else
+    /// The frame of an inlined call of R(A), `callee`, with CALL's B, of a callee whose `max_stack`
+    /// is `stack`, made as `push_frame` makes a frame, nilled past its arguments if `fills`, or else
     /// by the JIT code. With `ENTRY`, its entry returns to the code inlining it
     /// (`Return::Inlined`); without, in JIT code, it is only counted (`jit_depth`), the JIT code
     /// keeping what its entry would hold. See Note [Inlined calls] in `specialize`.
     #[inline(always)]
-    pub fn shift_frame<const ENTRY: bool>(&mut self, owner: &Owner, a: usize, b: usize, stack: u8, fills: bool) {
-        debug_assert!(matches!(self.vals[self.base + a].unbox(), LValue::LClosure(_)), "an inlined call of what isn't a Lua function");
-        // SAFETY: R(A) is a Lua function, past its call's guard of it.
-        let LValue::LClosure(lclos) = self.vals[self.base + a].unbox() else { unsafe { core::hint::unreachable_unchecked() } };
+    pub fn shift_frame<const ENTRY: bool>(&mut self, owner: &Owner, callee: LBoxed<'src, 'intern>, a: usize, b: usize, stack: u8, fills: bool) {
+        debug_assert!(matches!(callee.unbox(), LValue::LClosure(_)), "an inlined call of what isn't a Lua function");
+        // SAFETY: R(A), `callee`, is a Lua function, past its call's guard of it.
+        let LValue::LClosure(lclos) = callee.unbox() else { unsafe { core::hint::unreachable_unchecked() } };
         debug_assert_eq!(stack, unsafe { (*lclos.ro(owner).prototype).max_stack }, "an inlined call's frame size isn't its callee's");
         let next_base = self.base + a + 1;
         let passed = if b == 0 { self.top } else { next_base + b - 1 };
@@ -2015,19 +2015,21 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         self.witness_base = self.witness_top;
     }
 
-    /// The return, RETURN A B, of the frame `shift_frame` made for an inlined call: closing its
-    /// open upvalues if `closes`, and its results to its function's slot, as `leave` moves them.
-    /// With `ENTRY`, its entry is popped, the caller's frame running again; without, in JIT code,
-    /// which puts the caller's frame back itself, it is only no longer counted. See Note [Inlined
-    /// calls] in `specialize`.
+    /// The return of the frame `shift_frame` made for an inlined call: closing its open upvalues
+    /// if `closes`, and for `results`, RETURN's A and B, its results to its function's slot, as
+    /// `leave` moves them; without, the code after it moves them. With `ENTRY`, its entry is
+    /// popped, the caller's frame running again; without, in JIT code, which puts the caller's
+    /// frame back itself, it is only no longer counted. See Note [Inlined calls] in `specialize`.
     #[inline(always)]
-    pub fn unshift_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool) {
+    pub fn unshift_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, results: Option<(usize, usize)>, closes: bool) {
         if closes && !self.upvals.is_empty() {
             self.close_upvalues(owner);
         }
-        let from = self.base + a;
-        let count = if b == 0 { self.top - from } else { b - 1 };
-        self.move_results(from, count, self.base - 1);
+        if let Some((a, b)) = results {
+            let from = self.base + a;
+            let count = if b == 0 { self.top - from } else { b - 1 };
+            self.move_results(from, count, self.base - 1);
+        }
         if !ENTRY {
             self.jit_depth -= 1;
             return;

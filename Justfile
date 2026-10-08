@@ -68,6 +68,12 @@ show-trace:
 trace-sql query:
     python3 tools/trace_sql.py "{{query}}"
 
+# The named golden tests (lua_tests/<name>.lua), each against its expected
+# output, in one debug build with `test`'s golden suite's features: quicker than
+# the whole suite while iterating.
+golden +names:
+    LUNACY_GOLDEN={{replace(names, " ", ",")}} cargo test --features gc_sanitize --test golden_tests test_golden
+
 # Golden tests, each against its expected output, under the default build,
 # immediate_jit, no_dynamic_guards and both (tools/golden_builds.py).
 golden-builds +tests:
@@ -154,12 +160,13 @@ jit-code-size benchmark times='10': (jit-disasm benchmark times)
     python3 tools/jit_code_size.py working/jit_disasm.txt
 
 # A golden test's JIT code, in bytes, as `jit-code-size` measures a benchmark's:
-# lua_tests/<name>.lua run by the release build.
+# lua_tests/<name>.lua run by the unsafe build, as `jit-disasm` builds it (with
+# `magic`, for the tests that force JIT compiling).
 jit-code-size-test name:
     just _luac-test {{name}}
     rm -f working/jit_disasm.txt
-    cd working && cargo run --release --features jit_disasm --bin lunacy \
-        --target-dir ../target/jit_disasm -- {{name}}.bin > /dev/null
+    cd working && cargo run --profile unsafe --no-default-features --features "unsafe magic jit_disasm" --bin lunacy \
+        --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- {{name}}.bin > /dev/null
     python3 tools/jit_code_size.py working/jit_disasm.txt
 
 # How much machine code LuaJIT's JIT generates for a benchmark, and whether it

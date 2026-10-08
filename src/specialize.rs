@@ -823,19 +823,33 @@ windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64],
     };
 });
 
-// `shift_frame` without the callstack's entry, for an inlined call of R(A) with CALL's B (`a` and
-// `b` as `Count::hold` holds them), of a callee whose `max_stack` is `stack`. Nilling the callee's
-// frame if `FILLS`, or else the JIT code does. See Notes [Inlined calls] and [Count case
-// analysis].
-windowed!(frame ShiftFrame, [a: u16, b: u16, stack: u8], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
-    state.shift_frame::<false>(owner, A.lift(a), B.lift(b), stack, FILLS);
+// `shift_frame` without the callstack's entry, for an inlined call of `callee`, R(A), with CALL's B
+// (`a` and `b` as `Count::hold` holds them), of a callee whose `max_stack` is `stack`, keeping the
+// window: the JIT code nils the callee's frame. Its cold path makes the stack long enough first.
+// See Notes [Inlined calls] and [Count case analysis].
+windowed!(ShiftFrame, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
+    if state.base + A.lift(a) + 1 + stack as usize > state.vals.len() {
+        true
+    } else {
+        state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false);
+        false
+    }
+} rejoin {
+    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false);
+});
+
+// `ShiftFrame` as a frame op, nilling the callee's frame past its arguments, as many as there are
+// or up to the top. See Notes [Inlined calls] and [Count case analysis].
+windowed!(frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| () {
+    let callee = state.vals[state.base + A.lift(a)];
+    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, true);
 });
 
 // `unshift_frame` without the callstack's entry, for an inlined callee's RETURN A B (`a` and `b`
-// as `Count::hold` holds them), closing its frame's open upvalues if `CLOSES`. See Notes [Inlined
-// calls] and [Count case analysis].
-windowed!(frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, A: Count, B: Count], |owner, state, base| () {
-    state.unshift_frame::<false>(owner, A.lift(a), B.lift(b), CLOSES);
+// as `Count::hold` holds them), closing its frame's open upvalues if `CLOSES`, moving its results
+// if `MOVES`. See Notes [Inlined calls] and [Count case analysis].
+windowed!(frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, MOVES: bool, A: Count, B: Count], |owner, state, base| () {
+    state.unshift_frame::<false>(owner, MOVES.then(|| (A.lift(a), B.lift(b))), CLOSES);
 });
 
 // Whether a table's array part has kind `kind`, testing an element loaded from it in place of
@@ -969,8 +983,9 @@ pub enum Residual {
     /// Note [Inlined calls].
     Inline { a: u16, b: u16, stack: u8 },
     /// An inlined callee's RETURN A B, which closes its frame's open upvalues if `closes`: its
-    /// results to the call's R(A), `call`, and the caller's frame back. See Note [Inlined calls].
-    InlineReturn { a: u16, b: u16, closes: bool, call: u16 },
+    /// results to the call's R(A), `call`, if `moves`, and the caller's frame back. See Note
+    /// [Inlined calls].
+    InlineReturn { a: u16, b: u16, closes: bool, call: u16, moves: bool },
     GC,
 }
 
@@ -1067,11 +1082,29 @@ fn inlining() -> bool {
     *INLINES
 }
 
-/// Whether a call in `caller`, of the context `calling`, inlines `callee`. See Note [Inlined calls].
-fn inlines<C>(calling: &Context, caller: &crate::chunk::FunctionBlock<'_, C>, callee: &crate::chunk::FunctionBlock<'_, C>) -> bool {
+/// How many slots past the base of the outermost frame inlining it the frame of code of `ctx` is.
+/// See Note [Inlined calls].
+fn inline_offset(ctx: &Context) -> usize {
+    let mut offset = 0;
+    let mut inline = ctx.inline.as_ref();
+    while let Some(frame) = inline {
+        offset += frame.a as usize + 1;
+        inline = frame.caller.inline.as_ref();
+    }
+    offset
+}
+
+/// The slots past the base of the outermost frame an inlined callee's frame may reach: the JIT's
+/// window names them (`Slots`). See Note [Inlined calls].
+const MAX_INLINE_SLOTS: usize = 256;
+
+/// Whether a call of R(A) in `caller`, of the context `calling`, inlines `callee`. See Note
+/// [Inlined calls].
+fn inlines<C>(calling: &Context, caller: &crate::chunk::FunctionBlock<'_, C>, callee: &crate::chunk::FunctionBlock<'_, C>, a: usize) -> bool {
     let code = &callee.instructions.items;
     inlining()
         && calling.inline.as_ref().map_or(0, |frame| frame.depth) < MAX_INLINE_DEPTH
+        && inline_offset(calling) + a + 1 + callee.max_stack as usize <= MAX_INLINE_SLOTS
         && callee.is_vararg == 0
         && !core::ptr::eq(caller, callee)
         && code.len() <= MAX_INLINE_SIZE
@@ -3313,11 +3346,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // An inlined callee's returns to the code after its call. See Note [Inlined calls].
                     if let Some(frame) = ctx.inline.clone() {
                         let after = self.inline_return(owner, &ctx, &frame, a as usize, b as usize);
-                        self.blocks[block_id.0].instructions.push(Residual::InlineReturn { a: a as u16, b, closes, call: frame.a });
-                        if b == 0 {
+                        // A count of results known statically moves them as window ops in the
+                        // caller's frame, missing ones nil: values the JIT's window only renames.
+                        // Every result up to the top moves as a return's do.
+                        let moves = b == 0;
+                        self.blocks[block_id.0].instructions.push(Residual::InlineReturn { a: a as u16, b, closes, call: frame.a, moves });
+                        if moves {
                             self.blocks[block_id.0].instructions.push(Residual::Arrive { a: frame.a, c: frame.c });
                         } else {
-                            self.blocks[block_id.0].instructions.push(Residual::Arrived { a: frame.a, c: frame.c, returned: b - 1 });
+                            let (call, c, a, returned) = (frame.a as usize, frame.c as usize, a as usize, b as usize - 1);
+                            for i in 0..if c == 0 { returned } else { c - 1 } {
+                                let result: Rc<dyn Window> = if i < returned {
+                                    Rc::new(crate::generators::Move::new(&[call + 1 + a + i, call + i]))
+                                } else {
+                                    Rc::new(crate::generators::LoadNil::new(&[call + i]))
+                                };
+                                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(result));
+                            }
+                            if c == 0 {
+                                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(SetTop::new(call + returned, &[]))));
+                            }
                         }
                         self.blocks[block_id.0].instructions.push(Residual::Jump(after));
                     } else {
@@ -3941,7 +3989,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let Some(call) = &inline
                 && !vm.compiled(call.block)
                 && matches!(vm.blocks[call.block.0].instructions.get(call.off), Some(Residual::LuaCall { .. }))
-                && inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee })
+                && inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee }, a)
             {
                 let frame = InlineFrame {
                     caller: (*ctx).clone(),
@@ -5003,7 +5051,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // the interpreter has for them, the callstack's last. See Note [Inlined
                         // calls].
                         let depth = state.callstack.iter().rev().take_while(|entry| entry.returns_to().is_none()).count();
-                        self.jit_compile(id, owner, depth);
+                        let offset = state.callstack.len().checked_sub(depth).filter(|_| depth > 0).map_or(0, |outer| state.base - state.callstack[outer].frame);
+                        self.jit_compile(id, owner, depth, offset);
                     }
 
                     let mut jit_entry = self.blocks[id.0].jit_info.entry.unwrap();
@@ -5257,12 +5306,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 &Residual::Inline { a, b, stack } => {
                     off += 1;
-                    state.shift_frame::<true>(owner, a as usize, b as usize, stack, true);
+                    let callee = state.vals[state.base + a as usize];
+                    state.shift_frame::<true>(owner, callee, a as usize, b as usize, stack, true);
                     self.set_current(state.clos.ro(owner).prototype);
                 },
-                &Residual::InlineReturn { a, b, closes, .. } => {
+                &Residual::InlineReturn { a, b, closes, moves, .. } => {
                     off += 1;
-                    state.unshift_frame::<true>(owner, a as usize, b as usize, closes);
+                    state.unshift_frame::<true>(owner, moves.then_some((a as usize, b as usize)), closes);
                     self.set_current(state.clos.ro(owner).prototype);
                 },
                 Residual::Thunk(thunk) => {

@@ -346,13 +346,13 @@ impl WindowAlloc {
 
     /// The next op of the run: resculpt the window for it at the cheapest of the
     /// `skips` it can run at, and run it. `None` if there are none.
-    pub fn op(&mut self, op: &dyn Window, skips: impl IntoIterator<Item = usize>) -> Option<SmallVec<[Emit; 16]>> {
-        let accesses = op.accesses();
-        let slots = op.operands();
+    pub fn op(&mut self, op: &Framed, skips: impl IntoIterator<Item = usize>) -> Option<SmallVec<[Emit; 16]>> {
+        let accesses = op.op.accesses();
+        let slots = op.slots();
         let plan = skips
             .into_iter()
             .filter(|&skip| skip + slots.len() <= self.width)
-            .map(|skip| self.plan(&slots, accesses, op.doubles(), skip))
+            .map(|skip| self.plan(slots, accesses, op.op.doubles(), skip))
             .min_by_key(|plan| (plan.cost, plan.overwritten, plan.skip))?;
         self.cache = plan.after;
         Some(plan.emits)
@@ -363,8 +363,9 @@ impl WindowAlloc {
     /// survive nowhere else and that `op` doesn't rewrite, then fill the named
     /// registers as one parallel move (a slot loaded into several registers is
     /// loaded once and copied). See Note [Window allocation].
-    pub fn reconcile(&mut self, want: &Placement, op: &dyn Window, skip: usize) -> SmallVec<[Emit; 16]> {
-        let rewritten = |slot: usize| op.operands().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a.writes());
+    pub fn reconcile(&mut self, want: &Placement, framed: &Framed, skip: usize) -> SmallVec<[Emit; 16]> {
+        let op = framed.op;
+        let rewritten = |slot: usize| framed.slots().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a.writes());
         let now = &self.cache;
         // Each wanted value in the form its op reads it in, if in its run, else
         // in the one it has.
@@ -411,6 +412,16 @@ impl WindowAlloc {
     /// path leaving the window (the cache itself is kept for the other paths).
     pub fn stores(&self) -> SmallVec<[Emit; WINDOW]> {
         self.cache.dirty.iter().map(|&slot| self.cache.store(slot)).collect()
+    }
+
+    /// Drop `slots` from the window without storing them: their values are dead.
+    pub fn forget(&mut self, slots: &Slots) {
+        for reg in 0..WINDOW {
+            if self.cache.regs[reg].is_some_and(|slot| slots.contains(slot)) {
+                self.cache.set(reg, None, false);
+            }
+        }
+        self.cache.dirty.retain(|slot| !slots.contains(*slot));
     }
 
     /// End the run: flush every dirty register and empty the window.
@@ -539,16 +550,40 @@ impl WindowAlloc {
 
 /// A step of a trace, for [`plan_trace`]: its blocks' residuals, as planning
 /// sees them.
+/// An op as the window sees it: its operands' slots counted from the base of the frame of the
+/// code the window is of, which the op's own frame is `offset` slots past when the op is code
+/// inlined into it. See Note [Inlined calls] in `specialize`.
+#[derive(Debug)]
+pub struct Framed<'a> {
+    pub op: &'a dyn Window,
+    slots: SmallVec<[usize; WINDOW]>,
+}
+
+impl<'a> Framed<'a> {
+    pub fn new(op: &'a dyn Window, offset: usize) -> Self {
+        Framed { op, slots: op.operands().iter().map(|&slot| slot + offset).collect() }
+    }
+
+    /// The operands' slots, as the window names them.
+    pub fn slots(&self) -> &[usize] {
+        &self.slots
+    }
+}
+
 pub enum Step<'a> {
     /// A block's start, continuing the trace from the step before it, with
     /// its `Rise` if the edge into it enters more frequent code.
     Start(Option<Rise>),
     /// A window op, and the `SKIP`s it can run at.
-    Op(&'a dyn Window, SmallVec<[usize; WINDOW]>),
+    Op(Framed<'a>, SmallVec<[usize; WINDOW]>),
     /// An inline guard testing `slot` in its register, if the window has one.
     Read(usize),
     /// A residual that flushes the window.
     Flush,
+    /// Slots whose values die, which the window drops without storing them: an inlined callee's
+    /// frame past its arguments, its caller's dead temporaries, which it nils. See Note [Inlined
+    /// calls] in `specialize`.
+    Kill(Slots),
     /// A jump to the block starting at step `start`, earlier in the trace:
     /// an edge into it, reading its entry window.
     Back(usize),
@@ -602,10 +637,10 @@ impl Ahead {
         for (step, s) in steps.iter().enumerate() {
             match s {
                 Step::Op(op, _) => {
-                    for (i, (&slot, &access)) in op.operands().iter().zip(op.accesses()).enumerate() {
+                    for (i, (&slot, &access)) in op.slots().iter().zip(op.op.accesses()).enumerate() {
                         if access.reads() {
                             ahead.events[slot].push((step, true));
-                            ahead.forms[slot].push((step, bit(op.doubles(), i)));
+                            ahead.forms[slot].push((step, bit(op.op.doubles(), i)));
                         }
                         if access.writes() {
                             ahead.events[slot].push((step, false));
@@ -616,6 +651,7 @@ impl Ahead {
                 Step::Exit { hot: true, reads } => reads.iter().for_each(|slot| ahead.events[slot].push((step, true))),
                 Step::Exit { hot: false, reads } => reads.iter().for_each(|slot| ahead.leaves[slot].push(step)),
                 Step::Flush => ahead.flushes.push(step),
+                Step::Kill(slots) => slots.iter().for_each(|slot| ahead.events[slot].push((step, false))),
                 Step::Back(start) => ahead.backs.push((step, *start)),
                 Step::Start(_) => {}
             }
@@ -785,16 +821,16 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 plan.dirty[step] = dirty;
             }
             Step::Op(op, usable) => {
-                let (want, skip) = place(&alloc, &ahead, step, *op, usable);
+                let (want, skip) = place(&alloc, &ahead, step, op, usable);
                 #[cfg(feature = "tracing")]
                 let (before, worth) = (format!("{}", alloc.cache()), worths(&ahead, alloc.cache(), step));
-                let mut emits = alloc.reconcile(&want, *op, skip);
-                emits.extend(alloc.op(*op, [skip]).expect("a placed op runs at its SKIP"));
+                let mut emits = alloc.reconcile(&want, op, skip);
+                emits.extend(alloc.op(op, [skip]).expect("a placed op runs at its SKIP"));
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("alloc", "op", &[
                     ("trace", trace.into()),
                     ("step", step.into()),
-                    ("name", op.name().into()),
+                    ("name", op.op.name().into()),
                     ("before", before.as_str().into()),
                     ("worth", worth.as_str().into()),
                     ("skip", skip.into()),
@@ -810,6 +846,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 crate::tracing::instant("alloc", "flush", &[("trace", trace.into()), ("step", step.into()), ("window", format!("{}", alloc.cache()).as_str().into())]);
                 alloc.flush();
             }
+            Step::Kill(slots) => alloc.forget(slots),
             Step::Exit { hot, .. } => {
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("alloc", "exit", &[
@@ -830,8 +867,8 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
 /// Where the op at `step` runs, and the window it wants: its inputs in its
 /// run, and the values worth most of the others, as many as fit outside it.
 /// See Note [Trace allocation].
-fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &dyn Window, usable: &[usize]) -> (Placement, usize) {
-    let (slots, accesses) = (op.operands(), op.accesses());
+fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed, usable: &[usize]) -> (Placement, usize) {
+    let (slots, accesses) = (op.slots(), op.op.accesses());
     let now = alloc.cache();
     let width = alloc.width;
     let mut kept: SmallVec<[((bool, usize), usize); WINDOW]> = now
@@ -1088,7 +1125,7 @@ mod tests {
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
         for w in &windows {
-            for emit in alloc.op(&**w, 0..WINDOW).unwrap() {
+            for emit in alloc.op(&Framed::new(&**w, 0), 0..WINDOW).unwrap() {
                 machine.exec(emit, Some(&**w));
             }
         }
@@ -1100,15 +1137,15 @@ mod tests {
     fn run_planned(width: usize, ops: &[TestOp], doubles: impl Fn(usize) -> u8) {
         let windows = windows(ops, doubles);
         let steps: Vec<Step> =
-            std::iter::once(Step::Start(None)).chain(windows.iter().map(|w| Step::Op(&**w, (0..WINDOW).collect()))).collect();
+            std::iter::once(Step::Start(None)).chain(windows.iter().map(|w| Step::Op(Framed::new(&**w, 0), (0..WINDOW).collect()))).collect();
         let plan = plan_trace(&steps, width, &Cache::default(), 0);
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
         for (i, w) in windows.iter().enumerate() {
-            for emit in alloc.reconcile(&plan.windows[i + 1], &**w, plan.skips[i + 1]) {
+            for emit in alloc.reconcile(&plan.windows[i + 1], &Framed::new(&**w, 0), plan.skips[i + 1]) {
                 machine.exec(emit, None);
             }
-            for emit in alloc.op(&**w, [plan.skips[i + 1]]).unwrap() {
+            for emit in alloc.op(&Framed::new(&**w, 0), [plan.skips[i + 1]]).unwrap() {
                 machine.exec(emit, Some(&**w));
             }
         }
@@ -1267,7 +1304,7 @@ mod tests {
             };
             let steps: Vec<Step> = std::iter::once(Step::Start(None))
                 .chain(kinds.iter().map(|&(kind, arg)| match kind {
-                    0 => Step::Op(&**next_op.next().unwrap(), (0..WINDOW).collect()),
+                    0 => Step::Op(Framed::new(&**next_op.next().unwrap(), 0), (0..WINDOW).collect()),
                     1 => Step::Start(None),
                     2 => Step::Flush,
                     3 => Step::Exit { hot: rng.below(2) == 0, reads: some_slots(&mut rng) },
@@ -1311,11 +1348,11 @@ mod tests {
                         alloc = WindowAlloc { width, cache: entry };
                     }
                     Step::Op(op, _) => {
-                        for emit in alloc.reconcile(&plan.windows[step], *op, plan.skips[step]) {
+                        for emit in alloc.reconcile(&plan.windows[step], op, plan.skips[step]) {
                             machine.exec(emit, None);
                         }
-                        for emit in alloc.op(*op, [plan.skips[step]]).unwrap() {
-                            machine.exec(emit, Some(*op));
+                        for emit in alloc.op(op, [plan.skips[step]]).unwrap() {
+                            machine.exec(emit, Some(op.op));
                         }
                     }
                     Step::Flush => {
@@ -1370,6 +1407,7 @@ mod tests {
                         }
                     }
                     Step::Read(_) => {}
+                    Step::Kill(_) => unreachable!("a test trace kills no slot"),
                 }
             }
             finish(alloc, machine, &ops);

@@ -213,12 +213,19 @@ pub fn emit_loadbool(dest: usize, value: bool, skip: bool, pc: usize) -> impl Co
 }
 
 /// `R(A) := ... := R(B) := nil`.
+// `R(dest) := nil`.
+windowed!(LoadNil, [], [], |owner, state, base| (out dest) {
+    *dest = LBoxed::NIL;
+});
+
+// `R(to) := R(from)`.
+windowed!(Move, [], [], |owner, state, base| (from, out to) {
+    *to = from;
+});
+
 pub fn emit_loadnil(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        windowed!(LoadNil, [], [], |owner, state, base| (out dest) {
-            *dest = LBoxed::NIL;
-        });
         for dest in a..=b {
             yield YieldOp::ExecWindow(Rc::new(LoadNil::new(&[dest])));
         }
@@ -1743,9 +1750,6 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Typeof(src);
         if let ResumeArg::Type(t) = arg.clone() {
-            windowed!(Move, [], [], |owner, state, base| (from, out to) {
-                *to = from;
-            });
             yield YieldOp::ExecWindow(Rc::new(Move::new(&[src, dest])));
             // TODO: track references? see PyLBBV
             debug!("move {} = {} {:?}", dest, src, t);

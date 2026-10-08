@@ -10,6 +10,7 @@ use crate::lboxed::NClosureCell;
 use crate::stack::ValueStack;
 use crate::specialize::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, EXITS, WINDOW};
+use crate::window_alloc::Framed;
 use crate::window_alloc::{plan_trace, Cache, ALLOCATED, Emit, Packed, Placement, Rise, Step, WindowAlloc, SCRATCH};
 use crate::trace::{Block as TraceBlock, Event, Loops, Policy, Region, Slots};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
@@ -396,8 +397,8 @@ struct Snapshot {
     /// How many inlined calls deep it is. See Note [Inlined calls] in `specialize`.
     depth: usize,
     /// The window register index, whether its value is unboxed, and slot of
-    /// each store.
-    stores: Vec<(usize, bool, usize)>,
+    /// each store, past the running frame's base.
+    stores: Vec<(usize, bool, isize)>,
 }
 
 impl Snapshot {
@@ -410,7 +411,7 @@ impl Snapshot {
         let mut bytes = (location | (self.depth as u64) << 48).to_le_bytes().to_vec();
         bytes.extend(u32::try_from(self.stores.len()).unwrap().to_le_bytes());
         for &(reg, unboxed, slot) in &self.stores {
-            bytes.extend(u16::try_from(slot).expect("a slot in a u16").to_le_bytes());
+            bytes.extend(i16::try_from(slot).expect("a slot in an i16").to_le_bytes());
             bytes.extend(u16::try_from(reg + if unboxed { WINDOW } else { 0 }).unwrap().to_le_bytes());
         }
         bytes.resize(bytes.len().next_multiple_of(8), 0);
@@ -441,11 +442,22 @@ enum Stub {
     /// `Select` or `Branch` after it: out of its copy's alignment if `aligned`,
     /// the window's moves, then the jump. See Note [Window exits] in `window`.
     /// With `count`, the window dump's counter of its moves.
-    Way { aligned: bool, moves: SmallVec<[Emit; 16]>, to: JumpTo, count: Option<i64> },
+    Way { aligned: bool, moves: SmallVec<[Emit; 16]>, to: JumpTo, count: Option<i64>, offset: usize },
     /// An exit of an op that selects with no `Select` or `Branch` after it:
     /// out of its copy's alignment if `aligned`, the exit to `select`, then on
     /// at `join`. See Note [Window exits] in `window`.
     Select { aligned: bool, exit: usize, join: DynamicLabel },
+}
+
+/// How many slots past the base of the frame of the code a window is of the frame of the code
+/// past `res` is, `offset` before it: the window names slots from that base, so a value keeps its
+/// name across an inlined call. See Note [Inlined calls] in `specialize`.
+fn offset_past(res: &Residual, offset: usize) -> usize {
+    match res {
+        Residual::Inline { a, .. } => offset + *a as usize + 1,
+        Residual::InlineReturn { call, .. } => offset - (*call as usize + 1),
+        _ => offset,
+    }
 }
 
 /// Where a jump to a block goes: its code, or a label it will have.
@@ -482,9 +494,9 @@ impl Pool {
 
     /// The label of a new entry holding the snapshot of `stores` at
     /// `location`. See Note [Snapshots].
-    fn snapshot(&mut self, ops: &mut Assembler, location: Location, depth: usize, stores: impl IntoIterator<Item = Emit>) -> DynamicLabel {
+    fn snapshot(&mut self, ops: &mut Assembler, location: Location, depth: usize, offset: usize, stores: impl IntoIterator<Item = Emit>) -> DynamicLabel {
         let stores = stores.into_iter().map(|emit| match emit {
-            Emit::Store { slot, reg, unboxed } => (reg, unboxed, slot),
+            Emit::Store { slot, reg, unboxed } => (reg, unboxed, slot as isize - offset as isize),
             emit => unreachable!("a flush only stores, not {emit:?}"),
         }).collect();
         let label = ops.new_dynamic_label();
@@ -576,28 +588,30 @@ fn xmm(r: usize) -> u8 {
 /// Emit an allocator instruction other than `Emit::Op`. Boxing subtracts the
 /// pinned tag and unboxing adds it, as `LBoxed` does (see Note [Pinned tag] in
 /// `window`), through r10, never a window register.
-fn emit_window_move(ops: &mut Assembler, emit: Emit) {
+fn emit_window_move(ops: &mut Assembler, emit: Emit, offset: usize) {
     let reg = |r: usize| WINDOW_REGS[r];
+    // A slot's home, past the running frame's base: the window names it from its own frame's.
+    let home = |slot: usize| (slot as isize - offset as isize) as i32 * 8;
     match emit {
         Emit::Load { reg: r, slot, unboxed: false } => dynasm!(ops
             ; .arch x64
-            ; mov Rq(reg(r)), QWORD [r13 + (slot * 8) as i32]
+            ; mov Rq(reg(r)), QWORD [r13 + home(slot)]
         ),
         Emit::Load { reg: r, slot, unboxed: true } => dynasm!(ops
             ; .arch x64
-            ; mov r10, QWORD [r13 + (slot * 8) as i32]
+            ; mov r10, QWORD [r13 + home(slot)]
             ; add r10, r14
             ; vmovq Rx(xmm(r)), r10
         ),
         Emit::Store { slot, reg: r, unboxed: false } => dynasm!(ops
             ; .arch x64
-            ; mov QWORD [r13 + (slot * 8) as i32], Rq(reg(r))
+            ; mov QWORD [r13 + home(slot)], Rq(reg(r))
         ),
         Emit::Store { slot, reg: r, unboxed: true } => dynasm!(ops
             ; .arch x64
             ; vmovq r10, Rx(xmm(r))
             ; sub r10, r14
-            ; mov QWORD [r13 + (slot * 8) as i32], r10
+            ; mov QWORD [r13 + home(slot)], r10
         ),
         Emit::Move { dst, src } => match (dst.unboxed, src.unboxed) {
             (false, false) => dynasm!(ops
@@ -637,6 +651,21 @@ const INLINE_NILS: usize = 16;
 
 /// The frame op `$op`, its const params `$pre` then a `Count` of each of
 /// `$counts` (see Note [Frame ops] in `specialize`), made from `$args`.
+/// `frame_op!`, of a window op with `operands`.
+macro_rules! window_op {
+    ($op:ident [$($pre:tt)*] ($($args:expr),*) [$operands:expr];) => {
+        Rc::new(crate::specialize::$op::<$($pre)*>::new($($args,)* $operands)) as Rc<dyn Window>
+    };
+    ($op:ident [$($pre:tt)*] ($($args:expr),*) [$operands:expr]; $count:expr $(, $rest:expr)*) => {
+        match crate::specialize::Count::of($count) {
+            crate::specialize::Count::Zero => window_op!($op [$($pre)* { crate::specialize::Count::Zero },] ($($args),*) [$operands]; $($rest),*),
+            crate::specialize::Count::One => window_op!($op [$($pre)* { crate::specialize::Count::One },] ($($args),*) [$operands]; $($rest),*),
+            crate::specialize::Count::Two => window_op!($op [$($pre)* { crate::specialize::Count::Two },] ($($args),*) [$operands]; $($rest),*),
+            crate::specialize::Count::Many => window_op!($op [$($pre)* { crate::specialize::Count::Many },] ($($args),*) [$operands]; $($rest),*),
+        }
+    };
+}
+
 macro_rules! frame_op {
     ($op:ident [$($pre:tt)*] ($($args:expr),*);) => {
         Rc::new(crate::specialize::$op::<$($pre)*>::new($($args,)* &[])) as Rc<dyn Window>
@@ -649,6 +678,39 @@ macro_rules! frame_op {
             crate::specialize::Count::Many => frame_op!($op [$($pre)* { crate::specialize::Count::Many },] ($($args),*); $($rest),*),
         }
     };
+}
+
+/// The window op an `Inline` moves to the callee's frame by, keeping the window, if its call has a
+/// fixed count of arguments, past which its code nils the frame itself; else the frame op does,
+/// flushing the window. See Note [Inlined calls] in `specialize`.
+fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
+    let &Residual::Inline { a, b, stack } = res else { return None };
+    let passed = (b as usize).checked_sub(1)?;
+    if (stack as usize).saturating_sub(passed) > INLINE_NILS {
+        return None;
+    }
+    let hold = crate::specialize::Count::hold;
+    let (held_a, held_b) = (hold(a), hold(b));
+    Some(window_op!(ShiftFrame [] (held_a, held_b, stack) [&[a as usize]]; a, b))
+}
+
+/// The slots, as the window names them at `offset`, that an `Inline`'s window op kills: the
+/// callee's frame past its arguments, which its code nils. See Note [Inlined calls] in
+/// `specialize`.
+fn inline_kills(res: &Residual, offset: usize) -> Slots {
+    let mut kills = Slots::default();
+    if let &Residual::Inline { a, b, stack } = res {
+        let base = offset + a as usize + 1;
+        (base + b as usize - 1..base + stack as usize).for_each(|slot| kills.insert(slot));
+    }
+    kills
+}
+
+/// Whether an `InlineReturn` keeps the window: its results moved by the window ops after it, and
+/// no upvalue to close, it only puts the caller's frame back. See Note [Inlined calls] in
+/// `specialize`.
+fn keeps_frame(res: &Residual) -> bool {
+    matches!(res, Residual::InlineReturn { moves: false, closes: false, .. })
 }
 
 /// A frame op's stencil, copied at `SKIP` 0, or, in a build that copies none, a
@@ -926,9 +988,10 @@ impl Drop for JitContext {
 pub struct JitBlock {
     ptr: JitPtr,
     window: Cache,
-    /// How many inlined calls deep its code is entered. See Note [Inlined calls] in
-    /// `specialize`.
+    /// How many inlined calls deep its code is entered, and its frame's offset (`offset_past`).
+    /// See Note [Inlined calls] in `specialize`.
     depth: usize,
+    offset: usize,
 }
 
 /// A block to compile in the current region: jumps to it go to `label`, with
@@ -936,8 +999,9 @@ pub struct JitBlock {
 pub struct Pending {
     label: DynamicLabel,
     window: Cache,
-    /// How many inlined calls deep the jumps to it are.
+    /// How many inlined calls deep the jumps to it are, and their frame's offset.
     depth: usize,
+    offset: usize,
 }
 
 /// Where planning placed a block's window ops. See Note [Window allocation].
@@ -1232,7 +1296,7 @@ impl JitContext {
             ; test ecx, ecx
             ; jz >done
             ; store:
-            ; movzx esi, WORD [rdx]
+            ; movsx rsi, WORD [rdx]
             ; movzx edi, WORD [rdx + 2]
             ; mov r8, QWORD [rsp + rdi * 8]
             // An XMM half's value, boxed.
@@ -1363,8 +1427,9 @@ impl JitContext {
 }
 
 impl<'src, 'intern> Specializer<'src, 'intern> {
-    /// JIT compile the region entered at `id`, whose code is `depth` inlined calls deep.
-    pub fn jit_compile(&mut self, id: BlockId, owner: &mut Owner, depth: usize) {
+    /// JIT compile the region entered at `id`, whose code is `depth` inlined calls deep, its frame
+    /// `offset` slots past the window's (`offset_past`).
+    pub fn jit_compile(&mut self, id: BlockId, owner: &mut Owner, depth: usize, offset: usize) {
         #[cfg(feature = "tracing")]
         crate::tracing::begin("jit", "compile", &[("block_id", id.0.into())]);
         debug!("JIT compiling block {:?}", id);
@@ -1410,14 +1475,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // first. In that case we just have to jump to it.
         let mut successor = None;
         if let Some(block) = self.jctx.blocks.get(&id) {
-            debug_assert_eq!(block.depth, depth, "a region entered at another depth than its block's code");
+            debug_assert_eq!((block.depth, block.offset), (depth, offset), "a region entered at another depth than its block's code");
             // Load the window the block is entered with.
             let loads = WindowAlloc::default().transfer(&block.window);
             jit_note!(self.jctx, ops, "load the window block {} is entered with, and jump to it", id.0);
             let counted = window_count!(self.jctx, &mut ops, loads);
             window_dump!(self.jctx, "block {} compiled already, entered with {}: {}{counted}", id.0, block.window, emits_line(&loads));
             for emit in loads {
-                emit_window_move(&mut ops, emit);
+                emit_window_move(&mut ops, emit, offset);
             }
             self.load_returned(&mut ops, id);
             dynasm!(ops
@@ -1436,7 +1501,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     {
                         self.jctx.traced_line = unsafe { (*self.proto).line_defined } as usize;
                     }
-                    plans = self.plan_region(id, policy, linked.as_ref());
+                    plans = self.plan_region(id, policy, linked.as_ref(), offset);
                     plans[&id].entry_window(linked.as_ref().unwrap_or(&Cache::default()))
                 }
                 None => linked.clone().unwrap_or_default(),
@@ -1446,7 +1511,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let counted = window_count!(self.jctx, &mut ops, loads);
             window_dump!(self.jctx, "region entry block {} loads {}{counted}", id.0, emits_line(&loads));
             for emit in loads {
-                emit_window_move(&mut ops, emit);
+                emit_window_move(&mut ops, emit, offset);
             }
             self.load_returned(&mut ops, id);
             // A loop header starts aligned. The entry's code is reserved as a
@@ -1458,9 +1523,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             // We need to skip over the uncommitted prologue
             let new_block = JitPtr(unsafe { base.0.add(ops.offset().0) });
-            self.jctx.blocks.insert(id, JitBlock { ptr: new_block, window, depth });
+            self.jctx.blocks.insert(id, JitBlock { ptr: new_block, window, depth, offset });
             let start_off = ops.offset().0;
-            let (_block, entry_succ) = self.jit_block(id, depth, &mut ops, &mut pool, owner, &plans);
+            let (_block, entry_succ) = self.jit_block(id, depth, offset, &mut ops, &mut pool, owner, &plans);
             successor = entry_succ;
             compiled_offsets.push((id, start_off, ops.offset().0));
         }
@@ -1488,11 +1553,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let pending_ptr = self.jctx.end();
             let pending_start = ops.offset();
-            self.jctx.blocks.insert(pending_block, JitBlock { ptr: pending_ptr, window: pending.window, depth: pending.depth });
+            self.jctx.blocks.insert(pending_block, JitBlock { ptr: pending_ptr, window: pending.window, depth: pending.depth, offset: pending.offset });
             dynasm!(ops
                 ; =>pending.label
             );
-            let (_block, next_succ) = self.jit_block(pending_block, pending.depth, &mut ops, &mut pool, owner, &plans);
+            let (_block, next_succ) = self.jit_block(pending_block, pending.depth, pending.offset, &mut ops, &mut pool, owner, &plans);
             successor = next_succ;
             compiled_offsets.push((pending_block, pending_start.0, ops.offset().0));
             self.jctx.reserve(ops.offset().0 - pending_start.0);
@@ -1522,7 +1587,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp =>join
                     );
                 }
-                Stub::Way { aligned, moves, to, count } => {
+                Stub::Way { aligned, moves, to, count, offset } => {
                     jit_note!(self.jctx, ops, "an exit's way");
                     if aligned {
                         dynasm!(ops ; .arch x64 ; add rsp, 8);
@@ -1531,7 +1596,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         emit_count(&mut ops, at);
                     }
                     for emit in moves {
-                        emit_window_move(&mut ops, emit);
+                        emit_window_move(&mut ops, emit, offset);
                     }
                     match to {
                         JumpTo::Code(code) => dynasm!(ops ; .arch x64 ; jmp extern code),
@@ -1739,7 +1804,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// the thunk's `window` to `target`'s entry window, then a jump into it.
     fn thunk_stub(&mut self, window: &Cache, target: BlockId) -> usize {
         let block = &self.jctx.blocks[&target];
-        let (ptr, entry) = (block.ptr, block.window.clone());
+        let (ptr, entry, offset) = (block.ptr, block.window.clone(), block.offset);
         let base = self.jctx.end();
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
         let emits = WindowAlloc::entering(window.clone()).transfer(&entry);
@@ -1747,7 +1812,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let counted = window_count!(self.jctx, &mut ops, emits);
         window_dump!(self.jctx, "thunk linked from {} into block {} entered with {}: {}{counted}", window, target.0, entry, emits_line(&emits));
         for emit in emits {
-            emit_window_move(&mut ops, emit);
+            emit_window_move(&mut ops, emit, offset);
         }
         dynasm!(ops
             ; .arch x64
@@ -1766,18 +1831,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// policy, each trace planned by one pass. See Note [Trace register
     /// allocation].
     /// With `entered`, the entry's trace starts from that window.
-    fn plan_region(&mut self, entry: BlockId, policy: Policy, entered: Option<&Cache>) -> Plans {
+    fn plan_region(&mut self, entry: BlockId, policy: Policy, entered: Option<&Cache>, offset: usize) -> Plans {
         let mut ids = vec![entry];
+        // Each block's frame offset (`offset_past`), the entry's `offset`.
+        let mut offsets = vec![offset];
         let mut index: HashMap<BlockId, usize, FxBuildHasher> = HashMap::default();
         index.insert(entry, 0);
         let mut next = 0;
         while let Some(&block) = ids.get(next) {
+            let mut offset = offsets[next];
             next += 1;
             let residuals = &self.blocks[block.0].instructions;
-            for target in residuals[..runs_to(residuals)].iter().flat_map(jump_targets) {
-                if !self.jctx.blocks.contains_key(&target) && !index.contains_key(&target) {
-                    index.insert(target, ids.len());
-                    ids.push(target);
+            for res in &residuals[..runs_to(residuals)] {
+                offset = offset_past(res, offset);
+                for target in jump_targets(res) {
+                    if !self.jctx.blocks.contains_key(&target) && !index.contains_key(&target) {
+                        index.insert(target, ids.len());
+                        ids.push(target);
+                        offsets.push(offset);
+                    }
                 }
             }
         }
@@ -1792,7 +1864,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     .iter()
                     .map(|res| match res {
                         Residual::ExecWindow(w) | Residual::GuardDynamic(w) => Some(stencils.effective(w)),
-                        _ => None,
+                        res => inline_shift(res).map(|w| stencils.effective(&w)),
                     })
                     .collect()
             })
@@ -1809,17 +1881,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let region = Region::new(
             ids.iter()
                 .zip(&skips)
-                .map(|(block, skips)| {
+                .zip(&offsets)
+                .map(|((block, skips), &offset)| {
                     let mut events = Vec::new();
+                    let mut offset = offset;
                     let residuals = &self.blocks[block.0].instructions;
                     for (off, res) in residuals[..runs_to(residuals)].iter().enumerate() {
+                        let at = offset;
+                        offset = offset_past(res, offset);
                         match res {
                             Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[off].is_empty() => {
                                 let operands = w.operands().iter().zip(w.accesses());
-                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot)));
-                                events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot)));
+                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot + at)));
+                                events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot + at)));
                             }
-                            Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => events.push(Event::Read(*idx)),
+                            Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => events.push(Event::Read(*idx + at)),
+                            Residual::Inline { a, .. } if !skips[off].is_empty() => {
+                                events.push(Event::Read(*a as usize + at));
+                                events.extend(inline_kills(res, at).iter().map(Event::Write));
+                            }
+                            res if keeps_frame(res) => {}
                             // Reads its field through the witness, no slot.
                             Residual::GuardWitness { .. } => {}
                             Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. } => {
@@ -1869,7 +1950,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let head = ids[trace[0]];
             let (hint, from) = hints.get(&head).map(|(_, window, from)| (window.clone(), *from)).unwrap_or_default();
             window_dump!(self.jctx, "trace from block {} starts from {}", head.0, hint);
-            let (planned, exits) = self.plan_trace(trace, &ids, &windows, &skips, &index, &live_in, &loops, &plans, &hint, from);
+            let (planned, exits) = self.plan_trace(trace, &ids, &offsets, &windows, &skips, &index, &live_in, &loops, &plans, &hint, from);
             for (from, target, window) in exits {
                 let hotness = self.blocks[from.0].jit_info.hotness.get();
                 if hints.get(&target).is_none_or(|&(hottest, ..)| hotness < hottest) {
@@ -1891,6 +1972,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         &self,
         trace: &[usize],
         ids: &[BlockId],
+        offsets: &[usize],
         windows: &[Vec<Option<Rc<dyn Window>>>],
         skips: &[Vec<SmallVec<[usize; WINDOW]>>],
         index: &HashMap<BlockId, usize, FxBuildHasher>,
@@ -1938,13 +2020,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Rise { reads, writes }
             })));
             let mut of = vec![None; block.instructions.len()];
+            let mut offset = offsets[b];
             for (off, res) in block.instructions[..runs_to(&block.instructions)].iter().enumerate() {
+                let at = offset;
+                offset = offset_past(res, offset);
                 match res {
                     Residual::ExecWindow(_) | Residual::GuardDynamic(_) if !skips[b][off].is_empty() => {
                         of[off] = Some(steps.len());
-                        steps.push(Step::Op(&**windows[b][off].as_ref().expect("a window op"), skips[b][off].clone()));
+                        steps.push(Step::Op(Framed::new(&**windows[b][off].as_ref().expect("a window op"), at), skips[b][off].clone()));
                     }
-                    Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => steps.push(Step::Read(*idx)),
+                    Residual::Guard { idx, .. } | Residual::NumericGuard { idx, .. } if inline_guard(res) => steps.push(Step::Read(*idx + at)),
+                    Residual::Inline { .. } if !skips[b][off].is_empty() => {
+                        of[off] = Some(steps.len());
+                        steps.push(Step::Op(Framed::new(&**windows[b][off].as_ref().expect("a window op"), at), skips[b][off].clone()));
+                        steps.push(Step::Kill(inline_kills(res, at)));
+                    }
+                    res if keeps_frame(res) => {}
                     Residual::GuardWitness { .. } => {}
                     Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. } => {
                         for target in jump_targets(res) {
@@ -2008,10 +2099,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// JIT compile one block, returning the JIT code offset and optionally the next block to
     /// compile.
-    pub fn jit_block(&mut self, id: BlockId, depth: usize, ops: &mut Assembler, pool: &mut Pool, owner: &mut Owner, plans: &Plans) -> (AssemblyOffset, Option<BlockId>) {
-        // How many inlined calls deep the code being emitted is, and each depth's exit. See Note
-        // [Inlined calls] in `specialize`.
+    pub fn jit_block(&mut self, id: BlockId, depth: usize, offset: usize, ops: &mut Assembler, pool: &mut Pool, owner: &mut Owner, plans: &Plans) -> (AssemblyOffset, Option<BlockId>) {
+        // How many inlined calls deep the code being emitted is, its frame's offset
+        // (`offset_past`), and each depth's exit. See Note [Inlined calls] in `specialize`.
         let depth = core::cell::Cell::new(depth);
+        let offset = core::cell::Cell::new(offset);
         let exits = pool.exits.clone();
         pool.deepest = pool.deepest.max(depth.get());
         // The address `JitHelper::dynamic_call` gets: this code only runs while
@@ -2041,7 +2133,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // place of emitting it.
         let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool, defer: bool| -> Option<(SmallVec<[Emit; 16]>, JumpTo, Option<i64>)> {
             if let Some(target_block) = self.jctx.blocks.get(target) {
-                debug_assert_eq!(target_block.depth, depth.get(), "a jump to a block at another depth");
+                debug_assert_eq!((target_block.depth, target_block.offset), (depth.get(), offset.get()), "a jump to a block at another depth");
                 // We already JIT compiled the block, and can jump to it directly.
                 let transfer = alloc.transfer(&target_block.window);
                 let (counted, count) = if defer { window_deferred!(self.jctx, transfer) } else { (window_count!(self.jctx, ops, transfer), None) };
@@ -2050,7 +2142,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     return Some((transfer, JumpTo::Code(target_block.ptr.0 as usize), count));
                 }
                 for emit in transfer {
-                    emit_window_move(ops, emit);
+                    emit_window_move(ops, emit, offset.get());
                 }
                 if !skip {
                     dynasm!(ops
@@ -2063,6 +2155,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // relocation.
                 let pending = self.jctx.pending.entry(*target).or_insert_with(|| Pending {
                     depth: depth.get(),
+                    offset: offset.get(),
                     label: ops.new_dynamic_label(),
                     window: match plans.get(target) {
                         Some(plan) => plan.entry_window(alloc.cache()),
@@ -2077,7 +2170,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     return Some((transfer, JumpTo::Label(pending.label), count));
                 }
                 for emit in transfer {
-                    emit_window_move(ops, emit);
+                    emit_window_move(ops, emit, offset.get());
                 }
                 if !skip {
                     dynasm!(ops
@@ -2121,7 +2214,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; ja >have_gas
             );
             for &emit in stores {
-                emit_window_move(ops, emit);
+                emit_window_move(ops, emit, offset.get());
             }
             dynasm!(ops
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
@@ -2214,7 +2307,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             window_dump!(self.jctx, "  {off:3} {res}");
             jit_note!(self.jctx, ops, "  {off:3} {res}");
             let prev = off.checked_sub(1).map(|p| &block.instructions[p]);
-            let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_) | Residual::GuardWitness { .. });
+            // An inlined call shifting to its callee's frame by a window op is laid out as the op,
+            // the caller's frame kept before it. See Note [Inlined calls] in `specialize`.
+            let shifted = inline_shift(res).map(Residual::ExecWindow);
+            let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_) | Residual::GuardWitness { .. })
+                || shifted.is_some() || keeps_frame(res);
             if window(res) && prev.is_some_and(|p| window(p)) {
                 // Inside a run of window residuals, charged for with its first.
             } else {
@@ -2227,12 +2324,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let counted = window_count!(self.jctx, ops, stores);
                     window_dump!(self.jctx, "      flush: {}{counted}", emits_line(&stores));
                     for emit in stores {
-                        emit_window_move(ops, emit);
+                        emit_window_move(ops, emit, offset.get());
                     }
                 }
                 #[cfg(feature = "gas")]
                 emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1), &alloc.stores());
             }
+            let call = res;
+            if shifted.is_some() {
+                jit_note!(self.jctx, ops, "        keep the caller's frame");
+                dynasm!(ops
+                    ; .arch x64
+                    ; push QWORD r12 => RunState.clos
+                    ; push QWORD r12 => RunState.base
+                    ; push QWORD r12 => RunState.witness_base
+                    ; push QWORD r12 => RunState.witness_top
+                    ; sub rsp, 16
+                );
+            }
+            let res = shifted.as_ref().unwrap_or(res);
             loop { match res {
                 Residual::Guard { idx, expected } | Residual::NumericGuard { idx, expected } if inline_guard(res) => {
                     let numeric = matches!(res, Residual::NumericGuard { .. });
@@ -2242,7 +2352,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // *mismatch* falls through to the failure edge at `off + 1`,
                     // both with the window live. `v` holds the value: its window
                     // register, or else r10.
-                    let v = match alloc.register_of(*idx) {
+                    let v = match alloc.register_of(*idx + offset.get()) {
                         // Unboxed, boxed into r10 for the test, the window as it was.
                         Some(reg) if alloc.cache().loc(reg).unboxed => {
                             window_dump!(self.jctx, "      tests r10 <- x{reg} boxed");
@@ -2746,21 +2856,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                 },
                 Residual::Inline { a, b, stack } => {
-                    // The callee's frame, moved to by `ShiftFrame`, which keeps no register but
-                    // `state`'s; and the base pointer with it, from the region's copy of it on the
-                    // native stack, which the code after a call takes it back from, moved too.
-                    // Past a fixed count of arguments the frame is nilled here, as for a
-                    // `LuaCall`. See Note [Inlined calls] in `specialize`.
-                    let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
+                    // The callee's frame, moved to by `ShiftFrameFilled`, which keeps no register
+                    // but `state`'s and nils the frame; what the frame's entry would hold kept as
+                    // `RunState::adopt_inlined` lays it out, the callee's base pointer last, where
+                    // the code after a call takes it back from. See Note [Inlined calls] in
+                    // `specialize`.
                     let hold = crate::specialize::Count::hold;
                     let (held_a, held_b) = (hold(*a), hold(*b));
-                    let shift = match nils {
-                        Some(_) => frame_op!(ShiftFrame [false,] (held_a, held_b, *stack); *a, *b),
-                        None => frame_op!(ShiftFrame [true,] (held_a, held_b, *stack); *a, *b),
-                    };
-                    // What the frame's entry would hold, kept as `RunState::adopt_inlined` lays
-                    // it out, the callee's base pointer last, where the code after a call takes it
-                    // back from. See Note [Inlined calls] in `specialize`.
+                    let shift = frame_op!(ShiftFrameFilled [] (held_a, held_b, *stack); *a, *b);
                     jit_note!(self.jctx, ops, "        keep the caller's frame");
                     dynasm!(ops
                         ; .arch x64
@@ -2770,7 +2873,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; push QWORD r12 => RunState.witness_top
                         ; sub rsp, 16
                     );
-                    jit_note!(self.jctx, ops, "        ShiftFrame");
+                    jit_note!(self.jctx, ops, "        ShiftFrameFilled");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &shift);
                     self.jctx.frame_ops.push(shift);
                     dynasm!(ops
@@ -2780,29 +2883,39 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov QWORD [rsp], r13
                     );
                     depth.set(depth.get() + 1);
+                    offset.set(offset_past(res, offset.get()));
                     pool.deepest = pool.deepest.max(depth.get());
-                    let nils = nils.unwrap_or_default();
-                    if !nils.is_empty() {
-                        let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
-                        dynasm!(ops ; .arch x64 ; mov eax, nil);
-                    }
-                    for slot in nils {
-                        match i8::try_from(slot * 8) {
-                            Ok(disp) => dynasm!(ops ; .arch x64 ; mov QWORD [BYTE r13 + disp], rax),
-                            Err(_) => dynasm!(ops ; .arch x64 ; mov QWORD [DWORD r13 + (slot * 8) as i32], rax),
-                        }
-                    }
                 },
-                Residual::InlineReturn { a, b, closes, call } => {
+                Residual::InlineReturn { .. } if keeps_frame(res) => {
+                    // Its results moved by the window ops after it, the caller's frame put back
+                    // from what `Inline` kept, keeping the window. See Note [Inlined calls] in
+                    // `specialize`.
+                    jit_note!(self.jctx, ops, "        put back the caller's frame");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; dec QWORD r12 => RunState.jit_depth
+                        ; add rsp, 16
+                        ; pop QWORD r12 => RunState.witness_top
+                        ; pop QWORD r12 => RunState.witness_base
+                        ; pop QWORD r12 => RunState.base
+                        ; pop QWORD r12 => RunState.clos
+                        ; mov r13, QWORD [rsp - 0]
+                    );
+                    depth.set(depth.get() - 1);
+                    offset.set(offset_past(res, offset.get()));
+                },
+                Residual::InlineReturn { a, b, closes, call, moves } => {
                     // The results moved by `UnshiftFrame`, then the caller's frame put back from
                     // what `Inline` kept, and the base pointer with it. See Note [Inlined calls]
                     // in `specialize`.
                     let _ = call;
                     let hold = crate::specialize::Count::hold;
                     let (held_a, held_b) = (hold(*a), hold(*b));
-                    let unshift = match closes {
-                        false => frame_op!(UnshiftFrame [false,] (held_a, held_b); *a, *b),
-                        true => frame_op!(UnshiftFrame [true,] (held_a, held_b); *a, *b),
+                    let unshift = match (closes, moves) {
+                        (false, false) => frame_op!(UnshiftFrame [false, false,] (held_a, held_b); *a, *b),
+                        (false, true) => frame_op!(UnshiftFrame [false, true,] (held_a, held_b); *a, *b),
+                        (true, false) => frame_op!(UnshiftFrame [true, false,] (held_a, held_b); *a, *b),
+                        (true, true) => frame_op!(UnshiftFrame [true, true,] (held_a, held_b); *a, *b),
                     };
                     jit_note!(self.jctx, ops, "        UnshiftFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &unshift);
@@ -2818,6 +2931,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov r13, QWORD [rsp - 0]
                     );
                     depth.set(depth.get() - 1);
+                    offset.set(offset_past(res, offset.get()));
                 },
                 Residual::Branch { hot, cold } => {
                     match fused.take() {
@@ -2826,7 +2940,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // `window` and [Optimistic ops] in `specialize`.
                         Some((label, aligned, _)) => {
                             let (moves, to, count) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
-                            pool.stubs.push((label, Stub::Way { aligned, moves, to, count }));
+                            pool.stubs.push((label, Stub::Way { aligned, moves, to, count, offset: offset.get() }));
                             emit_jump(ops, &alloc, hot, self.jctx.blocks.get(hot).is_none(), false);
                         },
                         // An op run by its body on the stack, which selected.
@@ -2858,7 +2972,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         // Exit 1 comes only from its cold path: its way off the hot path.
                         let (moves, to, count) = emit_jump(ops, &alloc, &targets[1].1, false, true).expect("a deferred jump's moves");
-                        pool.stubs.push((label, Stub::Way { aligned, moves, to, count }));
+                        pool.stubs.push((label, Stub::Way { aligned, moves, to, count, offset: offset.get() }));
                     }
                     emit_jump(ops, &alloc, &first, self.jctx.blocks.get(&first).is_none(), false);
                     successor = Some(first);
@@ -2918,13 +3032,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let stencils = &mut self.jctx.stencils;
                     let emits = match plans.get(&id) {
                         Some(plan) => plan.placed[off].map(|(skip, want)| {
-                            let mut emits = alloc.reconcile(&want.unpack(), &**w, skip as usize);
-                            emits.extend(alloc.op(&**w, [skip as usize]).expect("a placed op runs at its SKIP"));
+                            let mut emits = alloc.reconcile(&want.unpack(), &Framed::new(&**w, offset.get()), skip as usize);
+                            emits.extend(alloc.op(&Framed::new(&**w, offset.get()), [skip as usize]).expect("a placed op runs at its SKIP"));
                             emits
                         }),
                         // Streaming: the op picks its `SKIP` from the window it finds.
                         None => {
-                            alloc.op(&**w, usable_skips(stencils, &**w))
+                            alloc.op(&Framed::new(&**w, offset.get()), usable_skips(stencils, &**w))
                         }
                     };
                     // How its exits are laid out: a guard falls through to its failure
@@ -2960,7 +3074,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         splat(ops, &body, w.name(), &w.captures(), pool, other, unalign);
                                         copied = Some(body.aligned);
                                     }
-                                    emit => emit_window_move(ops, emit),
+                                    emit => emit_window_move(ops, emit, offset.get()),
                                 }
                             }
                         }
@@ -2970,7 +3084,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let counted = window_count!(self.jctx, ops, stores);
                             window_dump!(self.jctx, "      no stencil: flush {}, then call window_interp{counted}", emits_line(&stores));
                             for emit in stores {
-                                emit_window_move(ops, emit);
+                                emit_window_move(ops, emit, offset.get());
                             }
                             let (op, vtable) = (Rc::as_ptr(w) as *const dyn Window).to_raw_parts();
                             let vtable: *const () = unsafe { core::mem::transmute(vtable) };
@@ -3024,7 +3138,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let counted = window_count!(self.jctx, ops, stores);
                     window_dump!(self.jctx, "      exit after {}{counted}", emits_line(&stores));
                     // See Note [Snapshots].
-                    let snapshot = pool.snapshot(ops, Location(id, off), depth.get(), stores);
+                    let snapshot = pool.snapshot(ops, Location(id, off), depth.get(), offset.get(), stores);
                     dynasm!(ops
                         ; .arch x64
                         ; lea rax, [=>snapshot]
@@ -3035,6 +3149,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     emit_bailout(ops, off)
                 }
             }; break; }
+            if shifted.is_some() {
+                let &Residual::Inline { a, b, stack } = call else { unreachable!() };
+                jit_note!(self.jctx, ops, "        enter the callee's frame");
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r13, QWORD [rsp + (crate::vm::INLINE_KEPT * 8) as i32]
+                    ; add r13, (a as i32 + 1) * 8
+                    ; mov QWORD [rsp], r13
+                );
+                // Past its arguments, its frame's slots hold nil, the caller's dead temporaries
+                // before.
+                alloc.forget(&inline_kills(call, offset.get()));
+                let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
+                let nils = b as usize - 1..stack as usize;
+                if !nils.is_empty() {
+                    dynasm!(ops ; .arch x64 ; mov eax, nil);
+                }
+                for slot in nils {
+                    match i8::try_from(slot * 8) {
+                        Ok(disp) => dynasm!(ops ; .arch x64 ; mov QWORD [BYTE r13 + disp], rax),
+                        Err(_) => dynasm!(ops ; .arch x64 ; mov QWORD [DWORD r13 + (slot * 8) as i32], rax),
+                    }
+                }
+                depth.set(depth.get() + 1);
+                offset.set(offset_past(call, offset.get()));
+                pool.deepest = pool.deepest.max(depth.get());
+            }
             window_dump!(self.jctx, "      window {}", alloc.cache());
         }
 
