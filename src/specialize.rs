@@ -1610,6 +1610,7 @@ pub enum Fragile {
     Holds { slot: usize, upvalue: usize },
     /// Upvalue `upvalue` holds a value of `ctype`, which a guard found in a
     /// slot holding its value: for a function past its identity guard, which.
+    /// Every slot holding its value is of `ctype`.
     Upvalue { upvalue: usize, ctype: CType },
     /// Stack slot `slot` holds a value loaded from the array part of the table
     /// in slot `table`. See Note [Array kinds].
@@ -1948,6 +1949,17 @@ impl Context {
             Fragile::Holds { slot: held, upvalue } if *held == slot => Some(*upvalue),
             _ => None,
         })
+    }
+
+    /// Assume upvalue `upvalue` holds a value of `ctype`, as does each slot
+    /// holding its value, unless the slot's type already tells more.
+    fn learn_upvalue(&mut self, upvalue: usize, ctype: CType) {
+        for fact in &self.fragile {
+            if let Fragile::Holds { slot, upvalue: held } = fact.fragile && held == upvalue && self.types[slot].accepts(&ctype) {
+                self.types[slot] = ctype.clone();
+            }
+        }
+        self.assume(Fragile::Upvalue { upvalue, ctype });
     }
 
     /// A slot holding upvalue `upvalue`'s value, if one is known to.
@@ -3518,7 +3530,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let holds = forced_mut.holds(idx);
             if let Some(upvalue) = holds {
-                forced_mut.assume(Fragile::Upvalue { upvalue, ctype: found.clone() });
+                forced_mut.learn_upvalue(upvalue, found.clone());
             }
             debug!("forcing thunk with {} == {}", found, expected);
             // Continued as a guard the context answers would be, so the ways
@@ -3551,7 +3563,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // a block for it immediately.
                 forced_mut.types[idx] = idx_ctype.clone().unwrap();
                 if let Some(upvalue) = holds {
-                    forced_mut.assume(Fragile::Upvalue { upvalue, ctype: idx_ctype.clone().unwrap() });
+                    forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
                 }
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
@@ -3569,7 +3581,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // Likewise we can do the same thing with statically known Lua functions
                 forced_mut.types[idx] = idx_ctype.clone().unwrap();
                 if let Some(upvalue) = holds {
-                    forced_mut.assume(Fragile::Upvalue { upvalue, ctype: idx_ctype.clone().unwrap() });
+                    forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
                 }
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 let proto = lclos.ro(owner).prototype.cast();
