@@ -823,18 +823,19 @@ windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64],
     };
 });
 
-// `shift_frame` for an inlined call of R(A) with CALL's B (`a` and `b` as `Count::hold` holds
-// them), of a callee whose `max_stack` is `stack`. Nilling the callee's frame if `FILLS`, or else
-// the JIT code does. See Notes [Inlined calls] and [Count case analysis].
+// `shift_frame` without the callstack's entry, for an inlined call of R(A) with CALL's B (`a` and
+// `b` as `Count::hold` holds them), of a callee whose `max_stack` is `stack`. Nilling the callee's
+// frame if `FILLS`, or else the JIT code does. See Notes [Inlined calls] and [Count case
+// analysis].
 windowed!(frame ShiftFrame, [a: u16, b: u16, stack: u8], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
-    state.shift_frame(owner, A.lift(a), B.lift(b), stack, FILLS);
+    state.shift_frame::<false>(owner, A.lift(a), B.lift(b), stack, FILLS);
 });
 
-// `unshift_frame` for an inlined callee's RETURN A B (`a` and `b` as `Count::hold` holds them),
-// closing its frame's open upvalues if `CLOSES`. See Notes [Inlined calls] and [Count case
-// analysis].
+// `unshift_frame` without the callstack's entry, for an inlined callee's RETURN A B (`a` and `b`
+// as `Count::hold` holds them), closing its frame's open upvalues if `CLOSES`. See Notes [Inlined
+// calls] and [Count case analysis].
 windowed!(frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, A: Count, B: Count], |owner, state, base| () {
-    state.unshift_frame(owner, A.lift(a), B.lift(b), CLOSES);
+    state.unshift_frame::<false>(owner, A.lift(a), B.lift(b), CLOSES);
 });
 
 // Whether a table's array part has kind `kind`, testing an element loaded from it in place of
@@ -1013,11 +1014,16 @@ pub enum CallEntry {
 // effects, applied as a continuation applies a callee's; Note [Call effects]), with no guard on the
 // return between.
 //
-// At runtime the callee's frame is made and left as a call's (`Inline`, `InlineReturn`), but its
-// entry in the callstack returns to the code inlining it (`Return::Inlined`), not to a residual:
-// to the interpreter, the collector and unwinding it is a frame as any other. An inlined call's
-// entry pushed by a frame JIT code called, which has no entry of its own until a bailout writes it,
-// records that frame's depth, so that the bailout's entries go before it (`finish_unwinding`).
+// At runtime the callee's frame is made and left as a call's (`Inline`, `InlineReturn`). In the
+// interpreter its entry in the callstack returns to the code inlining it (`Return::Inlined`), not
+// to a residual: to the interpreter, the collector and unwinding it is a frame as any other. JIT
+// code makes no entry for it, as for a frame JIT code calls (Note [Frame ops]): it keeps what the
+// entry would hold on the native stack and counts the frame (`jit_depth`), and code leaving JIT
+// code from inside it writes the entry as a call's bailout does. The JIT knows how many inlined
+// calls deep each block's code is as it compiles it, so each way out of JIT code unwinds as many:
+// a region's exits per depth, and an exit through a snapshot by the depth the snapshot records.
+// Entered from the interpreter inside inlined calls, JIT code takes their entries onto the native
+// stack first (`RunState::adopt_inlined`).
 //
 // The callee's code is its versions for the inlined call, which their contexts carry
 // (`InlineFrame`), apart from its versions for its calls and for other inlined calls. Calls in
@@ -1051,7 +1057,7 @@ struct InlineCall {
 }
 
 /// How many inlined calls deep code can be. See Note [Inlined calls].
-const MAX_INLINE_DEPTH: u8 = 2;
+pub(crate) const MAX_INLINE_DEPTH: u8 = 2;
 /// The most instructions a callee inlined has. See Note [Inlined calls].
 const MAX_INLINE_SIZE: usize = 32;
 
@@ -4993,7 +4999,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 } else {
                     if block.jit_info.entry.is_none() {
                         debug!("jit compile {id:?}");
-                        self.jit_compile(id, owner);
+                        // As many inlined calls deep as the running frame's code is: the entries
+                        // the interpreter has for them, the callstack's last. See Note [Inlined
+                        // calls].
+                        let depth = state.callstack.iter().rev().take_while(|entry| entry.returns_to().is_none()).count();
+                        self.jit_compile(id, owner, depth);
                     }
 
                     let mut jit_entry = self.blocks[id.0].jit_info.entry.unwrap();
@@ -5247,12 +5257,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 &Residual::Inline { a, b, stack } => {
                     off += 1;
-                    state.shift_frame(owner, a as usize, b as usize, stack, true);
+                    state.shift_frame::<true>(owner, a as usize, b as usize, stack, true);
                     self.set_current(state.clos.ro(owner).prototype);
                 },
                 &Residual::InlineReturn { a, b, closes, .. } => {
                     off += 1;
-                    state.unshift_frame(owner, a as usize, b as usize, closes);
+                    state.unshift_frame::<true>(owner, a as usize, b as usize, closes);
                     self.set_current(state.clos.ro(owner).prototype);
                 },
                 Residual::Thunk(thunk) => {
