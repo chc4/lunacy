@@ -1,0 +1,152 @@
+( All five portraits should look right )
+
+|00 @System &vector $2 &wst $1 &rst $1 &eaddr $2 &ecode $1 &pad $1 &r $2 &g $2 &b $2 &debug $1 &halt $1
+|20 @Screen &vector $2 &width $2 &height $2 &auto $1 &pad $1 &x $2 &y $2 &addr $2 &pixel $1 &sprite $1
+
+|0100
+	( | size )
+	#00a0 .Screen/width DEO2
+	#0020 .Screen/height DEO2
+	( | theme )
+	#05ae .System/r DEO2
+	#0a9f .System/g DEO2
+	#097f .System/b DEO2
+	( | normal horizontal )
+	#0000 .Screen/x DEO2
+	#0000 .Screen/y DEO2
+	[ LIT2 35 -Screen/auto ] DEO
+	;img-hor .Screen/addr DEO2
+	#85 <draw-4times>
+	( | normal vertical )
+	#0020 .Screen/x DEO2
+	#0000 .Screen/y DEO2
+	[ LIT2 36 -Screen/auto ] DEO
+	;img-ver .Screen/addr DEO2
+	#85 <draw-4times>
+	( | flipped horizontal )
+	#0058 .Screen/x DEO2
+	#0000 .Screen/y DEO2
+	[ LIT2 36 -Screen/auto ] DEO
+	;img-x-flipped .Screen/addr DEO2
+	#95 <draw-4times>
+	( | flipped vertical )
+	#0060 .Screen/x DEO2
+	#0018 .Screen/y DEO2
+	[ LIT2 36 -Screen/auto ] DEO
+	;img-y-flipped .Screen/addr DEO2
+	#a5 <draw-4times>
+	( | flipped horizontal/vertical )
+	#0098 .Screen/x DEO2
+	#0018 .Screen/y DEO2
+	[ LIT2 36 -Screen/auto ] DEO
+	;img-xy-flipped .Screen/addr DEO2
+	#b5 <draw-4times>
+	BRK
+
+@<draw-4times> ( color -- )
+	.Screen/sprite DEOk DEOk DEOk DEO
+	JMP2r
+
+@draw-fast ( w h addr* color -- )
+	,&color STR
+	.Screen/addr DEO2
+	SWP #01 SUB #40 SFT #06 ORA .Screen/auto DEO
+	#00 SWP SUB
+	&times ( -- )
+		[ LIT2 &color $1 -Screen/sprite ] DEO
+		INC DUP ?&times
+	POP JMP2r
+
+(
+@|assets )
+
+@img-ver [
+	0000 0008 0404 0501 ffff fff7 fbfa f9f9
+	0000 1000 21ff ffff ffff efde 21ff ffff
+	2020 0060 f8ff fffc dfdf 9f67 f8ff fffc
+	0703 2110 0888 c851 e7fb ddee 76b6 d64d
+	0307 0617 172f 080c fbf7 f6e5 e7cf e8ec
+	ffef 1fff ff1f 0f37 f7ef 1fff 8f07 0733
+	fbff ffff fcf8 f3f7 fbf7 fff8 f0f0 f1f1
+	d3d7 c783 0100 0040 8bc7 d79b 1d3e 3e5e
+	0e06 0301 0101 0505 eef6 fbfd fdfd f9f9
+	7bfb 3fff ffff ffff 3b3b 3fff ffff ffff
+	f7f7 f7ff fff7 fffb f3ff fff3 fbff ffe3
+	c0e0 e0e4 e5e3 c7cf feee eeea e9eb f7cf
+	3800 0103 c7ff ffff c6fe fd3b c7ff ffff
+	ff7f 3f0f a0b8 bebf ff7f 3f5f b1bf bfbf
+	dfbf fefd fb07 0fdf c387 fefd fb07 efdf
+	bf7f ffff ffff ffff bf7f ffff ffff ffff ]
+
+@img-hor [
+	0000 0008 0404 0501 ffff fff7 fbfa f9f9
+	0307 0617 172f 080c fbf7 f6e5 e7cf e8ec
+	0e06 0301 0101 0505 eef6 fbfd fdfd f9f9
+	3800 0103 c7ff ffff c6fe fd3b c7ff ffff
+	0000 1000 21ff ffff ffff efde 21ff ffff
+	ffef 1fff ff1f 0f37 f7ef 1fff 8f07 0733
+	7bfb 3fff ffff ffff 3b3b 3fff ffff ffff
+	ff7f 3f0f a0b8 bebf ff7f 3f5f b1bf bfbf
+	2020 0060 f8ff fffc dfdf 9f67 f8ff fffc
+	fbff ffff fcf8 f3f7 fbf7 fff8 f0f0 f1f1
+	f7f7 f7ff fff7 fffb f3ff fff3 fbff ffe3
+	dfbf fefd fb07 0fdf c387 fefd fb07 efdf
+	0703 2110 0888 c851 e7fb ddee 76b6 d64d
+	d3d7 c783 0100 0040 8bc7 d79b 1d3e 3e5e
+	c0e0 e0e4 e5e3 c7cf feee eeea e9eb f7cf
+	bf7f ffff ffff ffff bf7f ffff ffff ffff ]
+
+@img-x-flipped [
+	e0c0 8408 1011 138a e7df bb77 6e6d 6bb2
+	0404 0006 1fff ff3f fbfb f9e6 1fff ff3f
+	0000 0800 84ff ffff ffff f77b 84ff ffff
+	0000 0010 2020 a080 ffff ffef df5f 9f9f
+	cbeb e3c1 8000 0002 d1e3 ebd9 b87c 7c7a
+	dfff ffff 3f1f cfef dfef ff1f 0f0f 8f8f
+	fff7 f8ff fff8 f0ec eff7 f8ff f1e0 e0cc
+	c0e0 60e8 e8f4 1030 dfef 6fa7 e7f3 1737
+	0307 0727 a7c7 e3f3 7f77 7757 97d7 eff3
+	efef efff ffef ffdf cfff ffcf dfff ffc7
+	dedf fcff ffff ffff dcdc fcff ffff ffff
+	7060 c080 8080 a0a0 776f dfbf bfbf 9f9f
+	fdfe ffff ffff ffff fdfe ffff ffff ffff
+	fbfd 7fbf dfe0 f0fb c3e1 7fbf dfe0 f7fb
+	fffe fcf0 051d 7dfd fffe fcfa 8dfd fdfd
+	1c00 80c0 e3ff ffff 637f bfdc e3ff ffff ]
+
+@img-y-flipped [
+	ffff ffc7 0301 0038 ffff ffc7 3bfd fec6
+	bfbe b8a0 0f3f 7fff bfbf bfb1 5f3f 7fff
+	df0f 07fb fdfe bfdf dfef 07fb fdfe 87c3
+	ffff ffff ffff 7fbf ffff ffff ffff 7fbf
+	0505 0101 0103 060e f9f9 fdfd fdfb f6ee
+	ffff ffff ff3f fb7b ffff ffff ff3f 3b3b
+	fbff f7ff fff7 f7f7 e3ff fffb f3ff fff3
+	cfc7 e3e5 e4e0 e0c0 cff7 ebe9 eaee eefe
+	0c08 2f17 1706 0703 ece8 cfe7 e5f6 f7fb
+	370f 1fff ff1f efff 3307 078f ff1f eff7
+	f7f3 f8fc ffff fffb f1f1 f0f0 f8ff f7fb
+	4000 0001 83c7 d7d3 5e3e 3e1d 9bd7 c78b
+	0105 0404 0800 0000 f9f9 fafb f7ff ffff
+	ffff ff21 0010 0000 ffff ff21 deef ffff
+	fcff fff8 6000 2020 fcff fff8 679f dfdf
+	51c8 8808 1021 0307 4dd6 b676 eedd fbe7 ]
+
+@img-xy-flipped [
+	ffff ffff ffff fefd ffff ffff ffff fefd
+	fbf0 e0df bf7f fdfb fbf7 e0df bf7f e1c3
+	fd7d 1d05 f0fc feff fdfd fd8d fafc feff
+	ffff ffe3 c080 001c ffff ffe3 dcbf 7f63
+	f3e3 c7a7 2707 0703 f3ef d797 5777 777f
+	dfff efff ffef efef c7ff ffdf cfff ffcf
+	ffff ffff fffc dfde ffff ffff fffc dcdc
+	a0a0 8080 80c0 6070 9f9f bfbf bfdf 6f77
+	0200 0080 c1e3 ebcb 7a7c 7cb8 d9eb e3d1
+	efcf 1f3f ffff ffdf 8f8f 0f0f 1fff efdf
+	ecf0 f8ff fff8 f7ff cce0 e0f1 fff8 f7ef
+	3010 f4e8 e860 e0c0 3717 f3e7 a76f efdf
+	8a13 1110 0884 c0e0 b26b 6d6e 77bb dfe7
+	3fff ff1f 0600 0404 3fff ff1f e6f9 fbfb
+	ffff ff84 0008 0000 ffff ff84 7bf7 ffff
+	80a0 2020 1000 0000 9f9f 5fdf efff ffff ]
+

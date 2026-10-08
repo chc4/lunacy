@@ -559,6 +559,91 @@ hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
         -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
         -n unsafe "./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
+# Raven (https://github.com/mkeeter/raven), Matt Keeter's Uxn and Varvara
+# emulator, at RAVEN_REV in target/raven: its CLI, with each of its backends,
+# `--backend interpreter` (safe Rust), `tailcall` (safe Rust, tail calls) and
+# `native` (x86-64 assembly).
+RAVEN_REV := "14dbcbeb38cf15fa941f35095f6acf944252f4b3"
+_raven:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -d target/raven || git clone -q https://github.com/mkeeter/raven target/raven
+    git -C target/raven checkout -q --detach {{RAVEN_REV}}
+    cd target/raven && cargo build -q --release -p raven-cli --features native,tailcall
+
+# The uxn_* benchmarks run a Uxn ROM (varvara/roms) on the Lua Varvara emulator
+# (varvara/), which needs more JIT code than lunacy's default buffer holds: their
+# lunacy builds get LUNACY_JIT_SIZE bytes.
+UXN_JIT_SIZE := "16777216"
+
+# `hyperfine-full` of a uxn_* benchmark, lunacy's builds with UXN_JIT_SIZE, and
+# with `times` 1, Raven's backends running its ROM's reset vector (raven-cli
+# --quit), where the ROM needs nothing past it (not bunnymark, which runs on
+# frames): the same work as the benchmark's, past building the Lua machine.
+hyperfine-uxn benchmark times='1': unsafe-compile interpreter-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    b={{benchmark}}
+    just _luac $b
+    just _luajitc $b
+    just _lua55c $b
+    just _luauc $b
+    cargo build --release --bin bench
+    jit="LUNACY_JIT_SIZE={{UXN_JIT_SIZE}}"
+    raven=()
+    rom=working/roms/${b#uxn_}.rom
+    if [ {{times}} = 1 ] && [ $b != uxn_bunnymark ]; then
+        for backend in interpreter tailcall native; do
+            raven+=(-n "raven $backend" "target/raven/target/release/raven-cli --backend $backend --quit $rom")
+        done
+    fi
+    # As `hyperfine-full`: a command failing is timed, and left out of the history.
+    taskset -c {{CPU}} hyperfine -i -N --warmup {{WARMUP}} --export-markdown working/hyperfine-$b-{{times}}.md \
+        --export-json working/hyperfine-$b-{{times}}.json \
+        -n lua5.1 "lua5.1 bench.lua -- working/$b.bin {{times}}" \
+        -n lua5.5 "lua5.5 bench.lua -- working/$b.lua55.bin {{times}}" \
+        -n luau "luau -O2 working/$b.luau -a {{times}}" \
+        -n "luau --codegen" "luau -O2 --codegen working/$b.luau -a {{times}}" \
+        -n "luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin {{times}}" \
+        -n luajit "luajit bench.lua -- working/$b.luajit.bin {{times}}" \
+        -n interpreter "./target/interpreter/release/bench working/$b.bin {{times}}" \
+        -n release "env $jit ./target/release/bench working/$b.bin {{times}}" \
+        -n unsafe "env $jit ./target/unsafe/bench working/$b.bin {{times}}" \
+        "${raven[@]}"
+    python3 tools/bench_history.py record working/hyperfine-$b-{{times}}.json --benchmark $b --arg {{times}}
+
+# `hyperfine-uxn` over UXN_HYPERFINES.
+UXN_HYPERFINES := "uxn_fib:1 uxn_tak:1 uxn_mandelbrot:1 uxn_bunnymark:1"
+hyperfines-uxn:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{UXN_HYPERFINES}}; do just hyperfine-uxn ${run%:*} ${run#*:}; done
+    for run in {{UXN_HYPERFINES}}; do echo "${run%:*} ${run#*:}"; tail -n +3 working/hyperfine-${run%:*}-${run#*:}.md; done
+
+# The Lua Varvara emulator's screen against Raven's snapshot tests' images:
+# each ROM given input as Raven's tests give it (varvara/snapshot.lua) by
+# `lua`, a Lua (`lua5.1`, `luajit`) or lunacy's release build (`lunacy`), in
+# working/snapshot-<rom>.ppm, compared pixel by pixel with Raven's
+# (tools/compare_snapshot.py), any differences drawn in working/snapshot-<rom>-diff.png.
+SNAPSHOT_ROMS := "screen screen.auto screen.blending screen.bounds screen.pixel controller mandelbrot"
+varvara-snapshots lua='lunacy': _raven
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if [ {{lua}} = lunacy ]; then cargo build --release --bin lunacy || exit 1; fi
+    failed=0
+    for rom in {{SNAPSHOT_ROMS}}; do
+        python3 tools/bundle_bench.py --entry varvara/snapshot.lua --rom $rom > working/snapshot-$rom.lua || exit 1
+        if [ {{lua}} = lunacy ]; then
+            luac5.1 -o working/snapshot-$rom.bin working/snapshot-$rom.lua
+            LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} ./target/release/lunacy working/snapshot-$rom.bin > working/snapshot-$rom.ppm
+        else
+            {{lua}} working/snapshot-$rom.lua > working/snapshot-$rom.ppm
+        fi
+        python3 tools/compare_snapshot.py working/snapshot-$rom.ppm target/raven/raven-varvara/tests/${rom//./_}.png \
+            --diff working/snapshot-$rom-diff.png || failed=1
+    done
+    exit $failed
+
 # Compare the trace-building policies of the window allocator, and streaming
 # allocation, on a benchmark
 # (LUNACY_TRACES; see docs/trace-register-allocation.md).

@@ -105,11 +105,12 @@
             tcvm              # tcvm, which `just hyperfine-full` compares against
             pkgs.graphviz     # `dot`, which the `graph` feature renders block graphs with
             # tools/*.py, and `perfetto` for traces (`just trace*`)
-            (pkgs.python3.withPackages (ps: [ perfettoPython ]))
+            (pkgs.python3.withPackages (ps: [ perfettoPython ps.pillow ]))
             traceProcessor    # Perfetto's trace processor, for the `perfetto` module
             pkgs.perf         # `just flamegraph`
             pkgs.cargo-flamegraph
             pkgs.gdb          # backtraces of crashes in JIT code and stencils
+            pkgs.uxn          # `uxnasm`, which assembles varvara/roms, and `uxncli`
           ];
 
           # mimalloc (and other -sys crates) need a C toolchain to build.

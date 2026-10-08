@@ -1,0 +1,172 @@
+( mandelbrot.tal )
+( )
+( by alderwick and d_m )
+( )
+( uses 4.12 fixed point arithmetic. )
+
+( SCALE  LOGICAL   SCREENSIZE )
+( #0001    21x16        42x32 )
+( #0002    42x32        84x64 )
+( #0004    84x64      168x128 )
+( #0008  168x128      336x256 )
+( #0010  336x256      672x512 )
+( #0020  672x512    1344x1024 )
+
+%SCALE  { #0009 } (    32 )
+%WIDTH  { #0015 } (    21 )
+%HEIGHT { #0010 } (    16 )
+%XMIN   { #de69 } ( -8601 => -8601/4096 => -2.100 )
+%XMAX   { #0b33 } (  2867 =>  2867/4096 =>  0.700 )
+%YMIN   { #ecc7 } ( -4915 => -4915/4096 => -1.200 )
+%YMAX   { #1333 } (  4915 =>  4915/4096 =>  1.200 )
+
+|00 @System &vector $2 &wst $1 &rst $1 &eaddr $2 &ecode $1 &pad $1 &r $2 &g $2 &b $2 &debug $1 &halt $1
+|20 @Screen &vector $2 &width $2 &height $2 &auto $1 &pad $1 &x $2 &y $2 &addr $2 &pixel $1 &sprite $1
+
+|0100 ( -> )
+
+	( set colors )
+	#00ff .System/r DEO2
+	#0ff0 .System/g DEO2
+	#0f0f .System/b DEO2
+
+	( set window size )
+	width #10 SFT2 .Screen/width  DEO2
+	height #10 SFT2 .Screen/height DEO2
+
+	( run )
+	draw-mandel BRK
+
+( logical width )
+@width ( -> w* )
+    WIDTH SCALE MUL2 JMP2r
+
+( logical height )
+@height ( -> h* )
+    HEIGHT SCALE MUL2 JMP2r
+
+( draw the mandelbrot set using 4.12 fixed point numbers )
+@draw-mandel ( -> )
+	XMAX XMIN SUB2 width DIV2 ,&dx STR2 ( ; &dx<-{xmax-min}/width )
+	YMAX YMIN SUB2 height DIV2 ,&dy STR2 ( ; &dy<-{ymax-ymin}/height )
+	[ LIT2 01 -Screen/auto ] DEO         ( ; auto<-1 )
+	LIT2r 8000                           ( [8000] )
+	YMAX YMIN                            ( ymax* ymin* [8000] )
+	&yloop                               ( ymax* y* [8000] )
+		XMAX XMIN                        ( ymax* y* xmax* xmin* [8000] )
+		&xloop                           ( ymax* y* xmax* x* [8000] )
+			ROT2k evaluate               ( ymax* y* xmax* x* xmax* count^ [8000] )
+			draw-px POP2                 ( ymax* y* xmax* x* [8000] )
+			[ LIT2 &dx $2 ] ADD2         ( ymax* y* xmax* x+dx* [8000] )
+			OVR2 STH2kr ADD2             ( ymax* y* xmax* x+dx* 8000+xmax* [8000] )
+			OVR2 STH2kr ADD2             ( ymax* y* xmax* x+dx* 8000+xmax* 8000+x+dx* [8000] )
+			GTH2 ?&xloop                 ( ymax* y* xmax* x+dx* [8000] )
+		POP2 POP2                        ( ymax* y* [8000] )
+		#0000 .Screen/x DEO2             ( ymax* y* [8000] ; sc/x<-0 )
+		.Screen/y ;inc2 adjust           ( ymax* y* [8000] ; sc/y<-sy+1 )
+		[ LIT2 &dy $2 ] ADD2             ( ymax* y+dy* [8000] )
+		OVR2 STH2kr ADD2                 ( ymax* y+dy* 8000+ymax* [8000] )
+		OVR2 STH2kr ADD2                 ( ymax* y+dy* 8000+ymax* 8000+y+dy* [8000] )
+		GTH2 ?&yloop                     ( ymax* y+dy* [8000] )
+	POP2 POP2 POP2r JMP2r                ( )
+
+( dithering pattern for 2x2 pixels: )
+( )
+( |o o|  ->  |x o|  ->  |x o|  ->  |x x|  ->  |x x| )
+( |o o|  ->  |o o|  ->  |o x|  ->  |o x|  ->  |x x| )
+( )
+( |[p+3]/4 [px+1]/4| )
+( |[p+0]/4 [px+2]/4| )
+@draw-px ( px^ -> )
+	INCk INCk INC               ( p+0 p+1 p+3 )
+	draw-quad draw-quad         ( p+0 ; draw NW, NE )
+	.Screen/y ;inc1 adjust      ( ; y<-y+1 )
+	.Screen/x ;sub2 adjust      ( ; x<-x-2 )
+	INCk INC SWP                ( p+2 p+0 )
+	draw-quad draw-quad         ( ; draw SW, SE )
+	.Screen/y ;sub1 !adjust     ( ; y<-y-1 )
+
+( draw one quadrant of a 2x2 area )
+@draw-quad ( p^ -> )
+	#02 SFT .Screen/pixel DEO JMP2r ( ; pixel<-p/4 )
+
+( evaluate the mandelbrot function at one point )
+@evaluate ( x* y* -> count^ )
+	#0000 DUP2 ,&x1 STR2         ( x* y* ; x1<-0 )
+		  DUP2 ,&y1 STR2         ( x* y* ; y1<-0 )
+		  DUP2 ,&x2 STR2         ( x* y* ; x2<-0 )
+			   ,&y2 STR2         ( x* y* ; y2<-0 )
+	LIT2r 2000                   ( x* y* [20 00] )
+	&loop                        ( x* y* [20 n^] )
+		[ LIT2 &x1 $2 ]          ( x* y* x1* [20 n^] )
+		[ LIT2 &y1 $2 ]          ( x* y* x1* y1* [20 n^] )
+		smul2 DUP2 ADD2          ( x* y* 2x1y1* [20 n^] )
+		OVR2 ADD2 ,&y1 STR2      ( x* y* [20 n^] ; y1<-2x1y1+y* )
+		SWP2 [ LIT2 &x2 $2 ]     ( y* x* x2* [20 n^] )
+		[ LIT2 &y2 $2 ] SUB2     ( y* x* x2-y2* [20 n^] )
+		OVR2 ADD2 ,&x1 STR2 SWP2 ( x* y* [20 n^] ; x1<-x2-y2+x* )
+		,&x1 LDR2 square         ( x* y* x1^2* [20 n^] )
+		DUP2 ,&x2 STR2           ( x* y* x1^2* [20 n^] ; x2<-x1^2* )
+		,&y1 LDR2 square         ( x* y* x1^2* y1^2* [20 n^] )
+		DUP2 ,&y2 STR2           ( x* y* x1^2* y1^2* [20 n^] ; y2<-y1^2* )
+		ADD2 #4000 GTH2 ?&end    ( x* y* [20 n^] )
+		INCr GTHkr STHr ?&loop   ( x* y* [20 n+1*] )
+	&end                         ( x* y* [20 count^] )
+	POP2 POP2 NIPr STHr JMP2r    ( count^ )
+
+( is x a non-negative signed value? )
+@non-negative ( x* -> x* x>=0^ )
+	DUP2 #8000 LTH2 JMP2r
+
+( multiply two signed 4.12 fixed point numbers )
+@smul2 ( a* b* -> ab* )
+	LIT2r 0001 non-negative ?{ negate SWPr } ( a* |b|* [sign*] )
+	SWP2 non-negative ?{ negate SWPr }       ( |b|* |a|* [sign*] )
+	smul2-pos STHr ?{ negate } POPr JMP2r    ( ab* )
+
+( multiply two non-negative fixed point numbers )
+( )
+( a * b = {a0/16 + a1/4096} * {b0/16 + b1/4096} )
+(       = a0b0/256 + a1b0/65536 + a0b1/65536 + a1b1/16777216 )
+(       = x + y + z + 0 ; the last term is too small to represent, i.e. zero )
+( )
+( x = a0b0 << 4 )
+( y = a1b0 >> 4 )
+( z = a0b1 >> 4 )
+@smul2-pos ( a* b* -> ab* )
+	aerate ROT2 aerate           ( b0* b1* a0* a1* )
+	STH2 ROT2k STH2 MUL2r        ( b0* b1* a0* b1* a0* [a1b0*] )
+	MUL2 STH2 ADD2r              ( b0* b1* a0* [a1b0+a0b1*] )
+	NIP2 MUL2 #07ff min #40 SFT2 ( a0b0* [y+z*] )
+	STH2r #04 SFT2 ADD2          ( x* [y+z*] )
+	#7fff !min                   ( ab* )
+
+( equivalent to DUP2 smul2 but faster )
+@square ( a* -> aa* )
+	non-negative ?{ negate }     ( |a|* )
+	aerate                       ( 00 ahi^ 00 alo^ )
+	OVR2 MUL2 #03 SFT2 SWP2      ( yz* ahi* )
+	DUP2 MUL2 #07ff min #40 SFT2 ( x* yz* )
+	ADD2 #7fff !min              ( aa* )
+
+( update a device d^ given a function f: x* -> f[x]* )
+@adjust ( d^ f* -> )
+	STH2 DEI2k STH2r JSR2 ROT DEO2 JMP2r
+
+( return the minimum of two non-negative numbers. )
+@min ( x* y* )
+	GTH2k [ JMP SWP2 ] NIP2 JMP2r
+
+( convert each byte of a a short into a short )
+@aerate ( x* -> 00 xhi^ 00 xlo^ )
+	SWP #0000 ROT SWP2 SWP JMP2r
+
+( negate a fixed point number. doesn't work for #8000 )
+@negate ( x* -> -x* )
+	DUP2k EOR2 SWP2 SUB2 JMP2r
+
+( useful arithmetic operations )
+@inc2 ( n* -> n+2* ) INC2
+@inc1 ( n* -> n+1* ) INC2 JMP2r
+@sub1 ( n* -> n-1* ) #0001 SUB2 JMP2r
+@sub2 ( n* -> n-2* ) #0002 SUB2 JMP2r
