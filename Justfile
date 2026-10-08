@@ -6,6 +6,16 @@ WARMUP := "3"
 # The core hyperfine and the commands it times are pinned to (`taskset`), so a
 # run never migrates onto a core that has not ramped up.
 CPU := "2"
+# A lock every run that times or samples code holds while it runs (`flock`), so
+# that no two of them, from any checkout or agent on the machine, run at once
+# and skew each other: a run waits for the one before it. Only the commands
+# that measure take it, not the builds before them, and never a recipe calling
+# another, which would wait on itself.
+BENCH_LOCK := env_var_or_default("LUNACY_BENCH_LOCK", "/tmp/lunacy-bench.lock")
+# The prefix of a timed command: the lock, then pinned to `CPU`.
+TIMED := "flock " + BENCH_LOCK + " taskset -c " + CPU
+# The prefix of a sampled command: the lock.
+SAMPLED := "flock " + BENCH_LOCK
 
 # Every test: `test`, then `test-stencils`.
 tests: test test-stencils
@@ -192,7 +202,7 @@ jit-profile benchmark times='10' op='' period='20000' features='unsafe':
     just _luac {{benchmark}}
     cargo build --profile unsafe --no-default-features --features "{{features}} perf jit_disasm" --bin bench \
         --target-dir target/jit_disasm -Z build-std="core,std,panic_abort"
-    cd working && perf record -e ibs_op// -c {{period}} -o jit-profile.data ../target/jit_disasm/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
+    cd working && {{SAMPLED}} perf record -e ibs_op// -c {{period}} -o jit-profile.data ../target/jit_disasm/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
     cd working && perf script -i jit-profile.data -F ip,sym > jit-profile.samples
     python3 tools/jit_samples.py working/jit_disasm.txt working/jit-profile.samples --out working/jit_samples.txt {{ if op != "" { "--op '" + op + "'" } else { "" } }}
 
@@ -434,7 +444,7 @@ flamegraphs freq='19997':
     for run in {{HYPERFINES}}; do
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark
-        (cd working && perf record -F {{freq}} --call-graph fp -g -o perf-$benchmark-$times.data -- ../target/flamegraph/bench $benchmark.bin $times > /dev/null)
+        (cd working && {{SAMPLED}} perf record -F {{freq}} --call-graph fp -g -o perf-$benchmark-$times.data -- ../target/flamegraph/bench $benchmark.bin $times > /dev/null)
         flamegraph --perfdata working/perf-$benchmark-$times.data -o working/flamegraph-$benchmark-$times.svg > /dev/null
         profiles+=(working/perf-$benchmark-$times.data)
     done
@@ -496,7 +506,7 @@ hyperfine benchmark times='10': unsafe-compile
     cargo build --release --bin bench
     # A build whose run fails (e.g. past the JIT buffer's end) is still timed,
     # and left out of the history for its exit code.
-    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
+    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
         -n "luajit -joff" "luajit -joff bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
         -n luajit "luajit bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
@@ -516,7 +526,7 @@ hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
     cargo build --release --bin bench
     # A command failing (lua5.1, lua5.5 and Luau lack the bit library) is timed,
     # and left out of the history for its exit code.
-    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
+    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
         -n lua5.1 "lua5.1 bench.lua -- working/{{benchmark}}.bin {{times}}" \
         -n lua5.5 "lua5.5 bench.lua -- working/{{benchmark}}.lua55.bin {{times}}" \
@@ -534,7 +544,7 @@ hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
 hyperfine-traces benchmark times='10' policies='streaming,single,unidirectional,bidirectional':
     just _luac {{benchmark}}
     cargo build --release --bin bench
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
         "LUNACY_TRACES={policy} ./target/release/bench working/{{benchmark}}.bin {{times}}"
 # `hyperfine-traces` over the benchmarks lunacy runs, each run enough times for
 # a stable mean. life runs twice: the difference between its 1000 and 5000 runs
@@ -576,7 +586,7 @@ _build-vs ref:
 hyperfine-vs ref benchmark times='10': (_build-vs ref)
     just _luac {{benchmark}}
     # As `hyperfine`: a build whose run fails is left out of the history.
-    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
+    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.json \
         -n "ref release" "target/compare/{{ref}}/target/release/bench working/{{benchmark}}.bin {{times}}" \
         -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
@@ -596,7 +606,7 @@ bench-rev ref:
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark
         # As `hyperfine`: a build whose run fails is left out of the history.
-        taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-json working/hyperfine-$benchmark-$times-{{ref}}.json \
+        {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-json working/hyperfine-$benchmark-$times-{{ref}}.json \
             -n "ref release" "target/compare/{{ref}}/target/release/bench working/$benchmark.bin $times" \
             -n "ref unsafe" "target/compare/{{ref}}/target/unsafe/bench working/$benchmark.bin $times"
         python3 tools/bench_history.py record working/hyperfine-$benchmark-$times-{{ref}}.json --benchmark $benchmark --arg $times --ref {{ref}}
@@ -630,9 +640,9 @@ bench-bars builds='lua5.1,lua5.5,luau,luau --codegen,luajit -joff,luajit,interpr
 # times.
 perf-stat-vs ref benchmark times='10' runs='5' profile='unsafe' events='task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses': (_build-vs ref)
     just _luac {{benchmark}}
-    taskset -c {{CPU}} perf stat -r {{runs}} -e {{events}} \
+    {{TIMED}} perf stat -r {{runs}} -e {{events}} \
         target/compare/{{ref}}/target/{{profile}}/bench working/{{benchmark}}.bin {{times}} > /dev/null
-    taskset -c {{CPU}} perf stat -r {{runs}} -e {{events}} \
+    {{TIMED}} perf stat -r {{runs}} -e {{events}} \
         ./target/{{profile}}/bench working/{{benchmark}}.bin {{times}} > /dev/null
 # `perf-stat-vs` over HYPERFINES (tools/perf_stat_vs.py): instructions, branches
 # and cycles of revision `ref`'s build of `profile` and this checkout's on each
@@ -646,17 +656,17 @@ hyperfine-feature feature benchmark times='10':
     just _luac {{benchmark}}
     cargo build --release --bin bench
     cargo build --release --features {{feature}} --bin bench --target-dir target/features/{{feature}}
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
         -n default "./target/release/bench working/{{benchmark}}.bin {{times}}" \
         -n {{feature}} "target/features/{{feature}}/release/bench working/{{benchmark}}.bin {{times}}"
 hyperfine-jit benchmark:
     just _luac {{benchmark}}
     cargo build --release --bin bench
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-jit.md \
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-jit.md \
         "./target/release/bench working/{{benchmark}}.bin"
 hyperfine-unsafe benchmark: unsafe-compile
     just _luac {{benchmark}}
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-unsafe.md \
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-unsafe.md \
         "./target/unsafe/bench working/{{benchmark}}.bin"
 
 
@@ -688,7 +698,7 @@ store-types:
 # every other implementation again.
 hyperfine-interpreter benchmark times='10': interpreter-compile
     just _luac {{benchmark}}
-    taskset -c {{CPU}} hyperfine -i --warmup {{WARMUP}} --export-json working/hyperfine-{{benchmark}}-{{times}}-interpreter.json \
+    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-json working/hyperfine-{{benchmark}}-{{times}}-interpreter.json \
         -n interpreter "./target/interpreter/release/bench working/{{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}-interpreter.json --benchmark {{benchmark}} --arg {{times}}
 
@@ -770,7 +780,7 @@ hyperfines-knob knob: unsafe-compile
     #!/usr/bin/env bash
     set -euo pipefail
     rm -rf working/knob && mkdir -p working/knob
-    for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-json working/knob/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{knob}}" "env {{knob}} ./target/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
+    for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; {{TIMED}} hyperfine --warmup {{WARMUP}} --export-json working/knob/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{knob}}" "env {{knob}} ./target/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
     python3 tools/knob_table.py working/knob/*.json
 
 hyperfines-full:
@@ -793,7 +803,7 @@ hyperfine-features benchmark times +sets:
         mkdir -p target/features/$set && cp target/release/bench target/features/$set/bench
         commands+=(-n $set "target/features/$set/bench working/{{benchmark}}.bin {{times}}")
     done
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-features.md "${commands[@]}"
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-features.md "${commands[@]}"
 
 # `hyperfine-features` over HYPERFINES, then every comparison's table.
 hyperfines-features +sets:
@@ -823,7 +833,7 @@ hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
         builds=target/compare/{{ref}}/target/unsafe/bench,$builds
         out=$out-vs-{{ref}}
     fi
-    taskset -c {{CPU}} hyperfine --warmup {{WARMUP}} --export-markdown $out.md --export-json $out.json \
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown $out.md --export-json $out.json \
         --parameter-list padding {{paddings}} --parameter-list build $builds \
         "LUNACY_JIT_PADDING={padding} {build} working/{{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record $out.json --benchmark {{benchmark}} --arg {{times}} ${ref:+--ref $ref}
