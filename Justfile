@@ -644,6 +644,35 @@ varvara-snapshots lua='lunacy': _raven
     done
     exit $failed
 
+# The Lua Varvara emulator in a window (the `varvara` bin, feature
+# `varvara_ui`): lunacy's release build running varvara/app.lua on ROM `rom`, a
+# name in varvara/roms or a path to a .rom file. `env` is more of the bin's
+# environment (`VARVARA_FRAMES`, `VARVARA_SCREENSHOT`).
+varvara rom env='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --features varvara_ui --bin varvara
+    python3 tools/bundle_bench.py --entry varvara/app.lua > working/varvara-app.lua
+    luac5.1 -o working/varvara-app.bin working/varvara-app.lua
+    rom={{rom}}
+    if [ -f varvara/roms/$rom.tal ]; then
+        mkdir -p working/roms
+        uxnasm varvara/roms/$rom.tal working/roms/$rom.rom > /dev/null
+        rom=working/roms/$rom.rom
+    fi
+    # GL is Mesa's, through libglvnd (see VARVARA_LIBRARY_PATH in flake.nix), by
+    # EGL: a virtual display may have no GLX.
+    env LD_LIBRARY_PATH=$VARVARA_LIBRARY_PATH SDL_VIDEO_FORCE_EGL=1 \
+        __EGL_VENDOR_LIBRARY_DIRS=$VARVARA_MESA/share/glvnd/egl_vendor.d LIBGL_DRIVERS_PATH=$VARVARA_MESA/lib/dri \
+        LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} {{env}} ./target/release/varvara working/varvara-app.bin $rom
+
+# `varvara` on a virtual display, its window after `frames` frames in
+# working/varvara-<rom>.png.
+varvara-screenshot rom frames='120':
+    xvfb-run -a -s "-screen 0 1440x900x24" just varvara {{rom}} "VARVARA_FRAMES={{frames}} VARVARA_SCREENSHOT=working/varvara-{{rom}}.ppm"
+    python3 -c 'import sys; from PIL import Image; Image.open(sys.argv[1]).save(sys.argv[2])' working/varvara-{{rom}}.ppm working/varvara-{{rom}}.png
+    @echo working/varvara-{{rom}}.png
+
 # Compare the trace-building policies of the window allocator, and streaming
 # allocation, on a benchmark
 # (LUNACY_TRACES; see docs/trace-register-allocation.md).

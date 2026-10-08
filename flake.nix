@@ -111,6 +111,9 @@
             pkgs.cargo-flamegraph
             pkgs.gdb          # backtraces of crashes in JIT code and stencils
             pkgs.uxn          # `uxnasm`, which assembles varvara/roms, and `uxncli`
+            pkgs.SDL2         # the `varvara` bin's window, input and GL context
+            pkgs.xvfb-run     # `just varvara-screenshot`: a virtual X display
+            pkgs.imagemagick  # `just varvara-screenshot`: `import`, which captures it
           ];
 
           # mimalloc (and other -sys crates) need a C toolchain to build.
@@ -120,6 +123,12 @@
           ];
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+
+          # The `varvara` bin's libraries at run time (`just varvara*`): SDL, and
+          # GL through libglvnd to Mesa, which renders in software on a virtual
+          # display.
+          VARVARA_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.SDL2 pkgs.libglvnd pkgs.mesa ];
+          VARVARA_MESA = "${pkgs.mesa}";
 
           shellHook = ''
             echo "lunacy devshell — try: just run nbody"

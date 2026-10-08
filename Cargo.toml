@@ -29,6 +29,9 @@ align_selects = ["jit"] # A branch on `select` never crosses a cache line
 jit_disasm = ["jit", "yaxpeax-x86/fmt", "dep:rustc-demangle"] # Disassemble the JIT's code, annotated, to jit_disasm.txt when it's dropped
 no_dynamic_guards = [] # GuardDynamic yields fail statically (Note [Dynamic guards])
 store_types = ["counters"] # Count array part stores by what's known of the value's type
+# The `varvara` bin: the Lua Varvara emulator (varvara/) in a window, through a
+# UI library of natives over Dear ImGui (src/bin/varvara.rs).
+varvara_ui = ["dep:imgui", "dep:imgui-glow-renderer", "dep:imgui-sdl2-support", "dep:sdl2", "dep:glow"]
 gc_sanitize = []
 gc_stress = []
 gc_test = []
@@ -60,6 +63,11 @@ goblin = "0.9"
 rustc-demangle = { version = "0.1", optional = true }
 yaxpeax-x86 = { version = "2.2.0", default-features = false, features = ["std"] }
 yaxpeax-arch = { version = "0.3.2", default-features = false, features = ["std"] }
+imgui = { version = "0.12", optional = true }
+imgui-glow-renderer = { version = "0.13", optional = true }
+imgui-sdl2-support = { version = "0.13", optional = true }
+sdl2 = { version = "0.37", optional = true }
+glow = { version = "0.14", optional = true }
 
 [dev-dependencies]
 regex = "1.11.1"
@@ -68,6 +76,10 @@ regex = "1.11.1"
 
 [target.jit]
 [target.jit.dependencies]
+
+[[bin]]
+name = "varvara"
+required-features = ["varvara_ui"]
 
 # Demangles the Rust symbols in its input (`just stencil-sizes`).
 [[bin]]
