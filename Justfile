@@ -569,7 +569,7 @@ _raven:
     set -euo pipefail
     test -d target/raven || git clone -q https://github.com/mkeeter/raven target/raven
     git -C target/raven checkout -q --detach {{RAVEN_REV}}
-    cd target/raven && cargo build -q --release -p raven-cli --features native,tailcall
+    cd target/raven && {{SHARED}} cargo build -q --release -p raven-cli --features native,tailcall
 
 # The uxn_* benchmarks run a Uxn ROM (varvara/roms) on the Lua Varvara emulator
 # (varvara/), the uxn_bit_* ones on its bitwise machine, which needs the bit
@@ -590,7 +590,7 @@ hyperfine-uxn benchmark times='1': unsafe-compile interpreter-compile _raven
     just _luajitc $b
     just _lua55c $b
     just _luauc $b
-    cargo build --release --bin bench
+    {{SHARED}} cargo build --release --bin bench
     jit="LUNACY_JIT_SIZE={{UXN_JIT_SIZE}}"
     raven=()
     # uxn_<rom> or uxn_bit_<rom>.
@@ -602,7 +602,7 @@ hyperfine-uxn benchmark times='1': unsafe-compile interpreter-compile _raven
         done
     fi
     # As `hyperfine-full`: a command failing is timed, and left out of the history.
-    taskset -c {{CPU}} hyperfine -i -N --warmup {{WARMUP}} --export-markdown working/hyperfine-$b-{{times}}.md \
+    {{TIMED}} hyperfine -i -N --warmup {{WARMUP}} --export-markdown working/hyperfine-$b-{{times}}.md \
         --export-json working/hyperfine-$b-{{times}}.json \
         -n lua5.1 "lua5.1 bench.lua -- working/$b.bin {{times}}" \
         -n lua5.5 "lua5.5 bench.lua -- working/$b.lua55.bin {{times}}" \
@@ -623,7 +623,7 @@ hyperfine-uxn benchmark times='1': unsafe-compile interpreter-compile _raven
 hyperfine-uxn-bit rom: unsafe-compile
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release --bin bench
+    {{SHARED}} cargo build --release --bin bench
     commands=()
     for b in uxn_{{rom}} uxn_bit_{{rom}}; do
         just _luac $b
@@ -636,7 +636,7 @@ hyperfine-uxn-bit rom: unsafe-compile
             -n "$b release" "env LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} ./target/release/bench working/$b.bin 1"
             -n "$b unsafe" "env LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} ./target/unsafe/bench working/$b.bin 1")
     done
-    taskset -c {{CPU}} hyperfine -N --warmup {{WARMUP}} --export-markdown working/hyperfine-uxn-bit-{{rom}}.md \
+    {{TIMED}} hyperfine -N --warmup {{WARMUP}} --export-markdown working/hyperfine-uxn-bit-{{rom}}.md \
         --export-json working/hyperfine-uxn-bit-{{rom}}.json "${commands[@]}"
 
 # `hyperfine-uxn` over UXN_HYPERFINES.
@@ -656,7 +656,7 @@ SNAPSHOT_ROMS := "screen screen.auto screen.blending screen.bounds screen.pixel 
 varvara-snapshots lua='lunacy': _raven
     #!/usr/bin/env bash
     set -uo pipefail
-    if [ {{lua}} = lunacy ]; then cargo build --release --bin lunacy || exit 1; fi
+    if [ {{lua}} = lunacy ]; then {{SHARED}} cargo build --release --bin lunacy || exit 1; fi
     failed=0
     for rom in {{SNAPSHOT_ROMS}}; do
         python3 tools/bundle_bench.py --entry varvara/snapshot.lua --rom $rom > working/snapshot-$rom.lua || exit 1
@@ -678,7 +678,7 @@ varvara-snapshots lua='lunacy': _raven
 varvara rom env='':
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release --features varvara_ui --bin varvara
+    {{SHARED}} cargo build --release --features varvara_ui --bin varvara
     python3 tools/bundle_bench.py --entry varvara/app.lua > working/varvara-app.lua
     luac5.1 -o working/varvara-app.bin working/varvara-app.lua
     rom={{rom}}
