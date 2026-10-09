@@ -125,6 +125,8 @@ pub struct ResidualExec {
     pub name: &'static str,
     pub body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)>,
     pub template: Option<Rc<dyn Fn()->()>>,
+    /// The slots it writes, if it says: else any. See Note [Fragile information].
+    pub writes: Option<Vec<usize>>,
 }
 
 /// A residual as the graph and window dumps label it.
@@ -174,7 +176,13 @@ fn window_label(w: &dyn Window) -> String {
 
 impl ResidualExec {
     pub fn new(name: &'static str, body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)>) -> Self {
-        Self { name, body, template: None }
+        Self { name, body, template: None, writes: None }
+    }
+
+    /// It, saying it writes only the slots `slots`.
+    pub fn writing(mut self, slots: &[usize]) -> Self {
+        self.writes = Some(slots.to_vec());
+        self
     }
 }
 
@@ -1784,12 +1792,12 @@ pub struct Context {
 // has none, and a call's continuation only what the callee's effects keep (Note [Call effects]).
 //
 // Effects come from the residuals as they are yielded (`Context::effect`). A window op writes the
-// slots its accesses say it writes (`Effect::Write`), an exec may write any slot
-// (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op or a pure native's
+// slots its accesses say it writes (`Effect::Write`), an exec those it says it writes, else any
+// slot (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op or a pure native's
 // (Note [Library natives] in `library`) is `Effect::Opaque`, and what a residual can't show a
 // yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A store into a table is always yielded as one, `Effect::ArrayStore` or
-// the hash hazards it sets, even where `WriteAny` already drops what it falsifies: an exec's
-// `WriteAny` is of its own frame, and a caller sees only the store (Note [Call effects]).
+// the hash hazards it sets: an exec's writes are of its own frame, and a caller sees only the
+// store (Note [Call effects]).
 //
 // A kind of fact says which effects it survives (`Fragile::survives`); a new kind is a variant,
 // its `key` and `survives`, and where it is established.
@@ -5180,8 +5188,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 }
                 CoroutineState::Yielded(YieldOp::Exec(func)) => {
+                    match &func.writes {
+                        Some(slots) => for &slot in slots {
+                            Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
+                        },
+                        None => Rc::make_mut(&mut ctx).effect(Effect::WriteAny),
+                    }
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
-                    Rc::make_mut(&mut ctx).effect(Effect::WriteAny);
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
                     for (&slot, access) in w.operands().iter().zip(w.accesses()) {

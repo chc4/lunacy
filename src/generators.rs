@@ -843,12 +843,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         };
                         let LValue::Table(mut t) = state.vals[state.base + a].unbox() else { unreachable!() };
                         t.set_widening::<$W>(owner, LBoxed::from_number(kb), kc, state.intern);
-                    }))
+                    })).writing(&[])
                 };
             }
             arg = yield YieldOp::Exec(with_widen!(how, make));
-            // The exec writing any slot drops the kinds this function knows, but its
-            // callers see only this. See Note [Call effects] in `specialize`.
+            // See Note [Call effects] in `specialize`.
             yield YieldOp::Effect(Effect::ArrayStore(stored));
         } else {
             // Hash part set
@@ -911,7 +910,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     }
                     // Last. See Note [Write barriers].
                     t.barrier_back();
-                })));
+                })).writing(&[]));
                 arg = yield YieldOp::SetHazards(None, None);
             }
         }
