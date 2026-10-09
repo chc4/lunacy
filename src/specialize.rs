@@ -2571,18 +2571,19 @@ impl Context {
         })
     }
 
-    /// The cells holding their upvalue's value where this is the context: its own frame's,
-    /// and each caller's it is inlined into. See Note [Upvalue cells].
+    /// The cells holding their upvalue's value where this is the context: its own frame's its
+    /// facts are about, and every one of each caller's it is inlined into, whose facts the
+    /// callee's about its callers' upvalues become on its return. See Note [Upvalue cells].
     fn filled_cells(&self) -> u32 {
         let mut cells = 0;
-        let mut ctx = Some(self);
-        while let Some(at) = ctx {
-            for upvalue in 0..UPVALUE_CELLS {
-                if at.cell_filled(upvalue) {
-                    cells |= 1 << at.upvalue_cell(upvalue).unwrap();
-                }
+        for upvalue in 0..UPVALUE_CELLS {
+            if self.cell_filled(upvalue) {
+                cells |= 1 << self.upvalue_cell(upvalue).unwrap();
             }
-            ctx = at.inline.as_ref().map(|frame| &frame.caller);
+        }
+        let frame = (1u32 << UPVALUE_CELLS) - 1;
+        for depth in 0..self.depth() {
+            cells |= frame << (depth * UPVALUE_CELLS);
         }
         cells
     }

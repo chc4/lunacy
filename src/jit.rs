@@ -244,6 +244,18 @@ impl JitHelper {
         }
     }
 
+    /// Debug builds: check that upvalue cell `cell`, which JIT code just read `value` from,
+    /// holds upvalue `index` of the running closure. See Note [Upvalue cells].
+    #[cfg(debug_assertions)]
+    pub unsafe extern "C" fn check_cell(state: *mut (), value: u64, index: usize, cell: usize) {
+        unsafe {
+            let state = &*(state as *const RunState<'static, 'static>);
+            let owner = crate::forge_owner();
+            let held = state.upvalue(owner, index);
+            assert_eq!(held.bits(), value, "upvalue cell {cell} (depth {}, upvalue {index}) holds {:?}, not the upvalue's {:?}", cell / crate::specialize::UPVALUE_CELLS, LBoxed::from_bits(value), held);
+        }
+    }
+
     pub unsafe extern "C" fn unwind_inlined(state: *mut (), kept: *const u64) {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
@@ -617,11 +629,13 @@ impl Stencils {
 // upvalue, and every path into a version carries its facts. So a cell is filled where such a fact
 // can come from: a load of the upvalue stores what it loads into its cell, a store into the
 // upvalue stores the value into its cell too, and where a fact comes from no load in the
-// activation, the JIT fills the cells the facts are about from the upvalues: where JIT code is
-// entered, for the facts of the block it enters and of each frame it is inlined into, and where an
-// inlined call's frame is entered, for its entry's facts, which a caller's facts about the
-// callee's closure's upvalues become. A load where the context has a fact about the upvalue reads
-// its cell. Interpreted, every load reads the upvalue.
+// activation, the JIT fills cells from the upvalues: where JIT code is entered, those of the facts
+// of the block it enters, and every cell of each frame it is inlined into (an inlined callee's facts
+// about its callers' upvalues, which its arguments held, become theirs as it returns, though the
+// loads that filled them ran before the code was entered); and where an inlined call's frame is
+// entered, those of its entry's facts, which a caller's facts about the callee's closure's upvalues
+// become. A load where the context has a fact about the upvalue reads its cell. Interpreted, every
+// load reads the upvalue. Debug builds check each cell a load reads.
 
 /// What a window op does with an upvalue's cell, besides its body. See Note [Upvalue cells].
 enum CellOp {
@@ -658,6 +672,35 @@ fn emit_fill_cells(ops: &mut Assembler, cells: u32, depth: usize) {
     if cells == 0 {
         return;
     }
+    emit_keeping_window(ops, |ops| dynasm!(ops
+        ; .arch x64
+        ; mov rdi, r12
+        ; lea rsi, [rsp + 0x80]
+        ; mov rdx, rbp
+        ; mov ecx, cells as i32
+        ; mov r8d, depth as i32
+        ; call extern (JitHelper::fill_cells as *const () as usize)
+    ));
+}
+
+/// Debug builds: check that the upvalue cell `cell` the window register `reg` was just loaded
+/// from holds upvalue `index` of the running closure. See Note [Upvalue cells].
+fn emit_check_cell(ops: &mut Assembler, reg: u8, index: usize, cell: usize) {
+    #[cfg(debug_assertions)]
+    emit_keeping_window(ops, |ops| dynasm!(ops
+        ; .arch x64
+        ; mov rsi, Rq(reg)
+        ; mov rdi, r12
+        ; mov rdx, QWORD index as i64
+        ; mov rcx, QWORD cell as i64
+        ; call extern (JitHelper::check_cell as *const () as usize)
+    ));
+    let _ = (ops, reg, index, cell);
+}
+
+/// `call` emitted keeping the window's registers, general and XMM, as a native call doesn't.
+/// `rsp` is 0x80 past what it was before `call` runs.
+fn emit_keeping_window(ops: &mut Assembler, call: impl FnOnce(&mut Assembler)) {
     dynasm!(ops
         ; .arch x64
         ; sub rsp, 0x40
@@ -677,12 +720,10 @@ fn emit_fill_cells(ops: &mut Assembler, cells: u32, depth: usize) {
         ; push r8
         ; push r9
         ; push r11
-        ; mov rdi, r12
-        ; lea rsi, [rsp + 0x80]
-        ; mov rdx, rbp
-        ; mov ecx, cells as i32
-        ; mov r8d, depth as i32
-        ; call extern (JitHelper::fill_cells as *const () as usize)
+    );
+    call(ops);
+    dynasm!(ops
+        ; .arch x64
         ; pop r11
         ; pop r9
         ; pop r8
@@ -3328,10 +3369,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 match emit {
                                     // A load from an upvalue's cell, into the op's register. See
                                     // Note [Upvalue cells].
-                                    Emit::Op { skip } if let Some(CellOp::Load(cell)) = cell_op(&**w) => dynasm!(ops
-                                        ; .arch x64
-                                        ; mov Rq(WINDOW_REGS[skip]), QWORD [rbp + cell_disp(cell)]
-                                    ),
+                                    Emit::Op { skip } if let Some(CellOp::Load(cell)) = cell_op(&**w) => {
+                                        dynasm!(ops
+                                            ; .arch x64
+                                            ; mov Rq(WINDOW_REGS[skip]), QWORD [rbp + cell_disp(cell)]
+                                        );
+                                        emit_check_cell(ops, WINDOW_REGS[skip], w.captures()[0] as usize, cell);
+                                    }
                                     Emit::Op { skip } => {
                                         let body = stencils.body(&**w, skip, fall_exit).expect("a usable skip");
                                         splat(ops, &body, w.name(), &w.captures(), pool, other, unalign);
