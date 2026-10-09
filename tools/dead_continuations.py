@@ -29,7 +29,7 @@ def main():
     tp = TraceProcessor(trace=args.trace, config=TraceProcessorConfig(bin_path=shutil.which('trace_processor_shell')))
     rows = list(tp.query(
         "SELECT EXTRACT_ARG(arg_set_id, 'block') AS block, EXTRACT_ARG(arg_set_id, 'line') AS line, "
-        "EXTRACT_ARG(arg_set_id, 'pc') AS pc, EXTRACT_ARG(arg_set_id, 'jitted') AS jitted, "
+        "EXTRACT_ARG(arg_set_id, 'pc') AS pc, EXTRACT_ARG(arg_set_id, 'compiled') AS compiled, "
         "EXTRACT_ARG(arg_set_id, 'returns') AS returns, EXTRACT_ARG(arg_set_id, 'returned_from') AS returned_from, "
         "EXTRACT_ARG(arg_set_id, 'unreachable') AS unreachable "
         "FROM slice WHERE category = 'spec' AND name = 'block_summary' AND EXTRACT_ARG(arg_set_id, 'line') != 0"))
@@ -41,11 +41,11 @@ def main():
             continue
         for id in ids(r.returned_from):
             live, dead = by_line.setdefault(r.line, ([], []))
-            (live if id == UNKNOWN_RETURN or id in returned else dead).append((r.block, r.pc, id, r.jitted, r.unreachable))
+            (live if id == UNKNOWN_RETURN or id in returned else dead).append((r.block, r.pc, id, r.compiled, r.unreachable))
     for line, (live, dead) in sorted(by_line.items()):
         print(f'line {line}: {len(live)} live, {len(dead)} dead continuations')
-        for block, pc, id, jitted, unreachable in sorted(dead):
-            print(f'  dead: block {block} pc {pc} returns from {id}{" (JIT code)" if jitted else ""}{" (unreachable)" if unreachable else ""}')
+        for block, pc, id, compiled, unreachable in sorted(dead):
+            print(f'  dead: block {block} pc {pc} returns from {id}{" (JIT code)" if compiled else ""}{" (unreachable)" if unreachable else ""}')
 
 
 if __name__ == '__main__':

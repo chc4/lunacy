@@ -3630,7 +3630,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             #[cfg(feature = "jit")]
             {
                 args.push(("hotness", block.jit_info.hotness.get().into()));
-                args.push(("jitted", (block.jit_info.entry.is_some() as u64).into()));
+                args.push(("jit_entry", (block.jit_info.entry.is_some() as u64).into()));
+                args.push(("compiled", (self.jctx.blocks.contains_key(&BlockId(id)) as u64).into()));
             }
             crate::tracing::instant("spec", "block_summary", &args);
         }

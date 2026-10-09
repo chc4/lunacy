@@ -27,8 +27,10 @@ The specializer's are also views, one column per argument:
       graph has there at the end. How often a version ran isn't in a trace:
       `just jit-profile` samples the JIT's, the interpreter tier's graph dump
       (`just window-runs`) counts every entry.
-  block_summary(block, line, pc, residuals, code, context, hotness, jitted, returns, returned_from, unreachable)
+  block_summary(block, line, pc, residuals, code, context, hotness, jit_entry, compiled, returns, returned_from, unreachable)
       every block at the end of the run (line 0 for one no version names),
+      whether JIT code is entered at it from the interpreter (`jit_entry`), and
+      whether it has JIT code at all, in any region (`compiled`),
       with the return ids its returns return with, those its call
       continuations guard on (comma separated), and whether the trimming
       found it unreachable (forgotten once its point needs the room).
@@ -112,7 +114,7 @@ from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 VIEWS = {
     'spec_version': ['line', 'pc', 'outcome', 'block', 'versions', 'context', 'joined', 'shapes_dropped', 'origins'],
     'spec_block': ['block', 'line', 'pc', 'context'],
-    'block_summary': ['block', 'line', 'pc', 'residuals', 'code', 'context', 'hotness', 'jitted', 'returns', 'returned_from', 'unreachable'],
+    'block_summary': ['block', 'line', 'pc', 'residuals', 'code', 'context', 'hotness', 'jit_entry', 'compiled', 'returns', 'returned_from', 'unreachable'],
     'alloc_step': ['trace', 'step', 'line', 'block', 'pc', 'off'],
     'alloc_start': ['trace', 'step', 'rise', 'arrives', 'worth', 'entry'],
     'alloc_op': ['trace', 'step', 'name', 'before', 'worth', 'skip', 'emits', 'after'],
