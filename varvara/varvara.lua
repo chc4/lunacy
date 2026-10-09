@@ -72,7 +72,7 @@ function M.new(rom, write, clock, bitwise)
   -- Runs the vector at `port`, unless it's unset or the machine has halted.
   local function vector(port)
     local addr = short(port)
-    if addr ~= 0 and dev[0x0f] == 0 then vm.eval(addr) end
+    if addr ~= 0 and dev[0x0f] == 0 then vm:eval(addr) end
   end
 
   -- System
@@ -300,7 +300,7 @@ function M.new(rom, write, clock, bitwise)
     dei[0xca] = field(function(t) return t.isdst and 1 or 0 end)
   end
 
-  vm.set_devices(function(port)
+  vm:set_devices(function(port)
     local f = dei[port]
     if f then return f() end
     return dev[port]
@@ -310,7 +310,7 @@ function M.new(rom, write, clock, bitwise)
     if f then f(value) end
   end)
 
-  vm.load(rom)
+  vm:load(rom)
 
   local emu = { vm = vm, dev = dev, palette = palette }
 
@@ -318,7 +318,7 @@ function M.new(rom, write, clock, bitwise)
   -- arguments.
   function emu.boot(has_args)
     dev[0x17] = has_args and 1 or 0
-    if dev[0x0f] == 0 then vm.eval(0x100) end
+    if dev[0x0f] == 0 then vm:eval(0x100) end
   end
 
   -- Whether the ROM has halted, and its exit code.

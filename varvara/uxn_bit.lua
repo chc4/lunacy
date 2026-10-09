@@ -650,6 +650,50 @@ for ins = 0, 255 do
   RET[ins] = band(ins, 0x40) ~= 0
 end
 
+-- The machine's methods, `m:eval(addr)` and so on, shared by every machine.
+
+-- Run machine `m` from `addr` until BRK, its state read from its fields once a
+-- run, `m` a local each operation is given. Where the Lua has `jit.promote`
+-- (lunacy), the program counter and the instruction there are promoted, so the
+-- loop is compiled once per guest instruction, its operation's call to one
+-- function.
+local eval
+if promote then
+  function eval(m, addr)
+    local ram, wst, rst, op, keep, ret = m.ram, m.wst, m.rst, m.op, m.keep, m.ret
+    local pc = addr
+    repeat
+      pc = promote(pc)
+      local ins = promote(ram[pc])
+      pc = band(pc + 1, 65535)
+      if ret[ins] then pc = op[ins](m, rst, wst, pc, keep[ins]) else pc = op[ins](m, wst, rst, pc, keep[ins]) end
+    until not pc
+  end
+else
+  function eval(m, addr)
+    local ram, wst, rst, op, keep, ret = m.ram, m.wst, m.rst, m.op, m.keep, m.ret
+    local pc = addr
+    repeat
+      local ins = ram[pc]
+      pc = band(pc + 1, 65535)
+      if ret[ins] then pc = op[ins](m, rst, wst, pc, keep[ins]) else pc = op[ins](m, wst, rst, pc, keep[ins]) end
+    until not pc
+  end
+end
+
+-- Set the device hooks: `read(port)` reads a device port, and `write(port,
+-- value)` writes one.
+local function set_devices(m, read, write)
+  m.dei, m.deo = read, write
+end
+
+-- Load a ROM, a string, at the program's start, 0x100.
+local function load(m, rom)
+  if #rom > 65536 - 256 then error("uxn: a ROM past 64KB needs expansion memory") end
+  local ram = m.ram
+  for i = 1, #rom do ram[255 + i] = rom:byte(i) end
+end
+
 -- A new machine with zeroed memory. `dei(port)` reads a device port, and
 -- `deo(port, value)` writes one, as `set_devices` sets them.
 function M.new()
@@ -657,46 +701,11 @@ function M.new()
     ram = {}, wst = {}, rst = {},
     dei = function() return 0 end, deo = function() end,
     op = OP, keep = KEEP, ret = RET,
+    eval = eval, load = load, set_devices = set_devices,
   }
   local ram, wst, rst = m.ram, m.wst, m.rst
   for i = 0, 65535 do ram[i] = 0 end
   for i = 0, 256 do wst[i], rst[i] = 0, 0 end
-
-  function m.set_devices(read, write)
-    m.dei, m.deo = read, write
-  end
-
-  -- Run from `addr` until BRK. Where the Lua has `jit.promote` (lunacy), the
-  -- program counter and the instruction there are promoted, so the loop is
-  -- compiled once per guest instruction, its operation's call to one function.
-  if promote then
-    function m.eval(addr)
-      local ram, wst, rst, op, keep, ret = m.ram, m.wst, m.rst, m.op, m.keep, m.ret
-      local pc = addr
-      repeat
-        pc = promote(pc)
-        local ins = promote(ram[pc])
-        pc = band(pc + 1, 65535)
-        if ret[ins] then pc = op[ins](m, rst, wst, pc, keep[ins]) else pc = op[ins](m, wst, rst, pc, keep[ins]) end
-      until not pc
-    end
-  else
-    function m.eval(addr)
-      local ram, wst, rst, op, keep, ret = m.ram, m.wst, m.rst, m.op, m.keep, m.ret
-      local pc = addr
-      repeat
-        local ins = ram[pc]
-        pc = band(pc + 1, 65535)
-        if ret[ins] then pc = op[ins](m, rst, wst, pc, keep[ins]) else pc = op[ins](m, wst, rst, pc, keep[ins]) end
-      until not pc
-    end
-  end
-
-  -- Load a ROM, a string, at the program's start, 0x100.
-  function m.load(rom)
-    if #rom > 65536 - 256 then error("uxn: a ROM past 64KB needs expansion memory") end
-    for i = 1, #rom do ram[255 + i] = rom:byte(i) end
-  end
 
   return m
 end
