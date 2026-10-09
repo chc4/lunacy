@@ -54,524 +54,689 @@ end
 local POW2 = { [0] = 1 }
 for n = 1, 15 do POW2[n] = POW2[n - 1] * 2 end
 
-local function signed(byte)
-  if byte >= 128 then return byte - 256 end
-  return byte
+-- A machine is a table of its state: its RAM, `ram`, its stacks, `wst` and
+-- `rst`, the device hooks `dei` and `deo`, and the tables its operations read,
+-- each a field. Its operations are shared by every machine: each is given the
+-- machine, its stack `s`, the other stack `o` for the operations moving a value
+-- onto it, the program counter `pc` past its instruction, and its keep flag `k`
+-- (0 or 1), and reads the machine's state from its fields, so it captures
+-- nothing. It returns the program counter to go on from, or nothing to stop the
+-- machine. The program counter is a local of `eval`, threaded through the
+-- operations.
+
+local ops = {}
+
+ops[0x01] = function(m, s, o, pc, k) -- INC
+  local p = s[256]
+  local t = s[p]
+  p = (p + k) % 256
+  s[p] = (t + 1) % 256
+  s[256] = p
+  return pc
+end
+ops[0x21] = function(m, s, o, pc, k) -- INC2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  p = (p + 2 * k) % 256
+  local v = (t + 1) % 65536
+  s[p] = v % 256
+  s[(p - 1) % 256] = floor(v / 256) % 256
+  s[256] = p
+  return pc
+end
+ops[0x02] = function(m, s, o, pc, k) -- POP
+  s[256] = (s[256] + k - 1) % 256
+  return pc
+end
+ops[0x22] = function(m, s, o, pc, k) -- POP2
+  s[256] = (s[256] + 2 * k - 2) % 256
+  return pc
+end
+ops[0x03] = function(m, s, o, pc, k) -- NIP
+  local p = s[256]
+  local t = s[p]
+  p = (p + 2 * k - 1) % 256
+  s[p] = t
+  s[256] = p
+  return pc
+end
+ops[0x23] = function(m, s, o, pc, k) -- NIP2
+  local p = s[256]
+  local t, tl = s[(p - 1) % 256], s[p]
+  p = (p + 4 * k - 2) % 256
+  s[p], s[(p - 1) % 256] = tl, t
+  s[256] = p
+  return pc
+end
+ops[0x04] = function(m, s, o, pc, k) -- SWP
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k) % 256
+  s[p], s[(p - 1) % 256] = n, t
+  s[256] = p
+  return pc
+end
+ops[0x24] = function(m, s, o, pc, k) -- SWP2
+  local p = s[256]
+  local t1, t0, n1, n0 = s[(p - 1) % 256], s[p], s[(p - 3) % 256], s[(p - 2) % 256]
+  p = (p + 4 * k) % 256
+  s[(p - 1) % 256], s[p], s[(p - 3) % 256], s[(p - 2) % 256] = n1, n0, t1, t0
+  s[256] = p
+  return pc
+end
+ops[0x05] = function(m, s, o, pc, k) -- ROT
+  local p = s[256]
+  local t, n, l = s[p], s[(p - 1) % 256], s[(p - 2) % 256]
+  p = (p + 3 * k) % 256
+  s[p], s[(p - 1) % 256], s[(p - 2) % 256] = l, t, n
+  s[256] = p
+  return pc
+end
+ops[0x25] = function(m, s, o, pc, k) -- ROT2
+  local p = s[256]
+  local t1, t0 = s[(p - 1) % 256], s[p]
+  local n1, n0 = s[(p - 3) % 256], s[(p - 2) % 256]
+  local l1, l0 = s[(p - 5) % 256], s[(p - 4) % 256]
+  p = (p + 6 * k) % 256
+  s[(p - 1) % 256], s[p] = l1, l0
+  s[(p - 3) % 256], s[(p - 2) % 256] = t1, t0
+  s[(p - 5) % 256], s[(p - 4) % 256] = n1, n0
+  s[256] = p
+  return pc
+end
+ops[0x06] = function(m, s, o, pc, k) -- DUP
+  local p = s[256]
+  local t = s[p]
+  p = (p + k + 1) % 256
+  s[p], s[(p - 1) % 256] = t, t
+  s[256] = p
+  return pc
+end
+ops[0x26] = function(m, s, o, pc, k) -- DUP2
+  local p = s[256]
+  local t1, t0 = s[(p - 1) % 256], s[p]
+  p = (p + 2 * k + 2) % 256
+  s[(p - 1) % 256], s[p] = t1, t0
+  s[(p - 3) % 256], s[(p - 2) % 256] = t1, t0
+  s[256] = p
+  return pc
+end
+ops[0x07] = function(m, s, o, pc, k) -- OVR
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k + 1) % 256
+  s[p], s[(p - 1) % 256], s[(p - 2) % 256] = n, t, n
+  s[256] = p
+  return pc
+end
+ops[0x27] = function(m, s, o, pc, k) -- OVR2
+  local p = s[256]
+  local t1, t0, n1, n0 = s[(p - 1) % 256], s[p], s[(p - 3) % 256], s[(p - 2) % 256]
+  p = (p + 4 * k + 2) % 256
+  s[(p - 1) % 256], s[p] = n1, n0
+  s[(p - 3) % 256], s[(p - 2) % 256] = t1, t0
+  s[(p - 5) % 256], s[(p - 4) % 256] = n1, n0
+  s[256] = p
+  return pc
 end
 
--- A byte bitwise operation's short form.
-local function short_op(t, a, b)
-  return t[floor(a / 256) * 256 + floor(b / 256)] * 256 + t[(a % 256) * 256 + b % 256]
+
+-- The comparisons: a byte flag from the top two bytes, or shorts.
+ops[0x08] = function(m, s, o, pc, k) -- EQU
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = n == t and 1 or 0
+  s[256] = p
+  return pc
+end
+ops[0x28] = function(m, s, o, pc, k) -- EQU2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 3) % 256
+  s[p] = n == t and 1 or 0
+  s[256] = p
+  return pc
+end
+ops[0x09] = function(m, s, o, pc, k) -- NEQ
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = n ~= t and 1 or 0
+  s[256] = p
+  return pc
+end
+ops[0x29] = function(m, s, o, pc, k) -- NEQ2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 3) % 256
+  s[p] = n ~= t and 1 or 0
+  s[256] = p
+  return pc
+end
+ops[0x0a] = function(m, s, o, pc, k) -- GTH
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = n > t and 1 or 0
+  s[256] = p
+  return pc
+end
+ops[0x2a] = function(m, s, o, pc, k) -- GTH2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 3) % 256
+  s[p] = n > t and 1 or 0
+  s[256] = p
+  return pc
+end
+ops[0x0b] = function(m, s, o, pc, k) -- LTH
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = n < t and 1 or 0
+  s[256] = p
+  return pc
+end
+ops[0x2b] = function(m, s, o, pc, k) -- LTH2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 3) % 256
+  s[p] = n < t and 1 or 0
+  s[256] = p
+  return pc
+end
+
+ops[0x0c] = function(m, s, o, pc, k) -- JMP
+  local p = s[256]
+  local t = s[p]
+  s[256] = (p + k - 1) % 256
+  pc = (pc + (t + 128) % 256 - 128) % 65536
+  return pc
+end
+ops[0x2c] = function(m, s, o, pc, k) -- JMP2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  s[256] = (p + 2 * k - 2) % 256
+  pc = t
+  return pc
+end
+ops[0x0d] = function(m, s, o, pc, k) -- JCN
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  s[256] = (p + 2 * k - 2) % 256
+  if n ~= 0 then pc = (pc + (t + 128) % 256 - 128) % 65536 end
+  return pc
+end
+ops[0x2d] = function(m, s, o, pc, k) -- JCN2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 2) % 256]
+  s[256] = (p + 3 * k - 3) % 256
+  if n ~= 0 then pc = t end
+  return pc
+end
+ops[0x0e] = function(m, s, o, pc, k) -- JSR
+  local p = s[256]
+  local t = s[p]
+  s[256] = (p + k - 1) % 256
+  local q = (o[256] + 2) % 256
+  local v = pc
+  o[q] = v % 256
+  o[(q - 1) % 256] = floor(v / 256) % 256
+  o[256] = q
+  pc = (pc + (t + 128) % 256 - 128) % 65536
+  return pc
+end
+ops[0x2e] = function(m, s, o, pc, k) -- JSR2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  s[256] = (p + 2 * k - 2) % 256
+  local q = (o[256] + 2) % 256
+  local v = pc
+  o[q] = v % 256
+  o[(q - 1) % 256] = floor(v / 256) % 256
+  o[256] = q
+  pc = t
+  return pc
+end
+ops[0x0f] = function(m, s, o, pc, k) -- STH
+  local p = s[256]
+  local t = s[p]
+  s[256] = (p + k - 1) % 256
+  local q = (o[256] + 1) % 256
+  o[q] = t
+  o[256] = q
+  return pc
+end
+ops[0x2f] = function(m, s, o, pc, k) -- STH2
+  local p = s[256]
+  local t1, t0 = s[(p - 1) % 256], s[p]
+  s[256] = (p + 2 * k - 2) % 256
+  local q = (o[256] + 2) % 256
+  o[(q - 1) % 256], o[q] = t1, t0
+  o[256] = q
+  return pc
+end
+
+ops[0x10] = function(m, s, o, pc, k) -- LDZ
+  local ram = m.ram
+  local p = s[256]
+  local t = s[p]
+  p = (p + k) % 256
+  s[p] = ram[t]
+  s[256] = p
+  return pc
+end
+ops[0x30] = function(m, s, o, pc, k) -- LDZ2
+  local ram = m.ram
+  local p = s[256]
+  local t = s[p]
+  p = (p + k + 1) % 256
+  s[(p - 1) % 256], s[p] = ram[t], ram[(t + 1) % 256]
+  s[256] = p
+  return pc
+end
+ops[0x11] = function(m, s, o, pc, k) -- STZ
+  local ram = m.ram
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  s[256] = (p + 2 * k - 2) % 256
+  ram[t] = n
+  return pc
+end
+ops[0x31] = function(m, s, o, pc, k) -- STZ2
+  local ram = m.ram
+  local p = s[256]
+  local t, n0, n1 = s[p], s[(p - 1) % 256], s[(p - 2) % 256]
+  s[256] = (p + 3 * k - 3) % 256
+  ram[t], ram[(t + 1) % 256] = n1, n0
+  return pc
+end
+ops[0x12] = function(m, s, o, pc, k) -- LDR
+  local ram = m.ram
+  local p = s[256]
+  local t = s[p]
+  p = (p + k) % 256
+  s[p] = ram[(pc + (t + 128) % 256 - 128) % 65536]
+  s[256] = p
+  return pc
+end
+ops[0x32] = function(m, s, o, pc, k) -- LDR2
+  local ram = m.ram
+  local p = s[256]
+  local r = (pc + (s[p] + 128) % 256 - 128) % 65536
+  p = (p + k + 1) % 256
+  s[(p - 1) % 256], s[p] = ram[r], ram[(r + 1) % 65536]
+  s[256] = p
+  return pc
+end
+ops[0x13] = function(m, s, o, pc, k) -- STR
+  local ram = m.ram
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  s[256] = (p + 2 * k - 2) % 256
+  ram[(pc + (t + 128) % 256 - 128) % 65536] = n
+  return pc
+end
+ops[0x33] = function(m, s, o, pc, k) -- STR2
+  local ram = m.ram
+  local p = s[256]
+  local t, n0, n1 = s[p], s[(p - 1) % 256], s[(p - 2) % 256]
+  s[256] = (p + 3 * k - 3) % 256
+  local r = (pc + (t + 128) % 256 - 128) % 65536
+  ram[r], ram[(r + 1) % 65536] = n1, n0
+  return pc
+end
+ops[0x14] = function(m, s, o, pc, k) -- LDA
+  local ram = m.ram
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  p = (p + 2 * k - 1) % 256
+  s[p] = ram[t]
+  s[256] = p
+  return pc
+end
+ops[0x34] = function(m, s, o, pc, k) -- LDA2
+  local ram = m.ram
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  p = (p + 2 * k) % 256
+  s[(p - 1) % 256], s[p] = ram[t], ram[(t + 1) % 65536]
+  s[256] = p
+  return pc
+end
+ops[0x15] = function(m, s, o, pc, k) -- STA
+  local ram = m.ram
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 2) % 256]
+  s[256] = (p + 3 * k - 3) % 256
+  ram[t] = n
+  return pc
+end
+ops[0x35] = function(m, s, o, pc, k) -- STA2
+  local ram = m.ram
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n1, n0 = s[(p - 3) % 256], s[(p - 2) % 256]
+  s[256] = (p + 4 * k - 4) % 256
+  ram[t], ram[(t + 1) % 65536] = n1, n0
+  return pc
+end
+ops[0x16] = function(m, s, o, pc, k) -- DEI
+  local dei = m.dei
+  local p = s[256]
+  local t = s[p]
+  p = (p + k) % 256
+  s[256] = p
+  s[p] = dei(t)
+  return pc
+end
+ops[0x36] = function(m, s, o, pc, k) -- DEI2
+  local dei = m.dei
+  local p = s[256]
+  local t = s[p]
+  p = (p + k + 1) % 256
+  s[256] = p
+  s[(p - 1) % 256] = dei(t)
+  s[p] = dei((t + 1) % 256)
+  return pc
+end
+ops[0x17] = function(m, s, o, pc, k) -- DEO
+  local deo = m.deo
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  s[256] = (p + 2 * k - 2) % 256
+  deo(t, n)
+  return pc
+end
+ops[0x37] = function(m, s, o, pc, k) -- DEO2
+  local deo = m.deo
+  local p = s[256]
+  local t, n, l = s[p], s[(p - 1) % 256], s[(p - 2) % 256]
+  s[256] = (p + 3 * k - 3) % 256
+  deo(t, l)
+  deo((t + 1) % 256, n)
+  return pc
+end
+
+-- The arithmetic and bitwise operations: a byte from the top two, or a short
+-- from the top two shorts.
+ops[0x18] = function(m, s, o, pc, k) -- ADD
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = (n + t) % 256
+  s[256] = p
+  return pc
+end
+ops[0x38] = function(m, s, o, pc, k) -- ADD2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 2) % 256
+  local v = (n + t) % 65536
+  s[p] = v % 256
+  s[(p - 1) % 256] = floor(v / 256) % 256
+  s[256] = p
+  return pc
+end
+ops[0x19] = function(m, s, o, pc, k) -- SUB
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = (n - t) % 256
+  s[256] = p
+  return pc
+end
+ops[0x39] = function(m, s, o, pc, k) -- SUB2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 2) % 256
+  local v = (n - t) % 65536
+  s[p] = v % 256
+  s[(p - 1) % 256] = floor(v / 256) % 256
+  s[256] = p
+  return pc
+end
+ops[0x1a] = function(m, s, o, pc, k) -- MUL
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = (n * t) % 256
+  s[256] = p
+  return pc
+end
+ops[0x3a] = function(m, s, o, pc, k) -- MUL2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 2) % 256
+  local v = (n * t) % 65536
+  s[p] = v % 256
+  s[(p - 1) % 256] = floor(v / 256) % 256
+  s[256] = p
+  return pc
+end
+ops[0x1b] = function(m, s, o, pc, k) -- DIV
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = t == 0 and 0 or floor(n / t)
+  s[256] = p
+  return pc
+end
+ops[0x3b] = function(m, s, o, pc, k) -- DIV2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 2) % 256
+  local v = t == 0 and 0 or floor(n / t)
+  s[p] = v % 256
+  s[(p - 1) % 256] = floor(v / 256) % 256
+  s[256] = p
+  return pc
+end
+ops[0x1c] = function(m, s, o, pc, k) -- AND
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = m.AND[n * 256 + t]
+  s[256] = p
+  return pc
+end
+ops[0x3c] = function(m, s, o, pc, k) -- AND2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 2) % 256
+  local v = m.AND[floor(n / 256) * 256 + floor(t / 256)] * 256 + m.AND[(n % 256) * 256 + t % 256]
+  s[p] = v % 256
+  s[(p - 1) % 256] = floor(v / 256) % 256
+  s[256] = p
+  return pc
+end
+ops[0x1d] = function(m, s, o, pc, k) -- ORA
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = m.ORA[n * 256 + t]
+  s[256] = p
+  return pc
+end
+ops[0x3d] = function(m, s, o, pc, k) -- ORA2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 2) % 256
+  local v = m.ORA[floor(n / 256) * 256 + floor(t / 256)] * 256 + m.ORA[(n % 256) * 256 + t % 256]
+  s[p] = v % 256
+  s[(p - 1) % 256] = floor(v / 256) % 256
+  s[256] = p
+  return pc
+end
+ops[0x1e] = function(m, s, o, pc, k) -- EOR
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = m.EOR[n * 256 + t]
+  s[256] = p
+  return pc
+end
+ops[0x3e] = function(m, s, o, pc, k) -- EOR2
+  local p = s[256]
+  local t = s[(p - 1) % 256] * 256 + s[p]
+  local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
+  p = (p + 4 * k - 2) % 256
+  local v = m.EOR[floor(n / 256) * 256 + floor(t / 256)] * 256 + m.EOR[(n % 256) * 256 + t % 256]
+  s[p] = v % 256
+  s[(p - 1) % 256] = floor(v / 256) % 256
+  s[256] = p
+  return pc
+end
+
+ops[0x1f] = function(m, s, o, pc, k) -- SFT
+  local POW2 = m.POW2
+  local p = s[256]
+  local t, n = s[p], s[(p - 1) % 256]
+  p = (p + 2 * k - 1) % 256
+  s[p] = floor(n / POW2[t % 16]) * POW2[floor(t / 16)] % 256
+  s[256] = p
+  return pc
+end
+ops[0x3f] = function(m, s, o, pc, k) -- SFT2
+  local POW2 = m.POW2
+  local p = s[256]
+  local t = s[p]
+  local n = s[(p - 2) % 256] * 256 + s[(p - 1) % 256]
+  p = (p + 3 * k - 1) % 256
+  local v = floor(n / POW2[t % 16]) * POW2[floor(t / 16)] % 65536
+  s[p] = v % 256
+  s[(p - 1) % 256] = floor(v / 256) % 256
+  s[256] = p
+  return pc
+end
+
+-- The immediate operations, which have no keep flag: its bit picks LIT.
+local imm = {}
+imm[0x00] = function() end -- BRK
+imm[0x20] = function(m, s, o, pc, k) -- JCI
+  local ram = m.ram
+  local p = s[256]
+  local t = s[p]
+  s[256] = (p - 1) % 256
+  if t == 0 then
+    pc = (pc + 2) % 65536
+  else
+    pc = (pc + 2 + ram[pc] * 256 + ram[(pc + 1) % 65536]) % 65536
+  end
+  return pc
+end
+imm[0x40] = function(m, s, o, pc, k) -- JMI
+  local ram = m.ram
+  pc = (pc + 2 + ram[pc] * 256 + ram[(pc + 1) % 65536]) % 65536
+  return pc
+end
+imm[0x60] = function(m, s, o, pc, k) -- JSI
+  local ram = m.ram
+  local q = (s[256] + 2) % 256
+  local rel = ram[pc] * 256 + ram[(pc + 1) % 65536]
+  pc = (pc + 2) % 65536
+  local v = pc
+  s[q] = v % 256
+  s[(q - 1) % 256] = floor(v / 256) % 256
+  s[256] = q
+  pc = (pc + rel) % 65536
+  return pc
+end
+local function lit(m, s, o, pc, k)
+  local ram = m.ram
+  local q = (s[256] + 1) % 256
+  s[q] = ram[pc]
+  s[256] = q
+  pc = (pc + 1) % 65536
+  return pc
+end
+local function lit2(m, s, o, pc, k)
+  local ram = m.ram
+  local q = (s[256] + 2) % 256
+  s[(q - 1) % 256], s[q] = ram[pc], ram[(pc + 1) % 65536]
+  s[256] = q
+  pc = (pc + 2) % 65536
+  return pc
+end
+imm[0x80], imm[0xc0], imm[0xa0], imm[0xe0] = lit, lit, lit2, lit2
+
+
+-- Each instruction's operation, its keep flag, and whether it works on the
+-- return stack.
+local OP, KEEP, RET = {}, {}, {}
+for ins = 0, 255 do
+  if ins % 32 == 0 then
+    OP[ins] = imm[ins]
+  else
+    OP[ins] = ops[ins % 64]
+  end
+  KEEP[ins] = floor(ins / 128)
+  RET[ins] = ins % 128 >= 64
 end
 
 -- A new machine with zeroed memory. `dei(port)` reads a device port, and
 -- `deo(port, value)` writes one, as `set_devices` sets them.
 function M.new()
-  local ram, wst, rst = {}, {}, {}
+  local m = {
+    ram = {}, wst = {}, rst = {},
+    dei = function() return 0 end, deo = function() end,
+    op = OP, keep = KEEP, ret = RET,
+    AND = AND, ORA = ORA, EOR = EOR, POW2 = POW2,
+  }
+  local ram, wst, rst = m.ram, m.wst, m.rst
   for i = 0, 65535 do ram[i] = 0 end
   for i = 0, 256 do wst[i], rst[i] = 0, 0 end
-  local dei, deo
 
-  -- Each operation, without and with keep (`k` 0 or 1), on its stack `s`, with
-  -- the other stack `o` for the operations moving a value onto it, and `pc`,
-  -- the program counter past its instruction. It returns the program counter
-  -- to go on from, or nothing to stop the machine. The program counter is a
-  -- local of `eval`, threaded through the operations, rather than an upvalue
-  -- they share: setting one, a closed cell, is a store out of line in lunacy,
-  -- and a call that may have set one forgets what the caller knew of every
-  -- upvalue.
-  local ops = {}
-
-  -- A short's result written as the top two bytes of `s` below pointer `p`.
-  local function put2(s, p, v)
-    s[p] = v % 256
-    s[(p - 1) % 256] = floor(v / 256) % 256
-  end
-
-  ops[0x01] = function(k) return function(s, o, pc) -- INC
-    local p = s[256]
-    local t = s[p]
-    p = (p + k) % 256
-    s[p] = (t + 1) % 256
-    s[256] = p
-    return pc
-  end end
-  ops[0x21] = function(k) return function(s, o, pc) -- INC2
-    local p = s[256]
-    local t = s[(p - 1) % 256] * 256 + s[p]
-    p = (p + 2 * k) % 256
-    put2(s, p, (t + 1) % 65536)
-    s[256] = p
-    return pc
-  end end
-  ops[0x02] = function(k) return function(s, o, pc) -- POP
-    s[256] = (s[256] + k - 1) % 256
-    return pc
-  end end
-  ops[0x22] = function(k) return function(s, o, pc) -- POP2
-    s[256] = (s[256] + 2 * k - 2) % 256
-    return pc
-  end end
-  ops[0x03] = function(k) return function(s, o, pc) -- NIP
-    local p = s[256]
-    local t = s[p]
-    p = (p + 2 * k - 1) % 256
-    s[p] = t
-    s[256] = p
-    return pc
-  end end
-  ops[0x23] = function(k) return function(s, o, pc) -- NIP2
-    local p = s[256]
-    local t, tl = s[(p - 1) % 256], s[p]
-    p = (p + 4 * k - 2) % 256
-    s[p], s[(p - 1) % 256] = tl, t
-    s[256] = p
-    return pc
-  end end
-  ops[0x04] = function(k) return function(s, o, pc) -- SWP
-    local p = s[256]
-    local t, n = s[p], s[(p - 1) % 256]
-    p = (p + 2 * k) % 256
-    s[p], s[(p - 1) % 256] = n, t
-    s[256] = p
-    return pc
-  end end
-  ops[0x24] = function(k) return function(s, o, pc) -- SWP2
-    local p = s[256]
-    local t1, t0, n1, n0 = s[(p - 1) % 256], s[p], s[(p - 3) % 256], s[(p - 2) % 256]
-    p = (p + 4 * k) % 256
-    s[(p - 1) % 256], s[p], s[(p - 3) % 256], s[(p - 2) % 256] = n1, n0, t1, t0
-    s[256] = p
-    return pc
-  end end
-  ops[0x05] = function(k) return function(s, o, pc) -- ROT
-    local p = s[256]
-    local t, n, l = s[p], s[(p - 1) % 256], s[(p - 2) % 256]
-    p = (p + 3 * k) % 256
-    s[p], s[(p - 1) % 256], s[(p - 2) % 256] = l, t, n
-    s[256] = p
-    return pc
-  end end
-  ops[0x25] = function(k) return function(s, o, pc) -- ROT2
-    local p = s[256]
-    local t1, t0 = s[(p - 1) % 256], s[p]
-    local n1, n0 = s[(p - 3) % 256], s[(p - 2) % 256]
-    local l1, l0 = s[(p - 5) % 256], s[(p - 4) % 256]
-    p = (p + 6 * k) % 256
-    s[(p - 1) % 256], s[p] = l1, l0
-    s[(p - 3) % 256], s[(p - 2) % 256] = t1, t0
-    s[(p - 5) % 256], s[(p - 4) % 256] = n1, n0
-    s[256] = p
-    return pc
-  end end
-  ops[0x06] = function(k) return function(s, o, pc) -- DUP
-    local p = s[256]
-    local t = s[p]
-    p = (p + k + 1) % 256
-    s[p], s[(p - 1) % 256] = t, t
-    s[256] = p
-    return pc
-  end end
-  ops[0x26] = function(k) return function(s, o, pc) -- DUP2
-    local p = s[256]
-    local t1, t0 = s[(p - 1) % 256], s[p]
-    p = (p + 2 * k + 2) % 256
-    s[(p - 1) % 256], s[p] = t1, t0
-    s[(p - 3) % 256], s[(p - 2) % 256] = t1, t0
-    s[256] = p
-    return pc
-  end end
-  ops[0x07] = function(k) return function(s, o, pc) -- OVR
-    local p = s[256]
-    local t, n = s[p], s[(p - 1) % 256]
-    p = (p + 2 * k + 1) % 256
-    s[p], s[(p - 1) % 256], s[(p - 2) % 256] = n, t, n
-    s[256] = p
-    return pc
-  end end
-  ops[0x27] = function(k) return function(s, o, pc) -- OVR2
-    local p = s[256]
-    local t1, t0, n1, n0 = s[(p - 1) % 256], s[p], s[(p - 3) % 256], s[(p - 2) % 256]
-    p = (p + 4 * k + 2) % 256
-    s[(p - 1) % 256], s[p] = n1, n0
-    s[(p - 3) % 256], s[(p - 2) % 256] = t1, t0
-    s[(p - 5) % 256], s[(p - 4) % 256] = n1, n0
-    s[256] = p
-    return pc
-  end end
-
-  -- The comparisons: a byte flag from the top two bytes, or shorts.
-  local function compare(test)
-    return function(k) return function(s, o, pc)
-      local p = s[256]
-      local t, n = s[p], s[(p - 1) % 256]
-      p = (p + 2 * k - 1) % 256
-      s[p] = test(n, t) and 1 or 0
-      s[256] = p
-      return pc
-    end end,
-    function(k) return function(s, o, pc)
-      local p = s[256]
-      local t = s[(p - 1) % 256] * 256 + s[p]
-      local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
-      p = (p + 4 * k - 3) % 256
-      s[p] = test(n, t) and 1 or 0
-      s[256] = p
-      return pc
-    end end
-  end
-  ops[0x08], ops[0x28] = compare(function(n, t) return n == t end) -- EQU
-  ops[0x09], ops[0x29] = compare(function(n, t) return n ~= t end) -- NEQ
-  ops[0x0a], ops[0x2a] = compare(function(n, t) return n > t end) -- GTH
-  ops[0x0b], ops[0x2b] = compare(function(n, t) return n < t end) -- LTH
-
-  ops[0x0c] = function(k) return function(s, o, pc) -- JMP
-    local p = s[256]
-    local t = s[p]
-    s[256] = (p + k - 1) % 256
-    pc = (pc + signed(t)) % 65536
-    return pc
-  end end
-  ops[0x2c] = function(k) return function(s, o, pc) -- JMP2
-    local p = s[256]
-    local t = s[(p - 1) % 256] * 256 + s[p]
-    s[256] = (p + 2 * k - 2) % 256
-    pc = t
-    return pc
-  end end
-  ops[0x0d] = function(k) return function(s, o, pc) -- JCN
-    local p = s[256]
-    local t, n = s[p], s[(p - 1) % 256]
-    s[256] = (p + 2 * k - 2) % 256
-    if n ~= 0 then pc = (pc + signed(t)) % 65536 end
-    return pc
-  end end
-  ops[0x2d] = function(k) return function(s, o, pc) -- JCN2
-    local p = s[256]
-    local t = s[(p - 1) % 256] * 256 + s[p]
-    local n = s[(p - 2) % 256]
-    s[256] = (p + 3 * k - 3) % 256
-    if n ~= 0 then pc = t end
-    return pc
-  end end
-  ops[0x0e] = function(k) return function(s, o, pc) -- JSR
-    local p = s[256]
-    local t = s[p]
-    s[256] = (p + k - 1) % 256
-    local q = (o[256] + 2) % 256
-    put2(o, q, pc)
-    o[256] = q
-    pc = (pc + signed(t)) % 65536
-    return pc
-  end end
-  ops[0x2e] = function(k) return function(s, o, pc) -- JSR2
-    local p = s[256]
-    local t = s[(p - 1) % 256] * 256 + s[p]
-    s[256] = (p + 2 * k - 2) % 256
-    local q = (o[256] + 2) % 256
-    put2(o, q, pc)
-    o[256] = q
-    pc = t
-    return pc
-  end end
-  ops[0x0f] = function(k) return function(s, o, pc) -- STH
-    local p = s[256]
-    local t = s[p]
-    s[256] = (p + k - 1) % 256
-    local q = (o[256] + 1) % 256
-    o[q] = t
-    o[256] = q
-    return pc
-  end end
-  ops[0x2f] = function(k) return function(s, o, pc) -- STH2
-    local p = s[256]
-    local t1, t0 = s[(p - 1) % 256], s[p]
-    s[256] = (p + 2 * k - 2) % 256
-    local q = (o[256] + 2) % 256
-    o[(q - 1) % 256], o[q] = t1, t0
-    o[256] = q
-    return pc
-  end end
-
-  ops[0x10] = function(k) return function(s, o, pc) -- LDZ
-    local p = s[256]
-    local t = s[p]
-    p = (p + k) % 256
-    s[p] = ram[t]
-    s[256] = p
-    return pc
-  end end
-  ops[0x30] = function(k) return function(s, o, pc) -- LDZ2
-    local p = s[256]
-    local t = s[p]
-    p = (p + k + 1) % 256
-    s[(p - 1) % 256], s[p] = ram[t], ram[(t + 1) % 256]
-    s[256] = p
-    return pc
-  end end
-  ops[0x11] = function(k) return function(s, o, pc) -- STZ
-    local p = s[256]
-    local t, n = s[p], s[(p - 1) % 256]
-    s[256] = (p + 2 * k - 2) % 256
-    ram[t] = n
-    return pc
-  end end
-  ops[0x31] = function(k) return function(s, o, pc) -- STZ2
-    local p = s[256]
-    local t, n0, n1 = s[p], s[(p - 1) % 256], s[(p - 2) % 256]
-    s[256] = (p + 3 * k - 3) % 256
-    ram[t], ram[(t + 1) % 256] = n1, n0
-    return pc
-  end end
-  ops[0x12] = function(k) return function(s, o, pc) -- LDR
-    local p = s[256]
-    local t = s[p]
-    p = (p + k) % 256
-    s[p] = ram[(pc + signed(t)) % 65536]
-    s[256] = p
-    return pc
-  end end
-  ops[0x32] = function(k) return function(s, o, pc) -- LDR2
-    local p = s[256]
-    local r = (pc + signed(s[p])) % 65536
-    p = (p + k + 1) % 256
-    s[(p - 1) % 256], s[p] = ram[r], ram[(r + 1) % 65536]
-    s[256] = p
-    return pc
-  end end
-  ops[0x13] = function(k) return function(s, o, pc) -- STR
-    local p = s[256]
-    local t, n = s[p], s[(p - 1) % 256]
-    s[256] = (p + 2 * k - 2) % 256
-    ram[(pc + signed(t)) % 65536] = n
-    return pc
-  end end
-  ops[0x33] = function(k) return function(s, o, pc) -- STR2
-    local p = s[256]
-    local t, n0, n1 = s[p], s[(p - 1) % 256], s[(p - 2) % 256]
-    s[256] = (p + 3 * k - 3) % 256
-    local r = (pc + signed(t)) % 65536
-    ram[r], ram[(r + 1) % 65536] = n1, n0
-    return pc
-  end end
-  ops[0x14] = function(k) return function(s, o, pc) -- LDA
-    local p = s[256]
-    local t = s[(p - 1) % 256] * 256 + s[p]
-    p = (p + 2 * k - 1) % 256
-    s[p] = ram[t]
-    s[256] = p
-    return pc
-  end end
-  ops[0x34] = function(k) return function(s, o, pc) -- LDA2
-    local p = s[256]
-    local t = s[(p - 1) % 256] * 256 + s[p]
-    p = (p + 2 * k) % 256
-    s[(p - 1) % 256], s[p] = ram[t], ram[(t + 1) % 65536]
-    s[256] = p
-    return pc
-  end end
-  ops[0x15] = function(k) return function(s, o, pc) -- STA
-    local p = s[256]
-    local t = s[(p - 1) % 256] * 256 + s[p]
-    local n = s[(p - 2) % 256]
-    s[256] = (p + 3 * k - 3) % 256
-    ram[t] = n
-    return pc
-  end end
-  ops[0x35] = function(k) return function(s, o, pc) -- STA2
-    local p = s[256]
-    local t = s[(p - 1) % 256] * 256 + s[p]
-    local n1, n0 = s[(p - 3) % 256], s[(p - 2) % 256]
-    s[256] = (p + 4 * k - 4) % 256
-    ram[t], ram[(t + 1) % 65536] = n1, n0
-    return pc
-  end end
-  ops[0x16] = function(k) return function(s, o, pc) -- DEI
-    local p = s[256]
-    local t = s[p]
-    p = (p + k) % 256
-    s[256] = p
-    s[p] = dei(t)
-    return pc
-  end end
-  ops[0x36] = function(k) return function(s, o, pc) -- DEI2
-    local p = s[256]
-    local t = s[p]
-    p = (p + k + 1) % 256
-    s[256] = p
-    s[(p - 1) % 256] = dei(t)
-    s[p] = dei((t + 1) % 256)
-    return pc
-  end end
-  ops[0x17] = function(k) return function(s, o, pc) -- DEO
-    local p = s[256]
-    local t, n = s[p], s[(p - 1) % 256]
-    s[256] = (p + 2 * k - 2) % 256
-    deo(t, n)
-    return pc
-  end end
-  ops[0x37] = function(k) return function(s, o, pc) -- DEO2
-    local p = s[256]
-    local t, n, l = s[p], s[(p - 1) % 256], s[(p - 2) % 256]
-    s[256] = (p + 3 * k - 3) % 256
-    deo(t, l)
-    deo((t + 1) % 256, n)
-    return pc
-  end end
-
-  -- The arithmetic and bitwise operations: a byte from the top two, or a short
-  -- from the top two shorts.
-  local function arith(byte, short)
-    return function(k) return function(s, o, pc)
-      local p = s[256]
-      local t, n = s[p], s[(p - 1) % 256]
-      p = (p + 2 * k - 1) % 256
-      s[p] = byte(n, t)
-      s[256] = p
-      return pc
-    end end,
-    function(k) return function(s, o, pc)
-      local p = s[256]
-      local t = s[(p - 1) % 256] * 256 + s[p]
-      local n = s[(p - 3) % 256] * 256 + s[(p - 2) % 256]
-      p = (p + 4 * k - 2) % 256
-      put2(s, p, short(n, t))
-      s[256] = p
-      return pc
-    end end
-  end
-  ops[0x18], ops[0x38] = arith( -- ADD
-    function(n, t) return (n + t) % 256 end,
-    function(n, t) return (n + t) % 65536 end)
-  ops[0x19], ops[0x39] = arith( -- SUB
-    function(n, t) return (n - t) % 256 end,
-    function(n, t) return (n - t) % 65536 end)
-  ops[0x1a], ops[0x3a] = arith( -- MUL
-    function(n, t) return (n * t) % 256 end,
-    function(n, t) return (n * t) % 65536 end)
-  local function div(n, t)
-    if t == 0 then return 0 end
-    return floor(n / t)
-  end
-  ops[0x1b], ops[0x3b] = arith(div, div) -- DIV
-  ops[0x1c], ops[0x3c] = arith( -- AND
-    function(n, t) return AND[n * 256 + t] end,
-    function(n, t) return short_op(AND, n, t) end)
-  ops[0x1d], ops[0x3d] = arith( -- ORA
-    function(n, t) return ORA[n * 256 + t] end,
-    function(n, t) return short_op(ORA, n, t) end)
-  ops[0x1e], ops[0x3e] = arith( -- EOR
-    function(n, t) return EOR[n * 256 + t] end,
-    function(n, t) return short_op(EOR, n, t) end)
-  ops[0x1f] = function(k) return function(s, o, pc) -- SFT
-    local p = s[256]
-    local t, n = s[p], s[(p - 1) % 256]
-    p = (p + 2 * k - 1) % 256
-    s[p] = floor(n / POW2[t % 16]) * POW2[floor(t / 16)] % 256
-    s[256] = p
-    return pc
-  end end
-  ops[0x3f] = function(k) return function(s, o, pc) -- SFT2
-    local p = s[256]
-    local t = s[p]
-    local n = s[(p - 2) % 256] * 256 + s[(p - 1) % 256]
-    p = (p + 3 * k - 1) % 256
-    put2(s, p, floor(n / POW2[t % 16]) * POW2[floor(t / 16)] % 65536)
-    s[256] = p
-    return pc
-  end end
-
-  -- The immediate operations, which have no keep flag: its bit picks LIT.
-  local imm = {}
-  imm[0x00] = function() end -- BRK
-  imm[0x20] = function(s, o, pc) -- JCI
-    local p = s[256]
-    local t = s[p]
-    s[256] = (p - 1) % 256
-    if t == 0 then
-      pc = (pc + 2) % 65536
-    else
-      pc = (pc + 2 + ram[pc] * 256 + ram[(pc + 1) % 65536]) % 65536
-    end
-    return pc
-  end
-  imm[0x40] = function(s, o, pc) -- JMI
-    pc = (pc + 2 + ram[pc] * 256 + ram[(pc + 1) % 65536]) % 65536
-    return pc
-  end
-  imm[0x60] = function(s, o, pc) -- JSI
-    local q = (s[256] + 2) % 256
-    local rel = ram[pc] * 256 + ram[(pc + 1) % 65536]
-    pc = (pc + 2) % 65536
-    put2(s, q, pc)
-    s[256] = q
-    pc = (pc + rel) % 65536
-    return pc
-  end
-  local function lit(s, o, pc)
-    local q = (s[256] + 1) % 256
-    s[q] = ram[pc]
-    s[256] = q
-    pc = (pc + 1) % 65536
-    return pc
-  end
-  local function lit2(s, o, pc)
-    local q = (s[256] + 2) % 256
-    s[(q - 1) % 256], s[q] = ram[pc], ram[(pc + 1) % 65536]
-    s[256] = q
-    pc = (pc + 2) % 65536
-    return pc
-  end
-  imm[0x80], imm[0xc0], imm[0xa0], imm[0xe0] = lit, lit, lit2, lit2
-
-  -- Each instruction's operation, and whether it works on the return stack.
-  local op, ret = {}, {}
-  for ins = 0, 255 do
-    if ins % 32 == 0 then
-      op[ins] = imm[ins]
-    else
-      op[ins] = ops[ins % 64](floor(ins / 128))
-    end
-    ret[ins] = ins % 128 >= 64
-  end
-
-  local vm = { ram = ram, wst = wst, rst = rst }
-
-  function vm.set_devices(read, write)
-    dei, deo = read, write
+  function m.set_devices(read, write)
+    m.dei, m.deo = read, write
   end
 
   -- Run from `addr` until BRK. Where the Lua has `jit.promote` (lunacy), the
   -- program counter and the instruction there are promoted, so the loop is
   -- compiled once per guest instruction, its operation's call to one function.
   if promote then
-    function vm.eval(addr)
+    function m.eval(addr)
+      local ram, wst, rst, op, keep, ret = m.ram, m.wst, m.rst, m.op, m.keep, m.ret
       local pc = addr
       repeat
         pc = promote(pc)
         local ins = promote(ram[pc])
         pc = (pc + 1) % 65536
-        if ret[ins] then pc = op[ins](rst, wst, pc) else pc = op[ins](wst, rst, pc) end
+        if ret[ins] then pc = op[ins](m, rst, wst, pc, keep[ins]) else pc = op[ins](m, wst, rst, pc, keep[ins]) end
       until not pc
     end
   else
-    function vm.eval(addr)
+    function m.eval(addr)
+      local ram, wst, rst, op, keep, ret = m.ram, m.wst, m.rst, m.op, m.keep, m.ret
       local pc = addr
       repeat
         local ins = ram[pc]
         pc = (pc + 1) % 65536
-        if ret[ins] then pc = op[ins](rst, wst, pc) else pc = op[ins](wst, rst, pc) end
+        if ret[ins] then pc = op[ins](m, rst, wst, pc, keep[ins]) else pc = op[ins](m, wst, rst, pc, keep[ins]) end
       until not pc
     end
   end
 
   -- Load a ROM, a string, at the program's start, 0x100.
-  function vm.load(rom)
+  function m.load(rom)
     if #rom > 65536 - 256 then error("uxn: a ROM past 64KB needs expansion memory") end
     for i = 1, #rom do ram[255 + i] = rom:byte(i) end
   end
 
-  return vm
+  return m
 end
 
 return M

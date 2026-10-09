@@ -2,7 +2,7 @@ These Uxntal programs are from the [`uxn` repository](https://git.sr.ht/~rabbits
 commit [`3a696f8f`](https://git.sr.ht/~rabbits/uxn/commit/3a696f8fa9931857e99e50074c6994649ee62d37),
 whose ROMs [Raven](https://github.com/mkeeter/raven) tests against: `uxnasm`
 assembles each to the same bytes as Raven's copy of its ROM. `loop.tal` and
-`loop-long.tal` are lunacy's own: a minimal loop, for looking at how an emulator
+`loop_long.tal` are lunacy's own: a minimal loop, for looking at how an emulator
 compiles one, and the same loop run long enough to time its steady state.
 
 The `uxn` repository is released under the MIT license:
