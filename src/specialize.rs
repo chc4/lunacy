@@ -1521,7 +1521,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // block for nothing. A slot typed `Integer` is one already, at the same `SubPc` as the narrowed hot
 // way, so the code after both is one version: in a loop, the first iteration narrows its counter,
 // and the rest compute on an integer. A whole constant is loaded as an integer already (Note
-// [Widening]): narrowing a slot holding one uses its fact, and nothing more.
+// [Widening]): narrowing a slot holding one uses its fact, and nothing more. A slot stored into an
+// array part the context knows holds integers is narrowed as a loop's counter is, by its value at
+// runtime: a whole double computed elsewhere keeps the array of the integer kind.
 
 // Note [Widening]
 // ~~~~~~~~~~~~~~~

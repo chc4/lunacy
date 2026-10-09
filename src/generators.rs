@@ -715,6 +715,13 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         if doubles && c & 0x100 == 0 {
             yield YieldOp::WidenConstant(c);
         }
+        // Into an array part known to hold integers, any double an i32 holds exactly is
+        // narrowed, so it keeps its kind. See Note [Narrowing] in `specialize`.
+        // Its type found out first: a value of unknown type isn't narrowed.
+        if integer.is_some() && c & 0x100 == 0 && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(LType::Integer)) {
+            yield YieldOp::GuardCType(c, CType::Number);
+            yield YieldOp::Narrow(c);
+        }
         let in_array = match integer {
             Some(Some(k)) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[a]))),
             Some(None) => yield YieldOp::GuardDynamic(Rc::new(InArray::new(&[a, b]))),
