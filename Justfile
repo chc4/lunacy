@@ -681,6 +681,22 @@ hyperfines-uxn-promote:
     for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark; do just hyperfine-uxn-promote $b; done
     for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark; do echo $b; tail -n +3 working/hyperfine-promote-$b.md; done
 
+# Each uxn_* benchmark (which checks its own output) run once on the unsafe
+# build and the unsafe build with `magic`, holding the benchmark lock shared:
+# its exit status per build, for a correctness sweep.
+uxn-check: unsafe-compile unsafe-magic-compile
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop uxn_bit_fib uxn_bit_tak uxn_bit_mandelbrot uxn_bit_bunnymark; do
+        just _luac $b > /dev/null
+        printf "%-20s" $b
+        for bin in target/unsafe/bench target/magic/unsafe/bench; do
+            LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} {{SHARED}} $bin working/$b.bin 1 > /dev/null 2>&1
+            printf " %-28s %s" $bin $?
+        done
+        echo
+    done
+
 # `hyperfine-uxn` over UXN_HYPERFINES.
 UXN_HYPERFINES := "uxn_fib:1 uxn_tak:1 uxn_mandelbrot:1 uxn_bunnymark:1 uxn_bit_fib:1 uxn_bit_tak:1 uxn_bit_mandelbrot:1 uxn_bit_bunnymark:1"
 hyperfines-uxn:
