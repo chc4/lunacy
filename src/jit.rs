@@ -3186,8 +3186,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; .arch x64
                         ; dec QWORD r12 => RunState.jit_depth
-                        ; add rsp, 16
-                        ; pop QWORD r12 => RunState.witness_top
+                        // The witnesses it wrote are its caller's: the top stays. See Note
+                        // [Hash witnesses] in `vm`.
+                        ; add rsp, 24
                         ; pop QWORD r12 => RunState.witness_base
                         ; pop QWORD r12 => RunState.base
                         ; pop QWORD r12 => RunState.clos
@@ -3215,8 +3216,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     jit_note!(self.jctx, ops, "        put back the caller's frame");
                     dynasm!(ops
                         ; .arch x64
-                        ; add rsp, 16
-                        ; pop QWORD r12 => RunState.witness_top
+                        // The witnesses it wrote are its caller's: the top stays. See Note
+                        // [Hash witnesses] in `vm`.
+                        ; add rsp, 24
                         ; pop QWORD r12 => RunState.witness_base
                         ; pop QWORD r12 => RunState.base
                         ; pop QWORD r12 => RunState.clos

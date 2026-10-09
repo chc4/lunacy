@@ -1214,7 +1214,13 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
     }).collect();
     for slot in params.clone() {
         if let CType::Shape(of, hrefs) = caller.slot(slot) && entry.types[slot - a - 1] == CType::Type(of) {
+            // The caller's slot whose table it is, below the call, which has the keys the
+            // callee finds of it as the caller's own on its return.
+            let owner = hrefs.first().map(|href| caller.hkeys[href.0 as usize].idx).filter(|&owner| owner < a);
             entry.types[slot - a - 1] = CType::Shape(of, hrefs);
+            if let Some(owner) = owner {
+                entry.introduce(Fact { fragile: Fragile::Passed { slot: slot - a - 1, owner }, origins: None });
+            }
         }
     }
     for fact in &caller.fragile {
@@ -1225,6 +1231,7 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
             Fragile::ElementOf { slot, table } => shifted(*slot).zip(table.into_callee(shifted, frame.closure.as_ref())).map(|(slot, table)| Fragile::ElementOf { slot, table }),
             Fragile::Holds { slot, upvalue } => shifted(*slot).zip(upvalue.into_callee(frame.closure.as_ref())).map(|(slot, upvalue)| Fragile::Holds { slot, upvalue }),
             Fragile::Upvalue { upvalue, ctype } => upvalue.into_callee(frame.closure.as_ref()).map(|upvalue| Fragile::Upvalue { upvalue, ctype: ctype.clone() }),
+            Fragile::Passed { .. } => None,
         };
         if let Some(fragile) = fragile.filter(|fragile| fragile.slot().is_none_or(|slot| entry.types[slot] != CType::Type(LType::Nil))) {
             entry.introduce(Fact { fragile, origins: fact.origins.clone() });
@@ -2113,6 +2120,9 @@ pub enum Fragile {
     /// Stack slot `slot` holds a number constant an i32 holds exactly,
     /// `value`. See Note [Widening].
     Constant { slot: usize, value: i32 },
+    /// Stack slot `slot`, a parameter of an inlined callee, holds the table it
+    /// was passed, which the caller's slot `owner` holds. See Note [Inlined calls].
+    Passed { slot: usize, owner: usize },
 }
 
 /// A fragile fact, with where the paths reaching it introduced it, if that can
@@ -2216,13 +2226,14 @@ impl Fragile {
             Fragile::ElementOf { slot, .. } => (2, *slot),
             Fragile::Kind { table, .. } => (3, table.key()),
             Fragile::Constant { slot, .. } => (4, *slot),
+            Fragile::Passed { slot, .. } => (5, *slot),
         }
     }
 
     /// The slot the fact is about, if it is about one.
     fn slot(&self) -> Option<usize> {
         match self {
-            Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } => Some(*slot),
+            Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } | Fragile::Passed { slot, .. } => Some(*slot),
             Fragile::Kind { table, .. } => table.slot(),
             Fragile::Upvalue { .. } => None,
         }
@@ -2256,6 +2267,8 @@ impl Fragile {
             },
             // Only its slot holds it.
             Fragile::Constant { slot, .. } => slot_survives(*slot, effect),
+            // The caller's slot is the caller's own, which the callee doesn't write.
+            Fragile::Passed { slot, .. } => slot_survives(*slot, effect),
         }
     }
 }
@@ -4337,8 +4350,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // The hash keys the callee leaves, in the witnesses it shared: the caller's own it kept
         // are the caller's again, and any other, of the callee's frame or put in place of one of
         // the caller's, is free. See Note [Inlined calls].
+        // A parameter still holding the table it was passed has its hash keys the caller's slot's.
+        let passed = |slot: usize| ctx.fragile.iter().find_map(|fact| match fact.fragile {
+            Fragile::Passed { slot: param, owner } if param == slot => Some(owner),
+            _ => None,
+        });
+        let mut gained: Vec<(usize, HashRef)> = Vec::new();
         known.hkeys = ctx.hkeys.iter().enumerate().map(|(i, hkey)| match frame.caller.hkeys.get(i) {
             Some(mine) if !hkey.orphan() && hkey.idx == OUTER && !mine.orphan() => mine.clone(),
+            _ if !hkey.orphan() && hkey.place == Place::Register && let Some(owner) = passed(hkey.idx) => {
+                let mut theirs = hkey.clone();
+                theirs.idx = owner;
+                theirs.clear_checks();
+                gained.push((owner, HashRef(i as u8)));
+                theirs
+            },
             _ => {
                 let mut free = hkey.clone();
                 free.known_type = None;
@@ -4346,12 +4372,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 free
             },
         }).collect();
-        let dropped: Vec<HashRef> = (0..known.hkeys.len()).filter(|&i| known.hkeys[i].orphan()).map(|i| HashRef(i as u8)).collect();
+        // A shape keeps the caller's hash keys that came back as they were, and gains its slot's.
+        let unchanged = |href: &HashRef| {
+            let (mine, back) = (frame.caller.hkeys.get(href.0 as usize), &known.hkeys[href.0 as usize]);
+            mine.is_some_and(|mine| !back.orphan() && mine.idx == back.idx && mine.key == back.key && mine.place == back.place && mine.chain == back.chain)
+        };
         for slot in 0..known.types.len() {
-            if let CType::Shape(of, hrefs) = &known.types[slot] && hrefs.iter().any(|href| dropped.contains(href)) {
-                let kept: SmallVec<[HashRef; 4]> = hrefs.iter().filter(|href| !dropped.contains(href)).cloned().collect();
-                known.types[slot] = if kept.is_empty() { CType::Type(*of) } else { CType::Shape(*of, kept) };
+            let CType::Shape(of, hrefs) = &known.types[slot] else { continue };
+            let mut kept: SmallVec<[HashRef; 4]> = hrefs.iter().filter(|href| unchanged(href)).cloned().collect();
+            for &(owner, href) in &gained {
+                if owner == slot && !kept.contains(&href) {
+                    kept.push(href);
+                }
             }
+            known.types[slot] = if kept.is_empty() { CType::Type(*of) } else { CType::Shape(*of, kept) };
         }
         frame.effects.apply(owner, &mut known, &frame.captured);
         // See Note [Upvalue paths]. A path through the callee's closure needs the

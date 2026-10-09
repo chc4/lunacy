@@ -1678,7 +1678,10 @@ impl Default for HashWitness {
 // function's entry context has no hash keys and a hash key's `href_init` runs
 // before any use of it. An inlined call's frame has its caller's region, and its
 // entry context its caller's hash keys: its code reads and writes the caller's
-// witnesses as the caller's own code would (Note [Inlined calls] in `specialize`).
+// witnesses as the caller's own code would (Note [Inlined calls] in `specialize`),
+// and its return leaves `witness_top` where the callee raised it, as the hash keys
+// the callee leaves the caller are past where the caller's top was: a call after
+// it starts past them.
 //
 // A witness holds its entry's index and its value's address while its table is
 // the one it saw, at the epoch it saw: a table's hash part only reallocates or moves an
@@ -2114,11 +2117,11 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         }
         debug_assert!(matches!(self.callstack.last(), Some(CallstackEntry { ret: Return::Inlined, .. })), "an inlined call's return to a frame it didn't make");
         // SAFETY: the running frame is the inlined call's, whose entry `shift_frame` pushed.
-        let CallstackEntry { clos, frame, witness_frame, witness_top, .. } = unsafe { self.callstack.pop().unwrap_unchecked() };
+        let CallstackEntry { clos, frame, witness_frame, .. } = unsafe { self.callstack.pop().unwrap_unchecked() };
         self.clos = clos;
         self.base = frame;
         self.witness_base = witness_frame;
-        self.witness_top = witness_top;
+        // The witnesses it wrote are its caller's: the top stays. See Note [Hash witnesses].
     }
 
     /// VARARG A B in the running frame, of a vararg function with `params`
