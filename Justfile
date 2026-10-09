@@ -650,7 +650,7 @@ unsafe-magic-compile:
 # past its reset vector (as `hyperfine-uxn`), LuaJIT with and without its JIT,
 # and lunacy's release build, its unsafe build, and its unsafe build with
 # `magic` (`unsafe-magic-compile`).
-hyperfine-uxn-promote benchmark: unsafe-compile unsafe-magic-compile _raven
+hyperfine-uxn-promote benchmark times='1': unsafe-compile unsafe-magic-compile _raven
     #!/usr/bin/env bash
     set -euo pipefail
     b={{benchmark}}
@@ -662,27 +662,27 @@ hyperfine-uxn-promote benchmark: unsafe-compile unsafe-magic-compile _raven
     # uxn_loop runs loop_long.tal.
     if [ $name = loop ]; then name=loop_long; fi
     rom=working/roms/$name.rom
-    if [ $name != bunnymark ]; then
+    if [ {{times}} = 1 ] && [ $name != bunnymark ]; then
         for backend in interpreter tailcall native; do
             raven+=(-n "raven $backend" "target/raven/target/release/raven-cli --backend $backend --quit $rom")
         done
     fi
     jit="LUNACY_JIT_SIZE={{UXN_JIT_SIZE}}"
     # As `hyperfine-full`: a command failing is timed, and left out of the history.
-    {{TIMED}} hyperfine -i -N --warmup {{WARMUP}} --export-markdown working/hyperfine-promote-$b.md \
-        --export-json working/hyperfine-promote-$b.json "${raven[@]}" \
-        -n "luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin 1" \
-        -n luajit "luajit bench.lua -- working/$b.luajit.bin 1" \
-        -n "lunacy release" "env $jit ./target/release/bench working/$b.bin 1" \
-        -n "lunacy unsafe" "env $jit ./target/unsafe/bench working/$b.bin 1" \
-        -n "lunacy unsafe magic" "env $jit ./target/magic/unsafe/bench working/$b.bin 1"
+    {{TIMED}} hyperfine -i -N --warmup {{WARMUP}} --export-markdown working/hyperfine-promote-$b-{{times}}.md \
+        --export-json working/hyperfine-promote-$b-{{times}}.json "${raven[@]}" \
+        -n "luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin {{times}}" \
+        -n luajit "luajit bench.lua -- working/$b.luajit.bin {{times}}" \
+        -n "lunacy release" "env $jit ./target/release/bench working/$b.bin {{times}}" \
+        -n "lunacy unsafe" "env $jit ./target/unsafe/bench working/$b.bin {{times}}" \
+        -n "lunacy unsafe magic" "env $jit ./target/magic/unsafe/bench working/$b.bin {{times}}"
 
 # `hyperfine-uxn-promote` over the uxn_* ROMs.
 hyperfines-uxn-promote:
     #!/usr/bin/env bash
     set -euo pipefail
     for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop; do just hyperfine-uxn-promote $b; done
-    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop; do echo $b; tail -n +3 working/hyperfine-promote-$b.md; done
+    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop; do echo $b; tail -n +3 working/hyperfine-promote-$b-1.md; done
 
 # Each uxn_* benchmark (which checks its own output) run once on the unsafe
 # build and the unsafe build with `magic`, holding the benchmark lock shared:
