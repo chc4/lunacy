@@ -66,7 +66,7 @@ trace benchmark times='10' features='unsafe':
     just _luac {{benchmark}}
     {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} tracing" --bin bench \
         --target-dir target/tracing -Z build-std="core,std,panic_abort"
-    cd working && ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
+    cd working && {{SHARED}} ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
     python3 tools/perfetto_summary.py working/lunacy.fxt
 
 # A golden test's run traced (feature `tracing`), as `trace` traces a
