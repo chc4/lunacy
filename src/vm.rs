@@ -1676,7 +1676,9 @@ impl Default for HashWitness {
 // The vector itself never shrinks, so a call never refills it: entries above
 // `witness_top` are stale, but no frame reads one it hasn't written, as a
 // function's entry context has no hash keys and a hash key's `href_init` runs
-// before any use of it.
+// before any use of it. An inlined call's frame has its caller's region, and its
+// entry context its caller's hash keys: its code reads and writes the caller's
+// witnesses as the caller's own code would (Note [Inlined calls] in `specialize`).
 //
 // A witness holds its entry's index and its value's address while its table is
 // the one it saw, at the epoch it saw: a table's hash part only reallocates or moves an
@@ -2088,7 +2090,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         if ENTRY {
             self.top = end;
         }
-        self.witness_base = self.witness_top;
+        // Its hash witnesses are its caller's. See Note [Hash witnesses].
     }
 
     /// The return of the frame `shift_frame` made for an inlined call: closing its open upvalues

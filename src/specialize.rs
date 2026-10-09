@@ -335,6 +335,10 @@ pub struct HashKey<'src, 'intern> {
     pub chain: Option<HashRef>,
 }
 
+/// The slot a hash key of a frame an inlined callee is inlined into is in, as the callee sees it:
+/// past any of its own. See Note [Inlined calls].
+const OUTER: usize = usize::MAX;
+
 /// How many `__index` hops down a table's chain a hash key's field can be.
 /// See Note [Table metatables].
 const MAX_CHAIN: usize = 3;
@@ -1078,6 +1082,14 @@ pub enum CallEntry {
 // Entered from the interpreter inside inlined calls, JIT code takes their entries onto the native
 // stack first (`RunState::adopt_inlined`).
 //
+// The callee's hash keys are the caller's (Note [Hash witnesses] in `vm`): its frame has its
+// caller's witnesses, and its entry context the caller's hash keys at their indexes, an argument's
+// its parameter's, with its shape, and every other's the caller's own, which the callee's code
+// keeps, naming no slot of it (`OUTER`). So the callee's code finds a field of a table it was
+// passed as its caller's code would, and does to the caller's hash keys what its caller's code
+// would. Each of its returns gives the caller the hash keys it leaves: the caller's own it kept,
+// and the rest free.
+//
 // The callee's code is its versions for the inlined call, which their contexts carry
 // (`InlineFrame`), apart from its versions for its calls and for other inlined calls. Calls in
 // inlined code inline in turn, to `MAX_INLINE_DEPTH` deep. A callee with a tail call or VARARG
@@ -1188,6 +1200,23 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
     let mut entry = entry_context(caller, proto, a, b);
     let params = a + 1..a + 1 + (proto.param_count as usize).min(entry.types.len());
     let shifted = |slot: usize| params.contains(&slot).then(|| slot - a - 1);
+    // The caller's hash keys, at their indexes, in the caller's witnesses: a parameter's are its
+    // argument's, with its shape, and any other's are the caller's own, which no slot of the
+    // callee names. See Note [Inlined calls].
+    let slots = entry.types.len();
+    entry.hkeys = caller.hkeys.iter().map(|hkey| {
+        let mut hkey = hkey.clone();
+        hkey.hazards = (0..slots).map(|slot| params.contains(&(a + 1 + slot)) && hkey.checked(a + 1 + slot)).collect();
+        if !hkey.orphan() {
+            hkey.idx = shifted(hkey.idx).unwrap_or(OUTER);
+        }
+        hkey
+    }).collect();
+    for slot in params.clone() {
+        if let CType::Shape(of, hrefs) = caller.slot(slot) && entry.types[slot - a - 1] == CType::Type(of) {
+            entry.types[slot - a - 1] = CType::Shape(of, hrefs);
+        }
+    }
     for fact in &caller.fragile {
         let fragile = match &fact.fragile {
             Fragile::Constant { slot, value } => shifted(*slot).map(|slot| Fragile::Constant { slot, value: *value }),
@@ -4304,6 +4333,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// callee's code may have done to it, with the results' types. See Note [Inlined calls].
     fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, frame: &InlineFrame, a: usize, b: usize) -> BlockId {
         let mut known = frame.caller.clone();
+        // The hash keys the callee leaves, in the witnesses it shared: the caller's own it kept
+        // are the caller's again, and any other, of the callee's frame or put in place of one of
+        // the caller's, is free. See Note [Inlined calls].
+        known.hkeys = ctx.hkeys.iter().enumerate().map(|(i, hkey)| match frame.caller.hkeys.get(i) {
+            Some(mine) if !hkey.orphan() && hkey.idx == OUTER && !mine.orphan() => mine.clone(),
+            _ => {
+                let mut free = hkey.clone();
+                free.known_type = None;
+                free.clear_checks();
+                free
+            },
+        }).collect();
+        let dropped: Vec<HashRef> = (0..known.hkeys.len()).filter(|&i| known.hkeys[i].orphan()).map(|i| HashRef(i as u8)).collect();
+        for slot in 0..known.types.len() {
+            if let CType::Shape(of, hrefs) = &known.types[slot] && hrefs.iter().any(|href| dropped.contains(href)) {
+                let kept: SmallVec<[HashRef; 4]> = hrefs.iter().filter(|href| !dropped.contains(href)).cloned().collect();
+                known.types[slot] = if kept.is_empty() { CType::Type(*of) } else { CType::Shape(*of, kept) };
+            }
+        }
         frame.effects.apply(owner, &mut known, &frame.captured);
         // See Note [Upvalue paths]. A path through the callee's closure needs the
         // closure known, and no upvalue set since it was loaded, which may have
