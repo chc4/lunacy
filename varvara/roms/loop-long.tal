@@ -1,0 +1,16 @@
+( loop.tal's loop of nothing, 65535 iterations of it run 16 times: long enough
+  that its steady state, not building the machine, is what a run times. )
+
+|0100
+
+@on-reset ( -> )
+	#10
+	&outer ( outer -- )
+		#ffff
+		&loop ( count* -- )
+			#0001 SUB2 DUP2 ORA ?&loop
+		POP2
+		#01 SUB DUP ?&outer
+	POP
+	#800f DEO
+	BRK

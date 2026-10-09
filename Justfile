@@ -713,6 +713,13 @@ varvara-snapshots lua='lunacy': _raven
     done
     exit $failed
 
+# ROM `rom` (varvara/roms/<rom>.tal) run headless on the Lua Varvara emulator
+# (varvara/run.lua), bundled into one chunk: working/run-<rom>.lua, compiled to
+# working/run-<rom>.bin, for `lunacy` or `trace` runs of a small ROM.
+uxn-bundle rom:
+    python3 tools/bundle_bench.py --entry varvara/run.lua --rom {{rom}} > working/run-{{rom}}.lua
+    luac5.1 -o working/run-{{rom}}.bin working/run-{{rom}}.lua
+
 # The Lua Varvara emulator in a window (the `varvara` bin, feature
 # `varvara_ui`): lunacy's release build running varvara/app.lua on ROM `rom`, a
 # name in varvara/roms or a path to a .rom file. `env` is more of the bin's
