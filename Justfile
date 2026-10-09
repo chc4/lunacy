@@ -639,6 +639,44 @@ hyperfine-uxn-bit rom: unsafe-compile
     {{TIMED}} hyperfine -N --warmup {{WARMUP}} --export-markdown working/hyperfine-uxn-bit-{{rom}}.md \
         --export-json working/hyperfine-uxn-bit-{{rom}}.json "${commands[@]}"
 
+# The unsafe build with `magic`, whose `jit` table's `promote` lets the Lua
+# Varvara emulator specialize its loop to the virtual program counter, in
+# target/magic (`unsafe-compile`'s has none: the emulator runs without).
+unsafe-magic-compile:
+    {{SHARED}} cargo build --profile unsafe --no-default-features --features unsafe,magic --bin bench \
+        --target-dir target/magic -Z build-std="core,std,panic_abort"
+
+# A uxn_* benchmark (`times` 1) on Raven's backends, where the ROM needs nothing
+# past its reset vector (as `hyperfine-uxn`), and lunacy's release build, its
+# unsafe build, and its unsafe build with `magic` (`unsafe-magic-compile`).
+hyperfine-uxn-promote benchmark: unsafe-compile unsafe-magic-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    b={{benchmark}}
+    just _luac $b
+    {{SHARED}} cargo build --release --bin bench
+    raven=()
+    name=${b#uxn_}; name=${name#bit_}
+    rom=working/roms/$name.rom
+    if [ $name != bunnymark ]; then
+        for backend in interpreter tailcall native; do
+            raven+=(-n "raven $backend" "target/raven/target/release/raven-cli --backend $backend --quit $rom")
+        done
+    fi
+    jit="LUNACY_JIT_SIZE={{UXN_JIT_SIZE}}"
+    {{TIMED}} hyperfine -N --warmup {{WARMUP}} --export-markdown working/hyperfine-promote-$b.md \
+        --export-json working/hyperfine-promote-$b.json "${raven[@]}" \
+        -n "lunacy release" "env $jit ./target/release/bench working/$b.bin 1" \
+        -n "lunacy unsafe" "env $jit ./target/unsafe/bench working/$b.bin 1" \
+        -n "lunacy unsafe magic" "env $jit ./target/magic/unsafe/bench working/$b.bin 1"
+
+# `hyperfine-uxn-promote` over the uxn_* ROMs.
+hyperfines-uxn-promote:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark; do just hyperfine-uxn-promote $b; done
+    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark; do echo $b; tail -n +3 working/hyperfine-promote-$b.md; done
+
 # `hyperfine-uxn` over UXN_HYPERFINES.
 UXN_HYPERFINES := "uxn_fib:1 uxn_tak:1 uxn_mandelbrot:1 uxn_bunnymark:1 uxn_bit_fib:1 uxn_bit_tak:1 uxn_bit_mandelbrot:1 uxn_bit_bunnymark:1"
 hyperfines-uxn:

@@ -729,6 +729,7 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
 /// `jit.promote`'s generator: for `promote(v)` keeping one result, of an integer (a whole double
 /// narrowed), `v` promoted, its value moved into the result's slot; any other call is the
 /// native's, which returns its argument. See Note [Green values] in `specialize`.
+#[cfg(feature = "magic")]
 fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp, PROMOTE_VALUES};
     Box::new(#[coroutine] move |_: ResumeArg| {
@@ -1086,7 +1087,9 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     };
     // `jit.promote(v)`: `v`, and the code after it specialized to its value. See Note [Green
     // values] in `specialize`. A global only: `require("jit")` is LuaJIT's, which code
-    // probes for.
+    // probes for. A magic JIT intrinsic (feature `magic`): without it there is no `jit`, as
+    // in a Lua other than LuaJIT, and code probing for it runs without.
+    #[cfg(feature = "magic")]
     let jit_lib = module(intern, vec![
         ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
     ]);
@@ -1095,7 +1098,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         *modules = vec![("bit", erase(&bit_lib)), ("table.new", erase(&table_new)), ("table.clear", erase(&table_clear))];
     });
 
-    vec![
+    let mut globals = vec![
         (InternString::intern(intern, "type"), type_),
         (InternString::intern(intern, "tostring"), tostring),
         (InternString::intern(intern, "tonumber"), tonumber),
@@ -1110,6 +1113,8 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "table"), table_lib),
         (InternString::intern(intern, "io"), io_lib),
         (InternString::intern(intern, "bit"), bit_lib),
-        (InternString::intern(intern, "jit"), jit_lib),
-    ]
+    ];
+    #[cfg(feature = "magic")]
+    globals.push((InternString::intern(intern, "jit"), jit_lib));
+    globals
 }
