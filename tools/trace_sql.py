@@ -35,6 +35,10 @@ The specializer's are also views, one column per argument:
       `hotness` counts down from 64, one for each time the interpreter
       entered the block, to 0 when it tiers up: 64 is never entered there, 0
       is compiled, and JIT code's entries don't count.
+  inline_refused(line, callee, call_block, reason)
+      each call's continuation that didn't inline its callee: `compiled` (its
+      call's block had JIT code by its first return), `relaid` (the call was
+      laid out again), or `policy` (`inlines` says no: size, depth, loops).
   alloc_step(trace, step, line, block, pc, off)
       each step of each trace the window planner planned: the block it is in
       and, for a residual, its offset (a block's start's is 2^64-1).
@@ -123,6 +127,7 @@ VIEWS = {
     'inline': ['line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
     'inline_return': ['line', 'callee', 'after', 'block', 'context'],
     'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'inlines', 'why'],
+    'inline_refused': ['line', 'callee', 'call_block', 'reason'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
@@ -131,7 +136,7 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'unreachable': ('spec', 'unreachable'), 'encoding': ('spec', 'encoding'),
           'widen': ('spec', 'widen'), 'evicted': ('spec', 'evicted'),
           'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return'),
-          'inline_cost': ('spec', 'inline_cost')}
+          'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused')}
 
 
 def connect(trace):

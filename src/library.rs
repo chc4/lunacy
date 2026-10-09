@@ -739,6 +739,7 @@ fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) ->
                     if let ResumeArg::Integer(_) = (yield YieldOp::Promote(a + 1)) {
                         yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::Move::new(&[a + 1, a])));
                         yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
+                        yield YieldOp::Effect(crate::specialize::Effect::Move { from: a + 1, to: a });
                         return ResumeArg::Start;
                     }
                 }

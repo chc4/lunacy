@@ -284,8 +284,8 @@ pub enum YieldOp {
     ArrayType(usize, Subject), // Inform the executor that STACK[a] was loaded from the array part
                                // of the table in a subject (as `Subject` answered before the
                                // load): its type is the array's kind, if known. See Note [Array kinds]
-    Subject(usize), // Resumed with Subject: the upvalue STACK[idx] holds the value of, if the
-                    // context knows, else the slot. See Note [Upvalue paths]
+    Subject(usize), // Resumed with Subject: the running closure's upvalue STACK[idx] holds the
+                    // value of, if the context knows, else the slot. See Note [Upvalue paths]
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
                                // See Note [Field types]
     LoadUpvalue(usize, usize), // Infrom the executor that STACK[idx]'s type is the same as an UPVALUE[b].
@@ -1180,18 +1180,11 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
             // See Note [Upvalue paths].
             Fragile::Kind { table, kind } => table.into_callee(shifted, frame.closure.as_ref()).map(|table| Fragile::Kind { table, kind: *kind }),
             Fragile::ElementOf { slot, table } => shifted(*slot).zip(table.into_callee(shifted, frame.closure.as_ref())).map(|(slot, table)| Fragile::ElementOf { slot, table }),
-            Fragile::Holds { .. } | Fragile::Upvalue { .. } => None,
+            Fragile::Holds { slot, upvalue } => shifted(*slot).zip(upvalue.into_callee(frame.closure.as_ref())).map(|(slot, upvalue)| Fragile::Holds { slot, upvalue }),
+            Fragile::Upvalue { upvalue, ctype } => upvalue.into_callee(frame.closure.as_ref()).map(|upvalue| Fragile::Upvalue { upvalue, ctype: ctype.clone() }),
         };
         if let Some(fragile) = fragile.filter(|fragile| fragile.slot().is_none_or(|slot| entry.types[slot] != CType::Type(LType::Nil))) {
             entry.introduce(Fact { fragile, origins: fact.origins.clone() });
-        }
-    }
-    // See Note [Upvalue paths].
-    if let Some(closure) = &frame.closure {
-        for fact in &caller.fragile {
-            if let Fragile::Upvalue { upvalue, ctype } = &fact.fragile && let Some(upvalue) = upvalue.rebase(closure) {
-                entry.assume(Fragile::Upvalue { upvalue, ctype: ctype.clone() });
-            }
         }
     }
     entry.inline = Some(Rc::new(frame));
@@ -1816,9 +1809,10 @@ pub struct Context {
 // slots its accesses say it writes (`Effect::Write`), an exec those it says it writes, else any
 // slot (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op or a pure native's
 // (Note [Library natives] in `library`) is `Effect::Opaque`, and what a residual can't show a
-// yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A store into a table is always yielded as one, `Effect::ArrayStore` or
-// the hash hazards it sets: an exec's writes are of its own frame, and a caller sees only the
-// store (Note [Call effects]).
+// yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`, and a MOVE's `Effect::Move`, by
+// which each fact about the moved value is known of its copy too, `Fragile::moved`). A store into
+// a table is always yielded as one, `Effect::ArrayStore` or the hash hazards it sets: an exec's
+// writes are of its own frame, and a caller sees only the store (Note [Call effects]).
 //
 // A kind of fact says which effects it survives (`Fragile::survives`); a new kind is a variant,
 // its `key` and `survives`, and where it is established.
@@ -1889,6 +1883,8 @@ impl std::fmt::Display for Kind {
 pub enum UpvaluePath {
     Own(u8),
     Of(Rc<UpvaluePath>, u8),
+    /// The upvalue of the function an inlined call is in, the caller, from the callee.
+    Caller(u8),
 }
 
 impl UpvaluePath {
@@ -1898,6 +1894,8 @@ impl UpvaluePath {
         match self {
             UpvaluePath::Own(j) => *j as usize + 1,
             UpvaluePath::Of(closure, n) => closure.key() << 8 | (*n as usize + 1),
+            // Apart from the others, which are short.
+            UpvaluePath::Caller(j) => 1 << (usize::BITS - 2) | *j as usize,
         }
     }
 
@@ -1907,21 +1905,42 @@ impl UpvaluePath {
         matches!(self, UpvaluePath::Own(j) if *j as usize != set)
     }
 
+    /// This path, from the callee of an inlined call whose closure the caller loaded from
+    /// `closure`, if the caller knows: its own upvalue is the callee's caller's, and one of the
+    /// closure's is the callee's own. A caller's caller's isn't named.
+    fn into_callee(&self, closure: Option<&UpvaluePath>) -> Option<UpvaluePath> {
+        match self {
+            UpvaluePath::Own(j) => Some(UpvaluePath::Caller(*j)),
+            UpvaluePath::Of(..) => closure.and_then(|closure| self.rebase(closure)),
+            UpvaluePath::Caller(_) => None,
+        }
+    }
+
+    /// This path, of the callee of an inlined call, from its caller, which loaded the callee's
+    /// closure from `closure`, if it knows: the caller's own upvalue, or one through the closure.
+    fn into_caller(&self, closure: Option<&UpvaluePath>) -> Option<UpvaluePath> {
+        match self {
+            UpvaluePath::Caller(j) => Some(UpvaluePath::Own(*j)),
+            _ => closure.map(|closure| self.under(closure)),
+        }
+    }
+
     /// This path from the function whose closure `closure` holds, which it names an upvalue of.
     fn rebase(&self, closure: &UpvaluePath) -> Option<UpvaluePath> {
         match self {
-            UpvaluePath::Own(_) => None,
+            UpvaluePath::Own(_) | UpvaluePath::Caller(_) => None,
             UpvaluePath::Of(of, n) if **of == *closure => Some(UpvaluePath::Own(*n)),
             UpvaluePath::Of(of, n) => of.rebase(closure).map(|of| UpvaluePath::Of(Rc::new(of), *n)),
         }
     }
 
     /// This path, of the function whose closure `closure` holds, from the function `closure` is
-    /// of.
+    /// of. Not of a `Caller` path, which `into_caller` maps.
     fn under(&self, closure: &UpvaluePath) -> UpvaluePath {
         match self {
             UpvaluePath::Own(n) => UpvaluePath::Of(Rc::new(closure.clone()), *n),
             UpvaluePath::Of(of, n) => UpvaluePath::Of(Rc::new(of.under(closure)), *n),
+            UpvaluePath::Caller(_) => unreachable!("a caller's upvalue under a closure"),
         }
     }
 }
@@ -1966,16 +1985,16 @@ impl Subject {
     fn into_callee(&self, shifted: impl Fn(usize) -> Option<usize>, closure: Option<&UpvaluePath>) -> Option<Subject> {
         match self {
             Subject::Slot(slot) => shifted(*slot).map(Subject::Slot),
-            Subject::Upvalue(upvalue) => closure.and_then(|closure| upvalue.rebase(closure)).map(Subject::Upvalue),
+            Subject::Upvalue(upvalue) => upvalue.into_callee(closure).map(Subject::Upvalue),
         }
     }
 
     /// The subject, of the callee of an inlined call, in its caller's frame, which loaded the
     /// callee's closure from `closure`: an upvalue of the closure. The callee's slots die with it.
-    fn into_caller(&self, closure: &UpvaluePath) -> Option<Subject> {
+    fn into_caller(&self, closure: Option<&UpvaluePath>) -> Option<Subject> {
         match self {
             Subject::Slot(_) => None,
-            Subject::Upvalue(upvalue) => Some(Subject::Upvalue(upvalue.under(closure))),
+            Subject::Upvalue(upvalue) => upvalue.into_caller(closure).map(Subject::Upvalue),
         }
     }
 }
@@ -1983,7 +2002,7 @@ impl Subject {
 /// Whether slot `slot` still holds the value it did before `effect`.
 fn slot_survives(slot: usize, effect: Effect) -> bool {
     match effect {
-        Effect::Write(written) => written != slot,
+        Effect::Write(written) | Effect::Move { to: written, .. } => written != slot,
         Effect::WriteAny | Effect::Opaque => false,
         Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_) => true,
     }
@@ -1994,15 +2013,16 @@ fn upvalue_survives(upvalue: &UpvaluePath, effect: Effect) -> bool {
     match effect {
         Effect::SetUpvalue(set) => upvalue.survives_set(set),
         Effect::AnyUpvalue | Effect::Opaque => false,
-        Effect::Write(_) | Effect::WriteAny | Effect::ArrayStore(_) => true,
+        Effect::Write(_) | Effect::WriteAny | Effect::ArrayStore(_) | Effect::Move { .. } => true,
     }
 }
 
 // Note [Upvalue paths]
 // ~~~~~~~~~~~~~~~~~~~~
-// Facts about upvalues name the upvalue by a path from the running function: its own upvalue j, or
-// upvalue n of the closure another path's upvalue holds. The closure isn't known, only its
-// prototype (what its identity guard compares), so a fact can't name its cells, only where it is.
+// Facts about upvalues name the upvalue by a path from the running function: its own upvalue j,
+// upvalue n of the closure another path's upvalue holds, or, in an inlined call's callee, its
+// caller's upvalue j. The closure isn't known, only its prototype (what its identity guard
+// compares), so a fact can't name its cells, only where it is.
 //
 // A set of the running function's own upvalue j falsifies the facts of paths through j, and of
 // every path through another closure: cells are shared, and any of them may be j's. Setting
@@ -2011,7 +2031,12 @@ fn upvalue_survives(upvalue: &UpvaluePath, effect: Effect) -> bool {
 // Paths carry facts across inlined calls (Note [Inlined calls]). Where the caller knows which of
 // its upvalues' paths the callee's closure was loaded from, the callee enters knowing as its own
 // the caller's facts about that closure's upvalues, and its return gives the caller what it then
-// knows of its own, as paths through that closure, unless it set some upvalue. A caller making
+// knows of its own, as paths through that closure, unless it set some upvalue. The callee enters
+// knowing the caller's facts about the caller's own upvalues too, as its caller's, and which of its
+// arguments hold their values; what it learns of them, as of any value it holds, its return gives
+// the caller as its own. So a table the caller passes from an upvalue to an inlined function, which
+// learns the kind of its array part, keeps it in the caller. A caller's caller's upvalue isn't
+// named, and a set of any of the callee's upvalues falsifies its caller's, as cells are shared. A caller making
 // several calls of one closure it loads from one upvalue learns at its first inlined call what
 // every later one then knows.
 //
@@ -2126,6 +2151,9 @@ pub enum Effect {
     /// A value of the representation (`None` if not known) is stored in some
     /// table's array part.
     ArrayStore(Option<LType>),
+    /// Slot `from`'s value is copied into slot `to`, which is written: what
+    /// is known of the value is then known of `to` too (`Fragile::moved`).
+    Move { from: usize, to: usize },
 }
 
 impl Fragile {
@@ -2152,6 +2180,18 @@ impl Fragile {
             Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } => Some(*slot),
             Fragile::Kind { table, .. } => table.slot(),
             Fragile::Upvalue { .. } => None,
+        }
+    }
+
+    /// The fact, if it is about slot `from`'s value, about slot `to`'s once the value is copied
+    /// there: whatever a fact says of a value holds of a copy of it.
+    fn moved(&self, from: usize, to: usize) -> Option<Fragile> {
+        match self {
+            Fragile::Holds { slot, upvalue } if *slot == from => Some(Fragile::Holds { slot: to, upvalue: upvalue.clone() }),
+            Fragile::ElementOf { slot, table } if *slot == from => Some(Fragile::ElementOf { slot: to, table: table.clone() }),
+            Fragile::Kind { table: Subject::Slot(slot), kind } if *slot == from => Some(Fragile::Kind { table: Subject::Slot(to), kind: *kind }),
+            Fragile::Constant { slot, value } if *slot == from => Some(Fragile::Constant { slot: to, value: *value }),
+            _ => None,
         }
     }
 
@@ -2233,7 +2273,7 @@ impl Effects {
     /// function's own frame.
     fn of(effect: Effect) -> Effects {
         match effect {
-            Effect::Write(_) | Effect::WriteAny => Effects::NONE,
+            Effect::Write(_) | Effect::WriteAny | Effect::Move { .. } => Effects::NONE,
             Effect::SetUpvalue(_) | Effect::AnyUpvalue => Effects::UPVALUE,
             Effect::Opaque => Effects::OPAQUE,
             Effect::ArrayStore(None) => Effects(Self::ARRAYS),
@@ -2366,7 +2406,16 @@ impl Context {
 
     /// Drop the facts `effect` may falsify. See Note [Fragile information].
     fn effect(&mut self, effect: Effect) {
+        let copies: Vec<Fact> = match effect {
+            Effect::Move { from, to } => self.fragile.iter()
+                .filter_map(|fact| fact.fragile.moved(from, to).map(|fragile| Fact { fragile, origins: fact.origins.clone() }))
+                .collect(),
+            _ => Vec::new(),
+        };
         self.fragile.retain(|fact| fact.survives(effect));
+        for copy in copies {
+            self.introduce(copy);
+        }
         self.inlined(Effects::of(effect));
     }
 
@@ -4090,7 +4139,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let value = match &table {
                     Subject::Slot(slot) => state.vals[state.base + slot],
                     Subject::Upvalue(UpvaluePath::Own(j)) => state.upvalue(owner, *j as usize),
-                    Subject::Upvalue(UpvaluePath::Of(..)) => return None,
+                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) => return None,
                 };
                 let LValue::Table(tab) = value.unbox() else { unreachable!("an element of an array part not of a table") };
                 Some((table, tab.ro(owner).kind))
@@ -4101,7 +4150,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::GuardDynamic(match table {
                     Subject::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot])),
                     Subject::Upvalue(UpvaluePath::Own(j)) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
-                    Subject::Upvalue(UpvaluePath::Of(..)) => unreachable!("a kind read through another closure"),
+                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) => unreachable!("a kind read through another closure"),
                 })
             } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
@@ -4199,16 +4248,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, frame: &InlineFrame, a: usize, b: usize) -> BlockId {
         let mut known = frame.caller.clone();
         frame.effects.apply(owner, &mut known, &frame.captured);
-        // See Note [Upvalue paths].
-        if let Some(closure) = frame.closure.as_ref().filter(|_| frame.effects.0 & Effects::UPVALUE.0 == 0) {
-            for fact in &ctx.fragile {
-                match &fact.fragile {
-                    Fragile::Upvalue { upvalue, ctype } => known.assume(Fragile::Upvalue { upvalue: upvalue.under(closure), ctype: ctype.clone() }),
-                    Fragile::Kind { table, kind } => if let Some(table) = table.into_caller(closure) {
-                        known.assume(Fragile::Kind { table, kind: *kind });
-                    },
-                    _ => {},
-                }
+        // See Note [Upvalue paths]. A path through the callee's closure needs the
+        // closure known, and no upvalue set since it was loaded, which may have
+        // been one of its cells; one of the caller's own has held since the
+        // callee knew it.
+        let closure = frame.closure.as_ref().filter(|_| frame.effects.0 & Effects::UPVALUE.0 == 0);
+        for fact in &ctx.fragile {
+            match &fact.fragile {
+                Fragile::Upvalue { upvalue, ctype } => if let Some(upvalue) = upvalue.into_caller(closure) {
+                    known.assume(Fragile::Upvalue { upvalue, ctype: ctype.clone() });
+                },
+                Fragile::Kind { table, kind } => if let Some(table) = table.into_caller(closure) {
+                    known.assume(Fragile::Kind { table, kind: *kind });
+                },
+                _ => {},
             }
         }
         let (call, c) = (frame.a as usize, frame.c as usize);
@@ -4563,6 +4616,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The call it continues, laid out just before it, inlined from now on: this return,
             // from its frame, continues as any other. See Note [Inlined calls].
+            #[cfg(feature = "tracing")]
+            if let Some(call) = &inline {
+                let refused = if vm.compiled(call.block) {
+                    Some("compiled")
+                } else if !matches!(vm.blocks[call.block.0].instructions.get(call.off), Some(Residual::LuaCall { .. })) {
+                    Some("relaid")
+                } else if !inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee }, a) {
+                    Some("policy")
+                } else {
+                    None
+                };
+                if let Some(reason) = refused {
+                    crate::tracing::instant("spec", "inline_refused", &[
+                        ("line", vm.traced_line(owner).into()),
+                        ("callee", (unsafe { (*call.callee).line_defined } as u64).into()),
+                        ("call_block", call.block.0.into()),
+                        ("reason", reason.into()),
+                    ]);
+                }
+            }
             if let Some(call) = &inline
                 && !vm.compiled(call.block)
                 && let Some(&Residual::LuaCall { entry: CallEntry::Block(entry), .. }) = vm.blocks[call.block.0].instructions.get(call.off)
@@ -5283,8 +5356,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let same = |of: &Subject| *of == Subject::Slot(table) || ctx.holds(table).is_some_and(|upvalue| *of == Subject::Upvalue(upvalue));
                     arg = if ctx.element_of(slot).is_some_and(|of| same(&of)) { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
+                // The running closure's own upvalue, which a guard can read the table of;
+                // through the slot, a kind found out is the upvalue's too (`learn_kind`).
                 CoroutineState::Yielded(YieldOp::Subject(slot)) => {
-                    arg = ResumeArg::Subject(ctx.holds(slot).map_or(Subject::Slot(slot), Subject::Upvalue));
+                    arg = ResumeArg::Subject(match ctx.holds(slot) {
+                        Some(upvalue @ UpvaluePath::Own(_)) => Subject::Upvalue(upvalue),
+                        _ => Subject::Slot(slot),
+                    });
                 },
                 CoroutineState::Yielded(YieldOp::ArrayType(slot, table)) => {
                     let kind = ctx.subject_kind(&table);

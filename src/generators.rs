@@ -1809,9 +1809,10 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
         arg = yield YieldOp::Typeof(src);
         if let ResumeArg::Type(t) = arg.clone() {
             yield YieldOp::ExecWindow(Rc::new(Move::new(&[src, dest])));
-            // TODO: track references? see PyLBBV
             debug!("move {} = {} {:?}", dest, src, t);
             yield YieldOp::SetCTypes(vec![(dest, t)]);
+            // What's known of the value is known of its copy. See Note [Fragile information].
+            yield YieldOp::Effect(Effect::Move { from: src, to: dest });
         } else {
             unreachable!();
         }
