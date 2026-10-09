@@ -217,6 +217,33 @@ impl JitHelper {
     /// The entry of the frame of the innermost inlined call JIT code is in, written as it unwinds
     /// a bailout, from what its code keeps on the native stack at `kept` (as `adopt_inlined` lays
     /// it out). See Note [Inlined calls] in `specialize`.
+    /// Fill the upvalue cells `cells` names, of JIT code `depth` inlined calls deep: each frame's
+    /// upvalue of its closure, the running one for the innermost frame, else the one `kept`
+    /// keeps for it (as `RunState::adopt_inlined` lays them out). The cells are below `rbp`, the
+    /// activation's frame pointer. See Note [Upvalue cells].
+    pub unsafe extern "C" fn fill_cells(state: *mut (), kept: *const u64, rbp: *mut u64, cells: u32, depth: usize) {
+        unsafe {
+            let state = &*(state as *const RunState<'static, 'static>);
+            let owner = crate::forge_owner();
+            let mut cells = cells;
+            while cells != 0 {
+                let cell = cells.trailing_zeros() as usize;
+                cells &= cells - 1;
+                let (frame, upvalue) = (cell / crate::specialize::UPVALUE_CELLS, cell % crate::specialize::UPVALUE_CELLS);
+                if frame > depth {
+                    break;
+                }
+                let clos = match frame == depth {
+                    true => state.clos.clone(),
+                    false => Tc(crate::gc::Gc::from_addr(*kept.add(crate::vm::INLINE_KEPT * (depth - 1 - frame) + 5))),
+                };
+                if upvalue < clos.ro(owner).upvalues.len() {
+                    *rbp.sub(cell_slot(cell)) = state.upvalue_of(owner, &clos, upvalue).bits();
+                }
+            }
+        }
+    }
+
     pub unsafe extern "C" fn unwind_inlined(state: *mut (), kept: *const u64) {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
@@ -578,6 +605,104 @@ impl Stencils {
 
 /// Load the pinned tag's register, r14: on entering a region, and after a
 /// frame op. See Note [Pinned tag] in `window`.
+// Note [Upvalue cells]
+// ~~~~~~~~~~~~~~~~~~~~
+// Code reading an upvalue more than once would reload it each time through its closure and
+// upvalue. Each activation of JIT code keeps the values of upvalues in cells on its native stack
+// instead, below its frame pointer: one per upvalue of each of its frames, its own and each inlined
+// call's, by its inlined depth and index (the first `UPVALUE_CELLS` of each frame's).
+//
+// A cell holds its upvalue's value wherever the context has a fact about the upvalue (`Upvalue`,
+// `Holds`, or a kind of the array it holds): such a fact dies with whatever may change the
+// upvalue, and every path into a version carries its facts. So a cell is filled where such a fact
+// can come from: a load of the upvalue stores what it loads into its cell, a store into the
+// upvalue stores the value into its cell too, and where a fact comes from no load in the
+// activation, the JIT fills the cells the facts are about from the upvalues: where JIT code is
+// entered, for the facts of the block it enters and of each frame it is inlined into, and where an
+// inlined call's frame is entered, for its entry's facts, which a caller's facts about the
+// callee's closure's upvalues become. A load where the context has a fact about the upvalue reads
+// its cell. Interpreted, every load reads the upvalue.
+
+/// What a window op does with an upvalue's cell, besides its body. See Note [Upvalue cells].
+enum CellOp {
+    /// Loads the upvalue's value from its cell in place of its body.
+    Load(usize),
+    /// Stores its only operand, the upvalue's value, into the cell after its body.
+    Store(usize),
+}
+
+/// What `op` does with an upvalue's cell, if anything.
+fn cell_op(op: &dyn Window) -> Option<CellOp> {
+    let cell = |op: &dyn Window| op.captures().get(1).copied().filter(|&cell| cell != crate::generators::NO_CELL as u64).map(|cell| cell as usize);
+    match op.name() {
+        "UpvalCell" => cell(op).map(CellOp::Load),
+        "GetUpval" | "SetUpval" => cell(op).map(CellOp::Store),
+        _ => None,
+    }
+}
+
+/// The words below the frame pointer of an activation's upvalue cell `cell`: past the saved
+/// `rbx`, and above the saved `r13`, which the code after an inlined call finds at the stack's top.
+fn cell_slot(cell: usize) -> usize {
+    2 + cell
+}
+
+/// The displacement from the frame pointer of upvalue cell `cell`.
+fn cell_disp(cell: usize) -> i32 {
+    -((cell_slot(cell) * 8) as i32)
+}
+
+/// Fill the upvalue cells `cells` of JIT code `depth` inlined calls deep, the window's registers
+/// kept, from the frame entries kept at `rsp`. See Note [Upvalue cells].
+fn emit_fill_cells(ops: &mut Assembler, cells: u32, depth: usize) {
+    if cells == 0 {
+        return;
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; sub rsp, 0x40
+        ; vmovq QWORD [rsp], xmm0
+        ; vmovq QWORD [rsp + 0x8], xmm1
+        ; vmovq QWORD [rsp + 0x10], xmm2
+        ; vmovq QWORD [rsp + 0x18], xmm3
+        ; vmovq QWORD [rsp + 0x20], xmm4
+        ; vmovq QWORD [rsp + 0x28], xmm5
+        ; vmovq QWORD [rsp + 0x30], xmm6
+        ; vmovq QWORD [rsp + 0x38], xmm7
+        ; push r15
+        ; push rdi
+        ; push rsi
+        ; push rdx
+        ; push rcx
+        ; push r8
+        ; push r9
+        ; push r11
+        ; mov rdi, r12
+        ; lea rsi, [rsp + 0x80]
+        ; mov rdx, rbp
+        ; mov ecx, cells as i32
+        ; mov r8d, depth as i32
+        ; call extern (JitHelper::fill_cells as *const () as usize)
+        ; pop r11
+        ; pop r9
+        ; pop r8
+        ; pop rcx
+        ; pop rdx
+        ; pop rsi
+        ; pop rdi
+        ; pop r15
+        ; vmovq xmm0, QWORD [rsp]
+        ; vmovq xmm1, QWORD [rsp + 0x8]
+        ; vmovq xmm2, QWORD [rsp + 0x10]
+        ; vmovq xmm3, QWORD [rsp + 0x18]
+        ; vmovq xmm4, QWORD [rsp + 0x20]
+        ; vmovq xmm5, QWORD [rsp + 0x28]
+        ; vmovq xmm6, QWORD [rsp + 0x30]
+        ; vmovq xmm7, QWORD [rsp + 0x38]
+        ; add rsp, 0x40
+    );
+}
+
 fn emit_pin(ops: &mut Assembler) {
     dynasm!(ops
         ; .arch x64
@@ -691,7 +816,7 @@ macro_rules! frame_op {
 /// fixed count of arguments, past which its code nils the frame itself; else the frame op does,
 /// flushing the window. See Note [Inlined calls] in `specialize`.
 fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
-    let &Residual::Inline { a, b, stack } = res else { return None };
+    let &Residual::Inline { a, b, stack, .. } = res else { return None };
     let passed = (b as usize).checked_sub(1)?;
     if (stack as usize).saturating_sub(passed) > INLINE_NILS {
         return None;
@@ -706,7 +831,7 @@ fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
 /// `specialize`.
 fn inline_kills(res: &Residual, offset: usize) -> Slots {
     let mut kills = Slots::default();
-    if let &Residual::Inline { a, b, stack } = res {
+    if let &Residual::Inline { a, b, stack, .. } = res {
         let base = offset + a as usize + 1;
         (base + b as usize - 1..base + stack as usize).for_each(|slot| kills.insert(slot));
     }
@@ -1418,6 +1543,7 @@ impl JitContext {
             ; mov rcx, QWORD ((-4i32 as u64) << 32) as i64
             ; or rax, rcx
             ; pop r13
+            ; add rsp, (crate::specialize::CELLS * 8) as i32
             ; pop rbx
             ; pop rbp
             ; ret
@@ -1531,7 +1657,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; push rbp
             ; mov rbp, rsp
             ; push rbx
-            ; push r13 // save initial base_ptr
+            // The upvalue cells. See Note [Upvalue cells].
+            ; sub rsp, (crate::specialize::CELLS * 8) as i32
+            // The initial base_ptr, where the code after an inlined call takes it back from.
+            ; push r13
         );
         emit_pin(&mut ops);
         // Entered inside inlined calls, the interpreter's entries for them kept as their code
@@ -1547,6 +1676,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; call extern (JitHelper::adopt_inlined as *const () as usize)
             );
         }
+        // The cells the entered block's facts are about. See Note [Upvalue cells].
+        jit_note!(self.jctx, ops, "fill the upvalue cells the entry's facts are about");
+        emit_fill_cells(&mut ops, self.blocks[id.0].cells, depth);
         // TODO: Pin state.vals.as_ptr() to a register, which will let us remove a lot of the
         // JitHelper function calls.
 
@@ -1711,6 +1843,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; =>pool.exits[0]
             ; ->exit_jit:
             ; pop r13
+            ; add rsp, (crate::specialize::CELLS * 8) as i32
             ; pop rbx
             ; pop rbp
             ; ret
@@ -2749,6 +2882,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; .arch x64
                         ; pop r13
+                        ; add rsp, (crate::specialize::CELLS * 8) as i32
                         ; pop rbx
                         ; pop rbp
                         // The callee's base: vals.stack_ptr + base * sizeof(LBoxed)
@@ -2971,7 +3105,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp =>exits[depth.get()]
                     );
                 },
-                Residual::Inline { a, b, stack } => {
+                Residual::Inline { a, b, stack, cells } => {
                     // The callee's frame, moved to by `ShiftFrameFilled`, which keeps no register
                     // but `state`'s and nils the frame; what the frame's entry would hold kept as
                     // `RunState::adopt_inlined` lays it out, the callee's base pointer last, where
@@ -2998,6 +3132,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; add r13, (*a as i32 + 1) * 8
                         ; mov QWORD [rsp], r13
                     );
+                    emit_fill_cells(ops, *cells, depth.get() + 1);
                     depth.set(depth.get() + 1);
                     offset.set(offset_past(res, offset.get()));
                     pool.deepest = pool.deepest.max(depth.get());
@@ -3191,10 +3326,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             window_dump!(self.jctx, "      {}{counted}", emits_line(&emits));
                             for emit in emits {
                                 match emit {
+                                    // A load from an upvalue's cell, into the op's register. See
+                                    // Note [Upvalue cells].
+                                    Emit::Op { skip } if let Some(CellOp::Load(cell)) = cell_op(&**w) => dynasm!(ops
+                                        ; .arch x64
+                                        ; mov Rq(WINDOW_REGS[skip]), QWORD [rbp + cell_disp(cell)]
+                                    ),
                                     Emit::Op { skip } => {
                                         let body = stencils.body(&**w, skip, fall_exit).expect("a usable skip");
                                         splat(ops, &body, w.name(), &w.captures(), pool, other, unalign);
                                         copied = Some(body.aligned);
+                                        // The value loaded from or stored into an upvalue, into
+                                        // its cell too.
+                                        if let Some(CellOp::Store(cell)) = cell_op(&**w) {
+                                            dynasm!(ops
+                                                ; .arch x64
+                                                ; mov QWORD [rbp + cell_disp(cell)], Rq(WINDOW_REGS[skip])
+                                            );
+                                        }
                                     }
                                     emit => emit_window_move(ops, emit, offset.get()),
                                 }
@@ -3217,6 +3366,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; mov rdx, QWORD (vtable as i64)
                                 ; call extern (JitHelper::window_interp as *const () as usize)
                             );
+                            // Its value, from the stack, into the upvalue's cell. See Note
+                            // [Upvalue cells].
+                            if let Some(CellOp::Store(cell)) = cell_op(&**w) {
+                                dynasm!(ops
+                                    ; .arch x64
+                                    ; mov rax, QWORD [r13 + (w.operands()[0] * 8) as i32]
+                                    ; mov QWORD [rbp + cell_disp(cell)], rax
+                                );
+                            }
                         }
                     }
                     match (res, other, copied) {
@@ -3272,7 +3430,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }; break; }
             if shifted.is_some() {
-                let &Residual::Inline { a, b, stack } = call else { unreachable!() };
+                let &Residual::Inline { a, b, stack, cells } = call else { unreachable!() };
                 // The window op keeps r13, the caller's base pointer, and the stack, which the
                 // callee's frame is within, stays where it is.
                 jit_note!(self.jctx, ops, "        enter the callee's frame");
@@ -3281,6 +3439,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ; add r13, (a as i32 + 1) * 8
                     ; mov QWORD [rsp], r13
                 );
+                emit_fill_cells(ops, cells, depth.get() + 1);
                 // Past its arguments, its frame's slots hold nil, the caller's dead temporaries
                 // before.
                 alloc.forget(&inline_kills(call, offset.get()));

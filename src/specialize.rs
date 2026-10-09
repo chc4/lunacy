@@ -74,6 +74,9 @@ pub struct Block {
     /// A version of a pc's context, which jumps to it enter. See Note [Version
     /// compatibility].
     context: Option<Rc<Context>>,
+    /// The upvalue cells holding their upvalue's value whenever the block is entered, by
+    /// `cell` index: every cell where its context isn't known. See Note [Upvalue cells].
+    pub cells: u32,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
     /// Times the interpreter entered the block, shown by `dump`.
@@ -100,6 +103,7 @@ impl Block {
             pc,
             allocates: false,
             context: None,
+            cells: u32::MAX,
             #[cfg(feature = "jit")]
             jit_info: JitInfo::new(),
             #[cfg(feature = "graph")]
@@ -293,6 +297,8 @@ pub enum YieldOp {
     UpvalueKnown(usize), // Resumed with what the context knows of UPVALUE[idx]'s value: Boxed, the
                          // native it holds; else Integer, a stack slot holding it; else Failed.
                          // See Note [Fragile information]
+    UpvalueCell(usize), // Resumed with UPVALUE[idx]'s cell, and whether it holds the value, as
+                        // Cell; else Failed, if it has none. See Note [Upvalue cells]
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
                     // Note [Fragile information]
 
@@ -416,6 +422,8 @@ pub enum ResumeArg {
     /// The end of a call's arguments, and the type its native's window op
     /// assumes they have.
     WindowArgs(usize, CType),
+    /// An upvalue's cell, and whether it holds the upvalue's value. See Note [Upvalue cells].
+    Cell(usize, bool),
 }
 
 // Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
@@ -995,9 +1003,10 @@ pub enum Residual {
     /// continuations].
     Arrived { a: u16, c: u16, returned: u16 },
     LuaGuard { idx: usize, ptr: *const () },
-    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`. See
+    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`, and
+    /// the callee's upvalue cells its entry knows hold their values (Note [Upvalue cells]). See
     /// Note [Inlined calls].
-    Inline { a: u16, b: u16, stack: u8 },
+    Inline { a: u16, b: u16, stack: u8, cells: u32 },
     /// An inlined callee's RETURN A B, which closes its frame's open upvalues if `closes`: its
     /// results to the call's R(A), `call`, if `moves`, and the caller's frame back. See Note
     /// [Inlined calls].
@@ -1120,6 +1129,11 @@ const MAX_INLINE_COST: usize = 48;
 /// The credit for each guard of an inlined callee's code the caller's facts can stand for. See Note
 /// [Inlined calls].
 const REUSED_GUARD_CREDIT: usize = 4;
+/// The upvalues of each frame, from the first, that have a cell. See Note [Upvalue cells].
+pub const UPVALUE_CELLS: usize = 8;
+/// The upvalue cells of a JIT code's activation: its own frame's and each inlined call's.
+pub const CELLS: usize = UPVALUE_CELLS * (MAX_INLINE_DEPTH as usize + 1);
+const _: () = assert!(CELLS <= u32::BITS as usize);
 
 /// Whether calls inline: unless `LUNACY_NO_INLINE` is set, to compare. See Note [Inlined calls].
 fn inlining() -> bool {
@@ -2535,6 +2549,44 @@ impl Context {
         })
     }
 
+    /// How many inlined calls deep the code this is the context of is.
+    fn depth(&self) -> usize {
+        self.inline.as_ref().map_or(0, |frame| frame.depth as usize)
+    }
+
+    /// The cell of the running function's upvalue `upvalue`, if it has one. See Note [Upvalue
+    /// cells].
+    fn upvalue_cell(&self, upvalue: usize) -> Option<usize> {
+        (upvalue < UPVALUE_CELLS).then(|| self.depth() * UPVALUE_CELLS + upvalue)
+    }
+
+    /// Whether a fact is about the running function's upvalue `upvalue`, so that its cell holds
+    /// its value. See Note [Upvalue cells].
+    fn cell_filled(&self, upvalue: usize) -> bool {
+        let own = |path: &UpvaluePath| *path == UpvaluePath::Own(upvalue as u8);
+        self.fragile.iter().any(|fact| match &fact.fragile {
+            Fragile::Holds { upvalue, .. } | Fragile::Upvalue { upvalue, .. } => own(upvalue),
+            Fragile::Kind { table: Subject::Upvalue(upvalue), .. } | Fragile::ElementOf { table: Subject::Upvalue(upvalue), .. } => own(upvalue),
+            _ => false,
+        })
+    }
+
+    /// The cells holding their upvalue's value where this is the context: its own frame's,
+    /// and each caller's it is inlined into. See Note [Upvalue cells].
+    fn filled_cells(&self) -> u32 {
+        let mut cells = 0;
+        let mut ctx = Some(self);
+        while let Some(at) = ctx {
+            for upvalue in 0..UPVALUE_CELLS {
+                if at.cell_filled(upvalue) {
+                    cells |= 1 << at.upvalue_cell(upvalue).unwrap();
+                }
+            }
+            ctx = at.inline.as_ref().map(|frame| &frame.caller);
+        }
+        cells
+    }
+
     /// The type of the running function's upvalue `upvalue`'s value, if known.
     fn upvalue(&self, upvalue: usize) -> Option<&CType> {
         self.fragile.iter().find_map(|fact| match &fact.fragile {
@@ -2961,6 +3013,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ("context", context.as_str().into()),
             ]);
         }
+        self.blocks[block_id.0].cells = ctx.filled_cells();
         self.compile(owner, entry, ctx, block_id);
         return block_id;
     }
@@ -2981,6 +3034,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         // Finish the remainder of the coroutine
         let new_block = self.new_block(pc.0);
+        self.blocks[new_block.0].cells = ctx.filled_cells();
         self.versions.get_mut(&self.proto).unwrap().insert((pc, ctx.clone()), new_block);
         if let Some((succ_next, succ_ty, succ_ret)) = self.compile_one(owner, pc, ctx, coro, arg, new_block) {
             // And continue compiling the block
@@ -4585,11 +4639,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let caller = self.proto;
         self.set_current(callee as LProto<'_, '_>);
         self.versions.entry(self.proto).or_insert_with(|| HashMap::default());
+        // Its frame's cells its entry's facts are about: the JIT fills them as the frame is
+        // entered. See Note [Upvalue cells].
+        let own = (1u32 << UPVALUE_CELLS) - 1;
+        let cells = entry.filled_cells() & own << (entry.depth() * UPVALUE_CELLS);
         let version = self.version(owner, 0, Rc::new(entry));
         self.set_current(caller);
         let shift = self.new_block(self.blocks[block.0].pc);
         let stack = unsafe { (*callee).max_stack };
-        self.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: b as u16, stack }, Residual::Jump(version)]);
+        self.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: b as u16, stack, cells }, Residual::Jump(version)]);
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline", &[
             ("line", _line.into()),
@@ -5407,6 +5465,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         _ => ResumeArg::Failed,
                     };
                 },
+                CoroutineState::Yielded(YieldOp::UpvalueCell(upvalue)) => {
+                    arg = match ctx.upvalue_cell(upvalue) {
+                        Some(cell) => ResumeArg::Cell(cell, ctx.cell_filled(upvalue)),
+                        None => ResumeArg::Failed,
+                    };
+                },
                 CoroutineState::Yielded(YieldOp::LoadUpvalue(slot, upvalue)) => {
                     // See Note [Fragile information].
                     let known = ctx.upvalue(upvalue).cloned();
@@ -5976,7 +6040,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     id = target;
                     off = 0;
                 },
-                &Residual::Inline { a, b, stack } => {
+                &Residual::Inline { a, b, stack, .. } => {
                     off += 1;
                     let callee = state.vals[state.base + a as usize];
                     state.shift_frame::<true>(owner, callee, a as usize, b as usize, stack, true);

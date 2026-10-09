@@ -1830,7 +1830,12 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// The value of the running closure's upvalue `index`.
     #[inline(always)]
     pub fn upvalue(&self, owner: &Owner, index: usize) -> LBoxed<'src, 'intern> {
-        match self.clos.ro(owner).upvalues[index].deref().ro(owner) {
+        self.upvalue_of(owner, &self.clos, index)
+    }
+
+    /// Upvalue `index` of `clos`, the running closure or one of a frame it is inlined into.
+    pub fn upvalue_of(&self, owner: &Owner, clos: &Tc<LClosure<'src, 'intern>>, index: usize) -> LBoxed<'src, 'intern> {
+        match clos.ro(owner).upvalues[index].deref().ro(owner) {
             // The running closure's upvalues were captured by an enclosing function,
             // so an open one is a slot of an enclosing frame, not one of this frame's
             // (which the window may cache).

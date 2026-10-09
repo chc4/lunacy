@@ -1827,14 +1827,44 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
     }
 }
 
+/// No upvalue cell. See Note [Upvalue cells] in `jit`.
+pub const NO_CELL: usize = usize::MAX;
+
+// An upvalue's value, which JIT code also stores into its `cell`, if it has one.
+windowed!(GetUpval, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
+    let _ = cell;
+    let upval = state.upvalue(owner, index);
+    debug!("upval {:?}", &upval);
+    *dest = upval;
+});
+// An upvalue's value, which JIT code loads from its `cell`, holding it. See Note [Upvalue cells]
+// in `jit`.
+windowed!(UpvalCell, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
+    let _ = cell;
+    *dest = state.upvalue(owner, index);
+});
+// A store into an upvalue, which JIT code also stores into its `cell`, if it has one. A closed
+// upvalue is stored out of line.
+windowed!(SetUpval, [index: usize, cell: usize], [], |owner, state, base| (value) {
+    let _ = cell;
+    let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
+    match upval {
+        Upvalue::Open(o) => {
+            debug_assert!(o < state.base, "open upvalue in the running frame");
+            state.vals[o] = value;
+            false
+        },
+        Upvalue::Closed(_) => true,
+    }
+} rejoin {
+    let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
+    let Upvalue::Closed(c) = upval else { unreachable!("an upvalue closed by its store") };
+    set_closed(owner, c, value);
+});
+
 pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        windowed!(GetUpval, [index: usize], [], |owner, state, base| (out dest) {
-            let upval = state.upvalue(owner, index);
-            debug!("upval {:?}", &upval);
-            *dest = upval;
-        });
         // An upvalue the context knows holds a native is that constant, not a
         // read. See Note [Fragile information].
         windowed!(NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
@@ -1871,8 +1901,18 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             ResumeArg::Integer(slot) => {
                 yield YieldOp::ExecWindow(Rc::new(HeldUpval::new(b, &[slot as usize, a])));
             },
-            _ => {
-                yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[a])));
+            // A load from its cell where that holds its value, else a load storing into it.
+            // See Note [Upvalue cells] in `jit`.
+            _ => match yield YieldOp::UpvalueCell(b) {
+                ResumeArg::Cell(cell, true) => {
+                    yield YieldOp::ExecWindow(Rc::new(UpvalCell::new(b, cell, &[a])));
+                },
+                ResumeArg::Cell(cell, false) => {
+                    yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, cell, &[a])));
+                },
+                _ => {
+                    yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, NO_CELL, &[a])));
+                },
             },
         }
         arg = yield YieldOp::LoadUpvalue(a, b);
@@ -1932,23 +1972,11 @@ fn set_closed<'src, 'intern>(owner: &mut Owner, cell: Tc<LBoxed<'src, 'intern>>,
 pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // A closed upvalue is stored out of line.
-        windowed!(SetUpval, [index: usize], [], |owner, state, base| (value) {
-            let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
-            match upval {
-                Upvalue::Open(o) => {
-                    debug_assert!(o < state.base, "open upvalue in the running frame");
-                    state.vals[o] = value;
-                    false
-                },
-                Upvalue::Closed(_) => true,
-            }
-        } rejoin {
-            let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
-            let Upvalue::Closed(c) = upval else { unreachable!("an upvalue closed by its store") };
-            set_closed(owner, c, value);
-        });
-        arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, &[a])));
+        let cell = match yield YieldOp::UpvalueCell(b) {
+            ResumeArg::Cell(cell, _) => cell,
+            _ => NO_CELL,
+        };
+        arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, cell, &[a])));
         yield YieldOp::Effect(Effect::SetUpvalue(b));
         arg
     }
