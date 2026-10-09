@@ -1742,6 +1742,9 @@ pub struct RunState<'src, 'intern> {
     /// the continuation of the call it returned from guards on. See Note [Call
     /// continuations] in `specialize`.
     pub returned: u64,
+    /// Where the last return is, a `PackedLocation`: the exit its call took, which the call's
+    /// continuation measures inlining the callee on. See Note [Inlined calls] in `specialize`.
+    pub returned_at: u64,
     /// Where the caller of the last return from JIT code continues, a
     /// `PackedLocation`, for the run loop: the return itself leaves the code
     /// with `returned`.
@@ -2714,6 +2717,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 top,
                 cold_site: core::ptr::null(),
                 returned: 0,
+                returned_at: 0,
                 resume: 0,
                 witness_base,
                 witness_top: 0,

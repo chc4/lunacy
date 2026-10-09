@@ -811,6 +811,7 @@ windowed!(frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, 
 // `CLOSES`, returning from a vararg function if `VARARG`. A return from a frame JIT code called
 // is the op; one from a frame with an entry, or the outermost, its cold path. See Note [Frame ops].
 windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+    state.returned_at = at;
     if state.jit_depth > 0 {
         let _ = state.leave::<false>(owner, A.lift(a), B.lift(b), CLOSES, VARARG);
         // See Note [Call continuations].
@@ -1073,9 +1074,10 @@ pub enum CallEntry {
 // never inlines; `LUNACY_NO_INLINE` turns inlining off, to compare.
 //
 // Whether a call inlines is measured on the callee's code as the call ran it, not its bytecode:
-// the continuation knows what the return was, so the code an inlined call would run is likely the
-// callee's code from the version the call entered that reaches a return of that, as far as it is
-// compiled, with the calls inlined into it. Code that loops there doesn't inline. Its cost is its
+// the continuation runs just after the return, which says where it was (`RunState::returned_at`),
+// so the code an inlined call would run is likely the callee's code from the version the call
+// entered that reaches that exit, back from it, as far as it is compiled, with the calls inlined
+// into it: one exit's, not every version's of the callee returning the same types. Code that loops there doesn't inline. Its cost is its
 // residuals that do work, less a credit for each guard the caller's facts can stand for once the
 // callee runs in the caller's context: a guard of a value loaded from an upvalue (Note [Upvalue
 // paths]), and a hash key's guard. A call inlines if what is left is within `MAX_INLINE_COST`.
@@ -4345,9 +4347,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// What inlining the callee entered at its version `entry` would cost, as its first call ran it,
-    /// returning `id`: its code from `entry` that reaches a return of `id`, as far as it is compiled,
-    /// or `None` if that code loops, or none of it from `entry` does. See Note [Inlined calls].
-    fn inline_cost(&self, owner: &Owner, entry: BlockId, id: u32, callee: LProto<'static, 'static>) -> Option<InlineCost> {
+    /// returning from block `exit`: its code from `entry` that reaches `exit`, as far as it is
+    /// compiled, or `None` if that code loops, or none of it from `entry` does. See Note [Inlined
+    /// calls].
+    fn inline_cost(&self, owner: &Owner, entry: BlockId, exit: BlockId, callee: LProto<'static, 'static>) -> Option<InlineCost> {
         type Blocks = std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>;
         // The blocks code goes on to within the callee's, its calls of other functions apart: all
         // of each block's code, as the call ran it, a rebuild's cut in it or not.
@@ -4368,9 +4371,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 work.extend(flow(block));
             }
         }
-        // Those that reach a return of `id`.
-        let returns = |block: BlockId| self.blocks[block.0].instructions.iter().any(|res| matches!(res, Residual::Ret(_, _, _, _, _, returns, _) if *returns == id));
-        let mut path: Blocks = reached.iter().copied().filter(|&block| returns(block)).collect();
+        // Those that reach the exit the call took, back from it.
+        let mut path: Blocks = reached.iter().copied().filter(|&block| block == exit).collect();
         loop {
             let more: Vec<BlockId> = reached.iter().copied().filter(|block| !path.contains(block) && flow(*block).iter().any(|target| path.contains(target))).collect();
             if more.is_empty() {
@@ -4525,7 +4527,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 && let Some(&Residual::LuaCall { entry: CallEntry::Block(entry), .. }) = vm.blocks[call.block.0].instructions.get(call.off)
                 && inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee }, a)
                 && state.returned & !0xffff_ffff == crate::vm::RETURNED
-                && vm.inline_cost(owner, entry, (state.returned & UNKNOWN_RETURN as u64) as u32, call.callee).is_some_and(InlineCost::inlines)
+                && vm.inline_cost(owner, entry, Location::unpack(crate::vm::PackedLocation::from_bits(state.returned_at as usize)).0, call.callee).is_some_and(InlineCost::inlines)
             {
                 let entry = Self::inline_frame(&call.calling, call.callee, &ctx, &captured, vm.proto as LProto<'static, 'static>, pc, a, call.b, c);
                 let mut decided = entry.clone();
@@ -5878,6 +5880,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 &Residual::Ret(_, a, b, closes, vararg, returns, effects) => {
                     debug!("spec final blocks: {:?}", self.blocks);
+                    state.returned_at = Location(id, off).pack().bits() as u64;
                     match state.leave::<true>(owner, a as usize, b as usize, closes, vararg) {
                         // The interpreter runs no frame JIT code called: each has its entry.
                         Ok(None) => unreachable!("a return from a frame with no entry in the interpreter"),
