@@ -3108,6 +3108,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut origins: Vec<Origin> = Vec::new();
         let mut conflicting: SmallVec<[(u8, usize); 2]> = SmallVec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
+        // Each duplicate's context, and whether it was one for a constant's slot of another type.
+        #[cfg(feature = "tracing")]
+        let mut _their: Vec<String> = Vec::new();
         for ((epc, ectx), _block) in self.versions.get(&proto).unwrap() {
             if *epc != pc || !ectx.same_point(&ctx) {
                 continue;
@@ -3124,6 +3127,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     continue;
                 }
                 _duplicates.push(_block.0);
+                #[cfg(feature = "tracing")]
+                _their.push(format!("{} retyped: {}", _block.0, ectx.tostring(owner)));
                 for origin in found {
                     if !origins.iter().any(|known| Rc::ptr_eq(known, &origin)) {
                         origins.push(origin);
@@ -3146,6 +3151,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 continue;
             }
             _duplicates.push(_block.0);
+            #[cfg(feature = "tracing")]
+            _their.push(format!("{} unused: {}", _block.0, ectx.tostring(owner)));
             for key in mine {
                 if !conflicting.contains(&key) {
                     conflicting.push(key);
@@ -3168,6 +3175,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ("duplicates", Self::ids(_duplicates.iter().copied()).as_str().into()),
                     ("origins", Self::ids(origins.iter().map(|origin| owner.ro(origin).block.0)).as_str().into()),
                     ("context", context.as_str().into()),
+                    ("theirs", _their.join(" | ").as_str().into()),
                 ]);
             }
             self.contractions.push((proto, origins, ResumeArg::Failed));

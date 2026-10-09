@@ -29,10 +29,12 @@ The specializer's are also views, one column per argument:
   alloc_op(trace, step, name, before, worth, skip, emits, after)
       each window op planned: the window before it and its values' worth, its
       SKIP, what it emits (stores, loads, moves), and the window after.
-  contractible(ts, line, pc, duplicates, origins, context)
+  contractible(ts, line, pc, duplicates, origins, context, theirs)
       each version about to be compiled at `pc` for `context` while versions
-      (`duplicates`) differ from it only in facts no code relied on: the
-      blocks introducing those facts are queued for contraction.
+      (`duplicates`) differ from it only in facts no code relied on, or in a
+      constant's slot holding another type: the blocks introducing those
+      facts are queued for contraction. `theirs` is each duplicate's context,
+      after which of the two it was (`unused`, `retyped`).
   contract(ts, line, origins, how, offsets, forgotten)
       each contraction: the blocks rebuilt from where they introduced the
       facts (at those residual offsets), how (`drop`, without the facts,
@@ -93,7 +95,7 @@ VIEWS = {
     'alloc_step': ['trace', 'step', 'line', 'block', 'pc', 'off'],
     'alloc_start': ['trace', 'step', 'rise', 'arrives', 'worth', 'entry'],
     'alloc_op': ['trace', 'step', 'name', 'before', 'worth', 'skip', 'emits', 'after'],
-    'contractible': ['line', 'pc', 'duplicates', 'origins', 'context'],
+    'contractible': ['line', 'pc', 'duplicates', 'origins', 'context', 'theirs'],
     'contract': ['line', 'origins', 'how', 'offsets', 'forgotten'],
     'contract_deferred': ['line', 'origins', 'at'],
     'contract_refused': ['line', 'origins', 'how', 'reason'],
