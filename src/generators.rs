@@ -401,7 +401,8 @@ crate::window::windowed!(guard InArrayHeldK, [k: i32], [], |owner, state, base| 
 
 /// R(A) := R(B)[RK(C)] for any table, userdata or string and key, through
 /// `gettable`; a string's from the strings' table. See Note [String methods] in
-/// `specialize`.
+/// `specialize`. It writes only R(A): it follows `__index` through tables, running
+/// no Lua code.
 fn gettable(a: usize, b: usize, c: usize) -> ResidualExec {
     ResidualExec::new("gettable", Rc::new(move |owner, state| {
         let kc: Cow<'_, LValue<'_, '_>> = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
@@ -418,7 +419,7 @@ fn gettable(a: usize, b: usize, c: usize) -> ResidualExec {
             },
             _ => LBoxed::box_lvalue(val_b.gettable(owner, kc, state.intern)),
         };
-    }))
+    })).writing(&[a])
 }
 
 pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
