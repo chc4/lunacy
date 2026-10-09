@@ -67,6 +67,14 @@ The specializer's are also views, one column per argument:
       a call in the function at `line` inlined, its continuation at pc `after`,
       of the function defined at `callee`: the call's block, the block moving
       to the callee's frame, and the callee's entry block and its context.
+  inline_cost(ts, line, callee, entry, blocks, cost, reused, inlines, why)
+      each call a continuation measures for inlining: the function at
+      `line`'s call of the function defined at `callee`, whose version
+      `entry` the call ran, the blocks of it reaching the return the call
+      took, what they cost and how many of their guards inlining lets the
+      caller's facts stand for, and whether it inlines; `why` is
+      `measured`, or why it wasn't: its code to the return `loops`, or none
+      of it from `entry` is compiled as it ran (`unmeasured`).
   inline_return(ts, line, callee, after, block, context)
       the code after an inlined call, of the function at `line` at pc `after`,
       for a return in the inlined callee's code: its block and context.
@@ -95,6 +103,7 @@ VIEWS = {
     'evicted': ['line', 'pc', 'blocks'],
     'inline': ['line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
     'inline_return': ['line', 'callee', 'after', 'block', 'context'],
+    'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'inlines', 'why'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
@@ -102,7 +111,8 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'contract_deferred': ('spec', 'contract_deferred'), 'contract_refused': ('spec', 'contract_refused'),
           'unreachable': ('spec', 'unreachable'), 'encoding': ('spec', 'encoding'),
           'narrow': ('spec', 'narrow'), 'evicted': ('spec', 'evicted'),
-          'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return')}
+          'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return'),
+          'inline_cost': ('spec', 'inline_cost')}
 
 
 def connect(trace):

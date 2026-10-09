@@ -1050,8 +1050,16 @@ pub enum CallEntry {
 //
 // The callee's code is its versions for the inlined call, which their contexts carry
 // (`InlineFrame`), apart from its versions for its calls and for other inlined calls. Calls in
-// inlined code inline in turn, to `MAX_INLINE_DEPTH` deep. A callee inlines if it is small, with no
-// loop, tail call or VARARG; `LUNACY_NO_INLINE` turns inlining off, to compare.
+// inlined code inline in turn, to `MAX_INLINE_DEPTH` deep. A callee with a tail call or VARARG
+// never inlines; `LUNACY_NO_INLINE` turns inlining off, to compare.
+//
+// Whether a call inlines is measured on the callee's code as the call ran it, not its bytecode:
+// the continuation knows what the return was, so the code an inlined call would run is likely the
+// callee's code from the version the call entered that reaches a return of that, as far as it is
+// compiled, with the calls inlined into it. Code that loops there doesn't inline. Its cost is its
+// residuals that do work, less a credit for each guard the caller's facts can stand for once the
+// callee runs in the caller's context: a guard of a value loaded from an upvalue (Note [Upvalue
+// paths]), and a hash key's guard. A call inlines if what is left is within `MAX_INLINE_COST`.
 
 /// An inlined call, for its callee's code: the caller's context before the call, its captured
 /// slots below the call, and its prototype; the pc after the call, its A and C; what the callee's
@@ -1085,8 +1093,11 @@ struct InlineCall {
 
 /// How many inlined calls deep code can be. See Note [Inlined calls].
 pub(crate) const MAX_INLINE_DEPTH: u8 = 2;
-/// The most instructions a callee inlined has. See Note [Inlined calls].
-const MAX_INLINE_SIZE: usize = 32;
+/// The most an inlined callee's code costs, less its credit. See Note [Inlined calls].
+const MAX_INLINE_COST: usize = 48;
+/// The credit for each guard of an inlined callee's code the caller's facts can stand for. See Note
+/// [Inlined calls].
+const REUSED_GUARD_CREDIT: usize = 4;
 
 /// Whether calls inline: unless `LUNACY_NO_INLINE` is set, to compare. See Note [Inlined calls].
 fn inlining() -> bool {
@@ -1110,21 +1121,28 @@ fn inline_offset(ctx: &Context) -> usize {
 /// window names them (`Slots`). See Note [Inlined calls].
 const MAX_INLINE_SLOTS: usize = 256;
 
-/// Whether a call of R(A) in `caller`, of the context `calling`, inlines `callee`. See Note
-/// [Inlined calls].
+/// Whether a call of R(A) in `caller`, of the context `calling`, can inline `callee`, whatever its
+/// code costs. See Note [Inlined calls].
 fn inlines<C>(calling: &Context, caller: &crate::chunk::FunctionBlock<'_, C>, callee: &crate::chunk::FunctionBlock<'_, C>, a: usize) -> bool {
-    let code = &callee.instructions.items;
     inlining()
         && calling.inline.as_ref().map_or(0, |frame| frame.depth) < MAX_INLINE_DEPTH
         && inline_offset(calling) + a + 1 + callee.max_stack as usize <= MAX_INLINE_SLOTS
         && callee.is_vararg == 0
         && !core::ptr::eq(caller, callee)
-        && code.len() <= MAX_INLINE_SIZE
-        && code.iter().all(|inst| match inst.0.Opcode() {
-            Opcode::TAILCALL | Opcode::VARARG | Opcode::FORPREP | Opcode::FORLOOP | Opcode::TFORLOOP => false,
-            Opcode::JMP => crate::vm::sBx::unpack(inst.0) >= 0,
-            _ => true,
-        })
+        && callee.instructions.items.iter().all(|inst| !matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::VARARG))
+}
+
+/// What an inlined callee's code costs and its credit. See Note [Inlined calls].
+#[derive(Debug, Clone, Copy)]
+struct InlineCost {
+    cost: usize,
+    reused: usize,
+}
+
+impl InlineCost {
+    fn inlines(self) -> bool {
+        self.cost <= MAX_INLINE_COST + REUSED_GUARD_CREDIT * self.reused
+    }
 }
 
 /// The context an inlined call in `caller`, of R(A) with operand B, enters the callee `proto`
@@ -4083,6 +4101,112 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
+    /// What inlining the callee entered at its version `entry` would cost, as its first call ran it,
+    /// returning `id`: its code from `entry` that reaches a return of `id`, as far as it is compiled,
+    /// or `None` if that code loops, or none of it from `entry` does. See Note [Inlined calls].
+    fn inline_cost(&self, owner: &Owner, entry: BlockId, id: u32, callee: LProto<'static, 'static>) -> Option<InlineCost> {
+        type Blocks = std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>;
+        // The blocks code goes on to within the callee's, its calls of other functions apart: all
+        // of each block's code, as the call ran it, a rebuild's cut in it or not.
+        let flow = |block: BlockId| -> SmallVec<[BlockId; 4]> {
+            self.blocks[block.0].instructions.iter().flat_map(|res| -> SmallVec<[BlockId; 2]> {
+                match res {
+                    Residual::Jump(target) => smallvec::smallvec![*target],
+                    Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
+                    Residual::Select(targets) => targets.iter().map(|(_, target)| *target).collect(),
+                    _ => SmallVec::new(),
+                }
+            }).collect()
+        };
+        let mut reached = Blocks::default();
+        let mut work = vec![entry];
+        while let Some(block) = work.pop() {
+            if reached.insert(block) {
+                work.extend(flow(block));
+            }
+        }
+        // Those that reach a return of `id`.
+        let returns = |block: BlockId| self.blocks[block.0].instructions.iter().any(|res| matches!(res, Residual::Ret(_, _, _, _, _, returns, _) if *returns == id));
+        let mut path: Blocks = reached.iter().copied().filter(|&block| returns(block)).collect();
+        loop {
+            let more: Vec<BlockId> = reached.iter().copied().filter(|block| !path.contains(block) && flow(*block).iter().any(|target| path.contains(target))).collect();
+            if more.is_empty() {
+                break;
+            }
+            path.extend(more);
+        }
+        // A cycle among them is a loop.
+        let mut done = Blocks::default();
+        let mut active = Blocks::default();
+        fn cycles(block: BlockId, path: &Blocks, flow: &dyn Fn(BlockId) -> SmallVec<[BlockId; 4]>, done: &mut Blocks, active: &mut Blocks) -> bool {
+            if done.contains(&block) {
+                return false;
+            }
+            if !active.insert(block) {
+                return true;
+            }
+            let found = flow(block).into_iter().filter(|target| path.contains(target)).any(|target| cycles(target, path, flow, done, active));
+            active.remove(&block);
+            done.insert(block);
+            found
+        }
+        // The decision, for the trace: what it measured, or why it didn't.
+        #[cfg(feature = "tracing")]
+        let traced = |why: &str, measured: Option<InlineCost>| crate::tracing::instant("spec", "inline_cost", &[
+            ("line", self.traced_line(owner).into()),
+            ("callee", (unsafe { (*callee).line_defined } as u64).into()),
+            ("entry", entry.0.into()),
+            ("blocks", path.len().into()),
+            ("cost", measured.map_or(0, |m| m.cost).into()),
+            ("reused", measured.map_or(0, |m| m.reused).into()),
+            ("inlines", u64::from(measured.is_some_and(InlineCost::inlines)).into()),
+            ("why", why.into()),
+        ]);
+        // With none from the entry, what the call ran isn't compiled as it ran: not measured, it
+        // doesn't inline.
+        if !path.contains(&entry) {
+            #[cfg(feature = "tracing")]
+            traced("unmeasured", None);
+            return None;
+        }
+        if cycles(entry, &path, &flow, &mut done, &mut active) {
+            #[cfg(feature = "tracing")]
+            traced("loops", None);
+            return None;
+        }
+        let mut measured = InlineCost { cost: 0, reused: 0 };
+        for &block in &path {
+            // The slots the block loaded from upvalues, still holding what they loaded.
+            let mut upvalued: SmallVec<[usize; 4]> = SmallVec::new();
+            for res in &self.blocks[block.0].instructions {
+                measured.cost += match res {
+                    Residual::Jump(_) | Residual::Branch { .. } | Residual::Select(_) | Residual::Thunk(_) | Residual::Ret(..)
+                        | Residual::ReturnedFrom(_) | Residual::Arrive { .. } | Residual::Arrived { .. } | Residual::GC => 0,
+                    _ => 1,
+                };
+                match res {
+                    Residual::ExecWindow(w) => {
+                        let written = w.operands().iter().zip(w.accesses()).filter(|(_, access)| access.writes()).map(|(&slot, _)| slot);
+                        let loads = matches!(w.name(), "GetUpval" | "HeldUpval" | "NativeUpval");
+                        for slot in written {
+                            upvalued.retain(|held| *held != slot);
+                            if loads {
+                                upvalued.push(slot);
+                            }
+                        }
+                    }
+                    Residual::Guard { idx, .. } | Residual::NativeGuard { idx, .. } | Residual::LuaGuard { idx, .. } if upvalued.contains(idx) => measured.reused += 1,
+                    Residual::GuardWitness { .. } | Residual::HashGuard { .. } | Residual::EpochCheck { .. } => measured.reused += 1,
+                    _ => {}
+                }
+            }
+        }
+        #[cfg(feature = "tracing")]
+        traced("measured", Some(measured));
+        let _ = (owner, callee);
+        Some(measured)
+    }
+
     /// The entry context of the inlined call of R(A) with B and C in `calling`, of `callee`, by the
     /// function `proto`, which continues at `after` from `caller`, the context before the call
     /// less the callee's frame (`captured` its slots below the call its closures captured). See
@@ -4155,8 +4279,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // from its frame, continues as any other. See Note [Inlined calls].
             if let Some(call) = &inline
                 && !vm.compiled(call.block)
-                && matches!(vm.blocks[call.block.0].instructions.get(call.off), Some(Residual::LuaCall { .. }))
+                && let Some(&Residual::LuaCall { entry: CallEntry::Block(entry), .. }) = vm.blocks[call.block.0].instructions.get(call.off)
                 && inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee }, a)
+                && state.returned & !0xffff_ffff == crate::vm::RETURNED
+                && vm.inline_cost(owner, entry, (state.returned & UNKNOWN_RETURN as u64) as u32, call.callee).is_some_and(InlineCost::inlines)
             {
                 let entry = Self::inline_frame(&call.calling, call.callee, &ctx, &captured, vm.proto as LProto<'static, 'static>, pc, a, call.b, c);
                 let mut decided = entry.clone();
