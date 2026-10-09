@@ -290,6 +290,14 @@ _lua55c benchmark:
 # bundle, then a call of its `run_iter` with the count Luau is given (`-a`).
 # Luau has no dofile, and runs each file with its own globals, so it can't run
 # the benchmark as bench.lua does for the other Luas.
+# tcvm's copy of a benchmark, as `_luac`, in working/<benchmark>.tcvm.lua: the Lua
+# 5.5 bundle, calling `run_iter` with the count tcvm's command line gives (`arg`).
+_tcvmc benchmark:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p working
+    { python3 tools/bundle_bench.py {{benchmark}}; printf '\nrun_iter(tonumber(arg[1]))\n'; } > working/{{benchmark}}.tcvm.lua
+
 _luauc benchmark:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -528,15 +536,17 @@ hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
     just _luajitc {{benchmark}}
     just _lua55c {{benchmark}}
     just _luauc {{benchmark}}
+    just _tcvmc {{benchmark}}
     {{SHARED}} cargo build --release --bin bench
-    # A command failing (lua5.1, lua5.5 and Luau lack the bit library) is timed,
-    # and left out of the history for its exit code.
+    # A command failing (lua5.1, lua5.5, Luau and tcvm lack the bit library) is
+    # timed, and left out of the history for its exit code.
     {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
         -n lua5.1 "lua5.1 bench.lua -- working/{{benchmark}}.bin {{times}}" \
         -n lua5.5 "lua5.5 bench.lua -- working/{{benchmark}}.lua55.bin {{times}}" \
         -n luau "luau -O2 working/{{benchmark}}.luau -a {{times}}" \
         -n "luau --codegen" "luau -O2 --codegen working/{{benchmark}}.luau -a {{times}}" \
+        -n tcvm "tcvm --file working/{{benchmark}}.tcvm.lua {{times}}" \
         -n "luajit -joff" "luajit -joff bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
         -n luajit "luajit bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
         -n interpreter "./target/interpreter/release/bench working/{{benchmark}}.bin {{times}}" \
@@ -637,7 +647,7 @@ bench-blockers:
 # working/bars.html (tools/bench_bars.py): `builds`, the implementations, in bar
 # order, and `clamp`, those whose bars don't set a row's scale past 1.5 times
 # the rest's highest (comma separated).
-bench-bars builds='lua5.1,lua5.5,luau,luau --codegen,luajit -joff,luajit,interpreter,release,unsafe' clamp='lua5.1,lua5.5,interpreter' per_row='5':
+bench-bars builds='lua5.1,lua5.5,luau,luau --codegen,tcvm,luajit -joff,luajit,interpreter,release,unsafe' clamp='lua5.1,lua5.5,interpreter' per_row='5':
     python3 tools/bench_bars.py --builds "{{builds}}" --clamp "{{clamp}}" --per-row {{per_row}}
 # Hardware counters (`perf stat`) for this checkout's build of `profile`
 # (`release` or `unsafe`) and revision `ref`'s (built as `_build-vs` builds

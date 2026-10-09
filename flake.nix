@@ -60,6 +60,30 @@
           propagatedBuildInputs = [ pkgs.python3Packages.protobuf ];
         };
 
+        # tcvm, a Lua VM in Rust, which `just hyperfine-full` compares against: its
+        # `ljr-prototype-2` branch at a pinned commit, built with the nightly it pins
+        # (its rust-toolchain.toml), whose features ours has moved past. Its CLI is
+        # `tcvm` here.
+        tcvmToolchain = (fenix.packages.${system}.toolchainOf {
+          channel = "nightly";
+          date = "2026-04-05";
+          sha256 = "sha256-0Voayvkfg3iryLFFLeM2K3rG5OOl58lSoKSpn7bAZYY=";
+        }).withComponents [ "cargo" "rustc" "rust-std" ];
+        tcvm = (pkgs.makeRustPlatform { cargo = tcvmToolchain; rustc = tcvmToolchain; }).buildRustPackage rec {
+          pname = "tcvm";
+          version = "ljr-prototype-2-8428fbb";
+          src = pkgs.fetchFromGitHub {
+            owner = "xacrimon";
+            repo = "tcvm";
+            rev = "8428fbbc677834234871f6eba2a01970ec56c8a5";
+            sha256 = "sha256-Ve2+iDDDAL3M+Bs9oiRWcaLOv0FAPf8lmNLh02rRMCE=";
+          };
+          cargoLock.lockFile = "${src}/Cargo.lock";
+          cargoBuildFlags = [ "-p" "tcvm-cli" ];
+          doCheck = false;
+          postInstall = "mv $out/bin/tcvm-cli $out/bin/tcvm";
+        };
+
         luaVersioned = pkgs.runCommand "lua5.1-versioned" { } ''
           mkdir -p $out/bin
           ln -s ${pkgs.lua5_1}/bin/lua  $out/bin/lua5.1
@@ -78,6 +102,7 @@
             pkgs.hyperfine    # used by the `just hyperfine*` recipes
             pkgs.luajit       # the reference JIT `just hyperfine` compares against
             pkgs.luau         # Luau, which `just hyperfine-full` compares against
+            tcvm              # tcvm, which `just hyperfine-full` compares against
             pkgs.graphviz     # `dot`, which the `graph` feature renders block graphs with
             # tools/*.py, and `perfetto` for traces (`just trace*`)
             (pkgs.python3.withPackages (ps: [ perfettoPython ]))

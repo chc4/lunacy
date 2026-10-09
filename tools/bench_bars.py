@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The latest benchmark times as a grouped bar chart, as compiler papers draw
 them: a group of bars per benchmark, one per implementation (lua5.1, lua5.5,
-Luau without and with its code generator (--codegen), LuaJIT without and with
+Luau without and with its code generator (--codegen), tcvm, LuaJIT without and with
 its JIT, and this project's interpreter, release and unsafe builds), on a linear
 axis of seconds, in rows of `--per-row` benchmarks, each row on its own axis.
 
@@ -23,9 +23,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_history import box, series, ordered, COLORS  # noqa: E402
 
-ORDER = ['lua5.1', 'lua5.5', 'luau', 'luau --codegen', 'luajit -joff', 'luajit', 'interpreter', 'release', 'unsafe']
+ORDER = ['lua5.1', 'lua5.5', 'luau', 'luau --codegen', 'tcvm', 'luajit -joff', 'luajit', 'interpreter', 'release', 'unsafe']
 LABELS = {'luajit -joff': 'LuaJIT (interpreter)', 'luajit': 'LuaJIT', 'lua5.1': 'Lua 5.1', 'lua5.5': 'Lua 5.5',
-          'luau': 'Luau', 'luau --codegen': 'Luau (codegen)',
+          'luau': 'Luau', 'luau --codegen': 'Luau (codegen)', 'tcvm': 'tcvm',
           'interpreter': 'lunacy interpreter', 'release': 'lunacy release', 'unsafe': 'lunacy unsafe'}
 
 
