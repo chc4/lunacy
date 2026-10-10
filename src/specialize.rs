@@ -1291,6 +1291,9 @@ impl CType {
             (a, b) if a == b => true,
             (CType::Unknown, _) => true,
             (CType::Number, CType::Type(LType::Integer | LType::Double)) => true,
+            // A shape is above one with more hash keys: code knowing fewer of a table's keys is
+            // correct where more are known, the context's hash keys accepting index by index.
+            (CType::Shape(a, mine), CType::Shape(b, theirs)) => a == b && mine.iter().all(|href| theirs.contains(href)),
             // A shape or a function's identity is below its table or closure.
             (CType::Type(a), b) => b.as_ltype() == Some(*a),
             _ => false,
@@ -1459,6 +1462,15 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 //
 // A field's type is only ever a representation: a shape or a function's identity
 // describes a register, not a field.
+//
+// A field's hash key on a slot has the same index on every path through the
+// function's code whose witnesses it uses, and an inlined callee's on a table it
+// was passed its caller's slot's: the index the first hash key for that field and
+// slot was given. So paths learning the same fields in another order, as code
+// runs before and after its calls are inlined, reach the same contexts, and a
+// context knowing some of them reaches the versions compiled knowing fewer (Note
+// [Version compatibility]). A path finding something else at that index gives the
+// field a free one instead.
 
 // Note [Table metatables]
 // ~~~~~~~~~~~~~~~~~~~~~~~
@@ -1733,9 +1745,12 @@ fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected
 //   Unknown  >  Number  >  Integer or Double
 //   Unknown  >  each other LType,  Table > a shape,  Closure > a known function
 //
-// (a shape accepts only itself). A version for a table in a slot is correct for
-// a shape there: the jump's hash keys on it are extra keys the version doesn't
-// know, as below. The join relies on this, widening shapes to tables.
+// (and a shape is above one with more hash keys). A version for a table in a slot
+// is correct for a shape there, and one for a shape for a shape with more hash
+// keys: the jump's hash keys on it past the version's are extra keys the version
+// doesn't know, as below. The join relies on this, widening shapes to tables. So
+// a caller learning a new field of a table, as an inlined callee's hash keys come
+// back to it, reaches the versions compiled knowing fewer of its fields.
 //
 // Hash keys are compared index by index, since the version's blocks read
 // witnesses at those indexes. At each index the version's hash key must be the
@@ -2970,6 +2985,10 @@ pub struct Specializer<'src, 'intern> {
     inlined: HashMap<(LProto<'src, 'intern>, SubPc, LProto<'src, 'intern>), Vec<Context>, rustc_hash::FxBuildHasher>,
     /// Each promote's values that have versions, by its function and pc. See Note [Green values].
     promoted: HashMap<(LProto<'src, 'intern>, Pc), std::collections::HashSet<i32, rustc_hash::FxBuildHasher>, rustc_hash::FxBuildHasher>,
+    /// The index of each field's hash key on each slot of the code of each function its
+    /// witnesses are of, and the indexes each function has given. See Note [Field types].
+    key_indexes: HashMap<(LProto<'src, 'intern>, usize, usize, Vec<u8>), u8, rustc_hash::FxBuildHasher>,
+    next_key_index: HashMap<LProto<'src, 'intern>, u8, rustc_hash::FxBuildHasher>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -3005,12 +3024,52 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             rebuilt: Default::default(),
             decided: Default::default(),
             promoted: Default::default(),
+            key_indexes: Default::default(),
+            next_key_index: Default::default(),
             inlined: Default::default(),
             unreachable: Default::default(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             proto,
         }
+    }
+
+    /// The index of field `key`'s hash key on slot `place` where `ctx` is the context, the same
+    /// for every path through the code of the function whose witnesses it uses (the one inlined
+    /// calls are inlined into): given the first time, from the function's next. A parameter still
+    /// holding the table it was passed has its caller's slot's. See Note [Field types].
+    fn key_index(&mut self, ctx: &Context, place: usize, key: &LConstant<'_, '_>) -> Option<usize> {
+        let crate::chunk::Constant::String(name) = key else { return None };
+        let root = {
+            let mut frame = ctx.inline.as_ref();
+            let mut root = self.proto;
+            while let Some(f) = frame {
+                root = f.proto as LProto<'src, 'intern>;
+                frame = f.caller.inline.as_ref();
+            }
+            root
+        };
+        // The slot the key is named by is chosen so that hash keys are confluent: contexts
+        // reaching the same point have each field's key at the same index whether the code that
+        // learned it was inlined or not. A callee's key on a table it was passed is named by the
+        // caller's slot holding it, so it gets the index the caller's own code would give it, and
+        // is the caller's key at that index when it comes back on the return.
+        let (depth, slot) = match ctx.fragile.iter().find_map(|fact| match fact.fragile {
+            Fragile::Passed { slot, owner } if slot == place => Some(owner),
+            _ => None,
+        }) {
+            Some(owner) => (ctx.depth() - 1, owner),
+            None => (ctx.depth(), place),
+        };
+        let entry = (root, depth, slot, name.as_bytes().to_vec());
+        if let Some(&index) = self.key_indexes.get(&entry) {
+            return Some(index as usize);
+        }
+        let next = self.next_key_index.entry(root).or_insert(0);
+        let index = *next;
+        *next = next.checked_add(1)?;
+        self.key_indexes.insert(entry, index);
+        Some(index as usize)
     }
 
     /// The id of a return of `results`, the same for every return of them. See
@@ -5289,10 +5348,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // captured by the generator: we only ever store the generator in the
                     // LClosure they came from, which is 'src 'lifetime, and so this is safe.
                     let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
-                    // Try to find an orphaned HashKey slot to re-use
+                    // At the field's index for its slot, which every path through the code
+                    // gives it, if no other hash key is there; else at a free one, or a new one.
+                    // See Note [Field types].
                     let href;
+                    let fixed = self.key_index(&ctx, place, k_val);
                     let orphan = ctx.hkeys.iter().enumerate().position(|(_, hkey)| hkey.orphan());
-                    if let Some(i) = orphan {
+                    if let Some(i) = fixed.filter(|&i| ctx.hkeys.get(i).is_none_or(|hkey| hkey.orphan())) {
+                        href = HashRef(i as u8);
+                        let ctx = Rc::make_mut(&mut ctx);
+                        while ctx.hkeys.len() <= i {
+                            ctx.hkeys.push(HashKey { idx: OUTER, ..HashKey::new(OUTER, k_val.clone()) });
+                        }
+                        ctx.hkeys[i] = HashKey::new(place, k_val.clone());
+                    } else if let Some(i) = orphan {
                         href = HashRef(i as u8);
                         Rc::make_mut(&mut ctx).hkeys[i] = HashKey::new(place, k_val.clone());
                     } else {
