@@ -1599,10 +1599,11 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // that runs (the code running, a frame returning, a handler, a rebuilt block) reaches them. JIT code is entered only
 // as its block is, so it keeps alive only what it reaches when its block is reached. Versions are
 // no roots, as only code that runs finds one again: versions reaching each other, as a caller's and
-// the callee's it calls, are reached or not together. The unreachable ones are forgotten, as a
-// contraction's are, once their point has all the versions it can have and needs the room: until
-// then a path reaching one again, as a thunk forced into code that finds it, takes it as it is,
-// with its JIT code. While code is
+// the callee's it calls, are reached or not together. An unreachable one is forgotten, as a
+// contraction's are, once its point has all the versions it can have and needs the room for one
+// more, the oldest first, one for each new version: until then a path reaching one again, as a
+// thunk forced into code that finds it, takes it as it is, with its JIT code. A peel makes its
+// versions in the order it learns its facts, so the newest knows the most. While code is
 // still running in what the replaced code reached, it may reach any of it, so that rebuild's are
 // tried again each time a thunk is forced, until none is.
 //
@@ -2971,7 +2972,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return (exists, "exact", None);
         }
         if self.versions_at(owner, subpc, &ctx) >= MAX_VERSIONS {
-            self.evict(owner, subpc);
+            self.evict(owner, subpc, &ctx);
         }
         let versions = self.versions.get(&self.proto).unwrap();
         let existing: Vec<(Rc<Context>, BlockId)> = versions
@@ -3053,18 +3054,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.versions.get(&self.proto).map_or(0, |versions| versions.keys().filter(|(at, ectx)| *at == pc && ectx.same_point(ctx)).count())
     }
 
-    /// Forget the versions at `pc` of the running function the trimming found unreachable, which
-    /// a point with all the versions it can have needs the room of. See Note [Contraction].
-    fn evict(&mut self, owner: &Owner, pc: SubPc) {
-        let unreachable = &mut self.unreachable;
+    /// Forget the oldest version at `pc` of the running function, at the same point as `ctx`, the
+    /// trimming found unreachable, to make the room a point with all the versions it can have needs
+    /// for one more: the others may yet be reused. See Note [Contraction].
+    fn evict(&mut self, owner: &Owner, pc: SubPc, ctx: &Context) {
+        let versions = self.versions.get_mut(&self.proto).unwrap();
+        let dead = versions.iter()
+            .filter(|((at, ectx), block)| *at == pc && ectx.same_point(ctx) && self.unreachable.contains(block))
+            .min_by_key(|(_, block)| block.0)
+            .map(|(key, block)| (key.clone(), *block));
         let mut _evicted: Vec<usize> = Vec::new();
-        self.versions.get_mut(&self.proto).unwrap().retain(|(at, _), block| {
-            let evict = *at == pc && unreachable.remove(block);
-            if evict {
-                _evicted.push(block.0);
-            }
-            !evict
-        });
+        if let Some((key, block)) = dead {
+            versions.remove(&key);
+            self.unreachable.remove(&block);
+            _evicted.push(block.0);
+        }
         #[cfg(feature = "tracing")]
         if !_evicted.is_empty() {
             crate::tracing::instant("spec", "evicted", &[
