@@ -728,7 +728,7 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
 /// the native's. See Note [Native generators].
 /// `jit.promote`'s generator: for `promote(v)` keeping one result, of an integer (a whole double
 /// narrowed), `v` promoted, its value moved into the result's slot; any other call is the
-/// native's, which returns its argument. See Note [Green values] in `specialize`.
+/// native's, which returns its argument. See Note [Promoted values] in `specialize`.
 #[cfg(feature = "magic")]
 fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp, PROMOTE_VALUES};
@@ -1085,7 +1085,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         // SAFETY: only the lifetimes change; see `MODULES`.
         unsafe { std::mem::transmute::<LBoxed<'s, 'i>, LBoxed<'static, 'static>>(boxed) }
     };
-    // `jit.promote(v)`: `v`, and the code after it specialized to its value. See Note [Green
+    // `jit.promote(v)`: `v`, and the code after it specialized to its value. See Note [Promoted
     // values] in `specialize`. A global only: `require("jit")` is LuaJIT's, which code
     // probes for. A magic JIT intrinsic (feature `magic`): without it there is no `jit`, as
     // in a Lua other than LuaJIT, and code probing for it runs without.
