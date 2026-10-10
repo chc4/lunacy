@@ -689,15 +689,18 @@ unsafe-magic-compile:
         --target-dir target/magic -Z build-std="core,std,panic_abort"
 
 # A uxn_* benchmark (`times` 1) on Raven's backends, where the ROM needs nothing
-# past its reset vector (as `hyperfine-uxn`), LuaJIT with and without its JIT,
-# and lunacy's unsafe build, and its unsafe build with `magic`
-# (`unsafe-magic-compile`).
-hyperfine-uxn-promote benchmark times='1': unsafe-compile unsafe-magic-compile _raven
+# past its reset vector (as `hyperfine-uxn`), and lunacy's unsafe build and its
+# unsafe build with `magic` (`unsafe-magic-compile`).
+hyperfine-uxn-promote benchmark times='1': (_hyperfine-uxn-promote benchmark times "")
+
+# `hyperfine-uxn-promote`, and LuaJIT with and without its JIT.
+hyperfine-uxn-promote-full benchmark times='1': (_hyperfine-uxn-promote benchmark times "full")
+
+_hyperfine-uxn-promote benchmark times full: unsafe-compile unsafe-magic-compile _raven
     #!/usr/bin/env bash
     set -euo pipefail
     b={{benchmark}}
     just _luac $b
-    just _luajitc $b
     raven=()
     name=${b#uxn_}; name=${name#bit_}
     # uxn_loop runs loop_long.tal.
@@ -708,20 +711,29 @@ hyperfine-uxn-promote benchmark times='1': unsafe-compile unsafe-magic-compile _
             raven+=(-n "raven $backend" "target/raven/target/release/raven-cli --backend $backend --quit $rom")
         done
     fi
+    luajit=()
+    if [ -n "{{full}}" ]; then
+        just _luajitc $b
+        luajit=(-n "luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin {{times}}"
+            -n luajit "luajit bench.lua -- working/$b.luajit.bin {{times}}")
+    fi
     jit="LUNACY_JIT_SIZE={{UXN_JIT_SIZE}}"
     # As `hyperfine-full`: a command failing is timed, and left out of the history.
     {{TIMED}} hyperfine -i -N --warmup {{WARMUP}} --export-markdown working/hyperfine-promote-$b-{{times}}.md \
-        --export-json working/hyperfine-promote-$b-{{times}}.json "${raven[@]}" \
-        -n "luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin {{times}}" \
-        -n luajit "luajit bench.lua -- working/$b.luajit.bin {{times}}" \
+        --export-json working/hyperfine-promote-$b-{{times}}.json "${raven[@]}" "${luajit[@]}" \
         -n "lunacy unsafe" "env $jit ./target/unsafe/bench working/$b.bin {{times}}" \
         -n "lunacy unsafe magic" "env $jit ./target/magic/unsafe/bench working/$b.bin {{times}}"
 
 # `hyperfine-uxn-promote` over the uxn_* ROMs.
-hyperfines-uxn-promote:
+hyperfines-uxn-promote: (_hyperfines-uxn-promote "hyperfine-uxn-promote")
+
+# `hyperfine-uxn-promote-full` over the uxn_* ROMs.
+hyperfines-uxn-promote-full: (_hyperfines-uxn-promote "hyperfine-uxn-promote-full")
+
+_hyperfines-uxn-promote recipe:
     #!/usr/bin/env bash
     set -euo pipefail
-    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop; do just hyperfine-uxn-promote $b; done
+    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop; do just {{recipe}} $b; done
     for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop; do echo $b; tail -n +3 working/hyperfine-promote-$b-1.md; done
 
 # Each uxn_* benchmark (which checks its own output) run once on the unsafe
