@@ -1247,3 +1247,37 @@ weak-hole-experiment:
     build pie
     build static -C relocation-model=static
     build static-emit-relocs -C relocation-model=static -C link-arg=-Wl,--emit-relocs
+
+# Holes as `!absolute_symbol` globals (experiments/absolute_hole): an IR module
+# declaring them, with accessors cross-language ThinLTO inlines into the Rust
+# using them, linked as a PIE (as `patchpoint-experiment` links): each
+# function's code, and the relocations at or into them and naming the holes.
+# `link` is extra linker arguments, comma separated, e.g. `-z,notext`.
+absolute-hole-experiment link='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=target/absolute_hole
+    mkdir -p $out
+    llvm=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#llvmPackages_23.llvm)/bin
+    $llvm/opt --thinlto-bc experiments/absolute_hole/hole.ll -o $out/hole.bc
+    extra=()
+    if [ -n "{{link}}" ]; then extra=(-C "link-arg=-Wl,{{link}}"); fi
+    {{SHARED}} rustc --edition 2024 -C opt-level=3 -C codegen-units=1 -C panic=abort -C target-cpu=native \
+        -C linker-plugin-lto -C linker-flavor=gnu-lld-cc -Z unstable-options -C link-self-contained=+linker \
+        -C link-arg=$out/hole.bc -C link-arg=-Wl,--save-temps "${extra[@]}" \
+        -o $out/absolute_hole experiments/absolute_hole/main.rs
+    echo "runs: $({{SHARED}} $out/absolute_hole)"
+    for s in ex_sub_hole ex_and_hole ex_add_small_hole ex_cmp_hole; do
+        $llvm/llvm-objdump -d -M intel --disassemble-symbols=$s $out/absolute_hole | sed -n '/^[0-9a-f]* </,$p'
+    done | tee $out/disasm.txt
+    echo "--- relocations naming the holes:"
+    readelf -rW $out/absolute_hole | grep -E "__lunacy_abs_hole" || echo "(none)"
+
+# `llc` alone on experiments/absolute_hole/isel.ll, as PIC: which operations
+# take an `!absolute_symbol` hole as their immediate operand.
+absolute-hole-isel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    llvm=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#llvmPackages_23.llvm)/bin
+    $llvm/llc -O3 -relocation-model=pic -x86-asm-syntax=intel experiments/absolute_hole/isel.ll -o - \
+        | grep -vE '^\s*(\.|#)' | grep -vE '^\s*$'
