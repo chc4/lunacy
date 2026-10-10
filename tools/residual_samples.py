@@ -3,16 +3,18 @@
 Each argument is the sampled disassembly `jit-profile` writes (working/jit_samples.txt):
 every instruction with its sample count, under the note of the region it is in, of its block
 and of the residual that emitted it. Block ids differ between builds, so samples are summed
-by the function of the block's region (an inlined callee's blocks are their caller's), the
-block's pc and the residual's text, its index in the block and the blocks it names dropped:
-the same residual at the same pc in every version and copy of it is one row. Code under any
-other note (a region's exits and epilogue) is its own row, as is code under none. Prints the rows
-with the most samples in either run, each run's count, and the change.
+by the block's function (as its note names it, `725-693` for 693's inlined into 725's, or for
+a dump without, its region's), the block's pc (where the block starts, which may be some
+instructions before the residual's) and the residual's text, its index in the block and the
+blocks it names dropped: the same residual at the same pc in every version and copy of it is
+one row. Code under any other note (a region's exits and epilogue) is its own row, as is code
+under none. Prints the rows with the most samples in either run, each run's count, and the
+change.
 """
 import argparse, collections, re
 
 REGION = re.compile(r"==== region entered at block \d+, function :(\d+)")
-BLOCK = re.compile(r"\s*; block (\d+) \(pc (\d+)")
+BLOCK = re.compile(r"\s*; block (\d+) \(pc (\d+)(?:, function ([\d?-]+))?")
 RESIDUAL = re.compile(r"\s*; (\d+) (.*)")
 # Any other note: code a region lays out around its blocks (an exit, an epilogue).
 NOTE = re.compile(r"\s*; (.*)")
@@ -23,12 +25,12 @@ TARGETS = re.compile(r"(jump|branch|select)\([\d, ]*\)")
 def residual_samples(path):
     """(function, pc, residual) -> samples."""
     counts = collections.Counter()
-    function, pc, residual = None, None, None
+    region, function, pc, residual = None, None, None, None
     for line in open(path):
         if m := REGION.match(line):
-            function = int(m.group(1))
+            region = m.group(1)
         elif m := BLOCK.match(line):
-            pc, residual = int(m.group(2)), '(block entry)'
+            function, pc, residual = m.group(3) or region, int(m.group(2)), '(block entry)'
         elif m := RESIDUAL.match(line):
             residual = TARGETS.sub(r"\1", m.group(2))
         elif (m := NOTE.match(line)) and not SAMPLED.match(line):
@@ -49,11 +51,11 @@ def main():
     args = parser.parse_args()
     base, head = residual_samples(args.base), residual_samples(args.head)
     keys = sorted(set(base) | set(head), key=lambda k: -max(base[k], head[k]))[:args.top]
-    print(f"{'line':>5} {'pc':>4}  {'residual':48} {'base':>7} {'head':>7} {'change':>7}")
-    for key in sorted(keys, key=lambda k: (k[0] or 0, k[1], k[2])):
+    print(f"{'function':>12} {'pc':>4}  {'residual':48} {'base':>7} {'head':>7} {'change':>7}")
+    for key in sorted(keys, key=lambda k: (k[0] or '', k[1], k[2])):
         b, h = base[key], head[key]
-        print(f"{key[0] or '?':>5} {key[1]:>4}  {key[2][:48]:48} {b:>7} {h:>7} {h - b:>+7}")
-    print(f"{'':>5} {'':>4}  {'all JIT samples':48} {sum(base.values()):>7} {sum(head.values()):>7} {sum(head.values()) - sum(base.values()):>+7}")
+        print(f"{key[0] or '?':>12} {key[1]:>4}  {key[2][:48]:48} {b:>7} {h:>7} {h - b:>+7}")
+    print(f"{'':>12} {'':>4}  {'all JIT samples':48} {sum(base.values()):>7} {sum(head.values()):>7} {sum(head.values()) - sum(base.values()):>+7}")
 
 
 if __name__ == '__main__':

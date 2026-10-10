@@ -938,6 +938,10 @@ pub struct JitContext {
     /// The code committed, and notes on it, disassembled on drop.
     #[cfg(feature = "jit_disasm")]
     pub disasm: crate::disasm::Disasm,
+    /// The functions each block of the region being compiled is in, for its note:
+    /// `Specializer::inline_chains`.
+    #[cfg(feature = "jit_disasm")]
+    pub functions: HashMap<BlockId, String>,
     /// Each thunk compiled into JIT code, by block and offset. See Note
     /// [Thunk patching].
     thunk_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
@@ -1339,6 +1343,8 @@ impl JitContext {
             window_counts: Default::default(),
             #[cfg(feature = "jit_disasm")]
             disasm: Default::default(),
+            #[cfg(feature = "jit_disasm")]
+            functions: Default::default(),
             trace_policy: match std::env::var("LUNACY_TRACES").as_deref() {
                 Ok("streaming") => None,
                 _ => Some(Policy::from_env()),
@@ -1521,6 +1527,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.region_base = base.0 as usize;
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
         let entry = ops.offset();
+        #[cfg(feature = "jit_disasm")]
+        {
+            self.jctx.functions = self.inline_chains(id);
+        }
         jit_note!(self.jctx, ops, "region entry: prologue");
 
         // SystemV ABI is RDI, RSI, RDX, RCX, R8, R9
@@ -2225,7 +2235,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
         let mut alloc = WindowAlloc::entering(self.jctx.blocks[&id].window.clone());
         window_dump!(self.jctx, "block {} hotness {} pc {} entered with {}", id.0, block.jit_info.hotness.get(), block.pc, alloc.cache());
-        jit_note!(self.jctx, ops, "block {} (pc {}, hotness {}) entered with {}", id.0, block.pc, block.jit_info.hotness.get(), alloc.cache());
+        jit_note!(self.jctx, ops, "block {} (pc {}, function {}, hotness {}) entered with {}", id.0, block.pc, self.jctx.functions.get(&id).map_or("?", String::as_str), block.jit_info.hotness.get(), alloc.cache());
 
         // Jump to `target`, or fall through to it if `skip`, transferring the
         // window to the one it is entered with: its planned entry window, dirty where the

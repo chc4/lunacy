@@ -3424,6 +3424,65 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let _ = owner;
     }
 
+    /// The functions each block reachable from `entry` is in, for the JIT's disassembly: the
+    /// lines its function and the functions it is inlined into are defined at, outermost first,
+    /// as `725-693` for 693's inlined into 725's. A version's are its context's inlined frames' and
+    /// its own; any other block's, the block's whose code reaches it, as a function changes only
+    /// at a version (a callee's entry, the code after its return), and `?` if none says.
+    #[cfg(feature = "jit_disasm")]
+    pub fn inline_chains(&self, entry: BlockId) -> HashMap<BlockId, String> {
+        let line = |proto: LProto<'_, '_>| unsafe { (*proto).line_defined }.to_string();
+        let chain = |proto: LProto<'_, '_>, ctx: &Context| {
+            let mut lines = vec![line(proto)];
+            let mut frame = ctx.inline.clone();
+            while let Some(f) = frame {
+                lines.push(line(f.proto.cast()));
+                frame = f.caller.inline.clone();
+            }
+            lines.reverse();
+            lines.join("-")
+        };
+        let mut versions: HashMap<BlockId, String> = HashMap::default();
+        for (proto, at) in &self.versions {
+            for ((_, ctx), block) in at {
+                versions.insert(*block, chain(*proto, ctx));
+            }
+        }
+        // The entry's, if it isn't a version: the nearest version whose code reaches it.
+        let of_entry = versions.get(&entry).cloned().or_else(|| {
+            let mut reaches: HashMap<BlockId, Vec<BlockId>> = HashMap::default();
+            for (from, block) in self.blocks.iter().enumerate() {
+                for target in Self::targets(&block.instructions) {
+                    reaches.entry(target).or_default().push(BlockId(from));
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut work = std::collections::VecDeque::from([entry]);
+            while let Some(block) = work.pop_front() {
+                if let Some(of) = versions.get(&block) {
+                    return Some(of.clone());
+                }
+                if seen.insert(block) {
+                    work.extend(reaches.get(&block).into_iter().flatten().copied());
+                }
+            }
+            None
+        });
+        let mut chains: HashMap<BlockId, String> = HashMap::default();
+        let mut work = vec![(entry, of_entry.unwrap_or_else(|| "?".to_string()))];
+        while let Some((block, of)) = work.pop() {
+            if chains.contains_key(&block) || block.0 >= self.blocks.len() {
+                continue;
+            }
+            chains.insert(block, of.clone());
+            for target in Self::targets(&self.blocks[block.0].instructions) {
+                let theirs = versions.get(&target).cloned().unwrap_or_else(|| of.clone());
+                work.push((target, theirs));
+            }
+        }
+        chains
+    }
+
     /// `ids` as a comma separated list, for traces.
     fn ids(ids: impl Iterator<Item = usize>) -> String {
         ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
