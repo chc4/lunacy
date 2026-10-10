@@ -69,6 +69,33 @@ trace benchmark times='10' features='unsafe':
     cd working && {{SHARED}} ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
     python3 tools/perfetto_summary.py working/lunacy.fxt
 
+# `trace` of revision `ref` (as for `hyperfine-vs`), from its compare worktree,
+# its trace in working/lunacy-<ref>.fxt.
+trace-rev ref benchmark times='10' features='unsafe':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _compare-worktree {{ref}}
+    dir=target/compare/{{ref}}
+    (cd $dir && just _luac {{benchmark}} > /dev/null)
+    (cd $dir && {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} tracing" --bin bench \
+        --target-dir target/tracing -Z build-std="core,std,panic_abort")
+    (cd $dir/working && {{SHARED}} ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null)
+    mv $dir/working/lunacy.fxt working/lunacy-{{ref}}.fxt
+
+# Each benchmark of HYPERFINES traced at revision `ref` and in this checkout,
+# their hash keys and versions compared (tools/hash_key_stats.py).
+hash-keys-vs ref features='unsafe':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        just trace-rev {{ref}} $benchmark $times "{{features}}" > /dev/null 2>&1 || { echo "skipped $benchmark: its traced run at {{ref}} failed"; continue; }
+        mv working/lunacy-{{ref}}.fxt working/hash-keys-$benchmark-{{ref}}.fxt
+        just trace $benchmark $times "{{features}}" > /dev/null 2>&1 || { echo "skipped $benchmark: its traced run failed"; continue; }
+        mv working/lunacy.fxt working/hash-keys-$benchmark.fxt
+        python3 tools/hash_key_stats.py $benchmark working/hash-keys-$benchmark-{{ref}}.fxt working/hash-keys-$benchmark.fxt
+    done
+
 # A golden test's run traced (feature `tracing`), as `trace` traces a
 # benchmark's: lua_tests/<name>.lua in the golden harness, built in release with
 # `features`, to working/lunacy.fxt, then summarized. A failing run still
