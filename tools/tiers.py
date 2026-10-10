@@ -10,14 +10,18 @@ samples in
   interpreter  the specializer running residuals (`Specializer::run`), and
                anything it called, but for the tiers below
   specialize   the specializer compiling blocks: its generators, versions,
-               subblocks and thunks
+               subblocks and thunks, and measuring calls for inlining
+  contract     the contraction: finding a version's duplicates, rebuilding
+               origins and trimming what they replaced, evicting versions
   jit compile  compiling blocks to machine code (`Specializer::jit_compile`)
   gc           the collector
   other        anything else: startup, loading the chunk, teardown
 
-A sample goes to the first of gc, jit compile, specialize, jit, interpreter
-whose frames are in its call chain, so compiling or collecting from JIT code
-counts as compiling or collecting. A sample in the kernel goes to the tier of
+A sample goes to the first of gc, jit compile, specialize or contract, jit,
+interpreter whose frames are in its call chain, so compiling or collecting
+from JIT code counts as compiling or collecting. Of specialize and contract,
+the one whose frame is nearer the sample's leaf: code a rebuild compiles is
+specializing, a version's search for duplicates is contracting. A sample in the kernel goes to the tier of
 the user code that entered it; `kernel` is the share of samples in the kernel,
 across the tiers.
 
@@ -28,7 +32,11 @@ tier below it (the interpreter, which entered the JIT code); the `ret` of a
 function JIT code calls often (e.g. `Tc::set` on an append) can move a
 noticeable share. `perf script -F ip,sym` shows where a tier's samples are.
 
-    tools/tiers.py perf-a.data [perf-b.data ...]
+    tools/tiers.py [--freq HZ] perf-a.data [perf-b.data ...]
+
+With `--freq`, the frequency the profiles were recorded at (`perf record -F`),
+each tier's time too: its samples over the frequency, as the program runs on
+one thread.
 
 (`perf` must be on PATH, as in `nix develop`.)
 """
@@ -37,14 +45,15 @@ import subprocess
 import sys
 from collections import Counter
 
-TIERS = ['jit', 'jit (unnamed)', 'interpreter', 'specialize', 'jit compile', 'gc', 'other']
+TIERS = ['jit', 'jit (unnamed)', 'interpreter', 'specialize', 'contract', 'jit compile', 'gc', 'other']
 GC = re.compile(r'lunacy::gc::')
 JIT_COMPILE = re.compile(r'Specializer>::jit_compile\b')
 SPECIALIZE = re.compile(
-    r'Specializer>::(compile|compile_one|subblock|version|block|new_block|make_\w+)\b'
+    r'Specializer>::(compile|compile_one|subblock|version|block|new_block|make_\w+|inline_cost)\b'
     # A generator's own body (it runs while compiling); a residual it made is a
     # closure inside it, `emit_*::{closure#0}::{closure#N}`, which runs later.
     r'|lunacy::generators::emit_\w+::\{closure#0\}(\s|$)')
+CONTRACT = re.compile(r'Specializer>::(contract|contractible|contract_joined|rebuild_queued|trim|evict)\b')
 JIT = re.compile(r'\bjit_block_\d+')
 INTERPRETER = re.compile(r'Specializer>::run\b')
 
@@ -56,7 +65,10 @@ KERNEL = 1 << 63
 def samples(path):
     """Each sample's frames, leaf first, as `perf script` prints them: (ip,
     symbol) pairs."""
-    out = subprocess.run(['perf', 'script', '-i', path, '-F', 'ip,sym'],
+    # Without the frames of inlined calls, which perf finds from debuginfo
+    # about a thousand times slower than it reads the samples: a function
+    # inlined into its caller is its caller's frame.
+    out = subprocess.run(['perf', 'script', '--no-inline', '-i', path, '-F', 'ip,sym'],
                          capture_output=True, text=True, check=True).stdout
     frames = []
     for line in out.splitlines():
@@ -78,9 +90,17 @@ def tier(frames):
     user = [sym for ip, sym in frames if ip < KERNEL]
     if not user:
         return 'other'
-    for name, pattern in (('gc', GC), ('jit compile', JIT_COMPILE), ('specialize', SPECIALIZE), ('jit', JIT)):
+    for name, pattern in (('gc', GC), ('jit compile', JIT_COMPILE)):
         if any(pattern.search(f) for f in user):
             return name
+    # The nearer the leaf of specializing and contracting.
+    for f in user:
+        if CONTRACT.search(f):
+            return 'contract'
+        if SPECIALIZE.search(f):
+            return 'specialize'
+    if any(JIT.search(f) for f in user):
+        return 'jit'
     if user[0].startswith('[unknown]'):
         return 'jit (unnamed)'
     if any(INTERPRETER.search(f) for f in user):
@@ -89,11 +109,16 @@ def tier(frames):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+    freq = None
+    if args[:1] == ['--freq']:
+        freq, args = float(args[1]), args[2:]
+    if not args:
         sys.exit(__doc__)
-    width = max(len(p) for p in sys.argv[1:])
+    width = max(len(p) for p in args)
     print(f"{'profile':<{width}}  {'samples':>7}  " + '  '.join(f'{t:>13}' for t in TIERS + ['kernel']))
-    for path in sys.argv[1:]:
+    times = []
+    for path in args:
         counts, kernel = Counter(), 0
         for frames in samples(path):
             counts[tier(frames)] += 1
@@ -101,6 +126,13 @@ def main():
         total = sum(counts.values())
         row = '  '.join(f'{100 * n / total:>12.1f}%' for n in [counts[t] for t in TIERS] + [kernel])
         print(f'{path:<{width}}  {total:>7}  {row}', flush=True)
+        times.append((path, total, counts, kernel))
+    if freq:
+        print()
+        print(f"{'profile':<{width}}  {'seconds':>7}  " + '  '.join(f'{t:>13}' for t in TIERS + ['kernel']))
+        for path, total, counts, kernel in times:
+            row = '  '.join(f'{n / freq:>12.3f}s' for n in [counts[t] for t in TIERS] + [kernel])
+            print(f'{path:<{width}}  {total / freq:>6.3f}s  {row}')
 
 
 if __name__ == '__main__':

@@ -445,8 +445,9 @@ flamegraph-vs ref benchmark times='10' freq='997' top='25':
 
 # `flamegraph` over HYPERFINES, sampling at `freq` Hz: for each run,
 # working/perf-<benchmark>-<times>.data and flamegraph-<benchmark>-<times>.svg,
-# then each profile's share of time by tier (tools/tiers.py): JIT code, the
-# interpreter, compiling, and GC. perf runs the benchmark itself: under
+# then each profile's share of time by tier, and its time in each
+# (tools/tiers.py): JIT code, the interpreter, specializing, contracting,
+# compiling to machine code, and GC. perf runs the benchmark itself: under
 # `cargo flamegraph`, samples from the run's start are the pre-exec process's,
 # which perf can't resolve.
 flamegraphs freq='19997':
@@ -457,11 +458,16 @@ flamegraphs freq='19997':
     for run in {{HYPERFINES}}; do
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark
-        (cd working && {{SAMPLED}} perf record -F {{freq}} --call-graph fp -g -o perf-$benchmark-$times.data -- ../target/flamegraph/bench $benchmark.bin $times > /dev/null)
-        flamegraph --perfdata working/perf-$benchmark-$times.data -o working/flamegraph-$benchmark-$times.svg > /dev/null
+        # A run that fails is left out, and said so.
+        if ! (cd working && {{SAMPLED}} perf record -F {{freq}} --call-graph fp -g -o perf-$benchmark-$times.data -- ../target/flamegraph/bench $benchmark.bin $times > /dev/null); then
+            echo "skipped $benchmark $times: the run failed"
+            continue
+        fi
+        # Without inlined calls' frames, which perf takes minutes to find a profile's.
+        flamegraph --no-inline --perfdata working/perf-$benchmark-$times.data -o working/flamegraph-$benchmark-$times.svg > /dev/null
         profiles+=(working/perf-$benchmark-$times.data)
     done
-    python3 tools/tiers.py "${profiles[@]}"
+    python3 tools/tiers.py --freq {{freq}} "${profiles[@]}"
 
 benchmarks: (run "binarytrees") (run "life") (run "nbody")
 
