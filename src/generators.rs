@@ -1256,6 +1256,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
             && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
         let (lint, rint) = if numbers { (integer_encoded!(lhs), integer_encoded!(rhs)) } else { (false, false) };
+        let mut quotient = None;
         let window = match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => Some(numeric_rr(opcode, lint, rint, &[lhs, rhs, dest])),
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
@@ -1274,6 +1275,11 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(rhsc)) else { unreachable!() };
+                // An integer's quotient by a positive whole constant, as `math.floor` can compute
+                // it again from the integer. See Note [Quotients] in `specialize`.
+                if opcode == Opcode::DIV && lint && dest != lhs && k >= 1.0 && k <= i32::MAX as f64 && k.fract() == 0.0 {
+                    quotient = Some(k as i32);
+                }
                 Some(numeric_rk(opcode, lint, k, &[lhs, dest]))
             },
             _ => None,
@@ -1281,6 +1287,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         if let Some(window) = window {
             yield YieldOp::ExecWindow(window);
             yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Double))]);
+            if let Some(by) = quotient {
+                yield YieldOp::Quotient(dest, lhs, by);
+            }
             return arg;
         }
 

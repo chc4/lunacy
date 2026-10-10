@@ -608,6 +608,14 @@ crate::window::windowed!(ByteRange, [], [N: usize], |owner, state, base, tag| (s
 crate::window::windowed!(WholeOfInt, [], [], |owner, state, base| (x, out r) {
     *r = x;
 });
+// `math.floor` of an integer's quotient by a positive constant `by`, from the integer: the floored
+// division, a shift for a power of two. See Note [Quotients] in `specialize`.
+crate::window::windowed!(FloorDivK, [by: i32], [], |owner, state, base, tag| (x, out r) {
+    *r = LBoxed::from_int_tagged(x.as_int().div_euclid(by), tag);
+});
+crate::window::windowed!(FloorShiftK, [shift: u32], [], |owner, state, base, tag| (x, out r) {
+    *r = LBoxed::from_int_tagged(x.as_int() >> shift, tag);
+});
 // `OP` of a double, in the integer encoding where an i32 holds the result: a cold path for one it
 // doesn't, which is a double. As an integer op whose result doesn't fit. See Note [Optimistic ops]
 // in `specialize`.
@@ -703,6 +711,18 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
                 return ResumeArg::Start;
             }
             if (yield YieldOp::Guard(a + 1, LType::Double)) == ResumeArg::Matched {
+                // An integer's quotient by a positive constant, floored from the integer. See
+                // Note [Quotients] in `specialize`.
+                if OP == FLOOR && let ResumeArg::Quotient(of, by) = (yield YieldOp::QuotientOf(a + 1)) {
+                    let op: std::rc::Rc<dyn crate::window::Window> = if by & (by - 1) == 0 {
+                        std::rc::Rc::new(FloorShiftK::new(by.trailing_zeros(), &[of, a]))
+                    } else {
+                        std::rc::Rc::new(FloorDivK::new(by, &[of, a]))
+                    };
+                    yield YieldOp::ExecWindow(op);
+                    yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
+                    return ResumeArg::Start;
+                }
                 let fits = Fits(std::rc::Rc::new(move |state: &crate::vm::RunState| {
                     crate::lboxed::is_integer(math1::<OP>(unsafe { checked_number(state.vals[state.base + a + 1]) }))
                 }));

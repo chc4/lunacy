@@ -278,6 +278,11 @@ pub enum YieldOp {
                            // integer whose fact isn't introduced, else as an integer. See
                            // Note [Contraction]
     HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Widening]
+    Quotient(usize, usize, i32), // STACK[idx] was just computed as STACK[of] / by: resumed with
+                                 // Matched where the fact says so, Failed where it was
+                                 // contracted. See Note [Quotients]
+    QuotientOf(usize), // Resumed with Quotient if a fact says STACK[idx] holds a quotient, which
+                       // the code then relies on, else Failed. See Note [Quotients]
     Encoding(Fits), // An optimistic integer op is about to be laid out, whose result fits for the
                     // values its operands have if the test does: resumed, once the op first runs,
                     // with the double type to compute it in the double encoding instead, else with
@@ -441,6 +446,8 @@ pub enum ResumeArg {
     WindowArgs(usize, CType),
     /// An upvalue's cell, and whether it holds the upvalue's value. See Note [Upvalue cells].
     Cell(usize, bool),
+    /// The integer slot and positive constant a slot holds the quotient of. See Note [Quotients].
+    Quotient(usize, i32),
 }
 
 // Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
@@ -1247,6 +1254,7 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
             Fragile::Passed { .. } => None,
             Fragile::HoldsValue { slot, of } => shifted(*slot).zip(of.into_callee(shifted, frame.closure.as_ref())).map(|(slot, of)| Fragile::HoldsValue { slot, of }),
             Fragile::Known { of, ctype } => of.into_callee(shifted, frame.closure.as_ref()).map(|of| Fragile::Known { of, ctype: ctype.clone() }),
+            Fragile::Quotient { slot, of, by } => shifted(*slot).zip(shifted(*of)).map(|(slot, of)| Fragile::Quotient { slot, of, by: *by }),
         };
         if let Some(fragile) = fragile.filter(|fragile| fragile.slot().is_none_or(|slot| entry.types[slot] != CType::Type(LType::Nil))) {
             entry.introduce(Fact { fragile, origins: fact.origins.clone() });
@@ -1685,6 +1693,20 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // instead of introducing the fact or asking again. An origin is rebuilt once; the fact may be
 // introduced again by other paths, which may be contracted in turn. Each contraction replaces code carrying the fact with code that doesn't, so
 // it ends, and a fact some code finds a use for before its duplicate appears is kept.
+
+// Note [Quotients]
+// ~~~~~~~~~~~~~~~~
+// Lua's `/` is a double's division, so `math.floor(n / k)` divides in doubles and rounds back,
+// though for an integer `n` and a positive whole `k` it is the floored integer division of `n` by
+// `k`, a shift where `k` is a power of two. A division of an integer slot by such a constant
+// introduces a fact that its result's slot holds that quotient, until something writes either
+// slot; `math.floor` of a slot the fact is about computes the floored division from the integer
+// instead, relying on the fact. The division itself is still computed, for any other reader.
+//
+// The fact tells versions apart as a constant's does, so it is introduced from an origin (Note
+// [Contraction]): where no code relies on it before a version without it appears, as where a
+// branch divides and the other doesn't before they meet, it is contracted, and the division
+// rebuilt to introduce nothing.
 
 /// Whether an integer op's overflow rebuilds it to compute in doubles (Note [Optimistic ops]);
 /// set `LUNACY_NO_OVERFLOW_REBUILD` for no rebuild, to compare.
@@ -2218,6 +2240,9 @@ pub enum Fragile {
     /// Stack slot `slot` holds a number constant an i32 holds exactly,
     /// `value`. See Note [Widening].
     Constant { slot: usize, value: i32 },
+    /// Stack slot `slot` holds the quotient of integer slot `of`'s value by `by`, a positive
+    /// constant. See Note [Quotients].
+    Quotient { slot: usize, of: usize, by: i32 },
     /// Stack slot `slot`, a parameter of an inlined callee, holds the table it
     /// was passed, which the caller's slot `owner` holds. See Note [Inlined calls].
     Passed { slot: usize, owner: usize },
@@ -2334,6 +2359,7 @@ impl Fragile {
             Fragile::Passed { slot, .. } => (5, *slot),
             Fragile::HoldsValue { slot, .. } => (6, *slot),
             Fragile::Known { of, .. } => (7, of.key()),
+            Fragile::Quotient { slot, .. } => (8, *slot),
         }
     }
 
@@ -2341,7 +2367,7 @@ impl Fragile {
     fn slot(&self) -> Option<usize> {
         match self {
             Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } | Fragile::Passed { slot, .. }
-                | Fragile::HoldsValue { slot, .. } => Some(*slot),
+                | Fragile::HoldsValue { slot, .. } | Fragile::Quotient { slot, .. } => Some(*slot),
             Fragile::Known { .. } => None,
             Fragile::Kind { table, .. } => table.slot(),
             Fragile::Upvalue { .. } => None,
@@ -2357,6 +2383,7 @@ impl Fragile {
             Fragile::Kind { table: Subject::Slot(slot), kind } if *slot == from => Some(Fragile::Kind { table: Subject::Slot(to), kind: *kind }),
             Fragile::Constant { slot, value } if *slot == from => Some(Fragile::Constant { slot: to, value: *value }),
             Fragile::HoldsValue { slot, of } if *slot == from => Some(Fragile::HoldsValue { slot: to, of: of.clone() }),
+            Fragile::Quotient { slot, of, by } if *slot == from => Some(Fragile::Quotient { slot: to, of: *of, by: *by }),
             _ => None,
         }
     }
@@ -2381,6 +2408,8 @@ impl Fragile {
             Fragile::Passed { slot, .. } => slot_survives(*slot, effect),
             Fragile::HoldsValue { slot, of } => slot_survives(*slot, effect) && of.survives(effect),
             Fragile::Known { of, .. } => of.survives(effect),
+            // The dividend too: the quotient is computed again from it.
+            Fragile::Quotient { slot, of, .. } => slot_survives(*slot, effect) && slot_survives(*of, effect),
         }
     }
 }
@@ -2814,6 +2843,15 @@ impl Context {
     fn constant(&self, slot: usize) -> Option<i32> {
         self.fragile.iter().find_map(|fact| match &fact.fragile {
             Fragile::Constant { slot: held, value } if *held == slot => Some(*value),
+            _ => None,
+        })
+    }
+
+    /// The integer slot and the positive constant slot `slot` holds the quotient of, if a fact
+    /// says it does. See Note [Quotients].
+    fn quotient(&self, slot: usize) -> Option<(usize, i32)> {
+        self.fragile.iter().find_map(|fact| match &fact.fragile {
+            Fragile::Quotient { slot: held, of, by } if *held == slot => Some((*of, *by)),
             _ => None,
         })
     }
@@ -6162,6 +6200,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let origin = loading.take().expect("a constant's load yields EncodeK first");
                         Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Constant { slot, value: n.0 as i32 }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
                     }
+                },
+                CoroutineState::Yielded(YieldOp::Quotient(..)) if let Some(how) = self.decision(owner, pc) => {
+                    arg = how;
+                },
+                CoroutineState::Yielded(YieldOp::Quotient(slot, of, by)) => {
+                    let origin = self.origin(block_id, coro.clone(), pc, ctx.clone());
+                    Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Quotient { slot, of, by }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
+                    arg = ResumeArg::Matched;
+                },
+                CoroutineState::Yielded(YieldOp::QuotientOf(slot)) => {
+                    arg = match ctx.quotient(slot) {
+                        Some((of, by)) => {
+                            ctx.rely(owner, Fragile::Quotient { slot, of, by }.key());
+                            ResumeArg::Quotient(of, by)
+                        },
+                        None => ResumeArg::Failed,
+                    };
                 },
                 CoroutineState::Yielded(YieldOp::Narrow(slot)) => match ctx.types[slot].clone() {
                     CType::Type(LType::Integer) => {
