@@ -4927,20 +4927,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }).collect()
         };
         let mut reached = Blocks::default();
+        // Each reached block's predecessors among them.
+        let mut from: HashMap<BlockId, SmallVec<[BlockId; 2]>, rustc_hash::FxBuildHasher> = HashMap::default();
         let mut work = vec![entry];
         while let Some(block) = work.pop() {
             if reached.insert(block) {
-                work.extend(flow(block));
+                for target in flow(block) {
+                    from.entry(target).or_default().push(block);
+                    work.push(target);
+                }
             }
         }
         // Those that reach the exit the call took, back from it.
-        let mut path: Blocks = reached.iter().copied().filter(|&block| block == exit).collect();
-        loop {
-            let more: Vec<BlockId> = reached.iter().copied().filter(|block| !path.contains(block) && flow(*block).iter().any(|target| path.contains(target))).collect();
-            if more.is_empty() {
-                break;
+        let mut path = Blocks::default();
+        let mut work: Vec<BlockId> = reached.contains(&exit).then_some(exit).into_iter().collect();
+        while let Some(block) = work.pop() {
+            if path.insert(block) {
+                work.extend(from.get(&block).into_iter().flatten().copied());
             }
-            path.extend(more);
         }
         // A cycle among them is a loop.
         let mut done = Blocks::default();
