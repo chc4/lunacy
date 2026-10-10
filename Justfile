@@ -1224,3 +1224,26 @@ patchpoint-experiment:
     done | tee $out/disasm.txt
     $llvm/llvm-readobj --stackmap $out/patchpoint_experiment | tee $out/stackmap.txt
     $llvm/llvm-objdump -s -j .lunacy_imm_holes $out/patchpoint_experiment || true
+
+# A hole declared as the stencils declare theirs (experiments/weak_hole), built
+# as a PIE (as lunacy is), non-PIE with relocation-model=static, and that with
+# --emit-relocs: each one's code for `x - hole` and `x & hole`, and the
+# relocations, dynamic and static, at or into those functions.
+weak-hole-experiment:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=target/weak_hole
+    mkdir -p $out
+    build() {
+        name=$1; shift
+        {{SHARED}} rustc --edition 2024 -C opt-level=3 -C panic=abort -C codegen-units=1 "$@" \
+            -o $out/$name experiments/weak_hole/main.rs
+        echo "=== $name: $* ; runs: $($out/$name)"
+        objdump -d -M intel --no-show-raw-insn $out/$name | awk '/<ex_(sub|and)_hole>:/{p=1} p&&/^$/{p=0} p'
+        lo=$(nm $out/$name | awk '$3=="ex_sub_hole"{print $1}')
+        echo "--- relocations naming the hole, or within ex_*:"
+        readelf -rW $out/$name | grep -E "__lunacy_hole1|^$lo" || echo "(none)"
+    }
+    build pie
+    build static -C relocation-model=static
+    build static-emit-relocs -C relocation-model=static -C link-arg=-Wl,--emit-relocs
