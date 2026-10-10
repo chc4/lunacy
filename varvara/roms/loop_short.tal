@@ -1,0 +1,16 @@
+( loop_long.tal's loop run once, not 16 times: what a run of loop_long.tal costs
+  apart from its loop's other 15 * 65535 iterations, which a run of each tells. )
+
+|0100
+
+@on-reset ( -> )
+	#01
+	&outer ( outer -- )
+		#ffff
+		&loop ( count* -- )
+			#0001 SUB2 DUP2 ORA ?&loop
+		POP2
+		#01 SUB DUP ?&outer
+	POP
+	#800f DEO
+	BRK

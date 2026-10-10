@@ -84,6 +84,13 @@ local PROGRAMS = {
     emu.boot(false)
     check("loop_long.tal's output", stdout(), "")
   end,
+  -- loop_short.tal: loop_long.tal's loop run once, not 16 times, for the cost
+  -- of one of its iterations from the two's difference.
+  loop_short = function(bitwise)
+    local emu, stdout = machine(require("roms.loop_short"), bitwise)
+    emu.boot(false)
+    check("loop_short.tal's output", stdout(), "")
+  end,
   -- bunnymark.tal: 300 frames with the mouse's button held, which adds a bunny
   -- each frame, every frame clearing the screen and drawing each bunny's
   -- sprite where it bounces to. The screen device's fill and sprites.

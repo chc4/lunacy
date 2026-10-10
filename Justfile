@@ -749,6 +749,26 @@ perf-stat-uxn-promote benchmark iterations times='1' runs='5': unsafe-compile un
         awk -v name="$name" -v cycles="$cycles" 'BEGIN { printf "%-22s %16s %12.2f\n", name, cycles, cycles / {{iterations}} }'
     done < <(just _uxn-promote-commands {{benchmark}} {{times}} full)
 
+# `perf-stat-uxn-promote`'s cycles on uxn_* benchmarks `long` and `short`, whose
+# ROMs differ only in running their loop `iterations` more times in `long`, and
+# the difference over `iterations`: one iteration's cycles, apart from starting
+# the process, building the machine and compiling, which both runs do alike.
+# uxn_loop runs uxn_loop_short's loop 15 * 65535 = 983025 times more.
+perf-stat-uxn-slope long='uxn_loop' short='uxn_loop_short' iterations='983025' runs='5': unsafe-compile unsafe-magic-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cycles() {
+        read -ra words <<< "$1"
+        {{TIMED}} perf stat -x, -r {{runs}} -e cycles -- "${words[@]}" 2>&1 < /dev/null > /dev/null \
+            | awk -F, '$3 ~ /cycles/ { print $1 }' | tail -1
+    }
+    printf '%-22s %16s %16s %12s\n' implementation {{long}} {{short}} cycles/iter
+    while IFS=$'\t' read -r name long short; do
+        l=$(cycles "$long"); s=$(cycles "$short")
+        awk -v name="$name" -v l="$l" -v s="$s" 'BEGIN { printf "%-22s %16s %16s %12.2f\n", name, l, s, (l - s) / {{iterations}} }'
+    done < <(paste <(just _uxn-promote-commands {{long}} 1 full) \
+        <(just _uxn-promote-commands {{short}} 1 full | cut -f2))
+
 # `hyperfine-uxn-promote` over the uxn_* ROMs.
 hyperfines-uxn-promote: (_hyperfines-uxn-promote "hyperfine-uxn-promote")
 
