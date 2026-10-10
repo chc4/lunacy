@@ -1244,11 +1244,12 @@ impl std::fmt::Display for StencilError {
 impl std::error::Error for StencilError {}
 
 /// What the copier needs from this executable's own ELF image: each hole's GOT
-/// slot and each function's size (to find the trailing `become`), at runtime
+/// slots and each function's size (to find the trailing `become`), at runtime
 /// addresses.
 pub struct Image {
-    /// The GOT slot of each hole, the site hole last.
-    holes: [Option<usize>; MAX_HOLES + 1],
+    /// Each slot a hole is read from, and the hole's index, the site hole's
+    /// `SITE_HOLE`: a hole can have several, one for each codegen unit reading it.
+    holes: Vec<(usize, usize)>,
     sizes: HashMap<usize, usize>,
 }
 
@@ -1279,8 +1280,8 @@ impl Image {
             "__lunacy_site" => Some(SITE_HOLE),
             _ => None,
         };
-        let mut holes = [None; MAX_HOLES + 1];
-        // The GLOB_DAT relocation for a weak hole gives its GOT slot.
+        let mut holes = Vec::new();
+        // Each relocation of a weak hole gives a slot it is read from.
         for r in elf.dynrelas.iter() {
             let name = elf
                 .dynsyms
@@ -1288,7 +1289,7 @@ impl Image {
                 .and_then(|s| elf.dynstrtab.get_at(s.st_name))
                 .unwrap_or("");
             if let Some(i) = hole_index(name) {
-                holes[i] = Some(bias.wrapping_add(r.r_offset as usize));
+                holes.push((bias.wrapping_add(r.r_offset as usize), i));
             }
         }
 
@@ -1594,7 +1595,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize, fall_exi
         // address, or a slot holding it), or anything else.
         if let Some((field, target)) = rip_operand(off, end, inst)? {
             let rel = RipRel { field, end, target };
-            if let Some(i) = image.holes.iter().position(|h| *h == Some(target)) {
+            if let Some(&(_, i)) = image.holes.iter().find(|(slot, _)| *slot == target) {
                 if i == SITE_HOLE {
                     // `mov r64, [rip+slot]` (REX.W 8B /r), made `lea r64,
                     // [rip+record]` (REX.W 8D /r). See Note [Cold stencils].
@@ -1609,7 +1610,7 @@ pub unsafe fn stencil_body(image: &Image, op: &dyn Window, skip: usize, fall_exi
                     leas.push(field - 2);
                 }
                 holes.push((rel, i));
-            } else if image.holes.iter().flatten().any(|&slot| slot < target && target < slot + 8) {
+            } else if image.holes.iter().any(|&(slot, _)| slot < target && target < slot + 8) {
                 return Err(StencilError::PartialHole { op: name, at: off });
             } else if inst.opcode() == Opcode::LEA && target == next {
                 nexts.push(NextRef::Direct(rel));
