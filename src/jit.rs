@@ -1892,6 +1892,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The compensation code a patched thunk site jumps to: the transfer from
     /// the thunk's `window` to `target`'s entry window, then a jump into it.
     fn thunk_stub(&mut self, window: &Cache, target: BlockId) -> usize {
+        #[cfg(feature = "jit_disasm")]
+        let notes = self.jctx.disasm.begin();
         let block = &self.jctx.blocks[&target];
         let (ptr, entry, offset) = (block.ptr, block.window.clone(), block.offset);
         let base = self.jctx.end();
@@ -1911,7 +1913,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.reserve(buf.len());
         let stub = self.jctx.commit(base, &buf).expect("a committed thunk stub") as usize;
         #[cfg(feature = "jit_disasm")]
-        self.jctx.disasm.committed(stub, buf.len(), format!("thunk stub into block {}", target.0));
+        self.jctx.disasm.committed_since(notes, stub, buf.len(), format!("thunk stub into block {}", target.0));
         stub
     }
 

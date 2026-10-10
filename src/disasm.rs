@@ -39,7 +39,19 @@ impl Disasm {
     /// The code assembled, `len` bytes, is now at `addr`: it takes the notes
     /// made on it.
     pub fn committed(&self, addr: usize, len: usize, title: String) {
-        let notes = std::mem::take(&mut *self.notes.borrow_mut());
+        self.committed_since(0, addr, len, title);
+    }
+
+    /// Where the notes of code assembled from now on start: code assembled and
+    /// committed while other code is still being assembled (a thunk stub linked
+    /// as a region is compiled) takes only its own, with `committed_since`.
+    pub fn begin(&self) -> usize {
+        self.notes.borrow().len()
+    }
+
+    /// `committed`, for the code whose notes start at `start` (`begin`).
+    pub fn committed_since(&self, start: usize, addr: usize, len: usize, title: String) {
+        let notes = self.notes.borrow_mut().drain(start..).collect();
         self.ranges.borrow_mut().push(Range { addr, len, title, notes });
     }
 
