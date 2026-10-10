@@ -2155,7 +2155,10 @@ fn upvalue_survives(upvalue: &UpvaluePath, effect: Effect) -> bool {
 // value copied into another, as an argument into an inlined callee's parameter, holds it too. An
 // inlined callee's hash keys are its caller's, and its globals the same, so the subject is the
 // same on both sides of the call, and what the callee learns of it, the caller knows on its
-// return. So a table kept in a field of an object, as the stacks of a machine, keeps the kind a
+// return. Facts are kept only of tables and functions: a slot holds a field only when the field
+// can hold one, and holds a global until a guard finds its value is neither. A load of anything
+// else has only its type to guard, and facts of it would only tell versions apart.
+// So a table kept in a field of an object, as the stacks of a machine, keeps the kind a
 // guard found once, through every call it is passed to; and a global library's table and its
 // functions, as `math.floor`, are known after their first guards wherever they are loaded again.
 //
@@ -4575,7 +4578,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A slot holding a field's or a global's value tells of it too. See Note [Field facts].
             let holds_value = forced_mut.holds_value(idx);
             if let Some(of) = &holds_value {
-                forced_mut.learn_value(of.clone(), found.clone());
+                if matches!(found_field, LType::Table | LType::Userdata | LType::Closure) {
+                    forced_mut.learn_value(of.clone(), found.clone());
+                } else {
+                    // A value that isn't a table or a function: a load of it has only its type
+                    // to guard, and what the slot holds would only tell versions apart. See
+                    // Note [Field facts].
+                    forced_mut.fragile.retain(|fact| !matches!(fact.fragile, Fragile::HoldsValue { slot, .. } if slot == idx));
+                }
             }
             debug!("forcing thunk with {} == {}", found, expected);
             // Continued as a guard the context answers would be, so the ways
@@ -5863,7 +5873,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.ctype())]);
                     // The slot holds the field's value, and the field's array kind is its. See
                     // Note [Field facts].
-                    if let Some(field) = FieldRef::of(&ctx.hkeys, href) {
+                    // Only for a value that can be a table or a function: what a slot holding any
+                    // other learns, its type tells already.
+                    let object = matches!(known, Kind::Mixed | Kind::Of(LType::Table | LType::Userdata | LType::Closure));
+                    if object && let Some(field) = FieldRef::of(&ctx.hkeys, href) {
                         Rc::make_mut(&mut ctx).loaded(slot, Subject::Field(field));
                     }
                     if let Kind::Of(known) = known {
