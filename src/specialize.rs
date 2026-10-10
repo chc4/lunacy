@@ -271,6 +271,9 @@ pub enum YieldOp {
                            // integer whose fact isn't introduced, else as an integer. See
                            // Note [Contraction]
     HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Widening]
+    Versions, // Resumed with Integer, once the code runs: the most versions the running function
+              // has at the point of a version the code is reached from. See `jit.versions` in
+              // `library`
     Encoding(Fits), // An optimistic integer op is about to be laid out, whose result fits for the
                     // values its operands have if the test does: resumed, once the op first runs,
                     // with the double type to compute it in the double encoding instead, else with
@@ -4107,6 +4110,50 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
+    /// The thunk a `Versions` ends its block in: forced, it lays out the code after with the
+    /// count, at a point of its own: at the call's, the version found would be the one the
+    /// thunk is in. See `jit.versions` in `library`.
+    fn make_versions_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let count = vm.versions_entering(owner, block_id);
+            let rest = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Integer(count as i32));
+            vm.jump_thunk(block_id, thunk_pc, rest);
+        })))
+    }
+
+    /// The most versions the running function has at the point of a version code reaching
+    /// `block` was entered at: those it has there, apart from those the trimming found
+    /// unreachable and those a queued contraction will forget. See `jit.versions` in `library`.
+    fn versions_entering(&self, owner: &Owner, block: BlockId) -> usize {
+        let mut from: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for (id, at) in self.blocks.iter().enumerate() {
+            for target in Self::targets(&at.instructions) {
+                from.entry(target).or_default().push(BlockId(id));
+            }
+        }
+        // Back from `block` to the versions code reaching it was entered at.
+        let mut entries: Vec<BlockId> = Vec::new();
+        let mut seen: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
+        let mut work = vec![block];
+        while let Some(at) = work.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            if self.blocks[at.0].context.is_some() {
+                entries.push(at);
+            } else {
+                work.extend(from.get(&at).into_iter().flatten().copied());
+            }
+        }
+        let doomed = |ctx: &Context| ctx.fragile.iter().any(|fact| fact.origins.as_ref().is_some_and(|set| owner.ro(set).iter().any(|origin| {
+            self.contractions.iter().any(|(of, queued, _)| *of == self.proto && queued.iter().any(|known| Rc::ptr_eq(known, origin)))
+        })));
+        let versions = self.versions.get(&self.proto).unwrap();
+        entries.iter().filter_map(|entry| versions.iter().find(|(_, block)| **block == *entry).map(|(key, _)| key)).map(|(at, ctx)| {
+            versions.iter().filter(|((there, theirs), block)| there == at && theirs.same_point(ctx) && !self.unreachable.contains(*block) && !doomed(theirs)).count()
+        }).max().unwrap_or(0)
+    }
+
     /// The thunk a `Guard(idx, t)` (`expected` `CType::Type(t)`) or a
     /// `GuardCType(idx, expected)` ends its block in when the context can't
     /// answer it.
@@ -5622,6 +5669,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let origin = loading.take().expect("a constant's load yields EncodeK first");
                         Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Constant { slot, value: n.0 as i32 }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
                     }
+                },
+                // Found out once run, when the code it is in is laid out. See `jit.versions` in
+                // `library`.
+                CoroutineState::Yielded(YieldOp::Versions) => {
+                    let thunk = Residual::Thunk(self.make_versions_thunk(block_id, coro.clone(), pc, ctx.clone()));
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(thunk);
+                    return None;
                 },
                 CoroutineState::Yielded(YieldOp::Narrow(slot)) => match ctx.types[slot].clone() {
                     CType::Type(LType::Integer) => {

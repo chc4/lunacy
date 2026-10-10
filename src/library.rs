@@ -744,6 +744,32 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
 /// `string.byte`'s generator: for `byte(s, i, j)` keeping one to four results, of a string and
 /// integer positions, its results read where they are in range, as integers; any other call is
 /// the native's. See Note [Native generators].
+/// `jit.versions`'s generator: for `versions()` keeping one result, how many versions the code
+/// it is in has, found out the first time it runs: the most the running function has at the
+/// point of a version reaching the call, apart from those already found unreachable or queued to
+/// be contracted. A test asserts with it that the code it is in isn't duplicated. Any other
+/// call, as one the interpreter runs, is the native's, which returns 0.
+#[cfg(feature = "magic")]
+fn versions_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 1 && c == 2 {
+            let ResumeArg::Integer(n) = (yield YieldOp::Versions) else { unreachable!() };
+            yield YieldOp::ExecWindow(std::rc::Rc::new(VersionsK::new(n, &[a])));
+            yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
+            return ResumeArg::Start;
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
+// `jit.versions()`'s result, as its call was specialized.
+#[cfg(feature = "magic")]
+crate::window::windowed!(VersionsK, [n: i32], [], |owner, state, base| (out r) {
+    *r = LBoxed::from_int(n);
+});
+
 /// `jit.promote`'s generator: for `promote(v)` keeping one result, of an integer (a whole double
 /// narrowed), `v` promoted, its value moved into the result's slot; any other call is the
 /// native's, which returns its argument. See Note [Green values] in `specialize`.
@@ -1103,10 +1129,15 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     };
     // `jit.promote(v)`: `v`, and the code after it specialized to its value. See Note [Green
     // values] in `specialize`. A global only: `require("jit")` is LuaJIT's, which code
-    // probes for.
-    let jit_lib = module(intern, vec![
+    // probes for. `jit.versions()` (feature `magic`): how many versions the code it is in has
+    // (`versions_generator`), for tests.
+    #[allow(unused_mut)]
+    let mut jit_entries = vec![
         ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
-    ]);
+    ];
+    #[cfg(feature = "magic")]
+    jit_entries.push(("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])));
+    let jit_lib = module(intern, jit_entries);
 
     MODULES.with_borrow_mut(|modules| {
         *modules = vec![("bit", erase(&bit_lib)), ("table.new", erase(&table_new)), ("table.clear", erase(&table_clear))];
