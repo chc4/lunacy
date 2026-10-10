@@ -5854,7 +5854,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     });
                 },
                 CoroutineState::Yielded(YieldOp::ArrayType(slot, table)) => {
-                    let kind = ctx.subject_kind(&table);
+                    // A table in a slot is also the field or global the slot holds. See Note
+                    // [Field facts].
+                    let kind = match &table {
+                        Subject::Slot(at) => ctx.array_kind(*at),
+                        _ => ctx.subject_kind(&table),
+                    };
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, kind.map_or(CType::Unknown, Kind::ctype))]);
                     // A load into its table's slot has overwritten the table there.
