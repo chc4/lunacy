@@ -295,6 +295,7 @@ pub enum YieldOp {
                     // value of, if the context knows, else the slot. See Note [Upvalue paths]
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
                                // See Note [Field types]
+    LoadGlobal(usize, usize), // STACK[idx] was just loaded with global CONSTANT[k]. See Note [Field facts]
     LoadUpvalue(usize, usize), // Infrom the executor that STACK[idx]'s type is the same as an UPVALUE[b].
                                // See Note [Fragile information]
     UpvalueKnown(usize), // Resumed with what the context knows of UPVALUE[idx]'s value: Boxed, the
@@ -348,6 +349,9 @@ const MAX_CHAIN: usize = 3;
 
 impl<'src, 'intern> HashKey<'src, 'intern> {
     fn tostring(&self, owner: &Owner) -> String {
+        if self.orphan() {
+            return "free".to_string();
+        }
         let lv: LValue = (&self.key).into();
         // The slots accesses through which are checked, if any.
         let checked: Vec<String> = self.hazards.iter().enumerate().filter(|(_, checked)| **checked).map(|(slot, _)| slot.to_string()).collect();
@@ -383,6 +387,12 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     /// Whether this index is free for a new hash key. See Note [Field types].
     fn orphan(&self) -> bool {
         self.known_type.is_none()
+    }
+
+    /// A free index, as every free index is: what the hash key there was tells nothing. See
+    /// Note [Version compatibility].
+    fn free() -> Self {
+        HashKey { idx: OUTER, key: crate::chunk::Constant::Nil, known_type: None, hazards: SmallVec::new(), place: Place::Register, chain: None }
     }
 
     /// Whether blocks compiled knowing `self` are correct for a context with
@@ -1235,7 +1245,8 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
             Fragile::Holds { slot, upvalue } => shifted(*slot).zip(upvalue.into_callee(frame.closure.as_ref())).map(|(slot, upvalue)| Fragile::Holds { slot, upvalue }),
             Fragile::Upvalue { upvalue, ctype } => upvalue.into_callee(frame.closure.as_ref()).map(|upvalue| Fragile::Upvalue { upvalue, ctype: ctype.clone() }),
             Fragile::Passed { .. } => None,
-            Fragile::HoldsField { slot, field } => shifted(*slot).map(|slot| Fragile::HoldsField { slot, field: *field }),
+            Fragile::HoldsValue { slot, of } => shifted(*slot).zip(of.into_callee(shifted, frame.closure.as_ref())).map(|(slot, of)| Fragile::HoldsValue { slot, of }),
+            Fragile::Known { of, ctype } => of.into_callee(shifted, frame.closure.as_ref()).map(|of| Fragile::Known { of, ctype: ctype.clone() }),
         };
         if let Some(fragile) = fragile.filter(|fragile| fragile.slot().is_none_or(|slot| entry.types[slot] != CType::Type(LType::Nil))) {
             entry.introduce(Fact { fragile, origins: fact.origins.clone() });
@@ -1415,8 +1426,9 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 // ~~~~~~~~~~~~~~~~~~~~
 // Each GETGLOBAL and SETGLOBAL has a cache (`GlobalCache`) of where its global's
 // value is in the global environment, so an access is a compare and a load, not
-// a hash lookup. Nothing about globals goes in the context: which globals a path
-// happens to touch would otherwise split versions at every merge.
+// a hash lookup. Where a global's value is goes in no context; what a guard found
+// of its value does, as a fact about the global (Note [Field facts]), which a
+// join keeps only where both paths have it.
 //
 // A cache holds the entry's address and `env_moves()` when it found it. The
 // entry stays at that address until the environment's entries move, which only
@@ -2026,6 +2038,16 @@ pub enum Subject {
     /// The value of a hash field: of the table and key the hash key at `href` is of. See Note
     /// [Field facts].
     Field(FieldRef),
+    /// The value of a global, by its name's hash (`name_hash`). See Note [Field facts].
+    Global(u64),
+}
+
+/// A field's or a global's name, hashed: what a store with a key of that name may change.
+fn name_hash(name: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    name.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A hash field, as the hash key at its index names it, with its key's name (hashed): an index
@@ -2041,10 +2063,7 @@ impl FieldRef {
     fn of(hkeys: &[HashKey<'_, '_>], href: HashRef) -> Option<FieldRef> {
         let hkey = hkeys.get(href.0 as usize).filter(|hkey| !hkey.orphan())?;
         let crate::chunk::Constant::String(name) = &hkey.key else { return None };
-        use std::hash::{Hash, Hasher};
-        let mut hasher = rustc_hash::FxHasher::default();
-        name.as_bytes().hash(&mut hasher);
-        Some(FieldRef { href: href.0, key: hasher.finish() })
+        Some(FieldRef { href: href.0, key: name_hash(name.as_bytes()) })
     }
 
     /// Whether the hash key at its index still names it.
@@ -2060,6 +2079,7 @@ impl Subject {
             Subject::Slot(slot) => slot << 2,
             Subject::Upvalue(upvalue) => upvalue.key() << 2 | 1,
             Subject::Field(field) => (field.href as usize) << 2 | 2,
+            Subject::Global(name) => (*name as usize) << 2 | 3,
         }
     }
 
@@ -2067,7 +2087,7 @@ impl Subject {
     fn slot(&self) -> Option<usize> {
         match self {
             Subject::Slot(slot) => Some(*slot),
-            Subject::Upvalue(_) | Subject::Field(_) => None,
+            Subject::Upvalue(_) | Subject::Field(_) | Subject::Global(_) => None,
         }
     }
 
@@ -2077,7 +2097,7 @@ impl Subject {
         match self {
             Subject::Slot(slot) => slot_survives(*slot, effect),
             Subject::Upvalue(upvalue) => upvalue_survives(upvalue, effect),
-            Subject::Field(_) => !matches!(effect, Effect::Opaque),
+            Subject::Field(_) | Subject::Global(_) => !matches!(effect, Effect::Opaque),
         }
     }
 
@@ -2088,8 +2108,10 @@ impl Subject {
         match self {
             Subject::Slot(slot) => shifted(*slot).map(Subject::Slot),
             Subject::Upvalue(upvalue) => upvalue.into_callee(closure).map(Subject::Upvalue),
-            // The callee's hash keys are its caller's. See Note [Inlined calls].
+            // The callee's hash keys are its caller's, and its globals the same. See Note
+            // [Inlined calls].
             Subject::Field(field) => Some(Subject::Field(*field)),
+            Subject::Global(name) => Some(Subject::Global(*name)),
         }
     }
 
@@ -2100,6 +2122,7 @@ impl Subject {
             Subject::Slot(_) => None,
             Subject::Upvalue(upvalue) => upvalue.into_caller(closure).map(Subject::Upvalue),
             Subject::Field(field) => Some(Subject::Field(*field)),
+            Subject::Global(name) => Some(Subject::Global(*name)),
         }
     }
 }
@@ -2124,19 +2147,22 @@ fn upvalue_survives(upvalue: &UpvaluePath, effect: Effect) -> bool {
 
 // Note [Field facts]
 // ~~~~~~~~~~~~~~~~~~
-// A hash field is a subject of facts as an upvalue is (Note [Upvalue paths]): named by its hash
-// key's index and its key, it is what a slot loaded from it holds (`HoldsField`), and what such a
-// slot learns of its value, as the kind of its table's array part, the field learns too; a load of
-// it gives the slot what is known of the field. A slot's value copied into another, as an
-// argument into an inlined callee's parameter, holds the field too. An inlined callee's hash keys
-// are its caller's, so the field is the same subject on both sides of the call, and what the
-// callee learns of a table it was passed from a field, the caller knows on its return. So a table
-// kept in a field of an object, as the stacks of a machine, keeps the kind a guard found once,
-// through every call it is passed to.
+// A hash field, and a global, is a subject of facts as an upvalue is (Note [Upvalue paths]): a
+// field named by its hash key's index and its key, a global by its name. It is what a slot loaded
+// from it holds (`HoldsValue`), and what a guard finds of such a slot's value, its type or, for a
+// function, which (`Known`), and the kind of its table's array part, it learns too; a load of it
+// gives the slot what is known of it, so a load needs no guard a load before it passed. A slot's
+// value copied into another, as an argument into an inlined callee's parameter, holds it too. An
+// inlined callee's hash keys are its caller's, and its globals the same, so the subject is the
+// same on both sides of the call, and what the callee learns of it, the caller knows on its
+// return. So a table kept in a field of an object, as the stacks of a machine, keeps the kind a
+// guard found once, through every call it is passed to; and a global library's table and its
+// functions, as `math.floor`, are known after their first guards wherever they are loaded again.
 //
-// A field fact holds while the hash key at its index still names its key, and until a store into
-// a hash part with its key (a store of an unknown key, any field), or an opaque effect: a store
-// into a field is no effect on slots or upvalues, and the hash part it changes may be any table's.
+// A field fact holds while the hash key at its index still names its key. A field's or a global's
+// fact holds until a store with its name, into any hash part (the environment's, as SETGLOBAL's,
+// included), or with an unknown key, or an opaque effect: a store into a hash part is no effect
+// on slots or upvalues, and the table it changes may be any one.
 
 // Note [Upvalue paths]
 // ~~~~~~~~~~~~~~~~~~~~
@@ -2192,9 +2218,13 @@ pub enum Fragile {
     /// Stack slot `slot`, a parameter of an inlined callee, holds the table it
     /// was passed, which the caller's slot `owner` holds. See Note [Inlined calls].
     Passed { slot: usize, owner: usize },
-    /// Stack slot `slot` holds the value hash field `field` held when loaded
-    /// into it. See Note [Field facts].
-    HoldsField { slot: usize, field: FieldRef },
+    /// Stack slot `slot` holds the value a field or a global, `of`, held when
+    /// loaded into it. See Note [Field facts].
+    HoldsValue { slot: usize, of: Subject },
+    /// A field or a global, `of`, holds a value of `ctype`, which a guard found
+    /// in a slot holding its value: for a function past its identity guard,
+    /// which. See Note [Field facts].
+    Known { of: Subject, ctype: CType },
 }
 
 /// A fragile fact, with where the paths reaching it introduced it, if that can
@@ -2299,7 +2329,8 @@ impl Fragile {
             Fragile::Kind { table, .. } => (3, table.key()),
             Fragile::Constant { slot, .. } => (4, *slot),
             Fragile::Passed { slot, .. } => (5, *slot),
-            Fragile::HoldsField { slot, .. } => (6, *slot),
+            Fragile::HoldsValue { slot, .. } => (6, *slot),
+            Fragile::Known { of, .. } => (7, of.key()),
         }
     }
 
@@ -2307,7 +2338,8 @@ impl Fragile {
     fn slot(&self) -> Option<usize> {
         match self {
             Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } | Fragile::Passed { slot, .. }
-                | Fragile::HoldsField { slot, .. } => Some(*slot),
+                | Fragile::HoldsValue { slot, .. } => Some(*slot),
+            Fragile::Known { .. } => None,
             Fragile::Kind { table, .. } => table.slot(),
             Fragile::Upvalue { .. } => None,
         }
@@ -2321,7 +2353,7 @@ impl Fragile {
             Fragile::ElementOf { slot, table } if *slot == from => Some(Fragile::ElementOf { slot: to, table: table.clone() }),
             Fragile::Kind { table: Subject::Slot(slot), kind } if *slot == from => Some(Fragile::Kind { table: Subject::Slot(to), kind: *kind }),
             Fragile::Constant { slot, value } if *slot == from => Some(Fragile::Constant { slot: to, value: *value }),
-            Fragile::HoldsField { slot, field } if *slot == from => Some(Fragile::HoldsField { slot: to, field: *field }),
+            Fragile::HoldsValue { slot, of } if *slot == from => Some(Fragile::HoldsValue { slot: to, of: of.clone() }),
             _ => None,
         }
     }
@@ -2344,7 +2376,8 @@ impl Fragile {
             Fragile::Constant { slot, .. } => slot_survives(*slot, effect),
             // The caller's slot is the caller's own, which the callee doesn't write.
             Fragile::Passed { slot, .. } => slot_survives(*slot, effect),
-            Fragile::HoldsField { slot, field } => slot_survives(*slot, effect) && Subject::Field(*field).survives(effect),
+            Fragile::HoldsValue { slot, of } => slot_survives(*slot, effect) && of.survives(effect),
+            Fragile::Known { of, .. } => of.survives(effect),
         }
     }
 }
@@ -2501,6 +2534,33 @@ impl Context {
         }
     }
 
+    /// The context with its free hash key indexes all alike, and none past its last hash key:
+    /// contexts knowing the same hash keys are then equal, whatever was at their free indexes
+    /// before. See Note [Version compatibility].
+    fn canonical_free(ctx: Rc<Context>) -> Rc<Context> {
+        if ctx.free_canonical() {
+            return ctx;
+        }
+        let mut ctx = ctx;
+        Rc::make_mut(&mut ctx).canonicalize_free();
+        ctx
+    }
+
+    /// Whether its free hash key indexes are all alike, and none is past its last hash key.
+    fn free_canonical(&self) -> bool {
+        self.hkeys.iter().all(|hkey| !hkey.orphan() || *hkey == HashKey::free()) && self.hkeys.last().is_none_or(|hkey| !hkey.orphan())
+    }
+
+    /// Make its free hash key indexes all alike, and drop those past its last hash key.
+    fn canonicalize_free(&mut self) {
+        for hkey in self.hkeys.iter_mut().filter(|hkey| hkey.orphan()) {
+            *hkey = HashKey::free();
+        }
+        while self.hkeys.last().is_some_and(|hkey| hkey.orphan()) {
+            self.hkeys.pop();
+        }
+    }
+
     /// Whether `self` and `other` are at the same point of the code: in the same
     /// inlined call, past the same promoted values. Versions at different points
     /// are never compared. See Note [Promoted values].
@@ -2568,38 +2628,97 @@ impl Context {
     /// Note [Array kinds].
     fn array_kind(&self, table: usize) -> Option<Kind> {
         self.subject_kind(&Subject::Slot(table))
-            .or_else(|| self.holds_field(table).and_then(|field| self.subject_kind(&Subject::Field(field))))
+            .or_else(|| self.holds_value(table).and_then(|of| self.subject_kind(&of)))
     }
 
-    /// The hash field slot `slot` holds the value of, if known and its hash key still names it.
-    /// See Note [Field facts].
-    fn holds_field(&self, slot: usize) -> Option<FieldRef> {
+    /// The field or global slot `slot` holds the value of, if known, and for a field, its hash
+    /// key still names it. See Note [Field facts].
+    fn holds_value(&self, slot: usize) -> Option<Subject> {
         self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::HoldsField { slot: held, field } if *held == slot && field.live(&self.hkeys) => Some(*field),
+            Fragile::HoldsValue { slot: held, of } if *held == slot && self.subject_live(of) => Some(of.clone()),
             _ => None,
         })
     }
 
-    /// Forget what is known of the fields `stored` may be: those of hash key `href`'s key, or
-    /// with none, every field. See Note [Field facts].
-    fn forget_fields(&mut self, stored: Option<HashRef>) {
-        let key = stored.map(|href| FieldRef::of(&self.hkeys, href).map(|field| field.key));
-        let falsified = |field: &FieldRef| match key {
-            Some(Some(key)) => field.key == key,
-            // A key no field names: no field is it.
-            Some(None) => false,
-            None => true,
-        };
-        self.fragile.retain(|fact| match &fact.fragile {
-            Fragile::HoldsField { field, .. } | Fragile::Kind { table: Subject::Field(field), .. } => !falsified(field),
+    /// Whether a field's hash key still names it; a global is always itself.
+    fn subject_live(&self, of: &Subject) -> bool {
+        match of {
+            Subject::Field(field) => field.live(&self.hkeys),
             _ => true,
+        }
+    }
+
+    /// What a guard found of field or global `of`'s value, if known. See Note [Field facts].
+    fn known(&self, of: &Subject) -> Option<CType> {
+        self.fragile.iter().find_map(|fact| match &fact.fragile {
+            Fragile::Known { of: known, ctype } if known == of && self.subject_live(of) => Some(ctype.clone()),
+            _ => None,
+        })
+    }
+
+    /// Assume field or global `of` holds a value of `ctype`, as does each slot holding its value,
+    /// unless the slot's type already tells more. See Note [Field facts].
+    fn learn_value(&mut self, of: Subject, ctype: CType) {
+        for fact in &self.fragile {
+            if let Fragile::HoldsValue { slot, of: held } = &fact.fragile && *held == of && self.types[*slot].accepts(&ctype) {
+                self.types[*slot] = ctype.clone();
+            }
+        }
+        self.assume(Fragile::Known { of, ctype });
+    }
+
+    /// Slot `slot` was just loaded from field or global `of`: it holds its value, of the type and
+    /// the array kind known of it. See Note [Field facts].
+    fn loaded(&mut self, slot: usize, of: Subject) {
+        if let Some(ctype) = self.known(&of) && self.types[slot].accepts(&ctype) {
+            self.types[slot] = ctype;
+        }
+        if let Some(kind) = self.subject_kind(&of) {
+            self.assume(Fragile::Kind { table: Subject::Slot(slot), kind });
+        }
+        self.assume(Fragile::HoldsValue { slot, of });
+    }
+
+    /// The name of the subject a fact is about, if a field or a global: what a store with a key of
+    /// that name falsifies.
+    fn fact_name(fact: &Fragile) -> Option<u64> {
+        let of = match fact {
+            Fragile::HoldsValue { of, .. } | Fragile::Known { of, .. } | Fragile::Kind { table: of, .. } => of,
+            _ => return None,
+        };
+        match of {
+            Subject::Field(field) => Some(field.key),
+            Subject::Global(name) => Some(*name),
+            _ => None,
+        }
+    }
+
+    /// Forget what is known of the fields and globals a store with a key named `stored` may
+    /// change, or with none, of every field and global. See Note [Field facts].
+    fn forget_named(&mut self, stored: Option<u64>) {
+        self.fragile.retain(|fact| match (Context::fact_name(&fact.fragile), stored) {
+            (Some(name), Some(stored)) => name != stored,
+            (Some(_), None) => false,
+            (None, _) => true,
         });
+    }
+
+    /// Forget what is known of the fields a store through hash key `href` may change: those of
+    /// its key's name, or with none, every field and global.
+    fn forget_fields(&mut self, stored: Option<HashRef>) {
+        match stored.map(|href| FieldRef::of(&self.hkeys, href).map(|field| field.key)) {
+            // A key no field names: no field or global is it.
+            Some(None) => {},
+            Some(Some(name)) => self.forget_named(Some(name)),
+            None => self.forget_named(None),
+        }
     }
 
     /// Forget what is known of the field hash key `href` named, its index given to another.
     fn forget_index(&mut self, href: usize) {
         self.fragile.retain(|fact| match &fact.fragile {
-            Fragile::HoldsField { field, .. } | Fragile::Kind { table: Subject::Field(field), .. } => field.href as usize != href,
+            Fragile::HoldsValue { of: Subject::Field(field), .. } | Fragile::Known { of: Subject::Field(field), .. }
+                | Fragile::Kind { table: Subject::Field(field), .. } => field.href as usize != href,
             _ => true,
         });
     }
@@ -2619,8 +2738,8 @@ impl Context {
         if let Subject::Slot(slot) = table && let Some(upvalue) = self.holds(slot) {
             self.assume(Fragile::Kind { table: Subject::Upvalue(upvalue), kind });
         }
-        if let Subject::Slot(slot) = table && let Some(field) = self.holds_field(slot) {
-            self.assume(Fragile::Kind { table: Subject::Field(field), kind });
+        if let Subject::Slot(slot) = table && let Some(of) = self.holds_value(slot) {
+            self.assume(Fragile::Kind { table: of, kind });
         }
         self.assume(Fragile::Kind { table, kind });
     }
@@ -3235,6 +3354,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
+        let ctx = Context::canonical_free(ctx);
         if let Some(((_, ectx), &exists)) = self.versions.get(&self.proto).unwrap().get_key_value(&(pc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
             return exists;
@@ -3264,6 +3384,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The block a jump to `pc` in `ctx` enters: a version for `ctx`, or one
     /// accepting it, compiled if need be. See Note [Version compatibility].
     pub fn version(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>) -> BlockId {
+        let ctx = Context::canonical_free(ctx);
         #[cfg(feature = "tracing")]
         let requested = ctx.clone();
         let (block, outcome, joined) = self.choose_version(owner, pc, ctx);
@@ -4413,7 +4534,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let value = match &table {
                     Subject::Slot(slot) => state.vals[state.base + slot],
                     Subject::Upvalue(UpvaluePath::Own(j)) => state.upvalue(owner, *j as usize),
-                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) | Subject::Field(_) => return None,
+                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) | Subject::Field(_) | Subject::Global(_) => return None,
                 };
                 let LValue::Table(tab) = value.unbox() else { unreachable!("an element of an array part not of a table") };
                 Some((table, tab.ro(owner).kind))
@@ -4424,7 +4545,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::GuardDynamic(match table {
                     Subject::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot])),
                     Subject::Upvalue(UpvaluePath::Own(j)) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
-                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) | Subject::Field(_) => unreachable!("a kind read through another closure or a field"),
+                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) | Subject::Field(_) | Subject::Global(_) => unreachable!("a kind read through another closure, a field or a global"),
                 })
             } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
@@ -4450,6 +4571,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let holds = forced_mut.holds(idx);
             if let Some(upvalue) = &holds {
                 forced_mut.learn_upvalue(upvalue.clone(), found.clone());
+            }
+            // A slot holding a field's or a global's value tells of it too. See Note [Field facts].
+            let holds_value = forced_mut.holds_value(idx);
+            if let Some(of) = &holds_value {
+                forced_mut.learn_value(of.clone(), found.clone());
             }
             debug!("forcing thunk with {} == {}", found, expected);
             // Continued as a guard the context answers would be, so the ways
@@ -4484,6 +4610,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if let Some(upvalue) = holds {
                     forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
                 }
+                if let Some(of) = holds_value {
+                    forced_mut.learn_value(of, idx_ctype.clone().unwrap());
+                }
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
                 // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
@@ -4501,6 +4630,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 forced_mut.types[idx] = idx_ctype.clone().unwrap();
                 if let Some(upvalue) = holds {
                     forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
+                }
+                if let Some(of) = holds_value {
+                    forced_mut.learn_value(of, idx_ctype.clone().unwrap());
                 }
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 let proto = lclos.ro(owner).prototype.cast();
@@ -4583,6 +4715,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Fragile::Kind { table, kind } => if let Some(table) = table.into_caller(closure) {
                     known.assume(Fragile::Kind { table, kind: *kind });
+                },
+                Fragile::Known { of, ctype } => if let Some(of) = of.into_caller(closure) {
+                    known.assume(Fragile::Known { of, ctype: ctype.clone() });
                 },
                 _ => {},
             }
@@ -4874,8 +5009,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// less the callee's frame (`captured` its slots below the call its closures captured). See
     /// Note [Inlined calls].
     fn inline_frame(calling: &Context, callee: LProto<'static, 'static>, caller: &Context, captured: &Rc<[usize]>, proto: LProto<'static, 'static>, after: Pc, a: usize, b: usize, c: usize) -> Context {
+        // The caller's context is part of the callee's versions' identity: its free hash key
+        // indexes alike, as a version's are. See Note [Version compatibility].
+        let mut caller = caller.clone();
+        caller.canonicalize_free();
         let frame = InlineFrame {
-            caller: caller.clone(),
+            caller,
             captured: captured.clone(),
             proto,
             after,
@@ -5725,11 +5864,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // The slot holds the field's value, and the field's array kind is its. See
                     // Note [Field facts].
                     if let Some(field) = FieldRef::of(&ctx.hkeys, href) {
-                        let ctx = Rc::make_mut(&mut ctx);
-                        if let Some(kind) = ctx.subject_kind(&Subject::Field(field)) {
-                            ctx.assume(Fragile::Kind { table: Subject::Slot(slot), kind });
-                        }
-                        ctx.assume(Fragile::HoldsField { slot, field });
+                        Rc::make_mut(&mut ctx).loaded(slot, Subject::Field(field));
                     }
                     if let Kind::Of(known) = known {
                         (pc, arg) = navigate(pc, &CType::Unknown, &CType::Type(known));
@@ -5958,10 +6093,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::Cache(&*cache as *const GlobalCache);
                     self.global_caches.push(cache);
                 },
+                CoroutineState::Yielded(YieldOp::LoadGlobal(slot, k)) => {
+                    let proto = self.proto;
+                    if let crate::chunk::Constant::String(name) = unsafe { &(&(*proto).constants.items)[k] } {
+                        Rc::make_mut(&mut ctx).loaded(slot, Subject::Global(name_hash(name.as_bytes())));
+                    }
+                },
                 CoroutineState::Yielded(YieldOp::SetKeyHazards(k)) => {
                     let proto = self.proto;
                     let key: &LConstant<'static, 'static> = unsafe { core::mem::transmute(&(&(*proto).constants.items)[k]) };
                     Rc::make_mut(&mut ctx).set_key_hazards(key);
+                    // The global, and any field of its name, may hold another value now. See Note
+                    // [Field facts].
+                    if let crate::chunk::Constant::String(name) = key {
+                        Rc::make_mut(&mut ctx).forget_named(Some(name_hash(name.as_bytes())));
+                    }
                     // A store into the environment's hash part. See Note [Call effects].
                     self.join_effects(owner, Effects::HASH);
                 },

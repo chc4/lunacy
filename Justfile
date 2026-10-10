@@ -105,6 +105,21 @@ trace-golden name features='check_windows':
     mv lunacy.fxt working/lunacy.fxt
     python3 tools/perfetto_summary.py working/lunacy.fxt
 
+# `trace-golden` of this checkout's lua_tests/<name>.lua at revision `ref`, from
+# its compare worktree (as for `hyperfine-vs`): its trace in
+# working/lunacy-golden-<name>-<ref>.fxt, its test output in
+# working/golden-<name>-<ref>.log. For when a test's versions grew, and which
+# revision made them.
+trace-golden-rev ref name features='check_windows':
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just _compare-worktree {{ref}}
+    dir=target/compare/{{ref}}
+    cp lua_tests/{{name}}.lua $dir/lua_tests/{{name}}.lua
+    (cd $dir && LUNACY_GOLDEN={{name}} {{SHARED}} cargo test --release --features "{{features}} tracing" --test golden_tests test_golden) > working/golden-{{name}}-{{ref}}.log 2>&1
+    grep -aE "test result|panicked at|Output mismatch" working/golden-{{name}}-{{ref}}.log | head -2
+    mv $dir/lunacy.fxt working/lunacy-golden-{{name}}-{{ref}}.fxt
+
 # `trace`'s summary of working/lunacy.fxt again.
 show-trace:
     python3 tools/perfetto_summary.py working/lunacy.fxt

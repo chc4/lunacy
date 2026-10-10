@@ -350,6 +350,8 @@ pub fn emit_getglobal(dest: usize, k: usize) -> impl Coroutine<ResumeArg, Yield 
         let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
         arg = yield YieldOp::ExecWindow(Rc::new(GetGlobal::new(cache as usize, &[dest])));
         yield YieldOp::SetCTypes(vec![(dest, CType::Unknown)]);
+        // What's known of the global's value. See Note [Field facts] in `specialize`.
+        yield YieldOp::LoadGlobal(dest, k);
         arg
     }
 }
@@ -387,7 +389,7 @@ crate::window::windowed!(guard InArrayK, [k: i32], [], |owner, state, base| (tab
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(k) < tab.ro(owner).array.len()
 });
-// Whether an integer is `k`: a promote's guard. See Note [Green values] in `specialize`.
+// Whether an integer is `k`: a promote's guard. See Note [Promoted values] in `specialize`.
 crate::window::windowed!(guard EqualsK, [k: i32], [], |owner, state, base| (value) {
     value.as_int() == k
 });
