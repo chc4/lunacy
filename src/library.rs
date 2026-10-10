@@ -689,6 +689,24 @@ fn abs_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box
     })
 }
 
+// `assert`'s condition: exit 0 if it holds, 1 if not. See Note [Optimistic ops] in `specialize`.
+crate::window::windowed!(select AssertHolds, [], [], |owner, state, base| (condition) {
+    if condition.truthy() { 0 } else { 1 }
+});
+
+/// `assert`'s generator: for a call keeping no results, its condition tested, the native called
+/// only where it fails, to raise; any other call is the native's. See Note [Native generators].
+pub(crate) fn assert_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b >= 2 && c == 1 && (yield YieldOp::OptimisticExec(std::rc::Rc::new(AssertHolds::new(&[a + 1])))) == ResumeArg::Matched {
+            return ResumeArg::Start;
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
 /// `math.floor`'s and `math.ceil`'s generator (`OP`): for a call of one number keeping one
 /// result, its result in the encoding an integer op's is, decided the first time it runs, and
 /// rebuilt to compute in doubles once one doesn't fit; any other call is the native's. See Notes

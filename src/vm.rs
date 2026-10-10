@@ -2520,7 +2520,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 }))),
                 // Lua's `assert(v [, message])`: its arguments, unless `v` is false or nil,
                 // where it raises `message`, or "assertion failed!".
-                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::pure(|mut seq, args, returns, _owner| {
+                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::pure_generated(|mut seq, args, returns, _owner| {
                     match args.ro(&seq).first() {
                         // Only the arguments the call wants back are copied, none for most.
                         Some(v) if v.truthy() => {
@@ -2535,7 +2535,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         },
                         _ => Err(args.ro(&seq).get(1).copied().unwrap_or_else(|| LBoxed::box_lvalue(LValue::OwnedString(Gc::string(b"assertion failed!"))))),
                     }
-                }))),
+                }, crate::library::assert_generator))),
                 // Lua's `collectgarbage(opt [, arg])`: drive the collector explicitly.
                 (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(collectgarbage))),
                 math,
