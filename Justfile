@@ -1191,3 +1191,36 @@ hyperfines-vs ref:
     python3 tools/bench_history.py report
 
 all: test benchmarks (hyperfine "binarytrees")
+
+# Experiment: stencil holes as LLVM patchpoints instead of RIP-relative loads.
+# experiments/patchpoint/hole.ll wraps `llvm.experimental.patchpoint.i64` (and
+# a stackmap) in plain functions, made ThinLTO bitcode (with a summary: plain
+# bitcode is a separate full-LTO partition, which ThinLTO never inlines from)
+# by the LLVM release rustc is built on; experiments/patchpoint/main.rs calls
+# them and is built with `-C linker-plugin-lto` and linked by rustc's own lld,
+# so LTO inlines the wrappers into the Rust callers. `.llvm_stackmaps` needs
+# keeping from section GC, and its absolute relocations in a read-only section
+# need `-z notext` under PIE. Built with rustc directly, not as a cargo bin, so
+# the crate's build never needs the bitcode. Writes the binary, LTO's
+# intermediate files, each `ex_*` function's disassembly and the stackmap to
+# target/patchpoint/.
+patchpoint-experiment:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=target/patchpoint
+    mkdir -p $out
+    llvm=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#llvmPackages_23.llvm)/bin
+    $llvm/llvm-as --version | grep version
+    rustc --version --verbose | grep LLVM
+    $llvm/opt --thinlto-bc experiments/patchpoint/hole.ll -o $out/hole.bc
+    {{SHARED}} rustc --edition 2024 -C opt-level=3 -C codegen-units=1 -C panic=abort -C target-cpu=native \
+        -C linker-plugin-lto -C linker-flavor=gnu-lld-cc -Z unstable-options -C link-self-contained=+linker \
+        -C link-arg=$out/hole.bc -C link-arg=-Wl,--save-temps -C link-arg=-Wl,--no-gc-sections -C link-arg=-Wl,-z,notext -o $out/patchpoint_experiment experiments/patchpoint/main.rs
+    {{SHARED}} $out/patchpoint_experiment
+    syms=$($llvm/llvm-nm $out/patchpoint_experiment | awk '$3 ~ /^(ex_|pp_|sm_)/ {print $3}' | sort)
+    echo "symbols: $syms"
+    for s in $(echo "$syms" | grep '^ex_'); do
+        $llvm/llvm-objdump -d -M intel --disassemble-symbols=$s $out/patchpoint_experiment | sed -n '/^[0-9a-f]* </,$p'
+    done | tee $out/disasm.txt
+    $llvm/llvm-readobj --stackmap $out/patchpoint_experiment | tee $out/stackmap.txt
+    $llvm/llvm-objdump -s -j .lunacy_imm_holes $out/patchpoint_experiment || true
