@@ -6978,76 +6978,122 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             reverse_versions.insert(v.0, k);
         }
 
-        let g = graph!(strict di id!("t"); subgraph!("s",
-            self.blocks.iter().enumerate().flat_map(|(id, residuals)| {
-                let block_id = id;
-                let mut instructions = Vec::new();
-                let mut edges = vec![];
-
-                fn safe_str(s: impl Into<String>) -> String {
-                    let s = s.into().replace("<", "\\<");
-                    let s = s.replace(">", "\\>");
-                    s
-                }
-
-                for (off, res) in residuals.instructions.iter().enumerate() {
-                    let inst_label = res.to_string();
-                    instructions.push(inst_label);
-                    match res {
-                        Residual::Jump(target) => {
-                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0))));
+        fn safe_str(s: impl Into<String>) -> String {
+            let s = s.into().replace("<", "\\<");
+            s.replace(">", "\\>")
+        }
+        // A side exit never taken: a block that is only a thunk never forced.
+        let untaken = |block: BlockId| matches!(self.blocks[block.0].instructions.as_slice(), [Residual::Thunk(_)]);
+        // Each block's edges, labelled, and the block its code goes straight on into: a jump's,
+        // or a branch's hot block where its cold one was never taken.
+        let mut edges: Vec<Vec<(usize, Option<&'static str>)>> = Vec::new();
+        let mut natives: Vec<Vec<String>> = Vec::new();
+        let mut straight: Vec<Option<usize>> = Vec::new();
+        for residuals in &self.blocks {
+            let (mut out, mut calls) = (Vec::new(), Vec::new());
+            for (off, res) in residuals.instructions.iter().enumerate() {
+                match res {
+                    Residual::Jump(target) => out.push((target.0, None)),
+                    Residual::NativeCall { nf, .. } => calls.push(format!("\"{:p}\"", nf)),
+                    Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::GuardWitness { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } | Residual::Selected => {
+                        if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
+                            out.push((target.0, Some("pass")));
                         }
-                        Residual::NativeCall { nf, a, b, c }  => {
-                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("\"{:p}\"", nf)); attr!("label", "ncall"))));
-                        },
-                        Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::GuardWitness { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } | Residual::Selected => {
-                            if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
-                                edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "pass"))));
-                            }
-                            if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 1) {
-                                edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "fail"))));
-                            }
-                        },
-                        Residual::Select(targets) => {
-                            for (name, target) in targets {
-                                edges.push(Stmt::Edge(
-                                    edge!(node_id!(block_id) => node_id!(target.0); attr!("label", name))));
-                            }
-                        },
-                        Residual::Branch { hot, cold } => {
-                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(hot.0); attr!("label", "hot"))));
-                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(cold.0); attr!("label", "cold"))));
-                        },
-                        _ => {}
+                        if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 1) {
+                            out.push((target.0, Some("fail")));
+                        }
+                    },
+                    Residual::Select(targets) => out.extend(targets.iter().map(|(name, target)| (target.0, Some(*name)))),
+                    Residual::Branch { hot, cold } => {
+                        out.push((hot.0, Some("hot")));
+                        if !untaken(*cold) {
+                            out.push((cold.0, Some("cold")));
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            straight.push(match residuals.instructions.last() {
+                Some(Residual::Jump(target)) => Some(target.0),
+                Some(Residual::Branch { hot, cold }) if untaken(*cold) => Some(hot.0),
+                _ => None,
+            });
+            edges.push(out);
+            natives.push(calls);
+        }
+        // Blocks drawn as the code before them goes on: the only block reaching them goes straight
+        // into them. Untaken side exits aren't drawn at all.
+        let mut sources: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); self.blocks.len()];
+        for (from, out) in edges.iter().enumerate() {
+            for &(to, _) in out {
+                sources[to].insert(from);
+            }
+        }
+        let hidden = |block: usize| untaken(BlockId(block)) && sources[block].is_empty();
+        let absorbed: Vec<bool> = (0..self.blocks.len()).map(|block| {
+            sources[block].len() == 1 && sources[block].iter().all(|&from| from != block && straight[from] == Some(block))
+        }).collect();
+        let header = |block: usize| {
+            let context = reverse_versions.get(&block).map_or(String::new(), |(subpc, ctx)| {
+                format!("PC: {:?}\\n{}", subpc, ctx.tostring(owner)).replace("{", "(").replace("}", ")")
+            });
+            #[cfg(feature = "graph")]
+            let entered = format!(" x{}", self.blocks[block].entered);
+            #[cfg(not(feature = "graph"))]
+            let entered = "";
+            (format!("{block}{entered}"), context)
+        };
+        let mut drawn = vec![false; self.blocks.len()];
+        let mut stmts = Vec::new();
+        // Heads first, then any cycle of blocks each the only way into the next.
+        let order: Vec<usize> = (0..self.blocks.len()).filter(|&b| !absorbed[b]).chain((0..self.blocks.len()).filter(|&b| absorbed[b])).collect();
+        for head in order {
+            if drawn[head] || hidden(head) {
+                continue;
+            }
+            let mut chain = vec![head];
+            drawn[head] = true;
+            while let Some(next) = straight[*chain.last().unwrap()].filter(|&next| absorbed[next] && !drawn[next]) {
+                drawn[next] = true;
+                chain.push(next);
+            }
+            let (name, context) = header(head);
+            let mut rows: Vec<String> = Vec::new();
+            if !context.is_empty() {
+                rows.push(context);
+            }
+            for (i, &block) in chain.iter().enumerate() {
+                if i > 0 {
+                    let (name, context) = header(block);
+                    rows.push(format!("→ {name}"));
+                    if !context.is_empty() {
+                        rows.push(context);
                     }
                 }
-                debug!("graphviz edges: {:?}", edges);
-
-                let context_str = if let Some((subpc, ctx)) = reverse_versions.get(&block_id) {
-                    format!("PC: {:?}\\n{} |", subpc, ctx.tostring(owner))
-                } else {
-                    "".to_string()
-                };
-                let context_str = context_str.replace("{", "(");
-                let context_str = context_str.replace("}", ")");
-
-                //let label = safe_str(format!("\"{} | {{ {} {} }}\"", block_id, context_str, instructions));
-                #[cfg(feature = "graph")]
-                let entered = format!(" x{}", residuals.entered);
-                #[cfg(not(feature = "graph"))]
-                let entered = "";
-                let label = safe_str(format!("\"{}{} | {{ {} {} }}\"", block_id, entered, context_str, instructions.drain(..).intersperse("| ".to_string()).collect::<String>()));
-
-                let mut stmts = vec![Stmt::Node(node!(block_id;
-                    attr!("id", block_id),
-                    attr!("shape", "record"),
-                    attr!("label", label)
-                ))];
-                stmts.extend(edges);
-                stmts
-            }).collect::<Vec<_>>()
-          )
-        );
+                let instructions = &self.blocks[block].instructions;
+                // The jump into the next block of the chain is the chain going on.
+                let shown = if i + 1 < chain.len() && matches!(instructions.last(), Some(Residual::Jump(_))) { instructions.len() - 1 } else { instructions.len() };
+                rows.extend(instructions[..shown].iter().map(|res| res.to_string()));
+            }
+            let label = safe_str(format!("\"{} | {{ {} }}\"", name, rows.join("| ")));
+            stmts.push(Stmt::Node(node!(head; attr!("id", head), attr!("shape", "record"), attr!("label", label))));
+            for (i, &block) in chain.iter().enumerate() {
+                for &(to, label) in &edges[block] {
+                    // Into the chain's next block, or into an untaken side exit: not an edge.
+                    if (i + 1 < chain.len() && to == chain[i + 1] && straight[block] == Some(to)) || hidden(to) {
+                        continue;
+                    }
+                    stmts.push(Stmt::Edge(match label {
+                        Some(label) => edge!(node_id!(head) => node_id!(to); attr!("label", label)),
+                        None => edge!(node_id!(head) => node_id!(to)),
+                    }));
+                }
+                for native in &natives[block] {
+                    stmts.push(Stmt::Edge(edge!(node_id!(head) => node_id!(native); attr!("label", "ncall"))));
+                }
+            }
+        }
+        let g = graph!(strict di id!("t"); subgraph!("s", stmts));
 
         // The DOT source is written next to the rendered graph, to read as text.
         let dot_path = std::path::Path::new(filepath).with_extension("dot");
