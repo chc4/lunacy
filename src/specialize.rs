@@ -163,7 +163,6 @@ impl std::fmt::Display for Residual {
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Select(targets) => write!(f, "select"),
             Residual::Branch { .. } => write!(f, "branch"),
-            Residual::Selected => write!(f, "selected"),
             Residual::Ret(..) => write!(f, "ret"),
             Residual::Inline { a, b, .. } => write!(f, "inline({}, {})", a, b),
             Residual::InlineReturn { a, b, .. } => write!(f, "inline_ret({}, {})", a, b),
@@ -421,15 +420,16 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     }
 }
 
-/// The integer ops the peephole holds, the first as it would have been laid out where it was held.
-/// See Note [Peephole fusion] in `peephole`.
+/// The integer ops the peephole holds, the first and the last as they would have been laid out where
+/// they were held. See Note [Peephole fusion] in `peephole`.
 struct Held {
     ops: Vec<crate::peephole::IntOp>,
-    first: HeldFirst,
+    first: HeldOp,
+    last: HeldOp,
 }
 
 #[derive(Clone)]
-struct HeldFirst {
+struct HeldOp {
     window: Rc<dyn Window>,
     /// Whether its window has a cold path (`OptimisticExec`), else none (`ExecWindow`).
     optimistic: bool,
@@ -444,7 +444,7 @@ struct HeldFirst {
 
 /// Whether the peephole can hold integer op `op`. See Note [Peephole fusion] in `peephole`.
 fn holdable(op: &crate::peephole::IntOp) -> bool {
-    crate::peephole::fuses() && crate::peephole::exact(std::slice::from_ref(op))
+    crate::peephole::fuses() && crate::peephole::starts(op)
 }
 
 /// Whether a yield leaves what the peephole holds held, laying out no code: in `ctx`, the window
@@ -1042,9 +1042,6 @@ pub enum Residual {
     /// takes it with no `select`: the op's cold path continues at `cold` itself. See Note
     /// [Optimistic ops].
     Branch { hot: BlockId, cold: BlockId },
-    /// Whether the op before it selected 0: if so the code goes on past the residual after it,
-    /// else to it. See Note [Peephole fusion] in `peephole`.
-    Selected,
     Jump(BlockId),
     Thunk(ThunkRef),
     /// A RETURN of `b - 1` values from R(A), or up to the top. Closes the frame's open upvalues.
@@ -4622,7 +4619,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn hold<C>(&mut self, owner: &mut Owner, block_id: BlockId, int_op: crate::peephole::IntOp, window: &Rc<dyn Window>, optimistic: bool, coro: &Box<C>, pc: SubPc, ctx: &mut Rc<Context>) -> bool
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
-        if self.held.as_ref().is_some_and(|held| !crate::peephole::exact(&[held.ops.as_slice(), &[int_op]].concat())) && self.flush(owner, block_id) {
+        if self.held.as_ref().is_some_and(|held| !crate::peephole::extends(&held.ops, &int_op)) && self.flush(owner, block_id) {
             return true;
         }
         // Its outputs are written, as laying it out would write them.
@@ -4631,19 +4628,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Rc::make_mut(ctx).effect(Effect::Write(slot));
             }
         }
-        if self.held.is_none() {
-            let asked = if optimistic { self.encoding.take() } else { None };
-            let first = HeldFirst { window: window.clone(), optimistic, coro: Box::new((**coro).clone()), pc, ctx: ctx.clone(), asked };
-            self.held = Some(Held { ops: Vec::new(), first });
+        let asked = if optimistic { self.encoding.take() } else { None };
+        let this = HeldOp { window: window.clone(), optimistic, coro: Box::new((**coro).clone()), pc, ctx: ctx.clone(), asked };
+        match &mut self.held {
+            Some(held) => {
+                held.ops.push(int_op);
+                held.last = this;
+            },
+            None => self.held = Some(Held { ops: vec![int_op], first: this.clone(), last: this }),
         }
-        self.held.as_mut().unwrap().ops.push(int_op);
         false
     }
 
     /// Lay out what the peephole holds in `block_id`: one op as it would have been where it was
-    /// held, which ends the block if it has a cold path; more as one, guarded by whether it fit,
-    /// the first op as it would have been on the cold path. Whether it ended the block. See Note
-    /// [Peephole fusion] in `peephole`.
+    /// held, which ends the block if it has a cold path; more as their fused op, ending the block,
+    /// its hot path as the last op's, its cold path the first op as it would have been where it was
+    /// held. Whether it ended the block. See Note [Peephole fusion] in `peephole`.
     fn flush(&mut self, owner: &mut Owner, block_id: BlockId) -> bool {
         let Some(held) = self.held.take() else { return false };
         let first = held.first;
@@ -4657,21 +4657,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.lay_out_held(owner, block_id, first);
             return true;
         }
+        let window = crate::peephole::fused_window(&held.ops).expect("a held run is a fused op");
         self.end_block(block_id);
-        self.blocks[block_id.0].instructions.push(Residual::Exec(crate::peephole::Fused::new(held.ops).exec()));
-        self.blocks[block_id.0].instructions.push(Residual::Selected);
+        self.blocks[block_id.0].instructions.push(Residual::ExecWindow(window));
+        let last = held.last;
+        let resume = if last.optimistic { ResumeArg::Matched } else { ResumeArg::Start };
+        let hot = self.subblock(owner, last.pc.next_true(), last.ctx.clone(), Box::new(last.coro.clone()), resume);
+        let cold = self.new_block(first.pc.0);
         let thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            let cold = vm.new_block(first.pc.0);
-            vm.lay_out_held(owner, cold, first.clone());
-            vm.jump_thunk(block_id, thunk_pc, cold);
+            let unfused = vm.new_block(first.pc.0);
+            vm.lay_out_held(owner, unfused, first.clone());
+            vm.jump_thunk(cold, thunk_pc, unfused);
         })));
-        self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
-        false
+        self.blocks[cold.0].instructions.push(Residual::Thunk(thunk));
+        self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
+        true
     }
 
     /// Lay out the first op the peephole held in `block`, as it would have been where it was held,
     /// the code going on from there. See Note [Peephole fusion] in `peephole`.
-    fn lay_out_held(&mut self, owner: &mut Owner, block: BlockId, first: HeldFirst) {
+    fn lay_out_held(&mut self, owner: &mut Owner, block: BlockId, first: HeldOp) {
         self.blocks[block.0].instructions.push(Residual::ExecWindow(first.window));
         if first.optimistic {
             let hot = self.subblock(owner, first.pc.next_true(), first.ctx.clone(), Box::new(first.coro.clone()), ResumeArg::Matched);
@@ -6815,9 +6820,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 &Residual::ReturnedFrom(from) => {
                     off += if state.returned == from { 2 } else { 1 };
                 },
-                Residual::Selected => {
-                    off += if state.select == 0 { 2 } else { 1 };
-                },
                 &Residual::Ret(_, a, b, closes, vararg, returns, effects) => {
                     debug!("spec final blocks: {:?}", self.blocks);
                     state.returned_at = Location(id, off).pack().bits() as u64;
@@ -6995,7 +6997,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 match res {
                     Residual::Jump(target) => out.push((target.0, None)),
                     Residual::NativeCall { nf, .. } => calls.push(format!("\"{:p}\"", nf)),
-                    Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::GuardWitness { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } | Residual::Selected => {
+                    Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::GuardWitness { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
                         if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
                             out.push((target.0, Some("pass")));
                         }

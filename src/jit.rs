@@ -1435,7 +1435,7 @@ fn runs_to(residuals: &[Residual]) -> usize {
         }
         guarded = matches!(res, Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::NativeGuard { .. }
             | Residual::LuaGuard { .. } | Residual::GuardWitness { .. } | Residual::EpochCheck { .. } | Residual::HashGuard { .. }
-            | Residual::GuardDynamic(_) | Residual::ReturnedFrom(_) | Residual::Selected);
+            | Residual::GuardDynamic(_) | Residual::ReturnedFrom(_));
     }
     residuals.len()
 }
@@ -3071,15 +3071,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize, true),
-                Residual::Selected => {
-                    // The op before it selected 0 having done its work: on past the residual after
-                    // it. See Note [Peephole fusion] in `peephole`.
-                    dynasm!(ops
-                        ; .arch x64
-                        ; cmp QWORD r12 => RunState.select, 0
-                        ; je =>insts[off + 2]
-                    );
-                },
                 Residual::ReturnedFrom(from) => {
                     // The call's return value, still in rax, from the `Ret` expected: its
                     // continuation goes on to `off + 2`, else falls through to the thunk for the

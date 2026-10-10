@@ -1,37 +1,43 @@
-//! Fusing runs of integer arithmetic into one operation. See Note [Peephole fusion].
+//! Fusing runs of integer arithmetic into one window op. See Note [Peephole fusion].
 
 use std::rc::Rc;
 
 use crate::lboxed::LBoxed;
-use crate::specialize::ResidualExec;
 use crate::vm::Opcode;
+use crate::window::{windowed, Window};
 
 // Note [Peephole fusion]
 // ~~~~~~~~~~~~~~~~~~~~~~
 // Each integer operation in the integer encoding checks its own result fits, and boxes it, though
 // the next often only reads it to compute another: `(p - 1) % 256 + 1` checks and boxes three
-// times. A run of integer operations can instead be one operation, computing in 64 bits and
-// checking once.
+// times. A run of integer operations can instead be one window op, which boxes once and has one
+// cold path.
 //
 // Every generator's yields pass through a peephole as the specializer lays them out. An integer
 // operation's generator says what its window computes before yielding it, and the peephole holds
 // such a window instead of laying it out: the generator goes on as if it took its hot path, its
 // result fitting, and so does the code after it, whichever instructions those are. What the
 // peephole holds it lays out as soon as anything else would lay out code, or the next operation
-// isn't one it can hold with them: what it holds has been read by nothing laid out since. Questions
-// about types and constants, and guards known statically, lay out nothing, and pass it by.
+// doesn't continue the run as a fused op could: what it holds has been read by nothing laid out
+// since. Questions about types and constants, and guards known statically, lay out nothing, and
+// pass it by.
+//
+// A fused op is a run of two or three operations of a register and a constant, each but the first
+// reading the slot the one before wrote, all writing the same slot: adds, subtracts, products by a
+// positive constant and masks (a floored remainder by a power of two). Its kinds are the op's
+// constant parameters, so each step is inlined into the next, nothing boxed between them.
 //
 // A run of one operation is laid out as it would have been where it was held, its overflow
-// continuing from there, and the code after it from its hot path again. A run of two or more is
-// laid out as one, guarded by whether its results fit: on the hot path the code goes on where the
-// peephole laid it out; on the cold path, the run's first operation is laid out as it would have
-// been where it was held, and the code after it again from there, the run's inputs as they were.
+// continuing from there, and the code after it from its hot path again. A run of more is laid out
+// as its fused op, an optimistic op of its own: on its hot path, the code goes on as it would after
+// the run's last operation's hot path; on its cold path, the run's first operation is laid out as
+// it would have been where it was held, and the code after it again from there, the run's inputs as
+// they were.
 //
-// The fused operation computes every result exactly: its operations neither make a -0 nor exceed
-// 2^53 from integers, so 64-bit integers give what doubles would. It checks that each slot it
-// writes, as the last of its operations to write the slot leaves it, fits the integer encoding,
-// and only then writes them all: where one doesn't fit, it writes nothing. A slot only an earlier
-// operation of the run writes, written again later in it, is never seen, and needs no check.
+// The fused op computes each step as its operation would, in the integer encoding, and takes its
+// cold path where any step's result wouldn't fit, as the operation would take its own: it writes its
+// slot only where every step fit. Its operations make no -0, so a step that fits is the double the
+// operation would have computed.
 
 /// An arithmetic operation of the integer encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -72,55 +78,33 @@ impl IntOp {
         Some(IntOp { op, lhs, rhs, dest })
     }
 
-    /// Whether it can be fused: never one that could make a -0 (a product with a factor that
-    /// isn't a positive constant) or divide by a slot.
-    pub fn fusable(&self) -> bool {
-        use Operand::{K, Slot};
-        match (self.op, self.lhs, self.rhs) {
-            (Arith::Add | Arith::Sub, _, _) => true,
-            (Arith::Mul, Slot(_), K(k)) | (Arith::Mul, K(k), Slot(_)) => k > 0,
-            (Arith::Mod, Slot(_), K(k)) => k > 0,
-            _ => false,
-        }
-    }
-
-    /// The operation of `l` and `r`, exactly.
-    fn apply(&self, l: i64, r: i64) -> i64 {
+    /// Its step of a fused op, and the step's constant, if it is one: of a register and a
+    /// constant, making no -0.
+    fn step(&self) -> Option<(u8, i32)> {
+        let (Operand::Slot(_), Operand::K(k)) = (self.lhs, self.rhs) else { return None };
         match self.op {
-            Arith::Add => l + r,
-            Arith::Sub => l - r,
-            Arith::Mul => l * r,
-            Arith::Mod => l.rem_euclid(r),
-        }
-    }
-
-    /// The most the result's magnitude can be, given each operand's.
-    fn bound(&self, l: u128, r: u128) -> u128 {
-        match self.op {
-            Arith::Add | Arith::Sub => l + r,
-            Arith::Mul => l * r,
-            // Of a positive constant divisor.
-            Arith::Mod => r,
+            Arith::Add => Some((ADD, k)),
+            Arith::Sub => Some((SUB, k)),
+            Arith::Mul if k > 0 => Some((MUL, k)),
+            Arith::Mod if k > 0 && k & (k - 1) == 0 => Some((MASK, k - 1)),
+            _ => None,
         }
     }
 }
 
-/// The most operations a run fuses.
-pub const MAX_RUN: usize = 8;
+/// The most operations a fused op is.
+pub const MAX_RUN: usize = 3;
 
-/// Whether `ops`, run in order on integers, can be fused: at most `MAX_RUN` of them, each fusable,
-/// and computing every result exactly, none past 2^53. See Note [Peephole fusion].
-pub fn exact(ops: &[IntOp]) -> bool {
-    let mut bounds: Vec<(usize, u128)> = Vec::new();
-    let bound = |bounds: &Vec<(usize, u128)>, operand: Operand| match operand {
-        Operand::K(k) => (k as i64).unsigned_abs() as u128,
-        Operand::Slot(s) => bounds.iter().rev().find(|(w, _)| *w == s).map_or(1 << 31, |(_, b)| *b),
-    };
-    ops.len() <= MAX_RUN && ops.iter().all(|op| {
-        let b = op.bound(bound(&bounds, op.lhs), bound(&bounds, op.rhs));
-        bounds.push((op.dest, b));
-        op.fusable() && b <= 1 << 53
-    })
+/// Whether `op` can begin a run. See Note [Peephole fusion].
+pub fn starts(op: &IntOp) -> bool {
+    op.step().is_some()
+}
+
+/// Whether `op` goes on with `run` as a fused op could: one more step, reading the slot the run
+/// writes and writing it again. See Note [Peephole fusion].
+pub fn extends(run: &[IntOp], op: &IntOp) -> bool {
+    let Some(last) = run.last() else { return starts(op) };
+    run.len() < MAX_RUN && starts(op) && op.lhs == Operand::Slot(last.dest) && op.dest == last.dest
 }
 
 /// Whether integer operations are held to fuse (Note [Peephole fusion]); set `LUNACY_NO_FUSION`
@@ -130,62 +114,84 @@ pub fn fuses() -> bool {
     *FUSES
 }
 
-/// A run of integer operations as one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Fused {
-    pub ops: Vec<IntOp>,
-    /// The slots it writes, in the order the run first writes them.
-    pub writes: Vec<usize>,
+// A fused op's steps, its constant parameters.
+const ADD: u8 = 0;
+const SUB: u8 = 1;
+const MUL: u8 = 2;
+/// `k` the mask.
+const MASK: u8 = 3;
+
+/// Step `S` of a fused op on `x`, with its constant `k`: its result, if it fits.
+fn step<const S: u8>(x: i32, k: i32) -> Option<i32> {
+    match S {
+        ADD => x.checked_add(k),
+        SUB => x.checked_sub(k),
+        MUL => x.checked_mul(k),
+        MASK => Some(x & k),
+        _ => unreachable!(),
+    }
 }
 
-impl Fused {
-    pub fn new(ops: Vec<IntOp>) -> Self {
-        let mut writes = Vec::new();
-        for op in &ops {
-            if !writes.contains(&op.dest) {
-                writes.push(op.dest);
-            }
-        }
-        Fused { ops, writes }
-    }
+/// Steps `A` and `B` of a fused op on `x`: the result, if every step's fits.
+fn steps2<const A: u8, const B: u8>(x: i32, k1: i32, k2: i32) -> Option<i32> {
+    step::<B>(step::<A>(x, k1)?, k2)
+}
 
-    /// Each slot it writes and the value it leaves there, from the slots' values before the run,
-    /// as `read` gives them; or none, where one doesn't fit the integer encoding.
-    pub fn eval(&self, read: impl Fn(usize) -> i32) -> Option<Vec<(usize, i32)>> {
-        let mut written: Vec<(usize, i64)> = Vec::new();
-        let value = |written: &Vec<(usize, i64)>, operand: Operand| match operand {
-            Operand::K(k) => k as i64,
-            // Read only where the run hasn't written it: a slot it has may hold anything before it.
-            Operand::Slot(s) => written.iter().rev().find(|(w, _)| *w == s).map_or_else(|| read(s) as i64, |(_, v)| *v),
-        };
-        for op in &self.ops {
-            let result = op.apply(value(&written, op.lhs), value(&written, op.rhs));
-            written.push((op.dest, result));
-        }
-        self.writes.iter().map(|&slot| {
-            let v = value(&written, Operand::Slot(slot));
-            i32::try_from(v).ok().map(|v| (slot, v))
-        }).collect()
-    }
+/// Steps `A`, `B` and `C` of a fused op on `x`: the result, if every step's fits.
+fn steps3<const A: u8, const B: u8, const C: u8>(x: i32, k1: i32, k2: i32, k3: i32) -> Option<i32> {
+    step::<C>(step::<B>(step::<A>(x, k1)?, k2)?, k3)
+}
 
-    /// It as a residual: it selects 0 having written its results, and 1 having written nothing.
-    pub fn exec(self) -> ResidualExec {
-        let writes = self.writes.clone();
-        let fused = Rc::new(self);
-        ResidualExec::new("fused", Rc::new(move |_owner, state| {
-            let base = state.base;
-            // Its inputs are in the integer encoding: it holds only integer paths.
-            let results = fused.eval(|slot| unsafe { state.vals[base + slot].as_int() });
-            state.select = match results {
-                Some(results) => {
-                    for (slot, n) in results {
-                        state.vals[base + slot] = LBoxed::from_int(n);
-                    }
-                    0
-                },
-                None => 1,
-            };
-        })).writing(&writes)
+// Two steps: every step fits on the hot path; on the cold path, `dest` holds `lhs`, as nothing was
+// computed. Its constants are whole holes, which a stencil reads as they are: decoding several
+// narrower ones costs it masks. See Note [Peephole fusion].
+windowed!(FusedRK2, [k1: u64, k2: u64], [A: u8, B: u8], |owner, state, base, tag| (lhs, out dest) {
+    match steps2::<A, B>(lhs.as_int(), k1 as i32, k2 as i32) {
+        Some(n) => { *dest = LBoxed::from_int_tagged(n, tag); false },
+        None => { core::intrinsics::cold_path(); true },
+    }
+} cold {
+    *dest = lhs;
+    1
+});
+
+// Three steps, as `FusedRK2`.
+windowed!(FusedRK3, [k1: u64, k2: u64, k3: u64], [A: u8, B: u8, C: u8], |owner, state, base, tag| (lhs, out dest) {
+    match steps3::<A, B, C>(lhs.as_int(), k1 as i32, k2 as i32, k3 as i32) {
+        Some(n) => { *dest = LBoxed::from_int_tagged(n, tag); false },
+        None => { core::intrinsics::cold_path(); true },
+    }
+} cold {
+    *dest = lhs;
+    1
+});
+
+/// The step whose constant parameter is `$s`, as `$S` in `$body`.
+macro_rules! by_step {
+    ($s:expr, $S:ident, $body:expr) => {
+        match $s {
+            ADD => { const $S: u8 = ADD; $body },
+            SUB => { const $S: u8 = SUB; $body },
+            MUL => { const $S: u8 = MUL; $body },
+            MASK => { const $S: u8 = MASK; $body },
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// The fused op a run is, if it is one. See Note [Peephole fusion].
+pub fn fused_window(run: &[IntOp]) -> Option<Rc<dyn Window>> {
+    let first = run.first()?;
+    if !run.iter().enumerate().all(|(i, op)| extends(&run[..i], op)) {
+        return None;
+    }
+    let Operand::Slot(lhs) = first.lhs else { return None };
+    let slots = [lhs, first.dest];
+    let steps: Vec<(u8, i32)> = run.iter().map(|op| op.step().unwrap()).collect();
+    match steps.as_slice() {
+        &[(a, k1), (b, k2)] => Some(by_step!(a, A, by_step!(b, B, Rc::new(FusedRK2::<A, B>::new(k1 as u32 as u64, k2 as u32 as u64, &slots)) as Rc<dyn Window>))),
+        &[(a, k1), (b, k2), (c, k3)] => Some(by_step!(a, A, by_step!(b, B, by_step!(c, C, Rc::new(FusedRK3::<A, B, C>::new(k1 as u32 as u64, k2 as u32 as u64, k3 as u32 as u64, &slots)) as Rc<dyn Window>)))),
+        _ => None,
     }
 }
 
@@ -194,31 +200,56 @@ mod tests {
     use super::*;
     use Operand::{K, Slot};
 
-    #[test]
-    fn checks_only_what_the_run_leaves() {
-        // 2^30 + 2^30 doesn't fit, but the run overwrites it before anything sees it.
-        let ops = vec![IntOp { op: Arith::Add, lhs: Slot(0), rhs: Slot(0), dest: 1 }, IntOp { op: Arith::Sub, lhs: Slot(1), rhs: Slot(0), dest: 1 }];
-        assert_eq!(Fused::new(ops.clone()).eval(|_| 1 << 30), Some(vec![(1, 1 << 30)]));
-        assert_eq!(Fused::new(ops[..1].to_vec()).eval(|_| 1 << 30), None);
+    fn op(op: Arith, lhs: Operand, rhs: Operand, dest: usize) -> IntOp {
+        IntOp { op, lhs, rhs, dest }
     }
 
     #[test]
-    fn reads_only_what_the_run_hasnt_written() {
-        // `(i % 7) - 3` into slot 9: slot 9 holds anything before the run.
-        let ops = vec![IntOp { op: Arith::Mod, lhs: Slot(8), rhs: K(7), dest: 9 }, IntOp { op: Arith::Sub, lhs: Slot(9), rhs: K(3), dest: 9 }];
-        assert_eq!(Fused::new(ops).eval(|s| if s == 8 { 15 } else { panic!("read slot {s}") }), Some(vec![(9, -2)]));
+    fn an_index_computation_is_a_fused_op() {
+        // (p - 1) % 256 + 1, from slot 5 into slot 6, as uxn.lua computes a stack index.
+        let run = [op(Arith::Sub, Slot(5), K(1), 6), op(Arith::Mod, Slot(6), K(256), 6), op(Arith::Add, Slot(6), K(1), 6)];
+        assert!(run.iter().enumerate().all(|(i, o)| extends(&run[..i], o)));
+        let window = fused_window(&run).expect("a fused op");
+        assert_eq!(window.name(), "FusedRK3");
+        assert_eq!(window.operands(), &[5, 6]);
     }
 
     #[test]
-    fn never_past_exact() {
-        let mul = IntOp { op: Arith::Mul, lhs: Slot(1), rhs: K(1 << 20), dest: 1 };
-        assert!(exact(&[mul]));
-        assert!(!exact(&[mul, mul]));
-        assert!(!exact(&[IntOp { op: Arith::Mul, lhs: Slot(1), rhs: K(-2), dest: 1 }]));
-        assert!(!exact(&[IntOp { op: Arith::Mod, lhs: Slot(1), rhs: Slot(2), dest: 1 }]));
-        let add = IntOp { op: Arith::Add, lhs: Slot(1), rhs: K(1), dest: 1 };
-        assert!(exact(&[add; MAX_RUN]));
-        assert!(!exact(&[add; MAX_RUN + 1]));
+    fn what_a_run_extends_by() {
+        let run = [op(Arith::Add, Slot(1), K(3), 2)];
+        // Not reading the slot the run writes, or writing another.
+        assert!(!extends(&run, &op(Arith::Add, Slot(1), K(3), 2)));
+        assert!(!extends(&run, &op(Arith::Add, Slot(2), K(3), 3)));
+        // Two registers; a product that could be -0; a remainder not a mask.
+        assert!(!extends(&run, &op(Arith::Add, Slot(2), Slot(1), 2)));
+        assert!(!extends(&run, &op(Arith::Mul, Slot(2), K(-2), 2)));
+        assert!(!extends(&run, &op(Arith::Mod, Slot(2), K(7), 2)));
+        assert!(extends(&run, &op(Arith::Mul, Slot(2), K(256), 2)));
+        // At most three.
+        let three = [run[0], op(Arith::Add, Slot(2), K(1), 2), op(Arith::Add, Slot(2), K(1), 2)];
+        assert!(!extends(&three, &op(Arith::Add, Slot(2), K(1), 2)));
+    }
+
+    #[test]
+    fn steps_compute_as_lua_does() {
+        // Each step against Lua's doubles, on edge values: its result where that is an integer,
+        // else none; masks for power-of-two remainders.
+        let edges = [0, 1, -1, 255, 256, -256, i32::MAX, i32::MIN, 1 << 30, -(1 << 30)];
+        for &x in &edges {
+            for k in [1, 2, 7, 256, 65536, -3, i32::MAX] {
+                for (kind, s) in [(Arith::Add, ADD), (Arith::Sub, SUB), (Arith::Mul, MUL)] {
+                    let o = op(kind, Slot(0), K(k), 0);
+                    if kind == Arith::Mul && k <= 0 {
+                        continue;
+                    }
+                    assert_eq!(by_step!(s, S, step::<S>(x, k)), in_encoding(lua(&o, &[x as f64])), "{o:?} on {x}");
+                }
+            }
+            for k in [1, 2, 256, 1 << 30] {
+                let o = op(Arith::Mod, Slot(0), K(k), 0);
+                assert_eq!(step::<MASK>(x, k - 1), in_encoding(lua(&o, &[x as f64])), "{o:?} on {x}");
+            }
+        }
     }
 
     /// A slot's value as Lua 5.1 computes it, in doubles.
@@ -239,47 +270,54 @@ mod tests {
     }
 
     #[test]
-    fn agrees_with_lua_numbers() {
-        // Random exact runs on edge and random integers, against Lua's doubles: what a fused
-        // operation writes, it writes as Lua computes it, and it writes nothing only where a slot
-        // it would write doesn't fit.
+    fn runs_agree_with_lua_numbers() {
+        // Random runs a fused op could be, on edge and random integers, against Lua's doubles: what
+        // it writes, it writes as Lua computes it, and it writes nothing exactly where a step's
+        // result, as Lua computes it, isn't an integer, where the operation would take its cold path.
         let mut seed = 0x9e3779b97f4a7c15u64;
         let mut rand = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
         let edges = [0, 1, -1, 2, 255, 256, -256, i32::MAX, i32::MIN, i32::MAX - 1, i32::MIN + 1, 1 << 30, -(1 << 30), 65535];
         let (mut fit, mut left) = (0, 0);
         for _ in 0..200_000 {
-            let mut operand = |rand: &mut dyn FnMut() -> u64| if rand() % 3 == 0 {
-                K(match rand() % 4 { 0 => edges[(rand() % edges.len() as u64) as usize], 1 => 1 << (rand() % 20), _ => (rand() % 600) as i32 - 300 })
-            } else {
-                Slot((rand() % 4) as usize)
-            };
-            let ops: Vec<IntOp> = (0..(2 + rand() % 5)).map(|_| {
-                let op = [Arith::Add, Arith::Sub, Arith::Mul, Arith::Mod][(rand() % 4) as usize];
-                let (lhs, rhs) = (operand(&mut rand), operand(&mut rand));
-                IntOp { op, lhs, rhs, dest: (rand() % 4) as usize }
-            }).collect();
-            if !exact(&ops) {
+            let (src, dest) = ((rand() % 3) as usize, (rand() % 3) as usize);
+            let mut run: Vec<IntOp> = Vec::new();
+            for i in 0..(2 + rand() % 2) {
+                let k = match rand() % 4 { 0 => edges[(rand() % edges.len() as u64) as usize], 1 => 1 << (rand() % 20), _ => (rand() % 600) as i32 - 300 };
+                let kind = [Arith::Add, Arith::Sub, Arith::Mul, Arith::Mod][(rand() % 4) as usize];
+                let candidate = op(kind, Slot(if i == 0 { src } else { dest }), K(k), dest);
+                if extends(&run, &candidate) {
+                    run.push(candidate);
+                }
+            }
+            if run.len() < 2 {
                 continue;
             }
-            let inputs: Vec<i32> = (0..4).map(|_| match rand() % 3 {
+            assert!(fused_window(&run).is_some(), "{run:?}");
+            let inputs: Vec<i32> = (0..3).map(|_| match rand() % 3 {
                 0 => edges[(rand() % edges.len() as u64) as usize],
                 _ => (rand() % 2000) as i32 - 1000,
             }).collect();
             let mut expected: Vec<f64> = inputs.iter().map(|&v| v as f64).collect();
-            for op in &ops {
-                expected[op.dest] = lua(op, &expected);
+            let mut every_step_fits = true;
+            for o in &run {
+                expected[o.dest] = lua(o, &expected);
+                every_step_fits &= in_encoding(expected[o.dest]).is_some();
             }
-            let fused = Fused::new(ops.clone());
-            match fused.eval(|s| inputs[s]) {
-                Some(writes) => {
+            // As the fused op computes it: its steps, from its one input.
+            let Slot(from) = run[0].lhs else { unreachable!() };
+            let result = run.iter().try_fold(inputs[from], |x, o| {
+                let (s, k) = o.step().unwrap();
+                by_step!(s, S, step::<S>(x, k))
+            });
+            match result {
+                Some(n) => {
                     fit += 1;
-                    for (slot, v) in writes {
-                        assert_eq!((v as f64).to_bits(), expected[slot].to_bits(), "{ops:?} on {inputs:?}");
-                    }
+                    assert!(every_step_fits, "{run:?} fused on {inputs:?}");
+                    assert_eq!((n as f64).to_bits(), expected[dest].to_bits(), "{run:?} on {inputs:?}");
                 },
                 None => {
                     left += 1;
-                    assert!(fused.writes.iter().any(|&s| in_encoding(expected[s]).is_none()), "{ops:?} left on {inputs:?}");
+                    assert!(!every_step_fits, "{run:?} left on {inputs:?}");
                 },
             }
         }
