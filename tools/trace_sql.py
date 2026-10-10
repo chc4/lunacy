@@ -12,12 +12,29 @@ The specializer's are also views, one column per argument:
       (if one was made), how many of the context's shapes it lost, and where
       each of its fragile facts was introduced (`fact <- block@offset,...`).
   spec_block(ts, block, line, pc, context)
-      each version compiled.
+      each version created, whatever became of it since: counting its rows
+      counts versions ever made, not versions in the graph (`point_versions`).
+  version_fate(ts, block, line, pc, fate, at)
+      each version created (as `spec_block`), and what became of it: `live`,
+      in the graph at the end; `forgotten` by a contraction, or `evicted` from
+      its point, at `at`; or `unreachable` at the end, still in the version
+      map: the trimming found it so and no lookup in the map found it since,
+      but code already linked to it (a jump, JIT code's) may still run it.
+      A block id is used again once its version is forgotten, so a version's
+      fate is that of its id until the id's next version.
+  point_versions(line, pc, created, live, unreachable, evicted, forgotten)
+      per point, its versions by fate: `live` and `unreachable` are what the
+      graph has there at the end. How often a version ran isn't in a trace:
+      `just jit-profile` samples the JIT's, the interpreter tier's graph dump
+      (`just window-runs`) counts every entry.
   block_summary(block, line, pc, residuals, code, context, hotness, jitted, returns, returned_from, unreachable)
       every block at the end of the run (line 0 for one no version names),
       with the return ids its returns return with, those its call
       continuations guard on (comma separated), and whether the trimming
       found it unreachable (forgotten once its point needs the room).
+      `hotness` counts down from 64, one for each time the interpreter
+      entered the block, to 0 when it tiers up: 64 is never entered there, 0
+      is compiled, and JIT code's entries don't count.
   alloc_step(trace, step, line, block, pc, off)
       each step of each trace the window planner planned: the block it is in
       and, for a residual, its offset (a block's start's is 2^64-1).
@@ -38,8 +55,8 @@ The specializer's are also views, one column per argument:
   contract(ts, line, origins, how, offsets, forgotten)
       each contraction: the blocks rebuilt from where they introduced the
       facts (at those residual offsets), how (`drop`, without the facts,
-      `integer`, with their constants loaded as integers, or `double`, an
-      integer op computing in doubles), and the versions forgotten.
+      `double`, with their constants loaded as doubles, or an integer op
+      computing in doubles), and the versions forgotten.
   encoding(ts, line, pc, block, encoding)
       each optimistic integer op the first time it runs: the block it is
       laid out in, and whether it computes in the `integer` or the `double`
@@ -51,17 +68,17 @@ The specializer's are also views, one column per argument:
       the room (`evicted`), how many rebuilds are
       still waiting, how many of the reached blocks each kind of root keeps
       (the running code, the rebuilt blocks), and the block running.
-  narrow(ts, line, slot, block, origins, queued)
-      each constant a fact says a slot holds narrowed to an integer where
+  widen(ts, line, slot, block, origins, queued)
+      each constant a fact says a slot holds widened to a double where
       `block` is compiled: the fact's origins (block@offset, ` rebuilt` if
-      one already was), and whether a contraction loading it as an integer
+      one already was), and whether a contraction loading it as a double
       was queued.
   contract_deferred(ts, line, origins, at)
       a queued contraction waiting, as the interpreter (in block `at`) or a
       frame returning will run code past where an origin introduced its fact.
   evicted(ts, line, pc, blocks)
-      the versions at a point the trimming found unreachable, forgotten as the
-      point has all the versions it can have.
+      the version at a point the trimming found unreachable forgotten, the
+      oldest, as the point has all the versions it can have.
   contract_refused(ts, line, origins, how, reason)
       a queued contraction dropped: a fact `used` since, an origin `compiled`,
       or every origin `rebuilt` already.
@@ -101,7 +118,7 @@ VIEWS = {
     'contract_refused': ['line', 'origins', 'how', 'reason'],
     'unreachable': ['line', 'reached', 'dropped', 'waiting', 'kept_by', 'at'],
     'encoding': ['line', 'pc', 'block', 'encoding'],
-    'narrow': ['line', 'slot', 'block', 'origins', 'queued'],
+    'widen': ['line', 'slot', 'block', 'origins', 'queued'],
     'evicted': ['line', 'pc', 'blocks'],
     'inline': ['line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
     'inline_return': ['line', 'callee', 'after', 'block', 'context'],
@@ -112,7 +129,7 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'contractible': ('spec', 'contractible'), 'contract': ('spec', 'contract'),
           'contract_deferred': ('spec', 'contract_deferred'), 'contract_refused': ('spec', 'contract_refused'),
           'unreachable': ('spec', 'unreachable'), 'encoding': ('spec', 'encoding'),
-          'narrow': ('spec', 'narrow'), 'evicted': ('spec', 'evicted'),
+          'widen': ('spec', 'widen'), 'evicted': ('spec', 'evicted'),
           'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return'),
           'inline_cost': ('spec', 'inline_cost')}
 
@@ -125,7 +142,54 @@ def connect(trace):
         category, name = EVENTS[view]
         tp.query(f"CREATE PERFETTO VIEW {view} AS SELECT ts, {extracted} FROM slice "
                  f"WHERE category = '{category}' AND name = '{name}'")
+    fates(tp)
     return tp
+
+
+def ids(text):
+    """The block ids of a comma separated list."""
+    return [int(i) for i in str(text or '').split(',') if i.strip().isdigit()]
+
+
+def fates(tp):
+    """The `version_fate` table and its `point_versions` summary: each version's
+    fate, found from the events forgetting versions, within its block id's life."""
+    created = [(r.ts, r.block, r.line, r.pc) for r in tp.query("SELECT ts, block, line, pc FROM spec_block ORDER BY ts")]
+    if not created:
+        return
+    # Each block id's events forgetting its version, in time order.
+    ends = {}
+    for r in tp.query("SELECT ts, forgotten FROM contract"):
+        for block in ids(r.forgotten):
+            ends.setdefault(block, []).append((r.ts, 'forgotten'))
+    for r in tp.query("SELECT ts, blocks FROM evicted"):
+        for block in ids(r.blocks):
+            ends.setdefault(block, []).append((r.ts, 'evicted'))
+    unreachable = {r.block for r in tp.query("SELECT block FROM block_summary WHERE unreachable = 1")}
+    # When each block id's next version is created.
+    following = {}
+    last = {}
+    for i, (ts, block, _, _) in enumerate(created):
+        if block in last:
+            following[last[block]] = ts
+        last[block] = i
+    rows = []
+    for i, (ts, block, line, pc) in enumerate(created):
+        until = following.get(i)
+        end = next(((at, fate) for at, fate in sorted(ends.get(block, [])) if at >= ts and (until is None or at < until)), None)
+        if end:
+            fate, at = end[1], end[0]
+        elif until is not None:
+            fate, at = 'forgotten', until
+        else:
+            fate, at = ('unreachable' if block in unreachable else 'live'), None
+        rows.append(f"({ts}, {block}, {line}, {pc}, '{fate}', {'NULL' if at is None else at})")
+    tp.query("CREATE PERFETTO TABLE version_fate AS WITH fates(ts, block, line, pc, fate, at) AS "
+             f"(VALUES {', '.join(rows)}) SELECT * FROM fates")
+    tp.query("CREATE PERFETTO VIEW point_versions AS SELECT line, pc, COUNT(*) AS created, "
+             "SUM(fate = 'live') AS live, SUM(fate = 'unreachable') AS unreachable, "
+             "SUM(fate = 'evicted') AS evicted, SUM(fate = 'forgotten') AS forgotten "
+             "FROM version_fate GROUP BY line, pc")
 
 
 def main():
