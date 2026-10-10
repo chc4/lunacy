@@ -194,8 +194,9 @@ def times_vs(args):
     """Each benchmark's pooled time for revision `base` and for `head`, as `build`,
     fastest change first: their medians and its change, at how many paddings
     `head`'s median is the lower, whether their quartile boxes are apart; and the
-    changes' geometric mean."""
-    base, head = commit_info(args.base)[0], commit_info(args.head)[0]
+    changes' geometric mean. `head` `dirty` is HEAD's newest dirty result."""
+    base = commit_info(args.base)[0]
+    head = 'dirty' if args.head == 'dirty' else commit_info(args.head)[0]
     data, _ = series()
     rows = []
     for key, builds in data.items():

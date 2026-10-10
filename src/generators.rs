@@ -157,31 +157,34 @@ macro_rules! integer_operands {
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // The constant's boxed value is the op's hole: a number is a double. See
-        // Note [Integers] in `specialize`.
+        // The constant's boxed value is the op's hole: a whole number is an integer,
+        // any other a double. See Note [Integers] in `specialize`.
         windowed!(LoadK, [bits: u64], [], |owner, state, base| (out dest) {
             // A constant's value lives as long as its prototype.
             *dest = LBoxed::from_bits(bits);
         });
         match c {
-            LType::Integer | LType::Double => match yield YieldOp::EncodeK(dest, bx as usize) {
-                // Rebuilt to load it as an integer. See Note [Contraction] in
-                // `specialize`.
-                ResumeArg::Matched => {
-                    let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(bx as usize)) else { unreachable!() };
-                    yield YieldOp::ExecWindow(Rc::new(LoadK::new(LBoxed::from_int(k).bits(), &[dest])));
-                    yield YieldOp::SetTypes(vec![(dest, LType::Integer)]);
-                },
-                encoding => {
-                    let ResumeArg::Type(t) = (yield YieldOp::TypeofK(bx as usize)) else { unreachable!() };
-                    let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
-                    yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
-                    yield YieldOp::SetCTypes(vec![(dest, t)]);
-                    // Rebuilt without the fact, it isn't introduced.
-                    if encoding != ResumeArg::Failed {
-                        yield YieldOp::HoldsK(dest, bx as usize);
-                    }
-                },
+            LType::Integer | LType::Double => {
+                let whole = (yield YieldOp::IntegralK(bx as usize)) == ResumeArg::Matched;
+                match yield YieldOp::EncodeK(dest, bx as usize) {
+                    encoding if whole && encoding != ResumeArg::Type(CType::Type(LType::Double)) => {
+                        let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(bx as usize)) else { unreachable!() };
+                        yield YieldOp::ExecWindow(Rc::new(LoadK::new(LBoxed::from_int(k).bits(), &[dest])));
+                        yield YieldOp::SetTypes(vec![(dest, LType::Integer)]);
+                        // Rebuilt without the fact, it isn't introduced.
+                        if encoding != ResumeArg::Failed {
+                            yield YieldOp::HoldsK(dest, bx as usize);
+                        }
+                    },
+                    // Not whole, or rebuilt to load it as a double. See Note [Contraction] in
+                    // `specialize`.
+                    _ => {
+                        let ResumeArg::Type(t) = (yield YieldOp::TypeofK(bx as usize)) else { unreachable!() };
+                        let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
+                        yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[dest])));
+                        yield YieldOp::SetCTypes(vec![(dest, t)]);
+                    },
+                }
             },
             LType::String => {
                 let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
@@ -698,17 +701,19 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             ResumeArg::Matched => Some(None),
             _ => None,
         };
-        // A whole number stored at an integer key, into the array part or appended to it, is
-        // narrowed: a constant is stored in the integer encoding, and a slot a fact says holds one
-        // is narrowed first. See Note [Narrowing] in `specialize`.
-        let narrowed = if integer.is_some() && c & 0x100 != 0 && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
+        // A whole constant stored at an integer key, into the array part or appended to it, is
+        // stored in the integer encoding, as it is loaded, unless the array is known to hold
+        // doubles: then a constant is stored in the double encoding, and a slot a fact says holds
+        // one is widened first. See Note [Widening] in `specialize`.
+        let doubles = integer.is_some() && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(LType::Double));
+        let narrowed = if integer.is_some() && !doubles && c & 0x100 != 0 && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
             let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
             Some(k)
         } else {
             None
         };
-        if integer.is_some() && c & 0x100 == 0 {
-            yield YieldOp::NarrowConstant(c);
+        if doubles && c & 0x100 == 0 {
+            yield YieldOp::WidenConstant(c);
         }
         let in_array = match integer {
             Some(Some(k)) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[a]))),
@@ -955,13 +960,6 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
         // We don't need to guard on LType::Table, because this instruction is only ever used for
         // table initialization, which means it is definitely a table and doesn't e.g. have a
         // metatable we have to chain to.
-        // A whole constant it stores is stored as an integer, as a store at an integer key
-        // stores one. See Note [Narrowing] in `specialize`.
-        if b != 0 {
-            for slot in a + 1..=a + b {
-                yield YieldOp::NarrowConstant(slot);
-            }
-        }
         arg = yield YieldOp::Exec(ResidualExec::new("setlist", Rc::new(move |owner, state| {
             match state.vals[state.base + a as usize].unbox() {
                 LValue::Table(tab) => {
@@ -1882,13 +1880,6 @@ pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: u
     move |mut arg: ResumeArg| {
         let skip = !upvalues.is_empty();
         let upvalues = upvalues.clone();
-        // A whole constant in a captured slot, narrowed. See Note [Narrowing] in
-        // `specialize`.
-        for i in 0..upvalues.len() {
-            if let (Opcode::MOVE, b) = upvalues[i] {
-                yield YieldOp::NarrowConstant(b);
-            }
-        }
         arg = yield YieldOp::Exec(ResidualExec::new("closure", Rc::new(move |owner, state| {
             let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx] };
             let mut fresh = LClosure::new(proto as *const _);
@@ -1949,9 +1940,6 @@ pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             let Upvalue::Closed(c) = upval else { unreachable!("an upvalue closed by its store") };
             set_closed(owner, c, value);
         });
-        // A whole constant stored into an upvalue, narrowed. See Note [Narrowing]
-        // in `specialize`.
-        yield YieldOp::NarrowConstant(a);
         arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, &[a])));
         yield YieldOp::Effect(Effect::SetUpvalue(b));
         arg
@@ -1987,10 +1975,10 @@ windowed!(ToInteger, [], [], |owner, state, base| (inout v) {
     1
 });
 
-// A known constant stored again in the integer encoding. See Note [Narrowing]
+// A known constant stored again in the double encoding. See Note [Widening]
 // in `specialize`.
-windowed!(NarrowK, [value: i32], [], |owner, state, base| (out dest) {
-    *dest = LBoxed::from_int(value);
+windowed!(WidenK, [value: i32], [], |owner, state, base| (out dest) {
+    *dest = LBoxed::from_double(value as f64);
 });
 
 pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
@@ -2107,9 +2095,6 @@ pub fn emit_call(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         if let ResumeArg::WindowArgs(end, args) = (yield YieldOp::NativeWindowArgs(a, b, c)) {
             for slot in a + 1..end {
                 yield YieldOp::GuardCType(slot, args.clone());
-                // A whole constant passed to the op, narrowed, so the op reads it as
-                // an integer. See Note [Narrowing] in `specialize`.
-                yield YieldOp::NarrowConstant(slot);
             }
         }
         // TODO: track concrete function targets at the type level, and emit a YieldOp::Dispatch

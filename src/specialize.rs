@@ -264,12 +264,13 @@ pub enum YieldOp {
     SetCTypes(Vec<(usize, CType)>), // Inform the executor that STACK[idx] = type for each entry
     Narrow(usize), // Resumed with Matched if STACK[idx] is, or is narrowed to, an integer, else
                    // Failed. See Note [Narrowing]
-    NarrowConstant(usize), // STACK[idx] is narrowed to an integer if a fact says it holds a
-                           // whole constant, else left as it is. See Note [Narrowing]
+    WidenConstant(usize), // STACK[idx] is widened to a double if a fact says it holds a
+                          // whole constant, else left as it is. See Note [Widening]
     EncodeK(usize, usize), // STACK[idx] is about to be loaded with CONSTANT[k]: resumed with
-                           // Matched to load it as an integer, Failed as a double whose fact
-                           // isn't introduced, else as a double. See Note [Contraction]
-    HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Narrowing]
+                           // the double type to load a whole one as a double, Failed as an
+                           // integer whose fact isn't introduced, else as an integer. See
+                           // Note [Contraction]
+    HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Widening]
     Encoding(Fits), // An optimistic integer op is about to be laid out, whose result fits for the
                     // values its operands have if the test does: resumed, once the op first runs,
                     // with the double type to compute it in the double encoding instead, else with
@@ -1315,9 +1316,9 @@ impl std::fmt::Display for CType {
 // code: a jump into a version typing a slot `Number` or `Unknown` enters it as it is, and generic
 // code (a table, an upvalue, a native, a return) reads either.
 //
-// A number is a double unless something narrows it to an integer, as LuaJIT narrows: a
-// constant as a value (loaded, stored, passed) is a double whatever its value, as are a native's
-// result and the generic paths' arithmetic. What narrows is a loop (below), a length, a bit
+// A constant an i32 holds exactly is an integer, unless it meets a double (Note [Widening]). Any
+// other number is a double unless something narrows it to an integer, as LuaJIT narrows: a
+// native's result and the generic paths' arithmetic are doubles. What narrows is a loop (below), a length, a bit
 // operation, and a typed integer op on integers, until its result first overflows (Note
 // [Optimistic ops]). A constant an i32 holds exactly is a compile-time
 // value either encoding can hold, so to an op asking for an integer (a constant guard for one,
@@ -1526,23 +1527,33 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // one of unknown type is most often of another type than a double, and narrowing it would end its
 // block for nothing. A slot typed `Integer` is one already, at the same `SubPc` as the narrowed hot
 // way, so the code after both is one version: in a loop, the first iteration narrows its counter,
-// and the rest compute on an integer. A slot a fact says holds a constant an i32 holds exactly (one
-// `LOADK` loaded, until something writes the slot) is narrowed statically, the constant stored
-// again in the integer encoding, at no cost each time the code runs: a counter a loop starts from a
-// constant each time it is entered, even the first iteration computes on an integer. The fact is
-// consumed by the slot's narrowing, whose type then says what it would, or by a guard finding out
-// the slot's type at runtime, which decides how the slot is used instead (one the context answers
-// decides nothing, as a loop's guards before narrowing); otherwise it holds until the slot is
-// written. Where it is never used, the code it was carried through is contracted (Note
-// [Contraction]). A slot holding such a constant is narrowed statically too where it escapes into
-// an upvalue, captured by a closure or stored into one: a whole number kept there is most likely
-// used as an integer, and is one for every reader. So is one stored into a table's array part, as a constant or a
-// slot holding one: an array a program fills with whole constants is then of the integer kind,
-// and so of one kind with the integers it later stores. So is an argument of a native's window op (Note
-// [Native windows] in `library`), which the op alone reads: the op then reads it as an integer, as
-// it picks its form by which arguments are. A store into a table isn't narrowed: values reach a
-// table's elements from many stores, constants stored from the constant table and copies among
-// them, and narrowing only some would leave it holding both encodings.
+// and the rest compute on an integer. A whole constant is loaded as an integer already (Note
+// [Widening]): narrowing a slot holding one uses its fact, and nothing more.
+
+// Note [Widening]
+// ~~~~~~~~~~~~~~~
+// A constant an i32 holds exactly is loaded in the integer encoding: whole numbers a program
+// writes are most often counted, indexed and compared as integers, and arithmetic of an integer
+// with a double reads the integer as a double (Note [Integers]), at no cost to its other uses.
+// Its load introduces a fact that the slot holds the constant, until something writes the slot,
+// which records where it was loaded (Note [Contraction]).
+//
+// Where the constant meets a double it is better loaded as one: where another version at the same
+// point, or the join of the versions there, types its slot a double or `Number`, as a sum a loop
+// starts from `0` meets the double from its back edge; and where it is stored into an array known
+// to hold doubles, which an integer would make mixed. There its load is rebuilt to load it as a
+// double, so every path from it computes on the double, and reaches the versions the double
+// does. Until the rebuild, a store into an array known to hold doubles widens the slot in place,
+// and stores a constant operand in the double encoding.
+//
+// A use of the constant as an integer that pays for it (a loop's index, limit or step, an array
+// key) relies on the fact and consumes it: the slot's type then says what the fact would, and a
+// rebuild to a double, which would undo what the use relies on, is refused. A guard finding out
+// the slot's type at runtime consumes it too, deciding how the slot is used instead (one the
+// context answers decides nothing). Where the fact is never used, the code it was carried through
+// is contracted. A whole constant passed to a function, stored into a table or an upvalue, or
+// passed to a native is the integer it was loaded as: a callee's versions, and a table's other
+// values, are out of the load's rebuild's reach.
 
 // Note [Contraction]
 // ~~~~~~~~~~~~~~~~~~
@@ -1578,11 +1589,10 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // compiles the code from the origin again, as any thunk lays out its code (Note [Thunk patching]
 // in `jit`): in place, truncating the dead residuals.
 //
-// A fact used for what it says can be rebuilt from the same origin the other way: a constant some
-// code narrows to an integer (Note [Narrowing]) is loaded as an integer instead, so every path
-// from its load computes on the integer, and none narrows it again. The narrowing still writes
-// the integer until the rebuild, which waits and is dropped as a contraction is, but for the fact
-// being used. An origin needn't introduce a fact: an integer op is rebuilt to compute in the
+// A fact can be rebuilt from the same origin another way: a constant that meets a double (Note
+// [Widening]) is loaded as a double instead, so every path from its load computes on the double.
+// A store widening it in place still writes the double until the rebuild, which waits and is
+// dropped as a contraction is. An origin needn't introduce a fact: an integer op is rebuilt to compute in the
 // double encoding once its result doesn't fit (Note [Optimistic ops]).
 //
 // Rebuilding replaces code, and the blocks only that code reached are then unreachable: nothing
@@ -1648,6 +1658,12 @@ fn constant_ctype<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> CType {
 }
 
 /// Whether a constant is a number an i32 holds exactly.
+/// Whether a whole constant's slot typed `ty` elsewhere meets a double there, so the
+/// constant is better loaded as one. See Note [Widening].
+fn meets_double(ty: &CType) -> bool {
+    matches!(ty, CType::Type(LType::Double) | CType::Number)
+}
+
 fn integral_constant<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>) -> bool {
     matches!(k, crate::chunk::Constant::Number(n) if is_integer(n.0))
 }
@@ -2024,7 +2040,7 @@ pub enum Fragile {
     /// [Array kinds].
     Kind { table: Subject, kind: Kind },
     /// Stack slot `slot` holds a number constant an i32 holds exactly,
-    /// `value`. See Note [Narrowing].
+    /// `value`. See Note [Widening].
     Constant { slot: usize, value: i32 },
 }
 
@@ -2418,7 +2434,7 @@ impl Context {
 
     /// A slot holding upvalue `upvalue`'s value, if one is known to.
     /// Slot `slot`'s type is found out at runtime: a fact that it holds a
-    /// constant has had its use. See Note [Narrowing].
+    /// constant has had its use. See Note [Widening].
     fn used(&mut self, slot: usize) {
         self.fragile.retain(|fact| !matches!(fact.fragile, Fragile::Constant { slot: held, .. } if held == slot));
     }
@@ -3065,26 +3081,36 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn contract_joined(&mut self, owner: &mut Owner, pc: SubPc, existing: &[(Rc<Context>, BlockId)], joined: &Context) {
         let proto = self.proto;
         let mut origins: Vec<Origin> = Vec::new();
+        // Of constants the join types a double: rebuilt as doubles, not dropped.
+        let mut widened: Vec<Origin> = Vec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         for (ectx, block) in existing {
-            let mut extra = ectx.fragile.iter().filter(|fact| !joined.fragile.contains(fact)).peekable();
-            if extra.peek().is_none() {
+            let extra: Vec<&Fact> = ectx.fragile.iter().filter(|fact| !joined.fragile.contains(fact)).collect();
+            if extra.is_empty() {
                 continue;
             }
-            let Some(sets) = extra.map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+            let doubles = extra.iter().all(|fact| matches!(fact.fragile, Fragile::Constant { slot, .. } if meets_double(&joined.slot(slot))));
+            let Some(sets) = extra.iter().map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
             let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
             if found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                 continue;
             }
             _duplicates.push(block.0);
+            let into = if doubles { &mut widened } else { &mut origins };
             for origin in found {
-                if !origins.iter().any(|known| Rc::ptr_eq(known, &origin)) {
-                    origins.push(origin);
+                if !into.iter().any(|known| Rc::ptr_eq(known, &origin)) {
+                    into.push(origin);
                 }
             }
         }
         let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
-        if origins.is_empty() || origins.iter().all(queued) {
+        widened.retain(|origin| !origins.iter().any(|known| Rc::ptr_eq(known, origin)));
+        let widens = !widened.is_empty() && !widened.iter().all(queued);
+        let drops = !origins.is_empty() && !origins.iter().all(queued);
+        if widens {
+            self.contractions.push((proto, widened, ResumeArg::Type(CType::Type(LType::Double))));
+        }
+        if !drops {
             return;
         }
         #[cfg(feature = "tracing")]
@@ -3110,6 +3136,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn contractible(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>) -> Rc<Context> {
         let proto = self.proto;
         let mut origins: Vec<Origin> = Vec::new();
+        // Of constants meeting a double: rebuilt as doubles, not dropped.
+        let mut widened: Vec<Origin> = Vec::new();
         let mut conflicting: SmallVec<[(u8, usize); 2]> = SmallVec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         // Each duplicate's context, and whether it was one for a constant's slot of another type.
@@ -3122,20 +3150,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A version whose slot holding a constant holds another type here: the constant is
             // worth nothing past the point either. See Note [Contraction].
             if !ectx.alike(&ctx) {
-                let retyped = ectx.fragile.iter().filter(|fact| {
+                let retyped: Vec<&Fact> = ectx.fragile.iter().filter(|fact| {
                     matches!(fact.fragile, Fragile::Constant { slot, .. } if !ctx.fragile.contains(fact) && ectx.slot(slot) != ctx.slot(slot))
-                });
-                let Some(sets) = retyped.map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+                }).collect();
+                let doubles = !retyped.is_empty() && retyped.iter().all(|fact| fact.fragile.slot().is_some_and(|slot| meets_double(&ctx.slot(slot))));
+                let Some(sets) = retyped.iter().map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
                 let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
                 if found.is_empty() || found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                     continue;
                 }
                 _duplicates.push(_block.0);
                 #[cfg(feature = "tracing")]
-                _their.push(format!("{} retyped: {}", _block.0, ectx.tostring(owner)));
+                _their.push(format!("{} {}: {}", _block.0, if doubles { "widened" } else { "retyped" }, ectx.tostring(owner)));
+                let into = if doubles { &mut widened } else { &mut origins };
                 for origin in found {
-                    if !origins.iter().any(|known| Rc::ptr_eq(known, &origin)) {
-                        origins.push(origin);
+                    if !into.iter().any(|known| Rc::ptr_eq(known, &origin)) {
+                        into.push(origin);
                     }
                 }
                 continue;
@@ -3169,7 +3199,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
         }
         let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
-        if !origins.is_empty() && !origins.iter().all(queued) {
+        widened.retain(|origin| !origins.iter().any(|known| Rc::ptr_eq(known, origin)));
+        let drops = !origins.is_empty() && !origins.iter().all(queued);
+        let widens = !widened.is_empty() && !widened.iter().all(queued);
+        if drops || widens {
             #[cfg(feature = "tracing")]
             {
                 let context = ctx.tostring(owner);
@@ -3177,12 +3210,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ("line", self.traced_line(owner).into()),
                     ("pc", pc.0.into()),
                     ("duplicates", Self::ids(_duplicates.iter().copied()).as_str().into()),
-                    ("origins", Self::ids(origins.iter().map(|origin| owner.ro(origin).block.0)).as_str().into()),
+                    ("origins", Self::ids(origins.iter().chain(&widened).map(|origin| owner.ro(origin).block.0)).as_str().into()),
                     ("context", context.as_str().into()),
                     ("theirs", _their.join(" | ").as_str().into()),
                 ]);
             }
+        }
+        if drops {
             self.contractions.push((proto, origins, ResumeArg::Failed));
+        }
+        if widens {
+            self.contractions.push((proto, widened, ResumeArg::Type(CType::Type(LType::Double))));
         }
         if conflicting.is_empty() {
             return ctx;
@@ -3221,13 +3259,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let _blocks = Self::ids(origins.iter().map(|origin| owner.ro(origin).block.0));
             let _how = match how {
-                ResumeArg::Matched => "integer",
                 ResumeArg::Failed => "drop",
                 _ => "double",
             };
-            // Relied on since (which an integer serves as well), or rebuilt in code
-            // that has its own JIT code.
-            let refused = if how == ResumeArg::Failed && origins.iter().any(|origin| owner.ro(origin).used) {
+            // Relied on since, or rebuilt in code that has its own JIT code.
+            let refused = if origins.iter().any(|origin| owner.ro(origin).used) {
                 Some("used")
             } else if origins.iter().any(|origin| owner.ro(origin).rebuild.is_some() && self.compiled(owner.ro(origin).block)) {
                 Some("compiled")
@@ -3871,21 +3907,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    /// Narrow slot `slot` of `block`, a double, statically if a fact says it holds a
-    /// whole constant: the constant is stored again in the integer encoding. Whether
-    /// it was. See Note [Narrowing].
-    fn narrow_constant(&mut self, owner: &mut Owner, ctx: &mut Rc<Context>, slot: usize, block: BlockId) -> bool {
+    /// Widen slot `slot` of `block`, an integer, statically if a fact says it holds a
+    /// whole constant: the constant is stored again in the double encoding, and its
+    /// load queued to be rebuilt as a double. Whether it was. See Note [Widening].
+    fn widen_constant(&mut self, owner: &mut Owner, ctx: &mut Rc<Context>, slot: usize, block: BlockId) -> bool {
         let Some(value) = ctx.constant(slot) else { return false };
         let key = Fragile::Constant { slot, value }.key();
-        ctx.rely(owner, key);
-        // Rebuilt from where the constant was loaded, as an integer. See Note
+        // Rebuilt from where the constant was loaded, as a double. See Note
         // [Contraction].
         if let Some(set) = ctx.fragile.iter().find(|fact| fact.key() == key).and_then(|fact| fact.origins.as_ref()) {
             let origins: Vec<Origin> = owner.ro(set).iter().filter(|origin| owner.ro(origin).rebuild.is_some()).cloned().collect();
             let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
             let queues = !origins.is_empty() && !origins.iter().all(queued);
             #[cfg(feature = "tracing")]
-            crate::tracing::instant("spec", "narrow", &[
+            crate::tracing::instant("spec", "widen", &[
                 ("line", self.traced_line(owner).into()),
                 ("slot", slot.into()),
                 ("block", block.0.into()),
@@ -3896,15 +3931,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ("queued", (queues as u64).into()),
             ]);
             if queues {
-                self.contractions.push((self.proto, origins, ResumeArg::Matched));
+                self.contractions.push((self.proto, origins, ResumeArg::Type(CType::Type(LType::Double))));
             }
         }
-        self.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::NarrowK::new(value, &[slot]))));
-        // The fact used, and dropped by the write: its type says what it would, so
-        // no version keeps it apart.
+        self.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::WidenK::new(value, &[slot]))));
+        // The fact dropped by the write: its type says what it would, so no version
+        // keeps it apart.
         let ctx = Rc::make_mut(ctx);
         ctx.effect(Effect::Write(slot));
-        ctx.set_types(owner, vec![(slot, CType::Type(LType::Integer))]);
+        ctx.set_types(owner, vec![(slot, CType::Type(LType::Double))]);
         true
     }
 
@@ -5091,7 +5126,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             arg = ResumeArg::MatchedConst(rk & 0xff);
                         }
                     } else {
-                        // See Note [Narrowing].
+                        // See Note [Widening].
                         Rc::make_mut(&mut ctx).used(rk);
                         let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, expected.clone(), None, pc, ctx.clone(), true, 0));
                         self.end_block(block_id);
@@ -5188,7 +5223,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         // Dynamic branch: create a thunk that will discovery the type of the
                         // guarded value when forced, and fork the coroutine for the observed case.
-                        // See Note [Narrowing].
+                        // See Note [Widening].
                         Rc::make_mut(&mut ctx).used(idx);
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
@@ -5502,9 +5537,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let clobbered = (from..ctx.types.len()).map(|idx| (idx, CType::Unknown)).collect();
                     Rc::make_mut(&mut ctx).set_types(owner, clobbered)
                 },
-                CoroutineState::Yielded(YieldOp::NarrowConstant(slot)) => {
-                    if ctx.types.get(slot) == Some(&CType::Type(LType::Double)) {
-                        self.narrow_constant(owner, &mut ctx, slot, block_id);
+                CoroutineState::Yielded(YieldOp::WidenConstant(slot)) => {
+                    if ctx.types.get(slot) == Some(&CType::Type(LType::Integer)) {
+                        self.widen_constant(owner, &mut ctx, slot, block_id);
                     }
                 },
                 CoroutineState::Yielded(YieldOp::EncodeK(..)) if let Some(how) = self.decision(owner, pc) => {
@@ -5525,10 +5560,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Narrow(slot)) => match ctx.types[slot].clone() {
                     CType::Type(LType::Integer) => {
-                        pc = pc.next_true();
-                        arg = ResumeArg::Matched;
-                    }
-                    CType::Type(LType::Double) if self.narrow_constant(owner, &mut ctx, slot, block_id) => {
+                        // A whole constant used as an integer: kept one, and its fact had its
+                        // use. See Note [Widening].
+                        if let Some(value) = ctx.constant(slot) {
+                            ctx.rely(owner, Fragile::Constant { slot, value }.key());
+                            Rc::make_mut(&mut ctx).used(slot);
+                        }
                         pc = pc.next_true();
                         arg = ResumeArg::Matched;
                     }
