@@ -365,6 +365,20 @@ graph name:
 graph-golden name:
     mkdir -p working/graphs/{{name}}
     LUNACY_GOLDEN={{name}} LUNACY_GRAPH_DIR=$PWD/working/graphs/{{name}} {{SHARED}} cargo test --features graph --test golden_tests test_golden
+# `graph-golden`'s graphs of lua_tests/<name>.lua with `env` (an assignment, such as
+# `LUNACY_NO_FUSION=1`) and without, side by side in working/graphs/<name>-vs/index.html
+# (tools/graph_compare.py): searchable, over the residuals whose counts differ.
+graph-golden-vs name env:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf working/graphs/{{name}} working/graphs/{{name}}-with working/graphs/{{name}}-without
+    env {{env}} just graph-golden {{name}}
+    mv working/graphs/{{name}} working/graphs/{{name}}-with
+    just graph-golden {{name}}
+    mv working/graphs/{{name}} working/graphs/{{name}}-without
+    python3 tools/graph_compare.py --before working/graphs/{{name}}-with --after working/graphs/{{name}}-without \
+        --out working/graphs/{{name}}-vs --before-label "{{env}}" --after-label "default" \
+        --title "{{name}}" --about "Residual graphs of lua_tests/{{name}}.lua from the golden runner, with {{env}} and without."
 graph-release name:
     mkdir -p working
     luac5.1 -o working/{{name}}.bin {{name}}.lua
