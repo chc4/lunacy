@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 
-use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Location, Upvalue};
+use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Location, Return, Upvalue};
 use qcell::{LCell, LCellOwner};
 use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{Tc, Vm};
@@ -654,6 +654,10 @@ pub const UNKNOWN_RETURN: u32 = (1 << crate::vm::EFFECTS_SHIFT) - 1;
 // made up front would take one of the pc's versions whether or not anything ever enters it, and
 // once the pc has `MAX_VERSIONS`, accept the contexts its continuations reach it with, knowing
 // nothing of them. A native call doesn't return this way, and never reaches such a guard.
+//
+// A call inside an instruction (a generic for's of its iterator) continues where the call left its
+// generator: the code after it is the generator, suspended at the call, resumed in the context the
+// return gives, as the code after any other call is a version of the next pc (`Rest`).
 
 /// A TAILCALL's site: the context it is laid out from, its pc, A and B,
 /// whether its function closes upvalues and is vararg, and that function's
@@ -849,14 +853,14 @@ windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64],
 // window: the JIT code nils the callee's frame. See Notes [Inlined calls] and [Count case
 // analysis].
 windowed!(ShiftFrame, [a: u64, b: u64, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
-    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false);
+    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false, 0);
 });
 
 // `ShiftFrame` as a frame op, nilling the callee's frame past its arguments, as many as there are
 // or up to the top. See Notes [Inlined calls] and [Count case analysis].
 windowed!(frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| () {
     let callee = state.vals[state.base + A.lift(a)];
-    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, true);
+    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, true, 0);
 });
 
 // `unshift_frame` without the callstack's entry, for an inlined callee's RETURN A B (`a` and `b`
@@ -998,9 +1002,9 @@ pub enum Residual {
     /// continuations].
     Arrived { a: u16, c: u16, returned: u16 },
     LuaGuard { idx: usize, ptr: *const () },
-    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`. See
-    /// Note [Inlined calls].
-    Inline { a: u16, b: u16, stack: u8 },
+    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`, whose
+    /// returns continue compiling `continuation`. See Note [Inlined calls].
+    Inline { a: u16, b: u16, stack: u8, continuation: *const Continuation },
     /// An inlined callee's RETURN A B, which closes its frame's open upvalues if `closes`: its
     /// results to the call's R(A), `call`, if `moves`, and the caller's frame back. See Note
     /// [Inlined calls].
@@ -1042,11 +1046,14 @@ pub enum CallEntry {
 // A call of a small Lua function can compile the callee's code into its caller's. The call's
 // continuation, forced once the call has returned, decides to: from then on the call site jumps to
 // the callee's code in place of its call. That code is compiled from the context the caller had at
-// the call, renumbered from the callee's frame's base, and carries the caller's context before the
-// call with it. Each of the callee's returns continues compiling the caller's code after the call
-// from that context, with the results' types, less what the callee's code may have falsified (its
-// effects, applied as a continuation applies a callee's; Note [Call effects]), with no guard on the
-// return between.
+// the call, renumbered from the callee's frame's base, and names the call, by where it is in its
+// caller's code, so it is the callee's code for that call alone. What the code after the call is
+// compiled from, the caller's context before the call and how it continues, is kept in the inlined
+// call's entry in the callstack (`Continuation`). Each of the callee's returns ends in a thunk which,
+// run, continues compiling the caller's code after the call from that context, with the results'
+// types, less what the callee's code may have falsified (its effects, applied as a continuation
+// applies a callee's; Note [Call effects]), with no guard on the return between, and becomes the
+// return and a jump to that code.
 //
 // A function's frames hold the frames of the calls inlined into it, to any depth: its frame size
 // grows with each call inlined, so every frame of it a call makes, and the collector's live
@@ -1086,23 +1093,57 @@ pub enum CallEntry {
 // callee runs in the caller's context: a guard of a value loaded from an upvalue (Note [Upvalue
 // paths]), and a hash key's guard. A call inlines if what is left is within `MAX_INLINE_COST`.
 
-/// An inlined call, for its callee's code: the caller's context before the call, its captured
-/// slots below the call, and its prototype; the pc after the call, its A and C; what the callee's
-/// code may have done to the caller so far; and how many inlined calls deep it is. See Note
-/// [Inlined calls].
+/// An inlined call, for its callee's code: where its call is in its caller's code, the caller's
+/// prototype, the call's A, and what the callee's code may have done to the caller so far. See
+/// Note [Inlined calls].
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct InlineFrame {
-    pub caller: Context,
-    pub captured: Rc<[usize]>,
+    pub call: Location,
     pub proto: LProto<'static, 'static>,
-    pub after: Pc,
     pub a: u16,
-    pub c: u16,
     pub effects: Effects,
-    pub depth: u8,
-    /// The upvalue the callee's closure was loaded from, if the caller knows. See Note [Upvalue
-    /// paths].
-    pub closure: Option<UpvaluePath>,
+}
+
+/// The code after an inlined call, which its callee's returns continue compiling: the caller's
+/// prototype and context before the call, its captured slots below the call, the call's A and C,
+/// the upvalue the callee's closure was loaded from (Note [Upvalue paths]), and how the code after
+/// the call is compiled. Kept for as long as the specializer is, in the inlined call's entry in the
+/// callstack by its address. See Note [Inlined calls].
+pub struct Continuation {
+    proto: LProto<'static, 'static>,
+    caller: Context,
+    captured: Rc<[usize]>,
+    a: u16,
+    c: u16,
+    closure: Option<UpvaluePath>,
+    rest: Rest,
+}
+
+/// How the code after a call is compiled, from the context its return gives: the next pc's
+/// version, or for a call inside its instruction, the generator suspended at the call, resumed.
+/// See Note [Call continuations].
+#[derive(Clone)]
+pub enum Rest {
+    Next(Pc),
+    Resume(SubPc, Rc<dyn Fn(&mut Specializer, &mut Owner, Rc<Context>) -> BlockId>),
+}
+
+impl Rest {
+    fn block(&self, vm: &mut Specializer, owner: &mut Owner, ctx: Rc<Context>) -> BlockId {
+        match self {
+            Rest::Next(pc) => vm.version(owner, *pc, ctx),
+            Rest::Resume(_, resume) => resume(vm, owner, ctx),
+        }
+    }
+
+    /// The pc the code after the call is at, for traces.
+    #[cfg(feature = "tracing")]
+    fn pc(&self) -> Pc {
+        match self {
+            Rest::Next(pc) => *pc,
+            Rest::Resume(at, _) => at.0,
+        }
+    }
 }
 
 /// A Lua call laid out, which its continuation may inline: the block and offset of its `LuaCall`,
@@ -1133,13 +1174,7 @@ fn inlining() -> bool {
 /// How many slots past the base of the outermost frame inlining it the frame of code of `ctx` is.
 /// See Note [Inlined calls].
 fn inline_offset(ctx: &Context) -> usize {
-    let mut offset = 0;
-    let mut inline = ctx.inline.as_ref();
-    while let Some(frame) = inline {
-        offset += frame.a as usize + 1;
-        inline = frame.caller.inline.as_ref();
-    }
-    offset
+    ctx.inline.iter().map(|frame| frame.a as usize + 1).sum()
 }
 
 /// The slots past the base of the outermost frame an inlined callee's frame may reach: the JIT's
@@ -1150,7 +1185,7 @@ const MAX_INLINE_SLOTS: usize = 256;
 /// code costs. See Note [Inlined calls].
 fn inlines<C>(calling: &Context, caller: &crate::chunk::FunctionBlock<'_, C>, callee: &crate::chunk::FunctionBlock<'_, C>, a: usize) -> bool {
     inlining()
-        && calling.inline.as_ref().map_or(0, |frame| frame.depth) < MAX_INLINE_DEPTH
+        && calling.inline.len() < MAX_INLINE_DEPTH as usize
         && inline_offset(calling) + a + 1 + callee.max_stack as usize <= MAX_INLINE_SLOTS
         && callee.is_vararg == 0
         && !core::ptr::eq(caller, callee)
@@ -1172,8 +1207,9 @@ impl InlineCost {
 
 /// The context an inlined call in `caller`, of R(A) with operand B, enters the callee `proto`
 /// with: the entry context a call has, and the caller's facts about the callee's arguments,
-/// renumbered from its base, for the inlined call `frame`. See Note [Inlined calls].
-fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize, frame: InlineFrame) -> Context {
+/// renumbered from its base, for the inlined call `frame`, of the closure loaded from `closure`.
+/// See Note [Inlined calls].
+fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize, frame: InlineFrame, closure: Option<&UpvaluePath>) -> Context {
     let mut entry = entry_context(caller, proto, a, b);
     let params = a + 1..a + 1 + (proto.param_count as usize).min(entry.types.len());
     let shifted = |slot: usize| params.contains(&slot).then(|| slot - a - 1);
@@ -1181,8 +1217,8 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
         let fragile = match &fact.fragile {
             Fragile::Constant { slot, value } => shifted(*slot).map(|slot| Fragile::Constant { slot, value: *value }),
             // See Note [Upvalue paths].
-            Fragile::Kind { table, kind } => table.into_callee(shifted, frame.closure.as_ref()).map(|table| Fragile::Kind { table, kind: *kind }),
-            Fragile::ElementOf { slot, table } => shifted(*slot).zip(table.into_callee(shifted, frame.closure.as_ref())).map(|(slot, table)| Fragile::ElementOf { slot, table }),
+            Fragile::Kind { table, kind } => table.into_callee(shifted, closure).map(|table| Fragile::Kind { table, kind: *kind }),
+            Fragile::ElementOf { slot, table } => shifted(*slot).zip(table.into_callee(shifted, closure)).map(|(slot, table)| Fragile::ElementOf { slot, table }),
             Fragile::Holds { .. } | Fragile::Upvalue { .. } => None,
         };
         if let Some(fragile) = fragile.filter(|fragile| fragile.slot().is_none_or(|slot| entry.types[slot] != CType::Type(LType::Nil))) {
@@ -1190,14 +1226,14 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
         }
     }
     // See Note [Upvalue paths].
-    if let Some(closure) = &frame.closure {
+    if let Some(closure) = closure {
         for fact in &caller.fragile {
             if let Fragile::Upvalue { upvalue, ctype } = &fact.fragile && let Some(upvalue) = upvalue.rebase(closure) {
                 entry.assume(Fragile::Upvalue { upvalue, ctype: ctype.clone() });
             }
         }
     }
-    entry.inline = Some(Rc::new(frame));
+    entry.inline = caller.inline.iter().cloned().chain([frame]).collect();
     entry
 }
 /// The context a call in `caller`, of R(A) with operand B, enters the callee
@@ -1740,7 +1776,7 @@ pub struct Context {
     /// order. See Note [Fragile information].
     pub fragile: SmallVec<[Fact; 2]>,
     /// The inlined call whose callee's frame this is, if it is one. See Note [Inlined calls].
-    pub inline: Option<Rc<InlineFrame>>,
+    pub inline: Vec<InlineFrame>,
     /// The value each promote this path last passed through promoted, by the
     /// promote's pc, in pc order. See Note [Green values].
     pub greens: SmallVec<[(Pc, i32); 2]>,
@@ -2313,9 +2349,6 @@ impl Mark for Context {
                 ctype.mark(owner);
             }
         }
-        if let Some(frame) = &self.inline {
-            frame.caller.mark(owner);
-        }
     }
 }
 
@@ -2327,7 +2360,7 @@ impl Context {
             hkeys: vec![],
             top: None,
             fragile: SmallVec::new(),
-            inline: None,
+            inline: Vec::new(),
             greens: SmallVec::new(),
         }
     }
@@ -2378,11 +2411,8 @@ impl Context {
     /// Add `effects` to what the callee's code this is the context of may have done to its
     /// caller, if it is an inlined call's. See Note [Inlined calls].
     fn inlined(&mut self, effects: Effects) {
-        if let Some(frame) = &mut self.inline {
-            let joined = frame.effects.join(effects);
-            if joined != frame.effects {
-                Rc::make_mut(frame).effects = joined;
-            }
+        if let Some(frame) = self.inline.last_mut() {
+            frame.effects = frame.effects.join(effects);
         }
     }
 
@@ -2829,6 +2859,8 @@ pub struct Specializer<'src, 'intern> {
     inlined: HashMap<(LProto<'src, 'intern>, SubPc, LProto<'src, 'intern>), Vec<Context>, rustc_hash::FxBuildHasher>,
     /// Each promote's values that have versions, by its function and pc. See Note [Green values].
     promoted: HashMap<(LProto<'src, 'intern>, Pc), std::collections::HashSet<i32, rustc_hash::FxBuildHasher>, rustc_hash::FxBuildHasher>,
+    /// The code after each inlined call, its returns continue compiling. See Note [Inlined calls].
+    continuations: Vec<Rc<Continuation>>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -2844,6 +2876,9 @@ impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
         }
         for entries in self.inlined.values() {
             entries.iter().for_each(|entry| entry.mark(owner));
+        }
+        for continuation in &self.continuations {
+            continuation.caller.mark(owner);
         }
     }
 }
@@ -2864,6 +2899,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             rebuilt: Default::default(),
             decided: Default::default(),
             promoted: Default::default(),
+            continuations: Vec::new(),
             inlined: Default::default(),
             unreachable: Default::default(),
             #[cfg(feature = "jit")]
@@ -3438,13 +3474,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn inline_chains(&self, entry: BlockId) -> HashMap<BlockId, String> {
         let line = |proto: LProto<'_, '_>| unsafe { (*proto).line_defined }.to_string();
         let chain = |proto: LProto<'_, '_>, ctx: &Context| {
-            let mut lines = vec![line(proto)];
-            let mut frame = ctx.inline.clone();
-            while let Some(f) = frame {
-                lines.push(line(f.proto.cast()));
-                frame = f.caller.inline.clone();
-            }
-            lines.reverse();
+            let mut lines: Vec<String> = ctx.inline.iter().map(|frame| line(frame.proto.cast())).collect();
+            lines.push(line(proto));
             lines.join("-")
         };
         let mut versions: HashMap<BlockId, String> = HashMap::default();
@@ -3747,30 +3778,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                     let effects: *const Cell<Effects> = self.effects_of(proto);
                     // An inlined callee's returns to the code after its call. See Note [Inlined calls].
-                    if let Some(frame) = ctx.inline.clone() {
-                        let after = self.inline_return(owner, &ctx, &frame, a as usize, b as usize);
-                        // A count of results known statically moves them as window ops in the
-                        // caller's frame, missing ones nil: values the JIT's window only renames.
-                        // Every result up to the top moves as a return's do.
-                        let moves = b == 0;
-                        self.blocks[block_id.0].instructions.push(Residual::InlineReturn { a: a as u16, b, closes, call: frame.a, moves });
-                        if moves {
-                            self.blocks[block_id.0].instructions.push(Residual::Arrive { a: frame.a, c: frame.c });
-                        } else {
-                            let (call, c, a, returned) = (frame.a as usize, frame.c as usize, a as usize, b as usize - 1);
-                            for i in 0..if c == 0 { returned } else { c - 1 } {
-                                let result: Rc<dyn Window> = if i < returned {
-                                    Rc::new(crate::generators::Move::new(&[call + 1 + a + i, call + i]))
-                                } else {
-                                    Rc::new(crate::generators::LoadNil::new(&[call + i]))
-                                };
-                                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(result));
-                            }
-                            if c == 0 {
-                                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(SetTop::new(call + returned, &[]))));
-                            }
-                        }
-                        self.blocks[block_id.0].instructions.push(Residual::Jump(after));
+                    if !ctx.inline.is_empty() {
+                        let thunk = self.make_inline_return_thunk(block_id, ctx.clone(), a as usize, b, closes);
+                        self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
                     } else {
                         self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0, returns, effects));
                     }
@@ -4301,14 +4311,62 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    /// The caller's code after the inlined call `frame`, for a return in the callee's code, in
-    /// `ctx`, of RETURN A B: compiled from the caller's context before the call, less what the
-    /// callee's code may have done to it, with the results' types. See Note [Inlined calls].
-    fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, frame: &InlineFrame, a: usize, b: usize) -> BlockId {
-        let mut known = frame.caller.clone();
-        frame.effects.apply(owner, &mut known, &frame.captured);
+    /// The thunk an inlined callee's RETURN A B ends its block in: run, it lays out the return to
+    /// the code after the call its frame's entry continues, and a jump to it. See Note [Inlined
+    /// calls].
+    fn make_inline_return_thunk(&self, block_id: BlockId, ctx: Rc<Context>, a: usize, b: u16, closes: bool) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let Some(&CallstackEntry { ret: Return::Inlined(continuation), .. }) = state.callstack.last() else {
+                unreachable!("an inlined call's return outside its frame")
+            };
+            // SAFETY: a continuation lives as long as the specializer does.
+            let continuation = unsafe { &*(continuation as *const Continuation) };
+            // In place, as for a call thunk. See Note [Thunk patching].
+            let block = if vm.compiled(block_id) {
+                let block = vm.new_block(vm.blocks[block_id.0].pc);
+                vm.jump_thunk(block_id, thunk_pc, block);
+                block
+            } else {
+                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
+                block_id
+            };
+            let after = vm.inline_return(owner, &ctx, continuation, a, b as usize);
+            // A count of results known statically moves them as window ops in the caller's frame,
+            // missing ones nil: values the JIT's window only renames. Every result up to the top
+            // moves as a return's do.
+            let moves = b == 0;
+            let mut layout = vec![Residual::InlineReturn { a: a as u16, b, closes, call: continuation.a, moves }];
+            if moves {
+                layout.push(Residual::Arrive { a: continuation.a, c: continuation.c });
+            } else {
+                let (call, c, returned) = (continuation.a as usize, continuation.c as usize, b as usize - 1);
+                for i in 0..if c == 0 { returned } else { c - 1 } {
+                    let result: Rc<dyn Window> = if i < returned {
+                        Rc::new(crate::generators::Move::new(&[call + 1 + a + i, call + i]))
+                    } else {
+                        Rc::new(crate::generators::LoadNil::new(&[call + i]))
+                    };
+                    layout.push(Residual::ExecWindow(result));
+                }
+                if c == 0 {
+                    layout.push(Residual::ExecWindow(Rc::new(SetTop::new(call + returned, &[]))));
+                }
+            }
+            layout.push(Residual::Jump(after));
+            vm.blocks[block.0].instructions.extend(layout);
+        })))
+    }
+
+    /// The caller's code after the inlined call `continuation` continues, for a return in the
+    /// callee's code, in `ctx`, of RETURN A B: compiled from the caller's context before the call,
+    /// less what the callee's code may have done to it, with the results' types. See Note [Inlined
+    /// calls].
+    fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, continuation: &Continuation, a: usize, b: usize) -> BlockId {
+        let effects = ctx.inline.last().expect("an inlined call's frame").effects;
+        let mut known = continuation.caller.clone();
+        effects.apply(owner, &mut known, &continuation.captured);
         // See Note [Upvalue paths].
-        if let Some(closure) = frame.closure.as_ref().filter(|_| frame.effects.0 & Effects::UPVALUE.0 == 0) {
+        if let Some(closure) = continuation.closure.as_ref().filter(|_| effects.0 & Effects::UPVALUE.0 == 0) {
             for fact in &ctx.fragile {
                 match &fact.fragile {
                     Fragile::Upvalue { upvalue, ctype } => known.assume(Fragile::Upvalue { upvalue: upvalue.under(closure), ctype: ctype.clone() }),
@@ -4319,7 +4377,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
         }
-        let (call, c) = (frame.a as usize, frame.c as usize);
+        let (call, c) = (continuation.a as usize, continuation.c as usize);
         let returned = (b != 0).then(|| b - 1);
         let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
         let slots = known.types.len();
@@ -4337,14 +4395,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let callee = self.proto;
         #[cfg(feature = "tracing")]
         let (_callee, _known) = (self.traced_line(owner), known.tostring(owner));
-        self.set_current(frame.proto as LProto<'_, '_>);
-        self.join_effects(owner, frame.effects);
-        let after = self.version(owner, frame.after, Rc::new(known));
+        self.set_current(continuation.proto as LProto<'_, '_>);
+        self.join_effects(owner, effects);
+        let after = continuation.rest.block(self, owner, Rc::new(known));
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline_return", &[
             ("line", self.traced_line(owner).into()),
             ("callee", _callee.into()),
-            ("after", frame.after.into()),
+            ("after", continuation.rest.pc().into()),
             ("block", after.0.into()),
             ("context", _known.as_str().into()),
         ]);
@@ -4362,7 +4420,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// below it, and the pc after it, a Lua function's call continues at a thunk
     /// specializing it to the return. See Notes [Call sites], [Call
     /// continuations] and [Call effects].
-    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
             // is a guard's failure, with the rest of the layout after it. See Note
@@ -4387,16 +4445,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     // A call a continuation decided to inline in a context its callee's entry
                     // accepts this one's in inlines from the first. See Note [Inlined calls].
-                    if let Some((ctx, captured, after_pc)) = &continuation
+                    if let Some((ctx, captured, rest)) = &continuation
                         && inlines(&calling, unsafe { &*vm.proto }, unsafe { &*proto }, a)
                     {
                         let callee = proto as LProto<'static, 'static>;
-                        let entry = Self::inline_frame(&calling, callee, ctx, captured, vm.proto as LProto<'static, 'static>, *after_pc, a, b, c);
+                        let call = Location(block, vm.blocks[block.0].instructions.len() + layout.len());
+                        let entry = Self::inline_frame(&calling, callee, call, vm.proto as LProto<'static, 'static>, a, b);
                         let mut known = entry.clone();
-                        known.inline = None;
+                        known.inline = Vec::new();
                         if vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known))) {
                             vm.blocks[block.0].instructions.extend(layout);
-                            let shift = vm.inline_call(owner, state, block, callee, a, b, entry);
+                            let continuation = vm.continuation(&calling, ctx, captured, rest, a, c);
+                            let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation);
                             vm.blocks[block.0].instructions.push(Residual::Jump(shift));
                             return;
                         }
@@ -4405,10 +4465,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let off = vm.blocks[block.0].instructions.len() + layout.len();
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg, callee: proto as LProto<'static, 'static> });
-                    if let Some((ctx, captured, after_pc)) = &continuation {
+                    if let Some((ctx, captured, rest)) = &continuation {
                         // See Notes [Call continuations] and [Inlined calls].
                         let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
-                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), *after_pc, a, c, after.clone(), Some(Rc::new(call)), 0, true)));
+                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), rest.clone(), a, c, after.clone(), Some(Rc::new(call)), 0, true)));
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -4450,7 +4510,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(&calling.slot(slot))));
                     // What the code after an effect-free call knows: its context before the
                     // call, but for the callee's frame, and a window op's result.
-                    let mut known = continuation.as_ref().map(|(before, _, pc)| ((**before).clone(), *pc));
+                    let mut known = continuation.as_ref().map(|(before, _, rest)| ((**before).clone(), rest.clone()));
                     if let Some((_, op)) = window {
                         layout.push(Residual::ExecWindow(op.window));
                         if c == 0 {
@@ -4474,9 +4534,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     }
                     // See Note [Library natives] in `library`.
-                    if let Some((known, pc)) = known {
-                        let known = vm.jumping(owner, Rc::new(known), pc);
-                        layout.push(Residual::Jump(After::Version(pc, known).block(vm, owner)));
+                    if let Some((known, rest)) = known {
+                        let after = match rest {
+                            Rest::Next(pc) => {
+                                let known = vm.jumping(owner, Rc::new(known), pc);
+                                After::Version(pc, known).block(vm, owner)
+                            },
+                            rest => rest.block(vm, owner, Rc::new(known)),
+                        };
+                        layout.push(Residual::Jump(after));
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -4601,40 +4667,44 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Some(measured)
     }
 
-    /// The entry context of the inlined call of R(A) with B and C in `calling`, of `callee`, by the
-    /// function `proto`, which continues at `after` from `caller`, the context before the call
-    /// less the callee's frame (`captured` its slots below the call its closures captured). See
-    /// Note [Inlined calls].
-    fn inline_frame(calling: &Context, callee: LProto<'static, 'static>, caller: &Context, captured: &Rc<[usize]>, proto: LProto<'static, 'static>, after: Pc, a: usize, b: usize, c: usize) -> Context {
-        let frame = InlineFrame {
+    /// The entry context of the inlined call `call` of R(A) with B in `calling`, of `callee`, by
+    /// the function `proto`. See Note [Inlined calls].
+    fn inline_frame(calling: &Context, callee: LProto<'static, 'static>, call: Location, proto: LProto<'static, 'static>, a: usize, b: usize) -> Context {
+        let frame = InlineFrame { call, proto, a: a as u16, effects: Effects::NONE };
+        inline_entry(calling, unsafe { &*callee }, a, b, frame, calling.holds(a).as_ref())
+    }
+
+    /// The code after the inlined call of R(A) with C in `calling`, by the running function: the
+    /// context before the call `caller`, less the callee's frame (`captured` its slots below the call
+    /// its closures captured), continuing as `rest`. See Note [Inlined calls].
+    fn continuation(&self, calling: &Context, caller: &Context, captured: &Rc<[usize]>, rest: &Rest, a: usize, c: usize) -> Continuation {
+        Continuation {
+            proto: self.proto as LProto<'static, 'static>,
             caller: caller.clone(),
             captured: captured.clone(),
-            proto,
-            after,
             a: a as u16,
             c: c as u16,
-            effects: Effects::NONE,
-            depth: calling.inline.as_ref().map_or(1, |frame| frame.depth + 1),
             closure: calling.holds(a),
-        };
-        inline_entry(calling, unsafe { &*callee }, a, b, frame)
+            rest: rest.clone(),
+        }
     }
 
     /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
-    /// callee's frame in, then goes on to its version for `entry`. See Note [Inlined calls].
-    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context) -> BlockId {
+    /// callee's frame in, then goes on to its version for `entry`, its returns continuing
+    /// `continuation`. See Note [Inlined calls].
+    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context, continuation: Continuation) -> BlockId {
         // The outermost function's frame holds the callee's.
-        let mut outermost = entry.inline.as_ref().expect("an inlined call's frame");
-        while let Some(frame) = &outermost.caller.inline {
-            outermost = frame;
-        }
-        if unsafe { (*outermost.proto).frame_size.grow(inline_offset(&entry) + (*callee).max_stack as usize) } {
+        let outermost = entry.inline.first().expect("an inlined call's frame").proto;
+        if unsafe { (*outermost).frame_size.grow(inline_offset(&entry) + (*callee).max_stack as usize) } {
             state.fit_frames(owner);
             #[cfg(feature = "jit")]
-            self.jctx.frame_grew(outermost.proto as usize, unsafe { (*outermost.proto).frame_size.get() });
+            self.jctx.frame_grew(outermost as usize, unsafe { (*outermost).frame_size.get() });
         }
         #[cfg(feature = "tracing")]
-        let (_line, _entry, _after) = (self.traced_line(owner), entry.tostring(owner), entry.inline.as_ref().map_or(0, |frame| frame.after));
+        let (_line, _entry, _after) = (self.traced_line(owner), entry.tostring(owner), continuation.rest.pc());
+        let continuation = Rc::new(continuation);
+        let pointer = Rc::as_ptr(&continuation);
+        self.continuations.push(continuation);
         let caller = self.proto;
         self.set_current(callee as LProto<'_, '_>);
         self.versions.entry(self.proto).or_insert_with(|| HashMap::default());
@@ -4642,7 +4712,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.set_current(caller);
         let shift = self.new_block(self.blocks[block.0].pc);
         let stack = unsafe { (*callee).max_stack };
-        self.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: b as u16, stack }, Residual::Jump(version)]);
+        self.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: b as u16, stack, continuation: pointer }, Residual::Jump(version)]);
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline", &[
             ("line", _line.into()),
@@ -4667,7 +4737,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// (`identities`). Past that, or for a return that doesn't know what it
     /// returns, the results, and `after` (as `After::block`). See Notes [Call continuations] and
     /// [Call effects].
-    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, pc: Pc, a: usize, c: usize, after: After, inline: Option<Rc<InlineCall>>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, rest: Rest, a: usize, c: usize, after: After, inline: Option<Rc<InlineCall>>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The call it continues, laid out just before it, inlined from now on: this return,
             // from its frame, continues as any other. See Note [Inlined calls].
@@ -4678,11 +4748,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 && state.returned & !0xffff_ffff == crate::vm::RETURNED
                 && vm.inline_cost(owner, entry, Location::unpack(crate::vm::PackedLocation::from_bits(state.returned_at as usize)).0, call.callee).is_some_and(InlineCost::inlines)
             {
-                let entry = Self::inline_frame(&call.calling, call.callee, &ctx, &captured, vm.proto as LProto<'static, 'static>, pc, a, call.b, c);
+                let entry = Self::inline_frame(&call.calling, call.callee, Location(call.block, call.off), vm.proto as LProto<'static, 'static>, a, call.b);
                 let mut decided = entry.clone();
-                decided.inline = None;
+                decided.inline = Vec::new();
                 vm.inlined.entry((vm.proto, call.pc, call.callee as LProto<'_, '_>)).or_default().push(decided);
-                let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry);
+                let continuation = vm.continuation(&call.calling, &ctx, &captured, &rest, a, c);
+                let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry, continuation);
                 vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
             }
             // In place, as for a call thunk. See Note [Thunk patching].
@@ -4718,9 +4789,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     // Not `jumping`: the code after the call is reached by falling through,
                     // and the results are usually in temporaries it reads.
-                    let version = vm.version(owner, pc, Rc::new(known));
+                    let version = rest.block(vm, owner, Rc::new(known));
                     layout.push(Residual::ReturnedFrom(returned));
-                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), pc, a, c, after.clone(), None, identities + 1, false)));
+                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), rest.clone(), a, c, after.clone(), None, identities + 1, false)));
                     layout.push(Residual::Arrived { a: a16, c: c16, returned: results.len() as u16 });
                     layout.push(Residual::Jump(version));
                 },
@@ -5605,11 +5676,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // for the function it finds, the code after it a version of
                             // its own. See Note [Call sites].
                             let (after, continuation) = if resumes {
-                                (After::Block(self.subblock(owner, pc.next_true(), ctx, coro.clone(), ResumeArg::Start)), None)
+                                // The generator, suspended at the call, for its returns. See Note
+                                // [Call continuations].
+                                let at = pc.next_true();
+                                let suspended = coro.clone();
+                                let rest = Rest::Resume(at, Rc::new(move |vm: &mut Specializer, owner: &mut Owner, ctx: Rc<Context>| {
+                                    vm.subblock(owner, at, ctx, suspended.clone(), ResumeArg::Start)
+                                }));
+                                let continuation = before.map(|(before, captured)| (before, captured, rest));
+                                (After::Block(self.subblock(owner, at, ctx, coro.clone(), ResumeArg::Start)), continuation)
                             } else {
                                 // A Lua callee's return also chooses a version of its own. See
                                 // Note [Call continuations].
-                                let continuation = before.map(|(before, captured)| (before, captured, pc.0 + 1));
+                                let continuation = before.map(|(before, captured)| (before, captured, Rest::Next(pc.0 + 1)));
                                 let after = self.jumping(owner, ctx, pc.0 + 1);
                                 (After::Version(pc.0 + 1, after), continuation)
                             };
@@ -6012,10 +6091,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     id = target;
                     off = 0;
                 },
-                &Residual::Inline { a, b, stack } => {
+                &Residual::Inline { a, b, stack, continuation } => {
                     off += 1;
                     let callee = state.vals[state.base + a as usize];
-                    state.shift_frame::<true>(owner, callee, a as usize, b as usize, stack, true);
+                    state.shift_frame::<true>(owner, callee, a as usize, b as usize, stack, true, continuation as u64);
                     self.set_current(state.clos.ro(owner).prototype);
                 },
                 &Residual::InlineReturn { a, b, closes, moves, .. } => {

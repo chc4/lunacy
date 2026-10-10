@@ -222,7 +222,7 @@ impl JitHelper {
             let state = &mut *(state as *mut RunState<'static, 'static>);
             let kept = core::slice::from_raw_parts(kept, crate::vm::INLINE_KEPT);
             let clos = crate::vm::Tc(crate::gc::Gc::from_addr(kept[5]));
-            state.unwind_jit_frame(clos, kept[4] as usize, kept[3] as usize, kept[2] as usize, crate::vm::Return::Inlined);
+            state.unwind_jit_frame(clos, kept[4] as usize, kept[3] as usize, kept[2] as usize, crate::vm::Return::Inlined(kept[1]));
         }
     }
 
@@ -691,7 +691,7 @@ macro_rules! frame_op {
 /// fixed count of arguments, past which its code nils the frame itself; else the frame op does,
 /// flushing the window. See Note [Inlined calls] in `specialize`.
 fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
-    let &Residual::Inline { a, b, stack } = res else { return None };
+    let &Residual::Inline { a, b, stack, .. } = res else { return None };
     let passed = (b as usize).checked_sub(1)?;
     if (stack as usize).saturating_sub(passed) > INLINE_NILS {
         return None;
@@ -706,7 +706,7 @@ fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
 /// `specialize`.
 fn inline_kills(res: &Residual, offset: usize) -> Slots {
     let mut kills = Slots::default();
-    if let &Residual::Inline { a, b, stack } = res {
+    if let &Residual::Inline { a, b, stack, .. } = res {
         let base = offset + a as usize + 1;
         (base + b as usize - 1..base + stack as usize).for_each(|slot| kills.insert(slot));
     }
@@ -2460,6 +2460,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let call = res;
             if shifted.is_some() {
+                let &Residual::Inline { continuation, .. } = call else { unreachable!() };
                 jit_note!(self.jctx, ops, "        keep the caller's frame");
                 dynasm!(ops
                     ; .arch x64
@@ -2467,7 +2468,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ; push QWORD r12 => RunState.base
                     ; push QWORD r12 => RunState.witness_base
                     ; push QWORD r12 => RunState.witness_top
-                    ; sub rsp, 16
+                    ; mov rax, QWORD continuation as i64
+                    ; push rax
+                    ; sub rsp, 8
                 );
             }
             let res = shifted.as_ref().unwrap_or(res);
@@ -2995,12 +2998,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp =>exits[depth.get()]
                     );
                 },
-                Residual::Inline { a, b, stack } => {
+                Residual::Inline { a, b, stack, continuation } => {
                     // The callee's frame, moved to by `ShiftFrameFilled`, which keeps no register
                     // but `state`'s and nils the frame; what the frame's entry would hold kept as
-                    // `RunState::adopt_inlined` lays it out, the callee's base pointer last, where
-                    // the code after a call takes it back from. See Note [Inlined calls] in
-                    // `specialize`.
+                    // `RunState::adopt_inlined` lays it out, the code after the call above the
+                    // callee's base pointer, which is last, where the code after a call takes it
+                    // back from. See Note [Inlined calls] in `specialize`.
                     let hold = crate::specialize::Count::hold;
                     let (held_a, held_b) = (hold(*a), hold(*b));
                     let shift = frame_op!(ShiftFrameFilled [] (held_a, held_b, *stack); *a, *b);
@@ -3011,7 +3014,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; push QWORD r12 => RunState.base
                         ; push QWORD r12 => RunState.witness_base
                         ; push QWORD r12 => RunState.witness_top
-                        ; sub rsp, 16
+                        ; mov rax, QWORD *continuation as i64
+                        ; push rax
+                        ; sub rsp, 8
                     );
                     jit_note!(self.jctx, ops, "        ShiftFrameFilled");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &shift);
@@ -3296,7 +3301,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }; break; }
             if shifted.is_some() {
-                let &Residual::Inline { a, b, stack } = call else { unreachable!() };
+                let &Residual::Inline { a, b, stack, .. } = call else { unreachable!() };
                 // The window op keeps r13, the caller's base pointer, and the stack, which the
                 // callee's frame is within, stays where it is.
                 jit_note!(self.jctx, ops, "        enter the callee's frame");
