@@ -699,30 +699,55 @@ hyperfine-uxn-promote-full benchmark times='1': (_hyperfine-uxn-promote benchmar
 _hyperfine-uxn-promote benchmark times full: unsafe-compile unsafe-magic-compile _raven
     #!/usr/bin/env bash
     set -euo pipefail
+    commands=()
+    while IFS=$'\t' read -r name command; do commands+=(-n "$name" "$command"); done \
+        < <(just _uxn-promote-commands {{benchmark}} {{times}} "{{full}}")
+    # As `hyperfine-full`: a command failing is timed, and left out of the history.
+    {{TIMED}} hyperfine -i -N --warmup {{WARMUP}} --export-markdown working/hyperfine-promote-{{benchmark}}-{{times}}.md \
+        --export-json working/hyperfine-promote-{{benchmark}}-{{times}}.json "${commands[@]}"
+
+# The implementations `hyperfine-uxn-promote` runs a uxn_* benchmark on, one
+# `name<TAB>command` line each: Raven's backends, where the ROM needs nothing past
+# its reset vector, LuaJIT with and without its JIT with `full`, and lunacy's
+# unsafe build and its unsafe build with `magic`. Each command runs without a shell.
+_uxn-promote-commands benchmark times full:
+    #!/usr/bin/env bash
+    set -euo pipefail
     b={{benchmark}}
-    just _luac $b
-    raven=()
+    just _luac $b >&2
     name=${b#uxn_}; name=${name#bit_}
     # uxn_loop runs loop_long.tal.
     if [ $name = loop ]; then name=loop_long; fi
     rom=working/roms/$name.rom
     if [ {{times}} = 1 ] && [ $name != bunnymark ]; then
         for backend in interpreter tailcall native; do
-            raven+=(-n "raven $backend" "target/raven/target/release/raven-cli --backend $backend --quit $rom")
+            printf 'raven %s\t%s\n' $backend "target/raven/target/release/raven-cli --backend $backend --quit $rom"
         done
     fi
-    luajit=()
     if [ -n "{{full}}" ]; then
-        just _luajitc $b
-        luajit=(-n "luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin {{times}}"
-            -n luajit "luajit bench.lua -- working/$b.luajit.bin {{times}}")
+        just _luajitc $b >&2
+        printf 'luajit -joff\t%s\n' "luajit -joff bench.lua -- working/$b.luajit.bin {{times}}"
+        printf 'luajit\t%s\n' "luajit bench.lua -- working/$b.luajit.bin {{times}}"
     fi
     jit="LUNACY_JIT_SIZE={{UXN_JIT_SIZE}}"
-    # As `hyperfine-full`: a command failing is timed, and left out of the history.
-    {{TIMED}} hyperfine -i -N --warmup {{WARMUP}} --export-markdown working/hyperfine-promote-$b-{{times}}.md \
-        --export-json working/hyperfine-promote-$b-{{times}}.json "${raven[@]}" "${luajit[@]}" \
-        -n "lunacy unsafe" "env $jit ./target/unsafe/bench working/$b.bin {{times}}" \
-        -n "lunacy unsafe magic" "env $jit ./target/magic/unsafe/bench working/$b.bin {{times}}"
+    printf 'lunacy unsafe\t%s\n' "env $jit ./target/unsafe/bench working/$b.bin {{times}}"
+    printf 'lunacy unsafe magic\t%s\n' "env $jit ./target/magic/unsafe/bench working/$b.bin {{times}}"
+
+# Cycles (`perf stat`, the mean of `runs`) of each implementation
+# `hyperfine-uxn-promote-full` times on a uxn_* benchmark, pinned as it pins
+# them, and those cycles over `iterations`, the iterations of the ROM's loop: a
+# whole run's, starting the process and compiling included. uxn_loop's loop
+# runs 16 * 65535 = 1048560 times.
+perf-stat-uxn-promote benchmark iterations times='1' runs='5': unsafe-compile unsafe-magic-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf '%-22s %16s %12s\n' implementation cycles cycles/iter
+    while IFS=$'\t' read -r name command; do
+        read -ra words <<< "$command"
+        cycles=$({{TIMED}} perf stat -x, -r {{runs}} -e cycles -- "${words[@]}" 2>&1 < /dev/null > /dev/null \
+            | awk -F, '$3 ~ /cycles/ { print $1 }' | tail -1)
+        awk -v name="$name" -v cycles="$cycles" 'BEGIN { printf "%-22s %16s %12.2f\n", name, cycles, cycles / {{iterations}} }'
+    done < <(just _uxn-promote-commands {{benchmark}} {{times}} full)
 
 # `hyperfine-uxn-promote` over the uxn_* ROMs.
 hyperfines-uxn-promote: (_hyperfines-uxn-promote "hyperfine-uxn-promote")
