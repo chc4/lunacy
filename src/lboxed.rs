@@ -367,6 +367,23 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         self.0 as u32 as i32
     }
 
+    /// Decode a number known to be one, in either encoding, with `tag` the value
+    /// of `NUMBER_TAG`, as `from_arith_tagged`: one register for both the test of
+    /// its encoding and decoding a double. See Note [Pinned tag] in `window`.
+    ///
+    /// # Safety
+    ///
+    /// The value is a number, and `tag` is `NUMBER_TAG`.
+    #[inline(always)]
+    pub unsafe fn as_number_tagged(&self, tag: u64) -> f64 {
+        debug_assert!(self.is_number(), "{:#x} isn't a number", self.0);
+        if self.0 & tag == tag {
+            self.0 as u32 as i32 as f64
+        } else {
+            unsafe { self.as_double_tagged(tag) }
+        }
+    }
+
     /// Decode a number, in either encoding, or `None` if this value isn't a
     /// number. See Note [Integer encoding].
     #[inline(always)]

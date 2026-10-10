@@ -496,28 +496,28 @@ fn bit2<const OP: u8>(x: i32, y: i32) -> i32 {
 }
 
 /// A bit op's window op's argument: in the integer encoding (`INT`), read as it
-/// is, or a number of either encoding the specializer checked. See Note
-/// [Integers] in `specialize`.
+/// is, or a number of either encoding the specializer checked, decoded with the
+/// pinned tag. See Note [Integers] in `specialize` and Note [Pinned tag] in `window`.
 #[inline(always)]
-unsafe fn bit_arg<const INT: bool>(v: LBoxed) -> i32 {
-    if INT { unsafe { v.as_int() } } else { to_bit(unsafe { checked_number(v) }) }
+unsafe fn bit_arg<const INT: bool>(v: LBoxed, tag: u64) -> i32 {
+    if INT { unsafe { v.as_int() } } else { to_bit(unsafe { v.as_number_tagged(tag) }) }
 }
 
 // A bit op's result is an i32, so it is in the integer encoding. See Note
 // [Integers] in `specialize`.
 crate::window::windowed!(BitUnary, [], [OP: u8, X: bool], |owner, state, base, tag| (x, out r) {
-    *r = LBoxed::from_int_tagged(bit1::<OP>(bit_arg::<X>(x)), tag);
+    *r = LBoxed::from_int_tagged(bit1::<OP>(bit_arg::<X>(x, tag)), tag);
 });
 crate::window::windowed!(BitBinary, [], [OP: u8, X: bool, Y: bool], |owner, state, base, tag| (x, y, out r) {
-    *r = LBoxed::from_int_tagged(bit2::<OP>(bit_arg::<X>(x), bit_arg::<Y>(y)), tag);
+    *r = LBoxed::from_int_tagged(bit2::<OP>(bit_arg::<X>(x, tag), bit_arg::<Y>(y, tag)), tag);
 });
 // A folding bit op of three and of four numbers, all in the integer encoding if `INTS`.
 crate::window::windowed!(BitTernary, [], [OP: u8, INTS: bool], |owner, state, base, tag| (x, y, z, out r) {
-    *r = LBoxed::from_int_tagged(bit2::<OP>(bit2::<OP>(bit_arg::<INTS>(x), bit_arg::<INTS>(y)), bit_arg::<INTS>(z)), tag);
+    *r = LBoxed::from_int_tagged(bit2::<OP>(bit2::<OP>(bit_arg::<INTS>(x, tag), bit_arg::<INTS>(y, tag)), bit_arg::<INTS>(z, tag)), tag);
 });
 crate::window::windowed!(BitQuaternary, [], [OP: u8, INTS: bool], |owner, state, base, tag| (x, y, z, w, out r) {
-    let xy = bit2::<OP>(bit_arg::<INTS>(x), bit_arg::<INTS>(y));
-    *r = LBoxed::from_int_tagged(bit2::<OP>(bit2::<OP>(xy, bit_arg::<INTS>(z)), bit_arg::<INTS>(w)), tag);
+    let xy = bit2::<OP>(bit_arg::<INTS>(x, tag), bit_arg::<INTS>(y, tag));
+    *r = LBoxed::from_int_tagged(bit2::<OP>(bit2::<OP>(xy, bit_arg::<INTS>(z, tag)), bit_arg::<INTS>(w, tag)), tag);
 });
 
 /// `bit1::<OP>` as a window op, for a call with one number and one result: its
@@ -612,7 +612,7 @@ crate::window::windowed!(WholeOfInt, [], [], |owner, state, base| (x, out r) {
 // doesn't, which is a double. As an integer op whose result doesn't fit. See Note [Optimistic ops]
 // in `specialize`.
 crate::window::windowed!(WholeOptimistic, [], [OP: u8], |owner, state, base, tag| (x, out r) {
-    let whole = math1::<OP>(unsafe { checked_number(x) });
+    let whole = math1::<OP>(unsafe { x.as_number_tagged(tag) });
     if crate::lboxed::is_integer(whole) {
         *r = LBoxed::from_int_tagged(whole as i32, tag);
         false
