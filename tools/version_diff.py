@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """How the versions compiled at one point differ: each `spec_version` of the
 function at `line` and pc `pc` (with `like`, only those whose context contains
-it, e.g. a green), in order, with how its context differs from the first's,
+it, e.g. a promoted value), in order, with how its context differs from the first's,
 token by token. From a trace (`just trace`).
 
     tools/version_diff.py LINE PC [--like TEXT] [--outcome new] [--trace working/lunacy.fxt]

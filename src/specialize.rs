@@ -77,6 +77,8 @@ pub struct Block {
     /// The upvalue cells holding their upvalue's value whenever the block is entered, by
     /// `cell` index: every cell where its context isn't known. See Note [Upvalue cells].
     pub cells: u32,
+    /// The promoted values its context has, which the JIT's notes show. See Note [Promoted values].
+    pub promoted: SmallVec<[(Pc, i32); 2]>,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
     /// Times the interpreter entered the block, shown by `dump`.
@@ -104,6 +106,7 @@ impl Block {
             allocates: false,
             context: None,
             cells: u32::MAX,
+            promoted: SmallVec::new(),
             #[cfg(feature = "jit")]
             jit_info: JitInfo::new(),
             #[cfg(feature = "graph")]
@@ -248,7 +251,7 @@ pub enum YieldOp {
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
     Promote(usize), // Resumed with Integer(v) where STACK[idx], an integer, is guarded equal to v,
-                    // the path then green with v, or Failed where it isn't. See Note [Green values]
+                    // the path then promoting v, or Failed where it isn't. See Note [Promoted values]
     OptimisticExec(Rc<dyn Window>), // An op with a cold path, which selects 0 on its hot path and
                                     // 1 on its cold. Resumed with Matched on the hot path, and
                                     // Failed on the cold. See Note [Optimistic ops]
@@ -1232,6 +1235,7 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
             Fragile::Holds { slot, upvalue } => shifted(*slot).zip(upvalue.into_callee(frame.closure.as_ref())).map(|(slot, upvalue)| Fragile::Holds { slot, upvalue }),
             Fragile::Upvalue { upvalue, ctype } => upvalue.into_callee(frame.closure.as_ref()).map(|upvalue| Fragile::Upvalue { upvalue, ctype: ctype.clone() }),
             Fragile::Passed { .. } => None,
+            Fragile::HoldsField { slot, field } => shifted(*slot).map(|slot| Fragile::HoldsField { slot, field: *field }),
         };
         if let Some(fragile) = fragile.filter(|fragile| fragile.slot().is_none_or(|slot| entry.types[slot] != CType::Type(LType::Nil))) {
             entry.introduce(Fact { fragile, origins: fact.origins.clone() });
@@ -1775,11 +1779,11 @@ fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected
 /// The versions of a pc before jumps to it reuse one. See Note [Version compatibility].
 const MAX_VERSIONS: usize = 3;
 /// The values one version of a promote tests before it returns its argument
-/// unspecialized. See Note [Green values].
+/// unspecialized. See Note [Promoted values].
 pub const PROMOTE_VALUES: usize = 8;
 /// The values a promote has versions for, past which it promotes no other.
-/// See Note [Green values].
-const PROMOTE_GREENS: usize = 512;
+/// See Note [Promoted values].
+const PROMOTE_SITE_VALUES: usize = 512;
 /// The versions of a pc, or of a point in its instruction, past which
 /// specialization panics. See Note [Version compatibility].
 const HARD_MAX_VERSIONS: usize = 16;
@@ -1797,37 +1801,37 @@ pub struct Context {
     /// The inlined call whose callee's frame this is, if it is one. See Note [Inlined calls].
     pub inline: Option<Rc<InlineFrame>>,
     /// The value each promote this path last passed through promoted, by the
-    /// promote's pc, in pc order. See Note [Green values].
-    pub greens: SmallVec<[(Pc, i32); 2]>,
+    /// promote's pc, in pc order. See Note [Promoted values].
+    pub promoted: SmallVec<[(Pc, i32); 2]>,
 }
 
-// Note [Green values]
-// ~~~~~~~~~~~~~~~~~~~~
-// `jit.promote(v)` returns `v`, and specializes the code after it to `v`'s value, as a meta-tracer's
-// green variables do: an interpreter written in Lua promotes its program counter and the
-// instruction there, and its dispatch loop's code is compiled once per guest instruction, the
-// guest's control flow its edges.
+// Note [Promoted values]
+// ~~~~~~~~~~~~~~~~~~~~~~~
+// `jit.promote(v)` returns `v`, and specializes the code after it to `v`'s value, as a meta-tracer
+// does with the values it is told to treat as constants: an interpreter written in Lua promotes
+// its program counter and the instruction there, and its dispatch loop's code is compiled once per
+// guest instruction, the guest's control flow its edges.
 //
 // A promote ends its block in a thunk. Forced, it guards its argument equal to the integer it holds
 // then (`EqualsK`), and the code past the guard is a version for that value: the context records
-// it in `greens`, by the promote's pc. The guard's other way promotes again, so a site seeing
+// it in `promoted`, by the promote's pc. The guard's other way promotes again, so a site seeing
 // several values tests them in turn, up to `PROMOTE_VALUES`, past which it returns its argument
 // unspecialized. A promote whose argument the context knows is a constant needs no guard.
 //
-// A site's values are bounded too: it has versions for the first `PROMOTE_GREENS` values it sees,
-// and returns any other unspecialized. Code past a promote is compiled once per value, so
+// A site's values are bounded too: it has versions for the first `PROMOTE_SITE_VALUES` values it
+// sees, and returns any other unspecialized. Code past a promote is compiled once per value, so
 // promoting what takes many values, as a loop's counter, costs a version per value up to there;
 // an interpreter's program counter takes one per guest instruction.
 //
-// A green isn't a fact about a slot: it says which value the path's last pass through a promote
-// had, and holds until the path passes through it again, whatever is written since. So it is
-// part of a version's identity, as an inlined frame is (`same_point`): versions with different
-// greens are never compared, joined or counted together, and `MAX_VERSIONS` bounds each green's
-// versions apart. That is what makes a loop over an interpreter's instructions one per guest
-// instruction: the loop's back edge, though it overwrote the promoted program counter, still
-// carries the green of the instruction just run, so the loop's head has a version per guest
+// A promoted value isn't a fact about a slot: it says which value the path's last pass through a
+// promote had, and holds until the path passes through it again, whatever is written since. So it
+// is part of a version's identity, as an inlined frame is (`same_point`): versions with different
+// promoted values are never compared, joined or counted together, and `MAX_VERSIONS` bounds each
+// value's versions apart. That is what makes a loop over an interpreter's instructions one per
+// guest instruction: the loop's back edge, though it overwrote the promoted program counter, still
+// carries the value of the instruction just run, so the loop's head has a version per guest
 // instruction, and the promote there tests only the values seen after that instruction, most
-// often one. Greens are per activation: a function's entry has none.
+// often one. Promoted values are per activation: a function's entry has none.
 
 // Note [Array kinds]
 // ~~~~~~~~~~~~~~~~~~
@@ -2019,14 +2023,43 @@ impl UpvaluePath {
 pub enum Subject {
     Slot(usize),
     Upvalue(UpvaluePath),
+    /// The value of a hash field: of the table and key the hash key at `href` is of. See Note
+    /// [Field facts].
+    Field(FieldRef),
+}
+
+/// A hash field, as the hash key at its index names it, with its key's name (hashed): an index
+/// given to another key no longer names it. See Note [Field facts].
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct FieldRef {
+    pub href: u8,
+    pub key: u64,
+}
+
+impl FieldRef {
+    /// The field the hash key at `href` names, of a string key.
+    fn of(hkeys: &[HashKey<'_, '_>], href: HashRef) -> Option<FieldRef> {
+        let hkey = hkeys.get(href.0 as usize).filter(|hkey| !hkey.orphan())?;
+        let crate::chunk::Constant::String(name) = &hkey.key else { return None };
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        name.as_bytes().hash(&mut hasher);
+        Some(FieldRef { href: href.0, key: hasher.finish() })
+    }
+
+    /// Whether the hash key at its index still names it.
+    fn live(&self, hkeys: &[HashKey<'_, '_>]) -> bool {
+        FieldRef::of(hkeys, HashRef(self.href)) == Some(*self)
+    }
 }
 
 impl Subject {
     /// Unique among subjects.
     fn key(&self) -> usize {
         match self {
-            Subject::Slot(slot) => slot << 1,
-            Subject::Upvalue(upvalue) => upvalue.key() << 1 | 1,
+            Subject::Slot(slot) => slot << 2,
+            Subject::Upvalue(upvalue) => upvalue.key() << 2 | 1,
+            Subject::Field(field) => (field.href as usize) << 2 | 2,
         }
     }
 
@@ -2034,15 +2067,17 @@ impl Subject {
     fn slot(&self) -> Option<usize> {
         match self {
             Subject::Slot(slot) => Some(*slot),
-            Subject::Upvalue(_) => None,
+            Subject::Upvalue(_) | Subject::Field(_) => None,
         }
     }
 
-    /// Whether the subject still holds the value it did before `effect`.
+    /// Whether the subject still holds the value it did before `effect`. A store into a hash
+    /// part is no `Effect`: it drops what is known of the fields it may be (`set_hazards`).
     fn survives(&self, effect: Effect) -> bool {
         match self {
             Subject::Slot(slot) => slot_survives(*slot, effect),
             Subject::Upvalue(upvalue) => upvalue_survives(upvalue, effect),
+            Subject::Field(_) => !matches!(effect, Effect::Opaque),
         }
     }
 
@@ -2053,6 +2088,8 @@ impl Subject {
         match self {
             Subject::Slot(slot) => shifted(*slot).map(Subject::Slot),
             Subject::Upvalue(upvalue) => upvalue.into_callee(closure).map(Subject::Upvalue),
+            // The callee's hash keys are its caller's. See Note [Inlined calls].
+            Subject::Field(field) => Some(Subject::Field(*field)),
         }
     }
 
@@ -2062,6 +2099,7 @@ impl Subject {
         match self {
             Subject::Slot(_) => None,
             Subject::Upvalue(upvalue) => upvalue.into_caller(closure).map(Subject::Upvalue),
+            Subject::Field(field) => Some(Subject::Field(*field)),
         }
     }
 }
@@ -2083,6 +2121,22 @@ fn upvalue_survives(upvalue: &UpvaluePath, effect: Effect) -> bool {
         Effect::Write(_) | Effect::WriteAny | Effect::ArrayStore(_) | Effect::Move { .. } => true,
     }
 }
+
+// Note [Field facts]
+// ~~~~~~~~~~~~~~~~~~
+// A hash field is a subject of facts as an upvalue is (Note [Upvalue paths]): named by its hash
+// key's index and its key, it is what a slot loaded from it holds (`HoldsField`), and what such a
+// slot learns of its value, as the kind of its table's array part, the field learns too; a load of
+// it gives the slot what is known of the field. A slot's value copied into another, as an
+// argument into an inlined callee's parameter, holds the field too. An inlined callee's hash keys
+// are its caller's, so the field is the same subject on both sides of the call, and what the
+// callee learns of a table it was passed from a field, the caller knows on its return. So a table
+// kept in a field of an object, as the stacks of a machine, keeps the kind a guard found once,
+// through every call it is passed to.
+//
+// A field fact holds while the hash key at its index still names its key, and until a store into
+// a hash part with its key (a store of an unknown key, any field), or an opaque effect: a store
+// into a field is no effect on slots or upvalues, and the hash part it changes may be any table's.
 
 // Note [Upvalue paths]
 // ~~~~~~~~~~~~~~~~~~~~
@@ -2138,6 +2192,9 @@ pub enum Fragile {
     /// Stack slot `slot`, a parameter of an inlined callee, holds the table it
     /// was passed, which the caller's slot `owner` holds. See Note [Inlined calls].
     Passed { slot: usize, owner: usize },
+    /// Stack slot `slot` holds the value hash field `field` held when loaded
+    /// into it. See Note [Field facts].
+    HoldsField { slot: usize, field: FieldRef },
 }
 
 /// A fragile fact, with where the paths reaching it introduced it, if that can
@@ -2242,13 +2299,15 @@ impl Fragile {
             Fragile::Kind { table, .. } => (3, table.key()),
             Fragile::Constant { slot, .. } => (4, *slot),
             Fragile::Passed { slot, .. } => (5, *slot),
+            Fragile::HoldsField { slot, .. } => (6, *slot),
         }
     }
 
     /// The slot the fact is about, if it is about one.
     fn slot(&self) -> Option<usize> {
         match self {
-            Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } | Fragile::Passed { slot, .. } => Some(*slot),
+            Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } | Fragile::Passed { slot, .. }
+                | Fragile::HoldsField { slot, .. } => Some(*slot),
             Fragile::Kind { table, .. } => table.slot(),
             Fragile::Upvalue { .. } => None,
         }
@@ -2262,6 +2321,7 @@ impl Fragile {
             Fragile::ElementOf { slot, table } if *slot == from => Some(Fragile::ElementOf { slot: to, table: table.clone() }),
             Fragile::Kind { table: Subject::Slot(slot), kind } if *slot == from => Some(Fragile::Kind { table: Subject::Slot(to), kind: *kind }),
             Fragile::Constant { slot, value } if *slot == from => Some(Fragile::Constant { slot: to, value: *value }),
+            Fragile::HoldsField { slot, field } if *slot == from => Some(Fragile::HoldsField { slot: to, field: *field }),
             _ => None,
         }
     }
@@ -2284,6 +2344,7 @@ impl Fragile {
             Fragile::Constant { slot, .. } => slot_survives(*slot, effect),
             // The caller's slot is the caller's own, which the callee doesn't write.
             Fragile::Passed { slot, .. } => slot_survives(*slot, effect),
+            Fragile::HoldsField { slot, field } => slot_survives(*slot, effect) && Subject::Field(*field).survives(effect),
         }
     }
 }
@@ -2436,22 +2497,22 @@ impl Context {
             top: None,
             fragile: SmallVec::new(),
             inline: None,
-            greens: SmallVec::new(),
+            promoted: SmallVec::new(),
         }
     }
 
     /// Whether `self` and `other` are at the same point of the code: in the same
     /// inlined call, past the same promoted values. Versions at different points
-    /// are never compared. See Note [Green values].
+    /// are never compared. See Note [Promoted values].
     fn same_point(&self, other: &Context) -> bool {
-        self.inline == other.inline && self.greens == other.greens
+        self.inline == other.inline && self.promoted == other.promoted
     }
 
-    /// The path's green for the promote at `site`, now `value`. See Note [Green values].
-    fn green(&mut self, site: Pc, value: i32) {
-        match self.greens.binary_search_by_key(&site, |&(at, _)| at) {
-            Ok(i) => self.greens[i].1 = value,
-            Err(i) => self.greens.insert(i, (site, value)),
+    /// The path's promoted value for the promote at `site`, now `value`. See Note [Promoted values].
+    fn promote(&mut self, site: Pc, value: i32) {
+        match self.promoted.binary_search_by_key(&site, |&(at, _)| at) {
+            Ok(i) => self.promoted[i].1 = value,
+            Err(i) => self.promoted.insert(i, (site, value)),
         }
     }
 
@@ -2460,7 +2521,7 @@ impl Context {
             self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
             self.hkeys.iter().map(|hk| hk.tostring(owner)).intersperse(",".to_string()).collect::<String>(),
             self.fragile,
-            if self.greens.is_empty() { String::new() } else { format!(", greens: {:?}", self.greens) },
+            if self.promoted.is_empty() { String::new() } else { format!(", promoted: {:?}", self.promoted) },
         )
     }
 
@@ -2507,6 +2568,40 @@ impl Context {
     /// Note [Array kinds].
     fn array_kind(&self, table: usize) -> Option<Kind> {
         self.subject_kind(&Subject::Slot(table))
+            .or_else(|| self.holds_field(table).and_then(|field| self.subject_kind(&Subject::Field(field))))
+    }
+
+    /// The hash field slot `slot` holds the value of, if known and its hash key still names it.
+    /// See Note [Field facts].
+    fn holds_field(&self, slot: usize) -> Option<FieldRef> {
+        self.fragile.iter().find_map(|fact| match &fact.fragile {
+            Fragile::HoldsField { slot: held, field } if *held == slot && field.live(&self.hkeys) => Some(*field),
+            _ => None,
+        })
+    }
+
+    /// Forget what is known of the fields `stored` may be: those of hash key `href`'s key, or
+    /// with none, every field. See Note [Field facts].
+    fn forget_fields(&mut self, stored: Option<HashRef>) {
+        let key = stored.map(|href| FieldRef::of(&self.hkeys, href).map(|field| field.key));
+        let falsified = |field: &FieldRef| match key {
+            Some(Some(key)) => field.key == key,
+            // A key no field names: no field is it.
+            Some(None) => false,
+            None => true,
+        };
+        self.fragile.retain(|fact| match &fact.fragile {
+            Fragile::HoldsField { field, .. } | Fragile::Kind { table: Subject::Field(field), .. } => !falsified(field),
+            _ => true,
+        });
+    }
+
+    /// Forget what is known of the field hash key `href` named, its index given to another.
+    fn forget_index(&mut self, href: usize) {
+        self.fragile.retain(|fact| match &fact.fragile {
+            Fragile::HoldsField { field, .. } | Fragile::Kind { table: Subject::Field(field), .. } => field.href as usize != href,
+            _ => true,
+        });
     }
 
     /// The kind of the array part of the table in `table`, if known.
@@ -2523,6 +2618,9 @@ impl Context {
     fn learn_kind(&mut self, table: Subject, kind: Kind) {
         if let Subject::Slot(slot) = table && let Some(upvalue) = self.holds(slot) {
             self.assume(Fragile::Kind { table: Subject::Upvalue(upvalue), kind });
+        }
+        if let Subject::Slot(slot) = table && let Some(field) = self.holds_field(slot) {
+            self.assume(Fragile::Kind { table: Subject::Field(field), kind });
         }
         self.assume(Fragile::Kind { table, kind });
     }
@@ -2691,12 +2789,21 @@ impl Context {
     /// either has, the join has). Any other is dropped: left an orphan, which
     /// `accepts` ignores, and forgotten by every shape listing it.
     fn join(&mut self, owner: &mut Owner, other: &Context) {
-        let widened: Vec<(usize, CType)> = (0..self.types.len())
-            .filter_map(|idx| {
-                let joined = self.types[idx].join(&other.slot(idx));
-                (joined != self.types[idx]).then_some((idx, joined))
-            })
-            .collect();
+        let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
+        let mut widened: Vec<(usize, CType)> = Vec::new();
+        for idx in 0..self.types.len() {
+            let joined = self.types[idx].join(&other.slot(idx));
+            match (&self.types[idx], &joined) {
+                (a, b) if a == b => {},
+                // The same table, of which less is known: its hash keys the join's shape lacks go,
+                // and the rest stay its own. See Note [Version compatibility].
+                (CType::Shape(_, mine), CType::Shape(_, kept)) => {
+                    dropped.extend(mine.iter().filter(|href| !kept.contains(href)).cloned());
+                    self.types[idx] = joined;
+                },
+                _ => widened.push((idx, joined)),
+            }
+        }
         self.set_types(owner, widened);
         if self.top != other.top {
             self.top = None;
@@ -2715,9 +2822,12 @@ impl Context {
                 (mine, theirs) => mine.or_else(|| theirs.cloned()),
             };
         }
-        let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
         for (i, mine) in self.hkeys.iter_mut().enumerate() {
             match other.hkeys.get(i) {
+                _ if dropped.contains(&HashRef(i as u8)) => {
+                    mine.known_type = None;
+                    mine.clear_checks();
+                },
                 Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && theirs.place == mine.place && theirs.chain == mine.chain && mine.known_type.is_some() && theirs.known_type.is_some() => {
                     if mine.known_type != theirs.known_type {
                         mine.known_type = Some(Kind::Mixed);
@@ -2866,6 +2976,7 @@ impl Context {
         let hkey: HashKey<'_, '_> = hkey;
         match self.hkeys.iter().position(|hkey| hkey.orphan()) {
             Some(i) => {
+                self.forget_index(i);
                 self.hkeys[i] = hkey;
                 HashRef(i as u8)
             },
@@ -2917,6 +3028,8 @@ impl Context {
 
     pub fn set_hazards(&mut self, keep: Option<usize>, href: Option<HashRef>) {
         self.inlined(Effects::HASH);
+        // The store changed the field, wherever it is. See Note [Field facts].
+        self.forget_fields(href);
         let mut invalidate: Vec<usize> = (0..self.hkeys.len()).collect();
         if let Some(href) = href {
             // If we know we wrote to an href, then we can set hazards only on hkeys
@@ -2983,7 +3096,7 @@ pub struct Specializer<'src, 'intern> {
     /// Each function's calls a continuation inlined, by the call's point and the callee: the
     /// entry contexts it decided on. See Note [Inlined calls].
     inlined: HashMap<(LProto<'src, 'intern>, SubPc, LProto<'src, 'intern>), Vec<Context>, rustc_hash::FxBuildHasher>,
-    /// Each promote's values that have versions, by its function and pc. See Note [Green values].
+    /// Each promote's values that have versions, by its function and pc. See Note [Promoted values].
     promoted: HashMap<(LProto<'src, 'intern>, Pc), std::collections::HashSet<i32, rustc_hash::FxBuildHasher>, rustc_hash::FxBuildHasher>,
     /// The index of each field's hash key on each slot of the code of each function its
     /// witnesses are of, and the indexes each function has given. See Note [Field types].
@@ -3116,6 +3229,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ]);
         }
         self.blocks[block_id.0].cells = ctx.filled_cells();
+        self.blocks[block_id.0].promoted = ctx.promoted.clone();
         self.compile(owner, entry, ctx, block_id);
         return block_id;
     }
@@ -3137,6 +3251,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // Finish the remainder of the coroutine
         let new_block = self.new_block(pc.0);
         self.blocks[new_block.0].cells = ctx.filled_cells();
+        self.blocks[new_block.0].promoted = ctx.promoted.clone();
         self.versions.get_mut(&self.proto).unwrap().insert((pc, ctx.clone()), new_block);
         if let Some((succ_next, succ_ty, succ_ret)) = self.compile_one(owner, pc, ctx, coro, arg, new_block) {
             // And continue compiling the block
@@ -3255,7 +3370,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// How many versions the running function has at `pc` at the same point as `ctx`: for its
-    /// inlined call, or for its calls, past its greens. See Notes [Inlined calls] and [Green
+    /// inlined call, or for its calls, past its promoted values. See Notes [Inlined calls] and [Promoted
     /// values].
     fn versions_at(&self, owner: &Owner, pc: SubPc, ctx: &Context) -> usize {
         self.versions.get(&self.proto).map_or(0, |versions| versions.keys().filter(|(at, ectx)| *at == pc && ectx.same_point(ctx)).count())
@@ -4050,15 +4165,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Whether the promote at `site` of the running function has, or may have, a version for
-    /// `value`: one of the first `PROMOTE_GREENS` values it sees. See Note [Green values].
+    /// `value`: one of the first `PROMOTE_SITE_VALUES` values it sees. See Note [Promoted values].
     fn promotes(&mut self, site: Pc, value: i32) -> bool {
         let values = self.promoted.entry((self.proto, site)).or_default();
-        values.contains(&value) || (values.len() < PROMOTE_GREENS && values.insert(value))
+        values.contains(&value) || (values.len() < PROMOTE_SITE_VALUES && values.insert(value))
     }
 
     /// The thunk a `Promote` of `slot` ends its block in: forced, it guards the
-    /// slot equal to the integer it holds, and continues past the guard green
-    /// with it, the guard's other way promoting again. See Note [Green values].
+    /// slot equal to the integer it holds, and continues past the guard with
+    /// that value promoted, the guard's other way promoting again. See Note [Promoted values].
     fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Integer(value) = state.vals[state.base + slot].unbox() else { unreachable!("a promote's argument is an integer") };
@@ -4079,9 +4194,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test);
                 block_id
             };
-            let mut green = thunk_ctx.clone();
-            Rc::make_mut(&mut green).green(pc.0, value);
-            let pass = vm.subblock(owner, pc.next_true(), green, thunk_coro.clone(), ResumeArg::Integer(value));
+            let mut promoted = thunk_ctx.clone();
+            Rc::make_mut(&mut promoted).promote(pc.0, value);
+            let pass = vm.subblock(owner, pc.next_true(), promoted, thunk_coro.clone(), ResumeArg::Integer(value));
             let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
             vm.blocks[block.0].instructions.push(Residual::Thunk(fail));
             vm.blocks[block.0].instructions.push(Residual::Jump(pass));
@@ -4298,7 +4413,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let value = match &table {
                     Subject::Slot(slot) => state.vals[state.base + slot],
                     Subject::Upvalue(UpvaluePath::Own(j)) => state.upvalue(owner, *j as usize),
-                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) => return None,
+                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) | Subject::Field(_) => return None,
                 };
                 let LValue::Table(tab) = value.unbox() else { unreachable!("an element of an array part not of a table") };
                 Some((table, tab.ro(owner).kind))
@@ -4309,7 +4424,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::GuardDynamic(match table {
                     Subject::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot])),
                     Subject::Upvalue(UpvaluePath::Own(j)) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
-                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) => unreachable!("a kind read through another closure"),
+                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) | Subject::Field(_) => unreachable!("a kind read through another closure or a field"),
                 })
             } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
@@ -4431,10 +4546,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 free
             },
         }).collect();
+        // A callee's version knowing fewer hash keys than the caller had (Note [Version
+        // compatibility]) leaves fewer: the caller's past them are free, as the callee may have
+        // put its own there.
+        for i in known.hkeys.len()..frame.caller.hkeys.len() {
+            let mut free = frame.caller.hkeys[i].clone();
+            free.known_type = None;
+            free.clear_checks();
+            known.hkeys.push(free);
+        }
         // A shape keeps the caller's hash keys that came back as they were, and gains its slot's.
         let unchanged = |href: &HashRef| {
-            let (mine, back) = (frame.caller.hkeys.get(href.0 as usize), &known.hkeys[href.0 as usize]);
-            mine.is_some_and(|mine| !back.orphan() && mine.idx == back.idx && mine.key == back.key && mine.place == back.place && mine.chain == back.chain)
+            let (mine, back) = (frame.caller.hkeys.get(href.0 as usize), known.hkeys.get(href.0 as usize));
+            mine.zip(back).is_some_and(|(mine, back)| !back.orphan() && mine.idx == back.idx && mine.key == back.key && mine.place == back.place && mine.chain == back.chain)
         };
         for slot in 0..known.types.len() {
             let CType::Shape(of, hrefs) = &known.types[slot] else { continue };
@@ -5360,10 +5484,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         while ctx.hkeys.len() <= i {
                             ctx.hkeys.push(HashKey { idx: OUTER, ..HashKey::new(OUTER, k_val.clone()) });
                         }
+                        ctx.forget_index(i);
                         ctx.hkeys[i] = HashKey::new(place, k_val.clone());
                     } else if let Some(i) = orphan {
                         href = HashRef(i as u8);
-                        Rc::make_mut(&mut ctx).hkeys[i] = HashKey::new(place, k_val.clone());
+                        let ctx = Rc::make_mut(&mut ctx);
+                        ctx.forget_index(i);
+                        ctx.hkeys[i] = HashKey::new(place, k_val.clone());
                     } else {
                         warn!("allocating new hkey for {:?} {:?}", place, &k_val);
                         let hr: u8 = ctx.hkeys.len().try_into().expect("too many hrefs");
@@ -5465,7 +5592,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Promote(slot)) => match ctx.constant(slot) {
                     Some(value) if self.promotes(pc.0, value) => {
                         ctx.rely(owner, Fragile::Constant { slot, value }.key());
-                        Rc::make_mut(&mut ctx).green(pc.0, value);
+                        Rc::make_mut(&mut ctx).promote(pc.0, value);
                         pc = pc.next_true();
                         arg = ResumeArg::Integer(value);
                     }
@@ -5473,7 +5600,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     }
-                    None if self.promoted.get(&(self.proto, pc.0)).is_some_and(|values| values.len() >= PROMOTE_GREENS) => {
+                    None if self.promoted.get(&(self.proto, pc.0)).is_some_and(|values| values.len() >= PROMOTE_SITE_VALUES) => {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     }
@@ -5595,6 +5722,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         known => known,
                     };
                     Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.ctype())]);
+                    // The slot holds the field's value, and the field's array kind is its. See
+                    // Note [Field facts].
+                    if let Some(field) = FieldRef::of(&ctx.hkeys, href) {
+                        let ctx = Rc::make_mut(&mut ctx);
+                        if let Some(kind) = ctx.subject_kind(&Subject::Field(field)) {
+                            ctx.assume(Fragile::Kind { table: Subject::Slot(slot), kind });
+                        }
+                        ctx.assume(Fragile::HoldsField { slot, field });
+                    }
                     if let Kind::Of(known) = known {
                         (pc, arg) = navigate(pc, &CType::Unknown, &CType::Type(known));
                     } else {

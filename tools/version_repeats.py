@@ -40,10 +40,10 @@ def main():
         print(f'{s:5}  {new:12}  {repeated:17}')
     if args.nearest:
         # How each of the first new contexts of the last slices differs from the closest earlier
-        # one at its point and with its greens.
+        # one at its point and with its promoted values.
         import difflib, re
         tokens = lambda c: re.split(r'(?<=[,\])}]) ', c)
-        greens = lambda c: c[c.find('greens'):]
+        promoted = lambda c: c[c.find('promoted:'):]
         earlier_contexts = {}
         for r in rows:
             earlier_contexts.setdefault((r.pc, r.context), r.ts)
@@ -51,9 +51,9 @@ def main():
         late = [r for r in rows if (r.ts - t0) * args.slices // (t1 - t0) >= args.slices // 2
                 and earlier_contexts[(r.pc, r.context)] == r.ts]
         for r in late[:args.nearest]:
-            earlier = [e for e in rows if e.ts < r.ts and e.pc == r.pc and greens(e.context) == greens(r.context)]
+            earlier = [e for e in rows if e.ts < r.ts and e.pc == r.pc and promoted(e.context) == promoted(r.context)]
             if not earlier:
-                print(f'\n{r.ts / 1e9:.4f}s pc {r.pc}: no earlier version with its greens')
+                print(f'\n{r.ts / 1e9:.4f}s pc {r.pc}: no earlier version with its promoted values')
                 continue
             best = min(earlier, key=lambda e: sum(d[0] in '+-' for d in difflib.ndiff(tokens(e.context), tokens(r.context))))
             diff = [d for d in difflib.ndiff(tokens(best.context), tokens(r.context)) if d[0] in '+-']

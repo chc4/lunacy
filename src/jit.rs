@@ -2397,7 +2397,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
         let mut alloc = WindowAlloc::entering(self.jctx.blocks[&id].window.clone());
         window_dump!(self.jctx, "block {} hotness {} pc {} entered with {}", id.0, block.jit_info.hotness.get(), block.pc, alloc.cache());
-        jit_note!(self.jctx, ops, "block {} (pc {}, hotness {}) entered with {}", id.0, block.pc, block.jit_info.hotness.get(), alloc.cache());
+        jit_note!(self.jctx, ops, "block {} (pc {}, hotness {}{}) entered with {}", id.0, block.pc, block.jit_info.hotness.get(),
+            if block.promoted.is_empty() { String::new() } else {
+                format!(", promoted {}", block.promoted.iter().map(|(pc, value)| format!("pc {pc} = {value}")).collect::<Vec<_>>().join(", "))
+            }, alloc.cache());
 
         // Jump to `target`, or fall through to it if `skip`, transferring the
         // window to the one it is entered with: its planned entry window, dirty where the
