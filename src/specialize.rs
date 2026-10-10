@@ -1319,8 +1319,8 @@ impl std::fmt::Display for CType {
 // A constant an i32 holds exactly is an integer, unless it meets a double (Note [Widening]). Any
 // other number is a double unless something narrows it to an integer, as LuaJIT narrows: a
 // native's result and the generic paths' arithmetic are doubles. What narrows is a loop (below), a length, a bit
-// operation, and a typed integer op on integers, until its result first overflows (Note
-// [Optimistic ops]). A constant an i32 holds exactly is a compile-time
+// operation, a typed integer op on integers, and `math.floor`, `math.ceil` and `math.abs` of a
+// number they keep whole, each until its result first overflows (Note [Optimistic ops]). A constant an i32 holds exactly is a compile-time
 // value either encoding can hold, so to an op asking for an integer (a constant guard for one,
 // `IntegralK`) it is one: an integer register plus such a constant, or such a constant as an
 // array key, is an integer op.

@@ -288,7 +288,7 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
         ("floor", native!(pure generator: whole_generator::<FLOOR>, |owner, args| vec![math1_boxed::<FLOOR>(number(arg(&args, 0)))])),
         ("ceil", native!(pure generator: whole_generator::<CEIL>, |owner, args| vec![math1_boxed::<CEIL>(number(arg(&args, 0)))])),
         ("sqrt", math1!(SQRT)),
-        ("abs", math1!(ABS)),
+        ("abs", native!(pure generator: abs_generator, |owner, args| vec![abs_boxed(arg(&args, 0))])),
         ("sin", math1!(SIN)),
         ("cos", math1!(COS)),
         ("tan", math1!(TAN)),
@@ -628,6 +628,66 @@ crate::window::windowed!(WholeOptimistic, [], [OP: u8], |owner, state, base| (x,
 crate::window::windowed!(WholeDouble, [], [OP: u8], |owner, state, base| (x, out r) {
     *r = LBoxed::from_double(math1::<OP>(unsafe { checked_number(x) }));
 });
+
+/// `math.abs` of `x`: of an integer, an integer where an i32 holds it, as an integer op's
+/// result; of any other number, a double.
+fn abs_boxed<'s, 'i>(x: LBoxed<'s, 'i>) -> LBoxed<'s, 'i> {
+    match x.is_int().then(|| unsafe { x.as_int() }.checked_abs()).flatten() {
+        Some(n) => LBoxed::from_int(n),
+        None => LBoxed::from_double(number(x).abs()),
+    }
+}
+
+// `math.abs` of an integer, an integer: a cold path for the one whose absolute value an i32
+// doesn't hold, which is a double. As an integer op whose result doesn't fit. See Note
+// [Optimistic ops] in `specialize`.
+crate::window::windowed!(AbsOptimistic, [], [], |owner, state, base| (x, out r) {
+    match unsafe { x.as_int() }.checked_abs() {
+        Some(n) => { *r = LBoxed::from_int(n); false },
+        None => { core::intrinsics::cold_path(); true },
+    }
+} cold {
+    *r = LBoxed::from_double((unsafe { x.as_int() } as f64).abs());
+    1
+});
+// `math.abs` of an integer, in the double encoding.
+crate::window::windowed!(AbsIntDouble, [], [], |owner, state, base| (x, out r) {
+    *r = LBoxed::from_double((unsafe { x.as_int() } as f64).abs());
+});
+
+/// `math.abs`'s generator: for a call of one number keeping one result, of an integer its result
+/// in the encoding an integer op's is, decided the first time it runs, and rebuilt to compute in
+/// doubles once one doesn't fit; of a double, a double; any other call is the native's. See Notes
+/// [Native generators] and [Optimistic ops] in `specialize`.
+fn abs_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 2 && c == 2 {
+            if (yield YieldOp::Guard(a + 1, LType::Integer)) == ResumeArg::Matched {
+                let fits = Fits(std::rc::Rc::new(move |state: &crate::vm::RunState| {
+                    unsafe { state.vals[state.base + a + 1].as_int() }.checked_abs().is_some()
+                }));
+                if (yield YieldOp::Encoding(fits)) != ResumeArg::Type(CType::Type(LType::Double)) {
+                    let fit = yield YieldOp::OptimisticExec(std::rc::Rc::new(AbsOptimistic::new(&[a + 1, a])));
+                    let ty = if fit == ResumeArg::Matched { LType::Integer } else { LType::Double };
+                    yield YieldOp::SetCTypes(vec![(a, CType::Type(ty))]);
+                    return ResumeArg::Start;
+                }
+                yield YieldOp::Decided(false);
+                yield YieldOp::ExecWindow(std::rc::Rc::new(AbsIntDouble::new(&[a + 1, a])));
+                yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Double))]);
+                return ResumeArg::Start;
+            }
+            if (yield YieldOp::Guard(a + 1, LType::Double)) == ResumeArg::Matched {
+                yield YieldOp::ExecWindow(std::rc::Rc::new(WholeDouble::<ABS>::new(&[a + 1, a])));
+                yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Double))]);
+                return ResumeArg::Start;
+            }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
 
 /// `math.floor`'s and `math.ceil`'s generator (`OP`): for a call of one number keeping one
 /// result, its result in the encoding an integer op's is, decided the first time it runs, and
