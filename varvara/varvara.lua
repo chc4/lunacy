@@ -78,44 +78,44 @@ function M.new(rom, write, clock, bitwise)
   -- System
 
   -- Expansion memory's pages past the first, made when first used.
-  local pages = { [0] = ram }
+  local pages = { ram }
   local function page(n)
     n = n % RAM_PAGES
-    local p = pages[n]
+    local p = pages[n + 1]
     if not p then
       p = {}
-      for i = 0, 65535 do p[i] = 0 end
-      pages[n] = p
+      for i = 1, 65536 do p[i] = 0 end
+      pages[n + 1] = p
     end
     return p
   end
 
   local function peek2(addr)
-    return ram[addr % 65536] * 256 + ram[(addr + 1) % 65536]
+    return ram[addr % 65536 + 1] * 256 + ram[(addr + 1) % 65536 + 1]
   end
 
   -- System/expansion: a command in RAM, at the port's address, to fill or copy
   -- memory across pages.
   deo[0x03] = function()
     local addr = short(0x02)
-    local command, length = ram[addr], peek2(addr + 1)
+    local command, length = ram[addr + 1], peek2(addr + 1)
     if command == 0 then
-      local dst, at, value = page(peek2(addr + 3)), peek2(addr + 5), ram[(addr + 7) % 65536]
-      for i = 0, length - 1 do dst[(at + i) % 65536] = value end
+      local dst, at, value = page(peek2(addr + 3)), peek2(addr + 5), ram[(addr + 7) % 65536 + 1]
+      for i = 0, length - 1 do dst[(at + i) % 65536 + 1] = value end
     elseif command == 1 or command == 2 then
       local src, from = page(peek2(addr + 3)), peek2(addr + 5)
       local dst, to = page(peek2(addr + 7)), peek2(addr + 9)
       local first, last, step = 0, length - 1, 1
       if command == 2 then first, last, step = length - 1, 0, -1 end
-      for i = first, last, step do dst[(to + i) % 65536] = src[(from + i) % 65536] end
+      for i = first, last, step do dst[(to + i) % 65536 + 1] = src[(from + i) % 65536 + 1] end
     else
       write_string(2, string.format("Unknown Expansion Command 0x%02x\n", command))
     end
   end
-  dei[0x04] = function() return wst[256] end
-  dei[0x05] = function() return rst[256] end
-  deo[0x04] = function(v) wst[256] = v end
-  deo[0x05] = function(v) rst[256] = v end
+  dei[0x04] = function() return wst[257] end
+  dei[0x05] = function() return rst[257] end
+  deo[0x04] = function(v) wst[257] = v end
+  deo[0x05] = function(v) rst[257] = v end
 
   -- The palette's four colors, each its red, green and blue, 0 to 255, at
   -- 3 * color + 1 to 3 * color + 3: from the system's color ports, a nibble
@@ -137,10 +137,10 @@ function M.new(rom, write, clock, bitwise)
   -- System/debug: the stacks' top bytes, to standard error.
   local function inspect(name, s)
     local line = { name }
-    local p = s[256]
+    local p = s[257]
     for k = 7, 0, -1 do
       local i = (p - k) % 256
-      line[#line + 1] = string.format("%02x%s", s[i], i == 0 and "|" or " ")
+      line[#line + 1] = string.format("%02x%s", s[i + 1], i == 0 and "|" or " ")
     end
     line[#line + 1] = "< \n"
     write_string(2, table.concat(line))
@@ -230,8 +230,8 @@ function M.new(rom, write, clock, bitwise)
       for j = 0, 7 do
         local py = fy > 0 and band(y1 + j, 65535) or band(y1 + 7 - j, 65535)
         if py < height then
-          local lo = ram[band(at + j, 65535)]
-          local hi = twobpp and ram[band(at + j + 8, 65535)] or 0
+          local lo = ram[band(at + j, 65535) + 1]
+          local hi = twobpp and ram[band(at + j + 8, 65535) + 1] or 0
           local row = py * width
           -- From the low bit, the sprite's rightmost pixel.
           for i = 0, 7 do
@@ -248,8 +248,8 @@ function M.new(rom, write, clock, bitwise)
       for j = 0, 7 do
         local py = fy > 0 and (y1 + j) % 65536 or (y1 + 7 - j) % 65536
         if py < height then
-          local lo = ram[(at + j) % 65536]
-          local hi = twobpp and ram[(at + j + 8) % 65536] or 0
+          local lo = ram[(at + j) % 65536 + 1]
+          local hi = twobpp and ram[(at + j + 8) % 65536 + 1] or 0
           local row = py * width
           -- From the low bit, the sprite's rightmost pixel.
           for i = 0, 7 do

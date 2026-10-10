@@ -38,9 +38,9 @@ local screen = win:texture(width, height)
 -- A stack's bytes, the top last.
 local function stack(s, depth)
   local bytes = {}
-  local p = s[256]
+  local p = s[257]
   for k = depth - 1, 0, -1 do
-    bytes[#bytes + 1] = string.format("%02x", s[(p - k) % 256])
+    bytes[#bytes + 1] = string.format("%02x", s[(p - k) % 256 + 1])
   end
   return table.concat(bytes, " ")
 end
