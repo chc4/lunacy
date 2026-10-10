@@ -955,6 +955,13 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
         // We don't need to guard on LType::Table, because this instruction is only ever used for
         // table initialization, which means it is definitely a table and doesn't e.g. have a
         // metatable we have to chain to.
+        // A whole constant it stores is stored as an integer, as a store at an integer key
+        // stores one. See Note [Narrowing] in `specialize`.
+        if b != 0 {
+            for slot in a + 1..=a + b {
+                yield YieldOp::NarrowConstant(slot);
+            }
+        }
         arg = yield YieldOp::Exec(ResidualExec::new("setlist", Rc::new(move |owner, state| {
             match state.vals[state.base + a as usize].unbox() {
                 LValue::Table(tab) => {
