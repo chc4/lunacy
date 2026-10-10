@@ -877,8 +877,16 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::HashKey(a, b, false);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 count_store!(field_stores);
+                // A whole constant stored into a field known to hold integers is stored as one, so
+                // the field keeps its type. See Note [Widening] in `specialize`.
+                let whole = if c & 0x100 != 0 && htype == Kind::Of(LType::Integer) && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
+                    let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
+                    Some(k)
+                } else {
+                    None
+                };
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                let new_type = value_type.as_ltype();
+                let new_type = if whole.is_some() { Some(LType::Integer) } else { value_type.as_ltype() };
                 // A store to `__index` moves the table to a new epoch, whatever it
                 // stores. See Note [Table metatables] in `specialize`.
                 let index = b & 0x100 != 0 && (yield YieldOp::IsKey(b & 0xff, b"__index")) == ResumeArg::Matched;
@@ -894,7 +902,13 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Retype::Unknown => Rc::new(SetTableHref::<{ Retype::Unknown }>::new(hb.0, expected, &[a, c])),
                     });
                 } else {
-                    let ResumeArg::Boxed(value) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
+                    let value = match whole {
+                        Some(k) => LBoxed::from_int(k).bits(),
+                        None => {
+                            let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
+                            bits
+                        }
+                    };
                     arg = yield YieldOp::ExecWindow(match retype {
                         Retype::Same => Rc::new(SetTableHrefK::<{ Retype::Same }>::new(hb.0, expected, value, &[a])) as Rc<dyn Window>,
                         Retype::Known => Rc::new(SetTableHrefK::<{ Retype::Known }>::new(hb.0, expected, value, &[a])),

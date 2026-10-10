@@ -1553,7 +1553,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // context answers decides nothing). Where the fact is never used, the code it was carried through
 // is contracted. A whole constant passed to a function, stored into a table or an upvalue, or
 // passed to a native is the integer it was loaded as: a callee's versions, and a table's other
-// values, are out of the load's rebuild's reach.
+// values, are out of the load's rebuild's reach. One a field store takes as its operand is stored
+// as an integer where the field is known to hold integers, so the field keeps its type, and as
+// a double anywhere else, where it may be a double the program writes as a whole number.
 
 // Note [Contraction]
 // ~~~~~~~~~~~~~~~~~~
