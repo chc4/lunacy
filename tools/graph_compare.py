@@ -29,26 +29,32 @@ def last_graph(directory):
 
 
 def counts(dot):
-    """Blocks, blocks never entered, and how many of each residual the blocks have."""
-    blocks, never = 0, 0
+    """Nodes, blocks (a node draws a run of them, each after the first under a `→ block` row),
+    blocks never entered, and how many of each residual the blocks have."""
+    nodes, blocks, never = 0, 0, 0
     residuals = collections.Counter()
     for line in dot.read_text().splitlines():
         m = NODE.match(line)
         if not m:
             continue
+        nodes += 1
         blocks += 1
         never += m.group(2) == '0'
-        fields = m.group(3).split('| ')
-        # A version's first field is its pc and context.
-        if fields and fields[0].lstrip().startswith('PC:'):
-            fields = fields[1:]
-        for field in fields:
+        for field in m.group(3).split('| '):
+            field = field.strip()
+            # A block the node goes straight on into; a version's pc and context.
+            if (run := re.match(r'→ \d+ x(\d+)', field)):
+                blocks += 1
+                never += run.group(1) == '0'
+                continue
+            if field.startswith('PC:'):
+                continue
             # A residual by its name, and its first argument where that names it (a window's
             # op, an exec's name), not where it is a number (a slot, a block, an address).
-            m = re.match(r'\s*(\w+)(?:\((\w+))?', field)
+            m = re.match(r'(\w+)(?:\((\w+))?', field)
             if m:
                 residuals[m.group(1) + (f' {m.group(2)}' if m.group(2) and not m.group(2).isdigit() and not m.group(2).startswith('0x') else '')] += 1
-    return blocks, never, residuals
+    return nodes, blocks, never, residuals
 
 
 def render(dot, svg):
@@ -59,8 +65,8 @@ def render(dot, svg):
 
 def rows(before, after):
     """The table's rows: blocks, then each residual whose count differs, most changed first."""
-    (b_blocks, b_never, b_res), (a_blocks, a_never, a_res) = before, after
-    out = [('Blocks', b_blocks, a_blocks), ('Never entered (x0)', b_never, a_never)]
+    (b_nodes, b_blocks, b_never, b_res), (a_nodes, a_blocks, a_never, a_res) = before, after
+    out = [('Blocks drawn', b_blocks, a_blocks), ('Never entered (x0)', b_never, a_never), ('Nodes', b_nodes, a_nodes)]
     changed = [(name, b_res[name], a_res[name]) for name in set(b_res) | set(a_res) if b_res[name] != a_res[name]]
     changed.sort(key=lambda r: (-abs(r[2] - r[1]), r[0]))
     return out + changed
