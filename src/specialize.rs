@@ -1029,6 +1029,10 @@ pub enum CallEntry {
 // type; past `MAX_VERSIONS` functions, the site makes a generic call. A site whose context knows
 // its callee needs no guard.
 //
+// A Lua call is laid out in a version of its own point for the context at the call, which every
+// path reaching it in that context jumps to, as paths rejoin after a guard: they share the one
+// call, its continuation, and a callee inlined for it (Note [Inlined calls]).
+//
 // The callee is entered in a version specialized to what the caller knows of the arguments: the
 // parameters have the arguments' types, and the unpassed ones are nil. Facts that the caller knows
 // of its own frame (hash keys, fragile facts, etc) says nothing of the callee's, and are not
@@ -3371,15 +3375,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    /// The residuals of `block` that code entering it at `from` runs: from there to its end, or to
-    /// a rebuild's jump in it if `from` is before that. See Note [Contraction].
+    /// The residuals of `block` that code entering it at `from` runs: from there to its first jump
+    /// (past it, only a frame returning into the block runs), or to a rebuild's jump in it if
+    /// `from` is before that. See Note [Contraction].
     fn runnable(&self, block: BlockId, from: usize) -> &[Residual] {
         let residuals = &self.blocks[block.0].instructions;
         let end = match self.cuts.get(&block) {
             Some(&cut) if from < cut => cut.min(residuals.len()),
             _ => residuals.len(),
         };
-        &residuals[from.min(end)..end]
+        let from = from.min(end);
+        let end = residuals[from..end].iter().position(|residual| matches!(residual, Residual::Jump(_))).map_or(end, |jump| from + jump + 1);
+        &residuals[from..end]
     }
 
     /// The blocks `residuals` can go on to.
@@ -5672,6 +5679,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 }
                                 return Some((pc.0 + 1, ctx, ResumeArg::Start));
                             }
+                            // In a version of the call's point, for the context at the call. See
+                            // Note [Call sites].
+                            let found = self.versions.get(&self.proto).unwrap().get(&(pc, calling.clone())).copied();
+                            let call_block = match found {
+                                Some(call_block) if call_block != block_id => {
+                                    self.end_block(block_id);
+                                    self.blocks[block_id.0].instructions.push(Residual::Jump(call_block));
+                                    return None;
+                                },
+                                Some(call_block) => call_block,
+                                None => {
+                                    let call_block = self.new_block(pc.0);
+                                    self.blocks[call_block.0].context = Some(calling.clone());
+                                    self.versions.get_mut(&self.proto).unwrap().insert((pc, calling.clone()), call_block);
+                                    self.end_block(block_id);
+                                    self.blocks[block_id.0].instructions.push(Residual::Jump(call_block));
+                                    call_block
+                                },
+                            };
                             // Any other call ends its block in a thunk laying out the call
                             // for the function it finds, the code after it a version of
                             // its own. See Note [Call sites].
@@ -5692,9 +5718,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 let after = self.jumping(owner, ctx, pc.0 + 1);
                                 (After::Version(pc.0 + 1, after), continuation)
                             };
-                            self.end_block(block_id);
-                            let thunk = self.make_call_thunk(block_id, calling, pc, a, b, c, after, continuation, 0, true);
-                            self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                            self.end_block(call_block);
+                            let thunk = self.make_call_thunk(call_block, calling, pc, a, b, c, after, continuation, 0, true);
+                            self.blocks[call_block.0].instructions.push(Residual::Thunk(thunk));
                             return None;
                         },
                     }
