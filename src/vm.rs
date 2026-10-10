@@ -2537,29 +2537,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                     }
                 }))),
                 // Lua's `collectgarbage(opt [, arg])`: drive the collector explicitly.
-                (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-                    let opt: Vec<u8> = match args.ro(&seq).get(0).map(|b| b.unbox()) {
-                        Some(LValue::InternedString(s)) => s.as_bytes().to_vec(),
-                        Some(LValue::OwnedString(s)) => s.as_slice().to_vec(),
-                        _ => b"collect".to_vec(),
-                    };
-                    let result: LValue = match opt.as_slice() {
-                        // SAFETY: reachable only from a safepoint that just published roots.
-                        // See Note [GC roots].
-                        b"collect" | b"" => { unsafe { GcCtx::assume_rooted().full_collect_published(owner); } LValue::Double(Number(0.0)) },
-                        // Live memory in Kbytes, as a (fractional) number.
-                        b"count" => LValue::Double(Number(Heap::live_bytes() as f64 / 1024.0)),
-                        // Advance one incremental step.
-                        b"step" => { unsafe { GcCtx::assume_rooted().step_published(owner); } LValue::Bool(false) },
-                        b"stop" => { Heap::set_gc_off(true); LValue::Double(Number(0.0)) },
-                        b"restart" => { Heap::set_gc_off(false); LValue::Double(Number(0.0)) },
-                        // Tuning knobs we accept but don't model.
-                        b"setpause" | b"setstepmul" => LValue::Double(Number(0.0)),
-                        _ => LValue::Nil,
-                    };
-                    returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::box_lvalue(result));
-                    Ok(1)
-                }))),
+                (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(collectgarbage))),
                 math,
                 os,
                 ].into_iter().chain(crate::library::globals(intern)).map(|(k, v)| (LCanon(LBoxed::box_lvalue(k)), LBoxed::box_lvalue(v)))
@@ -2765,4 +2743,29 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         (spec, state, r_vals.into_iter().map(|b| b.unbox()).collect::<Vec<_>>().into())
     }
 
+}
+
+/// `collectgarbage`, named so profiles name it.
+fn collectgarbage<'id, 'a, 'src, 'intern>(mut seq: LCellOwner<'id>, args: &'a LCell<'id, [LBoxed<'src, 'intern>]>, returns: &'a LCell<'id, [LBoxed<'src, 'intern>]>, owner: &mut Owner) -> Result<usize, LBoxed<'src, 'intern>> {
+    let opt: Vec<u8> = match args.ro(&seq).get(0).map(|b| b.unbox()) {
+        Some(LValue::InternedString(s)) => s.as_bytes().to_vec(),
+        Some(LValue::OwnedString(s)) => s.as_slice().to_vec(),
+        _ => b"collect".to_vec(),
+    };
+    let result: LValue = match opt.as_slice() {
+        // SAFETY: reachable only from a safepoint that just published roots.
+        // See Note [GC roots].
+        b"collect" | b"" => { unsafe { GcCtx::assume_rooted().full_collect_published(owner); } LValue::Double(Number(0.0)) },
+        // Live memory in Kbytes, as a (fractional) number.
+        b"count" => LValue::Double(Number(Heap::live_bytes() as f64 / 1024.0)),
+        // Advance one incremental step.
+        b"step" => { unsafe { GcCtx::assume_rooted().step_published(owner); } LValue::Bool(false) },
+        b"stop" => { Heap::set_gc_off(true); LValue::Double(Number(0.0)) },
+        b"restart" => { Heap::set_gc_off(false); LValue::Double(Number(0.0)) },
+        // Tuning knobs we accept but don't model.
+        b"setpause" | b"setstepmul" => LValue::Double(Number(0.0)),
+        _ => LValue::Nil,
+    };
+    returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::box_lvalue(result));
+    Ok(1)
 }

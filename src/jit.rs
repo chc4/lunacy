@@ -1793,14 +1793,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         #[cfg(feature = "jit_disasm")]
         self.jctx.disasm.committed(slab as usize, buf.len(), format!("region entered at block {}, function {source}:{line}", id.0));
 
+        // Every address of the region named: by its block, or by the region.
         #[cfg(feature = "perf")]
         {
-            for (bid, start, end) in compiled_offsets {
+            let mut blocks = compiled_offsets;
+            blocks.sort_by_key(|&(_, start, _)| start);
+            let mut at = 0;
+            for (bid, start, end) in blocks {
+                if start > at {
+                    self.jctx.add_to_perf_map(unsafe { slab.add(at) } as usize, start - at, &format!("jit_region_{} {}:{}", id.0, source, line));
+                }
                 self.jctx.add_to_perf_map(
                     unsafe { slab.add(start) } as usize,
                     end - start,
                     &format!("jit_block_{} {}:{}", bid.0, source, line)
                 );
+                at = at.max(end);
+            }
+            if buf.len() > at {
+                self.jctx.add_to_perf_map(unsafe { slab.add(at) } as usize, buf.len() - at, &format!("jit_region_{} {}:{}", id.0, source, line));
             }
             self.jctx.perf_map.as_mut().map(|mut map| map.get_mut().sync_all());
         }
@@ -1924,6 +1935,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let stub = self.jctx.commit(base, &buf).expect("a committed thunk stub") as usize;
         #[cfg(feature = "jit_disasm")]
         self.jctx.disasm.committed_since(notes, stub, buf.len(), format!("thunk stub into block {}", target.0));
+        self.jctx.add_to_perf_map(stub, buf.len(), &format!("jit_thunk_stub {}", target.0));
         stub
     }
 
