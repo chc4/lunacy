@@ -690,15 +690,14 @@ unsafe-magic-compile:
 
 # A uxn_* benchmark (`times` 1) on Raven's backends, where the ROM needs nothing
 # past its reset vector (as `hyperfine-uxn`), LuaJIT with and without its JIT,
-# and lunacy's release build, its unsafe build, and its unsafe build with
-# `magic` (`unsafe-magic-compile`).
+# and lunacy's unsafe build, and its unsafe build with `magic`
+# (`unsafe-magic-compile`).
 hyperfine-uxn-promote benchmark times='1': unsafe-compile unsafe-magic-compile _raven
     #!/usr/bin/env bash
     set -euo pipefail
     b={{benchmark}}
     just _luac $b
     just _luajitc $b
-    {{SHARED}} cargo build --release --bin bench
     raven=()
     name=${b#uxn_}; name=${name#bit_}
     # uxn_loop runs loop_long.tal.
@@ -715,7 +714,6 @@ hyperfine-uxn-promote benchmark times='1': unsafe-compile unsafe-magic-compile _
         --export-json working/hyperfine-promote-$b-{{times}}.json "${raven[@]}" \
         -n "luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin {{times}}" \
         -n luajit "luajit bench.lua -- working/$b.luajit.bin {{times}}" \
-        -n "lunacy release" "env $jit ./target/release/bench working/$b.bin {{times}}" \
         -n "lunacy unsafe" "env $jit ./target/unsafe/bench working/$b.bin {{times}}" \
         -n "lunacy unsafe magic" "env $jit ./target/magic/unsafe/bench working/$b.bin {{times}}"
 
