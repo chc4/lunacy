@@ -1146,9 +1146,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 None
             } else if lk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(lhs & 0xff)) else { unreachable!() };
-                crate::window::windowed!(IntegerKR, [k: i32], [OP: Opcode], |owner, state, base| (rhs, out dest) {
+                crate::window::windowed!(IntegerKR, [k: i32], [OP: Opcode], |owner, state, base, tag| (rhs, out dest) {
                     match integer_op::<OP>(k, rhs.as_int()) {
-                        Some(n) => { *dest = LBoxed::from_int(n); false },
+                        Some(n) => { *dest = LBoxed::from_int_tagged(n, tag); false },
                         None => { core::intrinsics::cold_path(); true },
                     }
                 } cold {
@@ -1159,9 +1159,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true, Some(fits)))
             } else if rk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rhs & 0xff)) else { unreachable!() };
-                crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base| (lhs, out dest) {
+                crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base, tag| (lhs, out dest) {
                     match integer_op::<OP>(lhs.as_int(), k) {
-                        Some(n) => { *dest = LBoxed::from_int(n); false },
+                        Some(n) => { *dest = LBoxed::from_int_tagged(n, tag); false },
                         None => { core::intrinsics::cold_path(); true },
                     }
                 } cold {
@@ -1169,13 +1169,13 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     1
                 });
                 // MOD by a constant other than zero always fits.
-                crate::window::windowed!(ModRK, [k: i32], [], |owner, state, base| (lhs, out dest) {
-                    *dest = LBoxed::from_int(crate::unchecked_unwrap(integer_op::<{ Opcode::MOD }>(lhs.as_int(), k)));
+                crate::window::windowed!(ModRK, [k: i32], [], |owner, state, base, tag| (lhs, out dest) {
+                    *dest = LBoxed::from_int_tagged(crate::unchecked_unwrap(integer_op::<{ Opcode::MOD }>(lhs.as_int(), k)), tag);
                 });
                 // MOD by a positive power of two is a mask: floored, the remainder of a
                 // two's complement integer by 2^n is its low n bits, negative or not.
-                crate::window::windowed!(MaskRK, [mask: i32], [], |owner, state, base| (lhs, out dest) {
-                    *dest = LBoxed::from_int(lhs.as_int() & mask);
+                crate::window::windowed!(MaskRK, [mask: i32], [], |owner, state, base, tag| (lhs, out dest) {
+                    *dest = LBoxed::from_int_tagged(lhs.as_int() & mask, tag);
                 });
                 Some(match opcode == Opcode::MOD && k != 0 {
                     true if k > 0 && k & (k - 1) == 0 => (Rc::new(MaskRK::new(k - 1, &[lhs, dest])) as Rc<dyn Window>, false, None),
@@ -1186,9 +1186,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     },
                 })
             } else {
-                crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base| (lhs, rhs, out dest) {
+                crate::window::windowed!(IntegerRR, [], [OP: Opcode], |owner, state, base, tag| (lhs, rhs, out dest) {
                     match integer_op::<OP>(lhs.as_int(), rhs.as_int()) {
-                        Some(n) => { *dest = LBoxed::from_int(n); false },
+                        Some(n) => { *dest = LBoxed::from_int_tagged(n, tag); false },
                         None => { core::intrinsics::cold_path(); true },
                     }
                 } cold {
@@ -1962,10 +1962,10 @@ pub fn emit_self(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
 // The narrowing of a double an i32 holds exactly to the integer encoding, in
 // place, on its hot path; on its cold path the double stays. See Note
 // [Narrowing] in `specialize`.
-windowed!(ToInteger, [], [], |owner, state, base| (inout v) {
+windowed!(ToInteger, [], [], |owner, state, base, tag| (inout v) {
     let d = v.as_double();
     if crate::lboxed::is_integer(d) {
-        *v = LBoxed::from_int(d as i32);
+        *v = LBoxed::from_int_tagged(d as i32, tag);
         false
     } else {
         core::intrinsics::cold_path();

@@ -505,19 +505,19 @@ unsafe fn bit_arg<const INT: bool>(v: LBoxed) -> i32 {
 
 // A bit op's result is an i32, so it is in the integer encoding. See Note
 // [Integers] in `specialize`.
-crate::window::windowed!(BitUnary, [], [OP: u8, X: bool], |owner, state, base| (x, out r) {
-    *r = LBoxed::from_int(bit1::<OP>(bit_arg::<X>(x)));
+crate::window::windowed!(BitUnary, [], [OP: u8, X: bool], |owner, state, base, tag| (x, out r) {
+    *r = LBoxed::from_int_tagged(bit1::<OP>(bit_arg::<X>(x)), tag);
 });
-crate::window::windowed!(BitBinary, [], [OP: u8, X: bool, Y: bool], |owner, state, base| (x, y, out r) {
-    *r = LBoxed::from_int(bit2::<OP>(bit_arg::<X>(x), bit_arg::<Y>(y)));
+crate::window::windowed!(BitBinary, [], [OP: u8, X: bool, Y: bool], |owner, state, base, tag| (x, y, out r) {
+    *r = LBoxed::from_int_tagged(bit2::<OP>(bit_arg::<X>(x), bit_arg::<Y>(y)), tag);
 });
 // A folding bit op of three and of four numbers, all in the integer encoding if `INTS`.
-crate::window::windowed!(BitTernary, [], [OP: u8, INTS: bool], |owner, state, base| (x, y, z, out r) {
-    *r = LBoxed::from_int(bit2::<OP>(bit2::<OP>(bit_arg::<INTS>(x), bit_arg::<INTS>(y)), bit_arg::<INTS>(z)));
+crate::window::windowed!(BitTernary, [], [OP: u8, INTS: bool], |owner, state, base, tag| (x, y, z, out r) {
+    *r = LBoxed::from_int_tagged(bit2::<OP>(bit2::<OP>(bit_arg::<INTS>(x), bit_arg::<INTS>(y)), bit_arg::<INTS>(z)), tag);
 });
-crate::window::windowed!(BitQuaternary, [], [OP: u8, INTS: bool], |owner, state, base| (x, y, z, w, out r) {
+crate::window::windowed!(BitQuaternary, [], [OP: u8, INTS: bool], |owner, state, base, tag| (x, y, z, w, out r) {
     let xy = bit2::<OP>(bit_arg::<INTS>(x), bit_arg::<INTS>(y));
-    *r = LBoxed::from_int(bit2::<OP>(bit2::<OP>(xy, bit_arg::<INTS>(z)), bit_arg::<INTS>(w)));
+    *r = LBoxed::from_int_tagged(bit2::<OP>(bit2::<OP>(xy, bit_arg::<INTS>(z)), bit_arg::<INTS>(w)), tag);
 });
 
 /// `bit1::<OP>` as a window op, for a call with one number and one result: its
@@ -596,11 +596,11 @@ crate::window::windowed!(guard ByteInRange, [], [N: usize], |owner, state, base|
 });
 // `string.byte(s, i, j)`'s results to R(A) on, where `ByteInRange::<N>` passed: its first `N`
 // bytes from `i`, and nil past them, up to R(A+3), which a call of three arguments always has.
-crate::window::windowed!(ByteRange, [], [N: usize], |owner, state, base| (s, i, out r0, out r1, out r2, out r3) {
+crate::window::windowed!(ByteRange, [], [N: usize], |owner, state, base, tag| (s, i, out r0, out r1, out r2, out r3) {
     let bytes = unsafe { string_bytes(&s) };
     let at = unsafe { i.as_int() } as usize - 1;
     // SAFETY: `ByteInRange::<N>` passed, so `at + k` is in `bytes` for every `k < N`.
-    let byte = |k: usize| if k < N { LBoxed::from_int(unsafe { *bytes.get_unchecked(at + k) } as i32) } else { LBoxed::NIL };
+    let byte = |k: usize| if k < N { LBoxed::from_int_tagged(unsafe { *bytes.get_unchecked(at + k) } as i32, tag) } else { LBoxed::NIL };
     (*r0, *r1, *r2, *r3) = (byte(0), byte(1), byte(2), byte(3));
 });
 
@@ -611,10 +611,10 @@ crate::window::windowed!(WholeOfInt, [], [], |owner, state, base| (x, out r) {
 // `OP` of a double, in the integer encoding where an i32 holds the result: a cold path for one it
 // doesn't, which is a double. As an integer op whose result doesn't fit. See Note [Optimistic ops]
 // in `specialize`.
-crate::window::windowed!(WholeOptimistic, [], [OP: u8], |owner, state, base| (x, out r) {
+crate::window::windowed!(WholeOptimistic, [], [OP: u8], |owner, state, base, tag| (x, out r) {
     let whole = math1::<OP>(unsafe { checked_number(x) });
     if crate::lboxed::is_integer(whole) {
-        *r = LBoxed::from_int(whole as i32);
+        *r = LBoxed::from_int_tagged(whole as i32, tag);
         false
     } else {
         core::intrinsics::cold_path();
@@ -641,9 +641,9 @@ fn abs_boxed<'s, 'i>(x: LBoxed<'s, 'i>) -> LBoxed<'s, 'i> {
 // `math.abs` of an integer, an integer: a cold path for the one whose absolute value an i32
 // doesn't hold, which is a double. As an integer op whose result doesn't fit. See Note
 // [Optimistic ops] in `specialize`.
-crate::window::windowed!(AbsOptimistic, [], [], |owner, state, base| (x, out r) {
+crate::window::windowed!(AbsOptimistic, [], [], |owner, state, base, tag| (x, out r) {
     match unsafe { x.as_int() }.checked_abs() {
-        Some(n) => { *r = LBoxed::from_int(n); false },
+        Some(n) => { *r = LBoxed::from_int_tagged(n, tag); false },
         None => { core::intrinsics::cold_path(); true },
     }
 } cold {

@@ -297,6 +297,15 @@ impl<'src, 'intern> LBoxed<'src, 'intern> {
         f64::from_bits(self.0.wrapping_sub(Self::DOUBLE_ENCODE_OFFSET))
     }
 
+    /// `from_int`, with `tag` the value of `NUMBER_TAG`: a window op's pinned
+    /// register, so the stencil boxes with it rather than with a constant of its
+    /// own. See Note [Pinned tag] in `window`.
+    #[inline(always)]
+    pub fn from_int_tagged(i: i32, tag: u64) -> Self {
+        debug_assert_eq!(tag, Self::NUMBER_TAG, "the pinned tag");
+        Self::from_raw(tag | i as u32 as u64)
+    }
+
     /// Box an integer. See Note [Integer encoding].
     #[inline(always)]
     pub fn from_int(i: i32) -> Self {

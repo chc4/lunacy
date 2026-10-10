@@ -1101,7 +1101,8 @@ impl BlockPlan {
 
 /// The tag test of a guard of `expected` on the value in register `v`: a
 /// match jumps to `pass`, a mismatch falls through. `numeric` if the value is
-/// known to be a number. rax, never a window register, is scratch.
+/// known to be a number. rax, never a window register, is scratch. A number's
+/// test is against the pinned tag, r14 (see Note [Pinned tag] in `window`).
 ///
 ///   * Integer  : it has all `NUMBER_TAG` bits: at least `NUMBER_TAG`, unsigned.
 ///   * Double   : some but not all: below `NUMBER_TAG`, and, unless the guard
@@ -1116,22 +1117,19 @@ fn emit_type_test(ops: &mut Assembler, v: u8, expected: LType, numeric: bool, pa
     match expected {
         LType::Integer => dynasm!(ops
             ; .arch x64
-            ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
-            ; cmp Rq(v), Rq(m)
+            ; cmp Rq(v), r14
             ; jae =>pass
         ),
         LType::Double if numeric => dynasm!(ops
             ; .arch x64
-            ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
-            ; cmp Rq(v), Rq(m)
+            ; cmp Rq(v), r14
             ; jb =>pass
         ),
         LType::Double => dynasm!(ops
             ; .arch x64
-            ; mov Rq(m), QWORD (LBoxed::NUMBER_TAG as i64)
-            ; cmp Rq(v), Rq(m)
+            ; cmp Rq(v), r14
             ; jae >guard_fail // an integer
-            ; test Rq(v), Rq(m)
+            ; test Rq(v), r14
             ; jnz =>pass
             ; guard_fail:
         ),

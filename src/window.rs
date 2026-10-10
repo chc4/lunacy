@@ -1701,8 +1701,9 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 
 // Note [Pinned tag]
 // ~~~~~~~~~~~~~~~~~
-// Boxing and unboxing a double adds `NUMBER_TAG`, a 64-bit constant, which a
-// stencil would otherwise materialize in each copy that does it. Through JIT
+// Boxing and unboxing a double adds `NUMBER_TAG`, a 64-bit constant, and boxing
+// an integer ors it in, which a stencil would otherwise materialize in each copy
+// that does it. Through JIT
 // code, r14 holds it instead, as JavaScriptCore's JIT pins its NumberTag: it is
 // every window stencil's third fixed param, `tag`, which each passes on as it
 // passes on `state` and `base`. The JIT loads it on entering a region, and again
@@ -1711,9 +1712,10 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 //
 // A window op uses it by naming it in its header (`|owner, state, base,
 // tag|`) and boxing and unboxing with it (`LBoxed::from_arith_tagged`,
-// `as_double_tagged`). LLVM knows nothing of its value, so it uses the
-// register: told the value, it would fold the register back into the constant.
-// Run on the stack the op gets the constant.
+// `as_double_tagged`, `from_int_tagged`). LLVM knows nothing of its value, so it
+// uses the register: told the value, it would fold the register back into the
+// constant. Run on the stack the op gets the constant. The JIT's own tests of a
+// value's encoding compare it with r14 too.
 
 // Note [Cold stencils]
 // ~~~~~~~~~~~~~~~~~~~~
