@@ -43,9 +43,11 @@ def counts(dot):
         if fields and fields[0].lstrip().startswith('PC:'):
             fields = fields[1:]
         for field in fields:
-            field = field.strip()
-            if field:
-                residuals[re.match(r'[^(\s]+(?:\(\w+)?', field).group(0).replace('(', ' ').strip()] += 1
+            # A residual by its name, and its first argument where that names it (a window's
+            # op, an exec's name), not where it is a number (a slot, a block, an address).
+            m = re.match(r'\s*(\w+)(?:\((\w+))?', field)
+            if m:
+                residuals[m.group(1) + (f' {m.group(2)}' if m.group(2) and not m.group(2).isdigit() and not m.group(2).startswith('0x') else '')] += 1
     return blocks, never, residuals
 
 
