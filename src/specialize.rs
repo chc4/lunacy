@@ -1655,9 +1655,12 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 //
 // When a version is about to be compiled for a context, and a version at the same point differs
 // from it only in having more facts, all with origins and none used, the duplicate need not
-// exist: those origins are queued for contraction. So too if the context's own facts the version
-// lacks each say otherwise about something one of those facts is about, as a slot holding one
-// constant on one path and another on the other: neither is worth keeping where they meet, and
+// exist: those origins are queued for contraction. So too the other way, whichever path comes
+// first: where the context differs from a version only in having more facts, all with origins
+// and none used, the context drops them, reaching the version, and their origins are queued. So
+// too if the context's own facts the version lacks each say otherwise about something one of
+// those facts is about, as a slot holding one constant on one path and another on the other:
+// neither is worth keeping where they meet, and
 // the context drops its own there. So too when the versions at a point are joined: the facts of
 // theirs the join drops, all with origins and none used, are worth nothing past it. And when a
 // version's slot holding an unused constant holds another type in the context: the version is
@@ -3657,6 +3660,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 for origin in found {
                     if !into.iter().any(|known| Rc::ptr_eq(known, &origin)) {
                         into.push(origin);
+                    }
+                }
+                continue;
+            }
+            // The version has every fact `ctx` has but some only `ctx` has, all from origins and
+            // none used: `ctx` drops those, reaching the version, and they are contracted.
+            if ectx.fragile.iter().all(|fact| ctx.fragile.contains(fact)) {
+                let theirs: Vec<&Fact> = ctx.fragile.iter().filter(|fact| !ectx.fragile.contains(fact)).collect();
+                let Some(sets) = theirs.iter().map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+                let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
+                if theirs.is_empty() || found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
+                    continue;
+                }
+                _duplicates.push(_block.0);
+                #[cfg(feature = "tracing")]
+                _their.push(format!("{} lacks: {}", _block.0, ectx.tostring(owner)));
+                for fact in theirs {
+                    if !conflicting.contains(&fact.key()) {
+                        conflicting.push(fact.key());
+                    }
+                }
+                for origin in found {
+                    if !origins.iter().any(|known| Rc::ptr_eq(known, &origin)) {
+                        origins.push(origin);
                     }
                 }
                 continue;
