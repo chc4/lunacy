@@ -468,7 +468,11 @@ fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<Yie
             YieldOp::Clobber(from) => held.spells.spells.iter().all(|spell| spell.inputs.iter().all(|&slot| slot < *from)),
             YieldOp::OptimisticExec(_) => described.is_some(),
             YieldOp::ExecWindow(window) => described.is_some() || held.spells.untouched(&**window),
-            YieldOp::GuardDynamic(test) => held.spells.joins_guard(&**test, at),
+            // One joining a spell, or, as a type guard found out at runtime, one reading neither
+            // what they hold nor memory a held store may change.
+            YieldOp::GuardDynamic(test) => held.spells.joins_guard(&**test, at)
+                || (matches!(test.memory(), crate::window::Memory::None | crate::window::Memory::Properties)
+                    && held.spells.spells.iter().all(|spell| !test.operands().contains(&spell.dest) && spell.at != at)),
             // What a get or set asks before its guard on the key: of the table, a hash key for a
             // key in a register (there is none), and narrowing a key known not to be a double.
             YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) => true,
@@ -1075,12 +1079,12 @@ windowed!(frames frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, MOVES: boo
 
 // Whether a table's array part has kind `kind`, testing an element loaded from it in place of
 // the element's own tag. See Note [Array kinds].
-windowed!(reads guard KindIs, [kind: LType], [], |owner, state, base| (table) {
+windowed!(properties guard KindIs, [kind: LType], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).kind == kind.bit()
 });
 // The same of the table in the running closure's upvalue `index`.
-windowed!(reads guard UpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| () {
+windowed!(properties guard UpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| () {
     let LValue::Table(tab) = state.upvalue(owner, index).unbox() else { unreachable!() };
     tab.ro(owner).kind == kind.bit()
 });
@@ -4523,7 +4527,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// The thunk a `GuardDynamic` yield ends its block in. See Note [Dynamic guards].
-    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    /// What the peephole holds, `held`, stays held on both its ways. See Note [Peephole fusion] in
+    /// `peephole`.
+    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>, held: Option<Rc<crate::peephole::Spells>>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             test.interp(owner, state);
             let passed = state.select == 1;
@@ -4539,12 +4545,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 block_id
             };
             let (fail, pass) = if passed {
-                let pass = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Matched);
-                let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
+                let pass = vm.carried(owner, held.as_deref(), pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Matched);
+                let fail = vm.make_carried_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed, held.clone());
                 (Residual::Thunk(fail), Residual::Jump(pass))
             } else {
-                let fail = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
-                let pass = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_true(), thunk_ctx.clone(), ResumeArg::Matched);
+                let fail = vm.carried(owner, held.as_deref(), pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
+                let pass = vm.make_carried_side_thunk(block, thunk_coro.clone(), pc.next_true(), thunk_ctx.clone(), ResumeArg::Matched, held.clone());
                 (Residual::Jump(fail), Residual::Thunk(pass))
             };
             vm.blocks[block.0].instructions.push(fail);
@@ -5112,6 +5118,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             _ => None,
         };
         Some(ResumeArg::Element(element.bits(), value.ctypeof_(), constant))
+    }
+
+    /// A side not yet taken, as `make_side_thunk`'s, holding `held`. See Note [Peephole fusion] in
+    /// `peephole`.
+    fn make_carried_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg, held: Option<Rc<crate::peephole::Spells>>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, _: &mut RunState, thunk_pc: usize| {
+            let side = vm.carried(owner, held.as_deref(), pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
+            vm.jump_thunk(block_id, thunk_pc, side);
+        })))
     }
 
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
@@ -6560,7 +6575,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     } else {
-                        let thunk = Residual::Thunk(self.make_dynamic_thunk(block_id, coro.clone(), test, pc, ctx.clone()));
+                        let held = self.held.take().map(|held| Rc::new(held.spells));
+                        let thunk = Residual::Thunk(self.make_dynamic_thunk(block_id, coro.clone(), test, pc, ctx.clone(), held));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;

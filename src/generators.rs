@@ -383,11 +383,11 @@ pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield =
 
 // `GuardDynamic` tests: whether a `CType::Type(LType::Integer)` key, in a register or the
 // constant `k`, is in a table's array part. See Note [Dynamic guards].
-crate::window::windowed!(reads guard InArray, [], [], |owner, state, base| (table, key) {
+crate::window::windowed!(properties guard InArray, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(key.as_int()) < tab.ro(owner).array.len()
 });
-crate::window::windowed!(reads guard InArrayK, [k: i32], [], |owner, state, base| (table) {
+crate::window::windowed!(properties guard InArrayK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(k) < tab.ro(owner).array.len()
 });
@@ -406,11 +406,11 @@ crate::window::windowed!(guard EqualsK, [k: i32], [], |owner, state, base| (valu
     value.as_int() == k
 });
 // And whether the element there isn't nil.
-crate::window::windowed!(reads guard InArrayHeld, [], [], |owner, state, base| (table, key) {
+crate::window::windowed!(properties guard InArrayHeld, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).array.get(integer_slot(key.as_int())).is_some_and(|v| !v.is_nil())
 });
-crate::window::windowed!(reads guard InArrayHeldK, [k: i32], [], |owner, state, base| (table) {
+crate::window::windowed!(properties guard InArrayHeldK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).array.get(integer_slot(k)).is_some_and(|v| !v.is_nil())
 });

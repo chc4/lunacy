@@ -433,6 +433,10 @@ pub enum Memory {
     /// does, for the closure and the cells, but no table's elements are among what it touches,
     /// so whatever is known or held of them stays as it was across it.
     Frame,
+    /// Reads only the properties of a table's array part, its length and its kind, as a guard that
+    /// a key is in it does. A store into an element already in it, of a value that isn't nil and
+    /// widens no kind, changes neither, so it needn't be written before it.
+    Properties,
 }
 
 /// The owner of an op that touches no memory: nothing to reach the heap through. See Note
@@ -471,7 +475,8 @@ pub struct NoMemory;
 ///
 /// `windowed!(reads Name, ...)` or `windowed!(writes ...)` declares an op that reads, or writes,
 /// memory besides its operands: only one does is given `owner`. `windowed!(frames ...)` declares
-/// one that writes only the frames of calls (`Memory::Frame`). See Note [Window memory].
+/// one that writes only the frames of calls (`Memory::Frame`), and `windowed!(properties ...)` one
+/// that reads only an array part's length and kind (`Memory::Properties`). See Note [Window memory].
 ///
 /// `windowed!(guard Name, ...)` declares a dynamic guard's op, whose body
 /// evaluates to whether it passes: the op selects 0 when it does, and its
@@ -494,6 +499,9 @@ macro_rules! windowed {
     };
     (frames $($rest:tt)*) => {
         $crate::window::windowed!(@mem frames $($rest)*);
+    };
+    (properties $($rest:tt)*) => {
+        $crate::window::windowed!(@mem properties $($rest)*);
     };
     (
         @mem $mem:ident
@@ -619,10 +627,12 @@ macro_rules! windowed {
     (@owner reads, $owner:ident) => { &*$owner };
     (@owner writes, $owner:ident) => { $owner };
     (@owner frames, $owner:ident) => { $owner };
+    (@owner properties, $owner:ident) => { &*$owner };
     (@memory none) => { $crate::window::Memory::None };
     (@memory reads) => { $crate::window::Memory::Reads };
     (@memory writes) => { $crate::window::Memory::Writes };
     (@memory frames) => { $crate::window::Memory::Frame };
+    (@memory properties) => { $crate::window::Memory::Properties };
     (@cold_body []) => {
         { 0 }
     };

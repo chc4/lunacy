@@ -324,7 +324,7 @@ macro_rules! rule {
             |_, _| true, { let _ = alias; lhs });
     };
     ($rule:ident, $fused:ident, $compute:ident, $materialize:ident = [$($s:ident $k:ident),+] in $g:ident) => {
-        rule!(@ops [reads] m, alias, $rule, $fused, $compute, $materialize, [$(Sym::K($s),)+ Sym::Guard($g)], ($($k),+), (table, lhs), (m.table.unwrap(), m.lhs), (lhs), (m.lhs),
+        rule!(@ops [properties] m, alias, $rule, $fused, $compute, $materialize, [$(Sym::K($s),)+ Sym::Guard($g)], ($($k),+), (table, lhs), (m.table.unwrap(), m.lhs), (lhs), (m.lhs),
             (|| -> Option<i32> { let x = lhs.as_int(); $(let x = step::<$s>(x, $k as i32)?;)+ Some(x) })(),
             { let x = lhs.as_int(); $(let x = wrapping::<$s>(x, $k as i32);)+ x },
             { let x = lhs.as_int() as f64; $(let x = lua_step::<$s>(x, $k as i32);)+ x },
