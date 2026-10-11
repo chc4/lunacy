@@ -4,8 +4,11 @@
 -- one whose result doesn't fit once its inputs grow, which takes the fused
 -- operation's cold path. And runs computing a key a get or a set then checks
 -- is in a table's array part, which they fuse with: one whose key is sometimes
--- past it, in the hash part or nil there, which takes the cold path too. Once,
--- and in loops run often enough for JIT code.
+-- past it, in the hash part or nil there, which takes the cold path too. And
+-- two chains of different values interleaved, held apart, one of which
+-- overflows near the largest integer. And values computed and overwritten
+-- before anything reads them, one overflowing, which the peephole never lays
+-- out. Once, and in loops run often enough for JIT code.
 
 local function index(p)
   return (p - 1) % 256 + 1
@@ -38,12 +41,32 @@ local function store(u, i)
   u[(i + 3) % 8 + 1] = i
 end
 
+local function interleaved(i, j)
+  local x = i + 3
+  local y = j - 5
+  x = x % 256
+  y = y % 16
+  return x + y
+end
+
+local function dead(i, j)
+  -- Overwritten by a chain, a constant and an op the peephole can't hold.
+  local t = i + 1
+  t = t % 256
+  t = j - 3
+  local u = i * 2
+  u = 7
+  local v = i - 5
+  v = j * -2
+  return t + u + v
+end
+
 local function run(n)
   local t, u = {}, {}
   for i = 1, 16 do t[i] = i * i end
   for i = 1, 8 do u[i] = i end
   u[20] = 100
-  local s1, s2, s3, s4, s5 = 0, 0, 0, 0, 0
+  local s1, s2, s3, s4, s5, s6, s7 = 0, 0, 0, 0, 0, 0, 0
   for i = 1, n do
     s1 = s1 + index(i)
     s2 = s2 + around(t, i)
@@ -51,11 +74,13 @@ local function run(n)
     s4 = s4 + grows(i < n and i or 2147483000)
     s5 = s5 + lookup(u, i)
     store(u, i)
+    s6 = s6 + interleaved(i % 7 == 0 and 2147483646 or i, i * 3)
+    s7 = s7 + dead(i % 5 == 0 and 2147483647 or i, i)
   end
-  return s1, s2, s3, s4, s5, u[1] + u[8]
+  return s1, s2, s3, s4, s5, u[1] + u[8], s6, s7
 end
 
 print(run(10))
 print(run(2000))
--- EXPECT: 55	1178	21474836470	4294966070	20	9
--- EXPECT: 252008	998000	4294967293999	4298960000	506436	3993
+-- EXPECT: 55	1178	21474836470	4294966070	20	9	143	-15
+-- EXPECT: 252008	998000	4294967293999	4298960000	506436	3993	230353	-1993000

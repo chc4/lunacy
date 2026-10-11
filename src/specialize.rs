@@ -420,21 +420,12 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     }
 }
 
-/// The integer ops the peephole holds, the first and the last as they would have been laid out where
-/// they were held. See Note [Peephole fusion] in `peephole`.
+/// The spells the peephole holds, and the first integer op it held, as it would have been laid out
+/// where it was held, which the code goes on from where a check fails. See Note [Peephole fusion] in
+/// `peephole`.
 struct Held {
-    ops: Vec<crate::peephole::IntOp>,
+    spells: crate::peephole::Spells,
     first: HeldOp,
-    last: HeldOp,
-    /// The guard the run ends in, as `peephole::guard` gives it, held as passed.
-    guard: Option<(u8, usize, HeldOp)>,
-}
-
-impl Held {
-    /// The slot the run writes.
-    fn last_dest(&self) -> usize {
-        self.ops.last().expect("a held run").dest
-    }
 }
 
 #[derive(Clone)]
@@ -451,14 +442,10 @@ struct HeldOp {
     asked: Option<Origin>,
 }
 
-/// Whether the peephole can hold integer op `op`. See Note [Peephole fusion] in `peephole`.
-fn holdable(op: &crate::peephole::IntOp) -> bool {
-    crate::peephole::fuses() && crate::peephole::starts(op)
-}
 
 /// Whether a yield leaves what the peephole holds, `held`, held, laying out no code: in `ctx`, the
-/// window after `described` if it says, or a guard the run ends in. See Note [Peephole fusion] in
-/// `peephole`.
+/// window after `described` if it says, which the peephole is offered, or a guard joining a spell.
+/// See Note [Peephole fusion] in `peephole`.
 fn passes_held(held: &Held, ctx: &Context, state: &CoroutineState<YieldOp, ResumeArg>, described: Option<&crate::peephole::IntOp>) -> bool {
     let known = |slot: usize, expected: &CType| {
         let found = &ctx.types[slot];
@@ -470,8 +457,8 @@ fn passes_held(held: &Held, ctx: &Context, state: &CoroutineState<YieldOp, Resum
             YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
                 | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
                 | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::Clobber(_) | YieldOp::IntegerOp(_) => true,
-            YieldOp::OptimisticExec(_) | YieldOp::ExecWindow(_) => described.is_some_and(holdable),
-            YieldOp::GuardDynamic(test) => held.guard.is_none() && crate::peephole::guard(&**test, held.last_dest()).is_some(),
+            YieldOp::OptimisticExec(_) | YieldOp::ExecWindow(_) => described.is_some(),
+            YieldOp::GuardDynamic(test) => held.spells.joins_guard(&**test),
             // What a get or set asks before its guard on the key: of the table, a hash key for a
             // key in a register (there is none), and narrowing a key known not to be a double.
             YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) => true,
@@ -482,6 +469,20 @@ fn passes_held(held: &Held, ctx: &Context, state: &CoroutineState<YieldOp, Resum
             YieldOp::GuardCType(rk, expected) => rk & 0x100 != 0 || known(*rk, expected),
             _ => false,
         },
+    }
+}
+
+/// The slots a yield is about to write, and those it reads: a window's, or a constant load's. See
+/// Note [Peephole fusion] in `peephole`.
+fn overwrites(state: &CoroutineState<YieldOp, ResumeArg>) -> Option<(Vec<usize>, Vec<usize>)> {
+    match state {
+        CoroutineState::Yielded(YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w)) => {
+            let accesses = || w.operands().iter().zip(w.accesses());
+            Some((accesses().filter(|(_, a)| **a == Access::Write).map(|(s, _)| *s).collect(),
+                  accesses().filter(|(_, a)| a.reads()).map(|(s, _)| *s).collect()))
+        },
+        CoroutineState::Yielded(YieldOp::EncodeK(slot, _)) => Some((vec![*slot], Vec::new())),
+        _ => None,
     }
 }
 
@@ -4101,8 +4102,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
             // What the peephole holds, before what lays out code here. See Note [Peephole fusion].
-            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && self.flush(owner, block_id) {
-                return ctx;
+            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) {
+                self.flush(block_id);
             }
             if let Some((next, nctx, ret)) = match inst.0.Opcode() {
                 op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
@@ -4630,13 +4631,32 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Hold integer op `int_op`, of `window`, as its generator `coro` yielded the window at `pc` in
-    /// `ctx`: after laying out what the peephole holds, if it can't be fused with them. Whether that
-    /// ended the block. See Note [Peephole fusion] in `peephole`.
-    fn hold<C>(&mut self, owner: &mut Owner, block_id: BlockId, int_op: crate::peephole::IntOp, window: &Rc<dyn Window>, optimistic: bool, coro: &Box<C>, pc: SubPc, ctx: &mut Rc<Context>) -> bool
+    /// `ctx`, laying out what the peephole holds first where it must: whether it is held. See Note
+    /// [Peephole fusion] in `peephole`.
+    fn hold<C>(&mut self, block_id: BlockId, int_op: crate::peephole::IntOp, window: &Rc<dyn Window>, optimistic: bool, coro: &Box<C>, pc: SubPc, ctx: &mut Rc<Context>) -> bool
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
-        if self.held.as_ref().is_some_and(|held| held.guard.is_some() || !crate::peephole::extends(&held.ops, &int_op)) && self.flush(owner, block_id) {
-            return true;
+        use crate::peephole::{Offer, Spells};
+        if !crate::peephole::fuses() {
+            return false;
+        }
+        let joined = match self.held.as_mut().map(|held| held.spells.offer(&int_op)) {
+            Some(Offer::Held) => true,
+            // Laid out first; or dropped, as what it overwrites, if nothing is left.
+            Some(Offer::Flush | Offer::Refused) => {
+                self.flush(block_id);
+                false
+            },
+            None => false,
+        };
+        if !joined {
+            let mut spells = Spells::default();
+            if spells.offer(&int_op) != Offer::Held {
+                return false;
+            }
+            let asked = if optimistic { self.encoding.take() } else { None };
+            let first = HeldOp { window: window.clone(), optimistic, coro: Box::new((**coro).clone()), pc, ctx: ctx.clone(), asked };
+            self.held = Some(Held { spells, first });
         }
         // Its outputs are written, as laying it out would write them.
         for (&slot, access) in window.operands().iter().zip(window.accesses()) {
@@ -4644,57 +4664,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Rc::make_mut(ctx).effect(Effect::Write(slot));
             }
         }
-        let asked = if optimistic { self.encoding.take() } else { None };
-        let this = HeldOp { window: window.clone(), optimistic, coro: Box::new((**coro).clone()), pc, ctx: ctx.clone(), asked };
-        match &mut self.held {
-            Some(held) => {
-                held.ops.push(int_op);
-                held.last = this;
-            },
-            None => self.held = Some(Held { ops: vec![int_op], first: this.clone(), last: this, guard: None }),
-        }
-        false
-    }
-
-    /// Lay out what the peephole holds in `block_id`: one op as it would have been where it was
-    /// held, which ends the block if it has a cold path; more as their fused op, ending the block,
-    /// its hot path as the last op's, its cold path the first op as it would have been where it was
-    /// held. Whether it ended the block. See Note [Peephole fusion] in `peephole`.
-    fn flush(&mut self, owner: &mut Owner, block_id: BlockId) -> bool {
-        let Some(held) = self.held.take() else { return false };
-        let first = held.first;
-        if let Some((g, table, guard)) = held.guard {
-            let window = crate::peephole::fused_guard_window(&held.ops, (g, table)).expect("a held run and its guard are a fused op");
-            self.end_block(block_id);
-            self.blocks[block_id.0].instructions.push(Residual::ExecWindow(window));
-            let hot = self.subblock(owner, guard.pc.next_true(), guard.ctx.clone(), Box::new(guard.coro.clone()), ResumeArg::Matched);
-            let cold = self.cold_held(first);
-            self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
-            return true;
-        }
-        if held.ops.len() == 1 {
-            if !first.optimistic {
-                // Nothing laid out since reads what it writes.
-                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(first.window));
-                return false;
-            }
-            self.end_block(block_id);
-            self.lay_out_held(owner, block_id, first);
-            return true;
-        }
-        let window = crate::peephole::fused_window(&held.ops).expect("a held run is a fused op");
-        self.end_block(block_id);
-        self.blocks[block_id.0].instructions.push(Residual::ExecWindow(window));
-        let last = held.last;
-        let resume = if last.optimistic { ResumeArg::Matched } else { ResumeArg::Start };
-        let hot = self.subblock(owner, last.pc.next_true(), last.ctx.clone(), Box::new(last.coro.clone()), resume);
-        let cold = self.cold_held(first);
-        self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
         true
     }
 
-    /// A fused op's cold path: a block laying out the run's first op as it would have been where
-    /// it was held, once taken. See Note [Peephole fusion] in `peephole`.
+    /// Lay out what the peephole holds in `block_id`: every spell's check, failing to the first op
+    /// held as it would have been laid out where it was held, then every spell's computation. See
+    /// Note [Peephole fusion] in `peephole`.
+    fn flush(&mut self, block_id: BlockId) {
+        let Some(held) = self.held.take() else { return };
+        let windows: Vec<(Option<Rc<dyn Window>>, Rc<dyn Window>)> = held.spells.spells.iter().map(|spell| {
+            let (check, compute) = spell.windows();
+            (spell.can_fail().then_some(check), compute)
+        }).collect();
+        if windows.iter().any(|(check, _)| check.is_some()) {
+            let cold = self.cold_held(held.first);
+            for check in windows.iter().filter_map(|(check, _)| check.clone()) {
+                self.blocks[block_id.0].instructions.push(Residual::GuardDynamic(check));
+                self.blocks[block_id.0].instructions.push(Residual::Jump(cold));
+            }
+        }
+        for (_, compute) in windows {
+            self.blocks[block_id.0].instructions.push(Residual::ExecWindow(compute));
+        }
+    }
+
+    /// The cold path of the checks of what the peephole held: a block laying out the first op it
+    /// held as it would have been where it was held, once taken. See Note [Peephole fusion] in
+    /// `peephole`.
     fn cold_held(&mut self, first: HeldOp) -> BlockId {
         let cold = self.new_block(first.pc.0);
         let thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
@@ -5769,8 +5765,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut state = Pin::new(&mut coro).resume(arg);
             arg = ResumeArg::Start;
             'machine: loop {
-            if self.held.as_ref().is_some_and(|held| !passes_held(held, &ctx, &state, described.as_ref())) && self.flush(owner, block_id) {
-                return None;
+            if self.held.as_ref().is_some_and(|held| !passes_held(held, &ctx, &state, described.as_ref())) {
+                // What writes a held value unread: that spell is dead.
+                if let Some((writes, reads)) = overwrites(&state) {
+                    self.held.as_mut().unwrap().spells.drop_overwritten(&writes, &reads);
+                }
+                self.flush(block_id);
             }
             match state {
                 CoroutineState::Yielded(YieldOp::TypeofK(k)) => {
@@ -6007,18 +6007,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::IntegerOp(op)) => {
                     described = Some(op);
                 },
-                CoroutineState::Yielded(YieldOp::OptimisticExec(op)) if let Some(int_op) = described.take().filter(|op| holdable(op)) => {
-                    if self.hold(owner, block_id, int_op, &op, true, &coro, pc, &mut ctx) {
-                        return None;
-                    }
+                CoroutineState::Yielded(YieldOp::OptimisticExec(ref op)) if let Some(int_op) = described.take() && self.hold(block_id, int_op, op, true, &coro, pc, &mut ctx) => {
                     pc = pc.next_true();
                     arg = ResumeArg::Matched;
                 },
-                CoroutineState::Yielded(YieldOp::ExecWindow(w)) if let Some(int_op) = described.take().filter(|op| holdable(op)) => {
-                    if self.hold(owner, block_id, int_op, &w, false, &coro, pc, &mut ctx) {
-                        return None;
-                    }
-                },
+                CoroutineState::Yielded(YieldOp::ExecWindow(ref w)) if let Some(int_op) = described.take() && self.hold(block_id, int_op, w, false, &coro, pc, &mut ctx) => {},
                 CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
                     // Its outputs are written whichever path it takes. See Note [Optimistic ops].
                     for (&slot, access) in op.operands().iter().zip(op.accesses()) {
@@ -6069,10 +6062,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
-                // The guard the held run ends in: as passed. See Note [Peephole fusion] in `peephole`.
-                CoroutineState::Yielded(YieldOp::GuardDynamic(test)) if let Some((g, table)) = self.held.as_ref().filter(|held| held.guard.is_none()).and_then(|held| crate::peephole::guard(&*test, held.last_dest())) => {
-                    let guard = HeldOp { window: test.clone(), optimistic: false, coro: Box::new((*coro).clone()), pc, ctx: ctx.clone(), asked: None };
-                    self.held.as_mut().unwrap().guard = Some((g, table, guard));
+                // A guard joining a held spell: as passed. See Note [Peephole fusion] in `peephole`.
+                CoroutineState::Yielded(YieldOp::GuardDynamic(ref test)) if self.held.as_mut().is_some_and(|held| held.spells.offer_guard(&**test)) => {
                     pc = pc.next_true();
                     arg = ResumeArg::Matched;
                 },
