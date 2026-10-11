@@ -419,6 +419,17 @@ impl<F: ClassFact> Classes<F> {
         self.facts.iter().flat_map(|(_, facts)| facts.iter())
     }
 
+    /// The slots an open field is, in order.
+    pub fn open_slots(&self) -> Vec<u16> {
+        let mut slots: Vec<u16> = self.fields.iter().filter_map(|&(_, _, t)| match t {
+            Target::Open(slot) => Some(slot),
+            Target::Class(_) => None,
+        }).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
     /// Forget field `label` of the value `loc` holds.
     pub fn unlink(&mut self, loc: Loc, label: Label) {
         if let Some(class) = self.find(loc) {

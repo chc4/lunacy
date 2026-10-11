@@ -1812,7 +1812,8 @@ pub fn emit_close(a: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return
         arg = yield YieldOp::Exec(ResidualExec::new("close", Rc::new(move |owner, state| {
             let from = state.base + a;
             state.close_upvalues_from(owner, from);
-        })));
+        })).writing(&[]));
+        yield YieldOp::Close(a);
         arg
     }
 }
@@ -1893,6 +1894,7 @@ pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: u
     #[coroutine]
     move |mut arg: ResumeArg| {
         let skip = !upvalues.is_empty();
+        let captured = upvalues.clone();
         let upvalues = upvalues.clone();
         arg = yield YieldOp::Exec(ResidualExec::new("closure", Rc::new(move |owner, state| {
             let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx] };
@@ -1915,11 +1917,12 @@ pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: u
                 fresh.upvalues.push(cell);
             }
             state.vals[state.base + a] = LBoxed::box_lvalue(LValue::LClosure(Tc::new(fresh)));
-        })));
+        })).writing(&[a]));
         yield YieldOp::SetTypes(vec![(a, LType::Closure)]);
+        yield YieldOp::Captures(a, captured.clone());
         yield YieldOp::CollectGarbage;
         if skip {
-            arg = yield YieldOp::GetBlock(next);
+            arg = yield YieldOp::GetBlockKeeping(next, a);
             let ResumeArg::BlockId(target) = arg else { unreachable!() };
             arg = yield YieldOp::Jump(target);
         }
@@ -1956,6 +1959,7 @@ pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
         });
         arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, &[a])));
         yield YieldOp::Effect(Effect::SetUpvalue(b));
+        yield YieldOp::UpvalueHolds(b, a);
         arg
     }
 }

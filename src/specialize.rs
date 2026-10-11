@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 
 use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Location, Return, Upvalue};
-use crate::classes::{ClassFact, Label, Loc, Root};
+use crate::classes::{ClassFact, Label, Loc, Root, Target};
 use qcell::{LCell, LCellOwner};
 use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{Tc, Vm};
@@ -299,6 +299,13 @@ pub enum YieldOp {
     UpvalueKnown(usize), // Resumed with what the context knows of UPVALUE[idx]'s value: Boxed, the
                          // native it holds; else Integer, a stack slot holding it; else Failed.
                          // See Note [Fragile information]
+    Captures(usize, Vec<(Opcode, usize)>), // Inform the executor that the closure in STACK[a]
+                                           // captured these upvalues, as CLOSURE's pseudo-
+                                           // instructions name them. See Note [Upvalue paths]
+    Close(usize), // Inform the executor that the upvalues open into STACK[a] and up are closed.
+                  // See Note [Upvalue paths]
+    UpvalueHolds(usize, usize), // Inform the executor that UpValue[a] holds STACK[b]'s value. See
+                                // Note [Upvalue paths]
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
                     // Note [Fragile information]
 
@@ -1230,7 +1237,7 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
         .map(|param| (Root::Slot(param as u16), Loc::root(Root::Slot((a + 1 + param) as u16))))
         .chain(fields.iter().enumerate().map(|(n, path)| (Root::Upvalue(n as u8), Loc { root: Root::Slot(a as u16), path })))
         .collect();
-    entry.values = caller.values.view(&map);
+    entry.values = caller.closing(0).view(&map);
     entry.inline = caller.inline.iter().cloned().chain([frame]).collect();
     entry
 }
@@ -1533,15 +1540,17 @@ fn forgets(ctx: &Context, live: usize) -> bool {
 // paths differing only in temporaries they are done with share the target's version. A temporary
 // can be live across a jump, though: a LOADBOOL that skips the next instruction writes the
 // register its pair's other LOADBOOL does, whose path falls through to the same target knowing its
-// type, and what the target does with it (return it, pass it) needs it. Such a jump keeps the type
-// of the register its instruction wrote, so both ways in agree.
+// type, and what the target does with it (return it, pass it) needs it; a CLOSURE's jump past its
+// pseudo-instructions leaves its closure in a temporary until it is returned or stored. Such a
+// jump keeps what it knows of the register its instruction wrote: its type, and its value's class
+// (Note [Value classes] in `classes`), so both ways in agree.
 
 /// Forget, for a jump to a target where the registers from `live` on hold no
-/// local, those registers' types and the fragile facts about them.
-fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
-    let dead = (live..ctx.types.len()).filter(|&idx| forgotten(&ctx.types[idx])).map(|idx| (idx, CType::Unknown)).collect();
+/// local, those registers' types and the fragile facts about them, but `kept`'s.
+fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<usize>) {
+    let dead = (live..ctx.types.len()).filter(|&idx| forgotten(&ctx.types[idx]) && Some(idx) != kept).map(|idx| (idx, CType::Unknown)).collect();
     ctx.set_types(owner, dead);
-    for idx in live..ctx.types.len() {
+    for idx in (live..ctx.types.len()).filter(|&idx| Some(idx) != kept) {
         ctx.effect(Effect::Write(idx));
     }
 }
@@ -1941,15 +1950,22 @@ impl std::fmt::Display for Kind {
 // closure's class. Only a closure's prototype is known (what its identity guard compares), not
 // the closure, so what is known of its upvalues is known of their values, not of its cells.
 //
-// A set of the running function's upvalue j moves it to a class of its own, and forgets every
-// closure's upvalue fields: cells are shared, and any of them may be j's. Setting another
+// A set of the running function's upvalue j makes it hold the value stored, and forgets every
+// closure's upvalue fields but those open into the frame: cells are shared, and any of them may be
+// j's, but none open into the frame is one of the running function's own. Setting another
 // closure's upvalue is a call, whose effects say whether it set any (Note [Call effects]).
 //
+// A closure made here knows its cells. One it captured from a slot is that slot while it is open
+// (an open field), so a write to the slot is one to the upvalue, until a CLOSE or the frame's end
+// closes it: from then on it holds the value the slot had, with the slot's type. One it captured
+// from the running function's upvalue holds that upvalue's value.
+//
 // Fields carry facts across inlined calls (Note [Inlined calls]). The callee enters with its own
-// upvalue n holding what the closure's field n does, and unless it set some upvalue, its return
-// gives the closure's fields what its own upvalues then hold, at a place of the caller's still
-// holding the closure. A caller making several calls of one closure learns at its first inlined
-// call what every later one then knows.
+// upvalue n holding what the closure's field n does, and its return gives the closure's fields
+// what its own upvalues then hold, at a place of the caller's still holding the closure, and the
+// slots its results go to what it knows of its results, a closure it made included. A caller
+// making several calls of one closure learns at its first inlined call what every later one then
+// knows.
 //
 // A slot loaded from an upvalue holds its value, so what either learns the other knows: the
 // value's type (`Known::Type`) and, for a table, its array part's kind (`Known::Kind`). So a table
@@ -2259,11 +2275,11 @@ impl Context {
             Effect::WriteAny => self.values.retain_roots(|root| !matches!(root, Root::Slot(_))),
             Effect::SetUpvalue(j) => {
                 self.values.write(Root::Upvalue(j as u8));
-                self.values.retain_fields(|label, _| !matches!(label, Label::Upvalue(_)));
+                self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
             },
             Effect::AnyUpvalue => {
                 self.values.retain_roots(|root| !matches!(root, Root::Upvalue(_)));
-                self.values.retain_fields(|label, _| !matches!(label, Label::Upvalue(_)));
+                self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
             },
             Effect::Opaque => self.values = Values::default(),
             // Any table may be the one stored into: one of kind `kind` keeps it only for a value
@@ -2386,6 +2402,21 @@ impl Context {
             Some(Known::Type(ctype)) => Some(ctype),
             _ => None,
         }
+    }
+
+    /// What is known once the upvalues open into slot `from` and up are closed: each holds the
+    /// value its slot had, with the slot's type. See Note [Upvalue paths].
+    fn closing(&self, from: usize) -> Values {
+        let mut values = self.values.clone();
+        for slot in values.open_slots().into_iter().filter(|&slot| slot as usize >= from) {
+            let at = Loc::root(Root::Slot(slot));
+            match self.slot(slot as usize) {
+                CType::Unknown => {},
+                ctype => values.learn(at, Known::Type(ctype)),
+            }
+        }
+        values.close(from as u16);
+        values
     }
 
     /// What `self` knows that `other` doesn't, as each root's facts, if that is all: none if it
@@ -3715,7 +3746,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let pc = self.blocks[target.0].pc;
         let live = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
         let mut jumping = ctx.clone();
-        forget_dead(owner, &mut jumping, live);
+        forget_dead(owner, &mut jumping, live, None);
         // A jump may keep a register it wrote (`GetBlockKeeping`).
         assert!(entered.accepts(&jumping) || entered.accepts(ctx), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
         target
@@ -3735,10 +3766,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// fragile facts about them, and which array a value of known type was
     /// loaded from, which lets paths that differ only in them share the target's
     /// version. See Note [Jumped-to contexts].
-    fn jumping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
+    fn jumping(&self, owner: &mut Owner, ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
+        self.jumping_keeping(owner, ctx, dest_pc, None)
+    }
+
+    /// `jumping`, keeping what is known of register `kept`, which the jumping instruction wrote.
+    /// See Note [Jumped-to contexts].
+    fn jumping_keeping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc, kept: Option<usize>) -> Rc<Context> {
         let in_scope = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(dest_pc);
         if let Some(in_scope) = in_scope.filter(|&in_scope| forgets(&ctx, in_scope)) {
-            forget_dead(owner, Rc::make_mut(&mut ctx), in_scope);
+            forget_dead(owner, Rc::make_mut(&mut ctx), in_scope, kept);
         }
         // An element of a known type was guarded, or its array's kind is known:
         // what it was loaded from tells no more. Only the version jumped to is
@@ -4268,14 +4305,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut known = continuation.caller.clone();
         effects.apply(owner, &mut known, &continuation.captured);
         // See Note [Upvalue paths].
-        if let Some(closure) = continuation.closure.filter(|_| effects.0 & Effects::UPVALUE.0 == 0) {
-            let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
-            let map: Vec<(Loc, Loc)> = fields.iter().enumerate().map(|(n, path)| (Loc { root: closure, path }, Loc::root(Root::Upvalue(n as u8)))).collect();
-            known.values.overlay(&ctx.values, &map);
-        }
         let (call, c) = (continuation.a as usize, continuation.c as usize);
         let returned = (b != 0).then(|| b - 1);
         let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
+        let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
+        let map: Vec<(Loc, Loc)> = continuation.closure.into_iter()
+            .flat_map(|closure| fields.iter().enumerate().map(move |(n, path)| (Loc { root: closure, path }, Loc::root(Root::Upvalue(n as u8)))))
+            .chain((0..count.min(returned.unwrap_or(0))).map(|i| (Loc::root(Root::Slot((call + i) as u16)), Loc::root(Root::Slot((a + i) as u16)))))
+            .collect();
+        known.values.overlay(&ctx.closing(0), &map);
         let slots = known.types.len();
         for i in (0..count).filter(|i| call + i < slots) {
             known.types[call + i] = match returned {
@@ -5343,6 +5381,32 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Rc::make_mut(&mut ctx).set_types(owner, clobbered);
                     Rc::make_mut(&mut ctx).top = None;
                 },
+                CoroutineState::Yielded(YieldOp::Captures(closure, upvalues)) => {
+                    // See Note [Upvalue paths].
+                    let ctx = Rc::make_mut(&mut ctx);
+                    for (n, (from, index)) in upvalues.into_iter().enumerate() {
+                        let at = Loc::root(Root::Slot(closure as u16));
+                        if from == Opcode::MOVE {
+                            ctx.values.alias(at, Label::Upvalue(n as u8), index as u16);
+                        } else {
+                            ctx.values.link(at, Label::Upvalue(n as u8), Loc::root(Root::Upvalue(index as u8)));
+                        }
+                    }
+                },
+                CoroutineState::Yielded(YieldOp::Close(from)) => {
+                    let ctx = Rc::make_mut(&mut ctx);
+                    ctx.values = ctx.closing(from);
+                },
+                CoroutineState::Yielded(YieldOp::UpvalueHolds(upvalue, slot)) => {
+                    // See Note [Upvalue paths].
+                    let ctx = Rc::make_mut(&mut ctx);
+                    let at = Loc::root(Root::Upvalue(upvalue as u8));
+                    ctx.values.assign(Root::Upvalue(upvalue as u8), Loc::root(Root::Slot(slot as u16)));
+                    match ctx.slot(slot) {
+                        CType::Unknown => {},
+                        ctype => ctx.values.learn(at, Known::Type(ctype)),
+                    }
+                },
                 CoroutineState::Yielded(YieldOp::Effect(effect)) => {
                     Rc::make_mut(&mut ctx).effect(effect);
                     // See Note [Call effects].
@@ -5718,10 +5782,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::GetBlockKeeping(dest_pc, kept)) => {
                     // The register the jump's own instruction wrote, which the other way to the
                     // target holds the same type in. See Note [Jumped-to contexts].
-                    let mut jumping = self.jumping(owner, ctx.clone(), dest_pc);
-                    if jumping.types[kept] != ctx.types[kept] {
-                        Rc::make_mut(&mut jumping).set_types(owner, vec![(kept, ctx.types[kept].clone())]);
-                    }
+                    let jumping = self.jumping_keeping(owner, ctx.clone(), dest_pc, Some(kept));
                     arg = ResumeArg::BlockId(self.version(owner, dest_pc, jumping));
                 },
                 CoroutineState::Yielded(YieldOp::Jump(dest_block)) => {
