@@ -640,6 +640,16 @@ impl<F: ClassFact> Classes<F> {
             let side = above.root_class(root).map_or(Side::Root(root), Side::Class);
             roots.push((root, intern(&mut pairs, (Mine::Class(class), side))));
         }
+        // A slot a field is open to is that field, though nothing else is known of it: paired
+        // with what `above` has there, it stays equal to the field where `above` has them equal.
+        for &(_, _, target) in &self.fields {
+            if let Target::Open(slot) = target && self.root_class(Root::Slot(slot)).is_none() && !roots.iter().any(|&(root, _)| root == Root::Slot(slot)) {
+                let root = Root::Slot(slot);
+                let side = above.root_class(root).map_or(Side::Root(root), Side::Class);
+                roots.push((root, intern(&mut pairs, (Mine::Root(root), side))));
+            }
+        }
+        roots.sort_by_key(|&(root, _)| root);
         let mut fields = Vec::new();
         let mut i = 0;
         while i < pairs.len() {
@@ -649,8 +659,14 @@ impl<F: ClassFact> Classes<F> {
             };
             if let Side::Class(a) = side {
                 for &(_, label, theirs) in above.fields.iter().filter(|&&(c, _, _)| c == a) {
-                    if self.field(class, label).is_none() && let Some(t) = above.target_class(theirs) {
-                        let pair = intern(&mut pairs, (Mine::Field(class, label), Side::Class(t)));
+                    if self.field(class, label).is_none() {
+                        // Open to a slot nothing else is known of: that slot's value.
+                        let side = match (theirs, above.target_class(theirs)) {
+                            (_, Some(t)) => Side::Class(t),
+                            (Target::Open(k), None) => Side::Root(Root::Slot(k)),
+                            _ => continue,
+                        };
+                        let pair = intern(&mut pairs, (Mine::Field(class, label), side));
                         fields.push((i, label, PairTarget::Pair(pair)));
                     }
                 }
@@ -889,8 +905,8 @@ mod tests {
         }
     }
 
-    const ROOTS: [Root; 6] = [Root::Slot(0), Root::Slot(1), Root::Slot(2), Root::Slot(3), Root::Upvalue(0), Root::Upvalue(1)];
-    const LABELS: [Label; 3] = [Label::Upvalue(0), Label::Upvalue(1), Label::ElementOf];
+    const ROOTS: [Root; 8] = [Root::Slot(0), Root::Slot(1), Root::Slot(2), Root::Slot(3), Root::Upvalue(0), Root::Upvalue(1), Root::Global(7), Root::Arg(0)];
+    const LABELS: [Label; 4] = [Label::Upvalue(0), Label::Upvalue(1), Label::ElementOf, Label::Field(9)];
     const FACTS: [Fact; 5] = [Fact::Type(Ty::Int), Fact::Type(Ty::Float), Fact::Type(Ty::Number), Fact::Constant(1), Fact::Constant(2)];
 
     /// What a field of a value in the reference holds.
