@@ -1824,9 +1824,9 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
         arg = yield YieldOp::Typeof(src);
         if let ResumeArg::Type(t) = arg.clone() {
             yield YieldOp::ExecWindow(Rc::new(Move::new(&[src, dest])));
-            // TODO: track references? see PyLBBV
             debug!("move {} = {} {:?}", dest, src, t);
             yield YieldOp::SetCTypes(vec![(dest, t)]);
+            yield YieldOp::Copy(dest, src);
         } else {
             unreachable!();
         }
@@ -2139,6 +2139,7 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
             let ResumeArg::Type(t) = (yield YieldOp::Typeof(a + i)) else { unreachable!() };
             yield YieldOp::ExecWindow(Rc::new(ForInMove::new(&[a + i, f + i])));
             yield YieldOp::SetCTypes(vec![(f + i, t)]);
+            yield YieldOp::Copy(f + i, a + i);
         }
         arg = yield YieldOp::Guard(f, LType::Closure);
         if arg != ResumeArg::Matched {
@@ -2169,6 +2170,7 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
         let ResumeArg::Type(t) = (yield YieldOp::Typeof(f)) else { unreachable!() };
         yield YieldOp::ExecWindow(Rc::new(ForInMove::new(&[f, a + 2])));
         yield YieldOp::SetCTypes(vec![(a + 2, t)]);
+        yield YieldOp::Copy(a + 2, f);
         arg
     }
 }

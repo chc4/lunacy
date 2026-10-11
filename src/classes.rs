@@ -24,7 +24,9 @@ use std::hash::Hash;
 // only one place holding it), as that is what a place no class names means. An upvalue captured
 // while its slot is open is that slot, not a copy of its value: its field names the slot itself
 // (`Target::Open`), so a write to the slot is one to the upvalue, until the slot is closed and the
-// field holds the value it then had.
+// field holds the value it then had. A slot only one field was open to is closed into a sealed
+// field (`Target::Sealed`): its cell is reachable only through that closure, so only the closure
+// sets it. A root mapped from a sealed field into another frame (`view`) is sealed there too.
 //
 // The classes are kept in a canonical form, numbered in the order they are first reached from the
 // roots in order and then along fields in label order, with nothing kept that tells nothing. Two
@@ -86,11 +88,32 @@ pub trait ClassFact: Clone + Eq + Hash + Debug {
     fn implies(&self, weaker: &Self) -> bool;
 }
 
-/// What a field holds: a class, or an open slot's value whatever it is now.
+/// What a field holds: a class, an open slot's value whatever it is now, or a class in a cell
+/// only the field's closure reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Target {
     Class(u32),
     Open(u16),
+    Sealed(u32),
+}
+
+impl Target {
+    /// The class it holds, unless it is open.
+    fn closed(self) -> Option<u32> {
+        match self {
+            Target::Class(class) | Target::Sealed(class) => Some(class),
+            Target::Open(_) => None,
+        }
+    }
+
+    /// It, holding `class` in place of its own.
+    fn renamed(self, class: u32) -> Target {
+        match self {
+            Target::Sealed(_) => Target::Sealed(class),
+            Target::Class(_) => Target::Class(class),
+            open => open,
+        }
+    }
 }
 
 /// What `above` has at the places a class of a context is, as `Classes::resolve` names a place: a
@@ -112,11 +135,12 @@ enum Mine {
     Field(u32, Label),
 }
 
-/// What a field of a pair holds: a pair, or an open slot.
+/// What a field of a pair holds: a pair, an open slot, or a pair in a sealed cell.
 #[derive(Debug, Clone, Copy)]
 enum PairTarget {
     Pair(usize),
     Open(u16),
+    Sealed(usize),
 }
 
 /// A context's classes paired with what another has at the same places, reached from the roots
@@ -136,13 +160,15 @@ pub struct Classes<F> {
     fields: Vec<(u32, Label, Target)>,
     /// Each class's facts, by class, each class's by key.
     facts: Vec<(u32, Vec<F>)>,
+    /// The roots that are sealed cells, in order.
+    sealed: Vec<Root>,
     /// How many classes there are, numbered from 0.
     classes: u32,
 }
 
 impl<F> Default for Classes<F> {
     fn default() -> Self {
-        Classes { roots: Vec::new(), fields: Vec::new(), facts: Vec::new(), classes: 0 }
+        Classes { roots: Vec::new(), fields: Vec::new(), facts: Vec::new(), sealed: Vec::new(), classes: 0 }
     }
 }
 
@@ -157,7 +183,7 @@ impl<F: ClassFact> Classes<F> {
 
     fn target_class(&self, target: Target) -> Option<u32> {
         match target {
-            Target::Class(class) => Some(class),
+            Target::Class(class) | Target::Sealed(class) => Some(class),
             Target::Open(slot) => self.root_class(Root::Slot(slot)),
         }
     }
@@ -202,7 +228,7 @@ impl<F: ClassFact> Classes<F> {
         };
         for &label in loc.path {
             class = match self.field(class, label) {
-                Some(Target::Class(next)) => next,
+                Some(Target::Class(next) | Target::Sealed(next)) => next,
                 Some(Target::Open(slot)) => self.ensure(Loc::root(Root::Slot(slot))),
                 None => {
                     let next = self.new_class();
@@ -219,7 +245,7 @@ impl<F: ClassFact> Classes<F> {
         let Some(mut class) = self.root_class(loc.root) else { return (Err(loc.root), loc.path) };
         for (i, &label) in loc.path.iter().enumerate() {
             match self.field(class, label) {
-                Some(Target::Class(next)) => class = next,
+                Some(Target::Class(next) | Target::Sealed(next)) => class = next,
                 Some(Target::Open(slot)) => match self.root_class(Root::Slot(slot)) {
                     Some(next) => class = next,
                     None => return (Err(Root::Slot(slot)), &loc.path[i + 1..]),
@@ -317,10 +343,30 @@ impl<F: ClassFact> Classes<F> {
                 _ => None,
             })
             .collect();
-        for (i, slot) in open {
+        let sole: Vec<bool> = open.iter().map(|&(_, slot)| self.fields.iter().filter(|&&(_, _, t)| t == Target::Open(slot)).count() == 1).collect();
+        for (&(i, slot), sole) in open.iter().zip(sole) {
             let class = self.ensure(Loc::root(Root::Slot(slot)));
-            self.fields[i].2 = Target::Class(class);
+            self.fields[i].2 = if sole { Target::Sealed(class) } else { Target::Class(class) };
         }
+        self.normalize();
+    }
+
+    /// Whether `root` is a sealed cell. See Note [Value classes].
+    pub fn sealed(&self, root: Root) -> bool {
+        self.sealed.binary_search(&root).is_ok()
+    }
+
+    /// Whether the last field `loc` is reached by is a sealed cell.
+    pub fn sealed_field(&self, loc: Loc) -> bool {
+        let Some((&label, parent)) = loc.path.split_last() else { return false };
+        self.find(Loc { root: loc.root, path: parent }).is_some_and(|class| matches!(self.field(class, label), Some(Target::Sealed(_))))
+    }
+
+    /// The value `from` holds has field `label`, the value `to` holds, in a cell only it reaches.
+    pub fn link_sealed(&mut self, from: Loc, label: Label, to: Loc) {
+        let target = self.ensure(to);
+        let class = self.ensure(from);
+        self.set_field(class, label, Target::Sealed(target));
         self.normalize();
     }
 
@@ -343,25 +389,16 @@ impl<F: ClassFact> Classes<F> {
     /// holds the value it now has, as its slot isn't one of the other frame's.
     pub fn view(&self, map: &[(Root, Loc)]) -> Self {
         let mut seen = self.clone();
-        let open: Vec<u16> = seen.fields.iter().filter_map(|&(_, _, t)| match t { Target::Open(slot) => Some(slot), _ => None }).collect();
-        for slot in open {
-            seen.close_one(slot);
-        }
+        seen.close(0);
         let mut roots: Vec<(Root, u32)> = map.iter().filter_map(|&(root, loc)| seen.find(loc).map(|class| (root, class))).collect();
         roots.sort();
         roots.dedup_by_key(|&mut (root, _)| root);
-        let mut view = Classes { roots, fields: seen.fields, facts: seen.facts, classes: seen.classes };
+        let mut sealed: Vec<Root> = map.iter().filter(|&&(_, loc)| seen.sealed_field(loc)).map(|&(root, _)| root).collect();
+        sealed.sort();
+        sealed.dedup();
+        let mut view = Classes { roots, fields: seen.fields, facts: seen.facts, sealed, classes: seen.classes };
         view.normalize();
         view
-    }
-
-    fn close_one(&mut self, slot: u16) {
-        let class = self.ensure(Loc::root(Root::Slot(slot)));
-        for field in &mut self.fields {
-            if field.2 == Target::Open(slot) {
-                field.2 = Target::Class(class);
-            }
-        }
     }
 
     /// Each place `p` of `map`'s `(p, loc)`, a root or a field, holds what `loc` holds in `other`,
@@ -372,10 +409,7 @@ impl<F: ClassFact> Classes<F> {
         let imported = |i: usize| theirs.root_class(Root::Slot(i as u16));
         let offset = self.classes;
         self.classes += theirs.classes;
-        self.fields.extend(theirs.fields.iter().map(|&(c, l, t)| (c + offset, l, match t {
-            Target::Class(t) => Target::Class(t + offset),
-            open => open,
-        })));
+        self.fields.extend(theirs.fields.iter().map(|&(c, l, t)| (c + offset, l, t.closed().map_or(t, |class| t.renamed(class + offset)))));
         self.facts.extend(theirs.facts.iter().map(|(c, f)| (c + offset, f.clone())));
         for (i, &(place, _)) in map.iter().enumerate().filter(|(_, (place, _))| place.path.is_empty()) {
             match imported(i) {
@@ -387,8 +421,10 @@ impl<F: ClassFact> Classes<F> {
             let (&label, parent) = place.path.split_last().unwrap();
             match imported(i) {
                 Some(class) => {
+                    // A sealed cell stays one.
                     let parent = self.ensure(Loc { root: place.root, path: parent });
-                    self.set_field(parent, label, Target::Class(class + offset));
+                    let sealed = matches!(self.field(parent, label), Some(Target::Sealed(_)));
+                    self.set_field(parent, label, if sealed { Target::Sealed(class + offset) } else { Target::Class(class + offset) });
                 },
                 None => if let Some(parent) = self.find(Loc { root: place.root, path: parent }) {
                     self.fields.retain(|&(c, l, _)| c != parent || l != label);
@@ -423,7 +459,7 @@ impl<F: ClassFact> Classes<F> {
     pub fn open_slots(&self) -> Vec<u16> {
         let mut slots: Vec<u16> = self.fields.iter().filter_map(|&(_, _, t)| match t {
             Target::Open(slot) => Some(slot),
-            Target::Class(_) => None,
+            Target::Class(_) | Target::Sealed(_) => None,
         }).collect();
         slots.sort_unstable();
         slots.dedup();
@@ -475,7 +511,7 @@ impl<F: ClassFact> Classes<F> {
     /// and each field.
     pub fn equalities(&self) -> usize {
         let shared = self.roots.iter().filter(|&&(root, class)| {
-            self.roots.iter().any(|&(other, c)| c == class && other != root) || self.fields.iter().any(|&(_, _, t)| t == Target::Class(class))
+            self.roots.iter().any(|&(other, c)| c == class && other != root) || self.fields.iter().any(|&(_, _, t)| t.closed() == Some(class))
         }).count();
         shared + self.fields.len()
     }
@@ -503,6 +539,7 @@ impl<F: ClassFact> Classes<F> {
                 joined.bind(root, class);
             }
         }
+        joined.sealed = self.sealed.iter().filter(|root| other.sealed(**root)).copied().collect();
         while let Some((a, b, class)) = work.pop() {
             let mine = self.facts.iter().find(|(c, _)| *c == a).map_or(&[][..], |(_, f)| f.as_slice());
             let theirs = other.facts.iter().find(|(c, _)| *c == b).map_or(&[][..], |(_, f)| f.as_slice());
@@ -515,7 +552,8 @@ impl<F: ClassFact> Classes<F> {
             for &(_, label, mine) in self.fields.iter().filter(|&&(c, _, _)| c == a) {
                 let Some(theirs) = other.field(b, label) else { continue };
                 let target = match (mine, theirs) {
-                    (Target::Class(x), Target::Class(y)) => Target::Class(pair(&mut joined, &mut work, x, y)),
+                    (Target::Sealed(x), Target::Sealed(y)) => Target::Sealed(pair(&mut joined, &mut work, x, y)),
+                    (Target::Class(x) | Target::Sealed(x), Target::Class(y) | Target::Sealed(y)) => Target::Class(pair(&mut joined, &mut work, x, y)),
                     (Target::Open(x), Target::Open(y)) if x == y => Target::Open(x),
                     _ => continue,
                 };
@@ -539,6 +577,9 @@ impl<F: ClassFact> Classes<F> {
                 true
             },
         };
+        if !self.sealed.iter().all(|&root| other.sealed(root)) {
+            return false;
+        }
         for &(root, mine) in &self.roots {
             let Some(theirs) = other.root_class(root) else { return false };
             if !map(&mut work, mine, theirs) {
@@ -556,7 +597,7 @@ impl<F: ClassFact> Classes<F> {
             }
             for &(_, label, target) in self.fields.iter().filter(|&&(c, _, _)| c == mine) {
                 match (target, other.field(theirs, label)) {
-                    (Target::Class(x), Some(Target::Class(y))) => {
+                    (Target::Class(x), Some(Target::Class(y) | Target::Sealed(y))) | (Target::Sealed(x), Some(Target::Sealed(y))) => {
                         if !map(&mut work, x, y) {
                             return false;
                         }
@@ -609,7 +650,7 @@ impl<F: ClassFact> Classes<F> {
                 // Past a place `above` knows nothing of, what is reached keeps its equalities.
                 let beyond = |above_target: Option<Target>| match (side, above_target) {
                     (Side::Class(_), Some(Target::Open(k))) => above.root_class(Root::Slot(k)).map_or(Side::Root(Root::Slot(k)), Side::Class),
-                    (Side::Class(_), Some(Target::Class(t))) => Side::Class(t),
+                    (Side::Class(_), Some(Target::Class(t) | Target::Sealed(t))) => Side::Class(t),
                     (Side::Class(a), None) => Side::Field(a, label),
                     (unknown, _) => unknown,
                 };
@@ -619,7 +660,8 @@ impl<F: ClassFact> Classes<F> {
                         let held = self.root_class(Root::Slot(k)).map_or(Mine::Root(Root::Slot(k)), Mine::Class);
                         PairTarget::Pair(intern(&mut pairs, (held, beyond(theirs))))
                     },
-                    (Target::Class(t), theirs) => PairTarget::Pair(intern(&mut pairs, (Mine::Class(t), beyond(theirs)))),
+                    (Target::Sealed(t), Some(Target::Sealed(u))) => PairTarget::Sealed(intern(&mut pairs, (Mine::Class(t), Side::Class(u)))),
+                    (Target::Class(t) | Target::Sealed(t), theirs) => PairTarget::Pair(intern(&mut pairs, (Mine::Class(t), beyond(theirs)))),
                 };
                 fields.push((i, label, paired));
             }
@@ -662,8 +704,10 @@ impl<F: ClassFact> Classes<F> {
             fields: pairs.fields.iter().map(|&(pair, label, target)| (pair as u32, label, match target {
                 PairTarget::Pair(t) => Target::Class(t as u32),
                 PairTarget::Open(k) => Target::Open(k),
+                PairTarget::Sealed(t) => Target::Sealed(t as u32),
             })).collect(),
             facts: Vec::new(),
+            sealed: self.sealed.iter().filter(|root| above.sealed(**root)).copied().collect(),
             classes: pairs.pairs.len() as u32,
         };
         for (pair, &(mine, _)) in pairs.pairs.iter().enumerate() {
@@ -685,10 +729,7 @@ impl<F: ClassFact> Classes<F> {
             let mut work: Vec<u32> = self.roots.iter().map(|&(_, class)| class).collect();
             while let Some(class) = work.pop() {
                 if !std::mem::replace(&mut reached[class as usize], true) {
-                    work.extend(self.fields.iter().filter_map(|&(c, _, t)| match t {
-                        Target::Class(t) if c == class => Some(t),
-                        _ => None,
-                    }));
+                    work.extend(self.fields.iter().filter_map(|&(c, _, t)| t.closed().filter(|_| c == class)));
                 }
             }
             let fields_before = self.fields.len();
@@ -702,7 +743,7 @@ impl<F: ClassFact> Classes<F> {
             }
             for &(class, _, target) in &self.fields {
                 has_fields[class as usize] = true;
-                if let Target::Class(t) = target {
+                if let Some(t) = target.closed() {
                     held[t as usize] += 1;
                 }
             }
@@ -735,7 +776,7 @@ impl<F: ClassFact> Classes<F> {
         while i < order.len() {
             let class = order[i];
             for &(_, _, target) in fields.iter().filter(|&&(c, _, _)| c == class) {
-                if let Target::Class(t) = target {
+                if let Some(t) = target.closed() {
                     reach(t, &mut order);
                 }
             }
@@ -746,10 +787,7 @@ impl<F: ClassFact> Classes<F> {
             root.1 = renumber(root.1).unwrap();
         }
         self.fields = fields.into_iter()
-            .filter_map(|(class, label, target)| Some((renumber(class)?, label, match target {
-                Target::Class(t) => Target::Class(renumber(t).unwrap()),
-                open => open,
-            })))
+            .filter_map(|(class, label, target)| Some((renumber(class)?, label, target.closed().map_or(target, |t| target.renamed(renumber(t).unwrap())))))
             .collect();
         self.fields.sort();
         self.facts = std::mem::take(&mut self.facts).into_iter()
@@ -847,6 +885,7 @@ mod tests {
     enum RefField {
         Value(u32),
         Open(u16),
+        Sealed(u32),
     }
 
     /// The reference: every root holds a value, numbered as written; facts and fields are of
@@ -868,7 +907,7 @@ mod tests {
             let mut value = *self.values.get(&root)?;
             for &label in path {
                 value = match *self.fields.get(&(value, label))? {
-                    RefField::Value(v) => v,
+                    RefField::Value(v) | RefField::Sealed(v) => v,
                     RefField::Open(slot) => *self.values.get(&Root::Slot(slot))?,
                 };
             }
@@ -881,7 +920,7 @@ mod tests {
             let mut value = first;
             for (i, &label) in path.iter().enumerate() {
                 match self.fields.get(&(value, label)) {
-                    Some(RefField::Value(v)) => value = *v,
+                    Some(RefField::Value(v) | RefField::Sealed(v)) => value = *v,
                     Some(RefField::Open(slot)) => match self.values.get(&Root::Slot(*slot)) {
                         Some(&v) => value = v,
                         None => return (Err(Root::Slot(*slot)), path[i + 1..].to_vec()),
@@ -902,7 +941,7 @@ mod tests {
             };
             for &label in path {
                 value = match self.fields.get(&(value, label)).copied() {
-                    Some(RefField::Value(v)) => v,
+                    Some(RefField::Value(v) | RefField::Sealed(v)) => v,
                     Some(RefField::Open(slot)) => self.ensure(Root::Slot(slot), &[]),
                     None => {
                         let v = self.fresh();
@@ -912,6 +951,25 @@ mod tests {
                 };
             }
             value
+        }
+        /// The values the roots reach, along fields.
+        fn reached(&self) -> std::collections::HashSet<u32> {
+            let mut reached = std::collections::HashSet::new();
+            let mut work: Vec<u32> = self.values.values().copied().collect();
+            while let Some(v) = work.pop() {
+                if reached.insert(v) {
+                    work.extend(self.fields.iter().filter_map(|(&(from, _), &f)| match f {
+                        RefField::Value(t) | RefField::Sealed(t) if from == v => Some(t),
+                        _ => None,
+                    }));
+                }
+            }
+            reached
+        }
+        /// Whether the last field a place is reached by is a sealed cell.
+        fn sealed(&self, root: Root, path: &[Label]) -> bool {
+            let Some((&label, parent)) = path.split_last() else { return false };
+            self.value(root, parent).is_some_and(|v| matches!(self.fields.get(&(v, label)), Some(RefField::Sealed(_))))
         }
         fn learn(&mut self, root: Root, path: &[Label], fact: Fact) {
             let v = self.ensure(root, path);
@@ -966,9 +1024,14 @@ mod tests {
                     RefField::Open(s) if s >= from => Some((k, s)),
                     _ => None,
                 }).collect();
-                for (k, s) in open {
+                // A slot only one reached field is open to is sealed in it.
+                let reached = r.reached();
+                let sole: Vec<bool> = open.iter().map(|&(_, s)| {
+                    r.fields.iter().filter(|&(&(owner, _), &f)| f == RefField::Open(s) && reached.contains(&owner)).count() == 1
+                }).collect();
+                for ((k, s), sole) in open.into_iter().zip(sole) {
                     let v = r.ensure(Root::Slot(s), &[]);
-                    r.fields.insert(k, RefField::Value(v));
+                    r.fields.insert(k, if sole { RefField::Sealed(v) } else { RefField::Value(v) });
                 }
                 c.close(from);
             },
@@ -988,6 +1051,7 @@ mod tests {
             let mut facts = c.facts(loc).to_vec();
             facts.sort_by_key(|f| f.key());
             assert_eq!(facts, r.facts_of(*root, path), "facts of {root:?} {path:?} in {c:?}");
+            assert_eq!(c.sealed_field(loc), r.sealed(*root, path), "whether {root:?} {path:?} is sealed in {c:?} against {r:?}");
             for (other, other_path) in &places {
                 let theirs = Loc { root: *other, path: other_path };
                 let expected = r.resolve(*root, path) == r.resolve(*other, other_path);
@@ -1049,6 +1113,18 @@ mod tests {
             for (label, field) in fields {
                 match field {
                     RefField::Open(s) => c.alias(Loc { root, path: &path }, label, s),
+                    RefField::Sealed(t) => {
+                        let tpath = match named.get(&t).cloned() {
+                            Some((troot, tpath)) => {
+                                c.link_sealed(Loc { root, path: &path }, label, Loc { root: troot, path: &tpath });
+                                continue;
+                            },
+                            None => [path.clone(), vec![label]].concat(),
+                        };
+                        c.link_sealed(Loc { root, path: &path }, label, Loc { root, path: &tpath });
+                        named.insert(t, (root, tpath));
+                        work.push(t);
+                    },
                     RefField::Value(t) => match named.get(&t).cloned() {
                         Some((troot, tpath)) => c.link(Loc { root, path: &path }, label, Loc { root: troot, path: &tpath }),
                         None => {
@@ -1130,6 +1206,63 @@ mod tests {
         c.write(Root::Slot(2));
         assert_eq!(c.fact(captured, 0), Some(&Fact::Type(Ty::Float)), "once closed, the upvalue keeps the value it had");
         assert!(!c.same(captured, slot(2)));
+    }
+
+    #[test]
+    fn only_a_sole_capture_is_sealed() {
+        let field = [Label::Upvalue(0)];
+        let mut sole = C::default();
+        sole.alias(slot(0), Label::Upvalue(0), 2);
+        sole.close(2);
+        assert!(sole.sealed_field(Loc { root: Root::Slot(0), path: &field }));
+        let mut shared = C::default();
+        shared.alias(slot(0), Label::Upvalue(0), 2);
+        shared.alias(slot(1), Label::Upvalue(0), 2);
+        shared.close(2);
+        assert!(!shared.sealed_field(Loc { root: Root::Slot(0), path: &field }), "two closures share the cell");
+        assert!(!shared.sealed_field(Loc { root: Root::Slot(1), path: &field }), "two closures share the cell");
+    }
+
+    #[test]
+    fn a_sealed_cell_moves_with_its_closure_and_into_a_callee() {
+        let field = [Label::Upvalue(0)];
+        let mut c = C::default();
+        c.learn(slot(2), Fact::Type(Ty::Int));
+        c.alias(slot(0), Label::Upvalue(0), 2);
+        c.close(2);
+        c.assign(Root::Slot(3), slot(0));
+        c.write(Root::Slot(0));
+        let moved = Loc { root: Root::Slot(3), path: &field };
+        assert!(c.sealed_field(moved));
+        // The closure's own code, as a callee, sees its upvalue as a sealed root; what it then
+        // knows of it comes back into the same sealed cell.
+        let mut callee = c.view(&[(Root::Upvalue(0), moved)]);
+        assert!(callee.sealed(Root::Upvalue(0)));
+        callee.write(Root::Upvalue(0));
+        callee.learn(up(0), Fact::Type(Ty::Float));
+        assert!(callee.sealed(Root::Upvalue(0)), "a write to a sealed cell leaves it sealed");
+        c.overlay(&callee, &[(moved, up(0))]);
+        assert!(c.sealed_field(moved));
+        assert_eq!(c.fact(moved, 0), Some(&Fact::Type(Ty::Float)));
+        // A set of some unknown upvalue may be the closure's own code: it forgets the cell.
+        c.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
+        assert!(!c.sealed_field(moved));
+        assert_eq!(c.fact(moved, 0), None);
+    }
+
+    #[test]
+    fn sealing_is_knowledge() {
+        let field = [Label::Upvalue(0)];
+        let mut sealed = C::default();
+        sealed.alias(slot(0), Label::Upvalue(0), 2);
+        sealed.close(2);
+        let mut open = C::default();
+        open.link(slot(0), Label::Upvalue(0), slot(2));
+        assert!(open.accepts(&sealed), "code relying on less runs where the cell is sealed");
+        assert!(!sealed.accepts(&open), "code relying on the seal needs it");
+        let joined = sealed.join(&open);
+        assert!(!joined.sealed_field(Loc { root: Root::Slot(0), path: &field }));
+        assert!(joined.accepts(&sealed) && joined.accepts(&open));
     }
 
     #[test]

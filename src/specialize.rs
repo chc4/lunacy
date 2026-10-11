@@ -306,6 +306,8 @@ pub enum YieldOp {
                   // See Note [Upvalue paths]
     UpvalueHolds(usize, usize), // Inform the executor that UpValue[a] holds STACK[b]'s value. See
                                 // Note [Upvalue paths]
+    Copy(usize, usize), // Inform the executor that STACK[a] holds STACK[b]'s value. See Note
+                        // [Value classes] in `classes`
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
                     // Note [Fragile information]
 
@@ -1072,6 +1074,12 @@ pub enum CallEntry {
 // applies a callee's; Note [Call effects]), with no guard on the return between, and becomes the
 // return and a jump to that code.
 //
+// The call making a generic for's iterator (`for k, v in f(t) do`) inlines from its first layout,
+// before it has run: the loop is compiled from what the code after it knows, and a function whose
+// loop runs once (its only call making the iterator) has no later call to learn from. Inlined, the
+// iterator's closure comes back knowing its upvalues (Note [Upvalue paths]), and so does its own
+// code inlined into the loop.
+//
 // A function's frames hold the frames of the calls inlined into it, to any depth: its frame size
 // grows with each call inlined, so every frame of it a call makes, and the collector's live
 // extent, has room for them, and making an inlined callee's frame never lengthens the stack. As it
@@ -1177,7 +1185,7 @@ struct InlineCall {
 /// How many inlined calls deep code can be. See Note [Inlined calls].
 pub(crate) const MAX_INLINE_DEPTH: u8 = 2;
 /// Whether a call inside an instruction is inlined. See Note [Call continuations].
-const INLINE_RESUMES: bool = false;
+const INLINE_RESUMES: bool = true;
 /// The most an inlined callee's code costs, less its credit. See Note [Inlined calls].
 const MAX_INLINE_COST: usize = 48;
 /// The credit for each guard of an inlined callee's code the caller's facts can stand for. See Note
@@ -1199,6 +1207,15 @@ fn inline_offset(ctx: &Context) -> usize {
 /// The slots past the base of the outermost frame an inlined callee's frame may reach: the JIT's
 /// window names them (`Slots`). See Note [Inlined calls].
 const MAX_INLINE_SLOTS: usize = 256;
+
+/// Whether the call at `pc` in `proto`, of R(A), makes a generic for's iterator: a JMP to a
+/// TFORLOOP of the same A follows it. See Note [Inlined calls].
+fn makes_iterator<C>(proto: &crate::chunk::FunctionBlock<'_, C>, pc: Pc, a: usize) -> bool {
+    let instructions = &proto.instructions.items;
+    let Some(jmp) = instructions.get(pc + 1).filter(|inst| inst.0.Opcode() == Opcode::JMP) else { return false };
+    let target = ((pc + 2) as isize + crate::vm::sBx::unpack(jmp.0) as isize) as usize;
+    instructions.get(target).is_some_and(|inst| inst.0.Opcode() == Opcode::TFORLOOP && crate::vm::ABC::unpack(inst.0).0 as usize == a)
+}
 
 /// Whether a call of R(A) in `caller`, of the context `calling`, can inline `callee`, whatever its
 /// code costs. See Note [Inlined calls].
@@ -1958,7 +1975,10 @@ impl std::fmt::Display for Kind {
 // A closure made here knows its cells. One it captured from a slot is that slot while it is open
 // (an open field), so a write to the slot is one to the upvalue, until a CLOSE or the frame's end
 // closes it: from then on it holds the value the slot had, with the slot's type. One it captured
-// from the running function's upvalue holds that upvalue's value.
+// from the running function's upvalue holds that upvalue's value. A slot only the one closure
+// captured is closed into a sealed cell, which only that closure's code reaches: inlined, its sets
+// of the cell are of that cell alone, and falsify nothing else; a set of some unknown upvalue may
+// be the closure's, and forgets it.
 //
 // Fields carry facts across inlined calls (Note [Inlined calls]). The callee enters with its own
 // upvalue n holding what the closure's field n does, and its return gives the closure's fields
@@ -2270,12 +2290,17 @@ impl Context {
 
     /// Drop what `effect` may falsify. See Notes [Fragile information] and [Upvalue paths].
     fn effect(&mut self, effect: Effect) {
+        // A set of a sealed cell is of that cell alone. See Note [Upvalue paths].
+        if let Effect::SetUpvalue(j) = effect && self.values.sealed(Root::Upvalue(j as u8)) {
+            self.values.write(Root::Upvalue(j as u8));
+            return;
+        }
         match effect {
             Effect::Write(slot) => self.values.write(Root::Slot(slot as u16)),
             Effect::WriteAny => self.values.retain_roots(|root| !matches!(root, Root::Slot(_))),
             Effect::SetUpvalue(j) => {
                 self.values.write(Root::Upvalue(j as u8));
-                self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
+                self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_) | Target::Sealed(_)));
             },
             Effect::AnyUpvalue => {
                 self.values.retain_roots(|root| !matches!(root, Root::Upvalue(_)));
@@ -2405,18 +2430,29 @@ impl Context {
     }
 
     /// What is known once the upvalues open into slot `from` and up are closed: each holds the
-    /// value its slot had, with the slot's type. See Note [Upvalue paths].
+    /// value its slot had, with the slot's type, but not that it is a constant, which only a
+    /// slot's load is rebuilt for (Note [Widening]). See Note [Upvalue paths].
     fn closing(&self, from: usize) -> Values {
         let mut values = self.values.clone();
         for slot in values.open_slots().into_iter().filter(|&slot| slot as usize >= from) {
             let at = Loc::root(Root::Slot(slot));
-            match self.slot(slot as usize) {
-                CType::Unknown => {},
-                ctype => values.learn(at, Known::Type(ctype)),
+            if let Some(ctype) = self.value_type(slot as usize) {
+                values.learn(at, Known::Type(ctype));
             }
+            values.forget(at, CONSTANT);
         }
         values.close(from as u16);
         values
+    }
+
+    /// What slot `slot`'s type says of its value wherever else it is, if anything: a shape's hash
+    /// keys are the frame's, so a table's is only that it is one.
+    fn value_type(&self, slot: usize) -> Option<CType> {
+        match self.slot(slot) {
+            CType::Unknown => None,
+            CType::Shape(of, _) => Some(CType::Type(of)),
+            ctype => Some(ctype),
+        }
     }
 
     /// What `self` knows that `other` doesn't, as each root's facts, if that is all: none if it
@@ -4378,7 +4414,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         layout.push(next(vm));
                     }
                     // A call a continuation decided to inline in a context its callee's entry
-                    // accepts this one's in inlines from the first. See Note [Inlined calls].
+                    // accepts this one's in inlines from the first, as does one making a generic
+                    // for's iterator. See Note [Inlined calls].
                     if let Some((ctx, captured, rest)) = &continuation
                         && inlines(&calling, unsafe { &*vm.proto }, unsafe { &*proto }, a)
                     {
@@ -4387,7 +4424,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let entry = Self::inline_frame(&calling, callee, call, vm.proto as LProto<'static, 'static>, a, b);
                         let mut known = entry.clone();
                         known.inline = Vec::new();
-                        if vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known))) {
+                        let decided = vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known)));
+                        if decided || makes_iterator(unsafe { &*vm.proto }, pc.0, a) {
                             vm.blocks[block.0].instructions.extend(layout);
                             let continuation = vm.continuation(&calling, ctx, captured, rest, a, c);
                             let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation);
@@ -5397,14 +5435,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.values = ctx.closing(from);
                 },
+                CoroutineState::Yielded(YieldOp::Copy(dest, src)) => {
+                    // A copy's class tells more than its slots' type only of a value that can
+                    // have fields or a kind. See Note [Value classes] in `classes`.
+                    let plain = matches!(ctx.slot(src), CType::Number | CType::Type(LType::Nil | LType::Bool | LType::String | LType::Integer | LType::Double));
+                    if dest != src && !plain {
+                        Rc::make_mut(&mut ctx).values.assign(Root::Slot(dest as u16), Loc::root(Root::Slot(src as u16)));
+                    }
+                },
                 CoroutineState::Yielded(YieldOp::UpvalueHolds(upvalue, slot)) => {
                     // See Note [Upvalue paths].
                     let ctx = Rc::make_mut(&mut ctx);
                     let at = Loc::root(Root::Upvalue(upvalue as u8));
                     ctx.values.assign(Root::Upvalue(upvalue as u8), Loc::root(Root::Slot(slot as u16)));
-                    match ctx.slot(slot) {
-                        CType::Unknown => {},
-                        ctype => ctx.values.learn(at, Known::Type(ctype)),
+                    if let Some(ctype) = ctx.value_type(slot) {
+                        ctx.values.learn(at, Known::Type(ctype));
                     }
                 },
                 CoroutineState::Yielded(YieldOp::Effect(effect)) => {
