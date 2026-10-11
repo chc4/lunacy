@@ -783,6 +783,24 @@ perf-stat-uxn-slope long='uxn_loop' short='uxn_loop_short' iterations='983025' r
     done < <(paste <(just _uxn-promote-commands {{long}} 1 full) \
         <(just _uxn-promote-commands {{short}} 1 full | cut -f2))
 
+# `perf-stat-uxn-slope` for hardware counters `events` (`perf stat`, the mean of `runs`), of the
+# implementations whose names match `only` (a regex): each one's counts on `long` and `short` in
+# `out`/<implementation>.{long,short}.csv, and per iteration of the loop (tools/uxn_slope.py).
+# Compare runs, say with a knob set and without, with tools/uxn_slope.py over their `out`s.
+perf-stat-uxn-slope-events out='working/uxn-slope' only='lunacy' long='uxn_loop' short='uxn_loop_short' iterations='983025' runs='5' events='cycles,instructions,branches,branch-misses,stalled-cycles-frontend,L1-dcache-loads,L1-dcache-load-misses,L1-icache-load-misses,iTLB-load-misses': unsafe-compile unsafe-magic-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf {{out}} && mkdir -p {{out}}
+    while IFS=$'\t' read -r name long short; do
+        [[ "$name" =~ {{only}} ]] || continue
+        for rom in long short; do
+            read -ra words <<< "${!rom}"
+            {{TIMED}} perf stat -x, -r {{runs}} -e {{events}} -o "{{out}}/${name// /_}.$rom.csv" -- "${words[@]}" < /dev/null > /dev/null
+        done
+    done < <(paste <(just _uxn-promote-commands {{long}} 1 full) \
+        <(just _uxn-promote-commands {{short}} 1 full | cut -f2))
+    python3 tools/uxn_slope.py --iterations {{iterations}} {{out}}
+
 # `hyperfine-uxn-promote` over the uxn_* ROMs.
 hyperfines-uxn-promote: (_hyperfines-uxn-promote "hyperfine-uxn-promote")
 
