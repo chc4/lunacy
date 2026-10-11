@@ -20,7 +20,9 @@ use crate::window::{windowed, Window};
 // An integer's quotient by a constant is held as the double it is, and its floor is the floored
 // division. Whatever reads a held value without extending it, or lays out code, lays every spell
 // out; but a guard found out at runtime, of a value none holds, keeps them held on its ways, in code
-// of their own, unless one holds its instruction's operations, which a restart past it would repeat.
+// of their own, unless one holds its instruction's operations, which a restart past it would repeat;
+// and so does a window op with no way out, touching no memory, computing from registers no spell
+// writes into registers none reads, which a restart running it again leaves as it was.
 //
 // Spells only read values from before any held op, so laying out those that read a slot before the
 // one that writes it computes each as its ops would have. Where one fails, those before it have
@@ -687,6 +689,18 @@ impl Spells {
         self.clone().offer_guard(test, at)
     }
 
+    /// Whether they stay held across window op `window`: one with no way out, touching no memory,
+    /// computing only from registers no spell writes into registers none reads, so an exit going on
+    /// from before it runs it again to the same end. What it overwrites unread is then dropped.
+    pub fn untouched(&self, window: &dyn Window) -> bool {
+        !window.selects() && window.memory() == crate::window::Memory::None
+            && window.operands().iter().zip(window.accesses()).all(|(&slot, access)| match access {
+                crate::window::Access::Read => self.spells.iter().all(|spell| spell.dest != slot),
+                crate::window::Access::Write => self.spells.iter().all(|spell| !spell.inputs.contains(&slot)),
+                crate::window::Access::Update => false,
+            })
+    }
+
     /// Drop the spells of slots `writes` that something about to be laid out writes, reading
     /// only `reads`: their values are never read.
     pub fn drop_overwritten(&mut self, writes: &[usize], reads: &[usize]) {
@@ -786,6 +800,85 @@ mod tests {
         assert_eq!(held(&spells), [("SUB_MASK_ADD_HELD", 6, vec![5, 1])]);
         // One op; failing, the get runs again with the key as its operations made it.
         assert_eq!(laid(&spells, 3), [("FusedSubMaskAddHeld", vec![1, 5, 6], true, vec![("MaterializeSubMaskAdd", vec![5, 6])])]);
+    }
+
+    // An op updating its operand in place, with no way out and touching no memory.
+    crate::window::windowed!(Bump, [], [], |owner, state, base| (inout v) {
+        let _ = v;
+    });
+
+    /// Whether `spells` stay held across `window`, dropping what it overwrites if they do, as the
+    /// specializer does.
+    fn across(spells: &mut Spells, window: &dyn Window) -> bool {
+        if !spells.untouched(window) {
+            return false;
+        }
+        let writes: Vec<usize> = window.operands().iter().zip(window.accesses()).filter(|(_, a)| **a == crate::window::Access::Write).map(|(s, _)| *s).collect();
+        spells.drop_overwritten(&writes, &[]);
+        true
+    }
+
+    #[test]
+    fn a_chain_goes_on_across_a_pure_op_off_its_registers() {
+        // x = x + 1; y = z; x = x % 256: the move between is held across, and the chain goes on.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1)]);
+        assert!(across(&mut spells, &crate::generators::Move::new(&[3, 4])));
+        hold(&mut spells, 2, &[op(Arith::Mod, Slot(1), K(256), 1)]);
+        assert_eq!(held(&spells), [("ADD_MASK", 1, vec![1])]);
+    }
+
+    #[test]
+    fn an_op_reading_a_held_register_lays_them_out() {
+        // x = x + 1; y = x: the move reads what the spell computes.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1)]);
+        assert!(!across(&mut spells, &crate::generators::Move::new(&[1, 4])));
+    }
+
+    #[test]
+    fn an_op_writing_a_held_input_lays_them_out() {
+        // y = x + 1; x = z: the spell reads x as it was, which the move overwrites.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 2)]);
+        assert!(!across(&mut spells, &crate::generators::Move::new(&[3, 1])));
+    }
+
+    #[test]
+    fn an_op_overwriting_a_held_register_drops_its_spell() {
+        // y = x + 1; y = z; w = v + 2: y's spell is never read, and the other's stays held.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 2), op(Arith::Add, Slot(5), K(2), 6)]);
+        assert!(across(&mut spells, &crate::generators::Move::new(&[3, 2])));
+        assert_eq!(held(&spells), [("ADD_", 6, vec![5])]);
+        // And by a load writing it, as a frozen table's element.
+        assert!(across(&mut spells, &crate::generators::LoadFrozen::new(0, &[6])));
+        assert!(spells.is_empty());
+    }
+
+    #[test]
+    fn an_op_touching_memory_lays_them_out() {
+        // Off the held registers, but reading an upvalue's cell, or writing one.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1)]);
+        assert!(!across(&mut spells, &crate::generators::GetUpval::new(0, 0, &[4])));
+        assert!(!across(&mut spells, &crate::generators::SetUpval::new(0, 0, &[4])));
+    }
+
+    #[test]
+    fn an_op_with_a_way_out_lays_them_out() {
+        // A guard off the held registers: its exit would go on with them unwritten.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1)]);
+        assert!(!across(&mut spells, &crate::generators::EqualsK::new(5, &[3])));
+    }
+
+    #[test]
+    fn an_op_updating_in_place_lays_them_out() {
+        // An exit going on from before it would run it again on its own result.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1)]);
+        assert!(!across(&mut spells, &Bump::new(&[3])));
     }
 
     #[test]

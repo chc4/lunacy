@@ -466,7 +466,8 @@ fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<Yie
                 | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::IntegerOp(_) => true,
             // Slots whose values are dead: what spells write there is never read, if none reads them.
             YieldOp::Clobber(from) => held.spells.spells.iter().all(|spell| spell.inputs.iter().all(|&slot| slot < *from)),
-            YieldOp::OptimisticExec(_) | YieldOp::ExecWindow(_) => described.is_some(),
+            YieldOp::OptimisticExec(_) => described.is_some(),
+            YieldOp::ExecWindow(window) => described.is_some() || held.spells.untouched(&**window),
             YieldOp::GuardDynamic(test) => held.spells.joins_guard(&**test, at),
             // What a get or set asks before its guard on the key: of the table, a hash key for a
             // key in a register (there is none), and narrowing a key known not to be a double.
@@ -6241,6 +6242,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if self.flush(owner, block_id, pc, &ctx, Some((described, then.clone(), Box::new((*coro).clone()))), &writes) {
                     return None;
                 }
+            } else if described.is_none() && matches!(state, CoroutineState::Yielded(YieldOp::ExecWindow(_))) && let Some(held) = self.held.as_mut() {
+                // Held across it: what it writes unread is dead.
+                let (writes, reads) = overwrites(&state).unwrap_or_default();
+                held.spells.drop_overwritten(&writes, &reads);
             }
             match state {
                 CoroutineState::Yielded(YieldOp::TypeofK(k)) => {
