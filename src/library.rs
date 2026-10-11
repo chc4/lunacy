@@ -784,6 +784,30 @@ fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> B
     })
 }
 
+/// `jit.tripped`'s generator: for `tripped(t)` of a table keeping one result, a watch site: code
+/// past it knows `t` is still watched, as it was when the code was first run, its result `false`
+/// with no test, until a store into `t` trips its watchpoint; any other call is the native's. See
+/// Note [Watched tables] in `specialize`.
+#[cfg(feature = "magic")]
+fn tripped_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    crate::window::windowed!(Untripped, [], [], |owner, state, base| (out r) {
+        *r = LBoxed::from_bool(false);
+    });
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 2 && c == 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched
+            && (yield YieldOp::Watching(a + 1)) == ResumeArg::Matched
+        {
+            yield YieldOp::ExecWindow(std::rc::Rc::new(Untripped::new(&[a])));
+            yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Bool))]);
+            yield YieldOp::Clobber(a + 1);
+            return ResumeArg::Start;
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
 /// `string.byte`'s generator: for `byte(s, i, j)` keeping one to four results, of a string and
 /// integer positions, its results read where they are in range, as integers; any other call is
 /// the native's. See Note [Native generators].
@@ -993,11 +1017,13 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             cached: false,
             kind: 0,
             metatable: None,
+            watched: false,
         };
         vec![LBoxed::box_lvalue(LValue::Table(Tc::new(t)))]
     });
     let table_clear = native!(|owner, args| {
         let t = table(arg(&args, 0));
+        t.trip(owner);
         let t = t.rw(owner);
         t.array.clear();
         t.kind = 0;
@@ -1014,6 +1040,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         // moves every element up one, down to the position.
         ("insert", native!(|owner, args| {
             let mut t = table(arg(&args, 0));
+            t.trip(owner);
             let value = arg(&args, args.len() - 1);
             let end = t.ro(owner).array.len() as i64 + 1;
             let pos = if args.len() == 2 { end } else { number(arg(&args, 1)) as i64 };
@@ -1035,6 +1062,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         })),
         ("remove", native!(|owner, args| {
             let t = table(arg(&args, 0));
+            t.trip(owner);
             let tab = t.rw(owner);
             let at = if args.len() > 1 { number(arg(&args, 1)) as usize } else { tab.array.len() };
             if (1..=tab.array.len()).contains(&at) {
@@ -1116,6 +1144,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let Some(t) = arg(&args, 0).as_table() else {
             return Err(error_value(format!("bad argument #1 to 'setmetatable' (table expected, got {})", String::from_utf8_lossy(type_name(arg(&args, 0))))));
         };
+        t.trip(owner);
         let metatable = match arg(&args, 1).unbox() {
             LValue::Nil => None,
             LValue::Table(mt) => Some(mt),
@@ -1182,6 +1211,16 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
         ("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])),
         ("learn", native!(pure generator: learn_generator, |owner, args| vec![arg(&args, 0)])),
+        // `jit.watch(t)`: `t`, watched; `jit.tripped(t)`: whether a store into it tripped its
+        // watchpoint since. For tests. See Note [Watched tables] in `specialize`.
+        ("watch", native!(|owner, args| {
+            let t = table(arg(&args, 0));
+            t.rw(owner).watched = true;
+            vec![arg(&args, 0)]
+        })),
+        ("tripped", native!(pure generator: tripped_generator, |owner, args| {
+            vec![LBoxed::from_bool(!table(arg(&args, 0)).ro(owner).watched)]
+        })),
     ]);
 
     MODULES.with_borrow_mut(|modules| {

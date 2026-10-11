@@ -360,6 +360,8 @@ pub fn emit_getglobal(dest: usize, k: usize) -> impl Coroutine<ResumeArg, Yield 
 pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
     #[coroutine]
     move |mut arg: ResumeArg| {
+        // A watched environment trips first. See Note [Watched tables] in `specialize`.
+        yield YieldOp::Trip(None);
         let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
         // A store to `__index` moves the environment to a new epoch, as only the
         // generic store does. See Note [Table metatables] in `specialize`.
@@ -668,6 +670,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
     #[coroutine]
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Guard(a, LType::Table);
+        // A watched table trips first. See Note [Watched tables] in `specialize`.
+        if arg == ResumeArg::Matched {
+            yield YieldOp::Trip(Some(a));
+        }
         if arg != ResumeArg::Matched {
             arg = yield YieldOp::Exec(ResidualExec::new("settable_meta", Rc::new(move |owner, state| {
                 let key: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {

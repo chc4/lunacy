@@ -505,6 +505,28 @@ pub struct Table<'src, 'intern> {
     /// Its metatable, which only `setmetatable` changes. See Note [Table
     /// metatables] in `specialize`.
     pub metatable: Option<Tc<Table<'src, 'intern>>>,
+    /// Whether code the specializer compiled relies on its contents: a store
+    /// into it trips first. See Note [Watched tables] in `specialize`.
+    pub watched: bool,
+}
+
+/// Whether a native's store tripped a watched table's watchpoint, which the run loop then
+/// handles: the tables, by address, in `PENDING_TRIPS`. JIT code reads the flag after a native call,
+/// as a plain static. See Note [Watched tables] in `specialize`.
+pub static TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    pub static PENDING_TRIPS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl<'src, 'intern> Tc<Table<'src, 'intern>> {
+    /// A native's store into it: if watched, it trips. See Note [Watched tables] in `specialize`.
+    pub fn trip(&self, owner: &mut Owner) {
+        if self.ro(owner).watched {
+            self.rw(owner).watched = false;
+            PENDING_TRIPS.with(|pending| pending.borrow_mut().push(self.0.to_addr()));
+            TRIPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// How a store into an array part widens its kind. See Note [Array kinds] in
@@ -540,6 +562,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
             cached: false,
             kind: 0,
             metatable: None,
+            watched: false,
         }
     }
 
@@ -2576,6 +2599,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
             cached: true,
             kind: 0,
             metatable: None,
+            watched: false,
         });
         // `_g` needs no explicit root: it lives in the `RunState` (`RunState::mark` shades it)
         // for the whole run, which is the only time a collection can see it. See Note [GC roots].

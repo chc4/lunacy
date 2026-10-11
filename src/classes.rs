@@ -71,6 +71,8 @@ pub enum Label {
     ElementOf,
     /// The hash field of a name, by its hash, of the table it is.
     Field(u64),
+    /// The element at an index of the table it is, while it is watched.
+    Element(i32),
 }
 
 /// A place: a root, or a field reached from one along `path`.
@@ -446,6 +448,11 @@ impl<F: ClassFact> Classes<F> {
     pub fn retain_roots(&mut self, mut keep: impl FnMut(Root) -> bool) {
         self.roots.retain(|&(root, _)| keep(root));
         self.normalize();
+    }
+
+    /// Whether a field of a label `of` says is known.
+    pub fn has_label(&self, of: impl Fn(Label) -> bool) -> bool {
+        self.fields.iter().any(|&(_, label, _)| of(label))
     }
 
     /// The roots something is known of the value of.

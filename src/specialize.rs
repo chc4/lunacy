@@ -149,6 +149,7 @@ impl std::fmt::Display for Residual {
             Residual::ExecWindow(w) => write!(f, "window({})", window_label(&**w)),
             Residual::GuardDynamic(w) => write!(f, "guard_dynamic({})", window_label(&**w)),
             Residual::Jump(target) => write!(f, "jump({})", target.0),
+            Residual::PatchableJump(target) => write!(f, "patchable_jump({})", target.0),
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
             Residual::Arrive { a, c } => write!(f, "arrive({}, {})", a, c),
             Residual::ReturnedFrom(from) => write!(f, "returned({}, {:#x})", from & UNKNOWN_RETURN as u64, (from & 0xffff_ffff) >> crate::vm::EFFECTS_SHIFT),
@@ -162,6 +163,7 @@ impl std::fmt::Display for Residual {
             Residual::GuardWitness { href, expected } => write!(f, "guard_witness({:?}, {})", href, expected),
             Residual::EpochCheck { tab, href, place } => write!(f, "epoch({}, {:?}, {:?})", tab, href, place),
             Residual::Thunk(_) => write!(f, "thunk"),
+            Residual::Tripped(of) => write!(f, "tripped({of:?})"),
             Residual::Select(targets) => write!(f, "select"),
             Residual::Branch { .. } => write!(f, "branch"),
             Residual::Ret(..) => write!(f, "ret"),
@@ -325,6 +327,10 @@ pub enum YieldOp {
 
     HashKey(usize, usize, bool), // Looks up or allocates an HREF for STACK[idx][key]; down its `__index` chain if true (a load). See Note [Table metatables]
     HashKeyNamed(usize, LConstant<'static, 'static>, bool), // `HashKey` of a key known by its value
+    Watching(usize), // A watch site of STACK[idx]'s table: resumed with Matched while it is watched,
+                     // as it was when the code first ran, else Failed. See Note [Watched tables]
+    Trip(Option<usize>), // A store into STACK[idx]'s table, or with none the environment, is about
+                         // to be laid out: resumed with Matched. See Note [Watched tables]
     Learn(usize), // Resumed with Keys: the string keys of STACK[idx]'s table, once the code runs. See
                   // `jit.learn` in `library`
     LearnKind(usize), // Resumed with Matched once the context knows STACK[idx]'s table's array
@@ -1148,7 +1154,13 @@ pub enum Residual {
     /// [Optimistic ops].
     Branch { hot: BlockId, cold: BlockId },
     Jump(BlockId),
+    /// A jump whose JIT code can be unlinked again, to exit to the interpreter here: a forced
+    /// watch site, which a trip unpublishes. See Note [Watched tables].
+    PatchableJump(BlockId),
     Thunk(ThunkRef),
+    /// A store into STACK[idx]'s table, or with none the environment's, which is watched, trips its
+    /// watchpoint: the run loop handles it, then goes on after it. See Note [Watched tables].
+    Tripped(Option<usize>),
     /// A RETURN of `b - 1` values from R(A), or up to the top. Closes the frame's open upvalues.
     /// Functions which statically know they have no open upvalues may set `close = false` as an
     /// optimization. Then, whether the function is vararg (Note [Vararg frames]), the id of what
@@ -1307,6 +1319,63 @@ fn name_hash(name: &[u8]) -> u64 {
     hasher.finish()
 }
 
+// Note [Watched tables]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// Code can know a table's contents, as a constant element, if the table is watched: every store
+// into a table first checks whether it is (`Trip`), and one that is trips its watchpoint before it
+// stores, so nothing runs past the store relying on what it changes. The knowledge enters the code
+// only past a watch site, a thunk whose jump leads to the code knowing it; a trip unpublishes each
+// of the table's sites, the jump undone back into its thunk, which, forced again, compiles the code
+// after it knowing nothing of the table. The store goes on knowing no element of any table, and so
+// does each frame paused at a call: a trip leaves JIT code, which writes every frame's callstack
+// entry, and each entry whose code after the call knows an element is redirected to a fresh
+// continuation compiled without it, which, for a context that knew none, is the code it had.
+// Values already loaded from the table are what they were: facts follow values, so only what is
+// known of the table's contents goes.
+
+/// Where a Lua call's returns go on, and how the code after it is compiled: as
+/// `make_continuation_thunk` takes it. See Note [Watched tables].
+#[derive(Clone)]
+struct ContinuationSite {
+    ctx: Rc<Context>,
+    captured: Rc<[usize]>,
+    rest: Rest,
+    a: usize,
+    c: usize,
+    after: After,
+}
+
+/// A watch site of a table: the thunk at `at`, whose jump leads to code knowing its contents,
+/// and the thunk to put back there, which compiles it knowing none. See Note [Watched tables].
+struct WatchSite {
+    at: Location,
+    unwatched: ThunkRef,
+}
+
+// Whether a table, or the environment, is watched: its cold path trips its watchpoint. See Note
+// [Watched tables].
+windowed!(TripCheck, [], [], |owner, state, base| (table) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    if tab.ro(owner).watched {
+        core::intrinsics::cold_path();
+        true
+    } else {
+        false
+    }
+} cold {
+    1
+});
+windowed!(TripCheckGlobal, [], [], |owner, state, base| () {
+    if state._G.ro(owner).watched {
+        core::intrinsics::cold_path();
+        true
+    } else {
+        false
+    }
+} cold {
+    1
+});
+
 /// An inlined call, for its callee's code: where its call is in its caller's code, the caller's
 /// prototype, the call's A, what the callee's code may have done to the caller so far, and for
 /// each parameter passed a table the caller holds below the call, the caller's slot holding it.
@@ -1334,6 +1403,7 @@ impl InlineFrame {
 /// a root of the caller's still holding the callee's closure (Note [Upvalue paths]), and how the
 /// code after the call is compiled. Kept for as long as the specializer is, in the inlined call's entry in the
 /// callstack by its address. See Note [Inlined calls].
+#[derive(Clone)]
 pub struct Continuation {
     proto: LProto<'static, 'static>,
     caller: Context,
@@ -2654,6 +2724,18 @@ impl Context {
         })
     }
 
+    /// Whether it knows an element of some table. See Note [Watched tables].
+    fn watching(&self) -> bool {
+        self.values.has_label(|label| matches!(label, Label::Element(_)))
+    }
+
+    /// Forget what it knows of every table's elements. See Note [Watched tables].
+    fn unwatch(&mut self) {
+        if self.watching() {
+            self.values.retain_fields(|label, _| !matches!(label, Label::Element(_)));
+        }
+    }
+
     /// The slot of the table, and the name, of the field hash key `href` names: a string key of a
     /// table's own hash part. In an inlined callee, a caller's table is the parameter it was passed
     /// as, whose shape has its keys. See Note [Field facts].
@@ -3248,6 +3330,10 @@ pub struct Specializer<'src, 'intern> {
     next_key_index: HashMap<LProto<'src, 'intern>, u8, rustc_hash::FxBuildHasher>,
     /// The code after each inlined call, its returns continue compiling. See Note [Inlined calls].
     continuations: Vec<Rc<Continuation>>,
+    /// Each Lua call's continuation, by where its returns go on. See Note [Watched tables].
+    continuation_sites: HashMap<Location, ContinuationSite>,
+    /// The watch sites of each watched table, by its address. See Note [Watched tables].
+    watches: HashMap<u64, Vec<WatchSite>>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -3293,6 +3379,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             key_indexes: Default::default(),
             next_key_index: Default::default(),
             continuations: Vec::new(),
+            continuation_sites: HashMap::default(),
+            watches: HashMap::default(),
             inlined: Default::default(),
             unreachable: Default::default(),
             #[cfg(feature = "jit")]
@@ -3841,7 +3929,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             _ => residuals.len(),
         };
         let from = from.min(end);
-        let end = residuals[from..end].iter().position(|residual| matches!(residual, Residual::Jump(_))).map_or(end, |jump| from + jump + 1);
+        let end = residuals[from..end].iter().position(|residual| matches!(residual, Residual::Jump(_) | Residual::PatchableJump(_))).map_or(end, |jump| from + jump + 1);
         &residuals[from..end]
     }
 
@@ -3849,7 +3937,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn targets(residuals: &[Residual]) -> impl Iterator<Item = BlockId> + '_ {
         residuals.iter().flat_map(|residual| -> SmallVec<[BlockId; 2]> {
             match residual {
-                Residual::Jump(target) => smallvec::smallvec![*target],
+                Residual::Jump(target) | Residual::PatchableJump(target) => smallvec::smallvec![*target],
                 Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
                 Residual::Select(targets) => targets.iter().map(|(_, target)| *target).collect(),
                 Residual::LuaCall { entry: CallEntry::Block(target), .. } | Residual::TailCall { entry: CallEntry::Block(target), .. } => smallvec::smallvec![*target],
@@ -4834,6 +4922,93 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
+    /// Trip `tab`'s watchpoint: it is no longer watched, its watch sites are unpublished, and each
+    /// frame paused at a call goes on in code knowing no element. See Note [Watched tables].
+    fn trip(&mut self, owner: &mut Owner, state: &mut RunState, tab: Tc<Table>) {
+        tab.rw(owner).watched = false;
+        self.tripped(owner, state, tab.0.to_addr());
+    }
+
+    /// Handle the watchpoints natives' stores tripped, if any. See Note [Watched tables].
+    fn trip_pending(&mut self, owner: &mut Owner, state: &mut RunState) {
+        if !crate::vm::TRIPPED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        for table in crate::vm::PENDING_TRIPS.with(|pending| std::mem::take(&mut *pending.borrow_mut())) {
+            self.tripped(owner, state, table);
+        }
+    }
+
+    /// The table at `table` was tripped. See `trip`.
+    fn tripped(&mut self, owner: &mut Owner, state: &mut RunState, table: u64) {
+        for site in self.watches.remove(&table).unwrap_or_default() {
+            let Location(block, off) = site.at;
+            self.blocks[block.0].instructions[off] = Residual::Thunk(site.unwatched);
+            #[cfg(feature = "jit")]
+            self.unlink_thunk(block, off);
+        }
+        for i in 0..state.callstack.len() {
+            let ret = match state.callstack[i].ret {
+                Return::To(at) => match self.continuation_sites.get(&at).cloned() {
+                    Some(site) if site.ctx.watching() => {
+                        let block = self.new_block(self.blocks[at.0.0].pc);
+                        let mut ctx = (*site.ctx).clone();
+                        ctx.unwatch();
+                        let after = match site.after {
+                            After::Version(pc, ctx) => {
+                                let mut ctx = (*ctx).clone();
+                                ctx.unwatch();
+                                After::Version(pc, Rc::new(ctx))
+                            },
+                            after => after,
+                        };
+                        let thunk = self.make_continuation_thunk(block, Rc::new(ctx), site.captured, site.rest, site.a, site.c, after, None, 0, true);
+                        self.blocks[block.0].instructions.push(Residual::Thunk(thunk));
+                        Return::To(Location(block, 0))
+                    },
+                    _ => continue,
+                },
+                Return::Inlined(continuation) => {
+                    let continuation = unsafe { &*(continuation as *const Continuation) };
+                    if !continuation.caller.watching() {
+                        continue;
+                    }
+                    let mut caller = continuation.caller.clone();
+                    caller.unwatch();
+                    let unwatched = Rc::new(Continuation { caller, ..continuation.clone() });
+                    let at = Rc::as_ptr(&unwatched) as u64;
+                    self.continuations.push(unwatched);
+                    Return::Inlined(at)
+                },
+            };
+            state.callstack[i].ret = ret;
+        }
+    }
+
+    /// The thunk a watch site of the table in `slot` ends its block in: forced on a watched table,
+    /// if `watches`, it is one of the table's watch sites, the code after it knowing the table is
+    /// still watched; else, as the site a trip puts back, the code after it knowing nothing. See
+    /// Note [Watched tables].
+    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>, watches: bool) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("a watch site of a table") };
+            let watched = watches && tab.ro(owner).watched;
+            if watched {
+                let unwatched = vm.make_watch_thunk(block_id, thunk_coro.clone(), slot, pc, thunk_ctx.clone(), false);
+                vm.watches.entry(tab.0.to_addr()).or_default().push(WatchSite { at: Location(block_id, thunk_pc), unwatched });
+            }
+            let (next, arg) = if watched { (pc.next_true(), ResumeArg::Matched) } else { (pc.next_false(), ResumeArg::Failed) };
+            let rest = vm.subblock(owner, next, thunk_ctx.clone(), thunk_coro.clone(), arg);
+            if watched {
+                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::PatchableJump(rest);
+                #[cfg(feature = "jit")]
+                vm.link_thunk(block_id, thunk_pc, rest);
+            } else {
+                vm.jump_thunk(block_id, thunk_pc, rest);
+            }
+        })))
+    }
+
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
@@ -5248,6 +5423,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // See Notes [Call continuations] and [Inlined calls].
                         let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
                         layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), rest.clone(), a, c, after.clone(), Some(Rc::new(call)), 0, true)));
+                        // Where its returns go on. See Note [Watched tables].
+                        vm.continuation_sites.insert(Location(block, off + 1), ContinuationSite { ctx: ctx.clone(), captured: captured.clone(), rest: rest.clone(), a, c, after: after.clone() });
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -5351,7 +5528,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let flow = |block: BlockId| -> SmallVec<[BlockId; 4]> {
             self.blocks[block.0].instructions.iter().flat_map(|res| -> SmallVec<[BlockId; 2]> {
                 match res {
-                    Residual::Jump(target) => smallvec::smallvec![*target],
+                    Residual::Jump(target) | Residual::PatchableJump(target) => smallvec::smallvec![*target],
                     Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
                     Residual::Select(targets) => targets.iter().map(|(_, target)| *target).collect(),
                     _ => SmallVec::new(),
@@ -5423,7 +5600,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut upvalued: SmallVec<[usize; 4]> = SmallVec::new();
             for res in &self.blocks[block.0].instructions {
                 measured.cost += match res {
-                    Residual::Jump(_) | Residual::Branch { .. } | Residual::Select(_) | Residual::Thunk(_) | Residual::Ret(..)
+                    Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Branch { .. } | Residual::Select(_) | Residual::Thunk(_) | Residual::Ret(..)
                         | Residual::ReturnedFrom(_) | Residual::Arrive { .. } | Residual::Arrived { .. } | Residual::GC => 0,
                     _ => 1,
                 };
@@ -6280,6 +6457,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
+                CoroutineState::Yielded(YieldOp::Watching(slot)) => {
+                    let thunk = self.make_watch_thunk(block_id, coro.clone(), slot, pc, ctx.clone(), true);
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                    return None;
+                },
+                CoroutineState::Yielded(YieldOp::Trip(of)) => {
+                    // Its cold way, the table watched, goes on knowing no element. See Note
+                    // [Watched tables].
+                    let check: Rc<dyn Window> = match of {
+                        Some(slot) => Rc::new(TripCheck::new(&[slot])),
+                        None => Rc::new(TripCheckGlobal::new(&[])),
+                    };
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(check));
+                    let hot = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
+                    let cold = self.new_block(pc.0);
+                    let mut unwatched = (*ctx).clone();
+                    unwatched.unwatch();
+                    let side = self.make_side_thunk(cold, coro.clone(), pc.next_false(), Rc::new(unwatched), ResumeArg::Matched);
+                    self.blocks[cold.0].instructions.extend([Residual::Tripped(of), Residual::Thunk(side)]);
+                    self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
+                    return None;
+                },
                 CoroutineState::Yielded(YieldOp::Learn(slot)) => {
                     let thunk = self.make_learn_thunk(block_id, coro.clone(), slot, pc, ctx.clone());
                     self.end_block(block_id);
@@ -6900,6 +7101,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else if next_off == -1 {
                         debug!("jit bail 1 from {next_id}");
                         state.trap = false;
+                        self.trip_pending(owner, &mut state);
                         id = BlockId(next_id as usize);
                         off = state.current_off as usize;
                         // Fallthrough to continue post-trap in the interpreter
@@ -7088,6 +7290,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     gc.publish(&state, &*self);
                     state.call_native(nf, a, b, c, owner);
+                    self.trip_pending(owner, &mut state);
                 },
                 &Residual::Call { a, b, c } => {
                     off += 1;
@@ -7114,6 +7317,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Past the `Arrive`: the native put its results in place.
                         // See Note [Returns].
                         off += 1;
+                        self.trip_pending(owner, &mut state);
                         // FIXME(metatables): __call
                     } else {
                         // See Note [Errors].
@@ -7121,7 +7325,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         state.raise(LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::string(format!("attempt to call a {name} value").as_bytes()))));
                     }
                 },
-                &Residual::Jump(target) => {
+                &Residual::Jump(target) | &Residual::PatchableJump(target) => {
                     id = target;
                     off = 0;
                 },
@@ -7135,6 +7339,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     state.unshift_frame::<true>(owner, moves.then_some((a as usize, b as usize)), closes);
                     self.set_current(state.clos.ro(owner).prototype);
+                },
+                &Residual::Tripped(of) => {
+                    let table = match of {
+                        Some(slot) => state.vals[state.base + slot],
+                        None => LBoxed::box_lvalue(LValue::Table(state._G.clone())),
+                    };
+                    let LValue::Table(tab) = table.unbox() else { unreachable!("a store into a table") };
+                    self.trip(owner, &mut state, tab);
+                    off += 1;
                 },
                 Residual::Thunk(thunk) => {
                     debug!("thunk {:?}", thunk);
@@ -7325,7 +7538,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let (mut out, mut calls) = (Vec::new(), Vec::new());
             for (off, res) in residuals.instructions.iter().enumerate() {
                 match res {
-                    Residual::Jump(target) => out.push((target.0, None)),
+                    Residual::Jump(target) | Residual::PatchableJump(target) => out.push((target.0, None)),
                     Residual::NativeCall { nf, .. } => calls.push(format!("\"{:p}\"", nf)),
                     Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::GuardWitness { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
                         if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
@@ -7346,7 +7559,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
             straight.push(match residuals.instructions.last() {
-                Some(Residual::Jump(target)) => Some(target.0),
+                Some(Residual::Jump(target) | Residual::PatchableJump(target)) => Some(target.0),
                 Some(Residual::Branch { hot, cold }) if untaken(*cold) => Some(hot.0),
                 _ => None,
             });
@@ -7404,7 +7617,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
                 let instructions = &self.blocks[block].instructions;
                 // The jump into the next block of the chain is the chain going on.
-                let shown = if i + 1 < chain.len() && matches!(instructions.last(), Some(Residual::Jump(_))) { instructions.len() - 1 } else { instructions.len() };
+                let shown = if i + 1 < chain.len() && matches!(instructions.last(), Some(Residual::Jump(_) | Residual::PatchableJump(_))) { instructions.len() - 1 } else { instructions.len() };
                 rows.extend(instructions[..shown].iter().map(|res| res.to_string()));
             }
             let label = safe_str(format!("\"{} | {{ {} }}\"", name, rows.join("| ")));

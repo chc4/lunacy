@@ -184,6 +184,12 @@ impl JitHelper {
             match state.vals[state.base + a as usize].unbox() {
                 LValue::NClosure(ncall) => {
                     state.call_native(ncall.native(), a, b, c, owner);
+                    // A tripped watchpoint exits, past the call's `Arrive`. See Note [Watched
+                    // tables] in `specialize`.
+                    if crate::vm::TRIPPED.load(std::sync::atomic::Ordering::Relaxed) {
+                        state.trap = true;
+                        state.current_off = (Location::unpack(PackedLocation::from_bits(ret as usize)).1 + 1) as _;
+                    }
                     1
                 }
                 // Inside frames JIT code called, the interpreter makes the call, once the callstack
@@ -290,6 +296,11 @@ impl JitHelper {
             let state = &mut *(state as *mut RunState<'static, 'static>);
             let nf: crate::vm::NativeFunc = core::mem::transmute(nf);
             state.call_native(nf, a, b, 0, crate::forge_owner());
+            // A tripped watchpoint exits, after the call. See Note [Watched tables] in
+            // `specialize`.
+            if crate::vm::TRIPPED.load(std::sync::atomic::Ordering::Relaxed) {
+                state.trap = true;
+            }
         }
     }
 
@@ -474,6 +485,8 @@ struct Pool {
 
 /// Code a region lays out after its blocks, off its hot paths.
 enum Stub {
+    /// A `PatchableJump`'s exit to the interpreter, with `snapshot`, once unlinked.
+    Exit { snapshot: DynamicLabel },
     /// The way from a copy into its cold stencil: the site's record's address
     /// into `cold_site`, then the jump. See Note [Cold stencils] in `window`.
     ColdEntry { record: DynamicLabel, cold: usize },
@@ -1111,8 +1124,16 @@ pub struct JitContext {
     /// Each thunk compiled into JIT code, by block and offset. See Note
     /// [Thunk patching].
     thunk_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
+    /// Each thunk site linked, by what `thunk_sites` had it as, to unlink. See Note [Watched
+    /// tables] in `specialize`.
+    linked_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
     /// The thunk sites of the region being compiled, by offset in it.
     region_sites: Vec<(BlockId, usize, usize, Cache)>,
+    /// Each `PatchableJump` compiled: its jump, or the NOP5 it relaxed to, as a thunk site entered
+    /// with its target's window, and its exit's address.
+    patchable_sites: HashMap<(BlockId, usize), (ThunkSite, usize), FxBuildHasher>,
+    /// The `PatchableJump`s of the region being compiled: by offset in it, and their exits.
+    region_patchables: Vec<(BlockId, usize, usize, DynamicLabel, Cache)>,
     /// Where each call JIT code makes of a function holds the function's frame size, by the
     /// function's prototype's address: patched as it grows. See Note [Inlined calls] in
     /// `specialize`.
@@ -1162,6 +1183,7 @@ pub struct JitContext {
 struct JitPtr(*const u8);
 
 /// A thunk in JIT code: where its nops are, and the window it leaves.
+#[derive(Clone)]
 struct ThunkSite {
     at: usize,
     window: Cache,
@@ -1434,7 +1456,7 @@ fn runs_to(residuals: &[Residual]) -> usize {
     // Whether the residual before can skip this one: a guard's side exit.
     let mut guarded = false;
     for (off, res) in residuals.iter().enumerate() {
-        if matches!(res, Residual::Jump(_) | Residual::Thunk(_)) && !guarded {
+        if matches!(res, Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Thunk(_) | Residual::Tripped(_)) && !guarded {
             return off + 1;
         }
         guarded = matches!(res, Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::NativeGuard { .. }
@@ -1447,7 +1469,7 @@ fn runs_to(residuals: &[Residual]) -> usize {
 /// The blocks a residual jumps to.
 fn jump_targets(res: &Residual) -> SmallVec<[BlockId; 2]> {
     match res {
-        Residual::Jump(target) => smallvec::smallvec![*target],
+        Residual::Jump(target) | Residual::PatchableJump(target) => smallvec::smallvec![*target],
         Residual::Select(targets) => targets.iter().map(|target| target.1).collect(),
         Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
         _ => SmallVec::new(),
@@ -1483,7 +1505,10 @@ impl JitContext {
             blocks: HashMap::default(),
             pending: BTreeMap::new(),
             thunk_sites: HashMap::default(),
+            linked_sites: HashMap::default(),
             region_sites: Vec::new(),
+            patchable_sites: HashMap::default(),
+            region_patchables: Vec::new(),
             frame_sites: HashMap::default(),
             region_frames: Vec::new(),
             region_headers: Default::default(),
@@ -1833,6 +1858,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for (label, stub) in std::mem::take(&mut pool.stubs) {
             dynasm!(ops ; .arch x64 ; =>label);
             match stub {
+                Stub::Exit { snapshot } => {
+                    jit_note!(self.jctx, ops, "an unlinked patchable jump's exit");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; lea rax, [=>snapshot]
+                        ; jmp extern self.jctx.exit_snapshot
+                    );
+                }
                 Stub::ColdEntry { record, cold } => {
                     jit_note!(self.jctx, ops, "into a cold stencil");
                     dynasm!(ops
@@ -1938,6 +1971,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.reserve(ops.offset().0 - pool_start.0);
 
         debug!("drained pending");
+        let patchables: Vec<(BlockId, usize, usize, usize, Cache)> = std::mem::take(&mut self.jctx.region_patchables).into_iter()
+            .map(|(block, off, at, exit, window)| (block, off, at, ops.labels().resolve_dynamic(exit).expect("a patchable jump's exit placed").0, window))
+            .collect();
         let frames: Vec<(usize, usize)> = std::mem::take(&mut self.jctx.region_frames).into_iter()
             .map(|(proto, entry)| (proto, ops.labels().resolve_dynamic(entry).expect("a frame size's entry placed").0))
             .collect();
@@ -1949,6 +1985,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
         for (block, off, at, window) in std::mem::take(&mut self.jctx.region_sites) {
             self.jctx.thunk_sites.insert((block, off), ThunkSite { at: slab as usize + at, window });
+        }
+        for (block, off, at, exit, window) in patchables {
+            self.jctx.patchable_sites.insert((block, off), (ThunkSite { at: slab as usize + at, window }, slab as usize + exit));
         }
         // Thunk sites waiting for a block compiled here jump to it now.
         let ready: Vec<BlockId> = self.jctx.waiting.keys().filter(|target| self.jctx.blocks.contains_key(target)).copied().collect();
@@ -2067,11 +2106,31 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // ran is linked when it first runs and is forced, to a target compiled
         // by then or not.
         let Some(site) = self.jctx.thunk_sites.remove(&(block, off)) else { return };
+        self.jctx.linked_sites.insert((block, off), site.clone());
         if self.jctx.blocks.contains_key(&target) {
             self.patch_thunk(site, target);
         } else {
             self.jctx.waiting.entry(target).or_default().push(site);
         }
+    }
+
+    /// The thunk at `off` in `block` is a thunk again: its JIT code, if linked, exits again. See
+    /// Note [Watched tables] in `specialize`.
+    pub fn unlink_thunk(&mut self, block: BlockId, off: usize) {
+        if let Some((site, exit)) = self.jctx.patchable_sites.remove(&(block, off)) {
+            let rel = i32::try_from(exit as isize - (site.at as isize + NOP5.len() as isize)).expect("a patchable jump's exit within rel32 of it");
+            let mut jmp = [0xe9, 0, 0, 0, 0];
+            jmp[1..].copy_from_slice(&rel.to_le_bytes());
+            self.jctx.patch(site.at, &jmp);
+            self.jctx.thunk_sites.insert((block, off), site);
+            return;
+        }
+        let Some(site) = self.jctx.linked_sites.remove(&(block, off)) else { return };
+        for waiting in self.jctx.waiting.values_mut() {
+            waiting.retain(|other| other.at != site.at);
+        }
+        self.jctx.patch(site.at, &NOP5);
+        self.jctx.thunk_sites.insert((block, off), site);
     }
 
     /// Make the thunk site `site` jump into `target`'s JIT code, through its
@@ -2195,7 +2254,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             res if keeps_frame(res) => {}
                             // Reads its field through the witness, no slot.
                             Residual::GuardWitness { .. } => {}
-                            Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. } => {
+                            Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Select(_) | Residual::Branch { .. } => {
                                 for target in jump_targets(res) {
                                     events.push(match index.get(&target) {
                                         Some(&i) => Event::Edge(i),
@@ -2204,7 +2263,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 }
                             }
                             // An exit to the interpreter, which reads the stack.
-                            Residual::Thunk(_) => {}
+                            Residual::Thunk(_) | Residual::Tripped(_) => {}
                             _ => events.push(Event::Flush),
                         }
                     }
@@ -2334,7 +2393,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     res if keeps_frame(res) => {}
                     Residual::GuardWitness { .. } => {}
-                    Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. } => {
+                    Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Select(_) | Residual::Branch { .. } => {
                         for target in jump_targets(res) {
                             if Some(off) == flow && Some(target) == next {
                                 continue;
@@ -2349,7 +2408,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         }
                     }
-                    Residual::Thunk(_) => steps.push(Step::Leave),
+                    Residual::Thunk(_) | Residual::Tripped(_) => steps.push(Step::Leave),
                     _ => steps.push(Step::Flush),
                 }
             }
@@ -2431,7 +2490,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // first jump to it compiled delivers it dirty.
         // With `defer`, its moves and target, for code laid out elsewhere, in
         // place of emitting it.
-        let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool, defer: bool| -> Option<(SmallVec<[Emit; 16]>, JumpTo, Option<i64>)> {
+        let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool, defer: bool| -> Option<(SmallVec<[Emit; 16]>, JumpTo, Option<i64>, Cache)> {
             if let Some(target_block) = self.jctx.blocks.get(target) {
                 debug_assert_eq!((target_block.depth, target_block.offset), (depth.get(), offset.get()), "a jump to a block at another depth");
                 // We already JIT compiled the block, and can jump to it directly.
@@ -2439,7 +2498,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let (counted, count) = if defer { window_deferred!(self.jctx, transfer) } else { (window_count!(self.jctx, ops, transfer), None) };
                 window_dump!(self.jctx, "      to block {} (compiled, entered with {}): {}{counted}", target.0, target_block.window, emits_line(&transfer));
                 if defer {
-                    return Some((transfer, JumpTo::Code(target_block.ptr.0 as usize), count));
+                    return Some((transfer, JumpTo::Code(target_block.ptr.0 as usize), count, target_block.window.clone()));
                 }
                 for emit in transfer {
                     emit_window_move(ops, emit, offset.get());
@@ -2467,7 +2526,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let (counted, count) = if defer { window_deferred!(self.jctx, transfer) } else { (window_count!(self.jctx, ops, transfer), None) };
                 window_dump!(self.jctx, "      to block {} (entered with {}): {}{counted}", target.0, pending.window, emits_line(&transfer));
                 if defer {
-                    return Some((transfer, JumpTo::Label(pending.label), count));
+                    return Some((transfer, JumpTo::Label(pending.label), count, pending.window.clone()));
                 }
                 for emit in transfer {
                     emit_window_move(ops, emit, offset.get());
@@ -2600,7 +2659,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             );
         };
         let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_));
-        let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. });
+        let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Select(_) | Residual::Branch { .. });
         let end = runs_to(&block.instructions);
         let mut dies = None;
         for (off, res) in block.instructions[..end].iter().enumerate() {
@@ -2615,7 +2674,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // An inlined call shifting to its callee's frame by a window op is laid out as the op,
             // the caller's frame kept before it. See Note [Inlined calls] in `specialize`.
             let shifted = inline_shift(res).map(Residual::ExecWindow);
-            let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_) | Residual::GuardWitness { .. })
+            let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_) | Residual::Tripped(_) | Residual::GuardWitness { .. })
                 || shifted.is_some() || keeps_frame(res);
             if window(res) && prev.is_some_and(|p| window(p)) {
                 // Inside a run of window residuals, charged for with its first.
@@ -3061,6 +3120,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                         ; jmp =>exits[depth.get()]
                         ; native_ok:
+                    );
+                    // A tripped watchpoint exits, after the call. See Note [Watched tables] in
+                    // `specialize`.
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov r10, QWORD (&crate::vm::TRIPPED as *const _ as i64)
+                        ; cmp BYTE [r10], 0
+                        ; jz >untripped
+                        ; mov WORD r12 => RunState.current_off, ((off + 1) as i16)
+                        ; mov BYTE r12 => RunState.trap, 1
+                        ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; jmp =>exits[depth.get()]
+                        ; untripped:
                         ; mov rax, rdx
                     );
                     // Taking every result, the caller reads up to the top: the
@@ -3141,6 +3213,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; .arch x64
                         ; mov r13, QWORD [rsp - 0]
                     );
+                },
+                Residual::PatchableJump(target) => {
+                    // A jump, or relaxed to a fall-through a NOP5, the 5 bytes unlinking it patches
+                    // to a jump to its exit.
+                    let skip = off == end - 1 && self.jctx.blocks.get(target).is_none();
+                    let (moves, to, count, window) = emit_jump(ops, &alloc, target, skip, true).expect("a deferred jump's moves");
+                    if let Some(at) = count {
+                        emit_count(ops, at);
+                    }
+                    for emit in moves {
+                        emit_window_move(ops, emit, offset.get());
+                    }
+                    let snapshot = pool.snapshot(ops, Location(id, off), depth.get(), offset.get(), WindowAlloc::entering(window.clone()).stores());
+                    let exit = ops.new_dynamic_label();
+                    pool.stubs.push((exit, Stub::Exit { snapshot }));
+                    let at = ops.offset().0;
+                    self.jctx.region_patchables.push((id, off, at, exit, window));
+                    match to {
+                        _ if skip => ops.extend(&NOP5),
+                        JumpTo::Code(code) => dynasm!(ops ; .arch x64 ; jmp extern code),
+                        JumpTo::Label(label) => dynasm!(ops ; .arch x64 ; jmp =>label),
+                    }
+                    assert_eq!(ops.offset().0 - at, NOP5.len(), "a patchable jump of 5 bytes");
+                    successor = Some(*target);
                 },
                 Residual::Jump(target) => {
                     // If the block ends in a jump, and the block hasn't already been emitted, then
@@ -3265,7 +3361,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // path's, goes off the hot path. See Notes [Window exits] in
                         // `window` and [Optimistic ops] in `specialize`.
                         Some((label, aligned, _)) => {
-                            let (moves, to, count) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
+                            let (moves, to, count, _) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
                             pool.stubs.push((label, Stub::Way { aligned, moves, to, count, offset: offset.get() }));
                             emit_jump(ops, &alloc, hot, self.jctx.blocks.get(hot).is_none(), false);
                         },
@@ -3297,7 +3393,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     } else {
                         // Exit 1 comes only from its cold path: its way off the hot path.
-                        let (moves, to, count) = emit_jump(ops, &alloc, &targets[1].1, false, true).expect("a deferred jump's moves");
+                        let (moves, to, count, _) = emit_jump(ops, &alloc, &targets[1].1, false, true).expect("a deferred jump's moves");
                         pool.stubs.push((label, Stub::Way { aligned, moves, to, count, offset: offset.get() }));
                     }
                     emit_jump(ops, &alloc, &first, self.jctx.blocks.get(&first).is_none(), false);
@@ -3487,11 +3583,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         _ => {}
                     }
                 },
-                Residual::Thunk(_) => {
+                Residual::Thunk(_) | Residual::Tripped(_) => {
                     // Room for a `jmp rel32` past the exit, once the thunk is a
-                    // jump. See Note [Thunk patching].
-                    self.jctx.region_sites.push((id, off, ops.offset().0, alloc.cache().clone()));
-                    ops.extend(&NOP5);
+                    // jump. See Note [Thunk patching]. A trip always exits. See Note
+                    // [Watched tables] in `specialize`.
+                    if matches!(res, Residual::Thunk(_)) {
+                        self.jctx.region_sites.push((id, off, ops.offset().0, alloc.cache().clone()));
+                        ops.extend(&NOP5);
+                    }
                     let stores = alloc.stores();
                     let counted = window_count!(self.jctx, ops, stores);
                     window_dump!(self.jctx, "      exit after {}{counted}", emits_line(&stores));
