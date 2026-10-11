@@ -426,6 +426,15 @@ struct Held {
     ops: Vec<crate::peephole::IntOp>,
     first: HeldOp,
     last: HeldOp,
+    /// The guard the run ends in, as `peephole::guard` gives it, held as passed.
+    guard: Option<(u8, usize, HeldOp)>,
+}
+
+impl Held {
+    /// The slot the run writes.
+    fn last_dest(&self) -> usize {
+        self.ops.last().expect("a held run").dest
+    }
 }
 
 #[derive(Clone)]
@@ -447,9 +456,10 @@ fn holdable(op: &crate::peephole::IntOp) -> bool {
     crate::peephole::fuses() && crate::peephole::starts(op)
 }
 
-/// Whether a yield leaves what the peephole holds held, laying out no code: in `ctx`, the window
-/// after `described` if it says. See Note [Peephole fusion] in `peephole`.
-fn passes_held(ctx: &Context, state: &CoroutineState<YieldOp, ResumeArg>, described: Option<&crate::peephole::IntOp>) -> bool {
+/// Whether a yield leaves what the peephole holds, `held`, held, laying out no code: in `ctx`, the
+/// window after `described` if it says, or a guard the run ends in. See Note [Peephole fusion] in
+/// `peephole`.
+fn passes_held(held: &Held, ctx: &Context, state: &CoroutineState<YieldOp, ResumeArg>, described: Option<&crate::peephole::IntOp>) -> bool {
     let known = |slot: usize, expected: &CType| {
         let found = &ctx.types[slot];
         expected.accepts(found) || !found.accepts(expected)
@@ -461,6 +471,12 @@ fn passes_held(ctx: &Context, state: &CoroutineState<YieldOp, ResumeArg>, descri
                 | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
                 | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::Clobber(_) | YieldOp::IntegerOp(_) => true,
             YieldOp::OptimisticExec(_) | YieldOp::ExecWindow(_) => described.is_some_and(holdable),
+            YieldOp::GuardDynamic(test) => held.guard.is_none() && crate::peephole::guard(&**test, held.last_dest()).is_some(),
+            // What a get or set asks before its guard on the key: of the table, a hash key for a
+            // key in a register (there is none), and narrowing a key known not to be a double.
+            YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) => true,
+            YieldOp::HashKey(_, key, _) => key & 0x100 == 0,
+            YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
             YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected)),
             YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
             YieldOp::GuardCType(rk, expected) => rk & 0x100 != 0 || known(*rk, expected),
@@ -4619,7 +4635,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn hold<C>(&mut self, owner: &mut Owner, block_id: BlockId, int_op: crate::peephole::IntOp, window: &Rc<dyn Window>, optimistic: bool, coro: &Box<C>, pc: SubPc, ctx: &mut Rc<Context>) -> bool
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
-        if self.held.as_ref().is_some_and(|held| !crate::peephole::extends(&held.ops, &int_op)) && self.flush(owner, block_id) {
+        if self.held.as_ref().is_some_and(|held| held.guard.is_some() || !crate::peephole::extends(&held.ops, &int_op)) && self.flush(owner, block_id) {
             return true;
         }
         // Its outputs are written, as laying it out would write them.
@@ -4635,7 +4651,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 held.ops.push(int_op);
                 held.last = this;
             },
-            None => self.held = Some(Held { ops: vec![int_op], first: this.clone(), last: this }),
+            None => self.held = Some(Held { ops: vec![int_op], first: this.clone(), last: this, guard: None }),
         }
         false
     }
@@ -4647,6 +4663,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn flush(&mut self, owner: &mut Owner, block_id: BlockId) -> bool {
         let Some(held) = self.held.take() else { return false };
         let first = held.first;
+        if let Some((g, table, guard)) = held.guard {
+            let window = crate::peephole::fused_guard_window(&held.ops, (g, table)).expect("a held run and its guard are a fused op");
+            self.end_block(block_id);
+            self.blocks[block_id.0].instructions.push(Residual::ExecWindow(window));
+            let hot = self.subblock(owner, guard.pc.next_true(), guard.ctx.clone(), Box::new(guard.coro.clone()), ResumeArg::Matched);
+            let cold = self.cold_held(first);
+            self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
+            return true;
+        }
         if held.ops.len() == 1 {
             if !first.optimistic {
                 // Nothing laid out since reads what it writes.
@@ -4663,6 +4688,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let last = held.last;
         let resume = if last.optimistic { ResumeArg::Matched } else { ResumeArg::Start };
         let hot = self.subblock(owner, last.pc.next_true(), last.ctx.clone(), Box::new(last.coro.clone()), resume);
+        let cold = self.cold_held(first);
+        self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
+        true
+    }
+
+    /// A fused op's cold path: a block laying out the run's first op as it would have been where
+    /// it was held, once taken. See Note [Peephole fusion] in `peephole`.
+    fn cold_held(&mut self, first: HeldOp) -> BlockId {
         let cold = self.new_block(first.pc.0);
         let thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let unfused = vm.new_block(first.pc.0);
@@ -4670,8 +4703,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.jump_thunk(cold, thunk_pc, unfused);
         })));
         self.blocks[cold.0].instructions.push(Residual::Thunk(thunk));
-        self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
-        true
+        cold
     }
 
     /// Lay out the first op the peephole held in `block`, as it would have been where it was held,
@@ -5737,7 +5769,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut state = Pin::new(&mut coro).resume(arg);
             arg = ResumeArg::Start;
             'machine: loop {
-            if self.held.is_some() && !passes_held(&ctx, &state, described.as_ref()) && self.flush(owner, block_id) {
+            if self.held.as_ref().is_some_and(|held| !passes_held(held, &ctx, &state, described.as_ref())) && self.flush(owner, block_id) {
                 return None;
             }
             match state {
@@ -6036,6 +6068,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
                     }
+                },
+                // The guard the held run ends in: as passed. See Note [Peephole fusion] in `peephole`.
+                CoroutineState::Yielded(YieldOp::GuardDynamic(test)) if let Some((g, table)) = self.held.as_ref().filter(|held| held.guard.is_none()).and_then(|held| crate::peephole::guard(&*test, held.last_dest())) => {
+                    let guard = HeldOp { window: test.clone(), optimistic: false, coro: Box::new((*coro).clone()), pc, ctx: ctx.clone(), asked: None };
+                    self.held.as_mut().unwrap().guard = Some((g, table, guard));
+                    pc = pc.next_true();
+                    arg = ResumeArg::Matched;
                 },
                 CoroutineState::Yielded(YieldOp::GuardDynamic(test)) => {
                     assert!(test.accesses().iter().all(|access| *access == Access::Read), "{}: a guard's test has no outputs", test.name());

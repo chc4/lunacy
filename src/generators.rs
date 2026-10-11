@@ -2215,6 +2215,6 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
 /// The array part slot of a `CType::Type(LType::Integer)` key. Keys below 1 wrap past any
 /// array part.
 #[inline(always)]
-fn integer_slot(i: i32) -> usize {
+pub(crate) fn integer_slot(i: i32) -> usize {
     (i as i64 - 1) as usize
 }

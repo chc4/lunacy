@@ -2,7 +2,10 @@
 -- stack index as uxn.lua computes it, a run around a table read, one whose
 -- intermediate result doesn't fit an integer though what it leaves does, and
 -- one whose result doesn't fit once its inputs grow, which takes the fused
--- operation's cold path. Once, and in loops run often enough for JIT code.
+-- operation's cold path. And runs computing a key a get or a set then checks
+-- is in a table's array part, which they fuse with: one whose key is sometimes
+-- past it, in the hash part or nil there, which takes the cold path too. Once,
+-- and in loops run often enough for JIT code.
 
 local function index(p)
   return (p - 1) % 256 + 1
@@ -26,20 +29,33 @@ local function grows(x)
   return y - 3
 end
 
+local function lookup(u, i)
+  -- Keys 1 to 32: 1 to 8 are in the array part, 20 in the hash part.
+  return u[(i - 1) % 32 + 1] or 0
+end
+
+local function store(u, i)
+  u[(i + 3) % 8 + 1] = i
+end
+
 local function run(n)
-  local t = {}
+  local t, u = {}, {}
   for i = 1, 16 do t[i] = i * i end
-  local s1, s2, s3, s4 = 0, 0, 0, 0
+  for i = 1, 8 do u[i] = i end
+  u[20] = 100
+  local s1, s2, s3, s4, s5 = 0, 0, 0, 0, 0
   for i = 1, n do
     s1 = s1 + index(i)
     s2 = s2 + around(t, i)
     s3 = s3 + overwritten(2147483647 - i % 3)
     s4 = s4 + grows(i < n and i or 2147483000)
+    s5 = s5 + lookup(u, i)
+    store(u, i)
   end
-  return s1, s2, s3, s4
+  return s1, s2, s3, s4, s5, u[1] + u[8]
 end
 
 print(run(10))
 print(run(2000))
--- EXPECT: 55	1178	21474836470	4294966070
--- EXPECT: 252008	998000	4294967293999	4298960000
+-- EXPECT: 55	1178	21474836470	4294966070	20	9
+-- EXPECT: 252008	998000	4294967293999	4298960000	506436	3993

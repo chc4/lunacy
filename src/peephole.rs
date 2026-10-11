@@ -3,7 +3,9 @@
 use std::rc::Rc;
 
 use crate::lboxed::LBoxed;
-use crate::vm::Opcode;
+use crate::vm::{LValue, Opcode};
+#[cfg(feature = "unreachable")]
+use crate::unreachable;
 use crate::window::{windowed, Window};
 
 // Note [Peephole fusion]
@@ -26,6 +28,13 @@ use crate::window::{windowed, Window};
 // reading the slot the one before wrote, all writing the same slot: adds, subtracts, products by a
 // positive constant and masks (a floored remainder by a power of two). Its kinds are the op's
 // constant parameters, so each step is inlined into the next, nothing boxed between them.
+//
+// A run may end in a guard of whether the slot it writes is a key in a table's array part (and the
+// element there not nil), which the get or set reading the key yields next: the peephole holds the
+// guard too, as passed. The run is then one op with the guard, its hot path where the key fits and
+// the guard passes, and the guard's pass path after it; anything else, a key that doesn't fit or
+// isn't in the array part, its cold path, where the run's first operation is laid out again, and
+// the guard after it as it would have been.
 //
 // A run of one operation is laid out as it would have been where it was held, its overflow
 // continuing from there, and the code after it from its hot path again. A run of more is laid out
@@ -166,6 +175,79 @@ windowed!(FusedRK3, [k1: u64, k2: u64, k3: u64], [A: u8, B: u8, C: u8], |owner, 
     1
 });
 
+// The guards a run can end in: `InArray`'s, and `InArrayHeld`'s.
+const IN_ARRAY: u8 = 0;
+const HELD: u8 = 1;
+
+/// The guard a run can end in that `test` is, if it is one, on a key in `key`, and the slot of
+/// the table it tests. See Note [Peephole fusion].
+pub fn guard(test: &dyn Window, key: usize) -> Option<(u8, usize)> {
+    let kind = match test.name() {
+        "InArray" => IN_ARRAY,
+        "InArrayHeld" => HELD,
+        _ => return None,
+    };
+    match test.operands() {
+        &[table, k] if k == key && table != key => Some((kind, table)),
+        _ => None,
+    }
+}
+
+/// Whether integer `key` passes guard `G` of `table`.
+fn passes<const G: u8>(owner: &crate::Owner, table: LBoxed, key: i32) -> bool {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    let array = &tab.ro(owner).array;
+    let slot = crate::generators::integer_slot(key);
+    match G {
+        IN_ARRAY => slot < array.len(),
+        HELD => array.get(slot).is_some_and(|v| !v.is_nil()),
+        _ => unreachable!(),
+    }
+}
+
+// A run and the guard it ends in, `G`: the key fits and passes on the hot path; on the cold path,
+// `dest` holds `lhs`, as nothing was computed. See Note [Peephole fusion].
+windowed!(FusedRK1In, [k1: u64], [A: u8, G: u8], |owner, state, base, tag| (table, lhs, out dest) {
+    match step::<A>(lhs.as_int(), k1 as i32) {
+        Some(n) if passes::<G>(owner, table, n) => { *dest = LBoxed::from_int_tagged(n, tag); false },
+        _ => { core::intrinsics::cold_path(); true },
+    }
+} cold {
+    *dest = lhs;
+    1
+});
+
+windowed!(FusedRK2In, [k1: u64, k2: u64], [A: u8, B: u8, G: u8], |owner, state, base, tag| (table, lhs, out dest) {
+    match steps2::<A, B>(lhs.as_int(), k1 as i32, k2 as i32) {
+        Some(n) if passes::<G>(owner, table, n) => { *dest = LBoxed::from_int_tagged(n, tag); false },
+        _ => { core::intrinsics::cold_path(); true },
+    }
+} cold {
+    *dest = lhs;
+    1
+});
+
+windowed!(FusedRK3In, [k1: u64, k2: u64, k3: u64], [A: u8, B: u8, C: u8, G: u8], |owner, state, base, tag| (table, lhs, out dest) {
+    match steps3::<A, B, C>(lhs.as_int(), k1 as i32, k2 as i32, k3 as i32) {
+        Some(n) if passes::<G>(owner, table, n) => { *dest = LBoxed::from_int_tagged(n, tag); false },
+        _ => { core::intrinsics::cold_path(); true },
+    }
+} cold {
+    *dest = lhs;
+    1
+});
+
+/// The guard whose constant parameter is `$g`, as `$G` in `$body`.
+macro_rules! by_guard {
+    ($g:expr, $G:ident, $body:expr) => {
+        match $g {
+            IN_ARRAY => { const $G: u8 = IN_ARRAY; $body },
+            HELD => { const $G: u8 = HELD; $body },
+            _ => unreachable!(),
+        }
+    };
+}
+
 /// The step whose constant parameter is `$s`, as `$S` in `$body`.
 macro_rules! by_step {
     ($s:expr, $S:ident, $body:expr) => {
@@ -193,6 +275,25 @@ pub fn fused_window(run: &[IntOp]) -> Option<Rc<dyn Window>> {
         &[(a, k1), (b, k2), (c, k3)] => Some(by_step!(a, A, by_step!(b, B, by_step!(c, C, Rc::new(FusedRK3::<A, B, C>::new(k1 as u32 as u64, k2 as u32 as u64, k3 as u32 as u64, &slots)) as Rc<dyn Window>)))),
         _ => None,
     }
+}
+
+/// The fused op a run and the guard it ends in are, `guard` as `guard` gives it, if they are one.
+/// See Note [Peephole fusion].
+pub fn fused_guard_window(run: &[IntOp], (g, table): (u8, usize)) -> Option<Rc<dyn Window>> {
+    let first = run.first()?;
+    if !run.iter().enumerate().all(|(i, op)| extends(&run[..i], op)) {
+        return None;
+    }
+    let Operand::Slot(lhs) = first.lhs else { return None };
+    let slots = [table, lhs, first.dest];
+    let k = |k: i32| k as u32 as u64;
+    let steps: Vec<(u8, i32)> = run.iter().map(|op| op.step().unwrap()).collect();
+    Some(by_guard!(g, G, match steps.as_slice() {
+        &[(a, k1)] => by_step!(a, A, Rc::new(FusedRK1In::<A, G>::new(k(k1), &slots)) as Rc<dyn Window>),
+        &[(a, k1), (b, k2)] => by_step!(a, A, by_step!(b, B, Rc::new(FusedRK2In::<A, B, G>::new(k(k1), k(k2), &slots)) as Rc<dyn Window>)),
+        &[(a, k1), (b, k2), (c, k3)] => by_step!(a, A, by_step!(b, B, by_step!(c, C, Rc::new(FusedRK3In::<A, B, C, G>::new(k(k1), k(k2), k(k3), &slots)) as Rc<dyn Window>))),
+        _ => return None,
+    }))
 }
 
 #[cfg(test)]
