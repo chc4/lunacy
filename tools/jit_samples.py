@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A profile's samples on the JIT's code, joined to its disassembly.
 
-    tools/jit_samples.py JIT_DISASM SAMPLES [--out FILE] [--op NOTE] [--top N]
+    tools/jit_samples.py JIT_DISASM SAMPLES [--out FILE] [--hot-blocks FILE] [--op NOTE] [--top N]
 
 JIT_DISASM is the `jit_disasm.txt` a run writes (feature `jit_disasm`), and
 SAMPLES that same run's samples, `perf script -F ip,sym` (a sample's address,
@@ -12,7 +12,8 @@ Prints the samples' split between the JIT's code and the binary's functions,
 the JIT's by what emitted the code (the disassembly's notes: a region's entry
 and exit, and a block's residuals and the parts of one) summed over every
 copy, and the JIT's by block. `--out` writes the disassembly of every range with a sample, each
-instruction with its count. `--op` sums the copies of what one note names
+instruction with its count; `--hot-blocks` only the blocks with one, whole, in the order they are
+laid out: a loop's body, the way its code falls through. `--op` sums the copies of what one note names
 (`PushFrame`, `window(GetTableInteger`) instruction by instruction, over the
 copies of the same code, and prints each code with its first copy's text.
 `--blocks-of` splits the samples of what one note names by block.
@@ -64,6 +65,7 @@ def main():
     ap.add_argument('disasm')
     ap.add_argument('samples')
     ap.add_argument('--out', help='write the sampled ranges\' disassembly, with counts, here')
+    ap.add_argument('--hot-blocks', help='write the sampled blocks\' disassembly, with counts, here')
     ap.add_argument('--op', help='sum the copies of what this note names, by instruction')
     ap.add_argument('--blocks-of', help='the samples of what this note names, by block')
     ap.add_argument('--top', type=int, default=25)
@@ -151,6 +153,38 @@ def main():
             print(f'\n{args.op}: {len(by_offset)} instructions, {copies} copies, {n} samples ({100 * n / total:.1f}%)')
             for off in sorted(by_offset):
                 print(f'  {by_offset[off]:7} +{off:<4x} {text[off]}')
+
+    if args.hot_blocks:
+        block_of = lambda notes: next((note for note in notes if note.startswith('block ')), None)
+        hot = Counter()
+        for i, n in counts.items():
+            hot[(insts[i][1], block_of(insts[i][3]))] += n
+        by_range = Counter()
+        for (r, _), n in hot.items():
+            by_range[r] += n
+        with open(args.hot_blocks, 'w') as out:
+            last_notes, last_block, last_range = None, None, None
+            for i, (addr, r, line, notes) in enumerate(insts):
+                block = (r, block_of(notes))
+                if block[1] is None or not hot[block]:
+                    last_block = None
+                    continue
+                if r != last_range:
+                    base, size, title = ranges[r]
+                    out.write(f'\n==== {title} @ {base:#x}, {size} bytes: {by_range[r]} samples\n')
+                    last_range = r
+                if block != last_block:
+                    out.write(f'\n{hot[block]:7} samples: {block[1]}\n')
+                    last_block, last_notes = block, tuple(n for n in notes if not n.startswith('block '))[:0]
+                inner = tuple(n for n in notes if n != block[1] and not RANGE.match(n))
+                inner = inner[next((k for k, n in enumerate(notes) if n == block[1]), 0):]
+                shared = next((k for k, (a, b) in enumerate(zip(last_notes, inner)) if a != b), min(len(last_notes), len(inner)))
+                for note in inner[shared:]:
+                    out.write(f'        ; {note}\n')
+                last_notes = inner
+                n = counts.get(i, 0)
+                out.write(f'{n or "":>7} {line}\n')
+        print(f'\n{args.hot_blocks}')
 
     if args.out:
         with open(args.out, 'w') as out:
