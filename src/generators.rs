@@ -207,7 +207,7 @@ pub fn emit_loadbool(dest: usize, value: bool, skip: bool, pc: usize) -> impl Co
         yield YieldOp::ExecWindow(Rc::new(LoadBool::new(value as u8, &[dest])));
         yield YieldOp::SetTypes(vec![(dest, LType::Bool)]);
         if skip {
-            arg = yield YieldOp::GetBlock(pc + 1);
+            arg = yield YieldOp::GetBlockKeeping(pc + 1, dest);
             let ResumeArg::BlockId(target) = arg else { unreachable!() };
             arg = yield YieldOp::Jump(target);
         }

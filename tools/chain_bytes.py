@@ -8,6 +8,8 @@ between two dumps.
 import collections, re, sys
 
 BLOCK = re.compile(r"\s*; block \d+ \(pc \d+, function ([\d?-]+)")
+# A region's code past its blocks, which no block's notes are on.
+OUT_OF_LINE = re.compile(r"  ; (into a cold stencil|an exit's way|site record of|exit_jit|constant pool|region entry|load the entry window)")
 RESIDUAL = re.compile(r"\s*;\s+\d+ (\w+)")
 INSTR = re.compile(r"\s*[0-9a-f]{8,} \+([0-9a-f]+)\s+([0-9a-f]+)\s")
 
@@ -21,6 +23,8 @@ def tally(path):
             chain, kind = "(region)", "(region)"
         elif m := BLOCK.match(line):
             chain, kind = m.group(1), "(block entry)"
+        elif m := OUT_OF_LINE.match(line):
+            chain = kind = f"({m.group(1)})"
         elif m := RESIDUAL.match(line):
             kind = m.group(1)
         elif m := INSTR.match(line):

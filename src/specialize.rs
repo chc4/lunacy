@@ -231,6 +231,8 @@ pub enum YieldOp {
     NumberK(usize), // Resumed with the value of CONSTANT[idx] as a Number
     BoxedK(usize), // Resumed with the value of CONSTANT[idx], as its Boxed bits
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
+    GetBlockKeeping(Pc, usize), // As GetBlock, the jump keeping STACK[idx]'s type, which the
+                                // instruction jumping wrote
     NativeWindowArgs(usize, usize, usize), // For CALL A B C: resumed with WindowArgs if STACK[A] is
                                            // a native with a window op for the call, else Failed.
                                            // See Note [Native windows]
@@ -657,7 +659,10 @@ pub const UNKNOWN_RETURN: u32 = (1 << crate::vm::EFFECTS_SHIFT) - 1;
 //
 // A call inside an instruction (a generic for's of its iterator) continues where the call left its
 // generator: the code after it is the generator, suspended at the call, resumed in the context the
-// return gives, as the code after any other call is a version of the next pc (`Rest`).
+// return gives, as the code after any other call is a version of the next pc (`Rest`). Such a call
+// is not inlined while its callee's returns can give the instruction contexts that differ only in
+// what the callee learned on rarer paths (`INLINE_RESUMES`): it continues straight after its
+// return.
 
 /// A TAILCALL's site: the context it is laid out from, its pc, A and B,
 /// whether its function closes upvalues and is vararg, and that function's
@@ -1163,6 +1168,8 @@ struct InlineCall {
 
 /// How many inlined calls deep code can be. See Note [Inlined calls].
 pub(crate) const MAX_INLINE_DEPTH: u8 = 2;
+/// Whether a call inside an instruction is inlined. See Note [Call continuations].
+const INLINE_RESUMES: bool = false;
 /// The most an inlined callee's code costs, less its credit. See Note [Inlined calls].
 const MAX_INLINE_COST: usize = 48;
 /// The credit for each guard of an inlined callee's code the caller's facts can stand for. See Note
@@ -1532,6 +1539,15 @@ fn forgotten(ctype: &CType) -> bool {
 fn forgets(ctx: &Context, live: usize) -> bool {
     (live..ctx.types.len()).any(|idx| forgotten(&ctx.types[idx]) || ctx.fragile.iter().any(|fact| !fact.survives(Effect::Write(idx))))
 }
+
+// Note [Jumped-to contexts]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~
+// A jump forgets what it knows of the registers holding no local in scope at its target, so that
+// paths differing only in temporaries they are done with share the target's version. A temporary
+// can be live across a jump, though: a LOADBOOL that skips the next instruction writes the
+// register its pair's other LOADBOOL does, whose path falls through to the same target knowing its
+// type, and what the target does with it (return it, pass it) needs it. Such a jump keeps the type
+// of the register its instruction wrote, so both ways in agree.
 
 /// Forget, for a jump to a target where the registers from `live` on hold no
 /// local, those registers' types and the fragile facts about them.
@@ -3823,7 +3839,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let live = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
         let mut jumping = ctx.clone();
         forget_dead(owner, &mut jumping, live);
-        assert!(entered.accepts(&jumping), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
+        // A jump may keep a register it wrote (`GetBlockKeeping`).
+        assert!(entered.accepts(&jumping) || entered.accepts(ctx), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
         target
     }
 
@@ -3840,7 +3857,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// every register not holding a local in scope there (`forgotten`), and the
     /// fragile facts about them, and which array a value of known type was
     /// loaded from, which lets paths that differ only in them share the target's
-    /// version.
+    /// version. See Note [Jumped-to contexts].
     fn jumping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
         let in_scope = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(dest_pc);
         if let Some(in_scope) = in_scope.filter(|&in_scope| forgets(&ctx, in_scope)) {
@@ -5693,6 +5710,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     let call_block = self.new_block(pc.0);
                                     self.blocks[call_block.0].context = Some(calling.clone());
                                     self.versions.get_mut(&self.proto).unwrap().insert((pc, calling.clone()), call_block);
+                                    #[cfg(feature = "tracing")]
+                                    {
+                                        let context = calling.tostring(owner);
+                                        crate::tracing::instant("spec", "block", &[
+                                            ("block", call_block.0.into()),
+                                            ("line", self.traced_line(owner).into()),
+                                            ("pc", pc.0.into()),
+                                            ("context", context.as_str().into()),
+                                        ]);
+                                    }
                                     self.end_block(block_id);
                                     self.blocks[block_id.0].instructions.push(Residual::Jump(call_block));
                                     call_block
@@ -5709,7 +5736,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 let rest = Rest::Resume(at, Rc::new(move |vm: &mut Specializer, owner: &mut Owner, ctx: Rc<Context>| {
                                     vm.subblock(owner, at, ctx, suspended.clone(), ResumeArg::Start)
                                 }));
-                                let continuation = before.map(|(before, captured)| (before, captured, rest));
+                                let continuation = before.filter(|_| INLINE_RESUMES).map(|(before, captured)| (before, captured, rest));
                                 (After::Block(self.subblock(owner, at, ctx, coro.clone(), ResumeArg::Start)), continuation)
                             } else {
                                 // A Lua callee's return also chooses a version of its own. See
@@ -5814,6 +5841,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // stack; this should probably push a thunk which compiles the block
                     // instead of a jump
                     let jumping = self.jumping(owner, ctx.clone(), dest_pc);
+                    arg = ResumeArg::BlockId(self.version(owner, dest_pc, jumping));
+                },
+                CoroutineState::Yielded(YieldOp::GetBlockKeeping(dest_pc, kept)) => {
+                    // The register the jump's own instruction wrote, which the other way to the
+                    // target holds the same type in. See Note [Jumped-to contexts].
+                    let mut jumping = self.jumping(owner, ctx.clone(), dest_pc);
+                    if jumping.types[kept] != ctx.types[kept] {
+                        Rc::make_mut(&mut jumping).set_types(owner, vec![(kept, ctx.types[kept].clone())]);
+                    }
                     arg = ResumeArg::BlockId(self.version(owner, dest_pc, jumping));
                 },
                 CoroutineState::Yielded(YieldOp::Jump(dest_block)) => {
