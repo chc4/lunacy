@@ -749,6 +749,41 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
     })
 }
 
+/// `jit.learn`'s generator: for `learn(t)` of a table, keeping a result or none, what the context
+/// can know of `t`'s fields is learned once, when the code first runs, before any code needs it:
+/// a hash key for each string key it then has, with its field's type, and each field holding a
+/// table, its array part's kind, each guarded as a load of it would guard it, the call's own slot
+/// the field loaded into, as it is dead until the result is moved there. Returns `t`; any other
+/// call is the native's, which does too.
+#[cfg(feature = "magic")]
+fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{Kind, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 2 && c <= 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
+            if let ResumeArg::Keys(keys) = (yield YieldOp::Learn(a + 1)) {
+                for i in 0..keys.len() {
+                    if let ResumeArg::HashRef(href, kind) = (yield YieldOp::HashKeyNamed(a + 1, keys[i].clone(), true)) {
+                        yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::GetTableHref::new(href.0, &[a])));
+                        yield YieldOp::FieldType(a, href);
+                        if kind == Kind::Of(LType::Table) {
+                            yield YieldOp::LearnKind(a);
+                        }
+                    }
+                }
+            }
+            if c == 2 {
+                let ResumeArg::Type(ctype) = (yield YieldOp::Typeof(a + 1)) else { unreachable!() };
+                yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::Move::new(&[a + 1, a])));
+                yield YieldOp::SetCTypes(vec![(a, ctype)]);
+                yield YieldOp::Copy(a, a + 1);
+            }
+            return ResumeArg::Start;
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
 /// `string.byte`'s generator: for `byte(s, i, j)` keeping one to four results, of a string and
 /// integer positions, its results read where they are in range, as integers; any other call is
 /// the native's. See Note [Native generators].
@@ -1146,6 +1181,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     let jit_lib = module(intern, vec![
         ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
         ("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])),
+        ("learn", native!(pure generator: learn_generator, |owner, args| vec![arg(&args, 0)])),
     ]);
 
     MODULES.with_borrow_mut(|modules| {

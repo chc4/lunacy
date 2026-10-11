@@ -14,6 +14,8 @@ local M = {}
 
 -- lunacy's `jit.promote`, where the Lua has it. See `eval`.
 local promote = jit and jit.promote
+-- lunacy's `jit.learn`: what the specializer can know of a table's fields, learned once.
+local learn = jit and jit.learn
 
 -- A machine is a table of its state: its RAM, `ram`, its stacks, `wst` and
 -- `rst`, the device hooks `dei` and `deo`, and the tables its operations read,
@@ -660,6 +662,7 @@ end
 local eval
 if promote then
   function eval(m, addr)
+    learn(m)
     local ram, wst, rst, op, keep, ret = m.ram, m.wst, m.rst, m.op, m.keep, m.ret
     local pc = addr
     repeat

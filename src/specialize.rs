@@ -324,6 +324,11 @@ pub enum YieldOp {
                     // Note [Fragile information]
 
     HashKey(usize, usize, bool), // Looks up or allocates an HREF for STACK[idx][key]; down its `__index` chain if true (a load). See Note [Table metatables]
+    HashKeyNamed(usize, LConstant<'static, 'static>, bool), // `HashKey` of a key known by its value
+    Learn(usize), // Resumed with Keys: the string keys of STACK[idx]'s table, once the code runs. See
+                  // `jit.learn` in `library`
+    LearnKind(usize), // Resumed with Matched once the context knows STACK[idx]'s table's array
+                      // part's kind, found out at runtime, if it is of one; else Failed
     IsKey(usize, &'static [u8]), // Whether CONSTANT[k] is the string of these bytes: Matched, else Failed
     UpdateHashRef(HashRef, Option<LType>), // Update the type of HREF to a new type, if known
     GlobalCache(usize), // Resumed with a Cache for global CONSTANT[k]. See
@@ -593,6 +598,8 @@ pub enum ResumeArg {
     WindowArgs(usize, CType),
     /// An upvalue's cell, and whether it holds the upvalue's value. See Note [Upvalue cells].
     Cell(usize, bool),
+    /// A table's string keys. See `jit.learn` in `library`.
+    Keys(Rc<[LConstant<'static, 'static>]>),
 }
 
 // Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
@@ -1093,7 +1100,7 @@ windowed!(frame Arrive, [ac: u64], [A: Count, C: Count], |owner, state, base| ()
 pub type Pc = usize;
 /// Where in an instruction a generator is: see Note [Subblocks].
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
-pub struct SubPc(usize, usize);
+pub struct SubPc(usize, u128);
 
 impl SubPc {
     pub fn new(pc: Pc) -> Self {
@@ -1103,11 +1110,11 @@ impl SubPc {
         Self::new(self.0 + 1)
     }
     fn next_true(&self) -> Self {
-        assert!(self.1 < (1<<32));
+        assert!(self.1 < (1 << 126));
         Self(self.0, (self.1 << 1) | 1)
     }
     fn next_false(&self) -> Self {
-        assert!(self.1 < (1<<32));
+        assert!(self.1 < (1 << 126));
         Self(self.0, self.1 << 1)
     }
 }
@@ -4774,6 +4781,59 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
+    /// The thunk a `Learn` of `slot` ends its block in: forced, the code after it with the string
+    /// keys of the table there then, in order. See `jit.learn` in `library`.
+    fn make_learn_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table") };
+            let mut keys: Vec<LConstant<'static, 'static>> = tab.ro(owner).hash.keys().filter_map(|key| match key.boxed().unbox() {
+                // As the generator's constants, the intern arena outlives the code.
+                LValue::InternedString(name) => Some(unsafe { core::mem::transmute::<LConstant<'_, '_>, LConstant<'static, 'static>>(crate::chunk::Constant::String(name)) }),
+                _ => None,
+            }).collect();
+            keys.sort_by(|a, b| match (a, b) {
+                (crate::chunk::Constant::String(a), crate::chunk::Constant::String(b)) => a.as_bytes().cmp(b.as_bytes()),
+                _ => std::cmp::Ordering::Equal,
+            });
+            let rest = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Keys(keys.into()));
+            vm.jump_thunk(block_id, thunk_pc, rest);
+        })))
+    }
+
+    /// The thunk a `LearnKind` of `slot` ends its block in: forced on a table whose array part is of
+    /// one kind, a guard of it, past which the context knows it; else the code after it, knowing
+    /// nothing more. See `jit.learn` in `library`.
+    fn make_learn_kind_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table's field") };
+            let kind = tab.ro(owner).kind;
+            const TYPES: [LType; 8] = [LType::Nil, LType::Bool, LType::String, LType::Closure, LType::Table, LType::Integer, LType::Double, LType::Userdata];
+            let Some(of) = TYPES.into_iter().find(|t| t.bit() == kind).filter(|&t| t != LType::Nil) else {
+                let rest = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
+                vm.jump_thunk(block_id, thunk_pc, rest);
+                return;
+            };
+            let test: Rc<dyn Window> = Rc::new(KindIs::new(of, &[slot]));
+            // In place, unless the thunk's JIT code can only be patched to a jump. See Note
+            // [Thunk patching].
+            let block = if vm.compiled(block_id) {
+                let guard_block = vm.new_block(pc.0);
+                vm.jump_thunk(block_id, thunk_pc, guard_block);
+                vm.blocks[guard_block.0].instructions.push(Residual::GuardDynamic(test));
+                guard_block
+            } else {
+                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test);
+                block_id
+            };
+            let mut known = (*thunk_ctx).clone();
+            known.learn_kind(Root::Slot(slot as u16), Kind::Of(of));
+            let pass = vm.subblock(owner, pc.next_true(), Rc::new(known), thunk_coro.clone(), ResumeArg::Matched);
+            let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
+            vm.blocks[block.0].instructions.push(Residual::Thunk(fail));
+            vm.blocks[block.0].instructions.push(Residual::Jump(pass));
+        })))
+    }
+
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
@@ -5962,14 +6022,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let constant = unsafe { &(&(*proto).constants.items)[k] };
                     arg = if matches!(constant, crate::chunk::Constant::String(s) if s.as_bytes() == name) { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
-                CoroutineState::Yielded(YieldOp::HashKey(place, key, chains)) => {
+                CoroutineState::Yielded(ref yielded @ (YieldOp::HashKey(..) | YieldOp::HashKeyNamed(..))) => {
                     let proto = self.proto;
-                    // The constant key.
-                    let k_const = ((key & 0x100) != 0).then_some(key & 0xff);
+                    // The key: a constant, or one known by its value.
+                    let (place, chains, named) = match yielded {
+                        YieldOp::HashKey(place, key, chains) => (*place, *chains, ((key & 0x100) != 0).then(|| unsafe { (&(*proto).constants.items)[key & 0xff].clone() })),
+                        YieldOp::HashKeyNamed(place, key, chains) => (*place, *chains, Some(key.clone())),
+                        _ => unreachable!(),
+                    };
                     // Only cache string keys
-                    let Some(k_val) = k_const
-                        .map(|k| unsafe { &(&(*proto).constants.items)[k] })
-                        .filter(|k_val| matches!(k_val, crate::chunk::Constant::String(_)))
+                    let Some(k_val) = named.as_ref().filter(|k_val| matches!(k_val, crate::chunk::Constant::String(_)))
                     else {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
@@ -6215,6 +6277,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk = Residual::Thunk(self.make_dynamic_thunk(block_id, coro.clone(), test, pc, ctx.clone()));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
+                        return None;
+                    }
+                },
+                CoroutineState::Yielded(YieldOp::Learn(slot)) => {
+                    let thunk = self.make_learn_thunk(block_id, coro.clone(), slot, pc, ctx.clone());
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                    return None;
+                },
+                CoroutineState::Yielded(YieldOp::LearnKind(slot)) => {
+                    if ctx.kind(Root::Slot(slot as u16)).is_some() {
+                        pc = pc.next_true();
+                        arg = ResumeArg::Matched;
+                    } else {
+                        let thunk = self.make_learn_kind_thunk(block_id, coro.clone(), slot, pc, ctx.clone());
+                        self.end_block(block_id);
+                        self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
                         return None;
                     }
                 },
