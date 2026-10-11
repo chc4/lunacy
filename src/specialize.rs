@@ -1976,7 +1976,7 @@ pub struct Context {
 //
 // A promote ends its block in a thunk. Forced, it guards its argument equal to the integer it holds
 // then (`EqualsK`), and the code past the guard is a version for that value: the context records
-// it in `promoted`, by the promote's pc. The guard's other way promotes again, so a site seeing
+// it in `promoted`, by the promote's pc, and that the argument's slot holds it, as a constant. The guard's other way promotes again, so a site seeing
 // several values tests them in turn, up to `PROMOTE_VALUES`, past which it returns its argument
 // unspecialized. A promote whose argument the context knows is a constant needs no guard.
 //
@@ -4542,8 +4542,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test);
                 block_id
             };
+            // Past the guard, the slot holds the value too.
             let mut promoted = thunk_ctx.clone();
             Rc::make_mut(&mut promoted).promote(pc.0, value);
+            Rc::make_mut(&mut promoted).introduce(Fact { fragile: Fragile::Constant { slot, value }, origins: None });
             let pass = vm.subblock(owner, pc.next_true(), promoted, thunk_coro.clone(), ResumeArg::Integer(value));
             let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
             vm.blocks[block.0].instructions.push(Residual::Thunk(fail));
