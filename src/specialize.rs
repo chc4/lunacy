@@ -2772,6 +2772,16 @@ impl Context {
         for copy in copies {
             self.introduce(copy);
         }
+        // A copy of a table is checked where the table is.
+        if let Effect::Move { from, to } = effect {
+            for hkey in &mut self.hkeys {
+                if hkey.checked(from) {
+                    hkey.check(to);
+                } else if let Some(checked) = hkey.hazards.get_mut(to) {
+                    *checked = false;
+                }
+            }
+        }
         self.inlined(Effects::of(effect));
     }
 
