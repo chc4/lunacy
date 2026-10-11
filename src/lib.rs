@@ -31,6 +31,7 @@ pub mod perf;
 // The specializer (lazy basic-block versioning) runs every closure, driving
 // each instruction's generator (`generators`); the native code generator
 // (feature `jit`) compiles its hot blocks.
+pub mod classes;
 pub mod specialize;
 pub mod generators;
 pub mod window;

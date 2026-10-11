@@ -3,8 +3,9 @@
 graphs through frame pointers (as `just flamegraph` records them), the share of
 samples in
 
-  jit          JIT code (`jit_block_*`, named by the `perf` feature's map), or
-               anything it called: helpers, natives, window ops it calls
+  jit          JIT code (`jit_block_*` and a region's other code, `jit_region_*`,
+               thunk stubs and the snapshot code, named by the `perf` feature's
+               map), or anything it called: helpers, natives, window ops it calls
   jit (unnamed) a sample in code with no symbol, with no JIT block under it:
                JIT code the map doesn't name (its entry and exit)
   interpreter  the specializer running residuals (`Specializer::run`), and
@@ -14,7 +15,7 @@ samples in
   contract     the contraction: finding a version's duplicates, rebuilding
                origins and trimming what they replaced, evicting versions
   jit compile  compiling blocks to machine code (`Specializer::jit_compile`)
-  gc           the collector
+  gc           the collector, and `collectgarbage` running a full collection
   other        anything else: startup, loading the chunk, teardown
 
 A sample goes to the first of gc, jit compile, specialize or contract, jit,
@@ -25,12 +26,9 @@ specializing, a version's search for duplicates is contracting. A sample in the 
 the user code that entered it; `kernel` is the share of samples in the kernel,
 across the tiers.
 
-Frame pointers name a sample's callers but for the innermost: a sample on a
-function's `ret`, after it restored its caller's frame pointer, has its caller
-dropped from its chain. When the caller is JIT code, the sample goes to the
-tier below it (the interpreter, which entered the JIT code); the `ret` of a
-function JIT code calls often (e.g. `Tc::set` on an append) can move a
-noticeable share. `perf script -F ip,sym` shows where a tier's samples are.
+A sample whose chain returns to the interpreter where JIT code does is JIT
+time, though no frame of it names the JIT code (one on the `ret` of a function
+it called). `perf script -F ip,sym` shows where a tier's samples are.
 
     tools/tiers.py [--freq HZ] perf-a.data [perf-b.data ...]
 
@@ -46,7 +44,7 @@ import sys
 from collections import Counter
 
 TIERS = ['jit', 'jit (unnamed)', 'interpreter', 'specialize', 'contract', 'jit compile', 'gc', 'other']
-GC = re.compile(r'lunacy::gc::')
+GC = re.compile(r'lunacy::gc::|lunacy::vm::collectgarbage\b')
 JIT_COMPILE = re.compile(r'Specializer>::jit_compile\b')
 SPECIALIZE = re.compile(
     r'Specializer>::(compile|compile_one|subblock|version|block|new_block|make_\w+|inline_cost)\b'
@@ -54,7 +52,7 @@ SPECIALIZE = re.compile(
     # closure inside it, `emit_*::{closure#0}::{closure#N}`, which runs later.
     r'|lunacy::generators::emit_\w+::\{closure#0\}(\s|$)')
 CONTRACT = re.compile(r'Specializer>::(contract|contractible|contract_joined|rebuild_queued|trim|evict)\b')
-JIT = re.compile(r'\bjit_block_\d+')
+JIT = re.compile(r'\bjit_(block|region)_\d+|\bjit_thunk_stub\b|\bjit_snapshot_code\b')
 INTERPRETER = re.compile(r'Specializer>::run\b')
 
 
@@ -85,7 +83,17 @@ def samples(path):
         yield frames
 
 
-def tier(frames):
+def jit_returns(path):
+    """Where JIT code returns to in the interpreter."""
+    returns = set()
+    for frames in samples(path):
+        jit = [i for i, (ip, sym) in enumerate(frames) if ip < KERNEL and JIT.search(sym)]
+        if jit and jit[-1] + 1 < len(frames):
+            returns.add(frames[jit[-1] + 1][0])
+    return returns
+
+
+def tier(frames, returns=frozenset()):
     """The sample's tier, by its user-space frames."""
     user = [sym for ip, sym in frames if ip < KERNEL]
     if not user:
@@ -99,7 +107,7 @@ def tier(frames):
             return 'contract'
         if SPECIALIZE.search(f):
             return 'specialize'
-    if any(JIT.search(f) for f in user):
+    if any(JIT.search(f) for f in user) or any(ip in returns for ip, _ in frames[1:]):
         return 'jit'
     if user[0].startswith('[unknown]'):
         return 'jit (unnamed)'
@@ -120,8 +128,9 @@ def main():
     times = []
     for path in args:
         counts, kernel = Counter(), 0
+        returns = jit_returns(path)
         for frames in samples(path):
-            counts[tier(frames)] += 1
+            counts[tier(frames, returns)] += 1
             kernel += frames[0][0] >= KERNEL
         total = sum(counts.values())
         row = '  '.join(f'{100 * n / total:>12.1f}%' for n in [counts[t] for t in TIERS] + [kernel])

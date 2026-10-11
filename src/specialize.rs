@@ -7,7 +7,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 
-use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Location, Upvalue};
+use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Location, Return, Upvalue};
+use crate::classes::{ClassFact, Label, Loc, Root, Target};
 use qcell::{LCell, LCellOwner};
 use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{Tc, Vm};
@@ -238,6 +239,8 @@ pub enum YieldOp {
     NumberK(usize), // Resumed with the value of CONSTANT[idx] as a Number
     BoxedK(usize), // Resumed with the value of CONSTANT[idx], as its Boxed bits
     GetBlock(Pc), // Resumed with the BlockId for calling the given PC with the current types
+    GetBlockKeeping(Pc, usize), // As GetBlock, the jump keeping STACK[idx]'s type, which the
+                                // instruction jumping wrote
     NativeWindowArgs(usize, usize, usize), // For CALL A B C: resumed with WindowArgs if STACK[A] is
                                            // a native with a window op for the call, else Failed.
                                            // See Note [Native windows]
@@ -280,14 +283,9 @@ pub enum YieldOp {
                            // integer whose fact isn't introduced, else as an integer. See
                            // Note [Contraction]
     HoldsK(usize, usize), // STACK[idx] was just loaded with CONSTANT[k]. See Note [Widening]
-    Quotient(usize, usize, i32), // STACK[idx] was just computed as STACK[of] / by: resumed with
-                                 // Matched where the fact says so, Failed where it was
-                                 // contracted. See Note [Quotients]
     Versions, // Resumed with Integer, once the code runs: the most versions the running function
               // has at the point of a version the code is reached from. See `jit.versions` in
               // `library`
-    QuotientOf(usize), // Resumed with Quotient if a fact says STACK[idx] holds a quotient, which
-                       // the code then relies on, else Failed. See Note [Quotients]
     Encoding(Fits), // An optimistic integer op is about to be laid out, whose result fits for the
                     // values its operands have if the test does: resumed, once the op first runs,
                     // with the double type to compute it in the double encoding instead, else with
@@ -298,11 +296,11 @@ pub enum YieldOp {
                       // knows it, else Failed. See Note [Array kinds]
     IsElementOf(usize, usize), // Resumed with Matched if STACK[a] was loaded from STACK[b]'s array
                                // part, else Failed. See Note [Array kinds]
-    ArrayType(usize, Subject), // Inform the executor that STACK[a] was loaded from the array part
-                               // of the table in a subject (as `Subject` answered before the
-                               // load): its type is the array's kind, if known. See Note [Array kinds]
-    Subject(usize), // Resumed with Subject: the running closure's upvalue STACK[idx] holds the
-                    // value of, if the context knows, else the slot. See Note [Upvalue paths]
+    ArrayType(usize, Root), // Inform the executor that STACK[a] was loaded from the array part
+                            // of the table in a root (as `Subject` answered before the load): its
+                            // type is the array's kind, if known. See Note [Array kinds]
+    Subject(usize), // Resumed with Subject: the upvalue STACK[idx] holds the value of, if the
+                    // context knows, else the slot. See Note [Upvalue paths]
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
                                // See Note [Field types]
     LoadGlobal(usize, usize), // STACK[idx] was just loaded with global CONSTANT[k]. See Note [Field facts]
@@ -313,6 +311,15 @@ pub enum YieldOp {
                          // See Note [Fragile information]
     UpvalueCell(usize), // Resumed with UPVALUE[idx]'s cell, and whether it holds the value, as
                         // Cell; else Failed, if it has none. See Note [Upvalue cells]
+    Captures(usize, Vec<(Opcode, usize)>), // Inform the executor that the closure in STACK[a]
+                                           // captured these upvalues, as CLOSURE's pseudo-
+                                           // instructions name them. See Note [Upvalue paths]
+    Close(usize), // Inform the executor that the upvalues open into STACK[a] and up are closed.
+                  // See Note [Upvalue paths]
+    UpvalueHolds(usize, usize), // Inform the executor that UpValue[a] holds STACK[b]'s value. See
+                                // Note [Upvalue paths]
+    Copy(usize, usize), // Inform the executor that STACK[a] holds STACK[b]'s value. See Note
+                        // [Value classes] in `classes`
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
                     // Note [Fragile information]
 
@@ -553,7 +560,7 @@ impl std::fmt::Debug for Fits {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResumeArg {
-    Subject(Subject),
+    Subject(Root),
     Start,
     Matched,
     MatchedConst(usize),
@@ -571,8 +578,6 @@ pub enum ResumeArg {
     WindowArgs(usize, CType),
     /// An upvalue's cell, and whether it holds the upvalue's value. See Note [Upvalue cells].
     Cell(usize, bool),
-    /// The integer slot and positive constant a slot holds the quotient of. See Note [Quotients].
-    Quotient(usize, i32),
 }
 
 // Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
@@ -808,6 +813,13 @@ pub const UNKNOWN_RETURN: u32 = (1 << crate::vm::EFFECTS_SHIFT) - 1;
 // made up front would take one of the pc's versions whether or not anything ever enters it, and
 // once the pc has `MAX_VERSIONS`, accept the contexts its continuations reach it with, knowing
 // nothing of them. A native call doesn't return this way, and never reaches such a guard.
+//
+// A call inside an instruction (a generic for's of its iterator) continues where the call left its
+// generator: the code after it is the generator, suspended at the call, resumed in the context the
+// return gives, as the code after any other call is a version of the next pc (`Rest`). Such a call
+// is not inlined while its callee's returns can give the instruction contexts that differ only in
+// what the callee learned on rarer paths (`INLINE_RESUMES`): it continues straight after its
+// return.
 
 /// A TAILCALL's site: the context it is laid out from, its pc, A and B,
 /// whether its function closes upvalues and is vararg, and that function's
@@ -1003,14 +1015,14 @@ windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64],
 // window: the JIT code nils the callee's frame. See Notes [Inlined calls] and [Count case
 // analysis].
 windowed!(ShiftFrame, [a: u64, b: u64, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
-    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false);
+    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false, 0);
 });
 
 // `ShiftFrame` as a frame op, nilling the callee's frame past its arguments, as many as there are
 // or up to the top. See Notes [Inlined calls] and [Count case analysis].
 windowed!(frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| () {
     let callee = state.vals[state.base + A.lift(a)];
-    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, true);
+    state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, true, 0);
 });
 
 // `unshift_frame` without the callstack's entry, for an inlined callee's RETURN A B (`a` and `b`
@@ -1152,10 +1164,10 @@ pub enum Residual {
     /// continuations].
     Arrived { a: u16, c: u16, returned: u16 },
     LuaGuard { idx: usize, ptr: *const () },
-    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`, and
-    /// the callee's upvalue cells its entry knows hold their values (Note [Upvalue cells]). See
-    /// Note [Inlined calls].
-    Inline { a: u16, b: u16, stack: u8, cells: u32 },
+    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`: the
+    /// callee's upvalue cells its entry knows hold their values (Note [Upvalue cells]), and whose
+    /// returns continue compiling `continuation`. See Note [Inlined calls].
+    Inline { a: u16, b: u16, stack: u8, cells: u32, continuation: *const Continuation },
     /// An inlined callee's RETURN A B, which closes its frame's open upvalues if `closes`: its
     /// results to the call's R(A), `call`, if `moves`, and the caller's frame back. See Note
     /// [Inlined calls].
@@ -1180,6 +1192,10 @@ pub enum CallEntry {
 // type; past `MAX_VERSIONS` functions, the site makes a generic call. A site whose context knows
 // its callee needs no guard.
 //
+// A Lua call is laid out in a version of its own point for the context at the call, which every
+// path reaching it in that context jumps to, as paths rejoin after a guard: they share the one
+// call, its continuation, and a callee inlined for it (Note [Inlined calls]).
+//
 // The callee is entered in a version specialized to what the caller knows of the arguments: the
 // parameters have the arguments' types, and the unpassed ones are nil. Facts that the caller knows
 // of its own frame (hash keys, fragile facts, etc) says nothing of the callee's, and are not
@@ -1197,11 +1213,22 @@ pub enum CallEntry {
 // A call of a small Lua function can compile the callee's code into its caller's. The call's
 // continuation, forced once the call has returned, decides to: from then on the call site jumps to
 // the callee's code in place of its call. That code is compiled from the context the caller had at
-// the call, renumbered from the callee's frame's base, and carries the caller's context before the
-// call with it. Each of the callee's returns continues compiling the caller's code after the call
-// from that context, with the results' types, less what the callee's code may have falsified (its
-// effects, applied as a continuation applies a callee's; Note [Call effects]), with no guard on the
-// return between.
+// the call, renumbered from the callee's frame's base, and names the call, by where it is in its
+// caller's code, so it is the callee's code for that call alone. What the code after the call is
+// compiled from, the caller's context before the call and how it continues, is kept in the inlined
+// call's entry in the callstack (`Continuation`). Each of the callee's returns ends in a thunk which,
+// run, continues compiling the caller's code after the call from that context, with the results'
+// types, less what the callee's code may have falsified (its effects, applied as a continuation
+// applies a callee's; Note [Call effects]), with no guard on the return between, and becomes the
+// return and a jump to that code. What the callee learns of a value it was passed, as a table's
+// array kind, the caller's places holding it know on the return: the value of each argument is a
+// place of the callee's code (`Root::Arg`) that none of it writes.
+//
+// The call making a generic for's iterator (`for k, v in f(t) do`) inlines from its first layout,
+// before it has run: the loop is compiled from what the code after it knows, and a function whose
+// loop runs once (its only call making the iterator) has no later call to learn from. Inlined, the
+// iterator's closure comes back knowing its upvalues (Note [Upvalue paths]), and so does its own
+// code inlined into the loop.
 //
 // A function's frames hold the frames of the calls inlined into it, to any depth: its frame size
 // grows with each call inlined, so every frame of it a call makes, and the collector's live
@@ -1249,23 +1276,79 @@ pub enum CallEntry {
 // callee runs in the caller's context: a guard of a value loaded from an upvalue (Note [Upvalue
 // paths]), and a hash key's guard. A call inlines if what is left is within `MAX_INLINE_COST`.
 
-/// An inlined call, for its callee's code: the caller's context before the call, its captured
-/// slots below the call, and its prototype; the pc after the call, its A and C; what the callee's
-/// code may have done to the caller so far; and how many inlined calls deep it is. See Note
-/// [Inlined calls].
+/// A field's or a global's name, hashed: what a store with a key of that name may change. See
+/// Note [Field facts].
+fn name_hash(name: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// An inlined call, for its callee's code: where its call is in its caller's code, the caller's
+/// prototype, the call's A, what the callee's code may have done to the caller so far, and for
+/// each parameter passed a table the caller holds below the call, the caller's slot holding it.
+/// See Note [Inlined calls].
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct InlineFrame {
-    pub caller: Context,
-    pub captured: Rc<[usize]>,
+    pub call: Location,
     pub proto: LProto<'static, 'static>,
-    pub after: Pc,
     pub a: u16,
-    pub c: u16,
     pub effects: Effects,
-    pub depth: u8,
-    /// The upvalue the callee's closure was loaded from, if the caller knows. See Note [Upvalue
-    /// paths].
-    pub closure: Option<UpvaluePath>,
+    pub passed: SmallVec<[(u16, u16); 2]>,
+}
+
+impl InlineFrame {
+    /// The caller's slot holding the table parameter `param` was passed, if it still holds it in
+    /// `ctx`: a write to it forgets the shape it entered with.
+    fn owner(&self, ctx: &Context, param: usize) -> Option<usize> {
+        let (_, owner) = self.passed.iter().find(|&&(p, _)| p as usize == param)?;
+        matches!(ctx.slot(param), CType::Shape(..)).then_some(*owner as usize)
+    }
+}
+
+/// The code after an inlined call, which its callee's returns continue compiling: the caller's
+/// prototype and context before the call, its captured slots below the call, the call's A and C,
+/// a root of the caller's still holding the callee's closure (Note [Upvalue paths]), and how the
+/// code after the call is compiled. Kept for as long as the specializer is, in the inlined call's entry in the
+/// callstack by its address. See Note [Inlined calls].
+pub struct Continuation {
+    proto: LProto<'static, 'static>,
+    caller: Context,
+    captured: Rc<[usize]>,
+    a: u16,
+    c: u16,
+    closure: Option<Root>,
+    /// The places below the call holding each argument's value, by the argument.
+    args: Vec<(u8, Root)>,
+    rest: Rest,
+}
+
+/// How the code after a call is compiled, from the context its return gives: the next pc's
+/// version, or for a call inside its instruction, the generator suspended at the call, resumed.
+/// See Note [Call continuations].
+#[derive(Clone)]
+pub enum Rest {
+    Next(Pc),
+    Resume(SubPc, Rc<dyn Fn(&mut Specializer, &mut Owner, Rc<Context>) -> BlockId>),
+}
+
+impl Rest {
+    fn block(&self, vm: &mut Specializer, owner: &mut Owner, ctx: Rc<Context>) -> BlockId {
+        match self {
+            Rest::Next(pc) => vm.version(owner, *pc, ctx),
+            Rest::Resume(_, resume) => resume(vm, owner, ctx),
+        }
+    }
+
+    /// The pc the code after the call is at, for traces.
+    #[cfg(feature = "tracing")]
+    fn pc(&self) -> Pc {
+        match self {
+            Rest::Next(pc) => *pc,
+            Rest::Resume(at, _) => at.0,
+        }
+    }
 }
 
 /// A Lua call laid out, which its continuation may inline: the block and offset of its `LuaCall`,
@@ -1281,6 +1364,8 @@ struct InlineCall {
 
 /// How many inlined calls deep code can be. See Note [Inlined calls].
 pub(crate) const MAX_INLINE_DEPTH: u8 = 2;
+/// Whether a call inside an instruction is inlined. See Note [Call continuations].
+const INLINE_RESUMES: bool = true;
 /// The most an inlined callee's code costs, less its credit. See Note [Inlined calls].
 const MAX_INLINE_COST: usize = 48;
 /// The credit for each guard of an inlined callee's code the caller's facts can stand for. See Note
@@ -1301,24 +1386,27 @@ fn inlining() -> bool {
 /// How many slots past the base of the outermost frame inlining it the frame of code of `ctx` is.
 /// See Note [Inlined calls].
 fn inline_offset(ctx: &Context) -> usize {
-    let mut offset = 0;
-    let mut inline = ctx.inline.as_ref();
-    while let Some(frame) = inline {
-        offset += frame.a as usize + 1;
-        inline = frame.caller.inline.as_ref();
-    }
-    offset
+    ctx.inline.iter().map(|frame| frame.a as usize + 1).sum()
 }
 
 /// The slots past the base of the outermost frame an inlined callee's frame may reach: the JIT's
 /// window names them (`Slots`). See Note [Inlined calls].
 const MAX_INLINE_SLOTS: usize = 256;
 
+/// Whether the call at `pc` in `proto`, of R(A), makes a generic for's iterator: a JMP to a
+/// TFORLOOP of the same A follows it. See Note [Inlined calls].
+fn makes_iterator<C>(proto: &crate::chunk::FunctionBlock<'_, C>, pc: Pc, a: usize) -> bool {
+    let instructions = &proto.instructions.items;
+    let Some(jmp) = instructions.get(pc + 1).filter(|inst| inst.0.Opcode() == Opcode::JMP) else { return false };
+    let target = ((pc + 2) as isize + crate::vm::sBx::unpack(jmp.0) as isize) as usize;
+    instructions.get(target).is_some_and(|inst| inst.0.Opcode() == Opcode::TFORLOOP && crate::vm::ABC::unpack(inst.0).0 as usize == a)
+}
+
 /// Whether a call of R(A) in `caller`, of the context `calling`, can inline `callee`, whatever its
 /// code costs. See Note [Inlined calls].
 fn inlines<C>(calling: &Context, caller: &crate::chunk::FunctionBlock<'_, C>, callee: &crate::chunk::FunctionBlock<'_, C>, a: usize) -> bool {
     inlining()
-        && calling.inline.as_ref().map_or(0, |frame| frame.depth) < MAX_INLINE_DEPTH
+        && calling.inline.len() < MAX_INLINE_DEPTH as usize
         && inline_offset(calling) + a + 1 + callee.max_stack as usize <= MAX_INLINE_SLOTS
         && callee.is_vararg == 0
         && !core::ptr::eq(caller, callee)
@@ -1339,53 +1427,44 @@ impl InlineCost {
 }
 
 /// The context an inlined call in `caller`, of R(A) with operand B, enters the callee `proto`
-/// with: the entry context a call has, and the caller's facts about the callee's arguments,
-/// renumbered from its base, for the inlined call `frame`. See Note [Inlined calls].
+/// with: the entry context a call has, and what the caller knows of the arguments it passes, as
+/// the callee's parameters, and of its closure's upvalues, as the callee's own, for the inlined
+/// call `frame`. See Notes [Inlined calls] and [Upvalue paths].
 fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize, frame: InlineFrame) -> Context {
     let mut entry = entry_context(caller, proto, a, b);
-    let params = a + 1..a + 1 + (proto.param_count as usize).min(entry.types.len());
-    let shifted = |slot: usize| params.contains(&slot).then(|| slot - a - 1);
+    let args = a + 1..a + 1 + (proto.param_count as usize).min(entry.types.len());
+    let shifted = |slot: usize| args.contains(&slot).then(|| slot - a - 1);
     // The caller's hash keys, at their indexes, in the caller's witnesses: a parameter's are its
     // argument's, with its shape, and any other's are the caller's own, which no slot of the
     // callee names. See Note [Inlined calls].
     let slots = entry.types.len();
     entry.hkeys = caller.hkeys.iter().map(|hkey| {
         let mut hkey = hkey.clone();
-        hkey.hazards = (0..slots).map(|slot| params.contains(&(a + 1 + slot)) && hkey.checked(a + 1 + slot)).collect();
+        hkey.hazards = (0..slots).map(|slot| args.contains(&(a + 1 + slot)) && hkey.checked(a + 1 + slot)).collect();
         if !hkey.orphan() {
             hkey.idx = shifted(hkey.idx).unwrap_or(OUTER);
         }
         hkey
     }).collect();
-    for slot in params.clone() {
+    for slot in args.clone() {
         if let CType::Shape(of, hrefs) = caller.slot(slot) && entry.types[slot - a - 1] == CType::Type(of) {
-            // The caller's slot whose table it is, below the call, which has the keys the
-            // callee finds of it as the caller's own on its return.
-            let owner = hrefs.first().map(|href| caller.hkeys[href.0 as usize].idx).filter(|&owner| owner < a);
             entry.types[slot - a - 1] = CType::Shape(of, hrefs);
-            if let Some(owner) = owner {
-                entry.introduce(Fact { fragile: Fragile::Passed { slot: slot - a - 1, owner }, origins: None });
-            }
         }
     }
-    for fact in &caller.fragile {
-        let fragile = match &fact.fragile {
-            Fragile::Constant { slot, value } => shifted(*slot).map(|slot| Fragile::Constant { slot, value: *value }),
-            // See Note [Upvalue paths].
-            Fragile::Kind { table, kind } => table.into_callee(shifted, frame.closure.as_ref()).map(|table| Fragile::Kind { table, kind: *kind }),
-            Fragile::ElementOf { slot, table } => shifted(*slot).zip(table.into_callee(shifted, frame.closure.as_ref())).map(|(slot, table)| Fragile::ElementOf { slot, table }),
-            Fragile::Holds { slot, upvalue } => shifted(*slot).zip(upvalue.into_callee(frame.closure.as_ref())).map(|(slot, upvalue)| Fragile::Holds { slot, upvalue }),
-            Fragile::Upvalue { upvalue, ctype } => upvalue.into_callee(frame.closure.as_ref()).map(|upvalue| Fragile::Upvalue { upvalue, ctype: ctype.clone() }),
-            Fragile::Passed { .. } => None,
-            Fragile::HoldsValue { slot, of } => shifted(*slot).zip(of.into_callee(shifted, frame.closure.as_ref())).map(|(slot, of)| Fragile::HoldsValue { slot, of }),
-            Fragile::Known { of, ctype } => of.into_callee(shifted, frame.closure.as_ref()).map(|of| Fragile::Known { of, ctype: ctype.clone() }),
-            Fragile::Quotient { slot, of, by } => shifted(*slot).zip(shifted(*of)).map(|(slot, of)| Fragile::Quotient { slot, of, by: *by }),
-        };
-        if let Some(fragile) = fragile.filter(|fragile| fragile.slot().is_none_or(|slot| entry.types[slot] != CType::Type(LType::Nil))) {
-            entry.introduce(Fact { fragile, origins: fact.origins.clone() });
-        }
-    }
-    entry.inline = Some(Rc::new(frame));
+    let params = 0..(proto.param_count as usize).min(entry.types.len());
+    let fields: Vec<[Label; 1]> = (0..proto.upval_count).map(|n| [Label::Upvalue(n)]).collect();
+    let map: Vec<(Root, Loc)> = params
+        .filter(|&param| entry.types[param] != CType::Type(LType::Nil))
+        .map(|param| (Root::Slot(param as u16), Loc::root(Root::Slot((a + 1 + param) as u16))))
+        .chain(fields.iter().enumerate().map(|(n, path)| (Root::Upvalue(n as u8), Loc { root: Root::Slot(a as u16), path })))
+        // A callee's globals are its caller's. See Note [Field facts].
+        .chain(caller.values.roots().filter(|root| matches!(root, Root::Global(_))).map(|root| (root, Loc::root(root))))
+        // What it learns of the values it was passed, its return gives its caller. See Note [Inlined
+        // calls].
+        .chain(args.clone().map(|arg| (Root::Arg((arg - a - 1) as u8), Loc::root(Root::Slot(arg as u16)))))
+        .collect();
+    entry.values = caller.closing(0).view(&map);
+    entry.inline = caller.inline.iter().cloned().chain([frame]).collect();
     entry
 }
 /// The context a call in `caller`, of R(A) with operand B, enters the callee
@@ -1691,15 +1770,26 @@ fn forgotten(ctype: &CType) -> bool {
 /// forgets anything of `ctx`: those registers' types (`forgotten`), and the
 /// fragile facts about them.
 fn forgets(ctx: &Context, live: usize) -> bool {
-    (live..ctx.types.len()).any(|idx| forgotten(&ctx.types[idx]) || ctx.fragile.iter().any(|fact| !fact.survives(Effect::Write(idx))))
+    (live..ctx.types.len()).any(|idx| forgotten(&ctx.types[idx]) || ctx.values.has(Root::Slot(idx as u16)))
 }
 
+// Note [Jumped-to contexts]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~
+// A jump forgets what it knows of the registers holding no local in scope at its target, so that
+// paths differing only in temporaries they are done with share the target's version. A temporary
+// can be live across a jump, though: a LOADBOOL that skips the next instruction writes the
+// register its pair's other LOADBOOL does, whose path falls through to the same target knowing its
+// type, and what the target does with it (return it, pass it) needs it; a CLOSURE's jump past its
+// pseudo-instructions leaves its closure in a temporary until it is returned or stored. Such a
+// jump keeps what it knows of the register its instruction wrote: its type, and its value's class
+// (Note [Value classes] in `classes`), so both ways in agree.
+
 /// Forget, for a jump to a target where the registers from `live` on hold no
-/// local, those registers' types and the fragile facts about them.
-fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
-    let dead = (live..ctx.types.len()).filter(|&idx| forgotten(&ctx.types[idx])).map(|idx| (idx, CType::Unknown)).collect();
+/// local, those registers' types and the fragile facts about them, but `kept`'s.
+fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<usize>) {
+    let dead = (live..ctx.types.len()).filter(|&idx| forgotten(&ctx.types[idx]) && Some(idx) != kept).map(|idx| (idx, CType::Unknown)).collect();
     ctx.set_types(owner, dead);
-    for idx in live..ctx.types.len() {
+    for idx in (live..ctx.types.len()).filter(|&idx| Some(idx) != kept) {
         ctx.effect(Effect::Write(idx));
     }
 }
@@ -1761,7 +1851,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // rebuild, and isn't consumed. Where the fact is never used, the code it was carried through
 // is contracted. A whole constant passed to a function, stored into a table or an upvalue, or
 // passed to a native is the integer it was loaded as: a callee's versions, and a table's other
-// values, are out of the load's rebuild's reach.
+// values, are out of the load's rebuild's reach. One a field store takes as its operand is stored
+// as an integer where the field is known to hold integers, so the field keeps its type, and as
+// a double anywhere else, where it may be a double the program writes as a whole number.
 
 // Note [Contraction]
 // ~~~~~~~~~~~~~~~~~~
@@ -1823,20 +1915,6 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // instead of introducing the fact or asking again. An origin is rebuilt once; the fact may be
 // introduced again by other paths, which may be contracted in turn. Each contraction replaces code carrying the fact with code that doesn't, so
 // it ends, and a fact some code finds a use for before its duplicate appears is kept.
-
-// Note [Quotients]
-// ~~~~~~~~~~~~~~~~
-// Lua's `/` is a double's division, so `math.floor(n / k)` divides in doubles and rounds back,
-// though for an integer `n` and a positive whole `k` it is the floored integer division of `n` by
-// `k`, a shift where `k` is a power of two. A division of an integer slot by such a constant
-// introduces a fact that its result's slot holds that quotient, until something writes either
-// slot; `math.floor` of a slot the fact is about computes the floored division from the integer
-// instead, relying on the fact. The division itself is still computed, for any other reader.
-//
-// The fact tells versions apart as a constant's does, so it is introduced from an origin (Note
-// [Contraction]): where no code relies on it before a version without it appears, as where a
-// branch divides and the other doesn't before they meet, it is contracted, and the division
-// rebuilt to introduce nothing.
 
 /// Whether an integer op's overflow rebuilds it to compute in doubles (Note [Optimistic ops]);
 /// set `LUNACY_NO_OVERFLOW_REBUILD` for no rebuild, to compare.
@@ -1959,11 +2037,11 @@ pub struct Context {
     /// The frame's top, as a slot, when the instruction before left it at one
     /// the specializer knows. See Note [Known top].
     pub top: Option<usize>,
-    /// What the specializer assumes and no guard checks, in `Fragile::key`
-    /// order. See Note [Fragile information].
-    pub fragile: SmallVec<[Fact; 2]>,
+    /// What the specializer assumes and no guard checks: what it knows of the values its places
+    /// hold. See Note [Fragile information].
+    pub values: Values,
     /// The inlined call whose callee's frame this is, if it is one. See Note [Inlined calls].
-    pub inline: Option<Rc<InlineFrame>>,
+    pub inline: Vec<InlineFrame>,
     /// The value each promote this path last passed through promoted, by the
     /// promote's pc, in pc order. See Note [Promoted values].
     pub promoted: SmallVec<[(Pc, i32); 2]>,
@@ -2035,7 +2113,8 @@ pub struct Context {
 // visible; where the closed world can't be shown to hold, such as across code the specializer
 // doesn't see all of it is dropped. The known top (Note [Known top]) is information of this kind.
 //
-// It is in the context (`Context::fragile`), so it is part of every block's key. A block compiled
+// It is in the context, as what is known of the values its places hold (`Context::values`; Note
+// [Value classes] in `classes`), so it is part of every block's key. A block compiled
 // relying on a fact is only entered by paths that established it and kept it since, as any path
 // reaching a block with an equal context shares it. It is per activation: a function's entry block
 // has none, and a call's continuation only what the callee's effects keep (Note [Call effects]).
@@ -2044,13 +2123,13 @@ pub struct Context {
 // slots its accesses say it writes (`Effect::Write`), an exec those it says it writes, else any
 // slot (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op or a pure native's
 // (Note [Library natives] in `library`) is `Effect::Opaque`, and what a residual can't show a
-// yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`, and a MOVE's `Effect::Move`, by
-// which each fact about the moved value is known of its copy too, `Fragile::moved`). A store into
-// a table is always yielded as one, `Effect::ArrayStore` or the hash hazards it sets: an exec's
-// writes are of its own frame, and a caller sees only the store (Note [Call effects]).
+// yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A store into a table is always
+// yielded as one, `Effect::ArrayStore` or the hash hazards it sets: an exec's writes are of its own
+// frame, and a caller sees only the store (Note [Call effects]).
 //
-// A kind of fact says which effects it survives (`Fragile::survives`); a new kind is a variant,
-// its `key` and `survives`, and where it is established.
+// An effect falsifies what it writes (`Context::effect`): a written place moves to a class of its
+// own, and a domain of facts says which other effects its facts survive. A new domain is a variant
+// of `Known`, its key, and where it is established.
 //
 // Now that you have background of what a fragile fact is, why do we have them? LBBV naturally
 // peels one interation of loops during compilation; there is no CFG analysis that identifies a
@@ -2066,13 +2145,14 @@ pub struct Context {
 // carrying one invalidation per backwards edge may drop a single fact from the set at a different
 // position each time, and cause `2^n` combination repeatedly compiling the same loop.
 //
-// Instead the versions of a pc that differ only in their facts are kept ordered by inclusion, kind
-// by kind of fact (`Fragile::class`), each one's facts of a kind a subset of the next's, and a
-// context reaching the pc forgets whatever facts it has that would break that order. Dropping
-// facts is always sound, since a version relying on fewer facts accepts any context with more, and
-// n facts of a kind then give at most n + 1 versions for it. Kinds are kept apart so that facts of
-// one kind, established and lost on their own schedule, never cost another kind's: a join of
-// versions keeps a fact unless a version with facts of its kind lacks it.
+// Instead the versions of a pc that differ only in their facts are kept ordered by inclusion,
+// domain by domain (each key of `Known`, and the equalities), each one's knowledge in a domain
+// within the next's, and a context reaching the pc forgets whatever it knows that would break that
+// order. Forgetting is always sound, since a version relying on less accepts any context knowing
+// more, and n facts of a domain then give at most n + 1 versions for it. Domains are kept apart
+// so that facts of one, established and lost on their own schedule, never cost another's: a fact
+// is forgotten in one domain alone, and a class split keeps every fact it had. A join of versions
+// keeps what a version knowing nothing in a domain doesn't know there.
 //
 // Which facts a path keeps depends on the order paths are compiled in. Facts established before a
 // loop's paths diverge reach every back edge, and are kept by all of them; a path that establishes
@@ -2112,285 +2192,132 @@ impl std::fmt::Display for Kind {
     }
 }
 
-/// Which upvalue a fact is of: the running function's upvalue, or an upvalue of the closure
-/// another one holds. See Note [Upvalue paths].
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum UpvaluePath {
-    Own(u8),
-    Of(Rc<UpvaluePath>, u8),
-    /// The upvalue of the function an inlined call is in, the caller, from the callee.
-    Caller(u8),
-}
-
-impl UpvaluePath {
-    /// Unique among paths: an upvalue index fits a byte, and a path is as long as the inlined
-    /// calls it crosses.
-    fn key(&self) -> usize {
-        match self {
-            UpvaluePath::Own(j) => *j as usize + 1,
-            UpvaluePath::Of(closure, n) => closure.key() << 8 | (*n as usize + 1),
-            // Apart from the others, which are short.
-            UpvaluePath::Caller(j) => 1 << (usize::BITS - 2) | *j as usize,
-        }
-    }
-
-    /// Whether a fact of this path holds after the running function's upvalue `set` is set: only
-    /// of another of its own, as a cell any closure's upvalue names may be that one.
-    fn survives_set(&self, set: usize) -> bool {
-        matches!(self, UpvaluePath::Own(j) if *j as usize != set)
-    }
-
-    /// This path, from the callee of an inlined call whose closure the caller loaded from
-    /// `closure`, if the caller knows: its own upvalue is the callee's caller's, and one of the
-    /// closure's is the callee's own. A caller's caller's isn't named.
-    fn into_callee(&self, closure: Option<&UpvaluePath>) -> Option<UpvaluePath> {
-        match self {
-            UpvaluePath::Own(j) => Some(UpvaluePath::Caller(*j)),
-            UpvaluePath::Of(..) => closure.and_then(|closure| self.rebase(closure)),
-            UpvaluePath::Caller(_) => None,
-        }
-    }
-
-    /// This path, of the callee of an inlined call, from its caller, which loaded the callee's
-    /// closure from `closure`, if it knows: the caller's own upvalue, or one through the closure.
-    fn into_caller(&self, closure: Option<&UpvaluePath>) -> Option<UpvaluePath> {
-        match self {
-            UpvaluePath::Caller(j) => Some(UpvaluePath::Own(*j)),
-            _ => closure.map(|closure| self.under(closure)),
-        }
-    }
-
-    /// This path from the function whose closure `closure` holds, which it names an upvalue of.
-    fn rebase(&self, closure: &UpvaluePath) -> Option<UpvaluePath> {
-        match self {
-            UpvaluePath::Own(_) | UpvaluePath::Caller(_) => None,
-            UpvaluePath::Of(of, n) if **of == *closure => Some(UpvaluePath::Own(*n)),
-            UpvaluePath::Of(of, n) => of.rebase(closure).map(|of| UpvaluePath::Of(Rc::new(of), *n)),
-        }
-    }
-
-    /// This path, of the function whose closure `closure` holds, from the function `closure` is
-    /// of. Not of a `Caller` path, which `into_caller` maps.
-    fn under(&self, closure: &UpvaluePath) -> UpvaluePath {
-        match self {
-            UpvaluePath::Own(n) => UpvaluePath::Of(Rc::new(closure.clone()), *n),
-            UpvaluePath::Of(of, n) => UpvaluePath::Of(Rc::new(of.under(closure)), *n),
-            UpvaluePath::Caller(_) => unreachable!("a caller's upvalue under a closure"),
-        }
-    }
-}
-
-/// What a fact is about: a slot of the running function's frame, or an upvalue by its path. How a
-/// fact about one holds up is its subject's: what falsifies it (`survives`), and how it crosses an
-/// inlined call (`into_callee`, `into_caller`). See Note [Upvalue paths].
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum Subject {
-    Slot(usize),
-    Upvalue(UpvaluePath),
-    /// The value of a hash field: of the table and key the hash key at `href` is of. See Note
-    /// [Field facts].
-    Field(FieldRef),
-    /// The value of a global, by its name's hash (`name_hash`). See Note [Field facts].
-    Global(u64),
-}
-
-/// A field's or a global's name, hashed: what a store with a key of that name may change.
-fn name_hash(name: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
-    name.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// A hash field, as the hash key at its index names it, with its key's name (hashed): an index
-/// given to another key no longer names it. See Note [Field facts].
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct FieldRef {
-    pub href: u8,
-    pub key: u64,
-}
-
-impl FieldRef {
-    /// The field the hash key at `href` names, of a string key.
-    fn of(hkeys: &[HashKey<'_, '_>], href: HashRef) -> Option<FieldRef> {
-        let hkey = hkeys.get(href.0 as usize).filter(|hkey| !hkey.orphan())?;
-        let crate::chunk::Constant::String(name) = &hkey.key else { return None };
-        Some(FieldRef { href: href.0, key: name_hash(name.as_bytes()) })
-    }
-
-    /// Whether the hash key at its index still names it.
-    fn live(&self, hkeys: &[HashKey<'_, '_>]) -> bool {
-        FieldRef::of(hkeys, HashRef(self.href)) == Some(*self)
-    }
-}
-
-impl Subject {
-    /// Unique among subjects.
-    fn key(&self) -> usize {
-        match self {
-            Subject::Slot(slot) => slot << 2,
-            Subject::Upvalue(upvalue) => upvalue.key() << 2 | 1,
-            Subject::Field(field) => (field.href as usize) << 2 | 2,
-            Subject::Global(name) => (*name as usize) << 2 | 3,
-        }
-    }
-
-    /// The slot it is, if it is one.
-    fn slot(&self) -> Option<usize> {
-        match self {
-            Subject::Slot(slot) => Some(*slot),
-            Subject::Upvalue(_) | Subject::Field(_) | Subject::Global(_) => None,
-        }
-    }
-
-    /// Whether the subject still holds the value it did before `effect`. A store into a hash
-    /// part is no `Effect`: it drops what is known of the fields it may be (`set_hazards`).
-    fn survives(&self, effect: Effect) -> bool {
-        match self {
-            Subject::Slot(slot) => slot_survives(*slot, effect),
-            Subject::Upvalue(upvalue) => upvalue_survives(upvalue, effect),
-            Subject::Field(_) | Subject::Global(_) => !matches!(effect, Effect::Opaque),
-        }
-    }
-
-    /// The subject in the frame of the callee of an inlined call: a slot of the caller's that is
-    /// an argument, as `shifted` renumbers it, or an upvalue of the callee's closure, which the
-    /// caller loaded from `closure`.
-    fn into_callee(&self, shifted: impl Fn(usize) -> Option<usize>, closure: Option<&UpvaluePath>) -> Option<Subject> {
-        match self {
-            Subject::Slot(slot) => shifted(*slot).map(Subject::Slot),
-            Subject::Upvalue(upvalue) => upvalue.into_callee(closure).map(Subject::Upvalue),
-            // The callee's hash keys are its caller's, and its globals the same. See Note
-            // [Inlined calls].
-            Subject::Field(field) => Some(Subject::Field(*field)),
-            Subject::Global(name) => Some(Subject::Global(*name)),
-        }
-    }
-
-    /// The subject, of the callee of an inlined call, in its caller's frame, which loaded the
-    /// callee's closure from `closure`: an upvalue of the closure. The callee's slots die with it.
-    fn into_caller(&self, closure: Option<&UpvaluePath>) -> Option<Subject> {
-        match self {
-            Subject::Slot(_) => None,
-            Subject::Upvalue(upvalue) => upvalue.into_caller(closure).map(Subject::Upvalue),
-            Subject::Field(field) => Some(Subject::Field(*field)),
-            Subject::Global(name) => Some(Subject::Global(*name)),
-        }
-    }
-}
-
-/// Whether slot `slot` still holds the value it did before `effect`.
-fn slot_survives(slot: usize, effect: Effect) -> bool {
-    match effect {
-        Effect::Write(written) | Effect::Move { to: written, .. } => written != slot,
-        Effect::WriteAny | Effect::Opaque => false,
-        Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_) => true,
-    }
-}
-
-/// Whether upvalue `upvalue` still holds the value it did before `effect`.
-fn upvalue_survives(upvalue: &UpvaluePath, effect: Effect) -> bool {
-    match effect {
-        Effect::SetUpvalue(set) => upvalue.survives_set(set),
-        Effect::AnyUpvalue | Effect::Opaque => false,
-        Effect::Write(_) | Effect::WriteAny | Effect::ArrayStore(_) | Effect::Move { .. } => true,
-    }
-}
-
 // Note [Field facts]
 // ~~~~~~~~~~~~~~~~~~
-// A hash field, and a global, is a subject of facts as an upvalue is (Note [Upvalue paths]): a
-// field named by its hash key's index and its key, a global by its name. It is what a slot loaded
-// from it holds (`HoldsValue`), and what a guard finds of such a slot's value, its type or, for a
-// function, which (`Known`), and the kind of its table's array part, it learns too; a load of it
-// gives the slot what is known of it, so a load needs no guard a load before it passed. A slot's
-// value copied into another, as an argument into an inlined callee's parameter, holds it too. An
-// inlined callee's hash keys are its caller's, and its globals the same, so the subject is the
-// same on both sides of the call, and what the callee learns of it, the caller knows on its
-// return. Facts are kept only of tables and functions: a slot holds a field only when the field
-// can hold one, and holds a global until a guard finds its value is neither. A load of anything
-// else has only its type to guard, and facts of it would only tell versions apart.
-// So a table kept in a field of an object, as the stacks of a machine, keeps the kind a
-// guard found once, through every call it is passed to; and a global library's table and its
-// functions, as `math.floor`, are known after their first guards wherever they are loaded again.
+// A table's hash field and a global are places as an upvalue is (Note [Value classes] in
+// `classes`): a global a root, and a field an edge from the table's class, each by its name. A
+// slot loaded from one is in its class, so what a guard finds of either is known of both, and a
+// load needs no guard one before it passed: a global library's functions, or a machine's stacks
+// kept in its fields, are known after their first guards. Only a table or a function is kept so: a
+// load of anything else has only its type to guard, and its class would only tell versions apart.
+// An inlined callee's globals are its caller's, and its parameters' fields its arguments'.
 //
-// A field fact holds while the hash key at its index still names its key. A field's or a global's
-// fact holds until a store with its name, into any hash part (the environment's, as SETGLOBAL's,
-// included), or with an unknown key, or an opaque effect: a store into a hash part is no effect
-// on slots or upvalues, and the table it changes may be any one.
+// A store with a key of a name may be into any table, the environment included, so it forgets
+// every field and the global of that name, and one with an unknown key all of them.
 
 // Note [Upvalue paths]
 // ~~~~~~~~~~~~~~~~~~~~
-// Facts about upvalues name the upvalue by a path from the running function: its own upvalue j,
-// upvalue n of the closure another path's upvalue holds, or, in an inlined call's callee, its
-// caller's upvalue j. The closure isn't known, only its prototype (what its identity guard
-// compares), so a fact can't name its cells, only where it is.
+// A fact about an upvalue is one about the value it holds (Note [Value classes] in `classes`): the
+// running function's own upvalue j is a root, and upvalue n of a closure is a field of the
+// closure's class. Only a closure's prototype is known (what its identity guard compares), not
+// the closure, so what is known of its upvalues is known of their values, not of its cells.
 //
-// A set of the running function's own upvalue j falsifies the facts of paths through j, and of
-// every path through another closure: cells are shared, and any of them may be j's. Setting
-// another closure's upvalue is a call, whose effects say whether it set any (Note [Call effects]).
+// A set of the running function's upvalue j makes it hold the value stored, and forgets every
+// closure's upvalue fields but those open into the frame: cells are shared, and any of them may be
+// j's, but none open into the frame is one of the running function's own. Setting another
+// closure's upvalue is a call, whose effects say whether it set any (Note [Call effects]).
 //
-// Paths carry facts across inlined calls (Note [Inlined calls]). Where the caller knows which of
-// its upvalues' paths the callee's closure was loaded from, the callee enters knowing as its own
-// the caller's facts about that closure's upvalues, and its return gives the caller what it then
-// knows of its own, as paths through that closure, unless it set some upvalue. The callee enters
-// knowing the caller's facts about the caller's own upvalues too, as its caller's, and which of its
-// arguments hold their values; what it learns of them, as of any value it holds, its return gives
-// the caller as its own. So a table the caller passes from an upvalue to an inlined function, which
-// learns the kind of its array part, keeps it in the caller. A caller's caller's upvalue isn't
-// named, and a set of any of the callee's upvalues falsifies its caller's, as cells are shared. A caller making
-// several calls of one closure it loads from one upvalue learns at its first inlined call what
-// every later one then knows.
+// A closure made here knows its cells. One it captured from a slot is that slot while it is open
+// (an open field), so a write to the slot is one to the upvalue, until a CLOSE or the frame's end
+// closes it: from then on it holds the value the slot had, with the slot's type. One it captured
+// from the running function's upvalue holds that upvalue's value. A slot only the one closure
+// captured is closed into a sealed cell, which only that closure's code reaches: inlined, its sets
+// of the cell are of that cell alone, and falsify nothing else; a set of some unknown upvalue may
+// be the closure's, and forgets it.
 //
-// A fact's subject is a slot or an upvalue (`Subject`), which says what falsifies the fact and how
-// it crosses an inlined call, so a kind of fact about either gets those from it. What a slot
-// holding an upvalue's value (`Holds`) learns, its upvalue learns too, and a load of the upvalue
-// into a slot gives the slot what is known of the upvalue: its type (`Upvalue`), and the kind of
-// its table's array part (`Kind`). So a table an upvalue holds, loaded again each time it's used,
-// keeps the kind a guard found once, until the upvalue is set or a store into some array part
-// widens kinds.
+// Fields carry facts across inlined calls (Note [Inlined calls]). The callee enters with its own
+// upvalue n holding what the closure's field n does, and its return gives the closure's fields
+// what its own upvalues then hold, at a place of the caller's still holding the closure, and the
+// slots its results go to what it knows of its results, a closure it made included. A caller
+// making several calls of one closure learns at its first inlined call what every later one then
+// knows.
+//
+// A slot loaded from an upvalue holds its value, so what either learns the other knows: the
+// value's type (`Known::Type`) and, for a table, its array part's kind (`Known::Kind`). So a table
+// an upvalue holds, loaded again each time it's used, keeps the kind a guard found once, until
+// the upvalue is set or a store into some array part widens kinds.
 
-/// Speculation the specializer assumes without a guard. See Note [Fragile
-/// information].
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum Fragile {
-    /// Stack slot `slot` holds the value upvalue `upvalue` held when loaded
-    /// into it.
-    Holds { slot: usize, upvalue: UpvaluePath },
-    /// Upvalue `upvalue` holds a value of `ctype`, which a guard found in a
-    /// slot holding its value: for a function past its identity guard, which.
-    /// Every slot holding its value is of `ctype`.
-    Upvalue { upvalue: UpvaluePath, ctype: CType },
-    /// Stack slot `slot` holds a value loaded from the array part of the table
-    /// in `table`. See Note [Array kinds].
-    ElementOf { slot: usize, table: Subject },
-    /// The array part of the table in `table` has kind `kind`. See Note
-    /// [Array kinds].
-    Kind { table: Subject, kind: Kind },
-    /// Stack slot `slot` holds a number constant an i32 holds exactly,
-    /// `value`. See Note [Widening].
-    Constant { slot: usize, value: i32 },
-    /// Stack slot `slot` holds the quotient of integer slot `of`'s value by `by`, a positive
-    /// constant. See Note [Quotients].
-    Quotient { slot: usize, of: usize, by: i32 },
-    /// Stack slot `slot`, a parameter of an inlined callee, holds the table it
-    /// was passed, which the caller's slot `owner` holds. See Note [Inlined calls].
-    Passed { slot: usize, owner: usize },
-    /// Stack slot `slot` holds the value a field or a global, `of`, held when
-    /// loaded into it. See Note [Field facts].
-    HoldsValue { slot: usize, of: Subject },
-    /// A field or a global, `of`, holds a value of `ctype`, which a guard found
-    /// in a slot holding its value: for a function past its identity guard,
-    /// which. See Note [Field facts].
-    Known { of: Subject, ctype: CType },
+/// What is known of a value, besides the type the slots holding it have: an upvalue's value's type
+/// (`Type`, Note [Upvalue paths]), a table's array part's kind (`Kind`, Note [Array kinds]), and a
+/// number constant an i32 holds exactly, with where it was loaded (`Constant`, Note [Widening]).
+/// Each is a domain of its own. See Notes [Fragile information] and [Value classes] in `classes`.
+#[derive(Clone)]
+pub enum Known {
+    Type(CType),
+    Kind(Kind),
+    Constant { value: i32, origins: Option<Origins> },
 }
 
-/// A fragile fact, with where the paths reaching it introduced it, if that can
-/// be rebuilt without it. See Note [Contraction].
-#[derive(Clone)]
-pub struct Fact {
-    pub fragile: Fragile,
-    origins: Option<Origins>,
+/// The keys of `Known`'s domains.
+pub const TYPE: u8 = 0;
+pub const KIND: u8 = 1;
+pub const CONSTANT: u8 = 2;
+const KEYS: [u8; 3] = [TYPE, KIND, CONSTANT];
+
+/// What a context knows of values. See Note [Fragile information].
+pub type Values = crate::classes::Classes<Known>;
+
+impl Known {
+    /// Where code introduced it, which can be rebuilt from there without it. See Note
+    /// [Contraction].
+    fn origins(&self) -> Option<&Origins> {
+        match self {
+            Known::Constant { origins, .. } => origins.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+// The origins are where a fact came from, not what it says: versions are told apart only by the
+// fact.
+impl PartialEq for Known {
+    fn eq(&self, other: &Known) -> bool {
+        match (self, other) {
+            (Known::Type(a), Known::Type(b)) => a == b,
+            (Known::Kind(a), Known::Kind(b)) => a == b,
+            (Known::Constant { value: a, .. }, Known::Constant { value: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Known {}
+
+impl std::hash::Hash for Known {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Known::Type(ctype) => (TYPE, ctype).hash(state),
+            Known::Kind(kind) => (KIND, kind).hash(state),
+            Known::Constant { value, .. } => (CONSTANT, value).hash(state),
+        }
+    }
+}
+
+impl std::fmt::Debug for Known {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Known::Type(ctype) => write!(f, "{ctype}"),
+            Known::Kind(kind) => write!(f, "kind {kind:?}"),
+            Known::Constant { value, .. } => write!(f, "constant {value}"),
+        }
+    }
+}
+
+impl crate::classes::ClassFact for Known {
+    type Key = u8;
+    fn key(&self) -> u8 {
+        match self {
+            Known::Type(_) => TYPE,
+            Known::Kind(_) => KIND,
+            Known::Constant { .. } => CONSTANT,
+        }
+    }
+    fn join(&self, other: &Self) -> Option<Self> {
+        (self == other).then(|| self.clone())
+    }
+    fn implies(&self, weaker: &Self) -> bool {
+        self == weaker
+    }
 }
 
 /// The origins of a fact, shared by every context the fact flows into.
@@ -2414,41 +2341,6 @@ pub struct OriginState {
     used: bool,
 }
 
-impl Fact {
-    fn new(fragile: Fragile) -> Self {
-        Self { fragile, origins: None }
-    }
-}
-
-impl Deref for Fact {
-    type Target = Fragile;
-    fn deref(&self) -> &Fragile {
-        &self.fragile
-    }
-}
-
-// The origins are where a fact came from, not what it says: versions are
-// told apart only by the fact.
-impl PartialEq for Fact {
-    fn eq(&self, other: &Fact) -> bool {
-        self.fragile == other.fragile
-    }
-}
-
-impl Eq for Fact {}
-
-impl std::hash::Hash for Fact {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.fragile.hash(state)
-    }
-}
-
-impl std::fmt::Debug for Fact {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fragile.fmt(f)
-    }
-}
-
 /// What fragile information an operation may falsify. See Note [Fragile
 /// information].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2466,82 +2358,6 @@ pub enum Effect {
     /// A value of the representation (`None` if not known) is stored in some
     /// table's array part.
     ArrayStore(Option<LType>),
-    /// Slot `from`'s value is copied into slot `to`, which is written: what
-    /// is known of the value is then known of `to` too (`Fragile::moved`).
-    Move { from: usize, to: usize },
-}
-
-impl Fragile {
-    /// Its kind: facts of different kinds are kept apart where versions are
-    /// told apart by their facts. See Note [Fragile information].
-    fn class(&self) -> u8 {
-        self.key().0
-    }
-
-    /// What the fact is about, unique among a context's facts, and their order.
-    fn key(&self) -> (u8, usize) {
-        match self {
-            Fragile::Holds { slot, .. } => (0, *slot),
-            Fragile::Upvalue { upvalue, .. } => (1, upvalue.key()),
-            Fragile::ElementOf { slot, .. } => (2, *slot),
-            Fragile::Kind { table, .. } => (3, table.key()),
-            Fragile::Constant { slot, .. } => (4, *slot),
-            Fragile::Passed { slot, .. } => (5, *slot),
-            Fragile::HoldsValue { slot, .. } => (6, *slot),
-            Fragile::Known { of, .. } => (7, of.key()),
-            Fragile::Quotient { slot, .. } => (8, *slot),
-        }
-    }
-
-    /// The slot the fact is about, if it is about one.
-    fn slot(&self) -> Option<usize> {
-        match self {
-            Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } | Fragile::Passed { slot, .. }
-                | Fragile::HoldsValue { slot, .. } | Fragile::Quotient { slot, .. } => Some(*slot),
-            Fragile::Known { .. } => None,
-            Fragile::Kind { table, .. } => table.slot(),
-            Fragile::Upvalue { .. } => None,
-        }
-    }
-
-    /// The fact, if it is about slot `from`'s value, about slot `to`'s once the value is copied
-    /// there: whatever a fact says of a value holds of a copy of it.
-    fn moved(&self, from: usize, to: usize) -> Option<Fragile> {
-        match self {
-            Fragile::Holds { slot, upvalue } if *slot == from => Some(Fragile::Holds { slot: to, upvalue: upvalue.clone() }),
-            Fragile::ElementOf { slot, table } if *slot == from => Some(Fragile::ElementOf { slot: to, table: table.clone() }),
-            Fragile::Kind { table: Subject::Slot(slot), kind } if *slot == from => Some(Fragile::Kind { table: Subject::Slot(to), kind: *kind }),
-            Fragile::Constant { slot, value } if *slot == from => Some(Fragile::Constant { slot: to, value: *value }),
-            Fragile::HoldsValue { slot, of } if *slot == from => Some(Fragile::HoldsValue { slot: to, of: of.clone() }),
-            Fragile::Quotient { slot, of, by } if *slot == from => Some(Fragile::Quotient { slot: to, of: *of, by: *by }),
-            _ => None,
-        }
-    }
-
-    /// Whether the fact still holds after `effect`: while the places it is about hold the
-    /// values they did, and for a kind, past the stores into some array.
-    fn survives(&self, effect: Effect) -> bool {
-        match self {
-            Fragile::Holds { slot, upvalue } => slot_survives(*slot, effect) && upvalue_survives(upvalue, effect),
-            Fragile::Upvalue { upvalue, .. } => upvalue_survives(upvalue, effect),
-            // The value stays where it was loaded from.
-            Fragile::ElementOf { slot, table } => slot_survives(*slot, effect) && table.survives(effect),
-            // Any table may be the one stored into: one of kind `kind` keeps it
-            // only for a value of that kind, and a mixed one stays mixed.
-            Fragile::Kind { table, kind } => table.survives(effect) && match effect {
-                Effect::ArrayStore(stored) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
-                _ => true,
-            },
-            // Only its slot holds it.
-            Fragile::Constant { slot, .. } => slot_survives(*slot, effect),
-            // The caller's slot is the caller's own, which the callee doesn't write.
-            Fragile::Passed { slot, .. } => slot_survives(*slot, effect),
-            Fragile::HoldsValue { slot, of } => slot_survives(*slot, effect) && of.survives(effect),
-            Fragile::Known { of, .. } => of.survives(effect),
-            // The dividend too: the quotient is computed again from it.
-            Fragile::Quotient { slot, of, .. } => slot_survives(*slot, effect) && slot_survives(*of, effect),
-        }
-    }
 }
 
 // Note [Call effects]
@@ -2602,7 +2418,7 @@ impl Effects {
     /// function's own frame.
     fn of(effect: Effect) -> Effects {
         match effect {
-            Effect::Write(_) | Effect::WriteAny | Effect::Move { .. } => Effects::NONE,
+            Effect::Write(_) | Effect::WriteAny => Effects::NONE,
             Effect::SetUpvalue(_) | Effect::AnyUpvalue => Effects::UPVALUE,
             Effect::Opaque => Effects::OPAQUE,
             Effect::ArrayStore(None) => Effects(Self::ARRAYS),
@@ -2672,13 +2488,10 @@ impl Mark for Context {
         for ctype in &self.types {
             ctype.mark(owner);
         }
-        for fact in &self.fragile {
-            if let Fragile::Upvalue { ctype, .. } = &fact.fragile {
+        for fact in self.values.all_facts() {
+            if let Known::Type(ctype) = fact {
                 ctype.mark(owner);
             }
-        }
-        if let Some(frame) = &self.inline {
-            frame.caller.mark(owner);
         }
     }
 }
@@ -2690,8 +2503,8 @@ impl Context {
             types: smallvec::smallvec![CType::Unknown; slots],
             hkeys: vec![],
             top: None,
-            fragile: SmallVec::new(),
-            inline: None,
+            values: Values::default(),
+            inline: Vec::new(),
             promoted: SmallVec::new(),
         }
     }
@@ -2742,45 +2555,36 @@ impl Context {
         format!("context([{}], hkeys: {}, fragile: {:?}{})",
             self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
             self.hkeys.iter().map(|hk| hk.tostring(owner)).intersperse(",".to_string()).collect::<String>(),
-            self.fragile,
+            self.values,
             if self.promoted.is_empty() { String::new() } else { format!(", promoted: {:?}", self.promoted) },
         )
     }
 
-    /// Assume `fact`, in place of any about the same thing. See Note [Fragile
-    /// information].
-    fn assume(&mut self, fact: Fragile) {
-        self.introduce(Fact::new(fact));
-    }
-
-    /// Assume `fact`, as `assume`, with its origins.
-    fn introduce(&mut self, fact: Fact) {
-        self.fragile.retain(|known| known.key() != fact.key());
-        self.fragile.push(fact);
-        self.fragile.sort_by_key(|fact| fact.key());
-    }
-
-    /// Drop the facts `effect` may falsify. See Note [Fragile information].
+    /// Drop what `effect` may falsify. See Notes [Fragile information] and [Upvalue paths].
     fn effect(&mut self, effect: Effect) {
-        let copies: Vec<Fact> = match effect {
-            Effect::Move { from, to } => self.fragile.iter()
-                .filter_map(|fact| fact.fragile.moved(from, to).map(|fragile| Fact { fragile, origins: fact.origins.clone() }))
-                .collect(),
-            _ => Vec::new(),
-        };
-        self.fragile.retain(|fact| fact.survives(effect));
-        for copy in copies {
-            self.introduce(copy);
+        // A set of a sealed cell is of that cell alone. See Note [Upvalue paths].
+        if let Effect::SetUpvalue(j) = effect && self.values.sealed(Root::Upvalue(j as u8)) {
+            self.values.write(Root::Upvalue(j as u8));
+            return;
         }
-        // A copy of a table is checked where the table is.
-        if let Effect::Move { from, to } = effect {
-            for hkey in &mut self.hkeys {
-                if hkey.checked(from) {
-                    hkey.check(to);
-                } else if let Some(checked) = hkey.hazards.get_mut(to) {
-                    *checked = false;
-                }
-            }
+        match effect {
+            Effect::Write(slot) => self.values.write(Root::Slot(slot as u16)),
+            Effect::WriteAny => self.values.retain_roots(|root| !matches!(root, Root::Slot(_))),
+            Effect::SetUpvalue(j) => {
+                self.values.write(Root::Upvalue(j as u8));
+                self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_) | Target::Sealed(_)));
+            },
+            Effect::AnyUpvalue => {
+                self.values.retain_roots(|root| !matches!(root, Root::Upvalue(_)));
+                self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
+            },
+            Effect::Opaque => self.values = Values::default(),
+            // Any table may be the one stored into: one of kind `kind` keeps it only for a value
+            // of that kind, and a mixed one stays mixed.
+            Effect::ArrayStore(stored) => self.values.retain_facts(|fact| match fact {
+                Known::Kind(kind) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
+                _ => true,
+            }),
         }
         self.inlined(Effects::of(effect));
     }
@@ -2788,173 +2592,144 @@ impl Context {
     /// Add `effects` to what the callee's code this is the context of may have done to its
     /// caller, if it is an inlined call's. See Note [Inlined calls].
     fn inlined(&mut self, effects: Effects) {
-        if let Some(frame) = &mut self.inline {
-            let joined = frame.effects.join(effects);
-            if joined != frame.effects {
-                Rc::make_mut(frame).effects = joined;
-            }
+        if let Some(frame) = self.inline.last_mut() {
+            frame.effects = frame.effects.join(effects);
         }
     }
 
     /// The kind of the array part of the table in slot `table`, if known. See
     /// Note [Array kinds].
     fn array_kind(&self, table: usize) -> Option<Kind> {
-        self.subject_kind(&Subject::Slot(table))
-            .or_else(|| self.holds_value(table).and_then(|of| self.subject_kind(&of)))
+        self.kind(Root::Slot(table as u16))
     }
 
-    /// The field or global slot `slot` holds the value of, if known, and for a field, its hash
-    /// key still names it. See Note [Field facts].
-    fn holds_value(&self, slot: usize) -> Option<Subject> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::HoldsValue { slot: held, of } if *held == slot && self.subject_live(of) => Some(of.clone()),
+    /// The kind of the array part of the table `table` holds, if known.
+    fn kind(&self, table: Root) -> Option<Kind> {
+        match self.values.fact(Loc::root(table), KIND) {
+            Some(Known::Kind(kind)) => Some(*kind),
             _ => None,
-        })
-    }
-
-    /// Whether a field's hash key still names it; a global is always itself.
-    fn subject_live(&self, of: &Subject) -> bool {
-        match of {
-            Subject::Field(field) => field.live(&self.hkeys),
-            _ => true,
         }
     }
 
-    /// What a guard found of field or global `of`'s value, if known. See Note [Field facts].
-    fn known(&self, of: &Subject) -> Option<CType> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Known { of: known, ctype } if known == of && self.subject_live(of) => Some(ctype.clone()),
-            _ => None,
+    /// Assume the array part of the table `table` holds has kind `kind`, wherever else the table
+    /// is. See Notes [Array kinds] and [Upvalue paths].
+    fn learn_kind(&mut self, table: Root, kind: Kind) {
+        self.values.learn(Loc::root(table), Known::Kind(kind));
+    }
+
+    /// A root holding the table whose array part slot `slot`'s value was loaded from, if known:
+    /// a slot, else an upvalue. See Note [Array kinds].
+    fn element_of(&self, slot: usize) -> Option<Root> {
+        let path = [Label::ElementOf];
+        self.values.members(Loc { root: Root::Slot(slot as u16), path: &path }).into_iter().find(|root| matches!(root, Root::Slot(_) | Root::Upvalue(_)))
+    }
+
+    /// The running function's upvalue whose value slot `slot` holds, if known.
+    fn holds(&self, slot: usize) -> Option<u8> {
+        self.values.members(Loc::root(Root::Slot(slot as u16))).into_iter().find_map(|root| match root {
+            Root::Upvalue(j) => Some(j),
+            Root::Slot(_) | Root::Global(_) | Root::Arg(_) => None,
         })
     }
 
-    /// Assume field or global `of` holds a value of `ctype`, as does each slot holding its value,
-    /// unless the slot's type already tells more. See Note [Field facts].
-    fn learn_value(&mut self, of: Subject, ctype: CType) {
-        for fact in &self.fragile {
-            if let Fragile::HoldsValue { slot, of: held } = &fact.fragile && *held == of && self.types[*slot].accepts(&ctype) {
-                self.types[*slot] = ctype.clone();
-            }
-        }
-        self.assume(Fragile::Known { of, ctype });
+    /// The slot of the table, and the name, of the field hash key `href` names: a string key of a
+    /// table's own hash part. In an inlined callee, a caller's table is the parameter it was passed
+    /// as, whose shape has its keys. See Note [Field facts].
+    fn field_of(&self, href: HashRef) -> Option<(u16, u64)> {
+        let hkey = self.hkeys.get(href.0 as usize).filter(|hkey| !hkey.orphan() && hkey.place == Place::Register)?;
+        let crate::chunk::Constant::String(name) = &hkey.key else { return None };
+        let table = if hkey.idx != OUTER {
+            hkey.idx
+        } else {
+            (0..self.types.len()).find(|&slot| matches!(&self.types[slot], CType::Shape(_, hrefs) if hrefs.contains(&href)))?
+        };
+        Some((table as u16, name_hash(name.as_bytes())))
     }
 
-    /// Slot `slot` was just loaded from field or global `of`: it holds its value, of the type and
-    /// the array kind known of it. See Note [Field facts].
-    fn loaded(&mut self, slot: usize, of: Subject) {
-        if let Some(ctype) = self.known(&of) && self.types[slot].accepts(&ctype) {
+    /// Slot `slot` was just loaded from `root` along `path`, a global or a field: it holds its
+    /// value, of the type known of it. See Note [Field facts].
+    fn loaded(&mut self, slot: usize, root: Root, path: &[Label]) {
+        self.values.assign(Root::Slot(slot as u16), Loc { root, path });
+        if let Some(Known::Type(ctype)) = self.values.fact(Loc::root(Root::Slot(slot as u16)), TYPE).cloned() && self.types[slot].accepts(&ctype) {
             self.types[slot] = ctype;
         }
-        if let Some(kind) = self.subject_kind(&of) {
-            self.assume(Fragile::Kind { table: Subject::Slot(slot), kind });
-        }
-        self.assume(Fragile::HoldsValue { slot, of });
     }
 
-    /// The name of the subject a fact is about, if a field or a global: what a store with a key of
-    /// that name falsifies.
-    fn fact_name(fact: &Fragile) -> Option<u64> {
-        let of = match fact {
-            Fragile::HoldsValue { of, .. } | Fragile::Known { of, .. } | Fragile::Kind { table: of, .. } => of,
-            _ => return None,
+    /// A guard found `ctype` in slot `slot`, loaded from field `field` if any: a global or a field
+    /// whose value the slot holds holds a value of it too, as does each slot holding its value,
+    /// unless its type already tells more. Only of a table or a function: of any other value, the
+    /// slot no longer holds the place's, as what it holds would only tell versions apart. See Note
+    /// [Field facts].
+    fn learn_held(&mut self, slot: usize, field: Option<HashRef>, ctype: CType) {
+        let at = Loc::root(Root::Slot(slot as u16));
+        let path;
+        let field = match field.and_then(|href| self.field_of(href)) {
+            Some((table, name)) => {
+                path = [Label::Field(name)];
+                Some(Loc { root: Root::Slot(table), path: &path })
+            },
+            None => None,
         };
-        match of {
-            Subject::Field(field) => Some(field.key),
-            Subject::Global(name) => Some(*name),
-            _ => None,
+        let held = self.values.members(at).iter().any(|root| matches!(root, Root::Global(_)))
+            || field.is_some_and(|field| self.values.same(at, field));
+        if !held {
+            return;
         }
+        if !matches!(ctype, CType::Type(LType::Table | LType::Userdata) | CType::LuaFunction(_) | CType::NativeFunction(_) | CType::Shape(..)) {
+            self.values.write(Root::Slot(slot as u16));
+            return;
+        }
+        for root in self.values.members(at) {
+            if let Root::Slot(member) = root && self.types[member as usize].accepts(&ctype) {
+                self.types[member as usize] = ctype.clone();
+            }
+        }
+        self.values.learn(at, Known::Type(ctype));
     }
 
-    /// Forget what is known of the fields and globals a store with a key named `stored` may
-    /// change, or with none, of every field and global. See Note [Field facts].
+    /// Forget the fields and globals a store with a key named `stored` may change, or with none,
+    /// every field and global: any table may be the one stored into. See Note [Field facts].
     fn forget_named(&mut self, stored: Option<u64>) {
-        self.fragile.retain(|fact| match (Context::fact_name(&fact.fragile), stored) {
-            (Some(name), Some(stored)) => name != stored,
-            (Some(_), None) => false,
-            (None, _) => true,
-        });
+        self.values.retain_fields(|label, _| !matches!(label, Label::Field(name) if stored.is_none_or(|stored| name == stored)));
+        self.values.retain_roots(|root| !matches!(root, Root::Global(name) if stored.is_none_or(|stored| name == stored)));
     }
 
-    /// Forget what is known of the fields a store through hash key `href` may change: those of
-    /// its key's name, or with none, every field and global.
+    /// Forget the fields a store through hash key `href` may change: those of its key's name, or
+    /// with none, every field and global. A key no field names, not a string, is none of them.
     fn forget_fields(&mut self, stored: Option<HashRef>) {
-        match stored.map(|href| FieldRef::of(&self.hkeys, href).map(|field| field.key)) {
-            // A key no field names: no field or global is it.
-            Some(None) => {},
-            Some(Some(name)) => self.forget_named(Some(name)),
+        match stored {
+            Some(href) => if let Some(crate::chunk::Constant::String(name)) = self.hkeys.get(href.0 as usize).map(|hkey| &hkey.key) {
+                let name = name_hash(name.as_bytes());
+                self.forget_named(Some(name));
+            },
             None => self.forget_named(None),
         }
     }
 
-    /// Forget what is known of the field hash key `href` named, its index given to another.
-    fn forget_index(&mut self, href: usize) {
-        self.fragile.retain(|fact| match &fact.fragile {
-            Fragile::HoldsValue { of: Subject::Field(field), .. } | Fragile::Known { of: Subject::Field(field), .. }
-                | Fragile::Kind { table: Subject::Field(field), .. } => field.href as usize != href,
-            _ => true,
-        });
-    }
-
-    /// The kind of the array part of the table in `table`, if known.
-    fn subject_kind(&self, table: &Subject) -> Option<Kind> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Kind { table: known, kind } if known == table => Some(*kind),
-            _ => None,
-        })
-    }
-
-    /// Assume the array part of the table in `table` has kind `kind`, and if
-    /// that's a slot holding an upvalue's value, the upvalue's table's too. See
-    /// Notes [Array kinds] and [Upvalue paths].
-    fn learn_kind(&mut self, table: Subject, kind: Kind) {
-        if let Subject::Slot(slot) = table && let Some(upvalue) = self.holds(slot) {
-            self.assume(Fragile::Kind { table: Subject::Upvalue(upvalue), kind });
-        }
-        if let Subject::Slot(slot) = table && let Some(of) = self.holds_value(slot) {
-            self.assume(Fragile::Kind { table: of, kind });
-        }
-        self.assume(Fragile::Kind { table, kind });
-    }
-
-    /// Where the table is whose array part slot `slot`'s value was loaded
-    /// from, if known. See Note [Array kinds].
-    fn element_of(&self, slot: usize) -> Option<Subject> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::ElementOf { slot: loaded, table } if *loaded == slot => Some(table.clone()),
-            _ => None,
-        })
-    }
-
-    /// The upvalue whose value slot `slot` holds, if known.
-    fn holds(&self, slot: usize) -> Option<UpvaluePath> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Holds { slot: held, upvalue } if *held == slot => Some(upvalue.clone()),
-            _ => None,
-        })
-    }
-
-    /// Assume upvalue `upvalue` holds a value of `ctype`, as does each slot
+    /// Assume the running function's upvalue `upvalue` holds a value of `ctype`, as does each slot
     /// holding its value, unless the slot's type already tells more.
-    fn learn_upvalue(&mut self, upvalue: UpvaluePath, ctype: CType) {
-        for fact in &self.fragile {
-            if let Fragile::Holds { slot, upvalue: held } = &fact.fragile && *held == upvalue && self.types[*slot].accepts(&ctype) {
-                self.types[*slot] = ctype.clone();
+    fn learn_upvalue(&mut self, upvalue: u8, ctype: CType) {
+        for root in self.values.members(Loc::root(Root::Upvalue(upvalue))) {
+            if let Root::Slot(slot) = root && self.types[slot as usize].accepts(&ctype) {
+                self.types[slot as usize] = ctype.clone();
             }
         }
-        self.assume(Fragile::Upvalue { upvalue, ctype });
+        self.values.learn(Loc::root(Root::Upvalue(upvalue)), Known::Type(ctype));
     }
 
-    /// A slot holding upvalue `upvalue`'s value, if one is known to.
     /// Slot `slot`'s type is found out at runtime: a fact that it holds a
     /// constant has had its use. See Note [Widening].
     fn used(&mut self, slot: usize) {
-        self.fragile.retain(|fact| fact.origins.is_none() || !matches!(fact.fragile, Fragile::Constant { slot: held, .. } if held == slot));
+        let loc = Loc::root(Root::Slot(slot as u16));
+        if self.values.fact(loc, CONSTANT).is_some_and(|fact| fact.origins().is_some()) {
+            self.values.forget(loc, CONSTANT);
+        }
     }
 
-    /// Mark that code relies on the fact about `key`, so that it isn't
+    /// Mark that code relies on the constant slot `slot` holds, so that it isn't
     /// contracted. See Note [Contraction].
-    fn rely(&self, owner: &mut Owner, key: (u8, usize)) {
-        if let Some(origins) = self.fragile.iter().find(|fact| fact.key() == key).and_then(|fact| fact.origins.as_ref()) {
+    fn rely(&self, owner: &mut Owner, slot: usize) {
+        if let Some(origins) = self.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT).and_then(Known::origins) {
             for origin in owner.ro(origins).clone() {
                 owner.rw(&origin).used = true;
             }
@@ -2964,9 +2739,9 @@ impl Context {
     /// Add the origins of `other`'s facts to those of the same facts of `self`,
     /// whose code `other`'s paths now reach. See Note [Contraction].
     fn adopt(&self, owner: &mut Owner, other: &Context) {
-        for fact in &self.fragile {
-            let Some(mine) = &fact.origins else { continue };
-            let Some(theirs) = other.fragile.iter().find(|theirs| *theirs == fact).and_then(|theirs| theirs.origins.as_ref()) else { continue };
+        for (root, fact) in self.values.rooted() {
+            let Some(mine) = fact.origins() else { continue };
+            let Some(theirs) = other.values.fact(Loc::root(root), fact.key()).filter(|theirs| *theirs == fact).and_then(Known::origins) else { continue };
             if Rc::ptr_eq(mine, theirs) {
                 continue;
             }
@@ -2981,32 +2756,23 @@ impl Context {
     /// The number constant slot `slot` holds, if a fact says. See Note
     /// [Narrowing].
     fn constant(&self, slot: usize) -> Option<i32> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Constant { slot: held, value } if *held == slot => Some(*value),
+        match self.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT) {
+            Some(Known::Constant { value, .. }) => Some(*value),
             _ => None,
-        })
-    }
-
-    /// The integer slot and the positive constant slot `slot` holds the quotient of, if a fact
-    /// says it does. See Note [Quotients].
-    fn quotient(&self, slot: usize) -> Option<(usize, i32)> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Quotient { slot: held, of, by } if *held == slot => Some((*of, *by)),
-            _ => None,
-        })
+        }
     }
 
     /// A slot holding the running function's upvalue `upvalue`'s value, if known.
     fn held(&self, upvalue: usize) -> Option<usize> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Holds { slot, upvalue: UpvaluePath::Own(held) } if *held as usize == upvalue => Some(*slot),
-            _ => None,
+        self.values.members(Loc::root(Root::Upvalue(upvalue as u8))).into_iter().find_map(|root| match root {
+            Root::Slot(slot) => Some(slot as usize),
+            Root::Upvalue(_) | Root::Global(_) | Root::Arg(_) => None,
         })
     }
 
     /// How many inlined calls deep the code this is the context of is.
     fn depth(&self) -> usize {
-        self.inline.as_ref().map_or(0, |frame| frame.depth as usize)
+        self.inline.len()
     }
 
     /// The cell of the running function's upvalue `upvalue`, if it has one. See Note [Upvalue
@@ -3015,15 +2781,10 @@ impl Context {
         (upvalue < UPVALUE_CELLS).then(|| self.depth() * UPVALUE_CELLS + upvalue)
     }
 
-    /// Whether a fact is about the running function's upvalue `upvalue`, so that its cell holds
-    /// its value. See Note [Upvalue cells].
+    /// Whether something is known of the running function's upvalue `upvalue`'s value, so that its
+    /// cell holds it. See Note [Upvalue cells].
     fn cell_filled(&self, upvalue: usize) -> bool {
-        let own = |path: &UpvaluePath| *path == UpvaluePath::Own(upvalue as u8);
-        self.fragile.iter().any(|fact| match &fact.fragile {
-            Fragile::Holds { upvalue, .. } | Fragile::Upvalue { upvalue, .. } => own(upvalue),
-            Fragile::Kind { table: Subject::Upvalue(upvalue), .. } | Fragile::ElementOf { table: Subject::Upvalue(upvalue), .. } => own(upvalue),
-            _ => false,
-        })
+        self.values.has(Root::Upvalue(upvalue as u8))
     }
 
     /// The cells holding their upvalue's value where this is the context: its own frame's its
@@ -3045,15 +2806,60 @@ impl Context {
 
     /// The type of the running function's upvalue `upvalue`'s value, if known.
     fn upvalue(&self, upvalue: usize) -> Option<&CType> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Upvalue { upvalue: UpvaluePath::Own(known), ctype } if *known as usize == upvalue => Some(ctype),
+        match self.values.fact(Loc::root(Root::Upvalue(upvalue as u8)), TYPE) {
+            Some(Known::Type(ctype)) => Some(ctype),
             _ => None,
-        })
+        }
     }
 
-    /// Whether `other` has every fact `self` has.
-    fn fragile_within(&self, other: &Context) -> bool {
-        self.fragile.iter().all(|fact| other.fragile.contains(fact))
+    /// What is known once the upvalues open into slot `from` and up are closed: each holds the
+    /// value its slot had, with the slot's type, but not that it is a constant, which only a
+    /// slot's load is rebuilt for (Note [Widening]). See Note [Upvalue paths].
+    fn closing(&self, from: usize) -> Values {
+        let mut values = self.values.clone();
+        for slot in values.open_slots().into_iter().filter(|&slot| slot as usize >= from) {
+            let at = Loc::root(Root::Slot(slot));
+            if let Some(ctype) = self.value_type(slot as usize) {
+                values.learn(at, Known::Type(ctype));
+            }
+            values.forget(at, CONSTANT);
+        }
+        values.close(from as u16);
+        values
+    }
+
+    /// What slot `slot`'s type says of its value wherever else it is, if anything: a shape's hash
+    /// keys are the frame's, so a table's is only that it is one.
+    fn value_type(&self, slot: usize) -> Option<CType> {
+        match self.slot(slot) {
+            CType::Unknown => None,
+            CType::Shape(of, _) => Some(CType::Type(of)),
+            ctype => Some(ctype),
+        }
+    }
+
+    /// What `self` knows that `other` doesn't, as each root's facts, if that is all: none if it
+    /// knows an equality, a field, or a fact only a field reaches, that `other` doesn't. See Note
+    /// [Contraction].
+    fn past(&self, other: &Context) -> Option<Vec<(Root, Known)>> {
+        let mut split = self.values.clone();
+        split.lower_partition(&other.values);
+        if split != self.values {
+            return None;
+        }
+        let rooted: Vec<(Root, Known)> = self.values.rooted()
+            .filter(|&(root, fact)| other.values.fact(Loc::root(root), fact.key()) != Some(fact))
+            .map(|(root, fact)| (root, fact.clone()))
+            .collect();
+        let mut rest = self.values.clone();
+        for (root, fact) in &rooted {
+            rest.forget(Loc::root(*root), fact.key());
+        }
+        KEYS.iter().all(|&key| {
+            let mut lowered = rest.clone();
+            lowered.lower_facts(key, &other.values);
+            lowered == rest
+        }).then_some(rooted)
     }
 
     /// Whether `self` and `other` differ at most in fragile information.
@@ -3073,14 +2879,14 @@ impl Context {
             hkey.orphan() || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
         })
             && (self.top.is_none() || self.top == other.top)
-            && self.fragile_within(other)
+            && self.values.accepts(&other.values)
             && (0..self.types.len().max(other.types.len())).all(|idx| self.slot(idx).accepts(&other.slot(idx)))
     }
 
     /// The lattice height `self` loses from `other`, which it accepts.
     fn distance(&self, other: &Context) -> usize {
         (0..self.types.len().max(other.types.len())).map(|idx| other.slot(idx).depth() - self.slot(idx).depth()).sum::<usize>()
-            + (other.fragile.len() - self.fragile.len())
+            + other.values.size().saturating_sub(self.values.size())
     }
 
     /// Widen `self` to also accept `other`. Hash keys are joined one by one: a
@@ -3108,20 +2914,26 @@ impl Context {
         if self.top != other.top {
             self.top = None;
         }
-        // Kind by kind: a context with no fact of a kind doesn't drop that kind's.
-        // See Note [Fragile information].
-        self.fragile.retain(|fact| other.fragile.contains(fact) || !other.fragile.iter().any(|theirs| theirs.class() == fact.class()));
-        for fact in self.fragile.iter_mut() {
-            let theirs = other.fragile.iter().find(|theirs| *theirs == fact).and_then(|theirs| theirs.origins.as_ref());
-            fact.origins = match (fact.origins.take(), theirs) {
+        // Domain by domain: a context knowing nothing in one doesn't drop what `self` knows
+        // there. See Note [Fragile information].
+        if other.values.equalities() > 0 {
+            self.values.lower_partition(&other.values);
+        }
+        for key in KEYS.into_iter().filter(|&key| other.values.knows(key)) {
+            self.values.lower_facts(key, &other.values);
+        }
+        self.values.for_each_fact_mut(|roots, fact| {
+            let Known::Constant { origins, .. } = fact else { return };
+            let theirs = roots.first().and_then(|&root| other.values.fact(Loc::root(root), CONSTANT)).and_then(Known::origins);
+            *origins = match (origins.take(), theirs) {
                 (Some(mine), Some(theirs)) => {
-                    let mut origins = owner.ro(&mine).clone();
-                    origins.extend(owner.ro(theirs).iter().filter(|origin| !owner.ro(&mine).iter().any(|known| Rc::ptr_eq(known, origin))).cloned());
-                    Some(Rc::new(TLCell::new(origins)))
+                    let mut joined = owner.ro(&mine).clone();
+                    joined.extend(owner.ro(theirs).iter().filter(|origin| !owner.ro(&mine).iter().any(|known| Rc::ptr_eq(known, origin))).cloned());
+                    Some(Rc::new(TLCell::new(joined)))
                 },
                 (mine, theirs) => mine.or_else(|| theirs.cloned()),
             };
-        }
+        });
         for (i, mine) in self.hkeys.iter_mut().enumerate() {
             match other.hkeys.get(i) {
                 _ if dropped.contains(&HashRef(i as u8)) => {
@@ -3276,7 +3088,6 @@ impl Context {
         let hkey: HashKey<'_, '_> = hkey;
         match self.hkeys.iter().position(|hkey| hkey.orphan()) {
             Some(i) => {
-                self.forget_index(i);
                 self.hkeys[i] = hkey;
                 HashRef(i as u8)
             },
@@ -3413,6 +3224,8 @@ pub struct Specializer<'src, 'intern> {
     /// witnesses are of, and the indexes each function has given. See Note [Field types].
     key_indexes: HashMap<(LProto<'src, 'intern>, usize, usize, Vec<u8>), u8, rustc_hash::FxBuildHasher>,
     next_key_index: HashMap<LProto<'src, 'intern>, u8, rustc_hash::FxBuildHasher>,
+    /// The code after each inlined call, its returns continue compiling. See Note [Inlined calls].
+    continuations: Vec<Rc<Continuation>>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -3428,6 +3241,9 @@ impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
         }
         for entries in self.inlined.values() {
             entries.iter().for_each(|entry| entry.mark(owner));
+        }
+        for continuation in &self.continuations {
+            continuation.caller.mark(owner);
         }
     }
 }
@@ -3454,6 +3270,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             promoted: Default::default(),
             key_indexes: Default::default(),
             next_key_index: Default::default(),
+            continuations: Vec::new(),
             inlined: Default::default(),
             unreachable: Default::default(),
             #[cfg(feature = "jit")]
@@ -3468,24 +3285,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// holding the table it was passed has its caller's slot's. See Note [Field types].
     fn key_index(&mut self, ctx: &Context, place: usize, key: &LConstant<'_, '_>) -> Option<usize> {
         let crate::chunk::Constant::String(name) = key else { return None };
-        let root = {
-            let mut frame = ctx.inline.as_ref();
-            let mut root = self.proto;
-            while let Some(f) = frame {
-                root = f.proto as LProto<'src, 'intern>;
-                frame = f.caller.inline.as_ref();
-            }
-            root
-        };
+        let root = ctx.inline.first().map_or(self.proto, |frame| frame.proto as LProto<'src, 'intern>);
         // The slot the key is named by is chosen so that hash keys are confluent: contexts
         // reaching the same point have each field's key at the same index whether the code that
         // learned it was inlined or not. A callee's key on a table it was passed is named by the
         // caller's slot holding it, so it gets the index the caller's own code would give it, and
         // is the caller's key at that index when it comes back on the return.
-        let (depth, slot) = match ctx.fragile.iter().find_map(|fact| match fact.fragile {
-            Fragile::Passed { slot, owner } if slot == place => Some(owner),
-            _ => None,
-        }) {
+        let (depth, slot) = match ctx.inline.last().and_then(|frame| frame.owner(ctx, place)) {
             Some(owner) => (ctx.depth() - 1, owner),
             None => (ctx.depth(), place),
         };
@@ -3624,30 +3430,37 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // next's: `ctx` keeps the most facts of each kind that keep it one. See
         // Note [Fragile information].
         let alike: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
-        let mut classes: SmallVec<[u8; 8]> = alike.iter().flat_map(|(ectx, _)| ectx.fragile.iter()).chain(ctx.fragile.iter()).map(|fact| fact.class()).collect();
-        classes.sort_unstable();
-        classes.dedup();
-        let mut kept: Vec<Fact> = Vec::new();
-        for class in classes {
-            let of = |facts: &[Fact]| facts.iter().filter(|fact| fact.class() == class).cloned().collect::<Vec<_>>();
-            let mine = of(&ctx.fragile);
-            let mut chain: Vec<Vec<Fact>> = alike.iter().map(|(ectx, _)| of(&ectx.fragile)).collect();
-            chain.sort_by_key(Vec::len);
-            chain.dedup();
-            let below = chain.iter().rposition(|facts| facts.iter().all(|fact| mine.contains(fact)));
-            // Above the top every fact is kept; otherwise those shared with the
-            // version above the highest `ctx` has all of, or with the bottom.
-            match below.map_or(chain.first(), |below| chain.get(below + 1)) {
-                Some(above) => kept.extend(mine.into_iter().filter(|fact| above.contains(fact))),
-                None => kept.extend(mine),
+        let mut lowered = (*ctx).clone();
+        // The equalities, then each domain of facts.
+        for domain in std::iter::once(None).chain(KEYS.into_iter().map(Some)) {
+            let lower = |values: &mut Values, towards: &Values| match domain {
+                None => values.lower_partition(towards),
+                Some(key) => values.lower_facts(key, towards),
+            };
+            // Whether what `a` knows in the domain, `b` knows too.
+            let within = |a: &Values, b: &Values| {
+                let mut lowered = a.clone();
+                lower(&mut lowered, b);
+                lowered == *a
+            };
+            let size = |values: &Values| match domain {
+                None => values.equalities(),
+                Some(key) => values.count(key),
+            };
+            let mut chain: Vec<&Values> = alike.iter().map(|(ectx, _)| &ectx.values).collect();
+            chain.sort_by_key(|values| size(values));
+            chain.dedup_by(|a, b| within(a, b) && within(b, a));
+            let below = chain.iter().rposition(|values| within(values, &ctx.values));
+            // Above the top everything is kept; otherwise what is shared with the version above
+            // the highest `ctx` knows all of, or with the bottom.
+            if let Some(above) = below.map_or(chain.first(), |below| chain.get(below + 1)) {
+                lower(&mut lowered.values, above);
             }
         }
-        let ctx = if kept.len() == ctx.fragile.len() {
+        let ctx = if lowered.values == ctx.values {
             ctx
         } else {
-            let mut lowered = (*ctx).clone();
-            lowered.fragile.retain(|fact| kept.contains(fact));
-            if let Some((ectx, block)) = alike.iter().find(|(ectx, _)| ectx.fragile == lowered.fragile) {
+            if let Some((ectx, block)) = alike.iter().find(|(ectx, _)| ectx.values == lowered.values) {
                 ectx.adopt(owner, &lowered);
                 self.unreachable.remove(block);
                 return (*block, "fragile", None);
@@ -3728,12 +3541,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut widened: Vec<Origin> = Vec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         for (ectx, block) in existing {
-            let extra: Vec<&Fact> = ectx.fragile.iter().filter(|fact| !joined.fragile.contains(fact)).collect();
+            let Some(extra) = ectx.past(joined) else { continue };
             if extra.is_empty() {
                 continue;
             }
-            let doubles = extra.iter().all(|fact| matches!(fact.fragile, Fragile::Constant { slot, .. } if meets_double(&joined.slot(slot))));
-            let Some(sets) = extra.iter().map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+            let doubles = extra.iter().all(|(root, fact)| matches!((root, fact), (Root::Slot(slot), Known::Constant { .. }) if meets_double(&joined.slot(*slot as usize))));
+            let Some(sets) = extra.iter().map(|(_, fact)| fact.origins()).collect::<Option<Vec<_>>>() else { continue };
             let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
             if found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                 continue;
@@ -3781,7 +3594,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut origins: Vec<Origin> = Vec::new();
         // Of constants meeting a double: rebuilt as doubles, not dropped.
         let mut widened: Vec<Origin> = Vec::new();
-        let mut conflicting: SmallVec<[(u8, usize); 2]> = SmallVec::new();
+        let mut conflicting: SmallVec<[(Root, u8); 2]> = SmallVec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         // Each duplicate's context, and whether it was one for a constant's slot of another type.
         #[cfg(feature = "tracing")]
@@ -3793,11 +3606,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A version whose slot holding a constant holds another type here: the constant is
             // worth nothing past the point either. See Note [Contraction].
             if !ectx.alike(&ctx) {
-                let retyped: Vec<&Fact> = ectx.fragile.iter().filter(|fact| {
-                    matches!(fact.fragile, Fragile::Constant { slot, .. } if !ctx.fragile.contains(fact) && ectx.slot(slot) != ctx.slot(slot))
+                let retyped: Vec<(usize, Known)> = ectx.values.rooted().filter_map(|(root, fact)| match (root, fact) {
+                    (Root::Slot(slot), Known::Constant { .. }) if ctx.values.fact(Loc::root(root), CONSTANT) != Some(fact) && ectx.slot(slot as usize) != ctx.slot(slot as usize) => Some((slot as usize, fact.clone())),
+                    _ => None,
                 }).collect();
-                let doubles = !retyped.is_empty() && retyped.iter().all(|fact| fact.fragile.slot().is_some_and(|slot| meets_double(&ctx.slot(slot))));
-                let Some(sets) = retyped.iter().map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+                let doubles = !retyped.is_empty() && retyped.iter().all(|(slot, _)| meets_double(&ctx.slot(*slot)));
+                let Some(sets) = retyped.iter().map(|(_, fact)| fact.origins()).collect::<Option<Vec<_>>>() else { continue };
                 let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
                 if found.is_empty() || found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                     continue;
@@ -3815,9 +3629,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             // The version has every fact `ctx` has but some only `ctx` has, all from origins and
             // none used: `ctx` drops those, reaching the version, and they are contracted.
-            if ectx.fragile.iter().all(|fact| ctx.fragile.contains(fact)) {
-                let theirs: Vec<&Fact> = ctx.fragile.iter().filter(|fact| !ectx.fragile.contains(fact)).collect();
-                let Some(sets) = theirs.iter().map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+            if ectx.values.accepts(&ctx.values) && let Some(theirs) = ctx.past(ectx) {
+                let Some(sets) = theirs.iter().map(|(_, fact)| fact.origins()).collect::<Option<Vec<_>>>() else { continue };
                 let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
                 if theirs.is_empty() || found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                     continue;
@@ -3825,9 +3638,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 _duplicates.push(_block.0);
                 #[cfg(feature = "tracing")]
                 _their.push(format!("{} lacks: {}", _block.0, ectx.tostring(owner)));
-                for fact in theirs {
-                    if !conflicting.contains(&fact.key()) {
-                        conflicting.push(fact.key());
+                for (root, fact) in &theirs {
+                    if !conflicting.contains(&(*root, fact.key())) {
+                        conflicting.push((*root, fact.key()));
                     }
                 }
                 for origin in found {
@@ -3838,15 +3651,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 continue;
             }
             // `ctx`'s facts the version lacks each contradict one of its own.
-            let mine: SmallVec<[(u8, usize); 2]> = ctx.fragile.iter().filter(|fact| !ectx.fragile.contains(fact)).map(|fact| fact.key()).collect();
-            if !mine.iter().all(|key| ectx.fragile.iter().any(|theirs| theirs.key() == *key)) {
+            let Some(mine) = ctx.past(ectx) else { continue };
+            let mine: SmallVec<[(Root, u8); 2]> = mine.iter().map(|(root, fact)| (*root, fact.key())).collect();
+            if !mine.iter().all(|&(root, key)| ectx.values.fact(Loc::root(root), key).is_some()) {
                 continue;
             }
-            let mut extra = ectx.fragile.iter().filter(|fact| !ctx.fragile.contains(fact)).peekable();
-            if extra.peek().is_none() {
+            let Some(extra) = ectx.past(&ctx) else { continue };
+            if extra.is_empty() {
                 continue;
             }
-            let Some(sets) = extra.map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+            let Some(sets) = extra.iter().map(|(_, fact)| fact.origins()).collect::<Option<Vec<_>>>() else { continue };
             let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
             if found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                 continue;
@@ -3893,7 +3707,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return ctx;
         }
         let mut lowered = (*ctx).clone();
-        lowered.fragile.retain(|fact| !conflicting.contains(&fact.key()));
+        for &(root, key) in &conflicting {
+            lowered.values.forget(Loc::root(root), key);
+        }
         Rc::new(lowered)
     }
 
@@ -3961,8 +3777,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 self.contractions.push((of, origins, how));
                 continue;
             }
-            let carries = |ctx: &Context| ctx.fragile.iter().any(|fact| {
-                fact.origins.as_ref().is_some_and(|set| owner.ro(set).iter().any(|origin| origins.iter().any(|known| Rc::ptr_eq(known, origin))))
+            let carries = |ctx: &Context| ctx.values.all_facts().any(|fact| {
+                fact.origins().is_some_and(|set| owner.ro(set).iter().any(|origin| origins.iter().any(|known| Rc::ptr_eq(known, origin))))
             });
             let versions = self.versions.get_mut(&proto).unwrap();
             let mut _forgotten: Vec<usize> = Vec::new();
@@ -3993,15 +3809,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    /// The residuals of `block` that code entering it at `from` runs: from there to its end, or to
-    /// a rebuild's jump in it if `from` is before that. See Note [Contraction].
+    /// The residuals of `block` that code entering it at `from` runs: from there to its first jump
+    /// (past it, only a frame returning into the block runs), or to a rebuild's jump in it if
+    /// `from` is before that. See Note [Contraction].
     fn runnable(&self, block: BlockId, from: usize) -> &[Residual] {
         let residuals = &self.blocks[block.0].instructions;
         let end = match self.cuts.get(&block) {
             Some(&cut) if from < cut => cut.min(residuals.len()),
             _ => residuals.len(),
         };
-        &residuals[from.min(end)..end]
+        let from = from.min(end);
+        let end = residuals[from..end].iter().position(|residual| matches!(residual, Residual::Jump(_))).map_or(end, |jump| from + jump + 1);
+        &residuals[from..end]
     }
 
     /// The blocks `residuals` can go on to.
@@ -4087,6 +3906,60 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let _ = owner;
     }
 
+    /// The functions each block reachable from `entry` is in, for the JIT's disassembly: the
+    /// lines its function and the functions it is inlined into are defined at, outermost first,
+    /// as `725-693` for 693's inlined into 725's. A version's are its context's inlined frames' and
+    /// its own; any other block's, the block's whose code reaches it, as a function changes only
+    /// at a version (a callee's entry, the code after its return), and `?` if none says.
+    #[cfg(feature = "jit_disasm")]
+    pub fn inline_chains(&self, entry: BlockId) -> HashMap<BlockId, String> {
+        let line = |proto: LProto<'_, '_>| unsafe { (*proto).line_defined }.to_string();
+        let chain = |proto: LProto<'_, '_>, ctx: &Context| {
+            let mut lines: Vec<String> = ctx.inline.iter().map(|frame| line(frame.proto.cast())).collect();
+            lines.push(line(proto));
+            lines.join("-")
+        };
+        let mut versions: HashMap<BlockId, String> = HashMap::default();
+        for (proto, at) in &self.versions {
+            for ((_, ctx), block) in at {
+                versions.insert(*block, chain(*proto, ctx));
+            }
+        }
+        // The entry's, if it isn't a version: the nearest version whose code reaches it.
+        let of_entry = versions.get(&entry).cloned().or_else(|| {
+            let mut reaches: HashMap<BlockId, Vec<BlockId>> = HashMap::default();
+            for (from, block) in self.blocks.iter().enumerate() {
+                for target in Self::targets(&block.instructions) {
+                    reaches.entry(target).or_default().push(BlockId(from));
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut work = std::collections::VecDeque::from([entry]);
+            while let Some(block) = work.pop_front() {
+                if let Some(of) = versions.get(&block) {
+                    return Some(of.clone());
+                }
+                if seen.insert(block) {
+                    work.extend(reaches.get(&block).into_iter().flatten().copied());
+                }
+            }
+            None
+        });
+        let mut chains: HashMap<BlockId, String> = HashMap::default();
+        let mut work = vec![(entry, of_entry.unwrap_or_else(|| "?".to_string()))];
+        while let Some((block, of)) = work.pop() {
+            if chains.contains_key(&block) || block.0 >= self.blocks.len() {
+                continue;
+            }
+            chains.insert(block, of.clone());
+            for target in Self::targets(&self.blocks[block.0].instructions) {
+                let theirs = versions.get(&target).cloned().unwrap_or_else(|| of.clone());
+                work.push((target, theirs));
+            }
+        }
+        chains
+    }
+
     /// `ids` as a comma separated list, for traces.
     fn ids(ids: impl Iterator<Item = usize>) -> String {
         ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
@@ -4109,9 +3982,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let shapes_dropped = joined.map_or(0, |j| {
             (0..requested.types.len()).filter(|&i| matches!(requested.types[i], CType::Shape(..)) && !matches!(j.slot(i), CType::Shape(..))).count()
         });
-        let origins = requested.fragile.iter().map(|fact| {
-            let from = fact.origins.as_ref().map(|set| owner.ro(set).iter().map(|origin| format!("{}@{}", owner.ro(origin).block.0, owner.ro(origin).offset)).collect::<Vec<_>>().join(","));
-            format!("{:?} <- {}", fact.fragile, from.unwrap_or_default())
+        let origins = requested.values.rooted().map(|(root, fact)| {
+            let from = fact.origins().map(|set| owner.ro(set).iter().map(|origin| format!("{}@{}", owner.ro(origin).block.0, owner.ro(origin).offset)).collect::<Vec<_>>().join(","));
+            format!("{root:?} {fact:?} <- {}", from.unwrap_or_default())
         }).collect::<Vec<_>>().join("; ");
         crate::tracing::instant("spec", "version", &[
             ("line", self.traced_line(owner).into()),
@@ -4363,30 +4236,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                     let effects: *const Cell<Effects> = self.effects_of(proto);
                     // An inlined callee's returns to the code after its call. See Note [Inlined calls].
-                    if let Some(frame) = ctx.inline.clone() {
-                        let after = self.inline_return(owner, &ctx, &frame, a as usize, b as usize);
-                        // A count of results known statically moves them as window ops in the
-                        // caller's frame, missing ones nil: values the JIT's window only renames.
-                        // Every result up to the top moves as a return's do.
-                        let moves = b == 0;
-                        self.blocks[block_id.0].instructions.push(Residual::InlineReturn { a: a as u16, b, closes, call: frame.a, moves });
-                        if moves {
-                            self.blocks[block_id.0].instructions.push(Residual::Arrive { a: frame.a, c: frame.c });
-                        } else {
-                            let (call, c, a, returned) = (frame.a as usize, frame.c as usize, a as usize, b as usize - 1);
-                            for i in 0..if c == 0 { returned } else { c - 1 } {
-                                let result: Rc<dyn Window> = if i < returned {
-                                    Rc::new(crate::generators::Move::new(&[call + 1 + a + i, call + i]))
-                                } else {
-                                    Rc::new(crate::generators::LoadNil::new(&[call + i]))
-                                };
-                                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(result));
-                            }
-                            if c == 0 {
-                                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(SetTop::new(call + returned, &[]))));
-                            }
-                        }
-                        self.blocks[block_id.0].instructions.push(Residual::Jump(after));
+                    if !ctx.inline.is_empty() {
+                        let thunk = self.make_inline_return_thunk(block_id, ctx.clone(), a as usize, b, closes);
+                        self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
                     } else {
                         self.blocks[block_id.0].instructions.push(Residual::Ret(pc, a, b, closes, proto.is_vararg != 0, returns, effects));
                     }
@@ -4424,8 +4276,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let pc = self.blocks[target.0].pc;
         let live = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
         let mut jumping = ctx.clone();
-        forget_dead(owner, &mut jumping, live);
-        assert!(entered.accepts(&jumping), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
+        forget_dead(owner, &mut jumping, live, None);
+        // A jump may keep a register it wrote (`GetBlockKeeping`).
+        assert!(entered.accepts(&jumping) || entered.accepts(ctx), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
         target
     }
 
@@ -4442,19 +4295,29 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// every register not holding a local in scope there (`forgotten`), and the
     /// fragile facts about them, and which array a value of known type was
     /// loaded from, which lets paths that differ only in them share the target's
-    /// version.
-    fn jumping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
+    /// version. See Note [Jumped-to contexts].
+    fn jumping(&self, owner: &mut Owner, ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
+        self.jumping_keeping(owner, ctx, dest_pc, None)
+    }
+
+    /// `jumping`, keeping what is known of register `kept`, which the jumping instruction wrote.
+    /// See Note [Jumped-to contexts].
+    fn jumping_keeping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc, kept: Option<usize>) -> Rc<Context> {
         let in_scope = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(dest_pc);
         if let Some(in_scope) = in_scope.filter(|&in_scope| forgets(&ctx, in_scope)) {
-            forget_dead(owner, Rc::make_mut(&mut ctx), in_scope);
+            forget_dead(owner, Rc::make_mut(&mut ctx), in_scope, kept);
         }
         // An element of a known type was guarded, or its array's kind is known:
         // what it was loaded from tells no more. Only the version jumped to is
         // found without it, so it still accepts the jump. See Note [Array kinds].
-        let typed = |fact: &Fact| matches!(fact.fragile, Fragile::ElementOf { slot, .. } if ctx.slot(slot) != CType::Unknown);
-        if ctx.fragile.iter().any(typed) {
-            let forgotten: Vec<Fact> = ctx.fragile.iter().filter(|fact| typed(fact)).cloned().collect();
-            Rc::make_mut(&mut ctx).fragile.retain(|fact| !forgotten.contains(fact));
+        let typed: Vec<usize> = (0..ctx.types.len())
+            .filter(|&slot| ctx.slot(slot) != CType::Unknown && ctx.values.has_field(Loc::root(Root::Slot(slot as u16)), Label::ElementOf))
+            .collect();
+        if !typed.is_empty() {
+            let known = Rc::make_mut(&mut ctx);
+            for slot in typed {
+                known.values.unlink(Loc::root(Root::Slot(slot as u16)), Label::ElementOf);
+            }
         }
         ctx
     }
@@ -4557,7 +4420,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // Past the guard, the slot holds the value too.
             let mut promoted = thunk_ctx.clone();
             Rc::make_mut(&mut promoted).promote(pc.0, value);
-            Rc::make_mut(&mut promoted).introduce(Fact { fragile: Fragile::Constant { slot, value }, origins: None });
+            Rc::make_mut(&mut promoted).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Constant { value, origins: None });
             let pass = vm.subblock(owner, pc.next_true(), promoted, thunk_coro.clone(), ResumeArg::Integer(value));
             let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
             vm.blocks[block.0].instructions.push(Residual::Thunk(fail));
@@ -4601,10 +4464,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// load queued to be rebuilt as a double. Whether it was. See Note [Widening].
     fn widen_constant(&mut self, owner: &mut Owner, ctx: &mut Rc<Context>, slot: usize, block: BlockId) -> bool {
         let Some(value) = ctx.constant(slot) else { return false };
-        let key = Fragile::Constant { slot, value }.key();
         // Rebuilt from where the constant was loaded, as a double. See Note
         // [Contraction].
-        if let Some(set) = ctx.fragile.iter().find(|fact| fact.key() == key).and_then(|fact| fact.origins.as_ref()) {
+        if let Some(set) = ctx.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT).and_then(Known::origins) {
             let origins: Vec<Origin> = owner.ro(set).iter().filter(|origin| owner.ro(origin).rebuild.is_some()).cloned().collect();
             let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
             let queues = !origins.is_empty() && !origins.iter().all(queued);
@@ -4741,10 +4603,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // which relying on it would refuse. See Note [Peephole fusion] in `peephole`.
         let mut folded = None;
         let known = ctx.clone();
-        let known = |slot: usize| known.fragile.iter().find_map(|fact| match fact.fragile {
-            Fragile::Constant { slot: held, value } if held == slot && fact.origins.is_none() => Some(value),
+        let known = |slot: usize| match known.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT) {
+            Some(Known::Constant { value, origins: None }) => Some(*value),
             _ => None,
-        });
+        };
         let joined = match self.held.as_mut().map(|held| held.spells.offer(&int_op, pc.0, known)) {
             Some(Offer::Held) => true,
             Some(Offer::Folded(value)) => {
@@ -4781,7 +4643,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
         }
         if let Some(value) = folded {
-            Rc::make_mut(ctx).introduce(Fact { fragile: Fragile::Constant { slot: int_op.dest, value }, origins: None });
+            Rc::make_mut(ctx).values.learn(Loc::root(Root::Slot(int_op.dest as u16)), Known::Constant { value, origins: None });
         }
         Hold::Held
     }
@@ -4896,7 +4758,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 work.extend(from.get(&at).into_iter().flatten().copied());
             }
         }
-        let doomed = |ctx: &Context| ctx.fragile.iter().any(|fact| fact.origins.as_ref().is_some_and(|set| owner.ro(set).iter().any(|origin| {
+        let doomed = |ctx: &Context| ctx.values.all_facts().any(|fact| fact.origins().is_some_and(|set| owner.ro(set).iter().any(|origin| {
             self.contractions.iter().any(|(of, queued, _)| *of == self.proto && queued.iter().any(|known| Rc::ptr_eq(known, origin)))
         })));
         let versions = self.versions.get(&self.proto).unwrap();
@@ -4945,22 +4807,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // The runtime kind of the array the element was loaded from.
             // An upvalue's table is read from the running closure's own upvalue; one
             // through another closure isn't, and its element is tested as any value.
-            let array = thunk_ctx.element_of(idx).and_then(|table| {
-                let value = match &table {
-                    Subject::Slot(slot) => state.vals[state.base + slot],
-                    Subject::Upvalue(UpvaluePath::Own(j)) => state.upvalue(owner, *j as usize),
-                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) | Subject::Field(_) | Subject::Global(_) => return None,
+            let array = thunk_ctx.element_of(idx).map(|table| {
+                let value = match table {
+                    Root::Slot(slot) => state.vals[state.base + slot as usize],
+                    Root::Upvalue(j) => state.upvalue(owner, j as usize),
+                    Root::Global(_) | Root::Arg(_) => unreachable!("an array read through a global or an argument"),
                 };
                 let LValue::Table(tab) = value.unbox() else { unreachable!("an element of an array part not of a table") };
-                Some((table, tab.ro(owner).kind))
+                (table, tab.ro(owner).kind)
             });
             let kind_of = array.as_ref().filter(|(_, kind)| *kind == found_field.bit()).map(|(table, _)| table.clone());
             // A value the context knows is a number only has its encoding tested.
             let guard = if let Some(table) = &kind_of {
                 Residual::GuardDynamic(match table {
-                    Subject::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot])),
-                    Subject::Upvalue(UpvaluePath::Own(j)) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
-                    Subject::Upvalue(UpvaluePath::Of(..) | UpvaluePath::Caller(_)) | Subject::Field(_) | Subject::Global(_) => unreachable!("a kind read through another closure, a field or a global"),
+                    Root::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot as usize])),
+                    Root::Upvalue(j) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
+                    Root::Global(_) | Root::Arg(_) => unreachable!("an array read through a global or an argument"),
                 })
             } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
@@ -4988,17 +4850,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 forced_mut.learn_upvalue(upvalue.clone(), found.clone());
             }
             // A slot holding a field's or a global's value tells of it too. See Note [Field facts].
-            let holds_value = forced_mut.holds_value(idx);
-            if let Some(of) = &holds_value {
-                if matches!(found_field, LType::Table | LType::Userdata | LType::Closure) {
-                    forced_mut.learn_value(of.clone(), found.clone());
-                } else {
-                    // A value that isn't a table or a function: a load of it has only its type
-                    // to guard, and what the slot holds would only tell versions apart. See
-                    // Note [Field facts].
-                    forced_mut.fragile.retain(|fact| !matches!(fact.fragile, Fragile::HoldsValue { slot, .. } if slot == idx));
-                }
-            }
+            forced_mut.learn_held(idx, field, found.clone());
             debug!("forcing thunk with {} == {}", found, expected);
             // Continued as a guard the context answers would be, so the ways
             // finding out and knowing share the subblock.
@@ -5032,9 +4884,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if let Some(upvalue) = holds {
                     forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
                 }
-                if let Some(of) = holds_value {
-                    forced_mut.learn_value(of, idx_ctype.clone().unwrap());
-                }
+                forced_mut.learn_held(idx, field, idx_ctype.clone().unwrap());
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
                 // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
@@ -5053,9 +4903,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if let Some(upvalue) = holds {
                     forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
                 }
-                if let Some(of) = holds_value {
-                    forced_mut.learn_value(of, idx_ctype.clone().unwrap());
-                }
+                forced_mut.learn_held(idx, field, idx_ctype.clone().unwrap());
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 let proto = lclos.ro(owner).prototype.cast();
                 vm.blocks[block_id.0].instructions.push(Residual::LuaGuard { idx, ptr: proto });
@@ -5070,21 +4918,68 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    /// The caller's code after the inlined call `frame`, for a return in the callee's code, in
-    /// `ctx`, of RETURN A B: compiled from the caller's context before the call, less what the
-    /// callee's code may have done to it, with the results' types. See Note [Inlined calls].
-    fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, frame: &InlineFrame, a: usize, b: usize) -> BlockId {
-        let mut known = frame.caller.clone();
+    /// The thunk an inlined callee's RETURN A B ends its block in: run, it lays out the return to
+    /// the code after the call its frame's entry continues, and a jump to it. See Note [Inlined
+    /// calls].
+    fn make_inline_return_thunk(&self, block_id: BlockId, ctx: Rc<Context>, a: usize, b: u16, closes: bool) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let Some(&CallstackEntry { ret: Return::Inlined(continuation), .. }) = state.callstack.last() else {
+                unreachable!("an inlined call's return outside its frame")
+            };
+            // SAFETY: a continuation lives as long as the specializer does.
+            let continuation = unsafe { &*(continuation as *const Continuation) };
+            // In place, as for a call thunk. See Note [Thunk patching].
+            let block = if vm.compiled(block_id) {
+                let block = vm.new_block(vm.blocks[block_id.0].pc);
+                vm.jump_thunk(block_id, thunk_pc, block);
+                block
+            } else {
+                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
+                block_id
+            };
+            let after = vm.inline_return(owner, &ctx, continuation, a, b as usize);
+            // A count of results known statically moves them as window ops in the caller's frame,
+            // missing ones nil: values the JIT's window only renames. Every result up to the top
+            // moves as a return's do.
+            let moves = b == 0;
+            let mut layout = vec![Residual::InlineReturn { a: a as u16, b, closes, call: continuation.a, moves }];
+            if moves {
+                layout.push(Residual::Arrive { a: continuation.a, c: continuation.c });
+            } else {
+                let (call, c, returned) = (continuation.a as usize, continuation.c as usize, b as usize - 1);
+                for i in 0..if c == 0 { returned } else { c - 1 } {
+                    let result: Rc<dyn Window> = if i < returned {
+                        Rc::new(crate::generators::Move::new(&[call + 1 + a + i, call + i]))
+                    } else {
+                        Rc::new(crate::generators::LoadNil::new(&[call + i]))
+                    };
+                    layout.push(Residual::ExecWindow(result));
+                }
+                if c == 0 {
+                    layout.push(Residual::ExecWindow(Rc::new(SetTop::new(call + returned, &[]))));
+                }
+            }
+            layout.push(Residual::Jump(after));
+            vm.blocks[block.0].instructions.extend(layout);
+        })))
+    }
+
+    /// The caller's code after the inlined call `continuation` continues, for a return in the
+    /// callee's code, in `ctx`, of RETURN A B: compiled from the caller's context before the call,
+    /// less what the callee's code may have done to it, with the results' types. See Note [Inlined
+    /// calls].
+    fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, continuation: &Continuation, a: usize, b: usize) -> BlockId {
+        let effects = ctx.inline.last().expect("an inlined call's frame").effects;
+        let caller = &continuation.caller;
+        let mut known = caller.clone();
         // The hash keys the callee leaves, in the witnesses it shared: the caller's own it kept
         // are the caller's again, and any other, of the callee's frame or put in place of one of
         // the caller's, is free. See Note [Inlined calls].
         // A parameter still holding the table it was passed has its hash keys the caller's slot's.
-        let passed = |slot: usize| ctx.fragile.iter().find_map(|fact| match fact.fragile {
-            Fragile::Passed { slot: param, owner } if param == slot => Some(owner),
-            _ => None,
-        });
+        let frame = ctx.inline.last().expect("an inlined call's frame");
+        let passed = |slot: usize| frame.owner(ctx, slot);
         let mut gained: Vec<(usize, HashRef)> = Vec::new();
-        known.hkeys = ctx.hkeys.iter().enumerate().map(|(i, hkey)| match frame.caller.hkeys.get(i) {
+        known.hkeys = ctx.hkeys.iter().enumerate().map(|(i, hkey)| match caller.hkeys.get(i) {
             Some(mine) if !hkey.orphan() && hkey.idx == OUTER && !mine.orphan() => mine.clone(),
             _ if !hkey.orphan() && hkey.place == Place::Register && let Some(owner) = passed(hkey.idx) => {
                 let mut theirs = hkey.clone();
@@ -5103,15 +4998,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // A callee's version knowing fewer hash keys than the caller had (Note [Version
         // compatibility]) leaves fewer: the caller's past them are free, as the callee may have
         // put its own there.
-        for i in known.hkeys.len()..frame.caller.hkeys.len() {
-            let mut free = frame.caller.hkeys[i].clone();
+        for i in known.hkeys.len()..caller.hkeys.len() {
+            let mut free = caller.hkeys[i].clone();
             free.known_type = None;
             free.clear_checks();
             known.hkeys.push(free);
         }
         // A shape keeps the caller's hash keys that came back as they were, and gains its slot's.
         let unchanged = |href: &HashRef| {
-            let (mine, back) = (frame.caller.hkeys.get(href.0 as usize), known.hkeys.get(href.0 as usize));
+            let (mine, back) = (caller.hkeys.get(href.0 as usize), known.hkeys.get(href.0 as usize));
             mine.zip(back).is_some_and(|(mine, back)| !back.orphan() && mine.idx == back.idx && mine.key == back.key && mine.place == back.place && mine.chain == back.chain)
         };
         for slot in 0..known.types.len() {
@@ -5124,29 +5019,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             known.types[slot] = if kept.is_empty() { CType::Type(*of) } else { CType::Shape(*of, kept) };
         }
-        frame.effects.apply(owner, &mut known, &frame.captured);
-        // See Note [Upvalue paths]. A path through the callee's closure needs the
-        // closure known, and no upvalue set since it was loaded, which may have
-        // been one of its cells; one of the caller's own has held since the
-        // callee knew it.
-        let closure = frame.closure.as_ref().filter(|_| frame.effects.0 & Effects::UPVALUE.0 == 0);
-        for fact in &ctx.fragile {
-            match &fact.fragile {
-                Fragile::Upvalue { upvalue, ctype } => if let Some(upvalue) = upvalue.into_caller(closure) {
-                    known.assume(Fragile::Upvalue { upvalue, ctype: ctype.clone() });
-                },
-                Fragile::Kind { table, kind } => if let Some(table) = table.into_caller(closure) {
-                    known.assume(Fragile::Kind { table, kind: *kind });
-                },
-                Fragile::Known { of, ctype } => if let Some(of) = of.into_caller(closure) {
-                    known.assume(Fragile::Known { of, ctype: ctype.clone() });
-                },
-                _ => {},
-            }
-        }
-        let (call, c) = (frame.a as usize, frame.c as usize);
+        effects.apply(owner, &mut known, &continuation.captured);
+        // See Note [Upvalue paths].
+        let (call, c) = (continuation.a as usize, continuation.c as usize);
         let returned = (b != 0).then(|| b - 1);
         let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
+        let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
+        let map: Vec<(Loc, Loc)> = continuation.closure.into_iter()
+            .flat_map(|closure| fields.iter().enumerate().map(move |(n, path)| (Loc { root: closure, path }, Loc::root(Root::Upvalue(n as u8)))))
+            .chain((0..count.min(returned.unwrap_or(0))).map(|i| (Loc::root(Root::Slot((call + i) as u16)), Loc::root(Root::Slot((a + i) as u16)))))
+            // A callee's globals are its caller's. See Note [Field facts].
+            .chain(ctx.values.roots().filter(|root| matches!(root, Root::Global(_))).map(|root| (Loc::root(root), Loc::root(root))))
+            .collect();
+        known.values.overlay(&ctx.closing(0), &map);
+        // What it learned of the values it was passed, the caller's places holding them learn:
+        // the same values, of which the caller knows the rest. See Note [Inlined calls].
+        for &(n, root) in &continuation.args {
+            for fact in ctx.values.facts(Loc::root(Root::Arg(n))) {
+                known.values.learn(Loc::root(root), fact.clone());
+            }
+        }
         let slots = known.types.len();
         for i in (0..count).filter(|i| call + i < slots) {
             known.types[call + i] = match returned {
@@ -5157,27 +5049,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Some(_) => CType::Type(LType::Nil),
                 None => CType::Unknown,
             };
-            // A constant returned is the caller's constant.
-            known.effect(Effect::Write(call + i));
-            if returned.is_some_and(|returned| i < returned) {
-                let constant = ctx.fragile.iter().find(|fact| matches!(fact.fragile, Fragile::Constant { slot, .. } if slot == a + i));
-                if let Some(Fact { fragile: Fragile::Constant { value, .. }, origins }) = constant {
-                    known.introduce(Fact { fragile: Fragile::Constant { slot: call + i, value: *value }, origins: origins.clone() });
-                }
-            }
         }
         known.top = if c == 0 { returned.map(|returned| call + returned) } else { None };
         let callee = self.proto;
         #[cfg(feature = "tracing")]
         let (_callee, _known) = (self.traced_line(owner), known.tostring(owner));
-        self.set_current(frame.proto as LProto<'_, '_>);
-        self.join_effects(owner, frame.effects);
-        let after = self.version(owner, frame.after, Rc::new(known));
+        self.set_current(continuation.proto as LProto<'_, '_>);
+        self.join_effects(owner, effects);
+        let after = continuation.rest.block(self, owner, Rc::new(known));
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline_return", &[
             ("line", self.traced_line(owner).into()),
             ("callee", _callee.into()),
-            ("after", frame.after.into()),
+            ("after", continuation.rest.pc().into()),
             ("block", after.0.into()),
             ("context", _known.as_str().into()),
         ]);
@@ -5195,7 +5079,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// below it, and the pc after it, a Lua function's call continues at a thunk
     /// specializing it to the return. See Notes [Call sites], [Call
     /// continuations] and [Call effects].
-    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Pc)>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
             // is a guard's failure, with the rest of the layout after it. See Note
@@ -5219,17 +5103,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         layout.push(next(vm));
                     }
                     // A call a continuation decided to inline in a context its callee's entry
-                    // accepts this one's in inlines from the first. See Note [Inlined calls].
-                    if let Some((ctx, captured, after_pc)) = &continuation
+                    // accepts this one's in inlines from the first, as does one making a generic
+                    // for's iterator. See Note [Inlined calls].
+                    if let Some((ctx, captured, rest)) = &continuation
                         && inlines(&calling, unsafe { &*vm.proto }, unsafe { &*proto }, a)
                     {
                         let callee = proto as LProto<'static, 'static>;
-                        let entry = Self::inline_frame(&calling, callee, ctx, captured, vm.proto as LProto<'static, 'static>, *after_pc, a, b, c);
+                        let call = Location(block, vm.blocks[block.0].instructions.len() + layout.len());
+                        let entry = Self::inline_frame(&calling, callee, call, vm.proto as LProto<'static, 'static>, a, b);
                         let mut known = entry.clone();
-                        known.inline = None;
-                        if vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known))) {
+                        known.inline = Vec::new();
+                        let decided = vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known)));
+                        if decided || makes_iterator(unsafe { &*vm.proto }, pc.0, a) {
                             vm.blocks[block.0].instructions.extend(layout);
-                            let shift = vm.inline_call(owner, state, block, callee, a, b, entry);
+                            let continuation = vm.continuation(&calling, ctx, captured, rest, a, c);
+                            let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation);
                             vm.blocks[block.0].instructions.push(Residual::Jump(shift));
                             return;
                         }
@@ -5238,10 +5126,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let off = vm.blocks[block.0].instructions.len() + layout.len();
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg, callee: proto as LProto<'static, 'static> });
-                    if let Some((ctx, captured, after_pc)) = &continuation {
+                    if let Some((ctx, captured, rest)) = &continuation {
                         // See Notes [Call continuations] and [Inlined calls].
                         let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
-                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), *after_pc, a, c, after.clone(), Some(Rc::new(call)), 0, true)));
+                        layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), rest.clone(), a, c, after.clone(), Some(Rc::new(call)), 0, true)));
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -5283,7 +5171,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(&calling.slot(slot))));
                     // What the code after an effect-free call knows: its context before the
                     // call, but for the callee's frame, and a window op's result.
-                    let mut known = continuation.as_ref().map(|(before, _, pc)| ((**before).clone(), *pc));
+                    let mut known = continuation.as_ref().map(|(before, _, rest)| ((**before).clone(), rest.clone()));
                     if let Some((_, op)) = window {
                         layout.push(Residual::ExecWindow(op.window));
                         if c == 0 {
@@ -5307,9 +5195,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     }
                     // See Note [Library natives] in `library`.
-                    if let Some((known, pc)) = known {
-                        let known = vm.jumping(owner, Rc::new(known), pc);
-                        layout.push(Residual::Jump(After::Version(pc, known).block(vm, owner)));
+                    if let Some((known, rest)) = known {
+                        let after = match rest {
+                            Rest::Next(pc) => {
+                                let known = vm.jumping(owner, Rc::new(known), pc);
+                                After::Version(pc, known).block(vm, owner)
+                            },
+                            rest => rest.block(vm, owner, Rc::new(known)),
+                        };
+                        layout.push(Residual::Jump(after));
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -5438,44 +5332,58 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Some(measured)
     }
 
-    /// The entry context of the inlined call of R(A) with B and C in `calling`, of `callee`, by the
-    /// function `proto`, which continues at `after` from `caller`, the context before the call
-    /// less the callee's frame (`captured` its slots below the call its closures captured). See
-    /// Note [Inlined calls].
-    fn inline_frame(calling: &Context, callee: LProto<'static, 'static>, caller: &Context, captured: &Rc<[usize]>, proto: LProto<'static, 'static>, after: Pc, a: usize, b: usize, c: usize) -> Context {
-        // The caller's context is part of the callee's versions' identity: its free hash key
-        // indexes alike, as a version's are. See Note [Version compatibility].
-        let mut caller = caller.clone();
-        caller.canonicalize_free();
-        let frame = InlineFrame {
-            caller,
-            captured: captured.clone(),
-            proto,
-            after,
-            a: a as u16,
-            c: c as u16,
-            effects: Effects::NONE,
-            depth: calling.inline.as_ref().map_or(1, |frame| frame.depth + 1),
-            closure: calling.holds(a),
-        };
+    /// The entry context of the inlined call `call` of R(A) with B in `calling`, of `callee`, by
+    /// the function `proto`. See Note [Inlined calls].
+    fn inline_frame(calling: &Context, callee: LProto<'static, 'static>, call: Location, proto: LProto<'static, 'static>, a: usize, b: usize) -> Context {
+        // A table parameter's hash keys are its caller's slot's. See Note [Inlined calls].
+        let params = unsafe { (*callee).param_count } as usize;
+        let passed = (0..params).filter_map(|param| match calling.slot(a + 1 + param) {
+            CType::Shape(_, hrefs) => hrefs.first().map(|href| calling.hkeys[href.0 as usize].idx).filter(|&owner| owner < a)
+                .map(|owner| (param as u16, owner as u16)),
+            _ => None,
+        }).collect();
+        let frame = InlineFrame { call, proto, a: a as u16, effects: Effects::NONE, passed };
         inline_entry(calling, unsafe { &*callee }, a, b, frame)
     }
 
-    /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
-    /// callee's frame in, then goes on to its version for `entry`. See Note [Inlined calls].
-    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context) -> BlockId {
-        // The outermost function's frame holds the callee's.
-        let mut outermost = entry.inline.as_ref().expect("an inlined call's frame");
-        while let Some(frame) = &outermost.caller.inline {
-            outermost = frame;
+    /// The code after the inlined call of R(A) with C in `calling`, by the running function: the
+    /// context before the call `caller`, less the callee's frame (`captured` its slots below the call
+    /// its closures captured), continuing as `rest`. See Note [Inlined calls].
+    fn continuation(&self, calling: &Context, caller: &Context, captured: &Rc<[usize]>, rest: &Rest, a: usize, c: usize) -> Continuation {
+        Continuation {
+            proto: self.proto as LProto<'static, 'static>,
+            caller: caller.clone(),
+            captured: captured.clone(),
+            a: a as u16,
+            c: c as u16,
+            // A place below the call holding the callee's closure. See Note [Upvalue paths].
+            closure: calling.values.members(Loc::root(Root::Slot(a as u16))).into_iter().find(|root| !matches!(root, Root::Slot(slot) if *slot as usize >= a)),
+            // What the callee learns of its arguments' values. See Note [Inlined calls].
+            args: (a + 1..calling.types.len()).flat_map(|arg| {
+                calling.values.members(Loc::root(Root::Slot(arg as u16))).into_iter()
+                    .filter(|root| !matches!(root, Root::Slot(slot) if *slot as usize >= a))
+                    .map(move |root| ((arg - a - 1) as u8, root))
+            }).collect(),
+            rest: rest.clone(),
         }
-        if unsafe { (*outermost.proto).frame_size.grow(inline_offset(&entry) + (*callee).max_stack as usize) } {
+    }
+
+    /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
+    /// callee's frame in, then goes on to its version for `entry`, its returns continuing
+    /// `continuation`. See Note [Inlined calls].
+    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context, continuation: Continuation) -> BlockId {
+        // The outermost function's frame holds the callee's.
+        let outermost = entry.inline.first().expect("an inlined call's frame").proto;
+        if unsafe { (*outermost).frame_size.grow(inline_offset(&entry) + (*callee).max_stack as usize) } {
             state.fit_frames(owner);
             #[cfg(feature = "jit")]
-            self.jctx.frame_grew(outermost.proto as usize, unsafe { (*outermost.proto).frame_size.get() });
+            self.jctx.frame_grew(outermost as usize, unsafe { (*outermost).frame_size.get() });
         }
         #[cfg(feature = "tracing")]
-        let (_line, _entry, _after) = (self.traced_line(owner), entry.tostring(owner), entry.inline.as_ref().map_or(0, |frame| frame.after));
+        let (_line, _entry, _after) = (self.traced_line(owner), entry.tostring(owner), continuation.rest.pc());
+        let continuation = Rc::new(continuation);
+        let pointer = Rc::as_ptr(&continuation);
+        self.continuations.push(continuation);
         let caller = self.proto;
         self.set_current(callee as LProto<'_, '_>);
         self.versions.entry(self.proto).or_insert_with(|| HashMap::default());
@@ -5487,7 +5395,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.set_current(caller);
         let shift = self.new_block(self.blocks[block.0].pc);
         let stack = unsafe { (*callee).max_stack };
-        self.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: b as u16, stack, cells }, Residual::Jump(version)]);
+        self.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: b as u16, stack, cells, continuation: pointer }, Residual::Jump(version)]);
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline", &[
             ("line", _line.into()),
@@ -5512,7 +5420,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// (`identities`). Past that, or for a return that doesn't know what it
     /// returns, the results, and `after` (as `After::block`). See Notes [Call continuations] and
     /// [Call effects].
-    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, pc: Pc, a: usize, c: usize, after: After, inline: Option<Rc<InlineCall>>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, rest: Rest, a: usize, c: usize, after: After, inline: Option<Rc<InlineCall>>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The call it continues, laid out just before it, inlined from now on: this return,
             // from its frame, continues as any other. See Note [Inlined calls].
@@ -5543,11 +5451,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 && state.returned & !0xffff_ffff == crate::vm::RETURNED
                 && vm.inline_cost(owner, entry, Location::unpack(crate::vm::PackedLocation::from_bits(state.returned_at as usize)).0, call.callee).is_some_and(InlineCost::inlines)
             {
-                let entry = Self::inline_frame(&call.calling, call.callee, &ctx, &captured, vm.proto as LProto<'static, 'static>, pc, a, call.b, c);
+                let entry = Self::inline_frame(&call.calling, call.callee, Location(call.block, call.off), vm.proto as LProto<'static, 'static>, a, call.b);
                 let mut decided = entry.clone();
-                decided.inline = None;
+                decided.inline = Vec::new();
                 vm.inlined.entry((vm.proto, call.pc, call.callee as LProto<'_, '_>)).or_default().push(decided);
-                let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry);
+                let continuation = vm.continuation(&call.calling, &ctx, &captured, &rest, a, c);
+                let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry, continuation);
                 vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
             }
             // In place, as for a call thunk. See Note [Thunk patching].
@@ -5583,9 +5492,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     // Not `jumping`: the code after the call is reached by falling through,
                     // and the results are usually in temporaries it reads.
-                    let version = vm.version(owner, pc, Rc::new(known));
+                    let version = rest.block(vm, owner, Rc::new(known));
                     layout.push(Residual::ReturnedFrom(returned));
-                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), pc, a, c, after.clone(), None, identities + 1, false)));
+                    layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), rest.clone(), a, c, after.clone(), None, identities + 1, false)));
                     layout.push(Residual::Arrived { a: a16, c: c16, returned: results.len() as u16 });
                     layout.push(Residual::Jump(version));
                 },
@@ -6085,12 +5994,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         while ctx.hkeys.len() <= i {
                             ctx.hkeys.push(HashKey { idx: OUTER, ..HashKey::new(OUTER, k_val.clone()) });
                         }
-                        ctx.forget_index(i);
                         ctx.hkeys[i] = HashKey::new(place, k_val.clone());
                     } else if let Some(i) = orphan {
                         href = HashRef(i as u8);
                         let ctx = Rc::make_mut(&mut ctx);
-                        ctx.forget_index(i);
                         ctx.hkeys[i] = HashKey::new(place, k_val.clone());
                     } else {
                         warn!("allocating new hkey for {:?} {:?}", place, &k_val);
@@ -6216,7 +6123,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Promote(slot)) => match ctx.constant(slot) {
                     Some(value) if self.promotes(pc.0, value) => {
-                        ctx.rely(owner, Fragile::Constant { slot, value }.key());
+                        ctx.rely(owner, slot);
                         Rc::make_mut(&mut ctx).promote(pc.0, value);
                         pc = pc.next_true();
                         arg = ResumeArg::Integer(value);
@@ -6310,6 +6217,50 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Rc::make_mut(&mut ctx).set_types(owner, clobbered);
                     Rc::make_mut(&mut ctx).top = None;
                 },
+                CoroutineState::Yielded(YieldOp::Captures(closure, upvalues)) => {
+                    // See Note [Upvalue paths].
+                    let ctx = Rc::make_mut(&mut ctx);
+                    for (n, (from, index)) in upvalues.into_iter().enumerate() {
+                        let at = Loc::root(Root::Slot(closure as u16));
+                        if from == Opcode::MOVE {
+                            ctx.values.alias(at, Label::Upvalue(n as u8), index as u16);
+                        } else {
+                            ctx.values.link(at, Label::Upvalue(n as u8), Loc::root(Root::Upvalue(index as u8)));
+                        }
+                    }
+                },
+                CoroutineState::Yielded(YieldOp::Close(from)) => {
+                    let ctx = Rc::make_mut(&mut ctx);
+                    ctx.values = ctx.closing(from);
+                },
+                CoroutineState::Yielded(YieldOp::Copy(dest, src)) => {
+                    // A copy's class tells more than its slots' type only of a value that can
+                    // have fields or a kind, or is a known constant. See Note [Value classes] in
+                    // `classes`.
+                    let plain = matches!(ctx.slot(src), CType::Number | CType::Type(LType::Nil | LType::Bool | LType::String | LType::Integer | LType::Double));
+                    if dest != src && (!plain || ctx.constant(src).is_some()) {
+                        Rc::make_mut(&mut ctx).values.assign(Root::Slot(dest as u16), Loc::root(Root::Slot(src as u16)));
+                    }
+                    // A copy of a table is checked where the table is.
+                    if dest != src {
+                        for hkey in &mut Rc::make_mut(&mut ctx).hkeys {
+                            if hkey.checked(src) {
+                                hkey.check(dest);
+                            } else if let Some(checked) = hkey.hazards.get_mut(dest) {
+                                *checked = false;
+                            }
+                        }
+                    }
+                },
+                CoroutineState::Yielded(YieldOp::UpvalueHolds(upvalue, slot)) => {
+                    // See Note [Upvalue paths].
+                    let ctx = Rc::make_mut(&mut ctx);
+                    let at = Loc::root(Root::Upvalue(upvalue as u8));
+                    ctx.values.assign(Root::Upvalue(upvalue as u8), Loc::root(Root::Slot(slot as u16)));
+                    if let Some(ctype) = ctx.value_type(slot) {
+                        ctx.values.learn(at, Known::Type(ctype));
+                    }
+                },
                 CoroutineState::Yielded(YieldOp::Effect(effect)) => {
                     Rc::make_mut(&mut ctx).effect(effect);
                     // See Note [Call effects].
@@ -6322,30 +6273,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                 },
                 CoroutineState::Yielded(YieldOp::IsElementOf(slot, table)) => {
-                    // The table in slot `table`, or in the upvalue whose value the slot holds.
-                    let same = |of: &Subject| *of == Subject::Slot(table) || ctx.holds(table).is_some_and(|upvalue| *of == Subject::Upvalue(upvalue));
-                    arg = if ctx.element_of(slot).is_some_and(|of| same(&of)) { ResumeArg::Matched } else { ResumeArg::Failed };
+                    // The table in slot `table`, wherever else it is.
+                    let path = [Label::ElementOf];
+                    let loaded = ctx.values.same(Loc { root: Root::Slot(slot as u16), path: &path }, Loc::root(Root::Slot(table as u16)));
+                    arg = if loaded { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
                 // The running closure's own upvalue, which a guard can read the table of;
                 // through the slot, a kind found out is the upvalue's too (`learn_kind`).
                 CoroutineState::Yielded(YieldOp::Subject(slot)) => {
-                    arg = ResumeArg::Subject(match ctx.holds(slot) {
-                        Some(upvalue @ UpvaluePath::Own(_)) => Subject::Upvalue(upvalue),
-                        _ => Subject::Slot(slot),
-                    });
+                    arg = ResumeArg::Subject(ctx.holds(slot).map_or(Root::Slot(slot as u16), Root::Upvalue));
                 },
                 CoroutineState::Yielded(YieldOp::ArrayType(slot, table)) => {
-                    // A table in a slot is also the field or global the slot holds. See Note
-                    // [Field facts].
-                    let kind = match &table {
-                        Subject::Slot(at) => ctx.array_kind(*at),
-                        _ => ctx.subject_kind(&table),
-                    };
+                    let kind = ctx.kind(table);
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, kind.map_or(CType::Unknown, Kind::ctype))]);
                     // A load into its table's slot has overwritten the table there.
-                    if kind.is_none() && table.slot() != Some(slot) {
-                        ctx.assume(Fragile::ElementOf { slot, table });
+                    if kind.is_none() && table != Root::Slot(slot as u16) {
+                        ctx.values.link(Loc::root(Root::Slot(slot as u16)), Label::ElementOf, Loc::root(table));
                     }
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
@@ -6362,8 +6306,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // Only for a value that can be a table or a function: what a slot holding any
                     // other learns, its type tells already.
                     let object = matches!(known, Kind::Mixed | Kind::Of(LType::Table | LType::Userdata | LType::Closure));
-                    if object && let Some(field) = FieldRef::of(&ctx.hkeys, href) {
-                        Rc::make_mut(&mut ctx).loaded(slot, Subject::Field(field));
+                    if object && let Some((table, name)) = ctx.field_of(href) {
+                        Rc::make_mut(&mut ctx).loaded(slot, Root::Slot(table), &[Label::Field(name)]);
                     }
                     if let Kind::Of(known) = known {
                         (pc, arg) = navigate(pc, &CType::Unknown, &CType::Type(known));
@@ -6426,11 +6370,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, known.unwrap_or(CType::Unknown))]);
-                    let path = UpvaluePath::Own(upvalue as u8);
-                    if let Some(kind) = ctx.subject_kind(&Subject::Upvalue(path.clone())) {
-                        ctx.assume(Fragile::Kind { table: Subject::Slot(slot), kind });
-                    }
-                    ctx.assume(Fragile::Holds { slot, upvalue: path });
+                    // The slot holds the upvalue's value, and what is known of it. See Note
+                    // [Upvalue paths].
+                    ctx.values.assign(Root::Slot(slot as u16), Loc::root(Root::Upvalue(upvalue as u8)));
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
                     self.blocks[block_id.0].allocates = true;
@@ -6560,21 +6502,58 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 }
                                 return Some((pc.0 + 1, ctx, ResumeArg::Start));
                             }
+                            // In a version of the call's point, for the context at the call. See
+                            // Note [Call sites].
+                            let found = self.versions.get(&self.proto).unwrap().get(&(pc, calling.clone())).copied();
+                            let call_block = match found {
+                                Some(call_block) if call_block != block_id => {
+                                    self.end_block(block_id);
+                                    self.blocks[block_id.0].instructions.push(Residual::Jump(call_block));
+                                    return None;
+                                },
+                                Some(call_block) => call_block,
+                                None => {
+                                    let call_block = self.new_block(pc.0);
+                                    self.blocks[call_block.0].context = Some(calling.clone());
+                                    self.versions.get_mut(&self.proto).unwrap().insert((pc, calling.clone()), call_block);
+                                    #[cfg(feature = "tracing")]
+                                    {
+                                        let context = calling.tostring(owner);
+                                        crate::tracing::instant("spec", "block", &[
+                                            ("block", call_block.0.into()),
+                                            ("line", self.traced_line(owner).into()),
+                                            ("pc", pc.0.into()),
+                                            ("context", context.as_str().into()),
+                                        ]);
+                                    }
+                                    self.end_block(block_id);
+                                    self.blocks[block_id.0].instructions.push(Residual::Jump(call_block));
+                                    call_block
+                                },
+                            };
                             // Any other call ends its block in a thunk laying out the call
                             // for the function it finds, the code after it a version of
                             // its own. See Note [Call sites].
                             let (after, continuation) = if resumes {
-                                (After::Block(self.subblock(owner, pc.next_true(), ctx, coro.clone(), ResumeArg::Start)), None)
+                                // The generator, suspended at the call, for its returns. See Note
+                                // [Call continuations].
+                                let at = pc.next_true();
+                                let suspended = coro.clone();
+                                let rest = Rest::Resume(at, Rc::new(move |vm: &mut Specializer, owner: &mut Owner, ctx: Rc<Context>| {
+                                    vm.subblock(owner, at, ctx, suspended.clone(), ResumeArg::Start)
+                                }));
+                                let continuation = before.filter(|_| INLINE_RESUMES).map(|(before, captured)| (before, captured, rest));
+                                (After::Block(self.subblock(owner, at, ctx, coro.clone(), ResumeArg::Start)), continuation)
                             } else {
                                 // A Lua callee's return also chooses a version of its own. See
                                 // Note [Call continuations].
-                                let continuation = before.map(|(before, captured)| (before, captured, pc.0 + 1));
+                                let continuation = before.map(|(before, captured)| (before, captured, Rest::Next(pc.0 + 1)));
                                 let after = self.jumping(owner, ctx, pc.0 + 1);
                                 (After::Version(pc.0 + 1, after), continuation)
                             };
-                            self.end_block(block_id);
-                            let thunk = self.make_call_thunk(block_id, calling, pc, a, b, c, after, continuation, 0, true);
-                            self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                            self.end_block(call_block);
+                            let thunk = self.make_call_thunk(call_block, calling, pc, a, b, c, after, continuation, 0, true);
+                            self.blocks[call_block.0].instructions.push(Residual::Thunk(thunk));
                             return None;
                         },
                     }
@@ -6595,7 +6574,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::LoadGlobal(slot, k)) => {
                     let proto = self.proto;
                     if let crate::chunk::Constant::String(name) = unsafe { &(&(*proto).constants.items)[k] } {
-                        Rc::make_mut(&mut ctx).loaded(slot, Subject::Global(name_hash(name.as_bytes())));
+                        Rc::make_mut(&mut ctx).loaded(slot, Root::Global(name_hash(name.as_bytes())), &[]);
                     }
                 },
                 CoroutineState::Yielded(YieldOp::SetKeyHazards(k)) => {
@@ -6637,16 +6616,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let proto = self.proto;
                     if let crate::chunk::Constant::Number(n) = unsafe { &(&(*proto).constants.items)[k] } && is_integer(n.0) {
                         let origin = loading.take().expect("a constant's load yields EncodeK first");
-                        Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Constant { slot, value: n.0 as i32 }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
+                        Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Constant { value: n.0 as i32, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
                     }
-                },
-                CoroutineState::Yielded(YieldOp::Quotient(..)) if let Some(how) = self.decision(owner, pc) => {
-                    arg = how;
-                },
-                CoroutineState::Yielded(YieldOp::Quotient(slot, of, by)) => {
-                    let origin = self.origin(block_id, coro.clone(), pc, ctx.clone());
-                    Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Quotient { slot, of, by }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
-                    arg = ResumeArg::Matched;
                 },
                 // Found out once run, when the code it is in is laid out. See `jit.versions` in
                 // `library`.
@@ -6656,21 +6627,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(thunk);
                     return None;
                 },
-                CoroutineState::Yielded(YieldOp::QuotientOf(slot)) => {
-                    arg = match ctx.quotient(slot) {
-                        Some((of, by)) => {
-                            ctx.rely(owner, Fragile::Quotient { slot, of, by }.key());
-                            ResumeArg::Quotient(of, by)
-                        },
-                        None => ResumeArg::Failed,
-                    };
-                },
                 CoroutineState::Yielded(YieldOp::Narrow(slot)) => match ctx.types[slot].clone() {
                     CType::Type(LType::Integer) => {
                         // A whole constant used as an integer: kept one, and its fact had its
                         // use. See Note [Widening].
                         if let Some(value) = ctx.constant(slot) {
-                            ctx.rely(owner, Fragile::Constant { slot, value }.key());
+                            ctx.rely(owner, slot);
                             Rc::make_mut(&mut ctx).used(slot);
                         }
                         pc = pc.next_true();
@@ -6696,6 +6658,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // stack; this should probably push a thunk which compiles the block
                     // instead of a jump
                     let jumping = self.jumping(owner, ctx.clone(), dest_pc);
+                    arg = ResumeArg::BlockId(self.version(owner, dest_pc, jumping));
+                },
+                CoroutineState::Yielded(YieldOp::GetBlockKeeping(dest_pc, kept)) => {
+                    // The register the jump's own instruction wrote, which the other way to the
+                    // target holds the same type in. See Note [Jumped-to contexts].
+                    let jumping = self.jumping_keeping(owner, ctx.clone(), dest_pc, Some(kept));
                     arg = ResumeArg::BlockId(self.version(owner, dest_pc, jumping));
                 },
                 CoroutineState::Yielded(YieldOp::Jump(dest_block)) => {
@@ -6999,10 +6967,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     id = target;
                     off = 0;
                 },
-                &Residual::Inline { a, b, stack, .. } => {
+                &Residual::Inline { a, b, stack, continuation, .. } => {
                     off += 1;
                     let callee = state.vals[state.base + a as usize];
-                    state.shift_frame::<true>(owner, callee, a as usize, b as usize, stack, true);
+                    state.shift_frame::<true>(owner, callee, a as usize, b as usize, stack, true, continuation as u64);
                     self.set_current(state.clos.ro(owner).prototype);
                 },
                 &Residual::InlineReturn { a, b, closes, moves, .. } => {

@@ -261,7 +261,7 @@ impl JitHelper {
             let state = &mut *(state as *mut RunState<'static, 'static>);
             let kept = core::slice::from_raw_parts(kept, crate::vm::INLINE_KEPT);
             let clos = crate::vm::Tc(crate::gc::Gc::from_addr(kept[5]));
-            state.unwind_jit_frame(clos, kept[4] as usize, kept[3] as usize, kept[2] as usize, crate::vm::Return::Inlined);
+            state.unwind_jit_frame(clos, kept[4] as usize, kept[3] as usize, kept[2] as usize, crate::vm::Return::Inlined(kept[1]));
         }
     }
 
@@ -1104,6 +1104,10 @@ pub struct JitContext {
     /// The code committed, and notes on it, disassembled on drop.
     #[cfg(feature = "jit_disasm")]
     pub disasm: crate::disasm::Disasm,
+    /// The functions each block of the region being compiled is in, for its note:
+    /// `Specializer::inline_chains`.
+    #[cfg(feature = "jit_disasm")]
+    pub functions: HashMap<BlockId, String>,
     /// Each thunk compiled into JIT code, by block and offset. See Note
     /// [Thunk patching].
     thunk_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
@@ -1505,6 +1509,8 @@ impl JitContext {
             window_counts: Default::default(),
             #[cfg(feature = "jit_disasm")]
             disasm: Default::default(),
+            #[cfg(feature = "jit_disasm")]
+            functions: Default::default(),
             trace_policy: match std::env::var("LUNACY_TRACES").as_deref() {
                 Ok("streaming") => None,
                 _ => Some(Policy::from_env()),
@@ -1688,6 +1694,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.region_base = base.0 as usize;
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(base.0 as usize);
         let entry = ops.offset();
+        #[cfg(feature = "jit_disasm")]
+        {
+            self.jctx.functions = self.inline_chains(id);
+        }
         jit_note!(self.jctx, ops, "region entry: prologue");
 
         // SystemV ABI is RDI, RSI, RDX, RCX, R8, R9
@@ -1957,14 +1967,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         #[cfg(feature = "jit_disasm")]
         self.jctx.disasm.committed(slab as usize, buf.len(), format!("region entered at block {}, function {source}:{line}", id.0));
 
+        // Every address of the region named: by its block, or by the region.
         #[cfg(feature = "perf")]
         {
-            for (bid, start, end) in compiled_offsets {
+            let mut blocks = compiled_offsets;
+            blocks.sort_by_key(|&(_, start, _)| start);
+            let mut at = 0;
+            for (bid, start, end) in blocks {
+                if start > at {
+                    self.jctx.add_to_perf_map(unsafe { slab.add(at) } as usize, start - at, &format!("jit_region_{} {}:{}", id.0, source, line));
+                }
                 self.jctx.add_to_perf_map(
                     unsafe { slab.add(start) } as usize,
                     end - start,
                     &format!("jit_block_{} {}:{}", bid.0, source, line)
                 );
+                at = at.max(end);
+            }
+            if buf.len() > at {
+                self.jctx.add_to_perf_map(unsafe { slab.add(at) } as usize, buf.len() - at, &format!("jit_region_{} {}:{}", id.0, source, line));
             }
             self.jctx.perf_map.as_mut().map(|mut map| map.get_mut().sync_all());
         }
@@ -2066,6 +2087,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The compensation code a patched thunk site jumps to: the transfer from
     /// the thunk's `window` to `target`'s entry window, then a jump into it.
     fn thunk_stub(&mut self, window: &Cache, target: BlockId) -> usize {
+        #[cfg(feature = "jit_disasm")]
+        let notes = self.jctx.disasm.begin();
         let block = &self.jctx.blocks[&target];
         let (ptr, entry, offset) = (block.ptr, block.window.clone(), block.offset);
         let base = self.jctx.end();
@@ -2085,7 +2108,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.reserve(buf.len());
         let stub = self.jctx.commit(base, &buf).expect("a committed thunk stub") as usize;
         #[cfg(feature = "jit_disasm")]
-        self.jctx.disasm.committed(stub, buf.len(), format!("thunk stub into block {}", target.0));
+        self.jctx.disasm.committed_since(notes, stub, buf.len(), format!("thunk stub into block {}", target.0));
+        self.jctx.add_to_perf_map(stub, buf.len(), &format!("jit_thunk_stub {}", target.0));
         stub
     }
 
@@ -2397,7 +2421,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
         let mut alloc = WindowAlloc::entering(self.jctx.blocks[&id].window.clone());
         window_dump!(self.jctx, "block {} hotness {} pc {} entered with {}", id.0, block.jit_info.hotness.get(), block.pc, alloc.cache());
-        jit_note!(self.jctx, ops, "block {} (pc {}, hotness {}{}) entered with {}", id.0, block.pc, block.jit_info.hotness.get(),
+        jit_note!(self.jctx, ops, "block {} (pc {}, function {}, hotness {}{}) entered with {}", id.0, block.pc, self.jctx.functions.get(&id).map_or("?", String::as_str), block.jit_info.hotness.get(),
             if block.promoted.is_empty() { String::new() } else {
                 format!(", promoted {}", block.promoted.iter().map(|(pc, value)| format!("pc {pc} = {value}")).collect::<Vec<_>>().join(", "))
             }, alloc.cache());
@@ -2613,6 +2637,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let call = res;
             if shifted.is_some() {
+                let &Residual::Inline { continuation, .. } = call else { unreachable!() };
                 jit_note!(self.jctx, ops, "        keep the caller's frame");
                 dynasm!(ops
                     ; .arch x64
@@ -2620,7 +2645,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ; push QWORD r12 => RunState.base
                     ; push QWORD r12 => RunState.witness_base
                     ; push QWORD r12 => RunState.witness_top
-                    ; sub rsp, 16
+                    ; mov rax, QWORD continuation as i64
+                    ; push rax
+                    ; sub rsp, 8
                 );
             }
             let res = shifted.as_ref().unwrap_or(res);
@@ -3149,12 +3176,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp =>exits[depth.get()]
                     );
                 },
-                Residual::Inline { a, b, stack, cells } => {
+                Residual::Inline { a, b, stack, cells, continuation } => {
                     // The callee's frame, moved to by `ShiftFrameFilled`, which keeps no register
                     // but `state`'s and nils the frame; what the frame's entry would hold kept as
-                    // `RunState::adopt_inlined` lays it out, the callee's base pointer last, where
-                    // the code after a call takes it back from. See Note [Inlined calls] in
-                    // `specialize`.
+                    // `RunState::adopt_inlined` lays it out, the code after the call above the
+                    // callee's base pointer, which is last, where the code after a call takes it
+                    // back from. See Note [Inlined calls] in `specialize`.
                     let hold = crate::specialize::Count::hold;
                     let (held_a, held_b) = (hold(*a), hold(*b));
                     let shift = frame_op!(ShiftFrameFilled [] (held_a, held_b, *stack); *a, *b);
@@ -3165,7 +3192,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; push QWORD r12 => RunState.base
                         ; push QWORD r12 => RunState.witness_base
                         ; push QWORD r12 => RunState.witness_top
-                        ; sub rsp, 16
+                        ; mov rax, QWORD *continuation as i64
+                        ; push rax
+                        ; sub rsp, 8
                     );
                     jit_note!(self.jctx, ops, "        ShiftFrameFilled");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &shift);
@@ -3479,7 +3508,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }; break; }
             if shifted.is_some() {
-                let &Residual::Inline { a, b, stack, cells } = call else { unreachable!() };
+                let &Residual::Inline { a, b, stack, cells, .. } = call else { unreachable!() };
                 // The window op keeps r13, the caller's base pointer, and the stack, which the
                 // callee's frame is within, stays where it is.
                 jit_note!(self.jctx, ops, "        enter the callee's frame");

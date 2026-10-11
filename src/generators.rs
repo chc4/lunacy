@@ -207,7 +207,7 @@ pub fn emit_loadbool(dest: usize, value: bool, skip: bool, pc: usize) -> impl Co
         yield YieldOp::ExecWindow(Rc::new(LoadBool::new(value as u8, &[dest])));
         yield YieldOp::SetTypes(vec![(dest, LType::Bool)]);
         if skip {
-            arg = yield YieldOp::GetBlock(pc + 1);
+            arg = yield YieldOp::GetBlockKeeping(pc + 1, dest);
             let ResumeArg::BlockId(target) = arg else { unreachable!() };
             arg = yield YieldOp::Jump(target);
         }
@@ -886,8 +886,16 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             arg = yield YieldOp::HashKey(a, b, false);
             if let ResumeArg::HashRef(hb, htype) = arg {
                 count_store!(field_stores);
+                // A whole constant stored into a field known to hold integers is stored as one, so
+                // the field keeps its type. See Note [Widening] in `specialize`.
+                let whole = if c & 0x100 != 0 && htype == Kind::Of(LType::Integer) && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
+                    let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
+                    Some(k)
+                } else {
+                    None
+                };
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                let new_type = value_type.as_ltype();
+                let new_type = if whole.is_some() { Some(LType::Integer) } else { value_type.as_ltype() };
                 // A store to `__index` moves the table to a new epoch, whatever it
                 // stores. See Note [Table metatables] in `specialize`.
                 let index = b & 0x100 != 0 && (yield YieldOp::IsKey(b & 0xff, b"__index")) == ResumeArg::Matched;
@@ -903,7 +911,13 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         Retype::Unknown => Rc::new(SetTableHref::<{ Retype::Unknown }>::new(hb.0, expected, &[a, c])),
                     });
                 } else {
-                    let ResumeArg::Boxed(value) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
+                    let value = match whole {
+                        Some(k) => LBoxed::from_int(k).bits(),
+                        None => {
+                            let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(c & 0xff)) else { unreachable!() };
+                            bits
+                        }
+                    };
                     arg = yield YieldOp::ExecWindow(match retype {
                         Retype::Same => Rc::new(SetTableHrefK::<{ Retype::Same }>::new(hb.0, expected, value, &[a])) as Rc<dyn Window>,
                         Retype::Known => Rc::new(SetTableHrefK::<{ Retype::Known }>::new(hb.0, expected, value, &[a])),
@@ -1266,7 +1280,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
             && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
         let (lint, rint) = if numbers { (integer_encoded!(lhs), integer_encoded!(rhs)) } else { (false, false) };
-        let mut quotient = None;
         let window = match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) => Some(numeric_rr(opcode, lint, rint, &[lhs, rhs, dest])),
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
@@ -1285,11 +1298,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(rhsc)) else { unreachable!() };
-                // An integer's quotient by a positive whole constant, as `math.floor` can compute
-                // it again from the integer. See Note [Quotients] in `specialize`.
-                if opcode == Opcode::DIV && lint && dest != lhs && k >= 1.0 && k <= i32::MAX as f64 && k.fract() == 0.0 {
-                    quotient = Some(k as i32);
-                }
                 Some(numeric_rk(opcode, lint, k, &[lhs, dest]))
             },
             _ => None,
@@ -1297,9 +1305,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         if let Some(window) = window {
             yield YieldOp::ExecWindow(window);
             yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Double))]);
-            if let Some(by) = quotient {
-                yield YieldOp::Quotient(dest, lhs, by);
-            }
             return arg;
         }
 
@@ -1826,7 +1831,8 @@ pub fn emit_close(a: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return
         arg = yield YieldOp::Exec(ResidualExec::new("close", Rc::new(move |owner, state| {
             let from = state.base + a;
             state.close_upvalues_from(owner, from);
-        })));
+        })).writing(&[]));
+        yield YieldOp::Close(a);
         arg
     }
 }
@@ -1839,8 +1845,7 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
             yield YieldOp::ExecWindow(Rc::new(Move::new(&[src, dest])));
             debug!("move {} = {} {:?}", dest, src, t);
             yield YieldOp::SetCTypes(vec![(dest, t)]);
-            // What's known of the value is known of its copy. See Note [Fragile information].
-            yield YieldOp::Effect(Effect::Move { from: src, to: dest });
+            yield YieldOp::Copy(dest, src);
         } else {
             unreachable!();
         }
@@ -1948,6 +1953,7 @@ pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: u
     #[coroutine]
     move |mut arg: ResumeArg| {
         let skip = !upvalues.is_empty();
+        let captured = upvalues.clone();
         let upvalues = upvalues.clone();
         arg = yield YieldOp::Exec(ResidualExec::new("closure", Rc::new(move |owner, state| {
             let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx] };
@@ -1970,11 +1976,12 @@ pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: u
                 fresh.upvalues.push(cell);
             }
             state.vals[state.base + a] = LBoxed::box_lvalue(LValue::LClosure(Tc::new(fresh)));
-        })));
+        })).writing(&[a]));
         yield YieldOp::SetTypes(vec![(a, LType::Closure)]);
+        yield YieldOp::Captures(a, captured.clone());
         yield YieldOp::CollectGarbage;
         if skip {
-            arg = yield YieldOp::GetBlock(next);
+            arg = yield YieldOp::GetBlockKeeping(next, a);
             let ResumeArg::BlockId(target) = arg else { unreachable!() };
             arg = yield YieldOp::Jump(target);
         }
@@ -1999,6 +2006,7 @@ pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
         };
         arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, cell, &[a])));
         yield YieldOp::Effect(Effect::SetUpvalue(b));
+        yield YieldOp::UpvalueHolds(b, a);
         arg
     }
 }
@@ -2178,6 +2186,7 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
             let ResumeArg::Type(t) = (yield YieldOp::Typeof(a + i)) else { unreachable!() };
             yield YieldOp::ExecWindow(Rc::new(ForInMove::new(&[a + i, f + i])));
             yield YieldOp::SetCTypes(vec![(f + i, t)]);
+            yield YieldOp::Copy(f + i, a + i);
         }
         arg = yield YieldOp::Guard(f, LType::Closure);
         if arg != ResumeArg::Matched {
@@ -2208,6 +2217,7 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
         let ResumeArg::Type(t) = (yield YieldOp::Typeof(f)) else { unreachable!() };
         yield YieldOp::ExecWindow(Rc::new(ForInMove::new(&[f, a + 2])));
         yield YieldOp::SetCTypes(vec![(a + 2, t)]);
+        yield YieldOp::Copy(a + 2, f);
         arg
     }
 }

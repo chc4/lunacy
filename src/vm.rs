@@ -1499,7 +1499,7 @@ impl Drop for ScopeGuard {
 /// A place in the specializer's code: a block, and the offset of a residual in
 /// it. Where a call returns to, where JIT code exits to the interpreter, and so
 /// on.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Location(pub BlockId, pub usize);
 
 /// A [`Location`] in one register-sized word, `(off << 32) | block` (see
@@ -1587,16 +1587,17 @@ pub const EFFECTS_SHIFT: u32 = 20;
 // arguments.
 
 /// The words JIT code keeps on the native stack for an inlined call's frame: the callee's base
-/// pointer, padding, and its caller's hash witnesses' top and base, base and closure. See Note
-/// [Inlined calls] in `specialize`.
+/// pointer, the code after the call, and its caller's hash witnesses' top and base, base and
+/// closure. See Note [Inlined calls] in `specialize`.
 pub const INLINE_KEPT: usize = 6;
 
 /// Where a frame returns to: the residual after its call in its caller's code, or, for an inlined
-/// call's frame, the code inlining it. See Note [Inlined calls] in `specialize`.
+/// call's frame, the code inlining it, which its returns continue compiling (a `Continuation`'s
+/// address). See Note [Inlined calls] in `specialize`.
 #[derive(Debug)]
 pub enum Return {
     To(Location),
-    Inlined,
+    Inlined(u64),
 }
 
 /// A frame's caller's state, restored when it returns, and, for a vararg
@@ -1621,7 +1622,7 @@ impl<'src, 'intern> CallstackEntry<'src, 'intern> {
     pub fn returns_to(&self) -> Option<&Location> {
         match &self.ret {
             Return::To(location) => Some(location),
-            Return::Inlined => None,
+            Return::Inlined(_) => None,
         }
     }
 
@@ -1974,7 +1975,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     fn frames_end(&self, owner: &Owner) -> usize {
         let frames = self.callstack.iter().map(|call| (call.frame, &call.clos)).chain([(self.base, &self.clos)]);
         // A frame is an inlined call's if the entry below it, its caller's, returns to inlining code.
-        let inlined = [false].into_iter().chain(self.callstack.iter().map(|call| matches!(call.ret, Return::Inlined)));
+        let inlined = [false].into_iter().chain(self.callstack.iter().map(|call| matches!(call.ret, Return::Inlined(_))));
         frames.zip(inlined).map(|((base, clos), inlined)| {
             let proto = unsafe { &*clos.ro(owner).prototype };
             base + if inlined { proto.max_stack as usize } else { proto.frame_size.get() }
@@ -2059,12 +2060,12 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// The frame of an inlined call of R(A), `callee`, with CALL's B, of a callee whose `max_stack`
     /// is `stack`, made as `push_frame` makes a frame, nilled past its arguments if `fills`, or else
     /// by the JIT code. The stack is already long enough: the frame is within the frame size of the
-    /// function inlining it. With `ENTRY`, its entry returns to the code inlining it
+    /// function inlining it. With `ENTRY`, its entry returns to the code inlining it, `continuation`
     /// (`Return::Inlined`), and its top starts past its registers; without, in JIT code, it is only
     /// counted (`jit_depth`), the JIT code keeping what its entry would hold, and its top is left,
     /// as code reading it sets it first. See Note [Inlined calls] in `specialize`.
     #[inline(always)]
-    pub fn shift_frame<const ENTRY: bool>(&mut self, owner: &Owner, callee: LBoxed<'src, 'intern>, a: usize, b: usize, stack: u8, fills: bool) {
+    pub fn shift_frame<const ENTRY: bool>(&mut self, owner: &Owner, callee: LBoxed<'src, 'intern>, a: usize, b: usize, stack: u8, fills: bool, continuation: u64) {
         debug_assert!(matches!(callee.unbox(), LValue::LClosure(_)), "an inlined call of what isn't a Lua function");
         // SAFETY: R(A), `callee`, is a Lua function, past its call's guard of it.
         let LValue::LClosure(lclos) = callee.unbox() else { unsafe { core::hint::unreachable_unchecked() } };
@@ -2080,7 +2081,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         if ENTRY {
             self.callstack.push(CallstackEntry {
                 clos: caller,
-                ret: Return::Inlined,
+                ret: Return::Inlined(continuation),
                 frame: self.base,
                 func: core::mem::MaybeUninit::uninit(),
                 witness_frame: self.witness_base,
@@ -2115,7 +2116,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             self.jit_depth -= 1;
             return;
         }
-        debug_assert!(matches!(self.callstack.last(), Some(CallstackEntry { ret: Return::Inlined, .. })), "an inlined call's return to a frame it didn't make");
+        debug_assert!(matches!(self.callstack.last(), Some(CallstackEntry { ret: Return::Inlined(_), .. })), "an inlined call's return to a frame it didn't make");
         // SAFETY: the running frame is the inlined call's, whose entry `shift_frame` pushed.
         let CallstackEntry { clos, frame, witness_frame, .. } = unsafe { self.callstack.pop().unwrap_unchecked() };
         self.clos = clos;
@@ -2398,10 +2399,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let stack = unsafe { self.vals.stack_ptr.as_non_null_ptr().as_ptr() } as u64;
         for k in 0..depth {
             let entry = &self.callstack[len - depth + k];
-            debug_assert!(matches!(entry.ret, Return::Inlined), "JIT code entered in an inlined call's frame with no entry for it");
+            let Return::Inlined(continuation) = entry.ret else { unreachable!("JIT code entered in an inlined call's frame with no entry for it") };
             let callee = self.callstack.get(len - depth + k + 1).map_or(self.base, |inner| inner.frame);
             let at = INLINE_KEPT * (depth - 1 - k);
-            kept[at..at + INLINE_KEPT].copy_from_slice(&[stack + callee as u64 * 8, 0, entry.witness_top as u64, entry.witness_frame as u64, entry.frame as u64, entry.clos.0.to_addr() as u64]);
+            kept[at..at + INLINE_KEPT].copy_from_slice(&[stack + callee as u64 * 8, continuation, entry.witness_top as u64, entry.witness_frame as u64, entry.frame as u64, entry.clos.0.to_addr() as u64]);
         }
         kept[INLINE_KEPT * depth] = stack + self.callstack[len - depth].frame as u64 * 8;
         self.callstack.truncate(len - depth);
@@ -2549,7 +2550,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 }))),
                 // Lua's `assert(v [, message])`: its arguments, unless `v` is false or nil,
                 // where it raises `message`, or "assertion failed!".
-                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::pure(|mut seq, args, returns, _owner| {
+                (InternString::intern(intern, "assert"), LValue::NClosure(NClosure::pure_generated(|mut seq, args, returns, _owner| {
                     match args.ro(&seq).first() {
                         // Only the arguments the call wants back are copied, none for most.
                         Some(v) if v.truthy() => {
@@ -2564,31 +2565,9 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                         },
                         _ => Err(args.ro(&seq).get(1).copied().unwrap_or_else(|| LBoxed::box_lvalue(LValue::OwnedString(Gc::string(b"assertion failed!"))))),
                     }
-                }))),
+                }, crate::library::assert_generator))),
                 // Lua's `collectgarbage(opt [, arg])`: drive the collector explicitly.
-                (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(|mut seq, args, returns, owner| {
-                    let opt: Vec<u8> = match args.ro(&seq).get(0).map(|b| b.unbox()) {
-                        Some(LValue::InternedString(s)) => s.as_bytes().to_vec(),
-                        Some(LValue::OwnedString(s)) => s.as_slice().to_vec(),
-                        _ => b"collect".to_vec(),
-                    };
-                    let result: LValue = match opt.as_slice() {
-                        // SAFETY: reachable only from a safepoint that just published roots.
-                        // See Note [GC roots].
-                        b"collect" | b"" => { unsafe { GcCtx::assume_rooted().full_collect_published(owner); } LValue::Double(Number(0.0)) },
-                        // Live memory in Kbytes, as a (fractional) number.
-                        b"count" => LValue::Double(Number(Heap::live_bytes() as f64 / 1024.0)),
-                        // Advance one incremental step.
-                        b"step" => { unsafe { GcCtx::assume_rooted().step_published(owner); } LValue::Bool(false) },
-                        b"stop" => { Heap::set_gc_off(true); LValue::Double(Number(0.0)) },
-                        b"restart" => { Heap::set_gc_off(false); LValue::Double(Number(0.0)) },
-                        // Tuning knobs we accept but don't model.
-                        b"setpause" | b"setstepmul" => LValue::Double(Number(0.0)),
-                        _ => LValue::Nil,
-                    };
-                    returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::box_lvalue(result));
-                    Ok(1)
-                }))),
+                (InternString::intern(intern, "collectgarbage"), LValue::NClosure(NClosure::new(collectgarbage))),
                 math,
                 os,
                 ].into_iter().chain(crate::library::globals(intern)).map(|(k, v)| (LCanon(LBoxed::box_lvalue(k)), LBoxed::box_lvalue(v)))
@@ -2794,4 +2773,29 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         (spec, state, r_vals.into_iter().map(|b| b.unbox()).collect::<Vec<_>>().into())
     }
 
+}
+
+/// `collectgarbage`, named so profiles name it.
+fn collectgarbage<'id, 'a, 'src, 'intern>(mut seq: LCellOwner<'id>, args: &'a LCell<'id, [LBoxed<'src, 'intern>]>, returns: &'a LCell<'id, [LBoxed<'src, 'intern>]>, owner: &mut Owner) -> Result<usize, LBoxed<'src, 'intern>> {
+    let opt: Vec<u8> = match args.ro(&seq).get(0).map(|b| b.unbox()) {
+        Some(LValue::InternedString(s)) => s.as_bytes().to_vec(),
+        Some(LValue::OwnedString(s)) => s.as_slice().to_vec(),
+        _ => b"collect".to_vec(),
+    };
+    let result: LValue = match opt.as_slice() {
+        // SAFETY: reachable only from a safepoint that just published roots.
+        // See Note [GC roots].
+        b"collect" | b"" => { unsafe { GcCtx::assume_rooted().full_collect_published(owner); } LValue::Double(Number(0.0)) },
+        // Live memory in Kbytes, as a (fractional) number.
+        b"count" => LValue::Double(Number(Heap::live_bytes() as f64 / 1024.0)),
+        // Advance one incremental step.
+        b"step" => { unsafe { GcCtx::assume_rooted().step_published(owner); } LValue::Bool(false) },
+        b"stop" => { Heap::set_gc_off(true); LValue::Double(Number(0.0)) },
+        b"restart" => { Heap::set_gc_off(false); LValue::Double(Number(0.0)) },
+        // Tuning knobs we accept but don't model.
+        b"setpause" | b"setstepmul" => LValue::Double(Number(0.0)),
+        _ => LValue::Nil,
+    };
+    returns.rw(&mut seq).into_iter().next().map(|r| *r = LBoxed::box_lvalue(result));
+    Ok(1)
 }
