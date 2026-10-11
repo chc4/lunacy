@@ -14,9 +14,9 @@ use std::hash::Hash;
 //
 // The places are roots, the frame's slots and the running function's own upvalues, and fields: a
 // labelled edge from a class to the class its field holds, as the closure a class's value is has
-// its upvalues, or the table it is has the elements of its array part. A field reached from a
-// class holds the same value whatever place the class is reached from, so a closure moved to
-// another slot keeps what is known of its upvalues.
+// its upvalues, or a value loaded from a table's array part has the table it was loaded from. A
+// field reached from a class holds the same value whatever place the class is reached from, so a
+// closure moved to another slot keeps what is known of its upvalues.
 //
 // A write to a place moves it to a class of its own, which nothing is known of, and leaves the
 // rest of its old class as it was: facts follow values, and nothing else is falsified. A class no
@@ -36,6 +36,16 @@ use std::hash::Hash;
 // in the first is implied by one of the other's class, and every field the first knows the other
 // does. The join of two contexts (`join`) knows what both do: two places are equal in it if they
 // are in both, and a class's facts are the joins of the two's.
+//
+// Each key of fact is a domain of its own, and so are the equalities: what is known in one can be
+// forgotten without forgetting anything in another. Forgetting a fact leaves the classes as they
+// are, and splitting a class leaves each part every fact the class had, as facts follow values.
+// So a context can be lowered towards another in one domain alone (`lower_facts`,
+// `lower_partition`), keeping only what the other knows there too.
+//
+// Where the other knows nothing of a place, the places reached from it along fields keep the
+// equalities they have among themselves: a closure whose upvalue is itself (a recursive local
+// function) would otherwise split into endlessly many places.
 
 /// A place the frame names directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -49,8 +59,8 @@ pub enum Root {
 pub enum Label {
     /// Upvalue n of the closure it is.
     Upvalue(u8),
-    /// The elements of the table's array part it is.
-    Element,
+    /// The table whose array part it was loaded from.
+    ElementOf,
 }
 
 /// A place: a root, or a field reached from one along `path`.
@@ -81,6 +91,40 @@ pub trait ClassFact: Clone + Eq + Hash + Debug {
 pub enum Target {
     Class(u32),
     Open(u16),
+}
+
+/// What `above` has at the places a class of a context is, as `Classes::resolve` names a place: a
+/// class there, a root it knows nothing of, or a field one of its classes doesn't know of. See
+/// `Classes::pairs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Side {
+    Class(u32),
+    Root(Root),
+    Field(u32, Label),
+}
+
+/// What a context has at the places of a pair, named as `Side` names `above`'s. See
+/// `Classes::pairs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Mine {
+    Class(u32),
+    Root(Root),
+    Field(u32, Label),
+}
+
+/// What a field of a pair holds: a pair, or an open slot.
+#[derive(Debug, Clone, Copy)]
+enum PairTarget {
+    Pair(usize),
+    Open(u16),
+}
+
+/// A context's classes paired with what another has at the same places, reached from the roots
+/// and along the context's fields. See `Classes::pairs`.
+struct Pairs {
+    pairs: Vec<(Mine, Side)>,
+    roots: Vec<(Root, usize)>,
+    fields: Vec<(usize, Label, PairTarget)>,
 }
 
 /// The classes of a context's places. See Note [Value classes].
@@ -425,6 +469,113 @@ impl<F: ClassFact> Classes<F> {
         true
     }
 
+    /// Each class paired with what `above` has at each place it is: a class reaching places
+    /// `above` has in two classes is two pairs. A field `above` has open at the same place is
+    /// kept open; one open only here holds the slot's value. A field only `above` knows of is a
+    /// pair too, so places equal here and in `above` through it stay equal. See Note [Value
+    /// classes].
+    fn pairs(&self, above: &Self) -> Pairs {
+        let mut index: HashMap<(Mine, Side), usize> = HashMap::new();
+        let mut pairs: Vec<(Mine, Side)> = Vec::new();
+        let mut intern = |pairs: &mut Vec<(Mine, Side)>, pair: (Mine, Side)| *index.entry(pair).or_insert_with(|| {
+            pairs.push(pair);
+            pairs.len() - 1
+        });
+        let mut roots = Vec::new();
+        for &(root, class) in &self.roots {
+            let side = above.root_class(root).map_or(Side::Root(root), Side::Class);
+            roots.push((root, intern(&mut pairs, (Mine::Class(class), side))));
+        }
+        let mut fields = Vec::new();
+        let mut i = 0;
+        while i < pairs.len() {
+            let (Mine::Class(class), side) = pairs[i] else {
+                i += 1;
+                continue;
+            };
+            if let Side::Class(a) = side {
+                for &(_, label, theirs) in above.fields.iter().filter(|&&(c, _, _)| c == a) {
+                    if self.field(class, label).is_none() && let Some(t) = above.target_class(theirs) {
+                        let pair = intern(&mut pairs, (Mine::Field(class, label), Side::Class(t)));
+                        fields.push((i, label, PairTarget::Pair(pair)));
+                    }
+                }
+            }
+            for &(_, label, target) in self.fields.iter().filter(|&&(c, _, _)| c == class) {
+                let theirs = match side {
+                    Side::Class(a) => above.field(a, label),
+                    _ => None,
+                };
+                // Past a place `above` knows nothing of, what is reached keeps its equalities.
+                let beyond = |above_target: Option<Target>| match (side, above_target) {
+                    (Side::Class(a), Some(Target::Open(k))) => above.root_class(Root::Slot(k)).map_or(Side::Root(Root::Slot(k)), Side::Class),
+                    (Side::Class(_), Some(Target::Class(t))) => Side::Class(t),
+                    (Side::Class(a), None) => Side::Field(a, label),
+                    (unknown, _) => unknown,
+                };
+                let paired = match (target, theirs) {
+                    (Target::Open(k), Some(Target::Open(j))) if k == j => PairTarget::Open(k),
+                    (Target::Open(k), theirs) => {
+                        let held = self.root_class(Root::Slot(k)).map_or(Mine::Root(Root::Slot(k)), Mine::Class);
+                        PairTarget::Pair(intern(&mut pairs, (held, beyond(theirs))))
+                    },
+                    (Target::Class(t), theirs) => PairTarget::Pair(intern(&mut pairs, (Mine::Class(t), beyond(theirs)))),
+                };
+                fields.push((i, label, paired));
+            }
+            i += 1;
+        }
+        Pairs { pairs, roots, fields }
+    }
+
+    /// Keep each fact of `key` only where `above` has the same fact at every place its class
+    /// is, leaving every other fact and the classes as they are. See Note [Value classes].
+    pub fn lower_facts(&mut self, key: F::Key, above: &Self) {
+        let pairs = self.pairs(above);
+        let mut keep = vec![true; self.classes as usize];
+        for &(mine, side) in &pairs.pairs {
+            let Mine::Class(class) = mine else { continue };
+            let Some(mine) = self.facts.iter().find(|(c, _)| *c == class).and_then(|(_, facts)| facts.iter().find(|f| f.key() == key)) else { continue };
+            let theirs = match side {
+                Side::Class(a) => above.facts.iter().find(|(c, _)| *c == a).and_then(|(_, facts)| facts.iter().find(|f| f.key() == key)),
+                _ => None,
+            };
+            if theirs != Some(mine) {
+                keep[class as usize] = false;
+            }
+        }
+        for (class, facts) in &mut self.facts {
+            if !keep[*class as usize] {
+                facts.retain(|fact| fact.key() != key);
+            }
+        }
+        self.normalize();
+    }
+
+    /// Split the classes so that two places are equal only if they are in `above` too, each part
+    /// keeping every fact its class had; a field open only here holds its slot's value. See Note
+    /// [Value classes].
+    pub fn lower_partition(&mut self, above: &Self) {
+        let pairs = self.pairs(above);
+        let mut lowered = Classes {
+            roots: pairs.roots.iter().map(|&(root, pair)| (root, pair as u32)).collect(),
+            fields: pairs.fields.iter().map(|&(pair, label, target)| (pair as u32, label, match target {
+                PairTarget::Pair(t) => Target::Class(t as u32),
+                PairTarget::Open(k) => Target::Open(k),
+            })).collect(),
+            facts: Vec::new(),
+            classes: pairs.pairs.len() as u32,
+        };
+        for (pair, &(mine, _)) in pairs.pairs.iter().enumerate() {
+            let Mine::Class(class) = mine else { continue };
+            if let Some((_, facts)) = self.facts.iter().find(|(c, _)| *c == class) {
+                lowered.facts.push((pair as u32, facts.clone()));
+            }
+        }
+        lowered.normalize();
+        *self = lowered;
+    }
+
     /// Forget what tells nothing and what nothing reaches, and number the classes in the order
     /// they are reached. See Note [Value classes].
     fn normalize(&mut self) {
@@ -588,7 +739,7 @@ mod tests {
     }
 
     const ROOTS: [Root; 6] = [Root::Slot(0), Root::Slot(1), Root::Slot(2), Root::Slot(3), Root::Upvalue(0), Root::Upvalue(1)];
-    const LABELS: [Label; 3] = [Label::Upvalue(0), Label::Upvalue(1), Label::Element];
+    const LABELS: [Label; 3] = [Label::Upvalue(0), Label::Upvalue(1), Label::ElementOf];
     const FACTS: [Fact; 5] = [Fact::Type(Ty::Int), Fact::Type(Ty::Float), Fact::Type(Ty::Number), Fact::Constant(1), Fact::Constant(2)];
 
     /// What a field of a value in the reference holds.
@@ -942,6 +1093,76 @@ mod tests {
             let mut c = b.clone();
             if (0..8).any(|_| add(&mut rng, &mut c)) {
                 assert!(a.accepts(&c), "accepting isn't transitive: {a:?}, {b:?}, {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn lowering_one_fact_domain_leaves_the_rest() {
+        let mut rng = Rng(0x51ed);
+        let places = places();
+        for _ in 0..1000 {
+            let (before, _) = random(&mut rng, 30);
+            let (above, _) = random(&mut rng, 30);
+            let key = rng.below(2) as u8;
+            let mut lowered = before.clone();
+            lowered.lower_facts(key, &above);
+            let mut again = lowered.clone();
+            again.lower_facts(key, &above);
+            assert_eq!(again, lowered, "lowering twice is lowering once");
+            let mut towards_itself = before.clone();
+            towards_itself.lower_facts(key, &before);
+            assert_eq!(towards_itself, before, "lowering towards itself forgets nothing");
+            for (root, path) in &places {
+                let at = Loc { root: *root, path };
+                for other_key in [0u8, 1] {
+                    let kept = lowered.fact(at, other_key);
+                    if other_key == key {
+                        if let Some(fact) = kept {
+                            assert_eq!(before.fact(at, key), Some(fact), "{at:?} learned {fact:?}");
+                            assert_eq!(above.fact(at, key), Some(fact), "{at:?} kept {fact:?}, which {above:?} doesn't have");
+                        }
+                    } else {
+                        assert_eq!(kept, before.fact(at, other_key), "{at:?}'s other domain changed");
+                    }
+                }
+                for (other, other_path) in &places {
+                    let theirs = Loc { root: *other, path: other_path };
+                    assert_eq!(lowered.same(at, theirs), before.same(at, theirs), "the classes changed");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lowering_the_partition_keeps_every_fact() {
+        let mut rng = Rng(0xc0ffee);
+        let places = places();
+        for _ in 0..1000 {
+            let (before, _) = random(&mut rng, 30);
+            let (above, _) = random(&mut rng, 30);
+            let mut lowered = before.clone();
+            lowered.lower_partition(&above);
+            let mut again = lowered.clone();
+            again.lower_partition(&above);
+            assert_eq!(again, lowered, "lowering twice is lowering once");
+            let mut towards_itself = before.clone();
+            towards_itself.lower_partition(&before);
+            assert_eq!(towards_itself, before, "lowering towards itself forgets nothing");
+            for (root, path) in &places {
+                let at = Loc { root: *root, path };
+                assert_eq!(lowered.facts(at), before.facts(at), "{at:?} lost a fact lowering {before:?} towards {above:?}");
+                for (other, other_path) in &places {
+                    let theirs = Loc { root: *other, path: other_path };
+                    let (now, was, there) = (lowered.same(at, theirs), before.same(at, theirs), above.same(at, theirs));
+                    assert!(!now || was, "{at:?} and {theirs:?} became equal");
+                    if was && there {
+                        assert!(now, "{at:?} and {theirs:?} are equal in both {before:?} and {above:?}, not in {lowered:?}");
+                    }
+                    if now && !there {
+                        assert!(above.find(at).is_none() && above.find(theirs).is_none(), "{at:?} and {theirs:?} are kept equal, which {above:?} knows aren't");
+                    }
+                }
             }
         }
     }
