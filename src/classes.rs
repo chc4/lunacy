@@ -364,25 +364,114 @@ impl<F: ClassFact> Classes<F> {
         }
     }
 
-    /// Each root `r` of `map`'s `(r, loc)` holds what `loc` holds in `other`, and nothing else
-    /// changes: roots `other` holds equal are equal, and a root here holds no value one of them
-    /// does unless `other` says so too.
-    pub fn overlay(&mut self, other: &Classes<F>, map: &[(Root, Loc)]) {
+    /// Each place `p` of `map`'s `(p, loc)`, a root or a field, holds what `loc` holds in `other`,
+    /// and nothing else changes: places `other` holds equal are equal, and a root here holds no
+    /// value one of them does unless `other` says so too.
+    pub fn overlay(&mut self, other: &Classes<F>, map: &[(Loc, Loc)]) {
         let theirs = other.view(&map.iter().enumerate().map(|(i, &(_, loc))| (Root::Slot(i as u16), loc)).collect::<Vec<_>>());
-        let taken: Vec<Root> = map.iter().map(|&(root, _)| root).collect();
-        self.roots.retain(|(root, _)| !taken.contains(root));
+        let imported = |i: usize| theirs.root_class(Root::Slot(i as u16));
         let offset = self.classes;
-        for &(root, class) in &theirs.roots {
-            let Root::Slot(i) = root else { unreachable!() };
-            self.bind(map[i as usize].0, class + offset);
-        }
+        self.classes += theirs.classes;
         self.fields.extend(theirs.fields.iter().map(|&(c, l, t)| (c + offset, l, match t {
             Target::Class(t) => Target::Class(t + offset),
             open => open,
         })));
         self.facts.extend(theirs.facts.iter().map(|(c, f)| (c + offset, f.clone())));
-        self.classes += theirs.classes;
+        for (i, &(place, _)) in map.iter().enumerate().filter(|(_, (place, _))| place.path.is_empty()) {
+            match imported(i) {
+                Some(class) => self.bind(place.root, class + offset),
+                None => self.roots.retain(|&(root, _)| root != place.root),
+            }
+        }
+        for (i, &(place, _)) in map.iter().enumerate().filter(|(_, (place, _))| !place.path.is_empty()) {
+            let (&label, parent) = place.path.split_last().unwrap();
+            match imported(i) {
+                Some(class) => {
+                    let parent = self.ensure(Loc { root: place.root, path: parent });
+                    self.set_field(parent, label, Target::Class(class + offset));
+                },
+                None => if let Some(parent) = self.find(Loc { root: place.root, path: parent }) {
+                    self.fields.retain(|&(c, l, _)| c != parent || l != label);
+                },
+            }
+        }
         self.normalize();
+    }
+
+    /// Keep only the roots `keep` says to; the others hold values nothing is known of.
+    pub fn retain_roots(&mut self, mut keep: impl FnMut(Root) -> bool) {
+        self.roots.retain(|&(root, _)| keep(root));
+        self.normalize();
+    }
+
+    /// Whether anything is known of the value `root` holds.
+    pub fn has(&self, root: Root) -> bool {
+        self.root_class(root).is_some()
+    }
+
+    /// Whether field `label` of the value `loc` holds is known.
+    pub fn has_field(&self, loc: Loc, label: Label) -> bool {
+        self.find(loc).is_some_and(|class| self.field(class, label).is_some())
+    }
+
+    /// Every fact known, of every class.
+    pub fn all_facts(&self) -> impl Iterator<Item = &F> {
+        self.facts.iter().flat_map(|(_, facts)| facts.iter())
+    }
+
+    /// Forget field `label` of the value `loc` holds.
+    pub fn unlink(&mut self, loc: Loc, label: Label) {
+        if let Some(class) = self.find(loc) {
+            self.fields.retain(|&(c, l, _)| c != class || l != label);
+            self.normalize();
+        }
+    }
+
+    /// Each root with each fact of the value it holds.
+    pub fn rooted(&self) -> impl Iterator<Item = (Root, &F)> {
+        self.roots.iter().flat_map(move |&(root, class)| {
+            self.facts.iter().filter(move |(c, _)| *c == class).flat_map(move |(_, facts)| facts.iter().map(move |fact| (root, fact)))
+        })
+    }
+
+    /// Change each fact in place, given the roots holding its value; what tells it apart (`Eq`)
+    /// must stay as it was.
+    pub fn for_each_fact_mut(&mut self, mut f: impl FnMut(&[Root], &mut F)) {
+        for (class, facts) in &mut self.facts {
+            let members: Vec<Root> = self.roots.iter().filter(|&&(_, c)| c == *class).map(|&(r, _)| r).collect();
+            for fact in facts {
+                f(&members, fact);
+            }
+        }
+    }
+
+    /// How much is known: each root's facts, and each equality and field.
+    pub fn size(&self) -> usize {
+        self.rooted().count() + self.roots.len() + self.fields.len()
+    }
+
+    /// Whether nothing is known.
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    /// How many roots hold a value with a fact of `key`.
+    pub fn count(&self, key: F::Key) -> usize {
+        self.rooted().filter(|(_, fact)| fact.key() == key).count()
+    }
+
+    /// How many equalities and fields are known: each root holding a value another place holds,
+    /// and each field.
+    pub fn equalities(&self) -> usize {
+        let shared = self.roots.iter().filter(|&&(root, class)| {
+            self.roots.iter().any(|&(other, c)| c == class && other != root) || self.fields.iter().any(|&(_, _, t)| t == Target::Class(class))
+        }).count();
+        shared + self.fields.len()
+    }
+
+    /// Whether any key's facts are known.
+    pub fn knows(&self, key: F::Key) -> bool {
+        self.facts.iter().any(|(_, facts)| facts.iter().any(|fact| fact.key() == key))
     }
 
     /// What both `self` and `other` know.
@@ -508,7 +597,7 @@ impl<F: ClassFact> Classes<F> {
                 };
                 // Past a place `above` knows nothing of, what is reached keeps its equalities.
                 let beyond = |above_target: Option<Target>| match (side, above_target) {
-                    (Side::Class(a), Some(Target::Open(k))) => above.root_class(Root::Slot(k)).map_or(Side::Root(Root::Slot(k)), Side::Class),
+                    (Side::Class(_), Some(Target::Open(k))) => above.root_class(Root::Slot(k)).map_or(Side::Root(Root::Slot(k)), Side::Class),
                     (Side::Class(_), Some(Target::Class(t))) => Side::Class(t),
                     (Side::Class(a), None) => Side::Field(a, label),
                     (unknown, _) => unknown,
@@ -1198,11 +1287,13 @@ mod tests {
             let (mut c, _) = random(&mut rng, 30);
             let (other, _) = random(&mut rng, 30);
             let before = c.clone();
-            let map = [(Root::Slot(0), slot(1)), (Root::Upvalue(0), slot(2))];
+            let field = [Label::Upvalue(1)];
+            let map = [(slot(0), slot(1)), (up(0), slot(2)), (Loc { root: Root::Slot(0), path: &field }, slot(3))];
             c.overlay(&other, &map);
             for &(mine, at) in &map {
-                assert_eq!(c.facts(Loc::root(mine)), other.facts(at));
+                assert_eq!(c.facts(mine), other.facts(at), "{mine:?} doesn't have {at:?}'s facts");
             }
+            assert_eq!(c.same(Loc { root: Root::Slot(0), path: &field }, slot(0)), other.same(slot(3), slot(1)));
             assert_eq!(c.same(Loc::root(Root::Slot(0)), Loc::root(Root::Upvalue(0))), other.same(slot(1), slot(2)));
             for root in [Root::Slot(1), Root::Slot(2), Root::Slot(3), Root::Upvalue(1)] {
                 assert_eq!(c.facts(Loc::root(root)), before.facts(Loc::root(root)));

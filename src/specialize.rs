@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 
 use crate::vm::{CallstackEntry, HashWitness, NClosure, NativeFunc, Opcode, Location, Return, Upvalue};
+use crate::classes::{ClassFact, Label, Loc, Root};
 use qcell::{LCell, LCellOwner};
 use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{Tc, Vm};
@@ -286,9 +287,9 @@ pub enum YieldOp {
                       // knows it, else Failed. See Note [Array kinds]
     IsElementOf(usize, usize), // Resumed with Matched if STACK[a] was loaded from STACK[b]'s array
                                // part, else Failed. See Note [Array kinds]
-    ArrayType(usize, Subject), // Inform the executor that STACK[a] was loaded from the array part
-                               // of the table in a subject (as `Subject` answered before the
-                               // load): its type is the array's kind, if known. See Note [Array kinds]
+    ArrayType(usize, Root), // Inform the executor that STACK[a] was loaded from the array part
+                            // of the table in a root (as `Subject` answered before the load): its
+                            // type is the array's kind, if known. See Note [Array kinds]
     Subject(usize), // Resumed with Subject: the upvalue STACK[idx] holds the value of, if the
                     // context knows, else the slot. See Note [Upvalue paths]
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
@@ -405,7 +406,7 @@ impl std::fmt::Debug for Fits {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResumeArg {
-    Subject(Subject),
+    Subject(Root),
     Start,
     Matched,
     MatchedConst(usize),
@@ -1115,8 +1116,8 @@ pub struct InlineFrame {
 
 /// The code after an inlined call, which its callee's returns continue compiling: the caller's
 /// prototype and context before the call, its captured slots below the call, the call's A and C,
-/// the upvalue the callee's closure was loaded from (Note [Upvalue paths]), and how the code after
-/// the call is compiled. Kept for as long as the specializer is, in the inlined call's entry in the
+/// a root of the caller's still holding the callee's closure (Note [Upvalue paths]), and how the
+/// code after the call is compiled. Kept for as long as the specializer is, in the inlined call's entry in the
 /// callstack by its address. See Note [Inlined calls].
 pub struct Continuation {
     proto: LProto<'static, 'static>,
@@ -1124,7 +1125,7 @@ pub struct Continuation {
     captured: Rc<[usize]>,
     a: u16,
     c: u16,
-    closure: Option<UpvaluePath>,
+    closure: Option<Root>,
     rest: Rest,
 }
 
@@ -1217,33 +1218,19 @@ impl InlineCost {
 }
 
 /// The context an inlined call in `caller`, of R(A) with operand B, enters the callee `proto`
-/// with: the entry context a call has, and the caller's facts about the callee's arguments,
-/// renumbered from its base, for the inlined call `frame`, of the closure loaded from `closure`.
-/// See Note [Inlined calls].
-fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize, frame: InlineFrame, closure: Option<&UpvaluePath>) -> Context {
+/// with: the entry context a call has, and what the caller knows of the arguments it passes, as
+/// the callee's parameters, and of its closure's upvalues, as the callee's own, for the inlined
+/// call `frame`. See Notes [Inlined calls] and [Upvalue paths].
+fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize, frame: InlineFrame) -> Context {
     let mut entry = entry_context(caller, proto, a, b);
-    let params = a + 1..a + 1 + (proto.param_count as usize).min(entry.types.len());
-    let shifted = |slot: usize| params.contains(&slot).then(|| slot - a - 1);
-    for fact in &caller.fragile {
-        let fragile = match &fact.fragile {
-            Fragile::Constant { slot, value } => shifted(*slot).map(|slot| Fragile::Constant { slot, value: *value }),
-            // See Note [Upvalue paths].
-            Fragile::Kind { table, kind } => table.into_callee(shifted, closure).map(|table| Fragile::Kind { table, kind: *kind }),
-            Fragile::ElementOf { slot, table } => shifted(*slot).zip(table.into_callee(shifted, closure)).map(|(slot, table)| Fragile::ElementOf { slot, table }),
-            Fragile::Holds { .. } | Fragile::Upvalue { .. } => None,
-        };
-        if let Some(fragile) = fragile.filter(|fragile| fragile.slot().is_none_or(|slot| entry.types[slot] != CType::Type(LType::Nil))) {
-            entry.introduce(Fact { fragile, origins: fact.origins.clone() });
-        }
-    }
-    // See Note [Upvalue paths].
-    if let Some(closure) = closure {
-        for fact in &caller.fragile {
-            if let Fragile::Upvalue { upvalue, ctype } = &fact.fragile && let Some(upvalue) = upvalue.rebase(closure) {
-                entry.assume(Fragile::Upvalue { upvalue, ctype: ctype.clone() });
-            }
-        }
-    }
+    let params = 0..(proto.param_count as usize).min(entry.types.len());
+    let fields: Vec<[Label; 1]> = (0..proto.upval_count).map(|n| [Label::Upvalue(n)]).collect();
+    let map: Vec<(Root, Loc)> = params
+        .filter(|&param| entry.types[param] != CType::Type(LType::Nil))
+        .map(|param| (Root::Slot(param as u16), Loc::root(Root::Slot((a + 1 + param) as u16))))
+        .chain(fields.iter().enumerate().map(|(n, path)| (Root::Upvalue(n as u8), Loc { root: Root::Slot(a as u16), path })))
+        .collect();
+    entry.values = caller.values.view(&map);
     entry.inline = caller.inline.iter().cloned().chain([frame]).collect();
     entry
 }
@@ -1537,7 +1524,7 @@ fn forgotten(ctype: &CType) -> bool {
 /// forgets anything of `ctx`: those registers' types (`forgotten`), and the
 /// fragile facts about them.
 fn forgets(ctx: &Context, live: usize) -> bool {
-    (live..ctx.types.len()).any(|idx| forgotten(&ctx.types[idx]) || ctx.fragile.iter().any(|fact| !fact.survives(Effect::Write(idx))))
+    (live..ctx.types.len()).any(|idx| forgotten(&ctx.types[idx]) || ctx.values.has(Root::Slot(idx as u16)))
 }
 
 // Note [Jumped-to contexts]
@@ -1792,9 +1779,9 @@ pub struct Context {
     /// The frame's top, as a slot, when the instruction before left it at one
     /// the specializer knows. See Note [Known top].
     pub top: Option<usize>,
-    /// What the specializer assumes and no guard checks, in `Fragile::key`
-    /// order. See Note [Fragile information].
-    pub fragile: SmallVec<[Fact; 2]>,
+    /// What the specializer assumes and no guard checks: what it knows of the values its places
+    /// hold. See Note [Fragile information].
+    pub values: Values,
     /// The inlined call whose callee's frame this is, if it is one. See Note [Inlined calls].
     pub inline: Vec<InlineFrame>,
     /// The value each promote this path last passed through promoted, by the
@@ -1868,7 +1855,8 @@ pub struct Context {
 // visible; where the closed world can't be shown to hold, such as across code the specializer
 // doesn't see all of it is dropped. The known top (Note [Known top]) is information of this kind.
 //
-// It is in the context (`Context::fragile`), so it is part of every block's key. A block compiled
+// It is in the context, as what is known of the values its places hold (`Context::values`; Note
+// [Value classes] in `classes`), so it is part of every block's key. A block compiled
 // relying on a fact is only entered by paths that established it and kept it since, as any path
 // reaching a block with an equal context shares it. It is per activation: a function's entry block
 // has none, and a call's continuation only what the callee's effects keep (Note [Call effects]).
@@ -1881,8 +1869,9 @@ pub struct Context {
 // the hash hazards it sets: an exec's writes are of its own frame, and a caller sees only the
 // store (Note [Call effects]).
 //
-// A kind of fact says which effects it survives (`Fragile::survives`); a new kind is a variant,
-// its `key` and `survives`, and where it is established.
+// An effect falsifies what it writes (`Context::effect`): a written place moves to a class of its
+// own, and a domain of facts says which other effects its facts survive. A new domain is a variant
+// of `Known`, its key, and where it is established.
 //
 // Now that you have background of what a fragile fact is, why do we have them? LBBV naturally
 // peels one interation of loops during compilation; there is no CFG analysis that identifies a
@@ -1898,13 +1887,14 @@ pub struct Context {
 // carrying one invalidation per backwards edge may drop a single fact from the set at a different
 // position each time, and cause `2^n` combination repeatedly compiling the same loop.
 //
-// Instead the versions of a pc that differ only in their facts are kept ordered by inclusion, kind
-// by kind of fact (`Fragile::class`), each one's facts of a kind a subset of the next's, and a
-// context reaching the pc forgets whatever facts it has that would break that order. Dropping
-// facts is always sound, since a version relying on fewer facts accepts any context with more, and
-// n facts of a kind then give at most n + 1 versions for it. Kinds are kept apart so that facts of
-// one kind, established and lost on their own schedule, never cost another kind's: a join of
-// versions keeps a fact unless a version with facts of its kind lacks it.
+// Instead the versions of a pc that differ only in their facts are kept ordered by inclusion,
+// domain by domain (each key of `Known`, and the equalities), each one's knowledge in a domain
+// within the next's, and a context reaching the pc forgets whatever it knows that would break that
+// order. Forgetting is always sound, since a version relying on less accepts any context knowing
+// more, and n facts of a domain then give at most n + 1 versions for it. Domains are kept apart
+// so that facts of one, established and lost on their own schedule, never cost another's: a fact
+// is forgotten in one domain alone, and a class split keeps every fact it had. A join of versions
+// keeps what a version knowing nothing in a domain doesn't know there.
 //
 // Which facts a path keeps depends on the order paths are compiled in. Facts established before a
 // loop's paths diverge reach every back edge, and are kept by all of them; a path that establishes
@@ -1944,174 +1934,109 @@ impl std::fmt::Display for Kind {
     }
 }
 
-/// Which upvalue a fact is of: the running function's upvalue, or an upvalue of the closure
-/// another one holds. See Note [Upvalue paths].
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum UpvaluePath {
-    Own(u8),
-    Of(Rc<UpvaluePath>, u8),
-}
-
-impl UpvaluePath {
-    /// Unique among paths: an upvalue index fits a byte, and a path is as long as the inlined
-    /// calls it crosses.
-    fn key(&self) -> usize {
-        match self {
-            UpvaluePath::Own(j) => *j as usize + 1,
-            UpvaluePath::Of(closure, n) => closure.key() << 8 | (*n as usize + 1),
-        }
-    }
-
-    /// Whether a fact of this path holds after the running function's upvalue `set` is set: only
-    /// of another of its own, as a cell any closure's upvalue names may be that one.
-    fn survives_set(&self, set: usize) -> bool {
-        matches!(self, UpvaluePath::Own(j) if *j as usize != set)
-    }
-
-    /// This path from the function whose closure `closure` holds, which it names an upvalue of.
-    fn rebase(&self, closure: &UpvaluePath) -> Option<UpvaluePath> {
-        match self {
-            UpvaluePath::Own(_) => None,
-            UpvaluePath::Of(of, n) if **of == *closure => Some(UpvaluePath::Own(*n)),
-            UpvaluePath::Of(of, n) => of.rebase(closure).map(|of| UpvaluePath::Of(Rc::new(of), *n)),
-        }
-    }
-
-    /// This path, of the function whose closure `closure` holds, from the function `closure` is
-    /// of.
-    fn under(&self, closure: &UpvaluePath) -> UpvaluePath {
-        match self {
-            UpvaluePath::Own(n) => UpvaluePath::Of(Rc::new(closure.clone()), *n),
-            UpvaluePath::Of(of, n) => UpvaluePath::Of(Rc::new(of.under(closure)), *n),
-        }
-    }
-}
-
-/// What a fact is about: a slot of the running function's frame, or an upvalue by its path. How a
-/// fact about one holds up is its subject's: what falsifies it (`survives`), and how it crosses an
-/// inlined call (`into_callee`, `into_caller`). See Note [Upvalue paths].
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum Subject {
-    Slot(usize),
-    Upvalue(UpvaluePath),
-}
-
-impl Subject {
-    /// Unique among subjects.
-    fn key(&self) -> usize {
-        match self {
-            Subject::Slot(slot) => slot << 1,
-            Subject::Upvalue(upvalue) => upvalue.key() << 1 | 1,
-        }
-    }
-
-    /// The slot it is, if it is one.
-    fn slot(&self) -> Option<usize> {
-        match self {
-            Subject::Slot(slot) => Some(*slot),
-            Subject::Upvalue(_) => None,
-        }
-    }
-
-    /// Whether the subject still holds the value it did before `effect`.
-    fn survives(&self, effect: Effect) -> bool {
-        match self {
-            Subject::Slot(slot) => slot_survives(*slot, effect),
-            Subject::Upvalue(upvalue) => upvalue_survives(upvalue, effect),
-        }
-    }
-
-    /// The subject in the frame of the callee of an inlined call: a slot of the caller's that is
-    /// an argument, as `shifted` renumbers it, or an upvalue of the callee's closure, which the
-    /// caller loaded from `closure`.
-    fn into_callee(&self, shifted: impl Fn(usize) -> Option<usize>, closure: Option<&UpvaluePath>) -> Option<Subject> {
-        match self {
-            Subject::Slot(slot) => shifted(*slot).map(Subject::Slot),
-            Subject::Upvalue(upvalue) => closure.and_then(|closure| upvalue.rebase(closure)).map(Subject::Upvalue),
-        }
-    }
-
-    /// The subject, of the callee of an inlined call, in its caller's frame, which loaded the
-    /// callee's closure from `closure`: an upvalue of the closure. The callee's slots die with it.
-    fn into_caller(&self, closure: &UpvaluePath) -> Option<Subject> {
-        match self {
-            Subject::Slot(_) => None,
-            Subject::Upvalue(upvalue) => Some(Subject::Upvalue(upvalue.under(closure))),
-        }
-    }
-}
-
-/// Whether slot `slot` still holds the value it did before `effect`.
-fn slot_survives(slot: usize, effect: Effect) -> bool {
-    match effect {
-        Effect::Write(written) => written != slot,
-        Effect::WriteAny | Effect::Opaque => false,
-        Effect::SetUpvalue(_) | Effect::AnyUpvalue | Effect::ArrayStore(_) => true,
-    }
-}
-
-/// Whether upvalue `upvalue` still holds the value it did before `effect`.
-fn upvalue_survives(upvalue: &UpvaluePath, effect: Effect) -> bool {
-    match effect {
-        Effect::SetUpvalue(set) => upvalue.survives_set(set),
-        Effect::AnyUpvalue | Effect::Opaque => false,
-        Effect::Write(_) | Effect::WriteAny | Effect::ArrayStore(_) => true,
-    }
-}
-
 // Note [Upvalue paths]
 // ~~~~~~~~~~~~~~~~~~~~
-// Facts about upvalues name the upvalue by a path from the running function: its own upvalue j, or
-// upvalue n of the closure another path's upvalue holds. The closure isn't known, only its
-// prototype (what its identity guard compares), so a fact can't name its cells, only where it is.
+// A fact about an upvalue is one about the value it holds (Note [Value classes] in `classes`): the
+// running function's own upvalue j is a root, and upvalue n of a closure is a field of the
+// closure's class. Only a closure's prototype is known (what its identity guard compares), not
+// the closure, so what is known of its upvalues is known of their values, not of its cells.
 //
-// A set of the running function's own upvalue j falsifies the facts of paths through j, and of
-// every path through another closure: cells are shared, and any of them may be j's. Setting
-// another closure's upvalue is a call, whose effects say whether it set any (Note [Call effects]).
+// A set of the running function's upvalue j moves it to a class of its own, and forgets every
+// closure's upvalue fields: cells are shared, and any of them may be j's. Setting another
+// closure's upvalue is a call, whose effects say whether it set any (Note [Call effects]).
 //
-// Paths carry facts across inlined calls (Note [Inlined calls]). Where the caller knows which of
-// its upvalues' paths the callee's closure was loaded from, the callee enters knowing as its own
-// the caller's facts about that closure's upvalues, and its return gives the caller what it then
-// knows of its own, as paths through that closure, unless it set some upvalue. A caller making
-// several calls of one closure it loads from one upvalue learns at its first inlined call what
-// every later one then knows.
+// Fields carry facts across inlined calls (Note [Inlined calls]). The callee enters with its own
+// upvalue n holding what the closure's field n does, and unless it set some upvalue, its return
+// gives the closure's fields what its own upvalues then hold, at a place of the caller's still
+// holding the closure. A caller making several calls of one closure learns at its first inlined
+// call what every later one then knows.
 //
-// A fact's subject is a slot or an upvalue (`Subject`), which says what falsifies the fact and how
-// it crosses an inlined call, so a kind of fact about either gets those from it. What a slot
-// holding an upvalue's value (`Holds`) learns, its upvalue learns too, and a load of the upvalue
-// into a slot gives the slot what is known of the upvalue: its type (`Upvalue`), and the kind of
-// its table's array part (`Kind`). So a table an upvalue holds, loaded again each time it's used,
-// keeps the kind a guard found once, until the upvalue is set or a store into some array part
-// widens kinds.
+// A slot loaded from an upvalue holds its value, so what either learns the other knows: the
+// value's type (`Known::Type`) and, for a table, its array part's kind (`Known::Kind`). So a table
+// an upvalue holds, loaded again each time it's used, keeps the kind a guard found once, until
+// the upvalue is set or a store into some array part widens kinds.
 
-/// Speculation the specializer assumes without a guard. See Note [Fragile
-/// information].
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum Fragile {
-    /// Stack slot `slot` holds the value upvalue `upvalue` held when loaded
-    /// into it.
-    Holds { slot: usize, upvalue: UpvaluePath },
-    /// Upvalue `upvalue` holds a value of `ctype`, which a guard found in a
-    /// slot holding its value: for a function past its identity guard, which.
-    /// Every slot holding its value is of `ctype`.
-    Upvalue { upvalue: UpvaluePath, ctype: CType },
-    /// Stack slot `slot` holds a value loaded from the array part of the table
-    /// in `table`. See Note [Array kinds].
-    ElementOf { slot: usize, table: Subject },
-    /// The array part of the table in `table` has kind `kind`. See Note
-    /// [Array kinds].
-    Kind { table: Subject, kind: Kind },
-    /// Stack slot `slot` holds a number constant an i32 holds exactly,
-    /// `value`. See Note [Widening].
-    Constant { slot: usize, value: i32 },
+/// What is known of a value, besides the type the slots holding it have: an upvalue's value's type
+/// (`Type`, Note [Upvalue paths]), a table's array part's kind (`Kind`, Note [Array kinds]), and a
+/// number constant an i32 holds exactly, with where it was loaded (`Constant`, Note [Widening]).
+/// Each is a domain of its own. See Notes [Fragile information] and [Value classes] in `classes`.
+#[derive(Clone)]
+pub enum Known {
+    Type(CType),
+    Kind(Kind),
+    Constant { value: i32, origins: Option<Origins> },
 }
 
-/// A fragile fact, with where the paths reaching it introduced it, if that can
-/// be rebuilt without it. See Note [Contraction].
-#[derive(Clone)]
-pub struct Fact {
-    pub fragile: Fragile,
-    origins: Option<Origins>,
+/// The keys of `Known`'s domains.
+pub const TYPE: u8 = 0;
+pub const KIND: u8 = 1;
+pub const CONSTANT: u8 = 2;
+const KEYS: [u8; 3] = [TYPE, KIND, CONSTANT];
+
+/// What a context knows of values. See Note [Fragile information].
+pub type Values = crate::classes::Classes<Known>;
+
+impl Known {
+    /// Where code introduced it, which can be rebuilt from there without it. See Note
+    /// [Contraction].
+    fn origins(&self) -> Option<&Origins> {
+        match self {
+            Known::Constant { origins, .. } => origins.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+// The origins are where a fact came from, not what it says: versions are told apart only by the
+// fact.
+impl PartialEq for Known {
+    fn eq(&self, other: &Known) -> bool {
+        match (self, other) {
+            (Known::Type(a), Known::Type(b)) => a == b,
+            (Known::Kind(a), Known::Kind(b)) => a == b,
+            (Known::Constant { value: a, .. }, Known::Constant { value: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Known {}
+
+impl std::hash::Hash for Known {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Known::Type(ctype) => (TYPE, ctype).hash(state),
+            Known::Kind(kind) => (KIND, kind).hash(state),
+            Known::Constant { value, .. } => (CONSTANT, value).hash(state),
+        }
+    }
+}
+
+impl std::fmt::Debug for Known {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Known::Type(ctype) => write!(f, "{ctype}"),
+            Known::Kind(kind) => write!(f, "kind {kind:?}"),
+            Known::Constant { value, .. } => write!(f, "constant {value}"),
+        }
+    }
+}
+
+impl crate::classes::ClassFact for Known {
+    type Key = u8;
+    fn key(&self) -> u8 {
+        match self {
+            Known::Type(_) => TYPE,
+            Known::Kind(_) => KIND,
+            Known::Constant { .. } => CONSTANT,
+        }
+    }
+    fn join(&self, other: &Self) -> Option<Self> {
+        (self == other).then(|| self.clone())
+    }
+    fn implies(&self, weaker: &Self) -> bool {
+        self == weaker
+    }
 }
 
 /// The origins of a fact, shared by every context the fact flows into.
@@ -2135,41 +2060,6 @@ pub struct OriginState {
     used: bool,
 }
 
-impl Fact {
-    fn new(fragile: Fragile) -> Self {
-        Self { fragile, origins: None }
-    }
-}
-
-impl Deref for Fact {
-    type Target = Fragile;
-    fn deref(&self) -> &Fragile {
-        &self.fragile
-    }
-}
-
-// The origins are where a fact came from, not what it says: versions are
-// told apart only by the fact.
-impl PartialEq for Fact {
-    fn eq(&self, other: &Fact) -> bool {
-        self.fragile == other.fragile
-    }
-}
-
-impl Eq for Fact {}
-
-impl std::hash::Hash for Fact {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.fragile.hash(state)
-    }
-}
-
-impl std::fmt::Debug for Fact {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fragile.fmt(f)
-    }
-}
-
 /// What fragile information an operation may falsify. See Note [Fragile
 /// information].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2187,53 +2077,6 @@ pub enum Effect {
     /// A value of the representation (`None` if not known) is stored in some
     /// table's array part.
     ArrayStore(Option<LType>),
-}
-
-impl Fragile {
-    /// Its kind: facts of different kinds are kept apart where versions are
-    /// told apart by their facts. See Note [Fragile information].
-    fn class(&self) -> u8 {
-        self.key().0
-    }
-
-    /// What the fact is about, unique among a context's facts, and their order.
-    fn key(&self) -> (u8, usize) {
-        match self {
-            Fragile::Holds { slot, .. } => (0, *slot),
-            Fragile::Upvalue { upvalue, .. } => (1, upvalue.key()),
-            Fragile::ElementOf { slot, .. } => (2, *slot),
-            Fragile::Kind { table, .. } => (3, table.key()),
-            Fragile::Constant { slot, .. } => (4, *slot),
-        }
-    }
-
-    /// The slot the fact is about, if it is about one.
-    fn slot(&self) -> Option<usize> {
-        match self {
-            Fragile::Holds { slot, .. } | Fragile::ElementOf { slot, .. } | Fragile::Constant { slot, .. } => Some(*slot),
-            Fragile::Kind { table, .. } => table.slot(),
-            Fragile::Upvalue { .. } => None,
-        }
-    }
-
-    /// Whether the fact still holds after `effect`: while the places it is about hold the
-    /// values they did, and for a kind, past the stores into some array.
-    fn survives(&self, effect: Effect) -> bool {
-        match self {
-            Fragile::Holds { slot, upvalue } => slot_survives(*slot, effect) && upvalue_survives(upvalue, effect),
-            Fragile::Upvalue { upvalue, .. } => upvalue_survives(upvalue, effect),
-            // The value stays where it was loaded from.
-            Fragile::ElementOf { slot, table } => slot_survives(*slot, effect) && table.survives(effect),
-            // Any table may be the one stored into: one of kind `kind` keeps it
-            // only for a value of that kind, and a mixed one stays mixed.
-            Fragile::Kind { table, kind } => table.survives(effect) && match effect {
-                Effect::ArrayStore(stored) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
-                _ => true,
-            },
-            // Only its slot holds it.
-            Fragile::Constant { slot, .. } => slot_survives(*slot, effect),
-        }
-    }
 }
 
 // Note [Call effects]
@@ -2364,8 +2207,8 @@ impl Mark for Context {
         for ctype in &self.types {
             ctype.mark(owner);
         }
-        for fact in &self.fragile {
-            if let Fragile::Upvalue { ctype, .. } = &fact.fragile {
+        for fact in self.values.all_facts() {
+            if let Known::Type(ctype) = fact {
                 ctype.mark(owner);
             }
         }
@@ -2379,7 +2222,7 @@ impl Context {
             types: smallvec::smallvec![CType::Unknown; slots],
             hkeys: vec![],
             top: None,
-            fragile: SmallVec::new(),
+            values: Values::default(),
             inline: Vec::new(),
             greens: SmallVec::new(),
         }
@@ -2404,27 +2247,32 @@ impl Context {
         format!("context([{}], hkeys: {}, fragile: {:?}{})",
             self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
             self.hkeys.iter().map(|hk| hk.tostring(owner)).intersperse(",".to_string()).collect::<String>(),
-            self.fragile,
+            self.values,
             if self.greens.is_empty() { String::new() } else { format!(", greens: {:?}", self.greens) },
         )
     }
 
-    /// Assume `fact`, in place of any about the same thing. See Note [Fragile
-    /// information].
-    fn assume(&mut self, fact: Fragile) {
-        self.introduce(Fact::new(fact));
-    }
-
-    /// Assume `fact`, as `assume`, with its origins.
-    fn introduce(&mut self, fact: Fact) {
-        self.fragile.retain(|known| known.key() != fact.key());
-        self.fragile.push(fact);
-        self.fragile.sort_by_key(|fact| fact.key());
-    }
-
-    /// Drop the facts `effect` may falsify. See Note [Fragile information].
+    /// Drop what `effect` may falsify. See Notes [Fragile information] and [Upvalue paths].
     fn effect(&mut self, effect: Effect) {
-        self.fragile.retain(|fact| fact.survives(effect));
+        match effect {
+            Effect::Write(slot) => self.values.write(Root::Slot(slot as u16)),
+            Effect::WriteAny => self.values.retain_roots(|root| !matches!(root, Root::Slot(_))),
+            Effect::SetUpvalue(j) => {
+                self.values.write(Root::Upvalue(j as u8));
+                self.values.retain_fields(|label, _| !matches!(label, Label::Upvalue(_)));
+            },
+            Effect::AnyUpvalue => {
+                self.values.retain_roots(|root| !matches!(root, Root::Upvalue(_)));
+                self.values.retain_fields(|label, _| !matches!(label, Label::Upvalue(_)));
+            },
+            Effect::Opaque => self.values = Values::default(),
+            // Any table may be the one stored into: one of kind `kind` keeps it only for a value
+            // of that kind, and a mixed one stays mixed.
+            Effect::ArrayStore(stored) => self.values.retain_facts(|fact| match fact {
+                Known::Kind(kind) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
+                _ => true,
+            }),
+        }
         self.inlined(Effects::of(effect));
     }
 
@@ -2439,66 +2287,59 @@ impl Context {
     /// The kind of the array part of the table in slot `table`, if known. See
     /// Note [Array kinds].
     fn array_kind(&self, table: usize) -> Option<Kind> {
-        self.subject_kind(&Subject::Slot(table))
+        self.kind(Root::Slot(table as u16))
     }
 
-    /// The kind of the array part of the table in `table`, if known.
-    fn subject_kind(&self, table: &Subject) -> Option<Kind> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Kind { table: known, kind } if known == table => Some(*kind),
+    /// The kind of the array part of the table `table` holds, if known.
+    fn kind(&self, table: Root) -> Option<Kind> {
+        match self.values.fact(Loc::root(table), KIND) {
+            Some(Known::Kind(kind)) => Some(*kind),
             _ => None,
-        })
-    }
-
-    /// Assume the array part of the table in `table` has kind `kind`, and if
-    /// that's a slot holding an upvalue's value, the upvalue's table's too. See
-    /// Notes [Array kinds] and [Upvalue paths].
-    fn learn_kind(&mut self, table: Subject, kind: Kind) {
-        if let Subject::Slot(slot) = table && let Some(upvalue) = self.holds(slot) {
-            self.assume(Fragile::Kind { table: Subject::Upvalue(upvalue), kind });
         }
-        self.assume(Fragile::Kind { table, kind });
     }
 
-    /// Where the table is whose array part slot `slot`'s value was loaded
-    /// from, if known. See Note [Array kinds].
-    fn element_of(&self, slot: usize) -> Option<Subject> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::ElementOf { slot: loaded, table } if *loaded == slot => Some(table.clone()),
-            _ => None,
+    /// Assume the array part of the table `table` holds has kind `kind`, wherever else the table
+    /// is. See Notes [Array kinds] and [Upvalue paths].
+    fn learn_kind(&mut self, table: Root, kind: Kind) {
+        self.values.learn(Loc::root(table), Known::Kind(kind));
+    }
+
+    /// A root holding the table whose array part slot `slot`'s value was loaded from, if known:
+    /// a slot, else an upvalue. See Note [Array kinds].
+    fn element_of(&self, slot: usize) -> Option<Root> {
+        let path = [Label::ElementOf];
+        self.values.members(Loc { root: Root::Slot(slot as u16), path: &path }).first().copied()
+    }
+
+    /// The running function's upvalue whose value slot `slot` holds, if known.
+    fn holds(&self, slot: usize) -> Option<u8> {
+        self.values.members(Loc::root(Root::Slot(slot as u16))).into_iter().find_map(|root| match root {
+            Root::Upvalue(j) => Some(j),
+            Root::Slot(_) => None,
         })
     }
 
-    /// The upvalue whose value slot `slot` holds, if known.
-    fn holds(&self, slot: usize) -> Option<UpvaluePath> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Holds { slot: held, upvalue } if *held == slot => Some(upvalue.clone()),
-            _ => None,
-        })
-    }
-
-    /// Assume upvalue `upvalue` holds a value of `ctype`, as does each slot
+    /// Assume the running function's upvalue `upvalue` holds a value of `ctype`, as does each slot
     /// holding its value, unless the slot's type already tells more.
-    fn learn_upvalue(&mut self, upvalue: UpvaluePath, ctype: CType) {
-        for fact in &self.fragile {
-            if let Fragile::Holds { slot, upvalue: held } = &fact.fragile && *held == upvalue && self.types[*slot].accepts(&ctype) {
-                self.types[*slot] = ctype.clone();
+    fn learn_upvalue(&mut self, upvalue: u8, ctype: CType) {
+        for root in self.values.members(Loc::root(Root::Upvalue(upvalue))) {
+            if let Root::Slot(slot) = root && self.types[slot as usize].accepts(&ctype) {
+                self.types[slot as usize] = ctype.clone();
             }
         }
-        self.assume(Fragile::Upvalue { upvalue, ctype });
+        self.values.learn(Loc::root(Root::Upvalue(upvalue)), Known::Type(ctype));
     }
 
-    /// A slot holding upvalue `upvalue`'s value, if one is known to.
     /// Slot `slot`'s type is found out at runtime: a fact that it holds a
     /// constant has had its use. See Note [Widening].
     fn used(&mut self, slot: usize) {
-        self.fragile.retain(|fact| !matches!(fact.fragile, Fragile::Constant { slot: held, .. } if held == slot));
+        self.values.forget(Loc::root(Root::Slot(slot as u16)), CONSTANT);
     }
 
-    /// Mark that code relies on the fact about `key`, so that it isn't
+    /// Mark that code relies on the constant slot `slot` holds, so that it isn't
     /// contracted. See Note [Contraction].
-    fn rely(&self, owner: &mut Owner, key: (u8, usize)) {
-        if let Some(origins) = self.fragile.iter().find(|fact| fact.key() == key).and_then(|fact| fact.origins.as_ref()) {
+    fn rely(&self, owner: &mut Owner, slot: usize) {
+        if let Some(origins) = self.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT).and_then(Known::origins) {
             for origin in owner.ro(origins).clone() {
                 owner.rw(&origin).used = true;
             }
@@ -2508,9 +2349,9 @@ impl Context {
     /// Add the origins of `other`'s facts to those of the same facts of `self`,
     /// whose code `other`'s paths now reach. See Note [Contraction].
     fn adopt(&self, owner: &mut Owner, other: &Context) {
-        for fact in &self.fragile {
-            let Some(mine) = &fact.origins else { continue };
-            let Some(theirs) = other.fragile.iter().find(|theirs| *theirs == fact).and_then(|theirs| theirs.origins.as_ref()) else { continue };
+        for (root, fact) in self.values.rooted() {
+            let Some(mine) = fact.origins() else { continue };
+            let Some(theirs) = other.values.fact(Loc::root(root), fact.key()).filter(|theirs| *theirs == fact).and_then(Known::origins) else { continue };
             if Rc::ptr_eq(mine, theirs) {
                 continue;
             }
@@ -2525,31 +2366,50 @@ impl Context {
     /// The number constant slot `slot` holds, if a fact says. See Note
     /// [Narrowing].
     fn constant(&self, slot: usize) -> Option<i32> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Constant { slot: held, value } if *held == slot => Some(*value),
+        match self.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT) {
+            Some(Known::Constant { value, .. }) => Some(*value),
             _ => None,
-        })
+        }
     }
 
     /// A slot holding the running function's upvalue `upvalue`'s value, if known.
     fn held(&self, upvalue: usize) -> Option<usize> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Holds { slot, upvalue: UpvaluePath::Own(held) } if *held as usize == upvalue => Some(*slot),
-            _ => None,
+        self.values.members(Loc::root(Root::Upvalue(upvalue as u8))).into_iter().find_map(|root| match root {
+            Root::Slot(slot) => Some(slot as usize),
+            Root::Upvalue(_) => None,
         })
     }
 
     /// The type of the running function's upvalue `upvalue`'s value, if known.
     fn upvalue(&self, upvalue: usize) -> Option<&CType> {
-        self.fragile.iter().find_map(|fact| match &fact.fragile {
-            Fragile::Upvalue { upvalue: UpvaluePath::Own(known), ctype } if *known as usize == upvalue => Some(ctype),
+        match self.values.fact(Loc::root(Root::Upvalue(upvalue as u8)), TYPE) {
+            Some(Known::Type(ctype)) => Some(ctype),
             _ => None,
-        })
+        }
     }
 
-    /// Whether `other` has every fact `self` has.
-    fn fragile_within(&self, other: &Context) -> bool {
-        self.fragile.iter().all(|fact| other.fragile.contains(fact))
+    /// What `self` knows that `other` doesn't, as each root's facts, if that is all: none if it
+    /// knows an equality, a field, or a fact only a field reaches, that `other` doesn't. See Note
+    /// [Contraction].
+    fn past(&self, other: &Context) -> Option<Vec<(Root, Known)>> {
+        let mut split = self.values.clone();
+        split.lower_partition(&other.values);
+        if split != self.values {
+            return None;
+        }
+        let rooted: Vec<(Root, Known)> = self.values.rooted()
+            .filter(|&(root, fact)| other.values.fact(Loc::root(root), fact.key()) != Some(fact))
+            .map(|(root, fact)| (root, fact.clone()))
+            .collect();
+        let mut rest = self.values.clone();
+        for (root, fact) in &rooted {
+            rest.forget(Loc::root(*root), fact.key());
+        }
+        KEYS.iter().all(|&key| {
+            let mut lowered = rest.clone();
+            lowered.lower_facts(key, &other.values);
+            lowered == rest
+        }).then_some(rooted)
     }
 
     /// Whether `self` and `other` differ at most in fragile information.
@@ -2569,14 +2429,14 @@ impl Context {
             hkey.orphan() || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
         })
             && (self.top.is_none() || self.top == other.top)
-            && self.fragile_within(other)
+            && self.values.accepts(&other.values)
             && (0..self.types.len().max(other.types.len())).all(|idx| self.slot(idx).accepts(&other.slot(idx)))
     }
 
     /// The lattice height `self` loses from `other`, which it accepts.
     fn distance(&self, other: &Context) -> usize {
         (0..self.types.len().max(other.types.len())).map(|idx| other.slot(idx).depth() - self.slot(idx).depth()).sum::<usize>()
-            + (other.fragile.len() - self.fragile.len())
+            + other.values.size().saturating_sub(self.values.size())
     }
 
     /// Widen `self` to also accept `other`. Hash keys are joined one by one: a
@@ -2595,20 +2455,26 @@ impl Context {
         if self.top != other.top {
             self.top = None;
         }
-        // Kind by kind: a context with no fact of a kind doesn't drop that kind's.
-        // See Note [Fragile information].
-        self.fragile.retain(|fact| other.fragile.contains(fact) || !other.fragile.iter().any(|theirs| theirs.class() == fact.class()));
-        for fact in self.fragile.iter_mut() {
-            let theirs = other.fragile.iter().find(|theirs| *theirs == fact).and_then(|theirs| theirs.origins.as_ref());
-            fact.origins = match (fact.origins.take(), theirs) {
+        // Domain by domain: a context knowing nothing in one doesn't drop what `self` knows
+        // there. See Note [Fragile information].
+        if other.values.equalities() > 0 {
+            self.values.lower_partition(&other.values);
+        }
+        for key in KEYS.into_iter().filter(|&key| other.values.knows(key)) {
+            self.values.lower_facts(key, &other.values);
+        }
+        self.values.for_each_fact_mut(|roots, fact| {
+            let Known::Constant { origins, .. } = fact else { return };
+            let theirs = roots.first().and_then(|&root| other.values.fact(Loc::root(root), CONSTANT)).and_then(Known::origins);
+            *origins = match (origins.take(), theirs) {
                 (Some(mine), Some(theirs)) => {
-                    let mut origins = owner.ro(&mine).clone();
-                    origins.extend(owner.ro(theirs).iter().filter(|origin| !owner.ro(&mine).iter().any(|known| Rc::ptr_eq(known, origin))).cloned());
-                    Some(Rc::new(TLCell::new(origins)))
+                    let mut joined = owner.ro(&mine).clone();
+                    joined.extend(owner.ro(theirs).iter().filter(|origin| !owner.ro(&mine).iter().any(|known| Rc::ptr_eq(known, origin))).cloned());
+                    Some(Rc::new(TLCell::new(joined)))
                 },
                 (mine, theirs) => mine.or_else(|| theirs.cloned()),
             };
-        }
+        });
         let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
         for (i, mine) in self.hkeys.iter_mut().enumerate() {
             match other.hkeys.get(i) {
@@ -3046,30 +2912,37 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // next's: `ctx` keeps the most facts of each kind that keep it one. See
         // Note [Fragile information].
         let alike: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
-        let mut classes: SmallVec<[u8; 8]> = alike.iter().flat_map(|(ectx, _)| ectx.fragile.iter()).chain(ctx.fragile.iter()).map(|fact| fact.class()).collect();
-        classes.sort_unstable();
-        classes.dedup();
-        let mut kept: Vec<Fact> = Vec::new();
-        for class in classes {
-            let of = |facts: &[Fact]| facts.iter().filter(|fact| fact.class() == class).cloned().collect::<Vec<_>>();
-            let mine = of(&ctx.fragile);
-            let mut chain: Vec<Vec<Fact>> = alike.iter().map(|(ectx, _)| of(&ectx.fragile)).collect();
-            chain.sort_by_key(Vec::len);
-            chain.dedup();
-            let below = chain.iter().rposition(|facts| facts.iter().all(|fact| mine.contains(fact)));
-            // Above the top every fact is kept; otherwise those shared with the
-            // version above the highest `ctx` has all of, or with the bottom.
-            match below.map_or(chain.first(), |below| chain.get(below + 1)) {
-                Some(above) => kept.extend(mine.into_iter().filter(|fact| above.contains(fact))),
-                None => kept.extend(mine),
+        let mut lowered = (*ctx).clone();
+        // The equalities, then each domain of facts.
+        for domain in std::iter::once(None).chain(KEYS.into_iter().map(Some)) {
+            let lower = |values: &mut Values, towards: &Values| match domain {
+                None => values.lower_partition(towards),
+                Some(key) => values.lower_facts(key, towards),
+            };
+            // Whether what `a` knows in the domain, `b` knows too.
+            let within = |a: &Values, b: &Values| {
+                let mut lowered = a.clone();
+                lower(&mut lowered, b);
+                lowered == *a
+            };
+            let size = |values: &Values| match domain {
+                None => values.equalities(),
+                Some(key) => values.count(key),
+            };
+            let mut chain: Vec<&Values> = alike.iter().map(|(ectx, _)| &ectx.values).collect();
+            chain.sort_by_key(|values| size(values));
+            chain.dedup_by(|a, b| within(a, b) && within(b, a));
+            let below = chain.iter().rposition(|values| within(values, &ctx.values));
+            // Above the top everything is kept; otherwise what is shared with the version above
+            // the highest `ctx` knows all of, or with the bottom.
+            if let Some(above) = below.map_or(chain.first(), |below| chain.get(below + 1)) {
+                lower(&mut lowered.values, above);
             }
         }
-        let ctx = if kept.len() == ctx.fragile.len() {
+        let ctx = if lowered.values == ctx.values {
             ctx
         } else {
-            let mut lowered = (*ctx).clone();
-            lowered.fragile.retain(|fact| kept.contains(fact));
-            if let Some((ectx, block)) = alike.iter().find(|(ectx, _)| ectx.fragile == lowered.fragile) {
+            if let Some((ectx, block)) = alike.iter().find(|(ectx, _)| ectx.values == lowered.values) {
                 ectx.adopt(owner, &lowered);
                 self.unreachable.remove(block);
                 return (*block, "fragile", None);
@@ -3150,12 +3023,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut widened: Vec<Origin> = Vec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         for (ectx, block) in existing {
-            let extra: Vec<&Fact> = ectx.fragile.iter().filter(|fact| !joined.fragile.contains(fact)).collect();
+            let Some(extra) = ectx.past(joined) else { continue };
             if extra.is_empty() {
                 continue;
             }
-            let doubles = extra.iter().all(|fact| matches!(fact.fragile, Fragile::Constant { slot, .. } if meets_double(&joined.slot(slot))));
-            let Some(sets) = extra.iter().map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+            let doubles = extra.iter().all(|(root, fact)| matches!((root, fact), (Root::Slot(slot), Known::Constant { .. }) if meets_double(&joined.slot(*slot as usize))));
+            let Some(sets) = extra.iter().map(|(_, fact)| fact.origins()).collect::<Option<Vec<_>>>() else { continue };
             let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
             if found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                 continue;
@@ -3203,7 +3076,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut origins: Vec<Origin> = Vec::new();
         // Of constants meeting a double: rebuilt as doubles, not dropped.
         let mut widened: Vec<Origin> = Vec::new();
-        let mut conflicting: SmallVec<[(u8, usize); 2]> = SmallVec::new();
+        let mut conflicting: SmallVec<[(Root, u8); 2]> = SmallVec::new();
         let mut _duplicates: Vec<usize> = Vec::new();
         // Each duplicate's context, and whether it was one for a constant's slot of another type.
         #[cfg(feature = "tracing")]
@@ -3215,11 +3088,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A version whose slot holding a constant holds another type here: the constant is
             // worth nothing past the point either. See Note [Contraction].
             if !ectx.alike(&ctx) {
-                let retyped: Vec<&Fact> = ectx.fragile.iter().filter(|fact| {
-                    matches!(fact.fragile, Fragile::Constant { slot, .. } if !ctx.fragile.contains(fact) && ectx.slot(slot) != ctx.slot(slot))
+                let retyped: Vec<(usize, Known)> = ectx.values.rooted().filter_map(|(root, fact)| match (root, fact) {
+                    (Root::Slot(slot), Known::Constant { .. }) if ctx.values.fact(Loc::root(root), CONSTANT) != Some(fact) && ectx.slot(slot as usize) != ctx.slot(slot as usize) => Some((slot as usize, fact.clone())),
+                    _ => None,
                 }).collect();
-                let doubles = !retyped.is_empty() && retyped.iter().all(|fact| fact.fragile.slot().is_some_and(|slot| meets_double(&ctx.slot(slot))));
-                let Some(sets) = retyped.iter().map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+                let doubles = !retyped.is_empty() && retyped.iter().all(|(slot, _)| meets_double(&ctx.slot(*slot)));
+                let Some(sets) = retyped.iter().map(|(_, fact)| fact.origins()).collect::<Option<Vec<_>>>() else { continue };
                 let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
                 if found.is_empty() || found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                     continue;
@@ -3236,15 +3110,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 continue;
             }
             // `ctx`'s facts the version lacks each contradict one of its own.
-            let mine: SmallVec<[(u8, usize); 2]> = ctx.fragile.iter().filter(|fact| !ectx.fragile.contains(fact)).map(|fact| fact.key()).collect();
-            if !mine.iter().all(|key| ectx.fragile.iter().any(|theirs| theirs.key() == *key)) {
+            let Some(mine) = ctx.past(ectx) else { continue };
+            let mine: SmallVec<[(Root, u8); 2]> = mine.iter().map(|(root, fact)| (*root, fact.key())).collect();
+            if !mine.iter().all(|&(root, key)| ectx.values.fact(Loc::root(root), key).is_some()) {
                 continue;
             }
-            let mut extra = ectx.fragile.iter().filter(|fact| !ctx.fragile.contains(fact)).peekable();
-            if extra.peek().is_none() {
+            let Some(extra) = ectx.past(&ctx) else { continue };
+            if extra.is_empty() {
                 continue;
             }
-            let Some(sets) = extra.map(|fact| fact.origins.as_ref()).collect::<Option<Vec<_>>>() else { continue };
+            let Some(sets) = extra.iter().map(|(_, fact)| fact.origins()).collect::<Option<Vec<_>>>() else { continue };
             let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
             if found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
                 continue;
@@ -3291,7 +3166,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return ctx;
         }
         let mut lowered = (*ctx).clone();
-        lowered.fragile.retain(|fact| !conflicting.contains(&fact.key()));
+        for &(root, key) in &conflicting {
+            lowered.values.forget(Loc::root(root), key);
+        }
         Rc::new(lowered)
     }
 
@@ -3359,8 +3236,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 self.contractions.push((of, origins, how));
                 continue;
             }
-            let carries = |ctx: &Context| ctx.fragile.iter().any(|fact| {
-                fact.origins.as_ref().is_some_and(|set| owner.ro(set).iter().any(|origin| origins.iter().any(|known| Rc::ptr_eq(known, origin))))
+            let carries = |ctx: &Context| ctx.values.all_facts().any(|fact| {
+                fact.origins().is_some_and(|set| owner.ro(set).iter().any(|origin| origins.iter().any(|known| Rc::ptr_eq(known, origin))))
             });
             let versions = self.versions.get_mut(&proto).unwrap();
             let mut _forgotten: Vec<usize> = Vec::new();
@@ -3564,9 +3441,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let shapes_dropped = joined.map_or(0, |j| {
             (0..requested.types.len()).filter(|&i| matches!(requested.types[i], CType::Shape(..)) && !matches!(j.slot(i), CType::Shape(..))).count()
         });
-        let origins = requested.fragile.iter().map(|fact| {
-            let from = fact.origins.as_ref().map(|set| owner.ro(set).iter().map(|origin| format!("{}@{}", owner.ro(origin).block.0, owner.ro(origin).offset)).collect::<Vec<_>>().join(","));
-            format!("{:?} <- {}", fact.fragile, from.unwrap_or_default())
+        let origins = requested.values.rooted().map(|(root, fact)| {
+            let from = fact.origins().map(|set| owner.ro(set).iter().map(|origin| format!("{}@{}", owner.ro(origin).block.0, owner.ro(origin).offset)).collect::<Vec<_>>().join(","));
+            format!("{root:?} {fact:?} <- {}", from.unwrap_or_default())
         }).collect::<Vec<_>>().join("; ");
         crate::tracing::instant("spec", "version", &[
             ("line", self.traced_line(owner).into()),
@@ -3866,10 +3743,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // An element of a known type was guarded, or its array's kind is known:
         // what it was loaded from tells no more. Only the version jumped to is
         // found without it, so it still accepts the jump. See Note [Array kinds].
-        let typed = |fact: &Fact| matches!(fact.fragile, Fragile::ElementOf { slot, .. } if ctx.slot(slot) != CType::Unknown);
-        if ctx.fragile.iter().any(typed) {
-            let forgotten: Vec<Fact> = ctx.fragile.iter().filter(|fact| typed(fact)).cloned().collect();
-            Rc::make_mut(&mut ctx).fragile.retain(|fact| !forgotten.contains(fact));
+        let typed: Vec<usize> = (0..ctx.types.len())
+            .filter(|&slot| ctx.slot(slot) != CType::Unknown && ctx.values.has_field(Loc::root(Root::Slot(slot as u16)), Label::ElementOf))
+            .collect();
+        if !typed.is_empty() {
+            let known = Rc::make_mut(&mut ctx);
+            for slot in typed {
+                known.values.unlink(Loc::root(Root::Slot(slot as u16)), Label::ElementOf);
+            }
         }
         ctx
     }
@@ -4014,10 +3895,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// load queued to be rebuilt as a double. Whether it was. See Note [Widening].
     fn widen_constant(&mut self, owner: &mut Owner, ctx: &mut Rc<Context>, slot: usize, block: BlockId) -> bool {
         let Some(value) = ctx.constant(slot) else { return false };
-        let key = Fragile::Constant { slot, value }.key();
         // Rebuilt from where the constant was loaded, as a double. See Note
         // [Contraction].
-        if let Some(set) = ctx.fragile.iter().find(|fact| fact.key() == key).and_then(|fact| fact.origins.as_ref()) {
+        if let Some(set) = ctx.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT).and_then(Known::origins) {
             let origins: Vec<Origin> = owner.ro(set).iter().filter(|origin| owner.ro(origin).rebuild.is_some()).cloned().collect();
             let queued = |origin: &Origin| self.contractions.iter().any(|(_, queued, _)| queued.iter().any(|known| Rc::ptr_eq(known, origin)));
             let queues = !origins.is_empty() && !origins.iter().all(queued);
@@ -4179,7 +4059,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 work.extend(from.get(&at).into_iter().flatten().copied());
             }
         }
-        let doomed = |ctx: &Context| ctx.fragile.iter().any(|fact| fact.origins.as_ref().is_some_and(|set| owner.ro(set).iter().any(|origin| {
+        let doomed = |ctx: &Context| ctx.values.all_facts().any(|fact| fact.origins().is_some_and(|set| owner.ro(set).iter().any(|origin| {
             self.contractions.iter().any(|(of, queued, _)| *of == self.proto && queued.iter().any(|known| Rc::ptr_eq(known, origin)))
         })));
         let versions = self.versions.get(&self.proto).unwrap();
@@ -4228,22 +4108,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // The runtime kind of the array the element was loaded from.
             // An upvalue's table is read from the running closure's own upvalue; one
             // through another closure isn't, and its element is tested as any value.
-            let array = thunk_ctx.element_of(idx).and_then(|table| {
-                let value = match &table {
-                    Subject::Slot(slot) => state.vals[state.base + slot],
-                    Subject::Upvalue(UpvaluePath::Own(j)) => state.upvalue(owner, *j as usize),
-                    Subject::Upvalue(UpvaluePath::Of(..)) => return None,
+            let array = thunk_ctx.element_of(idx).map(|table| {
+                let value = match table {
+                    Root::Slot(slot) => state.vals[state.base + slot as usize],
+                    Root::Upvalue(j) => state.upvalue(owner, j as usize),
                 };
                 let LValue::Table(tab) = value.unbox() else { unreachable!("an element of an array part not of a table") };
-                Some((table, tab.ro(owner).kind))
+                (table, tab.ro(owner).kind)
             });
             let kind_of = array.as_ref().filter(|(_, kind)| *kind == found_field.bit()).map(|(table, _)| table.clone());
             // A value the context knows is a number only has its encoding tested.
             let guard = if let Some(table) = &kind_of {
                 Residual::GuardDynamic(match table {
-                    Subject::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot])),
-                    Subject::Upvalue(UpvaluePath::Own(j)) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
-                    Subject::Upvalue(UpvaluePath::Of(..)) => unreachable!("a kind read through another closure"),
+                    Root::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot as usize])),
+                    Root::Upvalue(j) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
                 })
             } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
@@ -4390,16 +4268,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut known = continuation.caller.clone();
         effects.apply(owner, &mut known, &continuation.captured);
         // See Note [Upvalue paths].
-        if let Some(closure) = continuation.closure.as_ref().filter(|_| effects.0 & Effects::UPVALUE.0 == 0) {
-            for fact in &ctx.fragile {
-                match &fact.fragile {
-                    Fragile::Upvalue { upvalue, ctype } => known.assume(Fragile::Upvalue { upvalue: upvalue.under(closure), ctype: ctype.clone() }),
-                    Fragile::Kind { table, kind } => if let Some(table) = table.into_caller(closure) {
-                        known.assume(Fragile::Kind { table, kind: *kind });
-                    },
-                    _ => {},
-                }
-            }
+        if let Some(closure) = continuation.closure.filter(|_| effects.0 & Effects::UPVALUE.0 == 0) {
+            let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
+            let map: Vec<(Loc, Loc)> = fields.iter().enumerate().map(|(n, path)| (Loc { root: closure, path }, Loc::root(Root::Upvalue(n as u8)))).collect();
+            known.values.overlay(&ctx.values, &map);
         }
         let (call, c) = (continuation.a as usize, continuation.c as usize);
         let returned = (b != 0).then(|| b - 1);
@@ -4695,7 +4567,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// the function `proto`. See Note [Inlined calls].
     fn inline_frame(calling: &Context, callee: LProto<'static, 'static>, call: Location, proto: LProto<'static, 'static>, a: usize, b: usize) -> Context {
         let frame = InlineFrame { call, proto, a: a as u16, effects: Effects::NONE };
-        inline_entry(calling, unsafe { &*callee }, a, b, frame, calling.holds(a).as_ref())
+        inline_entry(calling, unsafe { &*callee }, a, b, frame)
     }
 
     /// The code after the inlined call of R(A) with C in `calling`, by the running function: the
@@ -4708,7 +4580,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             captured: captured.clone(),
             a: a as u16,
             c: c as u16,
-            closure: calling.holds(a),
+            // A place below the call holding the callee's closure. See Note [Upvalue paths].
+            closure: calling.values.members(Loc::root(Root::Slot(a as u16))).into_iter().find(|root| !matches!(root, Root::Slot(slot) if *slot as usize >= a)),
             rest: rest.clone(),
         }
     }
@@ -5381,7 +5254,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Promote(slot)) => match ctx.constant(slot) {
                     Some(value) if self.promotes(pc.0, value) => {
-                        ctx.rely(owner, Fragile::Constant { slot, value }.key());
+                        ctx.rely(owner, slot);
                         Rc::make_mut(&mut ctx).green(pc.0, value);
                         pc = pc.next_true();
                         arg = ResumeArg::Integer(value);
@@ -5482,20 +5355,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                 },
                 CoroutineState::Yielded(YieldOp::IsElementOf(slot, table)) => {
-                    // The table in slot `table`, or in the upvalue whose value the slot holds.
-                    let same = |of: &Subject| *of == Subject::Slot(table) || ctx.holds(table).is_some_and(|upvalue| *of == Subject::Upvalue(upvalue));
-                    arg = if ctx.element_of(slot).is_some_and(|of| same(&of)) { ResumeArg::Matched } else { ResumeArg::Failed };
+                    // The table in slot `table`, wherever else it is.
+                    let path = [Label::ElementOf];
+                    let loaded = ctx.values.same(Loc { root: Root::Slot(slot as u16), path: &path }, Loc::root(Root::Slot(table as u16)));
+                    arg = if loaded { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
                 CoroutineState::Yielded(YieldOp::Subject(slot)) => {
-                    arg = ResumeArg::Subject(ctx.holds(slot).map_or(Subject::Slot(slot), Subject::Upvalue));
+                    arg = ResumeArg::Subject(ctx.holds(slot).map_or(Root::Slot(slot as u16), Root::Upvalue));
                 },
                 CoroutineState::Yielded(YieldOp::ArrayType(slot, table)) => {
-                    let kind = ctx.subject_kind(&table);
+                    let kind = ctx.kind(table);
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, kind.map_or(CType::Unknown, Kind::ctype))]);
                     // A load into its table's slot has overwritten the table there.
-                    if kind.is_none() && table.slot() != Some(slot) {
-                        ctx.assume(Fragile::ElementOf { slot, table });
+                    if kind.is_none() && table != Root::Slot(slot as u16) {
+                        ctx.values.link(Loc::root(Root::Slot(slot as u16)), Label::ElementOf, Loc::root(table));
                     }
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
@@ -5562,11 +5436,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     let ctx = Rc::make_mut(&mut ctx);
                     ctx.set_types(owner, vec![(slot, known.unwrap_or(CType::Unknown))]);
-                    let path = UpvaluePath::Own(upvalue as u8);
-                    if let Some(kind) = ctx.subject_kind(&Subject::Upvalue(path.clone())) {
-                        ctx.assume(Fragile::Kind { table: Subject::Slot(slot), kind });
-                    }
-                    ctx.assume(Fragile::Holds { slot, upvalue: path });
+                    // The slot holds the upvalue's value, and what is known of it. See Note
+                    // [Upvalue paths].
+                    ctx.values.assign(Root::Slot(slot as u16), Loc::root(Root::Upvalue(upvalue as u8)));
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
                     self.blocks[block_id.0].allocates = true;
@@ -5799,7 +5671,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let proto = self.proto;
                     if let crate::chunk::Constant::Number(n) = unsafe { &(&(*proto).constants.items)[k] } && is_integer(n.0) {
                         let origin = loading.take().expect("a constant's load yields EncodeK first");
-                        Rc::make_mut(&mut ctx).introduce(Fact { fragile: Fragile::Constant { slot, value: n.0 as i32 }, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
+                        Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Constant { value: n.0 as i32, origins: Some(Rc::new(TLCell::new(vec![origin]))) });
                     }
                 },
                 // Found out once run, when the code it is in is laid out. See `jit.versions` in
@@ -5815,7 +5687,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // A whole constant used as an integer: kept one, and its fact had its
                         // use. See Note [Widening].
                         if let Some(value) = ctx.constant(slot) {
-                            ctx.rely(owner, Fragile::Constant { slot, value }.key());
+                            ctx.rely(owner, slot);
                             Rc::make_mut(&mut ctx).used(slot);
                         }
                         pc = pc.next_true();
