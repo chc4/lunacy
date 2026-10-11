@@ -13,30 +13,37 @@ use crate::window::{windowed, Window};
 // ~~~~~~~~~~~~~~~~~~~~~~
 // Each integer operation in the integer encoding checks its own result fits, and boxes it, though
 // the next often only reads it to compute another: `(p - 1) % 256 + 1` checks and boxes three
-// times. A chain of integer operations on one value can instead be laid out as one check and one
-// computation.
+// times. A chain of integer operations computing one value can instead be one op.
 //
 // Every generator's yields pass through a peephole as the specializer lays them out. An integer
 // operation's generator says what its window computes before yielding it, and the peephole holds it
-// instead of laying it out, as a spell: the computation of the slot it writes, suspended. The
-// generator goes on as if the operation took its hot path, and so does the code after it, whichever
-// instructions those are. An operation reading a held value joins that value's spell, if a rule
-// matches the chain it makes; anything writing a held value no one read drops its spell; a guard
-// of whether a held value is a key in a table's array part (and the element there not nil), which a
-// get or set yields before reading it, joins the spell too, as passed, and ends it. Spells of other
-// values are held alongside, so chains of different values interleave.
+// instead of laying it out, as a spell: the computation of the slot it writes, from the values its
+// operations read as they were before any of them, suspended. The generator goes on as if the
+// operation took its hot path, and so does the code after it, whichever instructions those are. An
+// operation reading a held value makes a spell of the value's spell and itself, where a rule matches
+// the chain that makes: writing the same slot, the spell goes on; writing another, it is a spell of
+// that slot, the value's spell held too. A guard of whether a held value is a key in a table's array
+// part (and the element there not nil), which a get or set yields before reading it, joins the
+// value's spell, as passed, and ends it. Anything writing a held value no one read drops its spell.
+// Spells of other values are held alongside, so chains of different values interleave.
 //
-// What the peephole holds it lays out when anything would read a held value but can't join its
-// spell, would write a value a spell reads, or would lay out code: every spell at once. Each is a
-// check, which computes it and tests every step fits, as the operations would, and the guard it ends
-// in passes, and a computation, which writes it: every check comes first, so where one fails nothing
+// What the peephole holds it lays out when anything would read a held value but can't make a spell
+// of it, or would lay out code: every spell at once, those reading a slot before the one writing
+// it, so each reads what was there before any. Each spell is a check, an op with a cold path, which
+// it takes where a step doesn't fit or the guard it ends in fails, writing nothing, and a
+// computation, which writes it. Every check comes before any computation, so where one fails nothing
 // has been written, and the code goes on from the first operation held, laid out as it would have
-// been there, the values the operations read as they were. Where all pass, the computations write
-// the values and the code goes on where the peephole laid them out.
+// been there, the values the operations read as they were. The checks end the block as an
+// optimistic integer op's encoding does, each laid out the first time it runs, with a `Branch` to
+// its ways, the way it went compiled first (Note [Optimistic ops] in `specialize`); past the last,
+// the computations, and the code going on from what laid them out. A spell that can't
+// fail, only masks, has no check; with none to check, the computations are laid out in place.
+// Spells needing one another written first, in a cycle, can't be held together: what would make one
+// is laid out after them.
 //
 // The rules are the chains code computes keys and bytes with, and every one of their prefixes, so a
 // spell is always one. A spell's operations make no -0, so a step that fits is the double its
-// operation would have computed. A spell that can't fail, only masks, has no check.
+// operation would have computed.
 
 /// An arithmetic operation of the integer encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -189,7 +196,7 @@ fn passes<const G: u8>(owner: &crate::Owner, table: LBoxed, key: i32) -> bool {
     }
 }
 
-/// What a spell's windows take: its constants, in order, and its registers.
+/// What a spell's ops take: its constants, in order, and its registers.
 #[derive(Clone, Debug)]
 pub struct Matched {
     pub ks: Vec<i32>,
@@ -199,93 +206,78 @@ pub struct Matched {
     pub dest: usize,
 }
 
-/// A rule: the chain it matches, and its check and computation.
+/// A spell's ops, as its rule makes them.
+pub struct Ops {
+    /// Its check: an op taking its cold path, writing nothing, where a step doesn't fit or the
+    /// guard it ends in fails.
+    pub check: Rc<dyn Window>,
+    /// Its computation, where it fits.
+    pub compute: Rc<dyn Window>,
+}
+
+/// A rule: the chain it matches, and its ops.
 pub struct Rule {
     pub name: &'static str,
     pub pattern: &'static [Sym],
-    pub make: fn(&Matched) -> (Rc<dyn Window>, Rc<dyn Window>),
+    pub make: fn(&Matched) -> Ops,
 }
 
-/// The next constant of iterator `$ks` as a hole, for each `$k`.
+/// The constants of `$m` as holes, for each `$k`.
 macro_rules! holes {
-    ($ks:ident;) => { [0u64; 0] };
-    ($ks:ident; $($k:ident)*) => { [$({ let _ = stringify!($k); (*$ks.next().unwrap()) as u32 as u64 }),*] };
+    ($m:ident;) => { [0u64; 0] };
+    ($m:ident; $($k:ident)*) => {{
+        let mut ks = $m.ks.iter();
+        [$({ let _ = stringify!($k); (*ks.next().unwrap()) as u32 as u64 }),*]
+    }};
 }
 
-/// A rule `$rule`, with check `$check` and computation `$compute`, over a chain of steps of a
-/// register by constants `[S k, ..]`, ending in a guard `in G` or not; first a sum or difference
-/// of two registers `rr O`; or one step then a sum or difference with another register.
+/// A rule `$rule` and its ops `$check` and `$compute`, over a chain of steps of a register by
+/// constants `[S k, ..]`, ending in a guard `in G` or not; first a sum or difference of two
+/// registers `rr O`; or one step then a sum or difference with another register. Its chain's value
+/// is `$value`, from its operands, if every step fits, `$wrapped` where it does, and `$test` whether
+/// it passes any guard.
 macro_rules! rule {
-    ($rule:ident, $check:ident, $compute:ident = [$($s:ident $k:ident),+]) => {
-        windowed!(guard $check, [$($k: u64),+], [], |owner, state, base| (lhs) {
-            (|| -> Option<i32> { let x = lhs.as_int(); $(let x = step::<$s>(x, $k as i32)?;)+ Some(x) })().is_some()
+    (@ops $m:ident, $rule:ident, $check:ident, $compute:ident, [$($sym:expr),+], ($($ks:ident),*),
+        ($($input:ident),+), ($($slot:expr),+), $value:expr, $wrapped:expr, $test:expr) => {
+        windowed!($check, [$($ks: u64),*], [], |owner, state, base| ($($input),+) {
+            !$value.is_some_and(|x: i32| ($test)(owner, x))
+        } cold {
+            1
         });
-        windowed!($compute, [$($k: u64),+], [], |owner, state, base, tag| (lhs, out dest) {
-            let x = lhs.as_int();
-            $(let x = wrapping::<$s>(x, $k as i32);)+
-            *dest = LBoxed::from_int_tagged(x, tag);
+        windowed!($compute, [$($ks: u64),*], [], |owner, state, base, tag| ($($input,)+ out dest) {
+            *dest = LBoxed::from_int_tagged($wrapped, tag);
         });
-        const $rule: Rule = Rule { name: stringify!($rule), pattern: &[$(Sym::K($s)),+], make: |m| {
-            let (mut first, mut second) = (m.ks.iter(), m.ks.iter());
-            let [$($k),+] = holes!(first; $($k)+);
-            let check = Rc::new($check::new($($k,)+ &[m.lhs])) as Rc<dyn Window>;
-            let [$($k),+] = holes!(second; $($k)+);
-            (check, Rc::new($compute::new($($k,)+ &[m.lhs, m.dest])) as Rc<dyn Window>)
+        const $rule: Rule = Rule { name: stringify!($rule), pattern: &[$($sym),+], make: |$m| {
+            let [$($ks),*] = holes!($m; $($ks)*);
+            let slots = [$($slot),+];
+            let mut out = slots.to_vec();
+            out.push($m.dest);
+            Ops { check: Rc::new($check::new($($ks,)* &slots)), compute: Rc::new($compute::new($($ks,)* &out)) }
         }};
+    };
+    ($rule:ident, $check:ident, $compute:ident = [$($s:ident $k:ident),+]) => {
+        rule!(@ops m, $rule, $check, $compute, [$(Sym::K($s)),+], ($($k),+), (lhs), (m.lhs),
+            (|| -> Option<i32> { let x = lhs.as_int(); $(let x = step::<$s>(x, $k as i32)?;)+ Some(x) })(),
+            { let x = lhs.as_int(); $(let x = wrapping::<$s>(x, $k as i32);)+ x },
+            |_, _| true);
     };
     ($rule:ident, $check:ident, $compute:ident = [$($s:ident $k:ident),+] in $g:ident) => {
-        windowed!(guard $check, [$($k: u64),+], [], |owner, state, base| (table, lhs) {
-            (|| -> Option<i32> { let x = lhs.as_int(); $(let x = step::<$s>(x, $k as i32)?;)+ Some(x) })()
-                .is_some_and(|x| passes::<$g>(owner, table, x))
-        });
-        windowed!($compute, [$($k: u64),+], [], |owner, state, base, tag| (lhs, out dest) {
-            let x = lhs.as_int();
-            $(let x = wrapping::<$s>(x, $k as i32);)+
-            *dest = LBoxed::from_int_tagged(x, tag);
-        });
-        const $rule: Rule = Rule { name: stringify!($rule), pattern: &[$(Sym::K($s),)+ Sym::Guard($g)], make: |m| {
-            let (mut first, mut second) = (m.ks.iter(), m.ks.iter());
-            let [$($k),+] = holes!(first; $($k)+);
-            let check = Rc::new($check::new($($k,)+ &[m.table.unwrap(), m.lhs])) as Rc<dyn Window>;
-            let [$($k),+] = holes!(second; $($k)+);
-            (check, Rc::new($compute::new($($k,)+ &[m.lhs, m.dest])) as Rc<dyn Window>)
-        }};
+        rule!(@ops m, $rule, $check, $compute, [$(Sym::K($s),)+ Sym::Guard($g)], ($($k),+), (table, lhs), (m.table.unwrap(), m.lhs),
+            (|| -> Option<i32> { let x = lhs.as_int(); $(let x = step::<$s>(x, $k as i32)?;)+ Some(x) })(),
+            { let x = lhs.as_int(); $(let x = wrapping::<$s>(x, $k as i32);)+ x },
+            |owner, x| passes::<$g>(owner, table, x));
     };
     ($rule:ident, $check:ident, $compute:ident = rr $o:ident [$($s:ident $k:ident),*]) => {
-        windowed!(guard $check, [$($k: u64),*], [], |owner, state, base| (lhs, rhs) {
-            (|| -> Option<i32> {
-                let x = pair::<$o>(lhs.as_int(), rhs.as_int())?;
-                $(let x = step::<$s>(x, $k as i32)?;)*
-                Some(x)
-            })().is_some()
-        });
-        windowed!($compute, [$($k: u64),*], [], |owner, state, base, tag| (lhs, rhs, out dest) {
-            let x = wrapping_pair::<$o>(lhs.as_int(), rhs.as_int());
-            $(let x = wrapping::<$s>(x, $k as i32);)*
-            *dest = LBoxed::from_int_tagged(x, tag);
-        });
-        const $rule: Rule = Rule { name: stringify!($rule), pattern: &[Sym::RR($o), $(Sym::K($s)),*], make: |m| {
-            #[allow(unused_mut, unused_variables)]
-            let (mut first, mut second) = (m.ks.iter(), m.ks.iter());
-            let [$($k),*] = holes!(first; $($k)*);
-            let check = Rc::new($check::new($($k,)* &[m.lhs, m.rhs.unwrap()])) as Rc<dyn Window>;
-            let [$($k),*] = holes!(second; $($k)*);
-            (check, Rc::new($compute::new($($k,)* &[m.lhs, m.rhs.unwrap(), m.dest])) as Rc<dyn Window>)
-        }};
+        rule!(@ops m, $rule, $check, $compute, [Sym::RR($o) $(, Sym::K($s))*], ($($k),*), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
+            (|| -> Option<i32> { let x = pair::<$o>(lhs.as_int(), rhs.as_int())?; $(let x = step::<$s>(x, $k as i32)?;)* Some(x) })(),
+            { let x = wrapping_pair::<$o>(lhs.as_int(), rhs.as_int()); $(let x = wrapping::<$s>(x, $k as i32);)* x },
+            |_, _| true);
     };
     ($rule:ident, $check:ident, $compute:ident = [$s:ident $k:ident] rr $o:ident) => {
-        windowed!(guard $check, [$k: u64], [], |owner, state, base| (lhs, rhs) {
-            (|| -> Option<i32> { pair::<$o>(step::<$s>(lhs.as_int(), $k as i32)?, rhs.as_int()) })().is_some()
-        });
-        windowed!($compute, [$k: u64], [], |owner, state, base, tag| (lhs, rhs, out dest) {
-            let x = wrapping_pair::<$o>(wrapping::<$s>(lhs.as_int(), $k as i32), rhs.as_int());
-            *dest = LBoxed::from_int_tagged(x, tag);
-        });
-        const $rule: Rule = Rule { name: stringify!($rule), pattern: &[Sym::K($s), Sym::RR($o)], make: |m| {
-            let k = m.ks[0] as u32 as u64;
-            (Rc::new($check::new(k, &[m.lhs, m.rhs.unwrap()])) as Rc<dyn Window>,
-             Rc::new($compute::new(k, &[m.lhs, m.rhs.unwrap(), m.dest])) as Rc<dyn Window>)
-        }};
+        rule!(@ops m, $rule, $check, $compute, [Sym::K($s), Sym::RR($o)], ($k), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
+            (|| -> Option<i32> { pair::<$o>(step::<$s>(lhs.as_int(), $k as i32)?, rhs.as_int()) })(),
+            wrapping_pair::<$o>(wrapping::<$s>(lhs.as_int(), $k as i32), rhs.as_int()),
+            |_, _| true);
     };
 }
 
@@ -380,7 +372,7 @@ pub fn guard(test: &dyn Window) -> Option<(u8, usize, usize)> {
 pub struct Spell {
     node: usize,
     pub dest: usize,
-    /// The slots it reads, as they were before it.
+    /// The slots it reads, as they were before any held operation.
     pub inputs: Vec<usize>,
     matched: Matched,
     /// Ended in a guard.
@@ -400,25 +392,35 @@ impl Spell {
         Some(Spell { node, dest: op.dest, inputs, matched, closed: false })
     }
 
-    /// Whether `op`, reading this spell's value, joins it: stepping the value in place, as a rule
-    /// goes on.
-    fn join(&mut self, op: &IntOp) -> bool {
-        if self.closed || op.dest != self.dest {
-            return false;
+    /// The spell of this spell's value then `op`, which reads it, into `op`'s slot, as a rule goes
+    /// on: a step of the value by a constant, or a sum or difference of it and a register no spell
+    /// writes, `held` saying which do.
+    fn then(&self, op: &IntOp, held: impl Fn(usize) -> bool) -> Option<Spell> {
+        if self.closed {
+            return None;
         }
+        let mut spell = self.clone();
         if let Some((sym, slot, k)) = op.step() {
-            let Some(node) = (slot == self.dest).then(|| TRIE.step(self.node, sym)).flatten() else { return false };
-            self.node = node;
-            self.matched.ks.push(k);
-            return true;
+            spell.node = (slot == self.dest).then(|| TRIE.step(self.node, sym)).flatten()?;
+            spell.matched.ks.push(k);
+        } else {
+            // The value first: a sum's operands either way round.
+            let (sym, l, r) = op.pair()?;
+            let other = match (l == self.dest, r == self.dest) {
+                (true, false) => r,
+                (false, true) if sym == Sym::RR(ADD) => l,
+                _ => return None,
+            };
+            if held(other) || self.matched.rhs.is_some() {
+                return None;
+            }
+            spell.node = TRIE.step(self.node, sym)?;
+            spell.matched.rhs = Some(other);
+            spell.inputs.push(other);
         }
-        // A sum or difference of the value and another register, which the spell reads too.
-        let Some((sym, l, r)) = op.pair() else { return false };
-        let Some(node) = (l == self.dest && r != self.dest && self.matched.rhs.is_none()).then(|| TRIE.step(self.node, sym)).flatten() else { return false };
-        self.node = node;
-        self.matched.rhs = Some(r);
-        self.inputs.push(r);
-        true
+        spell.dest = op.dest;
+        spell.matched.dest = op.dest;
+        Some(spell)
     }
 
     /// Whether guard `kind` of `table` on this spell's value joins it, ending it.
@@ -431,14 +433,13 @@ impl Spell {
         true
     }
 
-    /// Its rule's check and computation.
-    pub fn windows(&self) -> (Rc<dyn Window>, Rc<dyn Window>) {
-        let rule = &RULES[TRIE.rule[self.node].expect("a spell is a rule")];
-        (rule.make)(&self.matched)
+    /// Its rule's ops.
+    pub fn ops(&self) -> Ops {
+        (RULES[TRIE.rule[self.node].expect("a spell is a rule")].make)(&self.matched)
     }
 
-    /// Whether its check can fail: a step but a mask's, or a guard. One that can't is never laid
-    /// out, nor can its stencil be, its test folded away.
+    /// Whether it can fail: a step but a mask's, or a guard. One that can't is only its
+    /// computation: its check's test would fold away.
     pub fn can_fail(&self) -> bool {
         RULES[TRIE.rule[self.node].expect("a spell is a rule")].pattern.iter().any(|&sym| sym != Sym::K(MASK))
     }
@@ -467,30 +468,33 @@ pub struct Spells {
 }
 
 impl Spells {
-    /// Offer integer operation `op`: joining the spell of the value it reads, or beginning its own.
+    /// Offer integer operation `op`: a spell of the value it reads and itself, or its own.
     pub fn offer(&mut self, op: &IntOp) -> Offer {
-        let held = |slot: usize| self.spells.iter().position(|s| s.dest == slot);
-        // Reading a held value: joining its spell, else they are laid out first.
-        let read: Vec<usize> = op.reads().filter_map(held).collect();
-        if let Some(&i) = read.first() {
-            let others = read.iter().any(|&j| j != i) || self.spells.iter().enumerate().any(|(j, s)| j != i && s.inputs.contains(&op.dest));
-            if !others && self.spells[i].join(op) {
-                return Offer::Held;
+        let holds = |slot: usize| self.spells.iter().any(|s| s.dest == slot);
+        let read: Vec<usize> = op.reads().filter(|&slot| holds(slot)).collect();
+        let spell = match read.as_slice() {
+            [] => Spell::start(op),
+            [value] => self.spells.iter().find(|s| s.dest == *value).unwrap().then(op, holds),
+            _ => None,
+        };
+        let Some(spell) = spell else {
+            // It is laid out as it is: what it overwrites unread isn't, and the rest first.
+            if read.is_empty() {
+                self.drop_overwritten(&[op.dest], &[]);
+                if self.spells.is_empty() {
+                    return Offer::Refused;
+                }
             }
             return Offer::Flush;
-        }
-        // Writing a value a spell reads: they are laid out first.
-        if self.spells.iter().any(|s| s.inputs.contains(&op.dest)) {
+        };
+        // The value its slot held, unread but by it, overwritten.
+        let mut next = self.clone();
+        next.spells.retain(|s| s.dest != op.dest);
+        next.spells.push(spell);
+        if next.order().is_none() {
             return Offer::Flush;
         }
-        let Some(spell) = Spell::start(op) else {
-            // It is laid out as it is: what it overwrites unread isn't, and the rest first.
-            self.drop_overwritten(&[op.dest], &[]);
-            return if self.spells.is_empty() { Offer::Refused } else { Offer::Flush };
-        };
-        // A held value overwritten that nothing read.
-        self.spells.retain(|s| s.dest != op.dest);
-        self.spells.push(spell);
+        *self = next;
         Offer::Held
     }
 
@@ -500,7 +504,17 @@ impl Spells {
         if self.spells.iter().any(|s| s.dest == table) {
             return false;
         }
-        self.spells.iter_mut().find(|s| s.dest == key).is_some_and(|s| s.join_guard(kind, table))
+        let mut next = self.clone();
+        if !next.spells.iter_mut().find(|s| s.dest == key).is_some_and(|s| s.join_guard(kind, table)) || next.order().is_none() {
+            return false;
+        }
+        *self = next;
+        true
+    }
+
+    /// Whether the guard `test` would join a spell.
+    pub fn joins_guard(&self, test: &dyn Window) -> bool {
+        self.clone().offer_guard(test)
     }
 
     /// Drop the spells of slots `writes` that something about to be laid out writes, reading
@@ -509,9 +523,22 @@ impl Spells {
         self.spells.retain(|s| !writes.contains(&s.dest) || reads.contains(&s.dest));
     }
 
-    /// Whether the guard `test` would join a spell.
-    pub fn joins_guard(&self, test: &dyn Window) -> bool {
-        self.clone().offer_guard(test)
+    /// The spells in an order where each reading a slot another writes comes before it, if
+    /// there is one.
+    pub fn order(&self) -> Option<Vec<usize>> {
+        let n = self.spells.len();
+        // `before[i]`: the spells reading what spell `i` writes.
+        let before: Vec<Vec<usize>> = (0..n).map(|i| {
+            (0..n).filter(|&j| j != i && self.spells[j].inputs.contains(&self.spells[i].dest)).collect()
+        }).collect();
+        let mut order = Vec::with_capacity(n);
+        let mut placed = vec![false; n];
+        while order.len() < n {
+            let next = (0..n).find(|&i| !placed[i] && before[i].iter().all(|&j| placed[j]))?;
+            placed[next] = true;
+            order.push(next);
+        }
+        Some(order)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -528,6 +555,10 @@ mod tests {
         IntOp { op, lhs, rhs, dest }
     }
 
+    fn held(spells: &Spells) -> Vec<(&'static str, usize, Vec<usize>)> {
+        spells.spells.iter().map(|s| (s.rule(), s.dest, s.inputs.clone())).collect()
+    }
+
     #[test]
     fn every_prefix_is_a_rule() {
         LazyLock::force(&TRIE);
@@ -541,11 +572,10 @@ mod tests {
             assert_eq!(spells.offer(&o), Offer::Held);
         }
         assert!(spells.offer_guard(&crate::generators::InArrayHeld::new(&[1, 6])));
-        let [spell] = &spells.spells[..] else { panic!("{spells:?}") };
-        assert_eq!(spell.rule(), "SUB_MASK_ADD_HELD");
-        let (check, compute) = spell.windows();
-        assert_eq!((check.name(), check.operands()), ("CheckSubMaskAddHeld", &[1, 5][..]));
-        assert_eq!((compute.name(), compute.operands()), ("ComputeSubMaskAddHeld", &[5, 6][..]));
+        assert_eq!(held(&spells), [("SUB_MASK_ADD_HELD", 6, vec![5, 1])]);
+        let ops = spells.spells[0].ops();
+        assert_eq!((ops.check.name(), ops.check.operands()), ("CheckSubMaskAddHeld", &[1, 5][..]));
+        assert_eq!((ops.compute.name(), ops.compute.operands()), ("ComputeSubMaskAddHeld", &[1, 5, 6][..]));
     }
 
     #[test]
@@ -555,17 +585,41 @@ mod tests {
         for o in [op(Arith::Add, Slot(1), K(1), 1), op(Arith::Sub, Slot(2), K(2), 2), op(Arith::Mod, Slot(1), K(256), 1), op(Arith::Mod, Slot(2), K(16), 2)] {
             assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
         }
-        let rules: Vec<_> = spells.spells.iter().map(|s| s.rule()).collect();
-        assert_eq!(rules, ["ADD_MASK", "SUB_MASK"]);
+        assert_eq!(held(&spells), [("ADD_MASK", 1, vec![1]), ("SUB_MASK", 2, vec![2])]);
     }
 
     #[test]
-    fn a_value_overwritten_unread_is_dropped() {
+    fn a_value_read_into_another_slot_makes_a_spell_of_it() {
+        // acc = acc + t * 256, t in slot 9 multiplied in place, acc in slot 8: the sum is a spell of
+        // t's, t's held too; then t is overwritten unread, so only the sum's is left.
         let mut spells = Spells::default();
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(1), K(1), 3)), Offer::Held);
-        assert_eq!(spells.offer(&op(Arith::Sub, Slot(2), K(1), 3)), Offer::Held);
-        let [spell] = &spells.spells[..] else { panic!("{spells:?}") };
-        assert_eq!((spell.rule(), spell.inputs.as_slice()), ("SUB_", &[2][..]));
+        for o in [op(Arith::Mul, Slot(9), K(256), 9), op(Arith::Add, Slot(8), Slot(9), 8)] {
+            assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
+        }
+        assert_eq!(held(&spells), [("MUL_", 9, vec![9]), ("MUL_RR_ADD", 8, vec![9, 8])]);
+        // The sum reads t as it was: it comes first.
+        assert_eq!(spells.order(), Some(vec![1, 0]));
+        let ops = spells.spells[1].ops();
+        assert_eq!((ops.check.operands(), ops.compute.operands()), (&[9, 8][..], &[9, 8, 8][..]));
+        assert_eq!(spells.offer(&op(Arith::Add, Slot(3), K(1), 9)), Offer::Held);
+        assert_eq!(held(&spells), [("MUL_RR_ADD", 8, vec![9, 8]), ("ADD_", 9, vec![3])]);
+        assert_eq!(spells.order(), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn spells_reading_a_slot_come_before_the_one_writing_it() {
+        // a = b + 1, then b = (a) % 256, a spell of a's into b: a's reads b as it was, so it comes
+        // first.
+        let mut spells = Spells::default();
+        assert_eq!(spells.offer(&op(Arith::Add, Slot(2), K(1), 1)), Offer::Held);
+        assert_eq!(spells.offer(&op(Arith::Mod, Slot(1), K(256), 2)), Offer::Held);
+        assert_eq!(held(&spells), [("ADD_", 1, vec![2]), ("ADD_MASK", 2, vec![2])]);
+        assert_eq!(spells.order(), Some(vec![0, 1]));
+        // Writing a slot a spell reads, from another, is ordered after it too.
+        let mut spells = Spells::default();
+        assert_eq!(spells.offer(&op(Arith::Add, Slot(2), K(1), 1)), Offer::Held);
+        assert_eq!(spells.offer(&op(Arith::Sub, Slot(3), K(4), 2)), Offer::Held);
+        assert_eq!(spells.order(), Some(vec![0, 1]));
     }
 
     #[test]
@@ -575,20 +629,13 @@ mod tests {
         for o in [op(Arith::Add, Slot(1), K(1), 3), op(Arith::Mod, Slot(3), K(256), 3), op(Arith::Sub, Slot(2), K(2), 3)] {
             assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
         }
-        let [spell] = &spells.spells[..] else { panic!("{spells:?}") };
-        assert_eq!((spell.rule(), spell.inputs.as_slice()), ("SUB_", &[2][..]));
+        assert_eq!(held(&spells), [("SUB_", 3, vec![2])]);
         // Among live ones: x = x + 1 lives on, t = y + 2 doesn't, overwritten by t = z + 5.
         let mut spells = Spells::default();
         for o in [op(Arith::Add, Slot(1), K(1), 1), op(Arith::Add, Slot(2), K(2), 3), op(Arith::Add, Slot(4), K(5), 3)] {
             assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
         }
-        let held: Vec<_> = spells.spells.iter().map(|s| (s.dest, s.inputs.clone())).collect();
-        assert_eq!(held, [(1, vec![1]), (3, vec![4])]);
-        // Read before it is overwritten: not dead, and laid out first.
-        let mut spells = Spells::default();
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(1), K(1), 3)), Offer::Held);
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(3), K(1), 4)), Offer::Flush);
-        assert_eq!(spells.spells.len(), 1);
+        assert_eq!(held(&spells), [("ADD_", 1, vec![1]), ("ADD_", 3, vec![4])]);
         // Overwritten by what can't be held: dropped, nothing left to lay out.
         let mut spells = Spells::default();
         assert_eq!(spells.offer(&op(Arith::Add, Slot(1), K(1), 3)), Offer::Held);
@@ -609,11 +656,13 @@ mod tests {
     fn what_lays_out_the_spells() {
         let mut spells = Spells::default();
         assert_eq!(spells.offer(&op(Arith::Add, Slot(1), K(1), 3)), Offer::Held);
-        // Writing a slot a spell reads.
-        assert_eq!(spells.clone().offer(&op(Arith::Add, Slot(4), K(1), 1)), Offer::Flush);
-        // Reading a held value without joining: into another slot, or no rule going on.
-        assert_eq!(spells.clone().offer(&op(Arith::Add, Slot(3), K(1), 4)), Offer::Flush);
+        // Reading a held value with no rule going on.
         assert_eq!(spells.clone().offer(&op(Arith::Mul, Slot(3), K(-2), 3)), Offer::Flush);
+        assert_eq!(spells.clone().offer(&op(Arith::Mod, Slot(3), K(7), 4)), Offer::Flush);
+        // Reading two held values.
+        let mut two = spells.clone();
+        assert_eq!(two.offer(&op(Arith::Add, Slot(5), K(1), 4)), Offer::Held);
+        assert_eq!(two.offer(&op(Arith::Add, Slot(3), Slot(4), 6)), Offer::Flush);
         // A product that could be -0, with nothing held, is refused.
         assert_eq!(Spells::default().offer(&op(Arith::Mul, Slot(3), K(-2), 3)), Offer::Refused);
         // A guard on a key held is joined, ending its spell; on another, not.
@@ -629,14 +678,7 @@ mod tests {
         for o in [op(Arith::Add, Slot(1), Slot(2), 3), op(Arith::Add, Slot(3), K(1), 3), op(Arith::Mod, Slot(3), K(256), 3)] {
             assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
         }
-        assert_eq!(spells.spells[0].rule(), "RR_ADD_ADD_MASK");
-        // n * 256 + t: the product's register stepped, then summed with another.
-        let mut spells = Spells::default();
-        for o in [op(Arith::Mul, Slot(1), K(256), 3), op(Arith::Add, Slot(3), Slot(2), 3)] {
-            assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
-        }
-        let (check, compute) = spells.spells[0].windows();
-        assert_eq!((spells.spells[0].rule(), check.operands(), compute.operands()), ("MUL_RR_ADD", &[1, 2][..], &[1, 2, 3][..]));
+        assert_eq!(held(&spells), [("RR_ADD_ADD_MASK", 3, vec![1, 2])]);
     }
 
     /// A slot's value as Lua 5.1 computes it, in doubles.
