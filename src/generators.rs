@@ -264,7 +264,7 @@ windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
 // GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
 // [Global caches].
 // A cache that misses is refilled out of line.
-windowed!(GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
+windowed!(writes GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         Some(entry) => {
@@ -293,7 +293,7 @@ windowed!(GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
 });
 // A string's field, from the strings' table through the cache of its constant
 // key. See Note [String methods] in `specialize`.
-windowed!(GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
+windowed!(writes GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         Some(entry) => {
@@ -308,7 +308,7 @@ windowed!(GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
 });
 // A store that hits the cache and keeps the field's type stores in place; any
 // other, or one needing the write barrier, goes out of line.
-windowed!(SetGlobal, [cache: usize], [], |owner, state, base| (value) {
+windowed!(writes SetGlobal, [cache: usize], [], |owner, state, base| (value) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         // Hash keys of registers holding the environment know a field's type
@@ -383,11 +383,11 @@ pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield =
 
 // `GuardDynamic` tests: whether a `CType::Type(LType::Integer)` key, in a register or the
 // constant `k`, is in a table's array part. See Note [Dynamic guards].
-crate::window::windowed!(guard InArray, [], [], |owner, state, base| (table, key) {
+crate::window::windowed!(reads guard InArray, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(key.as_int()) < tab.ro(owner).array.len()
 });
-crate::window::windowed!(guard InArrayK, [k: i32], [], |owner, state, base| (table) {
+crate::window::windowed!(reads guard InArrayK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(k) < tab.ro(owner).array.len()
 });
@@ -406,11 +406,11 @@ crate::window::windowed!(guard EqualsK, [k: i32], [], |owner, state, base| (valu
     value.as_int() == k
 });
 // And whether the element there isn't nil.
-crate::window::windowed!(guard InArrayHeld, [], [], |owner, state, base| (table, key) {
+crate::window::windowed!(reads guard InArrayHeld, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).array.get(integer_slot(key.as_int())).is_some_and(|v| !v.is_nil())
 });
-crate::window::windowed!(guard InArrayHeldK, [k: i32], [], |owner, state, base| (table) {
+crate::window::windowed!(reads guard InArrayHeldK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).array.get(integer_slot(k)).is_some_and(|v| !v.is_nil())
 });
@@ -515,24 +515,24 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 None => yield YieldOp::Decided(false),
             };
             let chains = !(in_array == ResumeArg::Matched && (holds || held));
-            windowed!(GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
+            windowed!(reads GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(k)];
             });
-            windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
+            windowed!(reads GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(key.as_int())];
             });
             // A load that may find nil takes its cold path on nil, the way on from
             // which looks the key up down the chain. See Note [Optimistic ops].
-            windowed!(GetTableArrayChain, [k: i32], [], |owner, state, base| (table, out dest) {
+            windowed!(reads GetTableArrayChain, [k: i32], [], |owner, state, base| (table, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(k)];
                 dest.is_nil()
             } cold {
                 1
             });
-            windowed!(GetTableIntegerChain, [], [], |owner, state, base| (table, key, out dest) {
+            windowed!(reads GetTableIntegerChain, [], [], |owner, state, base| (table, key, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(key.as_int())];
                 dest.is_nil()
@@ -660,7 +660,7 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
 }
 
 // Store through a hash key's witness into a register's table.
-windowed!(SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, state, base| (table, value) {
+windowed!(writes SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, state, base| (table, value) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     store_field(owner, state, &tab, value, href, expected, RETYPE);
     // Last. See Note [Write barriers].
@@ -669,7 +669,7 @@ windowed!(SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, st
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.barrier_slow();
 });
-windowed!(SetTableHrefK, [href: u8, expected: Kind, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
+windowed!(writes SetTableHrefK, [href: u8, expected: Kind, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     // A constant's value lives as long as its prototype.
     let value = LBoxed::from_bits(value);
@@ -804,7 +804,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             (true, Some(stored)) => Widen::Bit(stored),
         };
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableArray, [k: i32], [W: Widen, N: bool], |owner, state, base| (table, value) {
+            windowed!(writes SetTableArray, [k: i32], [W: Widen, N: bool], |owner, state, base| (table, value) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 store_array::<W, N>(owner, &tab, integer_slot(k), value);
                 // Last. See Note [Write barriers].
@@ -813,7 +813,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 tab.barrier_slow();
             });
-            windowed!(SetTableArrayK, [k: i32, value: u64], [W: Widen, N: bool], |owner, state, base| (table) {
+            windowed!(writes SetTableArrayK, [k: i32, value: u64], [W: Widen, N: bool], |owner, state, base| (table) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 // A constant's value lives as long as its prototype.
                 let value = LBoxed::from_bits(value);
@@ -841,7 +841,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 yield YieldOp::Effect(Effect::ArrayStore(stored));
             }
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableInteger, [], [W: Widen, N: bool], |owner, state, base| (table, key, value) {
+            windowed!(writes SetTableInteger, [], [W: Widen, N: bool], |owner, state, base| (table, key, value) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 store_array::<W, N>(owner, &tab, integer_slot(key.as_int()), value);
                 // Last. See Note [Write barriers].
@@ -850,7 +850,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 tab.barrier_slow();
             });
-            windowed!(SetTableIntegerK, [value: u64], [W: Widen, N: bool], |owner, state, base| (table, key) {
+            windowed!(writes SetTableIntegerK, [value: u64], [W: Widen, N: bool], |owner, state, base| (table, key) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 // A constant's value lives as long as its prototype.
                 let value = LBoxed::from_bits(value);
@@ -1890,7 +1890,7 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
 pub const NO_CELL: usize = usize::MAX;
 
 // An upvalue's value, which JIT code also stores into its `cell`, if it has one.
-windowed!(GetUpval, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
+windowed!(reads GetUpval, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
     let _ = cell;
     let upval = state.upvalue(owner, index);
     debug!("upval {:?}", &upval);
@@ -1898,13 +1898,13 @@ windowed!(GetUpval, [index: usize, cell: usize], [], |owner, state, base| (out d
 });
 // An upvalue's value, which JIT code loads from its `cell`, holding it. See Note [Upvalue cells]
 // in `jit`.
-windowed!(UpvalCell, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
+windowed!(reads UpvalCell, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
     let _ = cell;
     *dest = state.upvalue(owner, index);
 });
 // A store into an upvalue, which JIT code also stores into its `cell`, if it has one. A closed
 // upvalue is stored out of line.
-windowed!(SetUpval, [index: usize, cell: usize], [], |owner, state, base| (value) {
+windowed!(writes SetUpval, [index: usize, cell: usize], [], |owner, state, base| (value) {
     let _ = cell;
     let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
     match upval {
@@ -1926,7 +1926,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
     move |mut arg: ResumeArg| {
         // An upvalue the context knows holds a native is that constant, not a
         // read. See Note [Fragile information].
-        windowed!(NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
+        windowed!(reads NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
             #[cfg(debug_assertions)]
             {
                 let held = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {
@@ -1940,7 +1940,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
         });
         // One a slot is known to still hold is a move from that slot, or
         // nothing if it is the destination.
-        windowed!(HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
+        windowed!(reads HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
             #[cfg(debug_assertions)]
             {
                 let held = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {

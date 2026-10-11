@@ -318,6 +318,10 @@ pub trait Window: std::fmt::Debug {
     fn selects(&self) -> bool {
         false
     }
+    /// What it may do to memory besides its operands. See Note [Window memory].
+    fn memory(&self) -> Memory {
+        Memory::Writes
+    }
     /// The operands its stencils take and give as unboxed doubles, in their
     /// window registers' paired XMM registers: bit `i` for operand `i`. See
     /// Note [Unboxed doubles] in `window_alloc`.
@@ -408,6 +412,28 @@ macro_rules! bind_record {
 #[doc(hidden)]
 pub(crate) use bind_record;
 
+// Note [Window memory]
+// ~~~~~~~~~~~~~~~~~~~~~
+// A window op reads and writes its operands, which it declares, and may read or write memory
+// besides: the heap, through the owner of its cells, a table's elements and fields, upvalues, the
+// running closure. What it may do to memory is part of its declaration, as `reads` or `writes`
+// before it, and only an op declaring it is given the owner, shared to read or not to write:
+// without it, its body can't reach the heap. The peephole holds what an op that touches no memory
+// can't observe or change across it.
+
+/// What a window op may do to memory besides its operands. See Note [Window memory].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Memory {
+    None,
+    Reads,
+    /// Reads, and writes.
+    Writes,
+}
+
+/// The owner of an op that touches no memory: nothing to reach the heap through. See Note
+/// [Window memory].
+pub struct NoMemory;
+
 /// Declare a window op, usable at any emit site (like `define_exec!`):
 ///
 /// ```ignore
@@ -438,6 +464,9 @@ pub(crate) use bind_record;
 /// stencils]. A `rejoin { .. }` block in its place is a cold path that always
 /// goes on at the op's only exit: the op selects nothing.
 ///
+/// `windowed!(reads Name, ...)` or `windowed!(writes ...)` declares an op that reads, or writes,
+/// memory besides its operands: only one does is given `owner`. See Note [Window memory].
+///
 /// `windowed!(guard Name, ...)` declares a dynamic guard's op, whose body
 /// evaluates to whether it passes: the op selects 0 when it does, and its
 /// stencils jump to a second continuation instead. See Note [Exit stencils].
@@ -449,7 +478,16 @@ pub(crate) use bind_record;
 /// window it has none of. It may have a `rejoin` block, whose body says whether
 /// to take it, as an op with operands may.
 macro_rules! windowed {
+    // What the op may do to memory: nothing, unless it says it `reads` or `writes` it. See Note
+    // [Window memory].
+    (reads $($rest:tt)*) => {
+        $crate::window::windowed!(@mem reads $($rest)*);
+    };
+    (writes $($rest:tt)*) => {
+        $crate::window::windowed!(@mem writes $($rest)*);
+    };
     (
+        @mem $mem:ident
         $(#[$meta:meta])*
         frame $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
@@ -458,11 +496,12 @@ macro_rules! windowed {
         $body:block
     ) => {
         $crate::window::windowed!(@sort
-            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [] __tag []]
+            [frame $mem $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [] __tag []]
             [] [] [] (0usize)
         );
     };
     (
+        @mem $mem:ident
         $(#[$meta:meta])*
         frame $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
@@ -472,11 +511,12 @@ macro_rules! windowed {
         rejoin $rejoin:block
     ) => {
         $crate::window::windowed!(@sort
-            [frame $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [{ let () = $rejoin; 0 }] [rejoin] __tag []]
+            [frame $mem $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [{ let () = $rejoin; 0 }] [rejoin] __tag []]
             [] [] [] (0usize)
         );
     };
     (
+        @mem $mem:ident
         $(#[$meta:meta])*
         guard $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
@@ -485,11 +525,12 @@ macro_rules! windowed {
         $body:block
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [guard] __tag [$($tag)?]]
+            [window $mem $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [guard] __tag [$($tag)?]]
             [] [] [] (0usize) $($operands)*
         );
     };
     (
+        @mem $mem:ident
         $(#[$meta:meta])*
         select $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
@@ -498,11 +539,12 @@ macro_rules! windowed {
         $body:block
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [select] __tag [$($tag)?]]
+            [window $mem $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [] [select] __tag [$($tag)?]]
             [] [] [] (0usize) $($operands)*
         );
     };
     (
+        @mem $mem:ident
         $(#[$meta:meta])*
         $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
@@ -512,11 +554,12 @@ macro_rules! windowed {
         rejoin $rejoin:block
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [{ let () = $rejoin; 0 }] [rejoin] __tag [$($tag)?]]
+            [window $mem $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [{ let () = $rejoin; 0 }] [rejoin] __tag [$($tag)?]]
             [] [] [] (0usize) $($operands)*
         );
     };
     (
+        @mem $mem:ident
         $(#[$meta:meta])*
         $name:ident,
         [$($cap:ident : $cty:ty),* $(,)?],
@@ -526,7 +569,7 @@ macro_rules! windowed {
         $(cold $cold:block)?
     ) => {
         $crate::window::windowed!(@sort
-            [window $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [$($cold)?] [] __tag [$($tag)?]]
+            [window $mem $(#[$meta])* $name, [$($cap : $cty),*], [$($cp : $cpt),*], |$owner, $state, $base| $body [$($cold)?] [] __tag [$($tag)?]]
             [] [] [] (0usize) $($operands)*
         );
     };
@@ -562,6 +605,13 @@ macro_rules! windowed {
     (@run [select] $body:block) => {
         unsafe { $body }
     };
+    // What the body's `owner` is: nothing to read memory through, or the owner, shared or not.
+    (@owner none, $owner:ident) => { $crate::window::NoMemory };
+    (@owner reads, $owner:ident) => { &*$owner };
+    (@owner writes, $owner:ident) => { $owner };
+    (@memory none) => { $crate::window::Memory::None };
+    (@memory reads) => { $crate::window::Memory::Reads };
+    (@memory writes) => { $crate::window::Memory::Writes };
     (@cold_body []) => {
         { 0 }
     };
@@ -621,7 +671,7 @@ macro_rules! windowed {
     (@bit boxed, $i:expr) => { 0u8 };
     (@bit double, $i:expr) => { (1u8 << ($i)) };
     (@sort
-        [$kind:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block [$($cold:block)?] [$($guard:ident)?] $tagp:ident $tagl:tt]
+        [$kind:ident $mem:ident $(#[$meta:meta])* $name:ident, [$($cap:ident : $cty:ty),*], [$($cp:ident : $cpt:ty),*], |$owner:ident, $state:ident, $base:ident| $body:block [$($cold:block)?] [$($guard:ident)?] $tagp:ident $tagl:tt]
         [$(($in:ident, $ii:expr, $if:ident))*] [$(($out:ident, $oi:expr, $of:ident))*] [$($acc:ident)*] ($arity:expr)
     ) => {
         $(#[$meta])*
@@ -650,7 +700,7 @@ macro_rules! windowed {
             #[inline(always)]
             unsafe fn __run<'a, 'b, 'src, 'intern>(
                 $($cap: $cty,)*
-                $owner: &'a mut $crate::Owner,
+                __owner: &'a mut $crate::Owner,
                 $state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 $tagp: u64,
@@ -658,6 +708,7 @@ macro_rules! windowed {
                 $($out: &mut $crate::window::windowed!(@ty $of, 'src, 'intern),)*
             ) -> usize {
                 let $crate::window::windowed!(@tag_pattern $tagl): u64 = $tagp;
+                let $owner = $crate::window::windowed!(@owner $mem, __owner);
                 $crate::window::windowed!(@run [$($guard)?] $body $(, $cold)?)
             }
 
@@ -667,7 +718,7 @@ macro_rules! windowed {
             #[inline(always)]
             unsafe fn __run_cold<'a, 'b, 'src, 'intern>(
                 $($cap: $cty,)*
-                $owner: &'a mut $crate::Owner,
+                __owner: &'a mut $crate::Owner,
                 $state: &'b mut $crate::vm::RunState<'src, 'intern>,
                 $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                 $tagp: u64,
@@ -675,6 +726,7 @@ macro_rules! windowed {
                 $($out: &mut $crate::window::windowed!(@ty $of, 'src, 'intern),)*
             ) -> usize {
                 let $crate::window::windowed!(@tag_pattern $tagl): u64 = $tagp;
+                let $owner = $crate::window::windowed!(@owner $mem, __owner);
                 unsafe { $crate::window::windowed!(@cold_body [$($cold)?]) }
             }
 
@@ -684,7 +736,7 @@ macro_rules! windowed {
                 #[inline(always)]
                 unsafe fn __run_taken<'a, 'b, 'src, 'intern>(
                     $($cap: $cty,)*
-                    $owner: &'a mut $crate::Owner,
+                    __owner: &'a mut $crate::Owner,
                     $state: &'b mut $crate::vm::RunState<'src, 'intern>,
                     $base: *mut $crate::lboxed::LBoxed<'src, 'intern>,
                     $tagp: u64,
@@ -692,6 +744,7 @@ macro_rules! windowed {
                     $($out: &mut $crate::window::windowed!(@ty $of, 'src, 'intern),)*
                 ) -> bool {
                     let $crate::window::windowed!(@tag_pattern $tagl): u64 = $tagp;
+                    let $owner = $crate::window::windowed!(@owner $mem, __owner);
                     unsafe { $body }
                 }
 
@@ -763,6 +816,7 @@ macro_rules! windowed {
             fn name(&self) -> &'static str { stringify!($name) }
             fn operands(&self) -> &[usize] { &self.operands }
             fn accesses(&self) -> &'static [$crate::window::Access] { Self::ACCESSES }
+            fn memory(&self) -> $crate::window::Memory { $crate::window::windowed!(@memory $mem) }
             fn captures(&self) -> $crate::window::Captures {
                 ::smallvec::smallvec![$($crate::window::Capture::to_bits(self.$cap)),*]
             }
@@ -1168,6 +1222,12 @@ macro_rules! windowed {
             ) {
                 core::hint::black_box(state as *mut _);
             }
+    };
+    (@mem $($rest:tt)*) => {
+        compile_error!("windowed!: no form matches");
+    };
+    ($($rest:tt)*) => {
+        $crate::window::windowed!(@mem none $($rest)*);
     };
 }
 pub(crate) use windowed;

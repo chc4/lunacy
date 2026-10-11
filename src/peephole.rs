@@ -279,10 +279,10 @@ macro_rules! holes {
 /// Lua computes it, from `$value_in`, and `$test` whether it passes any guard; its cold path writes
 /// `$kept`, the operand its slot is, if any (`alias` saying which).
 macro_rules! rule {
-    (@ops $m:ident, $alias:ident, $rule:ident, $fused:ident, $compute:ident, $materialize:ident, [$($sym:expr),+], ($($ks:ident),*),
+    (@ops [$($memory:ident)?] $m:ident, $alias:ident, $rule:ident, $fused:ident, $compute:ident, $materialize:ident, [$($sym:expr),+], ($($ks:ident),*),
         ($($input:ident),+), ($($slot:expr),+), ($($value_in:ident),+), ($($value_slot:expr),+),
         $value:expr, $wrapped:expr, $lua:expr, $test:expr, $kept:expr) => {
-        windowed!($fused, [$($ks: u64,)* $alias: u64], [], |owner, state, base, tag| ($($input,)+ out dest) {
+        windowed!($($memory)? $fused, [$($ks: u64,)* $alias: u64], [], |owner, state, base, tag| ($($input,)+ out dest) {
             match $value {
                 Some(n) if ($test)(owner, n) => {
                     *dest = LBoxed::from_int_tagged(n, tag);
@@ -315,28 +315,28 @@ macro_rules! rule {
         }};
     };
     ($rule:ident, $fused:ident, $compute:ident, $materialize:ident = [$($s:ident $k:ident),+]) => {
-        rule!(@ops m, alias, $rule, $fused, $compute, $materialize, [$(Sym::K($s)),+], ($($k),+), (lhs), (m.lhs), (lhs), (m.lhs),
+        rule!(@ops [] m, alias, $rule, $fused, $compute, $materialize, [$(Sym::K($s)),+], ($($k),+), (lhs), (m.lhs), (lhs), (m.lhs),
             (|| -> Option<i32> { let x = lhs.as_int(); $(let x = step::<$s>(x, $k as i32)?;)+ Some(x) })(),
             { let x = lhs.as_int(); $(let x = wrapping::<$s>(x, $k as i32);)+ x },
             { let x = lhs.as_int() as f64; $(let x = lua_step::<$s>(x, $k as i32);)+ x },
             |_, _| true, { let _ = alias; lhs });
     };
     ($rule:ident, $fused:ident, $compute:ident, $materialize:ident = [$($s:ident $k:ident),+] in $g:ident) => {
-        rule!(@ops m, alias, $rule, $fused, $compute, $materialize, [$(Sym::K($s),)+ Sym::Guard($g)], ($($k),+), (table, lhs), (m.table.unwrap(), m.lhs), (lhs), (m.lhs),
+        rule!(@ops [reads] m, alias, $rule, $fused, $compute, $materialize, [$(Sym::K($s),)+ Sym::Guard($g)], ($($k),+), (table, lhs), (m.table.unwrap(), m.lhs), (lhs), (m.lhs),
             (|| -> Option<i32> { let x = lhs.as_int(); $(let x = step::<$s>(x, $k as i32)?;)+ Some(x) })(),
             { let x = lhs.as_int(); $(let x = wrapping::<$s>(x, $k as i32);)+ x },
             { let x = lhs.as_int() as f64; $(let x = lua_step::<$s>(x, $k as i32);)+ x },
             |owner, x| passes::<$g>(owner, table, x), { let _ = (alias, table); lhs });
     };
     ($rule:ident, $fused:ident, $compute:ident, $materialize:ident = rr $o:ident [$($s:ident $k:ident),*]) => {
-        rule!(@ops m, alias, $rule, $fused, $compute, $materialize, [Sym::RR($o) $(, Sym::K($s))*], ($($k),*), (lhs, rhs), (m.lhs, m.rhs.unwrap()), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
+        rule!(@ops [] m, alias, $rule, $fused, $compute, $materialize, [Sym::RR($o) $(, Sym::K($s))*], ($($k),*), (lhs, rhs), (m.lhs, m.rhs.unwrap()), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
             (|| -> Option<i32> { let x = pair::<$o>(lhs.as_int(), rhs.as_int())?; $(let x = step::<$s>(x, $k as i32)?;)* Some(x) })(),
             { let x = wrapping_pair::<$o>(lhs.as_int(), rhs.as_int()); $(let x = wrapping::<$s>(x, $k as i32);)* x },
             { let x = lua_pair::<$o>(lhs.as_int() as f64, rhs.as_int() as f64); $(let x = lua_step::<$s>(x, $k as i32);)* x },
             |_, _| true, if alias != 0 { rhs } else { lhs });
     };
     ($rule:ident, $fused:ident, $compute:ident, $materialize:ident = [$s:ident $k:ident] rr $o:ident) => {
-        rule!(@ops m, alias, $rule, $fused, $compute, $materialize, [Sym::K($s), Sym::RR($o)], ($k), (lhs, rhs), (m.lhs, m.rhs.unwrap()), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
+        rule!(@ops [] m, alias, $rule, $fused, $compute, $materialize, [Sym::K($s), Sym::RR($o)], ($k), (lhs, rhs), (m.lhs, m.rhs.unwrap()), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
             (|| -> Option<i32> { pair::<$o>(step::<$s>(lhs.as_int(), $k as i32)?, rhs.as_int()) })(),
             wrapping_pair::<$o>(wrapping::<$s>(lhs.as_int(), $k as i32), rhs.as_int()),
             lua_pair::<$o>(lua_step::<$s>(lhs.as_int() as f64, $k as i32), rhs.as_int() as f64),
