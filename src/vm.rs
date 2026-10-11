@@ -1399,6 +1399,12 @@ impl NClosure {
         NClosure { cell: NClosureCell::leak(Self::called(native), None, Some(generator), true, false) }
     }
 
+    /// A native whose call is compiled by `generator`, as an opcode's is. See Note [Native
+    /// generators] in `library`.
+    pub fn generated(native: NativeFunc, generator: crate::specialize::NativeGenerator) -> Self {
+        NClosure { cell: NClosureCell::leak(native, None, Some(generator), false, false) }
+    }
+
     /// The generator a call to this native is compiled by, if it has one.
     pub fn generator(&self) -> Option<crate::specialize::NativeGenerator> {
         self.cell.generator

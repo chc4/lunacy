@@ -391,6 +391,16 @@ crate::window::windowed!(guard InArrayK, [k: i32], [], |owner, state, base| (tab
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(k) < tab.ro(owner).array.len()
 });
+// Whether a value is the boxed `bits`: a watch site's. See Note [Watched tables] in `specialize`.
+crate::window::windowed!(guard IsValue, [bits: u64], [], |owner, state, base| (value) {
+    value.bits() == bits
+});
+// A frozen table's element, as it was when the load was compiled. The table still holds it while
+// the load runs: a store into it trips first, which unpublishes the load. See Note [Frozen tables]
+// in `specialize`.
+windowed!(LoadFrozen, [bits: u64], [], |owner, state, base| (out dest) {
+    *dest = LBoxed::from_bits(bits);
+});
 // Whether an integer is `k`: a promote's guard. See Note [Promoted values] in `specialize`.
 crate::window::windowed!(guard EqualsK, [k: i32], [], |owner, state, base| (value) {
     value.as_int() == k
@@ -454,6 +464,11 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 panic!("gettable_meta {:?} {:?} {:?}", &state.vals, &state.vals[state.base + b], have)
             })));
             yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
+            return arg;
+        }
+        if table && let ResumeArg::Element(bits, ctype, constant) = (yield YieldOp::FrozenElement(b, c)) {
+            arg = yield YieldOp::ExecWindow(Rc::new(LoadFrozen::new(bits, &[a])));
+            yield YieldOp::Discovered(a, bits, ctype, constant);
             return arg;
         }
         // Object shape specialization
@@ -1621,6 +1636,12 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
         // The targets are found after the guards, so they're versioned for what
         // the guards found out.
         let (fallthrough, taken) = (pc, pc + 1);
+        // A value known decides it.
+        if let ResumeArg::Boxed(bits) = (yield YieldOp::ValueOf(a)) {
+            let truthy = bits != LBoxed::VALUE_NIL && bits != LBoxed::VALUE_FALSE;
+            let ResumeArg::BlockId(target) = (yield YieldOp::GetBlock(if truthy == (c != 0) { fallthrough } else { taken })) else { unreachable!() };
+            return yield YieldOp::Jump(target);
+        }
         arg = yield YieldOp::Guard(a, LType::Bool);
         if let ResumeArg::Matched = arg {
             // Exit 1, the fallthrough, when the guarded bool is `C`.

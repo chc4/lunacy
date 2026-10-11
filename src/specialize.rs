@@ -327,8 +327,14 @@ pub enum YieldOp {
 
     HashKey(usize, usize, bool), // Looks up or allocates an HREF for STACK[idx][key]; down its `__index` chain if true (a load). See Note [Table metatables]
     HashKeyNamed(usize, LConstant<'static, 'static>, bool), // `HashKey` of a key known by its value
-    Watching(usize), // A watch site of STACK[idx]'s table: resumed with Matched while it is watched,
-                     // as it was when the code first ran, else Failed. See Note [Watched tables]
+    Watching(usize, bool), // A watch site of STACK[idx]'s table, frozen first if the bool says so:
+                           // resumed with Matched, the code after knowing which table it is,
+                           // while it is watched, else Failed. See Note [Watched tables]
+    FrozenElement(usize, usize), // The element of STACK[table] at RK(key), if the table is frozen and the
+                                 // key known: resumed with Element, else Failed. See Note [Frozen tables]
+    Discovered(usize, u64, CType, Option<i32>), // STACK[idx] holds the element `Element` resumed with.
+                                                // See Note [Frozen tables]
+    ValueOf(usize), // STACK[idx]'s value, if known: resumed with Boxed, else Failed
     Trip(Option<usize>), // A store into STACK[idx]'s table, or with none the environment, is about
                          // to be laid out: resumed with Matched. See Note [Watched tables]
     Learn(usize), // Resumed with Keys: the string keys of STACK[idx]'s table, once the code runs. See
@@ -597,6 +603,9 @@ pub enum ResumeArg {
     Integer(i32),
     Number(f64),
     Boxed(u64),
+    /// A frozen table's element: boxed, its type, and its value if an integer. See Note [Frozen
+    /// tables].
+    Element(u64, CType, Option<i32>),
     /// See Note [Global caches].
     Cache(*const GlobalCache),
     /// The end of a call's arguments, and the type its native's window op
@@ -1335,6 +1344,16 @@ fn name_hash(name: &[u8]) -> u64 {
 // known of the table's contents goes. A trip is an effect, and what was learned through a watch is
 // whatever doesn't survive it: a domain learned that way says so, as any domain does of the
 // effects it survives (Note [Fragile information]).
+
+// Note [Frozen tables]
+// ~~~~~~~~~~~~~~~~~~~~~
+// A table can be frozen (`jit.frozen`): watched, and code past its watch site knows which table it
+// is. A load from it at a key the context knows reads the element as it compiles, and goes on with
+// the value in its register, known: its type, constant, and boxed value. What the load knows of its
+// register stays true after a trip, as facts follow values; that the table still holds it is known
+// only through the watch, so code relying on it is unpublished by a trip as the watch's is. The
+// table is kept alive until it trips, and a load reads it only until then; nothing reads a value
+// back from what is known of it.
 
 /// Where a Lua call's returns go on, and how the code after it is compiled: as
 /// `make_continuation_thunk` takes it. See Note [Watched tables].
@@ -2341,8 +2360,10 @@ pub enum Known {
     Type(CType),
     Kind(Kind),
     Constant { value: i32, origins: Option<Origins> },
-    /// The table is watched. See Note [Watched tables].
-    Watched,
+    /// The value is the table, boxed, and it is watched. See Note [Watched tables].
+    Watched(u64),
+    /// The value, boxed. See Note [Frozen tables].
+    Value(u64),
 }
 
 /// The keys of `Known`'s domains.
@@ -2350,7 +2371,8 @@ pub const TYPE: u8 = 0;
 pub const KIND: u8 = 1;
 pub const CONSTANT: u8 = 2;
 pub const WATCHED: u8 = 3;
-const KEYS: [u8; 4] = [TYPE, KIND, CONSTANT, WATCHED];
+pub const VALUE: u8 = 4;
+const KEYS: [u8; 5] = [TYPE, KIND, CONSTANT, WATCHED, VALUE];
 
 /// What a context knows of values. See Note [Fragile information].
 pub type Values = crate::classes::Classes<Known>;
@@ -2374,7 +2396,7 @@ impl PartialEq for Known {
             (Known::Type(a), Known::Type(b)) => a == b,
             (Known::Kind(a), Known::Kind(b)) => a == b,
             (Known::Constant { value: a, .. }, Known::Constant { value: b, .. }) => a == b,
-            (Known::Watched, Known::Watched) => true,
+            (Known::Watched(a), Known::Watched(b)) | (Known::Value(a), Known::Value(b)) => a == b,
             _ => false,
         }
     }
@@ -2385,14 +2407,8 @@ impl Eq for Known {}
 impl Known {
     /// Whether it survives a trip: it wasn't learned through a watch. See Note [Watched tables].
     fn survives_trip(&self) -> bool {
-        !matches!(self, Known::Watched)
+        !matches!(self, Known::Watched(_))
     }
-}
-
-/// Whether a field by `label` survives a trip: it wasn't learned through a watch. See Note
-/// [Watched tables].
-fn survives_trip(label: Label) -> bool {
-    !matches!(label, Label::Element(_))
 }
 
 impl std::hash::Hash for Known {
@@ -2401,7 +2417,8 @@ impl std::hash::Hash for Known {
             Known::Type(ctype) => (TYPE, ctype).hash(state),
             Known::Kind(kind) => (KIND, kind).hash(state),
             Known::Constant { value, .. } => (CONSTANT, value).hash(state),
-            Known::Watched => WATCHED.hash(state),
+            Known::Watched(bits) => (WATCHED, bits).hash(state),
+            Known::Value(bits) => (VALUE, bits).hash(state),
         }
     }
 }
@@ -2412,7 +2429,8 @@ impl std::fmt::Debug for Known {
             Known::Type(ctype) => write!(f, "{ctype}"),
             Known::Kind(kind) => write!(f, "kind {kind:?}"),
             Known::Constant { value, .. } => write!(f, "constant {value}"),
-            Known::Watched => write!(f, "watched"),
+            Known::Watched(bits) => write!(f, "watched {bits:#x}"),
+            Known::Value(bits) => write!(f, "value {bits:#x}"),
         }
     }
 }
@@ -2424,7 +2442,8 @@ impl crate::classes::ClassFact for Known {
             Known::Type(_) => TYPE,
             Known::Kind(_) => KIND,
             Known::Constant { .. } => CONSTANT,
-            Known::Watched => WATCHED,
+            Known::Watched(_) => WATCHED,
+            Known::Value(_) => VALUE,
         }
     }
     fn join(&self, other: &Self) -> Option<Self> {
@@ -2705,10 +2724,7 @@ impl Context {
                 Known::Kind(kind) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
                 _ => true,
             }),
-            Effect::Trip => {
-                self.values.retain_fields(|label, _| survives_trip(label));
-                self.values.retain_facts(Known::survives_trip);
-            },
+            Effect::Trip => self.values.retain_facts(Known::survives_trip),
         }
         self.inlined(Effects::of(effect));
     }
@@ -2758,7 +2774,7 @@ impl Context {
 
     /// Whether a trip falsifies something it knows. See Note [Watched tables].
     fn trips(&self) -> bool {
-        self.values.has_label(|label| !survives_trip(label)) || self.values.all_facts().any(|fact| !fact.survives_trip())
+        self.values.all_facts().any(|fact| !fact.survives_trip())
     }
 
     /// The slot of the table, and the name, of the field hash key `href` names: a string key of a
@@ -3359,6 +3375,11 @@ pub struct Specializer<'src, 'intern> {
     continuation_sites: HashMap<Location, ContinuationSite>,
     /// The watch sites of each watched table, by its address. See Note [Watched tables].
     watches: HashMap<u64, Vec<WatchSite>>,
+    /// Each table watch sites know, by its boxed value, until it trips: what a load from it reads
+    /// as it compiles. See Note [Frozen tables].
+    frozen: HashMap<u64, Tc<Table<'static, 'static>>>,
+    /// How many tables each watch site has been compiled for, by prototype and pc.
+    watch_versions: HashMap<(usize, usize), usize>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
@@ -3377,6 +3398,9 @@ impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
         }
         for continuation in &self.continuations {
             continuation.caller.mark(owner);
+        }
+        for table in self.frozen.values() {
+            table.mark(owner);
         }
     }
 }
@@ -3406,6 +3430,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             continuations: Vec::new(),
             continuation_sites: HashMap::default(),
             watches: HashMap::default(),
+            watch_versions: HashMap::default(),
+            frozen: HashMap::default(),
             inlined: Default::default(),
             unreachable: Default::default(),
             #[cfg(feature = "jit")]
@@ -4966,6 +4992,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// The table at `table` was tripped. See `trip`.
     fn tripped(&mut self, owner: &mut Owner, state: &mut RunState, table: u64) {
+        self.frozen.retain(|_, frozen| frozen.0.to_addr() != table);
         for site in self.watches.remove(&table).unwrap_or_default() {
             let Location(block, off) = site.at;
             self.blocks[block.0].instructions[off] = Residual::Thunk(site.unwatched);
@@ -5014,28 +5041,73 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// if `watches`, it is one of the table's watch sites, the code after it knowing the table is
     /// still watched; else, as the site a trip puts back, the code after it knowing nothing. See
     /// Note [Watched tables].
-    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>, watches: bool) -> ThunkRef {
+    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>, watches: bool, freezes: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("a watch site of a table") };
-            let watched = watches && tab.ro(owner).watched;
-            if watched {
-                let unwatched = vm.make_watch_thunk(block_id, thunk_coro.clone(), slot, pc, thunk_ctx.clone(), false);
-                vm.watches.entry(tab.0.to_addr()).or_default().push(WatchSite { at: Location(block_id, thunk_pc), unwatched });
-            }
-            let (next, arg) = if watched { (pc.next_true(), ResumeArg::Matched) } else { (pc.next_false(), ResumeArg::Failed) };
-            let mut ctx = thunk_ctx.clone();
-            if watched {
-                Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Watched);
-            }
-            let rest = vm.subblock(owner, next, ctx, thunk_coro.clone(), arg);
-            if watched {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::PatchableJump(rest);
-                #[cfg(feature = "jit")]
-                vm.link_thunk(block_id, thunk_pc, rest);
-            } else {
+            let boxed = state.vals[state.base + slot];
+            let LValue::Table(tab) = boxed.unbox() else { unreachable!("a watch site of a table") };
+            let site = (vm.proto as usize, pc.0);
+            let watched = watches && vm.watch_versions.get(&site).is_none_or(|&versions| versions < MAX_VERSIONS) && {
+                if freezes {
+                    tab.rw(owner).watched = true;
+                }
+                tab.ro(owner).watched
+            };
+            if !watched {
+                let rest = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
                 vm.jump_thunk(block_id, thunk_pc, rest);
+                return;
             }
+            *vm.watch_versions.entry(site).or_default() += 1;
+            let unwatched = vm.make_watch_thunk(block_id, thunk_coro.clone(), slot, pc, thunk_ctx.clone(), false, false);
+            vm.watches.entry(tab.0.to_addr()).or_default().push(WatchSite { at: Location(block_id, thunk_pc), unwatched });
+            // SAFETY: as `ctypeof_`'s: the specializer is parameterized over the VM's own lifetimes,
+            // which the thunk's signature doesn't say, and it outlives the table it roots.
+            vm.frozen.insert(boxed.bits(), unsafe { core::mem::transmute::<Tc<Table<'_, '_>>, Tc<Table<'static, 'static>>>(tab.clone()) });
+            // Which table it is, past a guard; another table fails it to a site of its own.
+            let guard = vm.new_block(pc.0);
+            vm.blocks[block_id.0].instructions[thunk_pc] = Residual::PatchableJump(guard);
+            #[cfg(feature = "jit")]
+            vm.link_thunk(block_id, thunk_pc, guard);
+            let mut ctx = thunk_ctx.clone();
+            Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Watched(boxed.bits()));
+            let pass = vm.subblock(owner, pc.next_true(), ctx, thunk_coro.clone(), ResumeArg::Matched);
+            let (coro, ctx) = (thunk_coro.clone(), thunk_ctx.clone());
+            let other = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, _: &mut Owner, _: &mut RunState, other_pc: usize| {
+                let site = vm.new_block(pc.0);
+                let thunk = vm.make_watch_thunk(site, coro.clone(), slot, pc, ctx.clone(), true, freezes);
+                vm.blocks[site.0].instructions.push(Residual::Thunk(thunk));
+                vm.jump_thunk(guard, other_pc, site);
+            })));
+            vm.blocks[guard.0].instructions.extend([
+                Residual::GuardDynamic(Rc::new(crate::generators::IsValue::new(boxed.bits(), &[slot]))),
+                Residual::Thunk(other),
+                Residual::Jump(pass),
+            ]);
         })))
+    }
+
+    /// The element of the table in `table` at RK `key`, as `ResumeArg::Element`, if the context
+    /// knows which frozen table it is and the key, and the element is in its array part, not nil.
+    /// See Note [Frozen tables].
+    fn frozen_element(&self, owner: &Owner, ctx: &Context, table: usize, key: usize) -> Option<ResumeArg> {
+        let Some(&Known::Watched(bits)) = ctx.values.fact(Loc::root(Root::Slot(table as u16)), WATCHED) else { return None };
+        let tab = self.frozen.get(&bits)?;
+        let k = if key & 0x100 != 0 {
+            let crate::chunk::Constant::Number(n) = (unsafe { &(&(*self.proto).constants.items)[key & 0xff] }) else { return None };
+            is_integer(n.0).then_some(n.0 as i64)?
+        } else {
+            ctx.constant(key)? as i64
+        };
+        let element = *tab.ro(owner).array.get(usize::try_from(k - 1).ok()?)?;
+        if element.is_nil() {
+            return None;
+        }
+        let value = element.unbox();
+        let constant = match value {
+            LValue::Integer(value) => i32::try_from(value).ok(),
+            _ => None,
+        };
+        Some(ResumeArg::Element(element.bits(), value.ctypeof_(), constant))
     }
 
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
@@ -6486,15 +6558,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::Watching(slot)) if ctx.values.fact(Loc::root(Root::Slot(slot as u16)), WATCHED).is_some() => {
+                CoroutineState::Yielded(YieldOp::Watching(slot, _)) if ctx.values.fact(Loc::root(Root::Slot(slot as u16)), WATCHED).is_some() => {
                     pc = pc.next_true();
                     arg = ResumeArg::Matched;
                 },
-                CoroutineState::Yielded(YieldOp::Watching(slot)) => {
-                    let thunk = self.make_watch_thunk(block_id, coro.clone(), slot, pc, ctx.clone(), true);
+                CoroutineState::Yielded(YieldOp::Watching(slot, freezes)) => {
+                    let thunk = self.make_watch_thunk(block_id, coro.clone(), slot, pc, ctx.clone(), true, freezes);
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
                     return None;
+                },
+                CoroutineState::Yielded(YieldOp::FrozenElement(table, key)) => {
+                    arg = self.frozen_element(owner, &ctx, table, key).unwrap_or(ResumeArg::Failed);
+                },
+                CoroutineState::Yielded(YieldOp::Discovered(slot, bits, ctype, constant)) => {
+                    let ctx = Rc::make_mut(&mut ctx);
+                    ctx.set_types(owner, vec![(slot, ctype)]);
+                    let at = Loc::root(Root::Slot(slot as u16));
+                    if let Some(value) = constant {
+                        ctx.values.learn(at, Known::Constant { value, origins: None });
+                    }
+                    ctx.values.learn(at, Known::Value(bits));
+                },
+                CoroutineState::Yielded(YieldOp::ValueOf(slot)) => {
+                    arg = match ctx.values.fact(Loc::root(Root::Slot(slot as u16)), VALUE) {
+                        Some(&Known::Value(bits)) => ResumeArg::Boxed(bits),
+                        _ => ResumeArg::Failed,
+                    };
                 },
                 CoroutineState::Yielded(YieldOp::Trip(of)) => {
                     // Its cold way, the table watched, goes on knowing no element. See Note

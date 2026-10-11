@@ -140,6 +140,9 @@ macro_rules! native {
     (pure |$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::pure(native!(@fn $owner, $args, $body)))
     };
+    (generator: $generator:expr, |$owner:ident, $args:ident| $body:expr) => {
+        LValue::NClosure(NClosure::generated(native!(@fn $owner, $args, $body), $generator))
+    };
     (|$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::new(native!(@fn $owner, $args, $body)))
     };
@@ -784,6 +787,26 @@ fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> B
     })
 }
 
+/// `jit.frozen`'s generator: for `frozen(t)` of a table keeping one result, a watch site, which
+/// freezes it first: code past it knows which table it is while it stays frozen. Any other call is
+/// the native's. See Note [Frozen tables] in `specialize`.
+#[cfg(feature = "magic")]
+fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 2 && c == 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched
+            && (yield YieldOp::Watching(a + 1, true)) == ResumeArg::Matched
+        {
+            yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::Move::new(&[a + 1, a])));
+            yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Table))]);
+            yield YieldOp::Copy(a, a + 1);
+            return ResumeArg::Start;
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
 /// `jit.tripped`'s generator: for `tripped(t)` of a table keeping one result, a watch site: code
 /// past it knows `t` is still watched, as it was when the code was first run, its result `false`
 /// with no test, until a store into `t` trips its watchpoint; any other call is the native's. See
@@ -796,7 +819,7 @@ fn tripped_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) ->
     });
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c == 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched
-            && (yield YieldOp::Watching(a + 1)) == ResumeArg::Matched
+            && (yield YieldOp::Watching(a + 1, false)) == ResumeArg::Matched
         {
             yield YieldOp::ExecWindow(std::rc::Rc::new(Untripped::new(&[a])));
             yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Bool))]);
@@ -1211,9 +1234,10 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
         ("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])),
         ("learn", native!(pure generator: learn_generator, |owner, args| vec![arg(&args, 0)])),
-        // `jit.watch(t)`: `t`, watched; `jit.tripped(t)`: whether a store into it tripped its
-        // watchpoint since. For tests. See Note [Watched tables] in `specialize`.
-        ("watch", native!(|owner, args| {
+        // `jit.frozen(t)`: `t`, frozen; `jit.tripped(t)`: whether a store into it tripped its
+        // watchpoint since, for tests. See Notes [Frozen tables] and [Watched tables] in
+        // `specialize`.
+        ("frozen", native!(generator: frozen_generator, |owner, args| {
             let t = table(arg(&args, 0));
             t.rw(owner).watched = true;
             vec![arg(&args, 0)]

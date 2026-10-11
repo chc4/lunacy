@@ -71,8 +71,6 @@ pub enum Label {
     ElementOf,
     /// The hash field of a name, by its hash, of the table it is.
     Field(u64),
-    /// The element at an index of the table it is, while it is watched.
-    Element(i32),
 }
 
 /// A place: a root, or a field reached from one along `path`.

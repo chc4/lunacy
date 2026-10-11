@@ -1,4 +1,4 @@
--- `jit.watch(t)` watches a table, and `jit.tripped(t)`, a watch site, is
+-- `jit.frozen(t)` watches a table, and `jit.tripped(t)`, a watch site, is
 -- compiled knowing the table is still watched, `false` with no test, until a
 -- store into it trips its watchpoint, which unpublishes the site: from then on
 -- it is the native's answer. Each loop runs often enough for JIT code, checks
@@ -10,7 +10,7 @@
 local n, k = 400, 150
 
 local function count(t, store)
-  jit.watch(t)
+  jit.frozen(t)
   local seen = 0
   for i = 1, n do
     if jit.tripped(t) then seen = seen + 1 end
@@ -36,7 +36,7 @@ print(count({ 1, 2 }, insert), count({ 1, 2 }, remove), count({}, meta))
 -- has to go on in code that doesn't, or it counts one iteration short of the
 -- check before's, which a stale site would leave short too.
 local function across(t, store)
-  jit.watch(t)
+  jit.frozen(t)
   local seen = 0
   for i = 1, n do
     if jit.tripped(t) then seen = seen - 1 end
@@ -49,7 +49,7 @@ print(across({ 1, 2, 3 }, element), across({ 1, 2 }, far), across({ 1, 2 }, near
 
 -- The same loop, inlined into its caller, storing where the caller does.
 local function inlined(t)
-  jit.watch(t)
+  jit.frozen(t)
   local seen = 0
   for i = 1, n do
     if jit.tripped(t) then seen = seen + 1 end
@@ -60,7 +60,7 @@ end
 print(inlined({ 1, 2, 3 }))
 
 -- A global store into a watched environment.
-jit.watch(_G)
+jit.frozen(_G)
 local seen = 0
 for i = 1, n do
   if jit.tripped(_G) then seen = seen + 1 end
@@ -70,11 +70,11 @@ print(seen)
 
 -- Watched again after its trip: the site asks, from then on.
 local t, again = { 1 }, 0
-jit.watch(t)
+jit.frozen(t)
 for i = 1, n do
   if jit.tripped(t) then again = again + 1 end
   if i == k then t[1] = i end
-  if i == k + 50 then jit.watch(t) end
+  if i == k + 50 then jit.frozen(t) end
 end
 print(again)
 -- EXPECT: 250	250	250	250
