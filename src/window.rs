@@ -428,6 +428,11 @@ pub enum Memory {
     Reads,
     /// Reads, and writes.
     Writes,
+    /// Writes the frames of calls, never a table: pushing or popping one, with its callstack
+    /// entry, and closing its open upvalues into their cells. It needs the owner as a writer
+    /// does, for the closure and the cells, but no table's elements are among what it touches,
+    /// so whatever is known or held of them stays as it was across it.
+    Frame,
 }
 
 /// The owner of an op that touches no memory: nothing to reach the heap through. See Note
@@ -465,7 +470,8 @@ pub struct NoMemory;
 /// goes on at the op's only exit: the op selects nothing.
 ///
 /// `windowed!(reads Name, ...)` or `windowed!(writes ...)` declares an op that reads, or writes,
-/// memory besides its operands: only one does is given `owner`. See Note [Window memory].
+/// memory besides its operands: only one does is given `owner`. `windowed!(frames ...)` declares
+/// one that writes only the frames of calls (`Memory::Frame`). See Note [Window memory].
 ///
 /// `windowed!(guard Name, ...)` declares a dynamic guard's op, whose body
 /// evaluates to whether it passes: the op selects 0 when it does, and its
@@ -485,6 +491,9 @@ macro_rules! windowed {
     };
     (writes $($rest:tt)*) => {
         $crate::window::windowed!(@mem writes $($rest)*);
+    };
+    (frames $($rest:tt)*) => {
+        $crate::window::windowed!(@mem frames $($rest)*);
     };
     (
         @mem $mem:ident
@@ -609,9 +618,11 @@ macro_rules! windowed {
     (@owner none, $owner:ident) => { $crate::window::NoMemory };
     (@owner reads, $owner:ident) => { &*$owner };
     (@owner writes, $owner:ident) => { $owner };
+    (@owner frames, $owner:ident) => { $owner };
     (@memory none) => { $crate::window::Memory::None };
     (@memory reads) => { $crate::window::Memory::Reads };
     (@memory writes) => { $crate::window::Memory::Writes };
+    (@memory frames) => { $crate::window::Memory::Frame };
     (@cold_body []) => {
         { 0 }
     };

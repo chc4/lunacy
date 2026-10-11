@@ -1001,7 +1001,7 @@ impl Count {
 // callee: the JIT code's copy's own, which the JIT patches as it grows. Requires nilling the
 // callee's frame if `FILLS`, or else the JIT code does. The callee isn't vararg. See Notes [Frame
 // ops] and [Inlined calls].
-windowed!(writes frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(frames frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
     state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), A.lift(a), B.lift(b), frame as usize, FILLS);
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
@@ -1010,7 +1010,7 @@ windowed!(writes frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A:
 // `effects` and `callee` the addresses of the running function's effects and the callee's, which
 // the first is joined into (Note [Tail calls]). Closing upvalues if `CLOSES`, from a vararg
 // function if `VARARG`. See Note [Frame ops].
-windowed!(writes frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(frames frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
     unsafe { *(callee as *mut u16) |= *(effects as *const u16) };
     state.tail_call(owner, a, b, CLOSES, VARARG);
@@ -1021,7 +1021,7 @@ windowed!(writes frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES:
 // `effects` (Note [Call effects]); `at` (a `PackedLocation`) is where it is. Closing upvalues if
 // `CLOSES`, returning from a vararg function if `VARARG`. A return from a frame JIT code called
 // is the op; one from a frame with an entry, or the outermost, its cold path. See Note [Frame ops].
-windowed!(writes frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(frames frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     state.returned_at = at;
     if state.jit_depth > 0 {
         let _ = state.leave::<false>(owner, A.lift(a), B.lift(b), CLOSES, VARARG);
@@ -1055,13 +1055,13 @@ windowed!(writes frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at
 // (`a` and `b` as `Count::hold` holds them), of a callee whose `max_stack` is `stack`, keeping the
 // window: the JIT code nils the callee's frame. See Notes [Inlined calls] and [Count case
 // analysis].
-windowed!(reads ShiftFrame, [a: u64, b: u64, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
+windowed!(frames ShiftFrame, [a: u64, b: u64, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
     state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false, 0);
 });
 
 // `ShiftFrame` as a frame op, nilling the callee's frame past its arguments, as many as there are
 // or up to the top. See Notes [Inlined calls] and [Count case analysis].
-windowed!(reads frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| () {
+windowed!(frames frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| () {
     let callee = state.vals[state.base + A.lift(a)];
     state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, true, 0);
 });
@@ -1069,7 +1069,7 @@ windowed!(reads frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, 
 // `unshift_frame` without the callstack's entry, for an inlined callee's RETURN A B (`a` and `b`
 // as `Count::hold` holds them), closing its frame's open upvalues if `CLOSES`, moving its results
 // if `MOVES`. See Notes [Inlined calls] and [Count case analysis].
-windowed!(writes frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, MOVES: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(frames frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, MOVES: bool, A: Count, B: Count], |owner, state, base| () {
     state.unshift_frame::<false>(owner, MOVES.then(|| (A.lift(a), B.lift(b))), CLOSES);
 });
 
