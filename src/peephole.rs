@@ -9,6 +9,24 @@ use crate::vm::{LValue, Opcode};
 use crate::unreachable;
 use crate::window::{windowed, Window};
 
+// Note [Peephole memory]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// The peephole holds stores into elements of tables' array parts as it holds integer values, as
+// witchcraft holds stores: a store already known in the array part, of a value that isn't nil and
+// widens no kind, so it changes neither the part's length nor its kind. Cells are named as the
+// context knows values, by class: two are the same where their tables are and their keys are, as
+// classes or as constants; of different constant keys they are different, whatever their tables;
+// else they may be the same. A held store's registers are its inputs, held as a spell's are, so what the
+// context knows of them stays true while it is held.
+//
+// A store into a cell a held store is into makes that one dead, as a value overwritten unread. A
+// store into a cell that may be one a held store is into goes after it, as its dependency: there is
+// no order among the rest. A load of the cell exactly one held store is into, and no other may be,
+// is that store's value, with no load; any other load comes after the stores that may be into its
+// cell, laid out with their dependencies. What may read memory the context doesn't name, a window
+// op reading or writing it, a call, an exit, lays them all out, as it lays out the spells; what
+// reads only an array part's length and kind, as a guard on a key, doesn't.
+
 // Note [Peephole fusion]
 // ~~~~~~~~~~~~~~~~~~~~~~
 // Each integer op checks that its result fits and boxes it, though the next often only reads it to
@@ -112,6 +130,66 @@ impl IntOp {
             _ => None,
         }
     }
+}
+
+/// An element of a table's array part: the table's register, and the key, a register or a
+/// constant. See Note [Peephole memory].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Element {
+    pub table: usize,
+    pub key: Operand,
+}
+
+/// Whether two cells are the same, can't be, or may be. See Note [Peephole memory].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alias {
+    Same,
+    Disjoint,
+    May,
+}
+
+/// What a store stores: a register's value, or a constant's, boxed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Stored {
+    Slot(usize),
+    Boxed(u64),
+}
+
+/// A load or store of an element already in its table's array part, which leaves the array part's
+/// length and kind as they are: a store of a value that isn't nil and widens no kind. See Note
+/// [Peephole memory].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemOp {
+    Load { cell: Element, dest: usize },
+    Store { cell: Element, value: Stored },
+}
+
+/// A store held, unwritten: of `value` into `cell`, as `window` stores it, in instruction `at`,
+/// after the held stores `after` whose cells may be its own.
+#[derive(Clone, Debug)]
+pub struct Store {
+    id: usize,
+    pub cell: Element,
+    pub value: Stored,
+    pub window: Rc<dyn Window>,
+    pub at: usize,
+    after: Vec<usize>,
+}
+
+impl Store {
+    /// The registers it reads, as they were before any held operation.
+    fn inputs(&self) -> impl Iterator<Item = usize> + '_ {
+        let key = match self.cell.key { Operand::Slot(slot) => Some(slot), Operand::K(_) => None };
+        let value = match self.value { Stored::Slot(slot) => Some(slot), Stored::Boxed(_) => None };
+        std::iter::once(self.cell.table).chain(key).chain(value)
+    }
+}
+
+/// What a load of a cell becomes: the value a held store stores there, or itself, after the held
+/// stores whose cells may be its, laid out.
+pub enum Load {
+    Forward(Stored),
+    After(Vec<Rc<dyn Window>>),
 }
 
 /// Whether integer operations are held to fuse (Note [Peephole fusion]); set `LUNACY_NO_FUSION`
@@ -606,10 +684,14 @@ pub enum Offer {
     Refused,
 }
 
-/// The spells the peephole holds, one per slot. See Note [Peephole fusion].
+/// The spells the peephole holds, one per slot, and the stores. See Notes [Peephole fusion] and
+/// [Peephole memory].
 #[derive(Clone, Debug, Default)]
 pub struct Spells {
     pub spells: Vec<Spell>,
+    pub stores: Vec<Store>,
+    /// The next store's id.
+    next: usize,
 }
 
 impl Spells {
@@ -693,12 +775,75 @@ impl Spells {
     /// computing only from registers no spell writes into registers none reads, so an exit going on
     /// from before it runs it again to the same end. What it overwrites unread is then dropped.
     pub fn untouched(&self, window: &dyn Window) -> bool {
-        !window.selects() && window.memory() == crate::window::Memory::None
+        window.memory() == crate::window::Memory::None && self.off_registers(window)
+    }
+
+    /// Whether window op `window` has no way out, reads no register a spell writes, and writes none
+    /// a spell or store reads.
+    pub fn off_registers(&self, window: &dyn Window) -> bool {
+        !window.selects()
             && window.operands().iter().zip(window.accesses()).all(|(&slot, access)| match access {
                 crate::window::Access::Read => self.spells.iter().all(|spell| spell.dest != slot),
-                crate::window::Access::Write => self.spells.iter().all(|spell| !spell.inputs.contains(&slot)),
+                crate::window::Access::Write => self.inputs().all(|input| input != slot),
                 crate::window::Access::Update => false,
             })
+    }
+
+    /// Whether they stay held on both ways of guard `test` of instruction `at`, found out at
+    /// runtime: one reading no register a spell writes, and no memory but an array part's length
+    /// and kind, which no held store changes, unless one holds its instruction's operations, which
+    /// a restart past it would repeat.
+    pub fn across_guard(&self, test: &dyn Window, at: usize) -> bool {
+        matches!(test.memory(), crate::window::Memory::None | crate::window::Memory::Properties)
+            && self.spells.iter().all(|spell| !test.operands().contains(&spell.dest) && spell.at != at)
+    }
+
+    /// The registers the spells and stores read, as they were before any held operation.
+    pub fn inputs(&self) -> impl Iterator<Item = usize> + '_ {
+        self.spells.iter().flat_map(|spell| spell.inputs.iter().copied()).chain(self.stores.iter().flat_map(Store::inputs))
+    }
+
+    /// Hold the store of `value` into `cell`, as `window` stores it, in instruction `at`: a held
+    /// store to the same cell is never read, and those to cells that may be its come before it.
+    /// `alias` says how two cells are. See Note [Peephole memory].
+    pub fn hold_store(&mut self, cell: Element, value: Stored, window: Rc<dyn Window>, at: usize, alias: impl Fn(Element, Element) -> Alias) {
+        let dead: Vec<usize> = self.stores.iter().filter(|s| alias(s.cell, cell) == Alias::Same).map(|s| s.id).collect();
+        self.stores.retain(|s| !dead.contains(&s.id));
+        for store in &mut self.stores {
+            store.after.retain(|id| !dead.contains(id));
+        }
+        let after = self.stores.iter().filter(|s| alias(s.cell, cell) == Alias::May).map(|s| s.id).collect();
+        let id = self.next;
+        self.next += 1;
+        self.stores.push(Store { id, cell, value, window, at, after });
+    }
+
+    /// A load of `cell`: the value the one held store to it stores, if no other held store may be
+    /// to it; else itself, after those that may be, and those before them, laid out. See Note
+    /// [Peephole memory].
+    pub fn load(&mut self, cell: Element, alias: impl Fn(Element, Element) -> Alias) -> Load {
+        let to: Vec<(usize, Alias)> = self.stores.iter().map(|s| (s.id, alias(s.cell, cell))).filter(|(_, a)| *a != Alias::Disjoint).collect();
+        if let [(id, Alias::Same)] = to.as_slice() {
+            return Load::Forward(self.stores.iter().find(|s| s.id == *id).unwrap().value);
+        }
+        let mut laid: Vec<usize> = to.iter().map(|(id, _)| *id).collect();
+        let mut i = 0;
+        while i < laid.len() {
+            let store = self.stores.iter().find(|s| s.id == laid[i]).unwrap();
+            for &before in &store.after {
+                if !laid.contains(&before) {
+                    laid.push(before);
+                }
+            }
+            i += 1;
+        }
+        // In the order they were held, which each's `after` keeps.
+        let windows = self.stores.iter().filter(|s| laid.contains(&s.id)).map(|s| s.window.clone()).collect();
+        self.stores.retain(|s| !laid.contains(&s.id));
+        for store in &mut self.stores {
+            store.after.retain(|id| !laid.contains(id));
+        }
+        Load::After(windows)
     }
 
     /// Drop the spells of slots `writes` that something about to be laid out writes, reading
@@ -727,14 +872,19 @@ impl Spells {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.spells.is_empty()
+        self.spells.is_empty() && self.stores.is_empty()
     }
 
-    /// The spells laid out in instruction `at`, in order: each one op, and where it can fail, its
-    /// cold way's materializations of it and those after it. See Note [Peephole fusion].
+    /// The stores and spells laid out in instruction `at`, in order: each one op, and where it can
+    /// fail, its cold way's materializations of it and those after it. See Note [Peephole fusion].
     pub fn lay_out(&self, at: usize) -> Vec<Laid> {
         let order: Vec<&Spell> = self.order(at).expect("held spells are in an order").into_iter().map(|i| &self.spells[i]).collect();
-        let mut laid = Vec::with_capacity(order.len());
+        let mut laid = Vec::with_capacity(self.stores.len() + order.len());
+        // The stores first: they read registers as they were before any held operation, and write
+        // none. In the order they were held, which each's `after` keeps.
+        for store in &self.stores {
+            laid.push(Laid { op: store.window.clone(), checked: false, exit: Vec::new(), unknown: Vec::new() });
+        }
         for (k, spell) in order.iter().enumerate() {
             let ops = spell.ops();
             if !spell.can_fail() || order[..k].iter().any(|before| before.went_on_from(spell)) {
@@ -879,6 +1029,122 @@ mod tests {
         let mut spells = Spells::default();
         hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1)]);
         assert!(!across(&mut spells, &Bump::new(&[3])));
+    }
+
+    // A store, as one the peephole holds, and one of nil, which it doesn't.
+    crate::window::windowed!(writes TestStore, [k: i32], [], |owner, state, base| (table, value) {
+        let _ = (owner, table, value, k);
+    });
+    crate::window::windowed!(writes StoreNil, [k: i32], [], |owner, state, base| (table) {
+        let _ = (owner, table, k);
+    });
+
+    /// The element of the table in register `table` at `key`.
+    fn element(table: usize, key: Operand) -> Element {
+        Element { table, key }
+    }
+
+    /// How two elements are, as the context would know them knowing only that a register is
+    /// itself: one register is one table, and others may be.
+    fn alias(a: Element, b: Element) -> Alias {
+        match (a.key, b.key) {
+            (K(x), K(y)) if x != y => Alias::Disjoint,
+            (x, y) if x == y && a.table == b.table => Alias::Same,
+            _ => Alias::May,
+        }
+    }
+
+    /// Hold the store of register `value` into `at`, as instruction `pc`.
+    fn store(spells: &mut Spells, at: Element, value: usize, pc: usize) {
+        let K(k) = at.key else { panic!("a test stores at a constant key") };
+        spells.hold_store(at, Stored::Slot(value), Rc::new(TestStore::new(k, &[at.table, value])), pc, alias);
+    }
+
+    /// What a load of `at` becomes: the register forwarded, or the stores laid out before it, by
+    /// their keys.
+    fn load(spells: &mut Spells, at: Element) -> Result<Stored, Vec<i32>> {
+        match spells.load(at, alias) {
+            Load::Forward(value) => Ok(value),
+            Load::After(stores) => Err(stores.iter().map(|w| w.captures()[0] as i32).collect()),
+        }
+    }
+
+    #[test]
+    fn a_load_of_a_stored_element_is_the_stored_value() {
+        // t[1] = x; y = t[1]: no load.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        assert_eq!(load(&mut spells, element(1, K(1))), Ok(Stored::Slot(5)));
+        assert_eq!(spells.stores.len(), 1, "a load leaves the store held");
+    }
+
+    #[test]
+    fn a_store_overwritten_unread_is_dead() {
+        // t[1] = x; t[1] = y: only the second is laid out.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        store(&mut spells, element(1, K(1)), 6, 1);
+        assert_eq!(spells.stores.iter().map(|s| s.value).collect::<Vec<_>>(), [Stored::Slot(6)]);
+        assert_eq!(spells.lay_out(2).len(), 1);
+    }
+
+    #[test]
+    fn stores_to_different_keys_are_apart() {
+        // t[1] = x; u[2] = y; z = t[1]: u may be t, but its key isn't 1.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        store(&mut spells, element(2, K(2)), 6, 1);
+        assert_eq!(load(&mut spells, element(1, K(1))), Ok(Stored::Slot(5)));
+    }
+
+    #[test]
+    fn a_load_that_may_alias_comes_after_the_stores() {
+        // t[1] = x; u[1] = y; t[2] = w; z = u[1]: t may be u, so its store may be the element
+        // too; the store to t[2] can't be, and stays held.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        store(&mut spells, element(2, K(1)), 6, 1);
+        store(&mut spells, element(1, K(2)), 7, 2);
+        assert_eq!(load(&mut spells, element(2, K(1))), Err(vec![1, 1]));
+        assert_eq!(spells.stores.len(), 1);
+        assert_eq!(spells.stores[0].cell, element(1, K(2)));
+    }
+
+    #[test]
+    fn a_store_that_may_alias_keeps_the_one_before() {
+        // t[1] = x; u[1] = y: u may be t, so the first isn't dead, and comes first.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        store(&mut spells, element(2, K(1)), 6, 1);
+        assert_eq!(spells.stores.len(), 2);
+        let laid: Vec<i32> = spells.lay_out(2).iter().map(|l| l.op.operands()[1] as i32).collect();
+        assert_eq!(laid, [5, 6]);
+    }
+
+    #[test]
+    fn a_repeated_load_across_a_store_of_nil_loads_again() {
+        // t[2] = x; y = t[2]; t[3] = nil; z = t[2]. The first load is the stored value. The store
+        // of nil may shorten the array part, so it isn't held: it, and what is held, are laid out
+        // before it, and the guard on the second load's key then reads the part's length after
+        // it, as the load does its element.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(2)), 5, 0);
+        assert_eq!(load(&mut spells, element(1, K(2))), Ok(Stored::Slot(5)));
+        assert!(!spells.untouched(&StoreNil::new(3, &[1])), "a store of nil lays out what is held");
+        let laid = spells.lay_out(2);
+        assert_eq!(laid.iter().map(|l| l.op.name()).collect::<Vec<_>>(), ["TestStore"]);
+        let mut after = Spells::default();
+        assert!(after.across_guard(&crate::generators::InArrayK::new(2, &[1]), 3));
+        assert_eq!(load(&mut after, element(1, K(2))), Err(vec![]), "loaded, not forwarded");
+    }
+
+    #[test]
+    fn a_guard_on_a_key_keeps_stores_held() {
+        // t[1] = x, then the guard that t[2] is in t's array part: it reads only the part's
+        // length and kind, which the store, of a value that isn't nil, leaves as they were.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        assert!(spells.across_guard(&crate::generators::InArrayK::new(2, &[1]), 1));
     }
 
     #[test]

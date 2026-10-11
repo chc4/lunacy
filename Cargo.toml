@@ -23,6 +23,7 @@ magic = [] # Magic JIT intrinsics
 perf = [] # Create perf JIT map file
 tracing = [] # Write a Perfetto trace (Fuchsia trace format) of the run to lunacy.fxt
 alloc_stats = ["mimalloc/extended", "dep:libmimalloc-sys"] # bench prints mimalloc's statistics
+alloc_debug = ["dep:libmimalloc-sys", "libmimalloc-sys/debug"] # mimalloc checks its heap, to find a write past or after an allocation
 window_dump = ["jit"] # Dump the JIT's window allocation to window_dump.txt
 align_loops = ["jit"] # Loop headers' JIT code starts LOOP_ALIGN-aligned
 align_selects = ["jit"] # A branch on `select` never crosses a cache line

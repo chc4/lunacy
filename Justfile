@@ -296,9 +296,12 @@ debug-jit name: (_luac-test name)
 release name: (_luac-test name)
     cd working && time {{SHARED}} cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
 
-gdb-test name: (_luac-test name)
-    {{SHARED}} cargo build --release --bin lunacy
-    gdb --args ./target/release/lunacy working/{{name}}.bin
+# lua_tests/<name>.lua under gdb, with `gdb_args` (say "-batch -ex run -ex bt" for the
+# backtrace where it crashes), built with `features` too (`alloc_debug` to find a write past or
+# after an allocation).
+gdb-test name gdb_args='' features='': (_luac-test name)
+    {{SHARED}} cargo build --release --bin lunacy --features "{{features}}"
+    gdb {{gdb_args}} --args ./target/release/lunacy working/{{name}}.bin
 
 # Compile lua_tests/<name>.lua to working/<name>.bin.
 _luac-test name:

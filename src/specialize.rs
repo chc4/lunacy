@@ -327,6 +327,7 @@ pub enum YieldOp {
 
     HashKey(usize, usize, bool), // Looks up or allocates an HREF for STACK[idx][key]; down its `__index` chain if true (a load). See Note [Table metatables]
     HashKeyNamed(usize, LConstant<'static, 'static>, bool), // `HashKey` of a key known by its value
+    MemoryOp(crate::peephole::MemOp), // The table access the window yielded next is. See Note [Peephole memory]
     Watching(usize, bool), // A watch site of STACK[idx]'s table, frozen first if the bool says so:
                            // resumed with Matched, the code after knowing which table it is,
                            // while it is watched, else Failed. See Note [Watched tables]
@@ -446,6 +447,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 
 
 /// The spells the peephole holds. See Note [Peephole fusion] in `peephole`.
+#[derive(Default)]
 struct Held {
     spells: crate::peephole::Spells,
 }
@@ -453,7 +455,7 @@ struct Held {
 /// Whether a yield leaves what the peephole holds, `held`, held, laying out no code: in `ctx`, at
 /// instruction `at`, the window after `described` if it says, which the peephole is offered, or a
 /// guard joining a spell. See Note [Peephole fusion] in `peephole`.
-fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<YieldOp, ResumeArg>, described: Option<&crate::peephole::IntOp>) -> bool {
+fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<YieldOp, ResumeArg>, described: Option<&crate::peephole::IntOp>, memory: Option<&crate::peephole::MemOp>, proto: LProto) -> bool {
     let known = |slot: usize, expected: &CType| {
         let found = &ctx.types[slot];
         expected.accepts(found) || !found.accepts(expected)
@@ -463,16 +465,19 @@ fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<Yie
         CoroutineState::Yielded(y) => match y {
             YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
                 | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
-                | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::IntegerOp(_) => true,
+                | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_) => true,
             // Slots whose values are dead: what spells write there is never read, if none reads them.
-            YieldOp::Clobber(from) => held.spells.spells.iter().all(|spell| spell.inputs.iter().all(|&slot| slot < *from)),
+            YieldOp::Clobber(from) => held.spells.inputs().all(|slot| slot < *from),
             YieldOp::OptimisticExec(_) => described.is_some(),
-            YieldOp::ExecWindow(window) => described.is_some() || held.spells.untouched(&**window),
+            // An access the peephole is told of holds them as it touches memory. See Note
+            // [Peephole memory] in `peephole`.
+            YieldOp::ExecWindow(window) => described.is_some() || (memory.is_some() && held.spells.off_registers(&**window))
+                || held.spells.untouched(&**window),
+            // Its check reads only whether the table is watched.
+            YieldOp::Trip(of) => of.is_none_or(|slot| held.spells.spells.iter().all(|spell| spell.dest != slot)),
             // One joining a spell, or, as a type guard found out at runtime, one reading neither
             // what they hold nor memory a held store may change.
-            YieldOp::GuardDynamic(test) => held.spells.joins_guard(&**test, at)
-                || (matches!(test.memory(), crate::window::Memory::None | crate::window::Memory::Properties)
-                    && held.spells.spells.iter().all(|spell| !test.operands().contains(&spell.dest) && spell.at != at)),
+            YieldOp::GuardDynamic(test) => held.spells.joins_guard(&**test, at) || held.spells.across_guard(&**test, at),
             // What a get or set asks before its guard on the key: of the table, a hash key for a
             // key in a register (there is none), and narrowing a key known not to be a double.
             YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) => true,
@@ -489,7 +494,9 @@ fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<Yie
                     CType::LuaFunction(_) => false,
                     _ => true,
                 },
-            YieldOp::HashKey(_, key, _) => key & 0x100 == 0,
+            YieldOp::HashKey(_, key, _) => key & 0x100 == 0
+                // A constant key not a string has none either.
+                || !matches!(unsafe { &(&(*proto).constants.items)[key & 0xff] }, crate::chunk::Constant::String(_)),
             YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
             // One found out at runtime keeps them held on its ways, if it reads none and none
             // holds its instruction's operations, which a restart past it would run again.
@@ -500,6 +507,24 @@ fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<Yie
             _ => false,
         },
     }
+}
+
+/// How two cells are, as `ctx` knows their tables and keys. See Note [Peephole memory] in `peephole`.
+fn cells(ctx: &Context, a: crate::peephole::Element, b: crate::peephole::Element) -> crate::peephole::Alias {
+    use crate::peephole::{Alias, Operand};
+    let same = |x: usize, y: usize| x == y || ctx.values.same(Loc::root(Root::Slot(x as u16)), Loc::root(Root::Slot(y as u16)));
+    let constant = |key: Operand| match key {
+        Operand::K(k) => Some(k),
+        Operand::Slot(slot) => ctx.constant(slot),
+    };
+    // Different keys are different elements, whatever the tables.
+    let keys = match (constant(a.key), constant(b.key), a.key, b.key) {
+        (Some(x), Some(y), _, _) if x != y => return Alias::Disjoint,
+        (Some(_), Some(_), _, _) => true,
+        (_, _, Operand::Slot(x), Operand::Slot(y)) => same(x, y),
+        _ => false,
+    };
+    if keys && same(a.table, b.table) { Alias::Same } else { Alias::May }
 }
 
 /// Where an exit of what the peephole holds goes on from: the start of an instruction, in its
@@ -4819,6 +4844,40 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Hold::Held
     }
 
+    /// Table access `op`, of window `window`, at `pc` in `ctx`: a store held, or a load of a cell a
+    /// held store is into its value, or after the held stores that may be into it. Whether it laid
+    /// the access out, or held it. See Note [Peephole memory] in `peephole`.
+    fn access(&mut self, block_id: BlockId, op: crate::peephole::MemOp, window: &Rc<dyn Window>, pc: SubPc, ctx: &mut Rc<Context>) -> bool {
+        use crate::peephole::{Load, MemOp, Stored};
+        let holds = crate::peephole::fuses() && self.instruction.as_ref().is_some_and(|(at, _, holds)| *at == pc.0 && *holds);
+        let known = ctx.clone();
+        let alias = |a, b| cells(&known, a, b);
+        match op {
+            MemOp::Store { cell, value } if holds => {
+                let held = self.held.get_or_insert_with(Held::default);
+                held.spells.hold_store(cell, value, window.clone(), pc.0, alias);
+                true
+            },
+            MemOp::Load { cell, dest } => {
+                let Some(held) = self.held.as_mut().filter(|held| !held.spells.stores.is_empty()) else { return false };
+                let load = match held.spells.load(cell, alias) {
+                    Load::Forward(Stored::Slot(slot)) => Rc::new(crate::generators::Move::new(&[slot, dest])) as Rc<dyn Window>,
+                    Load::Forward(Stored::Boxed(bits)) => Rc::new(crate::generators::LoadStored::new(bits, &[dest])),
+                    Load::After(stores) => {
+                        for store in stores {
+                            self.blocks[block_id.0].instructions.push(Residual::ExecWindow(store));
+                        }
+                        window.clone()
+                    },
+                };
+                Rc::make_mut(ctx).effect(Effect::Write(dest));
+                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(load));
+                true
+            },
+            MemOp::Store { .. } => false,
+        }
+    }
+
     /// Lay out what the peephole holds at `pc` in `ctx`, in `block_id`, then `then`, the yield
     /// laying it out, about to write `stale`. A spell that can fail ends its block in a `Branch`,
     /// its cold way an exit, the code going on past the last; with none, the spells are laid out in
@@ -6245,11 +6304,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut loading: Option<Origin> = None;
         // The integer op the window the generator yields next computes. See Note [Peephole fusion].
         let mut described: Option<crate::peephole::IntOp> = None;
+        // The table access the window the generator yields next is. See Note [Peephole memory].
+        let mut memory: Option<crate::peephole::MemOp> = None;
         loop {
             let mut state = Pin::new(&mut coro).resume(arg);
             arg = ResumeArg::Start;
             'machine: loop {
-            if self.held.as_ref().is_some_and(|held| !passes_held(held, &ctx, pc.0, &state, described.as_ref())) {
+            if self.held.as_ref().is_some_and(|held| !passes_held(held, &ctx, pc.0, &state, described.as_ref(), memory.as_ref(), self.proto)) {
                 // What writes a held value unread: that spell is dead.
                 let (writes, reads) = overwrites(&state).unwrap_or_default();
                 self.held.as_mut().unwrap().spells.drop_overwritten(&writes, &reads);
@@ -6497,6 +6558,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::IntegerOp(op)) => {
                     described = Some(op);
                 },
+                CoroutineState::Yielded(YieldOp::MemoryOp(op)) => {
+                    memory = Some(op);
+                },
+                CoroutineState::Yielded(YieldOp::ExecWindow(ref w)) if let Some(op) = memory.take() && self.access(block_id, op, w, pc, &mut ctx) => {},
                 CoroutineState::Yielded(YieldOp::OptimisticExec(ref op)) if let Some(int_op) = described.take() => {
                     match self.hold(owner, block_id, int_op, op, true, &coro, pc, &mut ctx) {
                         Hold::Held => {
@@ -6617,13 +6682,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Some(slot) => Rc::new(TripCheck::new(&[slot])),
                         None => Rc::new(TripCheckGlobal::new(&[])),
                     };
+                    // What the peephole holds, on both its ways. See Note [Peephole memory] in
+                    // `peephole`.
+                    let held = self.held.take().map(|held| Rc::new(held.spells));
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(check));
-                    let hot = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
+                    let hot = self.carried(owner, held.as_deref(), pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
                     let cold = self.new_block(pc.0);
                     let mut unwatched = (*ctx).clone();
                     unwatched.effect(Effect::Trip);
-                    let side = self.make_side_thunk(cold, coro.clone(), pc.next_false(), Rc::new(unwatched), ResumeArg::Matched);
+                    let side = self.make_carried_side_thunk(cold, coro.clone(), pc.next_false(), Rc::new(unwatched), ResumeArg::Matched, held);
                     self.blocks[cold.0].instructions.extend([Residual::Tripped(of), Residual::Thunk(side)]);
                     self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
                     return None;

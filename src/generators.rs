@@ -22,6 +22,7 @@ use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
 use crate::window::{windowed, Access, Window};
+use crate::peephole::{Element, MemOp, Operand, Stored};
 // The native code generator (`JitContext`) and its per-block `JitInfo` (dynasm
 // buffer + hotness tiering) are only needed with the `jit` feature.
 #[cfg(feature = "jit")]
@@ -401,6 +402,11 @@ crate::window::windowed!(guard IsValue, [bits: u64], [], |owner, state, base| (v
 windowed!(LoadFrozen, [bits: u64], [], |owner, state, base| (out dest) {
     *dest = LBoxed::from_bits(bits);
 });
+// The value a store the peephole holds stores, as its cell's load. See Note [Peephole memory] in
+// `peephole`: a constant's lives as long as its prototype.
+windowed!(LoadStored, [bits: u64], [], |owner, state, base| (out dest) {
+    *dest = LBoxed::from_bits(bits);
+});
 // Whether an integer is `k`: a promote's guard. See Note [Promoted values] in `specialize`.
 crate::window::windowed!(guard EqualsK, [k: i32], [], |owner, state, base| (value) {
     value.as_int() == k
@@ -539,17 +545,28 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             } cold {
                 1
             });
-            let load: Option<(Rc<dyn Window>, Rc<dyn Window>)> = match (integer, &in_array) {
-                (Some(Some(k)), ResumeArg::Matched) => Some((Rc::new(GetTableArray::new(k, &[b, a])), Rc::new(GetTableArrayChain::new(k, &[b, a])))),
-                (Some(None), ResumeArg::Matched) => Some((Rc::new(GetTableInteger::new(&[b, c, a])), Rc::new(GetTableIntegerChain::new(&[b, c, a])))),
+            // The key, a constant or not, of a load in the array part. Its ops are made as they are
+            // yielded, never kept across a yield: a clone of this coroutine clones what it kept
+            // there even moved out of, which may be an op nothing else holds by then.
+            let key = match (integer, &in_array) {
+                (Some(Some(k)), ResumeArg::Matched) => Some(Operand::K(k)),
+                (Some(None), ResumeArg::Matched) => Some(Operand::Slot(c)),
                 _ => None,
             };
-            if let Some((plain, chain)) = load {
+            if let Some(key) = key {
                 // As one step each way, as the nil test is. See Note [Subblocks].
                 if !chains {
                     yield YieldOp::Decided(true);
-                    arg = yield YieldOp::ExecWindow(plain);
-                } else if (yield YieldOp::OptimisticExec(chain)) != ResumeArg::Matched {
+                    // See Note [Peephole memory] in `peephole`.
+                    yield YieldOp::MemoryOp(MemOp::Load { cell: Element { table: b, key }, dest: a });
+                    arg = yield YieldOp::ExecWindow(match key {
+                        Operand::K(k) => Rc::new(GetTableArray::new(k, &[b, a])),
+                        Operand::Slot(_) => Rc::new(GetTableInteger::new(&[b, c, a])),
+                    });
+                } else if (yield YieldOp::OptimisticExec(match key {
+                    Operand::K(k) => Rc::new(GetTableArrayChain::new(k, &[b, a])),
+                    Operand::Slot(_) => Rc::new(GetTableIntegerChain::new(&[b, c, a])),
+                })) != ResumeArg::Matched {
                     arg = yield YieldOp::Exec(gettable(a, b, c));
                     yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
                     return arg;
@@ -824,6 +841,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 tab.barrier_slow();
             });
+            // One keeping the array part's length and kind. See Note [Peephole memory] in `peephole`.
+            if how == Widen::No && !nil {
+                let value = match constant { Some(bits) => Stored::Boxed(bits), None => Stored::Slot(c) };
+                yield YieldOp::MemoryOp(MemOp::Store { cell: Element { table: a, key: Operand::K(k) }, value });
+            }
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {
                     macro_rules! make { ($W:tt) => { if nil { Rc::new(SetTableArray::<$W, true>::new(k, &[a, c])) as Rc<dyn Window> } else { Rc::new(SetTableArray::<$W, false>::new(k, &[a, c])) as Rc<dyn Window> } } }
@@ -861,6 +883,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 tab.barrier_slow();
             });
+            // One keeping the array part's length and kind. See Note [Peephole memory] in `peephole`.
+            if how == Widen::No && !nil {
+                let value = match constant { Some(bits) => Stored::Boxed(bits), None => Stored::Slot(c) };
+                yield YieldOp::MemoryOp(MemOp::Store { cell: Element { table: a, key: Operand::Slot(b) }, value });
+            }
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {
                     macro_rules! make { ($W:tt) => { if nil { Rc::new(SetTableInteger::<$W, true>::new(&[a, b, c])) as Rc<dyn Window> } else { Rc::new(SetTableInteger::<$W, false>::new(&[a, b, c])) as Rc<dyn Window> } } }
