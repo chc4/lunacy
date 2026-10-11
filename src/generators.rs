@@ -1298,6 +1298,12 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(rhsc)) else { unreachable!() };
+                // An integer's quotient by a positive whole constant, which a floor of it can
+                // compute from the integer. See Note [Peephole fusion] in `peephole`.
+                if opcode == Opcode::DIV && lint && k >= 1.0 && k <= i32::MAX as f64 && k.fract() == 0.0 {
+                    use crate::peephole::{Arith, IntOp, Operand};
+                    yield YieldOp::IntegerOp(IntOp { op: Arith::Div, lhs: Operand::Slot(lhs), rhs: Operand::K(k as i32), dest });
+                }
                 Some(numeric_rk(opcode, lint, k, &[lhs, dest]))
             },
             _ => None,

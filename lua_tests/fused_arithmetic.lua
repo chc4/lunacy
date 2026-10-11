@@ -10,7 +10,9 @@
 -- before anything reads them, one overflowing, which the peephole never lays
 -- out. And two chains where the second overflows after the first is written in
 -- place, and a sum of a product, whose spell the product's goes on into, which
--- overflows. Once, and in loops run often enough for JIT code.
+-- overflows. And the floor of an integer's quotient by a constant, a shift or
+-- a floored division, past the guards on the function called. Once, and in
+-- loops run often enough for JIT code.
 
 local function index(p)
   return (p - 1) % 256 + 1
@@ -74,12 +76,17 @@ local function word(acc, t)
   return acc + t * 256
 end
 
+local floor = math.floor
+local function halves(v)
+  return floor(v / 256) % 256 + floor(v / 10)
+end
+
 local function run(n)
   local t, u = {}, {}
   for i = 1, 16 do t[i] = i * i end
   for i = 1, 8 do u[i] = i end
   u[20] = 100
-  local s1, s2, s3, s4, s5, s6, s7, s8, s9 = 0, 0, 0, 0, 0, 0, 0, 0, 0
+  local s1, s2, s3, s4, s5, s6, s7, s8, s9, s10 = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
   for i = 1, n do
     s1 = s1 + index(i)
     s2 = s2 + around(t, i)
@@ -91,11 +98,12 @@ local function run(n)
     s7 = s7 + dead(i % 5 == 0 and 2147483647 or i, i)
     s8 = s8 + second(i, i % 11 == 0 and 1073741824 or i)
     s9 = s9 + word(i, i % 13 == 0 and 8388608 or i)
+    s10 = s10 + halves(i * 37 - 30000)
   end
-  return s1, s2, s3, s4, s5, u[1] + u[8], s6, s7, s8, s9
+  return s1, s2, s3, s4, s5, u[1] + u[8], s6, s7, s8, s9, s10
 end
 
 print(run(10))
 print(run(2000))
--- EXPECT: 55	1178	21474836470	4294966070	20	9	143	-15	175	14135
--- EXPECT: 252008	998000	4294967293999	4298960000	506436	3993	230353	-1993000	388699181454	329040047976
+-- EXPECT: 55	1178	21474836470	4294966070	20	9	143	-15	175	14135	-28410
+-- EXPECT: 252008	998000	4294967293999	4298960000	506436	3993	230353	-1993000	388699181454	329040047976	1663995

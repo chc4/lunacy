@@ -725,9 +725,17 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
                     crate::lboxed::is_integer(math1::<OP>(unsafe { checked_number(state.vals[state.base + a + 1]) }))
                 }));
                 if (yield YieldOp::Encoding(fits)) != ResumeArg::Type(CType::Type(LType::Double)) {
+                    // A floor of a quotient by a constant is the floored division. See Note
+                    // [Peephole fusion] in `peephole`.
+                    if OP == FLOOR {
+                        use crate::peephole::{Arith, IntOp, Operand};
+                        yield YieldOp::IntegerOp(IntOp { op: Arith::Floor, lhs: Operand::Slot(a + 1), rhs: Operand::K(0), dest: a });
+                    }
                     let fit = yield YieldOp::OptimisticExec(std::rc::Rc::new(WholeOptimistic::<OP>::new(&[a + 1, a])));
                     let ty = if fit == ResumeArg::Matched { LType::Integer } else { LType::Double };
                     yield YieldOp::SetCTypes(vec![(a, CType::Type(ty))]);
+                    // The call's frame above its result is dead.
+                    yield YieldOp::Clobber(a + 1);
                     return ResumeArg::Start;
                 }
                 yield YieldOp::Decided(false);

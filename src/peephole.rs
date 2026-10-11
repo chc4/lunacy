@@ -17,7 +17,10 @@ use crate::window::{windowed, Window};
 // does: one per slot, the slot's value as a computation of values from before any held op. An op
 // reading a held value extends its spell where a rule matches, and an array-part guard on a held key
 // joins it, so a chain becomes one op that checks once. A value overwritten unread is never computed.
-// Whatever reads a held value without extending it, or lays out code, lays every spell out.
+// An integer's quotient by a constant is held as the double it is, and its floor is the floored
+// division. Whatever reads a held value without extending it, or lays out code, lays every spell
+// out; but a guard found out at runtime, of a value none holds, keeps them held on its ways, in code
+// of their own, unless one holds its instruction's operations, which a restart past it would repeat.
 //
 // Spells only read values from before any held op, so laying out those that read a slot before the
 // one that writes it computes each as its ops would have. Where one fails, those before it have
@@ -39,6 +42,10 @@ pub enum Arith {
     Mul,
     /// Floored, as Lua's `%`.
     Mod,
+    /// Lua's `/`, a double.
+    Div,
+    /// `math.floor` of its left operand.
+    Floor,
 }
 
 /// An operand: a slot holding an integer, or a constant.
@@ -65,6 +72,7 @@ impl IntOp {
             Opcode::SUB => Arith::Sub,
             Opcode::MUL => Arith::Mul,
             Opcode::MOD => Arith::Mod,
+            Opcode::DIV => Arith::Div,
             _ => return None,
         };
         Some(IntOp { op, lhs, rhs, dest })
@@ -88,6 +96,8 @@ impl IntOp {
             Arith::Sub => Some((Sym::K(SUB), slot, k)),
             Arith::Mul if k > 0 => Some((Sym::K(MUL), slot, k)),
             Arith::Mod if k > 0 && k & (k - 1) == 0 => Some((Sym::K(MASK), slot, k - 1)),
+            Arith::Div if k > 0 => Some((Sym::K(DIV), slot, k)),
+            Arith::Floor => Some((Sym::K(FLOOR), slot, 0)),
             _ => None,
         }
     }
@@ -115,6 +125,9 @@ const SUB: u8 = 1;
 const MUL: u8 = 2;
 /// `k` the mask.
 const MASK: u8 = 3;
+/// A quotient by a positive constant, and its floor. See Note [Peephole fusion].
+const DIV: u8 = 4;
+const FLOOR: u8 = 5;
 // Guards on a key: `InArray`'s, and `InArrayHeld`'s.
 const IN_ARRAY: u8 = 0;
 const HELD: u8 = 1;
@@ -202,6 +215,9 @@ fn fold(op: Arith, l: i32, r: i32) -> Option<i32> {
         Arith::Sub => l - r,
         Arith::Mul => l * r,
         Arith::Mod => l - (l / r).floor() * r,
+        // A quotient is a double, though whole: its slot is typed so.
+        Arith::Div => return None,
+        Arith::Floor => l.floor(),
     };
     (v.fract() == 0.0 && v >= i32::MIN as f64 && v <= i32::MAX as f64 && v.to_bits() != (-0.0f64).to_bits()).then_some(v as i32)
 }
@@ -357,6 +373,31 @@ rule!(RR_ADD_SUB, FusedPairAddSub, ComputePairAddSub, MaterializePairAddSub = rr
 rule!(RR_ADD_SUB_MASK, FusedPairAddSubMask, ComputePairAddSubMask, MaterializePairAddSubMask = rr ADD [SUB a, MASK b]);
 rule!(MUL_RR_ADD, FusedMulPairAdd, ComputeMulPairAdd, MaterializeMulPairAdd = [MUL a] rr ADD);
 
+// An integer's quotient by a positive constant `k`, a double as Lua's `/` makes; and its floor, an
+// integer: the floored division, a shift for a power of two.
+windowed!(ComputeDiv, [k: u64], [], |owner, state, base| (lhs, out dest) {
+    *dest = LBoxed::from_double(lhs.as_int() as f64 / k as i32 as f64);
+});
+windowed!(ComputeDivFloor, [k: u64], [], |owner, state, base, tag| (lhs, out dest) {
+    *dest = LBoxed::from_int_tagged(lhs.as_int().div_euclid(k as i32), tag);
+});
+windowed!(ComputeDivFloorShift, [shift: u64], [], |owner, state, base, tag| (lhs, out dest) {
+    *dest = LBoxed::from_int_tagged(lhs.as_int() >> shift, tag);
+});
+const DIV_: Rule = Rule { name: "DIV_", pattern: &[Sym::K(DIV)], make: |m| {
+    let op: Rc<dyn Window> = Rc::new(ComputeDiv::new(m.ks[0] as u32 as u64, &[m.lhs, m.dest]));
+    Ops { fused: op.clone(), compute: op.clone(), materialize: op }
+}};
+const DIV_FLOOR: Rule = Rule { name: "DIV_FLOOR", pattern: &[Sym::K(DIV), Sym::K(FLOOR)], make: |m| {
+    let k = m.ks[0];
+    let op: Rc<dyn Window> = if k & (k - 1) == 0 {
+        Rc::new(ComputeDivFloorShift::new(k.trailing_zeros() as u64, &[m.lhs, m.dest]))
+    } else {
+        Rc::new(ComputeDivFloor::new(k as u32 as u64, &[m.lhs, m.dest]))
+    };
+    Ops { fused: op.clone(), compute: op.clone(), materialize: op }
+}};
+
 // A constant, stored.
 windowed!(StoreInt, [k: u64], [], |owner, state, base, tag| (out dest) {
     *dest = LBoxed::from_int_tagged(k as i32, tag);
@@ -368,7 +409,7 @@ const CONST_: Rule = Rule { name: "CONST_", pattern: &[Sym::Const], make: |m| {
 
 /// Every rule.
 pub static RULES: &[Rule] = &[
-    CONST_,
+    CONST_, DIV_, DIV_FLOOR,
     ADD_, SUB_, MUL_, MASK_, SUB_MASK, ADD_MASK, MASK_ADD, SUB_MASK_ADD, ADD_MASK_ADD, ADD_MASK_SUB,
     ADD_IN, ADD_HELD, MASK_ADD_IN, MASK_ADD_HELD, SUB_MASK_ADD_IN, SUB_MASK_ADD_HELD, ADD_MASK_ADD_IN, ADD_MASK_ADD_HELD,
     RR_ADD, RR_ADD_MASK, RR_ADD_ADD, RR_ADD_ADD_MASK, RR_ADD_SUB, RR_ADD_SUB_MASK, MUL_RR_ADD,
@@ -513,7 +554,7 @@ impl Spell {
     /// Whether it can fail: a step but a mask's, or a guard. One that can't is only its
     /// computation: its check's test would fold away.
     pub fn can_fail(&self) -> bool {
-        RULES[TRIE.rule[self.node].expect("a spell is a rule")].pattern.iter().any(|&sym| !matches!(sym, Sym::K(MASK) | Sym::Const))
+        RULES[TRIE.rule[self.node].expect("a spell is a rule")].pattern.iter().any(|&sym| !matches!(sym, Sym::K(MASK | DIV | FLOOR) | Sym::Const))
     }
 
     /// Its rule's name.
@@ -839,6 +880,22 @@ mod tests {
     }
 
     #[test]
+    fn the_floor_of_a_quotient_is_a_floored_division() {
+        // math.floor(n / 256) with n in slot 1, the quotient into slot 2 and its floor into 3: a
+        // shift, the quotient held too, a double if anything reads it.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Div, Slot(1), K(256), 2), op(Arith::Floor, Slot(2), K(0), 3)]);
+        assert_eq!(held(&spells), [("DIV_", 2, vec![1]), ("DIV_FLOOR", 3, vec![1])]);
+        assert_eq!(laid(&spells, 2), [("ComputeDiv", vec![1, 2], false, vec![]), ("ComputeDivFloorShift", vec![1, 3], false, vec![])]);
+        // By a constant that isn't a power of two: the floored division.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Div, Slot(1), K(10), 2), op(Arith::Floor, Slot(2), K(0), 3)]);
+        assert_eq!(spells.lay_out(2).iter().map(|l| l.op.name()).collect::<Vec<_>>(), ["ComputeDiv", "ComputeDivFloor"]);
+        // A floor of anything else isn't held.
+        assert_eq!(Spells::default().offer(&op(Arith::Floor, Slot(2), K(0), 3), 0, none), Offer::Refused);
+    }
+
+    #[test]
     fn dead_values_are_never_laid_out() {
         // A chain overwritten unread: t = x + 1; t = t % 256; then t = y - 2.
         let mut spells = Spells::default();
@@ -900,6 +957,8 @@ mod tests {
             Arith::Sub => l - r,
             Arith::Mul => l * r,
             Arith::Mod => l - (l / r).floor() * r,
+            Arith::Div => l / r,
+            Arith::Floor => l.floor(),
         }
     }
 

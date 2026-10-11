@@ -446,15 +446,30 @@ fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<Yie
         CoroutineState::Yielded(y) => match y {
             YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
                 | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
-                | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::Clobber(_) | YieldOp::IntegerOp(_) => true,
+                | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::IntegerOp(_) => true,
+            // Slots whose values are dead: what spells write there is never read, if none reads them.
+            YieldOp::Clobber(from) => held.spells.spells.iter().all(|spell| spell.inputs.iter().all(|&slot| slot < *from)),
             YieldOp::OptimisticExec(_) | YieldOp::ExecWindow(_) => described.is_some(),
             YieldOp::GuardDynamic(test) => held.spells.joins_guard(&**test, at),
             // What a get or set asks before its guard on the key: of the table, a hash key for a
             // key in a register (there is none), and narrowing a key known not to be a double.
             YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) => true,
+            // What a call asks of a native it may make a window op.
+            YieldOp::NativeWindowArgs(..) => true,
+            // A call of a native with a generator is compiled by it, holding them; of a function
+            // found out at runtime, its thunk holds them for one, else lays them out first.
+            YieldOp::Call(CallTarget::Dynamic(a, _, _)) => held.spells.spells.iter().all(|spell| spell.dest != *a && spell.at != at)
+                && match &ctx.types[*a] {
+                    CType::NativeFunction(nf) => !nf.is_protected_call() && nf.generator().is_some(),
+                    CType::LuaFunction(_) => false,
+                    _ => true,
+                },
             YieldOp::HashKey(_, key, _) => key & 0x100 == 0,
             YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
-            YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected)),
+            // One found out at runtime keeps them held on its ways, if it reads none and none
+            // holds its instruction's operations, which a restart past it would run again.
+            YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected))
+                || held.spells.spells.iter().all(|spell| spell.dest != *idx && spell.at != at),
             YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
             YieldOp::GuardCType(rk, expected) => rk & 0x100 != 0 || known(*rk, expected),
             _ => false,
@@ -4716,6 +4731,49 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
+    /// The code from `pc` in `ctx`, as `subblock` compiles it, holding `held` if anything: then in
+    /// a block of its own, as what is held isn't in the context. See Note [Peephole fusion] in
+    /// `peephole`.
+    fn carried(&mut self, owner: &mut Owner, held: Option<&crate::peephole::Spells>, pc: SubPc, ctx: Rc<Context>, coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
+        let Some(held) = held else { return self.subblock(owner, pc, ctx, coro, arg) };
+        let block = self.new_block(pc.0);
+        self.held = Some(Held { spells: held.clone() });
+        if let Some((next, ctx, _)) = self.compile_one(owner, pc, ctx, coro, arg, block) {
+            self.compile(owner, next, ctx, block);
+        }
+        block
+    }
+
+    /// The thunk a call of R(A) with B and C ends its block in, its callee found out at runtime,
+    /// with `spells` held from `restart`: forced on a native with a generator, its identity guard
+    /// and the generator's code, holding them; on anything else, they are laid out, and the call
+    /// goes on as any does. See Note [Peephole fusion] in `peephole`.
+    fn make_held_call_thunk(&self, block_id: BlockId, spells: Rc<crate::peephole::Spells>, restart: (Pc, Restart, bool), coro: Box<dyn NativeGen>, pc: SubPc, ctx: Rc<Context>, a: usize, b: usize, c: usize, identities: usize) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let block = vm.new_block(pc.0);
+            vm.jump_thunk(block_id, thunk_pc, block);
+            let callee = state.vals[state.base + a].unbox();
+            if let LValue::NClosure(nf) = &callee && !nf.is_protected_call() && let Some(generator) = nf.generator() && identities < MAX_VERSIONS {
+                let other = vm.make_held_call_thunk(block, spells.clone(), restart.clone(), coro.clone(), pc, ctx.clone(), a, b, c, identities + 1);
+                let mut known = (*ctx).clone();
+                known.types[a] = callee.ctypeof_();
+                let body = vm.carried(owner, Some(&spells), pc, Rc::new(known), Box::new(generator(nf.native(), a, b, c)), ResumeArg::Start);
+                vm.blocks[block.0].instructions.extend([Residual::NativeGuard { idx: a, ptr: nf.get_ptr() }, Residual::Thunk(other), Residual::Jump(body)]);
+                return;
+            }
+            vm.held = Some(Held { spells: (*spells).clone() });
+            let outer = vm.instruction.replace(restart.clone());
+            let then: AfterHeld = Some((None, YieldOp::Call(CallTarget::Dynamic(a, b, c)), coro.clone()));
+            if !vm.flush(owner, block, pc, &ctx, then.clone(), &[]) {
+                // Laid out in place: the call goes on in the block.
+                if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx.clone(), Box::new(after_held(Rc::new(then))), ResumeArg::Start, block) {
+                    vm.compile(owner, next, ctx, block);
+                }
+            }
+            vm.instruction = outer;
+        })))
+    }
+
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
@@ -4777,7 +4835,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// A function found gets its identity guarded too, unless the chain of
     /// thunks this one is in guards `identities` of them already, `MAX_VERSIONS`
     /// (Note [Call sites]).
-    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
+    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize, held: Option<Rc<crate::peephole::Spells>>) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // Each forcing patches the thunk where it was forced, in `block_id`: one
@@ -4875,7 +4933,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .filter(|_| identities < MAX_VERSIONS);
             let identities = identities + idx_ctype.is_some() as usize;
             // Push the same thunk down for the next value that fails the guard
-            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected.clone(), field, pc, thunk_ctx.clone(), false, identities);
+            let fail_thunk = vm.make_discovery_thunk(block_id, thunk_coro.clone(), idx, expected.clone(), field, pc, thunk_ctx.clone(), false, identities, held.clone());
             vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk.clone()));
             if let Some(CType::NativeFunction(nf)) = &idx_ctype {
                 // We know this original value has the correct native function, and so can compile
@@ -4885,7 +4943,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
                 }
                 forced_mut.learn_held(idx, field, idx_ctype.clone().unwrap());
-                let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
+                let guard_block = vm.carried(owner, held.as_deref(), next, forced_ctx, thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
                 // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
                 // we have to do this all over again with the newly observed type (up to our block
@@ -4904,13 +4962,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
                 }
                 forced_mut.learn_held(idx, field, idx_ctype.clone().unwrap());
-                let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
+                let guard_block = vm.carried(owner, held.as_deref(), next, forced_ctx, thunk_coro, arg);
                 let proto = lclos.ro(owner).prototype.cast();
                 vm.blocks[block_id.0].instructions.push(Residual::LuaGuard { idx, ptr: proto });
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
             } else {
-                let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
+                let guard_block = vm.carried(owner, held.as_deref(), next, forced_ctx, thunk_coro, arg);
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
             }
 
@@ -6053,7 +6111,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else {
                         // See Note [Widening].
                         Rc::make_mut(&mut ctx).used(rk);
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, expected.clone(), None, pc, ctx.clone(), true, 0));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), rk, expected.clone(), None, pc, ctx.clone(), true, 0, None));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -6182,7 +6240,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         debug!("emitting discovery thunk");
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), None, pc, thunk_ctx, true, 0));
+                        // What the peephole holds, the guard's ways hold too. See Note [Peephole
+                        // fusion] in `peephole`.
+                        let held = self.held.take().map(|held| Rc::new(held.spells));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), None, pc, thunk_ctx, true, 0, held));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -6315,7 +6376,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Record the type on the hash key too, unless the load overwrote
                         // the table's register and dropped its hash keys.
                         let live = ctx.types.iter().any(|ctype| matches!(ctype, CType::Shape(_, hrefs) if hrefs.contains(&href)));
-                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Unknown, live.then_some(href), pc, ctx.clone(), true, 0));
+                        let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, coro.clone(), slot, CType::Unknown, live.then_some(href), pc, ctx.clone(), true, 0, None));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
@@ -6403,6 +6464,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
+                            // A callee found out at runtime, with spells held. See Note [Peephole
+                            // fusion] in `peephole`.
+                            let generates = matches!(&ctx.types[a], CType::NativeFunction(nf) if !nf.is_protected_call() && nf.generator().is_some());
+                            if !generates && !resumes && let Some(held) = self.held.take() {
+                                let restart = self.instruction.clone().expect("spells are held in an instruction");
+                                let coro: Box<dyn NativeGen> = Box::new((*coro).clone());
+                                let thunk = self.make_held_call_thunk(block_id, Rc::new(held.spells), restart, coro, pc, ctx.clone(), a, b, c, 0);
+                                self.end_block(block_id);
+                                self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                                return None;
+                            }
                             // The result's type, if known. A window op's has one; it and a pure
                             // native's call have no effects. See Note [Library natives].
                             let mut result = None;
@@ -6596,7 +6668,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Clobber(from)) => {
                     let clobbered = (from..ctx.types.len()).map(|idx| (idx, CType::Unknown)).collect();
-                    Rc::make_mut(&mut ctx).set_types(owner, clobbered)
+                    Rc::make_mut(&mut ctx).set_types(owner, clobbered);
+                    // See Note [Peephole fusion] in `peephole`.
+                    if let Some(held) = self.held.as_mut() {
+                        held.spells.spells.retain(|spell| spell.dest < from);
+                        if held.spells.is_empty() {
+                            self.held = None;
+                        }
+                    }
                 },
                 CoroutineState::Yielded(YieldOp::WidenConstant(slot)) => {
                     if ctx.types.get(slot) == Some(&CType::Type(LType::Integer)) {
