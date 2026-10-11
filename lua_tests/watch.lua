@@ -31,6 +31,22 @@ local function meta(t, i) setmetatable(t, {}) end
 print(count({ 1, 2, 3 }, element), count({ x = 0 }, field), count({ 1, 2 }, far), count({ 1, 2 }, near))
 print(count({ 1, 2 }, insert), count({ 1, 2 }, remove), count({}, meta))
 
+-- Checked after the call that stores, as well as before it: the check after it
+-- knows the table is watched from the one before, so a frame paused at the call
+-- has to go on in code that doesn't, or it counts one iteration short of the
+-- check before's, which a stale site would leave short too.
+local function across(t, store)
+  jit.watch(t)
+  local seen = 0
+  for i = 1, n do
+    if jit.tripped(t) then seen = seen - 1 end
+    if i == k then store(t, i) end
+    if jit.tripped(t) then seen = seen + 2 end
+  end
+  return seen
+end
+print(across({ 1, 2, 3 }, element), across({ 1, 2 }, far), across({ 1, 2 }, near), across({ 1, 2 }, insert))
+
 -- The same loop, inlined into its caller, storing where the caller does.
 local function inlined(t)
   jit.watch(t)
@@ -63,6 +79,7 @@ end
 print(again)
 -- EXPECT: 250	250	250	250
 -- EXPECT: 250	250	250
+-- EXPECT: 252	252	252	252
 -- EXPECT: 250
 -- EXPECT: 250
 -- EXPECT: 50

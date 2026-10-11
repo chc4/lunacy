@@ -1321,17 +1321,20 @@ fn name_hash(name: &[u8]) -> u64 {
 
 // Note [Watched tables]
 // ~~~~~~~~~~~~~~~~~~~~~~
-// Code can know a table's contents, as a constant element, if the table is watched: every store
+// Code can know a table is watched, and its contents, as a constant element: every store
 // into a table first checks whether it is (`Trip`), and one that is trips its watchpoint before it
 // stores, so nothing runs past the store relying on what it changes. The knowledge enters the code
-// only past a watch site, a thunk whose jump leads to the code knowing it; a trip unpublishes each
+// only past a watch site, a thunk whose jump leads to the code knowing it, and is lost across code
+// the specializer doesn't see (`Effect::Opaque`), as a native's store trips no frame's; a trip unpublishes each
 // of the table's sites, the jump undone back into its thunk, which, forced again, compiles the code
-// after it knowing nothing of the table. The store goes on knowing no element of any table, and so
+// after it knowing nothing of the table. The store goes on knowing nothing through a watch, and so
 // does each frame paused at a call: a trip leaves JIT code, which writes every frame's callstack
-// entry, and each entry whose code after the call knows an element is redirected to a fresh
+// entry, and each entry whose code after the call knows something through one is redirected to a fresh
 // continuation compiled without it, which, for a context that knew none, is the code it had.
 // Values already loaded from the table are what they were: facts follow values, so only what is
-// known of the table's contents goes.
+// known of the table's contents goes. A trip is an effect, and what was learned through a watch is
+// whatever doesn't survive it: a domain learned that way says so, as any domain does of the
+// effects it survives (Note [Fragile information]).
 
 /// Where a Lua call's returns go on, and how the code after it is compiled: as
 /// `make_continuation_thunk` takes it. See Note [Watched tables].
@@ -2338,13 +2341,16 @@ pub enum Known {
     Type(CType),
     Kind(Kind),
     Constant { value: i32, origins: Option<Origins> },
+    /// The table is watched. See Note [Watched tables].
+    Watched,
 }
 
 /// The keys of `Known`'s domains.
 pub const TYPE: u8 = 0;
 pub const KIND: u8 = 1;
 pub const CONSTANT: u8 = 2;
-const KEYS: [u8; 3] = [TYPE, KIND, CONSTANT];
+pub const WATCHED: u8 = 3;
+const KEYS: [u8; 4] = [TYPE, KIND, CONSTANT, WATCHED];
 
 /// What a context knows of values. See Note [Fragile information].
 pub type Values = crate::classes::Classes<Known>;
@@ -2368,6 +2374,7 @@ impl PartialEq for Known {
             (Known::Type(a), Known::Type(b)) => a == b,
             (Known::Kind(a), Known::Kind(b)) => a == b,
             (Known::Constant { value: a, .. }, Known::Constant { value: b, .. }) => a == b,
+            (Known::Watched, Known::Watched) => true,
             _ => false,
         }
     }
@@ -2375,12 +2382,26 @@ impl PartialEq for Known {
 
 impl Eq for Known {}
 
+impl Known {
+    /// Whether it survives a trip: it wasn't learned through a watch. See Note [Watched tables].
+    fn survives_trip(&self) -> bool {
+        !matches!(self, Known::Watched)
+    }
+}
+
+/// Whether a field by `label` survives a trip: it wasn't learned through a watch. See Note
+/// [Watched tables].
+fn survives_trip(label: Label) -> bool {
+    !matches!(label, Label::Element(_))
+}
+
 impl std::hash::Hash for Known {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
             Known::Type(ctype) => (TYPE, ctype).hash(state),
             Known::Kind(kind) => (KIND, kind).hash(state),
             Known::Constant { value, .. } => (CONSTANT, value).hash(state),
+            Known::Watched => WATCHED.hash(state),
         }
     }
 }
@@ -2391,6 +2412,7 @@ impl std::fmt::Debug for Known {
             Known::Type(ctype) => write!(f, "{ctype}"),
             Known::Kind(kind) => write!(f, "kind {kind:?}"),
             Known::Constant { value, .. } => write!(f, "constant {value}"),
+            Known::Watched => write!(f, "watched"),
         }
     }
 }
@@ -2402,6 +2424,7 @@ impl crate::classes::ClassFact for Known {
             Known::Type(_) => TYPE,
             Known::Kind(_) => KIND,
             Known::Constant { .. } => CONSTANT,
+            Known::Watched => WATCHED,
         }
     }
     fn join(&self, other: &Self) -> Option<Self> {
@@ -2450,6 +2473,9 @@ pub enum Effect {
     /// A value of the representation (`None` if not known) is stored in some
     /// table's array part.
     ArrayStore(Option<LType>),
+    /// A watched table's watchpoint trips: what was learned through a watch is dropped. See Note
+    /// [Watched tables].
+    Trip,
 }
 
 // Note [Call effects]
@@ -2515,6 +2541,8 @@ impl Effects {
             Effect::Opaque => Effects::OPAQUE,
             Effect::ArrayStore(None) => Effects(Self::ARRAYS),
             Effect::ArrayStore(Some(stored)) => Effects(stored.bit() as u16),
+            // Its callers' code is replaced as it trips. See Note [Watched tables].
+            Effect::Trip => Effects::NONE,
         }
     }
 
@@ -2677,6 +2705,10 @@ impl Context {
                 Known::Kind(kind) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
                 _ => true,
             }),
+            Effect::Trip => {
+                self.values.retain_fields(|label, _| survives_trip(label));
+                self.values.retain_facts(Known::survives_trip);
+            },
         }
         self.inlined(Effects::of(effect));
     }
@@ -2724,16 +2756,9 @@ impl Context {
         })
     }
 
-    /// Whether it knows an element of some table. See Note [Watched tables].
-    fn watching(&self) -> bool {
-        self.values.has_label(|label| matches!(label, Label::Element(_)))
-    }
-
-    /// Forget what it knows of every table's elements. See Note [Watched tables].
-    fn unwatch(&mut self) {
-        if self.watching() {
-            self.values.retain_fields(|label, _| !matches!(label, Label::Element(_)));
-        }
+    /// Whether a trip falsifies something it knows. See Note [Watched tables].
+    fn trips(&self) -> bool {
+        self.values.has_label(|label| !survives_trip(label)) || self.values.all_facts().any(|fact| !fact.survives_trip())
     }
 
     /// The slot of the table, and the name, of the field hash key `href` names: a string key of a
@@ -4950,14 +4975,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for i in 0..state.callstack.len() {
             let ret = match state.callstack[i].ret {
                 Return::To(at) => match self.continuation_sites.get(&at).cloned() {
-                    Some(site) if site.ctx.watching() => {
+                    Some(site) if site.ctx.trips() => {
                         let block = self.new_block(self.blocks[at.0.0].pc);
                         let mut ctx = (*site.ctx).clone();
-                        ctx.unwatch();
+                        ctx.effect(Effect::Trip);
                         let after = match site.after {
                             After::Version(pc, ctx) => {
                                 let mut ctx = (*ctx).clone();
-                                ctx.unwatch();
+                                ctx.effect(Effect::Trip);
                                 After::Version(pc, Rc::new(ctx))
                             },
                             after => after,
@@ -4970,11 +4995,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Return::Inlined(continuation) => {
                     let continuation = unsafe { &*(continuation as *const Continuation) };
-                    if !continuation.caller.watching() {
+                    if !continuation.caller.trips() {
                         continue;
                     }
                     let mut caller = continuation.caller.clone();
-                    caller.unwatch();
+                    caller.effect(Effect::Trip);
                     let unwatched = Rc::new(Continuation { caller, ..continuation.clone() });
                     let at = Rc::as_ptr(&unwatched) as u64;
                     self.continuations.push(unwatched);
@@ -4998,7 +5023,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.watches.entry(tab.0.to_addr()).or_default().push(WatchSite { at: Location(block_id, thunk_pc), unwatched });
             }
             let (next, arg) = if watched { (pc.next_true(), ResumeArg::Matched) } else { (pc.next_false(), ResumeArg::Failed) };
-            let rest = vm.subblock(owner, next, thunk_ctx.clone(), thunk_coro.clone(), arg);
+            let mut ctx = thunk_ctx.clone();
+            if watched {
+                Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Watched);
+            }
+            let rest = vm.subblock(owner, next, ctx, thunk_coro.clone(), arg);
             if watched {
                 vm.blocks[block_id.0].instructions[thunk_pc] = Residual::PatchableJump(rest);
                 #[cfg(feature = "jit")]
@@ -6457,6 +6486,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
+                CoroutineState::Yielded(YieldOp::Watching(slot)) if ctx.values.fact(Loc::root(Root::Slot(slot as u16)), WATCHED).is_some() => {
+                    pc = pc.next_true();
+                    arg = ResumeArg::Matched;
+                },
                 CoroutineState::Yielded(YieldOp::Watching(slot)) => {
                     let thunk = self.make_watch_thunk(block_id, coro.clone(), slot, pc, ctx.clone(), true);
                     self.end_block(block_id);
@@ -6475,7 +6508,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let hot = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
                     let cold = self.new_block(pc.0);
                     let mut unwatched = (*ctx).clone();
-                    unwatched.unwatch();
+                    unwatched.effect(Effect::Trip);
                     let side = self.make_side_thunk(cold, coro.clone(), pc.next_false(), Rc::new(unwatched), ResumeArg::Matched);
                     self.blocks[cold.0].instructions.extend([Residual::Tripped(of), Residual::Thunk(side)]);
                     self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
