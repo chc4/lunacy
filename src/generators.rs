@@ -1973,6 +1973,12 @@ pub fn emit_self(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
         drain!(moveself, arg);
         let mut getmem = emit_gettable(a, b, c);
         drain!(getmem, arg);
+        // R(A+1) holds R(B)'s table, so what the lookup found of R(B), its shape, is R(A+1)'s
+        // too, unless the lookup's result has overwritten R(B).
+        if a != b {
+            let ResumeArg::Type(t) = (yield YieldOp::Typeof(b)) else { unreachable!() };
+            yield YieldOp::SetCTypes(vec![(a + 1, t)]);
+        }
         ResumeArg::Start
     }
 }
