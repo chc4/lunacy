@@ -24,6 +24,8 @@ local M = {}
 local promote = jit and jit.promote
 -- lunacy's `jit.learn`: what the specializer can know of a table's fields, learned once.
 local learn = jit and jit.learn
+-- lunacy's `jit.frozen`: a table whose elements code knows, until it is stored into.
+local frozen = jit and jit.frozen
 
 -- AND, OR and XOR of two bytes, at a * 256 + b + 1.
 local AND, ORA, EOR = {}, {}, {}
@@ -703,7 +705,7 @@ local eval
 if promote then
   function eval(m, addr)
     learn(m)
-    local ram, wst, rst, op, keep, ret = m.ram, m.wst, m.rst, m.op, m.keep, m.ret
+    local ram, wst, rst, op, keep, ret = m.ram, m.wst, m.rst, frozen(m.op), frozen(m.keep), frozen(m.ret)
     local pc = addr
     repeat
       pc = promote(pc)

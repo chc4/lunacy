@@ -471,6 +471,9 @@ fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<Yie
             // What a get or set asks before its guard on the key: of the table, a hash key for a
             // key in a register (there is none), and narrowing a key known not to be a double.
             YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) => true,
+            // What a load from a frozen table, or a test, asks of what the context knows, and
+            // what it learns of the register the load writes. See Note [Frozen tables].
+            YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) => true,
             // What a call asks of a native it may make a window op.
             YieldOp::NativeWindowArgs(..) => true,
             // A call of a native with a generator is compiled by it, holding them; of a function
