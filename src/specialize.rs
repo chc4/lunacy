@@ -420,33 +420,16 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     }
 }
 
-/// The spells the peephole holds, and the first integer op it held, as it would have been laid out
-/// where it was held, which the code goes on from where a check fails. See Note [Peephole fusion] in
-/// `peephole`.
+
+/// The spells the peephole holds. See Note [Peephole fusion] in `peephole`.
 struct Held {
     spells: crate::peephole::Spells,
-    first: HeldOp,
 }
 
-#[derive(Clone)]
-struct HeldOp {
-    window: Rc<dyn Window>,
-    /// Whether its window has a cold path (`OptimisticExec`), else none (`ExecWindow`).
-    optimistic: bool,
-    /// Its generator, as it yielded the window.
-    coro: Box<dyn NativeGen>,
-    pc: SubPc,
-    /// The context as its window leaves it.
-    ctx: Rc<Context>,
-    /// Where its encoding was decided. See Note [Optimistic ops].
-    asked: Option<Origin>,
-}
-
-
-/// Whether a yield leaves what the peephole holds, `held`, held, laying out no code: in `ctx`, the
-/// window after `described` if it says, which the peephole is offered, or a guard joining a spell.
-/// See Note [Peephole fusion] in `peephole`.
-fn passes_held(held: &Held, ctx: &Context, state: &CoroutineState<YieldOp, ResumeArg>, described: Option<&crate::peephole::IntOp>) -> bool {
+/// Whether a yield leaves what the peephole holds, `held`, held, laying out no code: in `ctx`, at
+/// instruction `at`, the window after `described` if it says, which the peephole is offered, or a
+/// guard joining a spell. See Note [Peephole fusion] in `peephole`.
+fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<YieldOp, ResumeArg>, described: Option<&crate::peephole::IntOp>) -> bool {
     let known = |slot: usize, expected: &CType| {
         let found = &ctx.types[slot];
         expected.accepts(found) || !found.accepts(expected)
@@ -458,7 +441,7 @@ fn passes_held(held: &Held, ctx: &Context, state: &CoroutineState<YieldOp, Resum
                 | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
                 | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::Clobber(_) | YieldOp::IntegerOp(_) => true,
             YieldOp::OptimisticExec(_) | YieldOp::ExecWindow(_) => described.is_some(),
-            YieldOp::GuardDynamic(test) => held.spells.joins_guard(&**test),
+            YieldOp::GuardDynamic(test) => held.spells.joins_guard(&**test, at),
             // What a get or set asks before its guard on the key: of the table, a hash key for a
             // key in a register (there is none), and narrowing a key known not to be a double.
             YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) => true,
@@ -472,6 +455,15 @@ fn passes_held(held: &Held, ctx: &Context, state: &CoroutineState<YieldOp, Resum
     }
 }
 
+/// Where an exit of what the peephole holds goes on from: the start of an instruction, in its
+/// context, or where compiling went on in one, nothing held: at a pc, in a context, with a
+/// generator and what it resumes with. See Note [Peephole fusion] in `peephole`.
+#[derive(Clone)]
+enum Restart {
+    Start(Rc<Context>),
+    Resume(SubPc, Rc<Context>, Box<dyn NativeGen>, ResumeArg),
+}
+
 /// Whether the peephole held an integer op. See Note [Peephole fusion] in `peephole`.
 enum Hold {
     Held,
@@ -481,16 +473,12 @@ enum Hold {
     Ended,
 }
 
-/// What follows the checks of what the peephole held: the computations, and then the yield that
-/// laid them out, with its description, and the generator that yielded it. See Note [Peephole
-/// fusion] in `peephole`.
-struct AfterHeld {
-    computes: Vec<Rc<dyn Window>>,
-    then: Option<(Option<crate::peephole::IntOp>, YieldOp, Box<dyn NativeGen>)>,
-}
+/// What follows what the peephole held, laid out: the yield that laid it out, with its
+/// description, and the generator that yielded it. See Note [Peephole fusion] in `peephole`.
+type AfterHeld = Option<(Option<crate::peephole::IntOp>, YieldOp, Box<dyn NativeGen>)>;
 
-/// `rest` as a generator: its computations, then its yield and the generator's yields after it. A
-/// state machine of its own, as a coroutine holding another across a yield is never `Clone`.
+/// `rest` as a generator: its yield and the generator's yields after it. A state machine of its
+/// own, as a coroutine holding another across a yield is never `Clone`.
 #[derive(Clone)]
 struct AfterHeldGen {
     rest: Rc<AfterHeld>,
@@ -500,8 +488,8 @@ struct AfterHeldGen {
 
 #[derive(Clone, Copy)]
 enum AfterHeldAt {
-    /// Yielding computation `i`.
-    Compute(usize),
+    /// Yielding the description.
+    Start,
     /// Yielding the yield.
     Then,
     /// The generator going on.
@@ -509,7 +497,7 @@ enum AfterHeldAt {
 }
 
 fn after_held(rest: Rc<AfterHeld>) -> AfterHeldGen {
-    AfterHeldGen { rest, at: AfterHeldAt::Compute(0), coro: None }
+    AfterHeldGen { rest, at: AfterHeldAt::Start, coro: None }
 }
 
 impl Coroutine<ResumeArg> for AfterHeldGen {
@@ -520,12 +508,8 @@ impl Coroutine<ResumeArg> for AfterHeldGen {
         let this = self.get_mut();
         loop {
             match this.at {
-                AfterHeldAt::Compute(i) if i < this.rest.computes.len() => {
-                    this.at = AfterHeldAt::Compute(i + 1);
-                    return CoroutineState::Yielded(YieldOp::ExecWindow(this.rest.computes[i].clone()));
-                },
-                AfterHeldAt::Compute(_) => {
-                    let Some((described, _, coro)) = &this.rest.then else { return CoroutineState::Complete(ResumeArg::Start) };
+                AfterHeldAt::Start => {
+                    let Some((described, _, coro)) = &*this.rest else { return CoroutineState::Complete(ResumeArg::Start) };
                     this.coro = Some(coro.clone());
                     this.at = AfterHeldAt::Then;
                     if let Some(op) = described {
@@ -534,7 +518,7 @@ impl Coroutine<ResumeArg> for AfterHeldGen {
                 },
                 AfterHeldAt::Then => {
                     this.at = AfterHeldAt::Going;
-                    return CoroutineState::Yielded(this.rest.then.as_ref().unwrap().1.clone());
+                    return CoroutineState::Yielded(this.rest.as_ref().as_ref().unwrap().1.clone());
                 },
                 AfterHeldAt::Going => return Pin::new(this.coro.as_mut().unwrap()).resume(arg),
             }
@@ -3386,6 +3370,15 @@ pub struct Specializer<'src, 'intern> {
     encoding: Option<Origin>,
     /// The integer ops the peephole holds. See Note [Peephole fusion] in `peephole`.
     held: Option<Held>,
+    /// The instruction being compiled: its pc, where an exit of what the peephole holds goes on
+    /// from, and whether the peephole holds its integer op. See Note [Peephole fusion] in
+    /// `peephole`.
+    instruction: Option<(Pc, Restart, bool)>,
+    /// Whether the next `compile_one` starts the instruction `instruction` is.
+    entering: bool,
+    /// The instruction an exit of what the peephole held runs again, compiled next, its integer
+    /// op not held. See Note [Peephole fusion] in `peephole`.
+    unheld: Option<Pc>,
     /// Where each rebuilt block ends for code entering it from its start. See Note [Contraction].
     cuts: std::collections::HashMap<BlockId, usize, rustc_hash::FxBuildHasher>,
     /// The targets of the code each rebuild replaced, whose blocks only it reaches are yet to be
@@ -3439,6 +3432,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             contractions: Vec::new(),
             encoding: None,
             held: None,
+            instruction: None,
+            entering: false,
+            unheld: None,
             cuts: Default::default(),
             trimming: Vec::new(),
             rebuilt: Default::default(),
@@ -4163,7 +4159,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.versions.get(&self.proto).unwrap().get(&(pc, ctx.clone())).cloned()
     }
 
-    pub fn compile(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
+    pub fn compile(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
+        // The instruction compiling this, if any, goes on after it.
+        let outer = self.instruction.take();
+        let ctx = self.compile_instructions(owner, pc, ctx, block_id);
+        self.instruction = outer;
+        ctx
+    }
+
+    fn compile_instructions(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
         loop {
             let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[pc].clone() };
             // Only a call uses the top the instruction before left. See Note [Known top].
@@ -4171,9 +4175,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Rc::make_mut(&mut ctx).top = None;
             }
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
+            let holds = self.unheld.take() != Some(pc);
+            self.instruction = Some((pc, Restart::Start(ctx.clone()), holds));
+            self.entering = true;
             // What the peephole holds, before what lays out code here. See Note [Peephole fusion].
             // Its continuation goes on from before the instruction, to it: something before it was held.
-            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && self.held.is_some() && self.flush(owner, block_id, SubPc::new(pc - 1), &ctx, None) {
+            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && self.held.is_some() && self.flush(owner, block_id, SubPc::new(pc - 1), &ctx, None, &[]) {
                 return ctx;
             }
             if let Some((next, nctx, ret)) = match inst.0.Opcode() {
@@ -4385,10 +4392,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, vararg, UNKNOWN_RETURN, effects)); None
                 },
             } {
+                self.entering = false;
                 pc = next;
                 ctx = nctx;
                 debug!("-> {}", next);
             } else {
+                self.entering = false;
                 debug_assert!(self.held.is_none(), "a block ended holding integer ops");
                 return ctx;
             }
@@ -4708,15 +4717,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
         use crate::peephole::{Offer, Spells};
-        if !crate::peephole::fuses() {
+        // Only in an instruction whose start an exit can go on from, and not one an exit runs
+        // again.
+        if !crate::peephole::fuses() || !self.instruction.as_ref().is_some_and(|(at, _, holds)| *at == pc.0 && *holds) {
             return Hold::Not;
         }
-        let joined = match self.held.as_mut().map(|held| held.spells.offer(&int_op)) {
+        let joined = match self.held.as_mut().map(|held| held.spells.offer(&int_op, pc.0)) {
             Some(Offer::Held) => true,
             // Laid out first; or dropped, as what it overwrites, if nothing is left.
             Some(Offer::Flush | Offer::Refused) => {
                 let window = if optimistic { YieldOp::OptimisticExec(window.clone()) } else { YieldOp::ExecWindow(window.clone()) };
-                if self.flush(owner, block_id, pc, ctx, Some((Some(int_op), window, Box::new((**coro).clone())))) {
+                if self.flush(owner, block_id, pc, ctx, Some((Some(int_op), window, Box::new((**coro).clone()))), &[int_op.dest]) {
                     return Hold::Ended;
                 }
                 false
@@ -4725,12 +4736,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         };
         if !joined {
             let mut spells = Spells::default();
-            if spells.offer(&int_op) != Offer::Held {
+            if spells.offer(&int_op, pc.0) != Offer::Held {
                 return Hold::Not;
             }
-            let asked = if optimistic { self.encoding.take() } else { None };
-            let first = HeldOp { window: window.clone(), optimistic, coro: Box::new((**coro).clone()), pc, ctx: ctx.clone(), asked };
-            self.held = Some(Held { spells, first });
+            self.held = Some(Held { spells });
+        }
+        // Its encoding was asked of the peephole, not decided. See Note [Optimistic ops].
+        if optimistic {
+            self.encoding = None;
         }
         // Its outputs are written, as laying it out would write them.
         for (&slot, access) in window.operands().iter().zip(window.accesses()) {
@@ -4741,115 +4754,72 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Hold::Held
     }
 
-    /// Lay out what the peephole holds at `pc` in `ctx`, in `block_id`, then `then`: a yield, as
-    /// the generator yielded it, and its description, if it said one. With checks, they end the
-    /// block, as dynamic guards' tests, the code going on past the last; else the computations are
-    /// laid out in place. Whether it ended the block. See Note [Peephole fusion] in `peephole`.
-    fn flush(&mut self, owner: &mut Owner, block_id: BlockId, pc: SubPc, ctx: &Rc<Context>, then: Option<(Option<crate::peephole::IntOp>, YieldOp, Box<dyn NativeGen>)>) -> bool {
+    /// Lay out what the peephole holds at `pc` in `ctx`, in `block_id`, then `then`, the yield
+    /// laying it out, about to write `stale`. A spell that can fail ends its block in a `Branch`,
+    /// its cold way an exit, the code going on past the last; with none, the spells are laid out in
+    /// place. Whether it ended the block. See Note [Peephole fusion] in `peephole`.
+    fn flush(&mut self, owner: &mut Owner, block_id: BlockId, pc: SubPc, ctx: &Rc<Context>, then: AfterHeld, stale: &[usize]) -> bool {
         let Some(held) = self.held.take() else { return false };
-        let order = held.spells.order().expect("held spells are in an order");
-        let mut checks: Vec<Rc<dyn Window>> = Vec::new();
-        let mut computes: Vec<Rc<dyn Window>> = Vec::new();
-        for spell in order.into_iter().map(|i| &held.spells.spells[i]) {
-            let ops = spell.ops();
-            if spell.can_fail() {
-                checks.push(ops.check);
+        let (at, restart, _) = self.instruction.clone().expect("spells are held in an instruction");
+        let mut block = block_id;
+        for laid in held.spells.lay_out(at) {
+            if !laid.checked {
+                self.blocks[block.0].instructions.push(Residual::ExecWindow(laid.op));
+                continue;
             }
-            computes.push(ops.compute);
+            self.end_block(block);
+            self.blocks[block.0].instructions.push(Residual::ExecWindow(laid.op));
+            let cold = self.new_block(pc.0);
+            let unknown = laid.unknown.iter().chain(stale).copied().collect();
+            let exit = self.make_held_exit(cold, laid.exit, unknown, at, restart.clone());
+            self.blocks[cold.0].instructions.push(Residual::Thunk(exit));
+            let hot = self.new_block(pc.0);
+            self.blocks[block.0].instructions.push(Residual::Branch { hot, cold });
+            block = hot;
         }
-        if checks.is_empty() {
-            for compute in computes {
-                self.blocks[block_id.0].instructions.push(Residual::ExecWindow(compute));
-            }
+        if block == block_id {
             return false;
         }
-        let cold = self.cold_held(held.first);
-        let rest = Rc::new(AfterHeld { computes, then });
-        self.end_block(block_id);
-        let thunk = self.make_check_thunk(block_id, checks.into(), 0, rest, cold, pc, ctx.clone());
-        self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+        // Never another version's, though their contexts be the same: what was held isn't in it.
+        if let Some((next, ctx, _)) = self.compile_one(owner, pc, ctx.clone(), Box::new(after_held(Rc::new(then))), ResumeArg::Start, block) {
+            self.compile(owner, next, ctx, block);
+        }
         true
     }
 
-    /// The thunk check `i` of `checks` of what the peephole held ends its block in: forced, it is
-    /// the check, as an optimistic op, and a `Branch` to its ways: its cold path to `cold`, its hot
-    /// one to the next check, or past the last to `rest`, the way it went compiled first. See Note
-    /// [Peephole fusion] in `peephole`.
-    fn make_check_thunk(&self, block_id: BlockId, checks: Rc<[Rc<dyn Window>]>, i: usize, rest: Rc<AfterHeld>, cold: BlockId, pc: SubPc, ctx: Rc<Context>) -> ThunkRef {
+    /// The exit a held spell failing takes, from `block`: it writes `materialize`, the spells not
+    /// yet written, as their operations would, and goes on from `restart`, in instruction `at`,
+    /// with slots `unknown` unknown, the instruction's integer op not held. Never another
+    /// version's, which might hold it. See Note [Peephole fusion] in `peephole`.
+    fn make_held_exit(&self, block: BlockId, materialize: Vec<Rc<dyn Window>>, unknown: Vec<usize>, at: Pc, restart: Restart) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            let check = checks[i].clone();
-            check.interp(owner, state);
-            let passed = state.select == 0;
-            // In place, unless the thunk's JIT code can only be patched to a jump. See Note
-            // [Thunk patching].
-            let block = if vm.compiled(block_id) {
-                let check_block = vm.new_block(pc.0);
-                vm.jump_thunk(block_id, thunk_pc, check_block);
-                vm.blocks[check_block.0].instructions.push(Residual::ExecWindow(check));
-                check_block
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::ExecWindow(check);
-                block_id
+            let exit = vm.new_block(at);
+            for window in &materialize {
+                vm.blocks[exit.0].instructions.push(Residual::ExecWindow(window.clone()));
+            }
+            let unknowing = |owner: &mut Owner, mut ctx: Rc<Context>| {
+                let ctx_mut = Rc::make_mut(&mut ctx);
+                ctx_mut.set_types(owner, unknown.iter().map(|&slot| (slot, CType::Unknown)).collect());
+                for &slot in &unknown {
+                    ctx_mut.effect(Effect::Write(slot));
+                }
+                ctx
             };
-            let hot = if passed {
-                vm.after_check(owner, checks.clone(), i + 1, rest.clone(), cold, pc, ctx.clone())
-            } else {
-                let hot = vm.new_block(pc.0);
-                let (checks, rest, ctx) = (checks.clone(), rest.clone(), ctx.clone());
-                let thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-                    let next = vm.after_check(owner, checks.clone(), i + 1, rest.clone(), cold, pc, ctx.clone());
-                    vm.jump_thunk(hot, thunk_pc, next);
-                })));
-                vm.blocks[hot.0].instructions.push(Residual::Thunk(thunk));
-                hot
-            };
-            vm.blocks[block.0].instructions.push(Residual::Branch { hot, cold });
+            vm.unheld = Some(at);
+            match &restart {
+                Restart::Start(start) => {
+                    let ctx = unknowing(owner, start.clone());
+                    vm.compile(owner, at, ctx, exit);
+                },
+                Restart::Resume(pc, ctx, coro, arg) => {
+                    let ctx = unknowing(owner, ctx.clone());
+                    if let Some((next, ctx, _)) = vm.compile_one(owner, *pc, ctx, Box::new(coro.clone()), arg.clone(), exit) {
+                        vm.compile(owner, next, ctx, exit);
+                    }
+                },
+            }
+            vm.jump_thunk(block, thunk_pc, exit);
         })))
-    }
-
-    /// A block past check `i - 1` of `checks`: the next check's thunk, or past the last, the
-    /// computations, and the code going on from what laid them out. Never another's, though their
-    /// contexts be the same: what was held isn't in the context. See Note [Peephole fusion] in
-    /// `peephole`.
-    fn after_check(&mut self, owner: &mut Owner, checks: Rc<[Rc<dyn Window>]>, i: usize, rest: Rc<AfterHeld>, cold: BlockId, pc: SubPc, ctx: Rc<Context>) -> BlockId {
-        let block = self.new_block(pc.0);
-        if i < checks.len() {
-            let thunk = self.make_check_thunk(block, checks, i, rest, cold, pc, ctx);
-            self.blocks[block.0].instructions.push(Residual::Thunk(thunk));
-        } else if let Some((next, ctx, _)) = self.compile_one(owner, pc, ctx, Box::new(after_held(rest)), ResumeArg::Start, block) {
-            self.compile(owner, next, ctx, block);
-        }
-        block
-    }
-
-    /// The cold path of the checks of what the peephole held: a block laying out the first op it
-    /// held as it would have been where it was held, once taken. See Note [Peephole fusion] in
-    /// `peephole`.
-    fn cold_held(&mut self, first: HeldOp) -> BlockId {
-        let cold = self.new_block(first.pc.0);
-        let thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            let unfused = vm.new_block(first.pc.0);
-            vm.lay_out_held(owner, unfused, first.clone());
-            vm.jump_thunk(cold, thunk_pc, unfused);
-        })));
-        self.blocks[cold.0].instructions.push(Residual::Thunk(thunk));
-        cold
-    }
-
-    /// Lay out the first op the peephole held in `block`, as it would have been where it was held,
-    /// the code going on from there. See Note [Peephole fusion] in `peephole`.
-    fn lay_out_held(&mut self, owner: &mut Owner, block: BlockId, first: HeldOp) {
-        self.blocks[block.0].instructions.push(Residual::ExecWindow(first.window));
-        if first.optimistic {
-            let hot = self.subblock(owner, first.pc.next_true(), first.ctx.clone(), Box::new(first.coro.clone()), ResumeArg::Matched);
-            let cold = self.new_block(first.pc.0);
-            let side = self.make_overflow_thunk(cold, Box::new(first.coro.clone()), first.pc.next_false(), first.ctx.clone(), first.asked.clone());
-            self.blocks[cold.0].instructions.push(Residual::Thunk(side));
-            self.blocks[block.0].instructions.push(Residual::Branch { hot, cold });
-        } else {
-            let next = self.subblock(owner, first.pc, first.ctx.clone(), Box::new(first.coro.clone()), ResumeArg::Start);
-            self.blocks[block.0].instructions.push(Residual::Jump(next));
-        }
     }
 
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
@@ -5888,7 +5858,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
     }
 
-    pub fn compile_one<C>(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
+    pub fn compile_one<C>(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<C>, arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
+    where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
+    {
+        // Going on in an instruction, not starting it: an exit of what the peephole holds from
+        // here goes on from here. See Note [Peephole fusion] in `peephole`.
+        if std::mem::take(&mut self.entering) {
+            return self.compile_yields(owner, pc, ctx, coro, arg, block_id);
+        }
+        let holds = self.unheld.take() != Some(pc.0);
+        let restart = Restart::Resume(pc, ctx.clone(), Box::new((*coro).clone()), arg.clone());
+        let outer = self.instruction.replace((pc.0, restart, holds));
+        let compiled = self.compile_yields(owner, pc, ctx, coro, arg, block_id);
+        self.instruction = outer;
+        compiled
+    }
+
+    fn compile_yields<C>(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
     where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
     {
         // Where the constant being loaded was, for its fact's origin.
@@ -5899,13 +5885,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut state = Pin::new(&mut coro).resume(arg);
             arg = ResumeArg::Start;
             'machine: loop {
-            if self.held.as_ref().is_some_and(|held| !passes_held(held, &ctx, &state, described.as_ref())) {
+            if self.held.as_ref().is_some_and(|held| !passes_held(held, &ctx, pc.0, &state, described.as_ref())) {
                 // What writes a held value unread: that spell is dead.
-                if let Some((writes, reads)) = overwrites(&state) {
-                    self.held.as_mut().unwrap().spells.drop_overwritten(&writes, &reads);
-                }
+                let (writes, reads) = overwrites(&state).unwrap_or_default();
+                self.held.as_mut().unwrap().spells.drop_overwritten(&writes, &reads);
                 let CoroutineState::Yielded(then) = &state else { unreachable!("a generator's end lays out nothing") };
-                if self.flush(owner, block_id, pc, &ctx, Some((described, then.clone(), Box::new((*coro).clone())))) {
+                if self.flush(owner, block_id, pc, &ctx, Some((described, then.clone(), Box::new((*coro).clone()))), &writes) {
                     return None;
                 }
             }
@@ -6212,7 +6197,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 // A guard joining a held spell: as passed. See Note [Peephole fusion] in `peephole`.
-                CoroutineState::Yielded(YieldOp::GuardDynamic(ref test)) if self.held.as_mut().is_some_and(|held| held.spells.offer_guard(&**test)) => {
+                CoroutineState::Yielded(YieldOp::GuardDynamic(ref test)) if self.held.as_mut().is_some_and(|held| held.spells.offer_guard(&**test, pc.0)) => {
                     pc = pc.next_true();
                     arg = ResumeArg::Matched;
                 },

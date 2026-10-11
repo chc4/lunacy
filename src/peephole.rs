@@ -29,15 +29,24 @@ use crate::window::{windowed, Window};
 //
 // What the peephole holds it lays out when anything would read a held value but can't make a spell
 // of it, or would lay out code: every spell at once, those reading a slot before the one writing
-// it, so each reads what was there before any. Each spell is a check, an op with a cold path, which
-// it takes where a step doesn't fit or the guard it ends in fails, writing nothing, and a
-// computation, which writes it. Every check comes before any computation, so where one fails nothing
-// has been written, and the code goes on from the first operation held, laid out as it would have
-// been there, the values the operations read as they were. The checks end the block as an
-// optimistic integer op's encoding does, each laid out the first time it runs, with a `Branch` to
-// its ways, the way it went compiled first (Note [Optimistic ops] in `specialize`); past the last,
-// the computations, and the code going on from what laid them out. A spell that can't
-// fail, only masks, has no check; with none to check, the computations are laid out in place.
+// it, so each reads what was there before any. Each spell is one op, computing its chain once and
+// writing it, with a cold path where a step doesn't fit or the guard it ends in fails, which writes
+// nothing it would need, and a `Branch` past it, as an optimistic integer op has (Note [Optimistic
+// ops] in `specialize`). A spell needn't check what one laid out before it checked already: one
+// whose chain another went on from, laid out after it, can't fail, nor can one only masking; those
+// only compute.
+//
+// Where a spell fails, those before it have written, and it and those after it haven't. Its cold
+// way goes on from the start of the instruction that laid them out, as if it ran then: it writes
+// each spell not yet written, as its operations would, from its inputs, still as they were, as
+// those reading a slot come before the one writing it; and the instruction runs again with them
+// unknown, as numbers its operations made, its own integer operation not held. A spell's
+// operations in that instruction itself run again, so only what it was before them is written.
+// Spells written already went on past any operations of the instruction, so a spell with some is
+// the last that can fail: anything laid out after it must be a chain it went on from, which its
+// check checked. Where an operation would make a spell needing another after it that isn't, all
+// held is laid out first.
+//
 // Spells needing one another written first, in a cycle, can't be held together: what would make one
 // is laid out after them.
 //
@@ -184,6 +193,27 @@ fn wrapping_pair<const O: u8>(x: i32, y: i32) -> i32 {
     }
 }
 
+/// Step `S` of `x` by `k`, as Lua computes it, in doubles.
+fn lua_step<const S: u8>(x: f64, k: i32) -> f64 {
+    let k = k as f64;
+    match S {
+        ADD => x + k,
+        SUB => x - k,
+        MUL => x * k,
+        MASK => x - (x / (k + 1.0)).floor() * (k + 1.0),
+        _ => unreachable!(),
+    }
+}
+
+/// `x` and `y`'s sum or difference, `O`, as Lua computes it.
+fn lua_pair<const O: u8>(x: f64, y: f64) -> f64 {
+    match O {
+        ADD => x + y,
+        SUB => x - y,
+        _ => unreachable!(),
+    }
+}
+
 /// Whether integer `key` passes guard `G` of `table`.
 fn passes<const G: u8>(owner: &crate::Owner, table: LBoxed, key: i32) -> bool {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -197,7 +227,7 @@ fn passes<const G: u8>(owner: &crate::Owner, table: LBoxed, key: i32) -> bool {
 }
 
 /// What a spell's ops take: its constants, in order, and its registers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Matched {
     pub ks: Vec<i32>,
     pub lhs: usize,
@@ -208,11 +238,14 @@ pub struct Matched {
 
 /// A spell's ops, as its rule makes them.
 pub struct Ops {
-    /// Its check: an op taking its cold path, writing nothing, where a step doesn't fit or the
-    /// guard it ends in fails.
-    pub check: Rc<dyn Window>,
-    /// Its computation, where it fits.
+    /// Its chain, computed and written where every step fits and the guard it ends in passes,
+    /// else its cold path, writing nothing it would need: a slot it writes that it reads too
+    /// keeps its value.
+    pub fused: Rc<dyn Window>,
+    /// Its chain, computed and written, where it fits.
     pub compute: Rc<dyn Window>,
+    /// Its chain's value as Lua computes it, written, any guard it ends in left out.
+    pub materialize: Rc<dyn Window>,
 }
 
 /// A rule: the chain it matches, and its ops.
@@ -231,84 +264,106 @@ macro_rules! holes {
     }};
 }
 
-/// A rule `$rule` and its ops `$check` and `$compute`, over a chain of steps of a register by
-/// constants `[S k, ..]`, ending in a guard `in G` or not; first a sum or difference of two
-/// registers `rr O`; or one step then a sum or difference with another register. Its chain's value
-/// is `$value`, from its operands, if every step fits, `$wrapped` where it does, and `$test` whether
-/// it passes any guard.
+/// A rule `$rule` and its ops `$fused`, `$compute` and `$materialize`, over a chain of steps of a
+/// register by constants `[S k, ..]`, ending in a guard `in G` or not; first a sum or difference
+/// of two registers `rr O`; or one step then a sum or difference with another register. Its chain's
+/// value is `$value`, from its operands, if every step fits, `$wrapped` where it does, `$lua` as
+/// Lua computes it, from `$value_in`, and `$test` whether it passes any guard; its cold path writes
+/// `$kept`, the operand its slot is, if any (`alias` saying which).
 macro_rules! rule {
-    (@ops $m:ident, $rule:ident, $check:ident, $compute:ident, [$($sym:expr),+], ($($ks:ident),*),
-        ($($input:ident),+), ($($slot:expr),+), $value:expr, $wrapped:expr, $test:expr) => {
-        windowed!($check, [$($ks: u64),*], [], |owner, state, base| ($($input),+) {
-            !$value.is_some_and(|x: i32| ($test)(owner, x))
+    (@ops $m:ident, $alias:ident, $rule:ident, $fused:ident, $compute:ident, $materialize:ident, [$($sym:expr),+], ($($ks:ident),*),
+        ($($input:ident),+), ($($slot:expr),+), ($($value_in:ident),+), ($($value_slot:expr),+),
+        $value:expr, $wrapped:expr, $lua:expr, $test:expr, $kept:expr) => {
+        windowed!($fused, [$($ks: u64,)* $alias: u64], [], |owner, state, base, tag| ($($input,)+ out dest) {
+            match $value {
+                Some(n) if ($test)(owner, n) => {
+                    *dest = LBoxed::from_int_tagged(n, tag);
+                    false
+                },
+                _ => {
+                    core::intrinsics::cold_path();
+                    true
+                },
+            }
         } cold {
+            *dest = $kept;
             1
         });
         windowed!($compute, [$($ks: u64),*], [], |owner, state, base, tag| ($($input,)+ out dest) {
             *dest = LBoxed::from_int_tagged($wrapped, tag);
         });
+        windowed!($materialize, [$($ks: u64),*], [], |owner, state, base| ($($value_in,)+ out dest) {
+            *dest = LBoxed::from_number($lua);
+        });
         const $rule: Rule = Rule { name: stringify!($rule), pattern: &[$($sym),+], make: |$m| {
             let [$($ks),*] = holes!($m; $($ks)*);
-            let slots = [$($slot),+];
-            let mut out = slots.to_vec();
-            out.push($m.dest);
-            Ops { check: Rc::new($check::new($($ks,)* &slots)), compute: Rc::new($compute::new($($ks,)* &out)) }
+            let $alias = ($m.rhs == Some($m.dest)) as u64;
+            let with = |slots: &[usize]| { let mut out = slots.to_vec(); out.push($m.dest); out };
+            Ops {
+                fused: Rc::new($fused::new($($ks,)* $alias, &with(&[$($slot),+]))),
+                compute: Rc::new($compute::new($($ks,)* &with(&[$($slot),+]))),
+                materialize: Rc::new($materialize::new($($ks,)* &with(&[$($value_slot),+]))),
+            }
         }};
     };
-    ($rule:ident, $check:ident, $compute:ident = [$($s:ident $k:ident),+]) => {
-        rule!(@ops m, $rule, $check, $compute, [$(Sym::K($s)),+], ($($k),+), (lhs), (m.lhs),
+    ($rule:ident, $fused:ident, $compute:ident, $materialize:ident = [$($s:ident $k:ident),+]) => {
+        rule!(@ops m, alias, $rule, $fused, $compute, $materialize, [$(Sym::K($s)),+], ($($k),+), (lhs), (m.lhs), (lhs), (m.lhs),
             (|| -> Option<i32> { let x = lhs.as_int(); $(let x = step::<$s>(x, $k as i32)?;)+ Some(x) })(),
             { let x = lhs.as_int(); $(let x = wrapping::<$s>(x, $k as i32);)+ x },
-            |_, _| true);
+            { let x = lhs.as_int() as f64; $(let x = lua_step::<$s>(x, $k as i32);)+ x },
+            |_, _| true, { let _ = alias; lhs });
     };
-    ($rule:ident, $check:ident, $compute:ident = [$($s:ident $k:ident),+] in $g:ident) => {
-        rule!(@ops m, $rule, $check, $compute, [$(Sym::K($s),)+ Sym::Guard($g)], ($($k),+), (table, lhs), (m.table.unwrap(), m.lhs),
+    ($rule:ident, $fused:ident, $compute:ident, $materialize:ident = [$($s:ident $k:ident),+] in $g:ident) => {
+        rule!(@ops m, alias, $rule, $fused, $compute, $materialize, [$(Sym::K($s),)+ Sym::Guard($g)], ($($k),+), (table, lhs), (m.table.unwrap(), m.lhs), (lhs), (m.lhs),
             (|| -> Option<i32> { let x = lhs.as_int(); $(let x = step::<$s>(x, $k as i32)?;)+ Some(x) })(),
             { let x = lhs.as_int(); $(let x = wrapping::<$s>(x, $k as i32);)+ x },
-            |owner, x| passes::<$g>(owner, table, x));
+            { let x = lhs.as_int() as f64; $(let x = lua_step::<$s>(x, $k as i32);)+ x },
+            |owner, x| passes::<$g>(owner, table, x), { let _ = (alias, table); lhs });
     };
-    ($rule:ident, $check:ident, $compute:ident = rr $o:ident [$($s:ident $k:ident),*]) => {
-        rule!(@ops m, $rule, $check, $compute, [Sym::RR($o) $(, Sym::K($s))*], ($($k),*), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
+    ($rule:ident, $fused:ident, $compute:ident, $materialize:ident = rr $o:ident [$($s:ident $k:ident),*]) => {
+        rule!(@ops m, alias, $rule, $fused, $compute, $materialize, [Sym::RR($o) $(, Sym::K($s))*], ($($k),*), (lhs, rhs), (m.lhs, m.rhs.unwrap()), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
             (|| -> Option<i32> { let x = pair::<$o>(lhs.as_int(), rhs.as_int())?; $(let x = step::<$s>(x, $k as i32)?;)* Some(x) })(),
             { let x = wrapping_pair::<$o>(lhs.as_int(), rhs.as_int()); $(let x = wrapping::<$s>(x, $k as i32);)* x },
-            |_, _| true);
+            { let x = lua_pair::<$o>(lhs.as_int() as f64, rhs.as_int() as f64); $(let x = lua_step::<$s>(x, $k as i32);)* x },
+            |_, _| true, if alias != 0 { rhs } else { lhs });
     };
-    ($rule:ident, $check:ident, $compute:ident = [$s:ident $k:ident] rr $o:ident) => {
-        rule!(@ops m, $rule, $check, $compute, [Sym::K($s), Sym::RR($o)], ($k), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
+    ($rule:ident, $fused:ident, $compute:ident, $materialize:ident = [$s:ident $k:ident] rr $o:ident) => {
+        rule!(@ops m, alias, $rule, $fused, $compute, $materialize, [Sym::K($s), Sym::RR($o)], ($k), (lhs, rhs), (m.lhs, m.rhs.unwrap()), (lhs, rhs), (m.lhs, m.rhs.unwrap()),
             (|| -> Option<i32> { pair::<$o>(step::<$s>(lhs.as_int(), $k as i32)?, rhs.as_int()) })(),
             wrapping_pair::<$o>(wrapping::<$s>(lhs.as_int(), $k as i32), rhs.as_int()),
-            |_, _| true);
+            lua_pair::<$o>(lua_step::<$s>(lhs.as_int() as f64, $k as i32), rhs.as_int() as f64),
+            |_, _| true, if alias != 0 { rhs } else { lhs });
     };
 }
 
 // uxn.lua's: `s[p + 1]`, `(p - 1) % 256 + 1`, `(pc + 1) % 65536 + 1`, `t % 256 + 1`, `(t + 128) % 256 -
 // 128`, `(t + 1) % 256`, `(p + k) % 256`, `(p + k + 1) % 256`, `(p + k - 1) % 256`, `n * 256 + t`,
 // keys checked as reads (`InArrayHeld`) or writes (`InArray`), and every prefix.
-rule!(ADD_, CheckAdd, ComputeAdd = [ADD a]);
-rule!(SUB_, CheckSub, ComputeSub = [SUB a]);
-rule!(MUL_, CheckMul, ComputeMul = [MUL a]);
-rule!(MASK_, CheckMask, ComputeMask = [MASK a]);
-rule!(SUB_MASK, CheckSubMask, ComputeSubMask = [SUB a, MASK b]);
-rule!(ADD_MASK, CheckAddMask, ComputeAddMask = [ADD a, MASK b]);
-rule!(MASK_ADD, CheckMaskAdd, ComputeMaskAdd = [MASK a, ADD b]);
-rule!(SUB_MASK_ADD, CheckSubMaskAdd, ComputeSubMaskAdd = [SUB a, MASK b, ADD c]);
-rule!(ADD_MASK_ADD, CheckAddMaskAdd, ComputeAddMaskAdd = [ADD a, MASK b, ADD c]);
-rule!(ADD_MASK_SUB, CheckAddMaskSub, ComputeAddMaskSub = [ADD a, MASK b, SUB c]);
-rule!(ADD_IN, CheckAddIn, ComputeAddIn = [ADD a] in IN_ARRAY);
-rule!(ADD_HELD, CheckAddHeld, ComputeAddHeld = [ADD a] in HELD);
-rule!(MASK_ADD_IN, CheckMaskAddIn, ComputeMaskAddIn = [MASK a, ADD b] in IN_ARRAY);
-rule!(MASK_ADD_HELD, CheckMaskAddHeld, ComputeMaskAddHeld = [MASK a, ADD b] in HELD);
-rule!(SUB_MASK_ADD_IN, CheckSubMaskAddIn, ComputeSubMaskAddIn = [SUB a, MASK b, ADD c] in IN_ARRAY);
-rule!(SUB_MASK_ADD_HELD, CheckSubMaskAddHeld, ComputeSubMaskAddHeld = [SUB a, MASK b, ADD c] in HELD);
-rule!(ADD_MASK_ADD_IN, CheckAddMaskAddIn, ComputeAddMaskAddIn = [ADD a, MASK b, ADD c] in IN_ARRAY);
-rule!(ADD_MASK_ADD_HELD, CheckAddMaskAddHeld, ComputeAddMaskAddHeld = [ADD a, MASK b, ADD c] in HELD);
-rule!(RR_ADD, CheckPairAdd, ComputePairAdd = rr ADD []);
-rule!(RR_ADD_MASK, CheckPairAddMask, ComputePairAddMask = rr ADD [MASK a]);
-rule!(RR_ADD_ADD, CheckPairAddAdd, ComputePairAddAdd = rr ADD [ADD a]);
-rule!(RR_ADD_ADD_MASK, CheckPairAddAddMask, ComputePairAddAddMask = rr ADD [ADD a, MASK b]);
-rule!(RR_ADD_SUB, CheckPairAddSub, ComputePairAddSub = rr ADD [SUB a]);
-rule!(RR_ADD_SUB_MASK, CheckPairAddSubMask, ComputePairAddSubMask = rr ADD [SUB a, MASK b]);
-rule!(MUL_RR_ADD, CheckMulPairAdd, ComputeMulPairAdd = [MUL a] rr ADD);
+rule!(ADD_, FusedAdd, ComputeAdd, MaterializeAdd = [ADD a]);
+rule!(SUB_, FusedSub, ComputeSub, MaterializeSub = [SUB a]);
+rule!(MUL_, FusedMul, ComputeMul, MaterializeMul = [MUL a]);
+rule!(MASK_, FusedMask, ComputeMask, MaterializeMask = [MASK a]);
+rule!(SUB_MASK, FusedSubMask, ComputeSubMask, MaterializeSubMask = [SUB a, MASK b]);
+rule!(ADD_MASK, FusedAddMask, ComputeAddMask, MaterializeAddMask = [ADD a, MASK b]);
+rule!(MASK_ADD, FusedMaskAdd, ComputeMaskAdd, MaterializeMaskAdd = [MASK a, ADD b]);
+rule!(SUB_MASK_ADD, FusedSubMaskAdd, ComputeSubMaskAdd, MaterializeSubMaskAdd = [SUB a, MASK b, ADD c]);
+rule!(ADD_MASK_ADD, FusedAddMaskAdd, ComputeAddMaskAdd, MaterializeAddMaskAdd = [ADD a, MASK b, ADD c]);
+rule!(ADD_MASK_SUB, FusedAddMaskSub, ComputeAddMaskSub, MaterializeAddMaskSub = [ADD a, MASK b, SUB c]);
+rule!(ADD_IN, FusedAddIn, ComputeAddIn, MaterializeAddIn = [ADD a] in IN_ARRAY);
+rule!(ADD_HELD, FusedAddHeld, ComputeAddHeld, MaterializeAddHeld = [ADD a] in HELD);
+rule!(MASK_ADD_IN, FusedMaskAddIn, ComputeMaskAddIn, MaterializeMaskAddIn = [MASK a, ADD b] in IN_ARRAY);
+rule!(MASK_ADD_HELD, FusedMaskAddHeld, ComputeMaskAddHeld, MaterializeMaskAddHeld = [MASK a, ADD b] in HELD);
+rule!(SUB_MASK_ADD_IN, FusedSubMaskAddIn, ComputeSubMaskAddIn, MaterializeSubMaskAddIn = [SUB a, MASK b, ADD c] in IN_ARRAY);
+rule!(SUB_MASK_ADD_HELD, FusedSubMaskAddHeld, ComputeSubMaskAddHeld, MaterializeSubMaskAddHeld = [SUB a, MASK b, ADD c] in HELD);
+rule!(ADD_MASK_ADD_IN, FusedAddMaskAddIn, ComputeAddMaskAddIn, MaterializeAddMaskAddIn = [ADD a, MASK b, ADD c] in IN_ARRAY);
+rule!(ADD_MASK_ADD_HELD, FusedAddMaskAddHeld, ComputeAddMaskAddHeld, MaterializeAddMaskAddHeld = [ADD a, MASK b, ADD c] in HELD);
+rule!(RR_ADD, FusedPairAdd, ComputePairAdd, MaterializePairAdd = rr ADD []);
+rule!(RR_ADD_MASK, FusedPairAddMask, ComputePairAddMask, MaterializePairAddMask = rr ADD [MASK a]);
+rule!(RR_ADD_ADD, FusedPairAddAdd, ComputePairAddAdd, MaterializePairAddAdd = rr ADD [ADD a]);
+rule!(RR_ADD_ADD_MASK, FusedPairAddAddMask, ComputePairAddAddMask, MaterializePairAddAddMask = rr ADD [ADD a, MASK b]);
+rule!(RR_ADD_SUB, FusedPairAddSub, ComputePairAddSub, MaterializePairAddSub = rr ADD [SUB a]);
+rule!(RR_ADD_SUB_MASK, FusedPairAddSubMask, ComputePairAddSubMask, MaterializePairAddSubMask = rr ADD [SUB a, MASK b]);
+rule!(MUL_RR_ADD, FusedMulPairAdd, ComputeMulPairAdd, MaterializeMulPairAdd = [MUL a] rr ADD);
 
 /// Every rule.
 pub static RULES: &[Rule] = &[
@@ -377,11 +432,15 @@ pub struct Spell {
     matched: Matched,
     /// Ended in a guard.
     closed: bool,
+    /// The instruction its last operation, or guard, is of.
+    pub at: usize,
+    /// What it was before that.
+    before: Option<Box<Spell>>,
 }
 
 impl Spell {
     /// The spell `op` begins, if a rule begins with it.
-    fn start(op: &IntOp) -> Option<Spell> {
+    fn start(op: &IntOp, at: usize) -> Option<Spell> {
         let (sym, matched, inputs) = if let Some((sym, slot, k)) = op.step() {
             (sym, Matched { ks: vec![k], lhs: slot, rhs: None, table: None, dest: op.dest }, vec![slot])
         } else {
@@ -389,17 +448,19 @@ impl Spell {
             (sym, Matched { ks: Vec::new(), lhs: l, rhs: Some(r), table: None, dest: op.dest }, vec![l, r])
         };
         let node = TRIE.step(0, sym)?;
-        Some(Spell { node, dest: op.dest, inputs, matched, closed: false })
+        Some(Spell { node, dest: op.dest, inputs, matched, closed: false, at, before: None })
     }
 
     /// The spell of this spell's value then `op`, which reads it, into `op`'s slot, as a rule goes
     /// on: a step of the value by a constant, or a sum or difference of it and a register no spell
     /// writes, `held` saying which do.
-    fn then(&self, op: &IntOp, held: impl Fn(usize) -> bool) -> Option<Spell> {
+    fn then(&self, op: &IntOp, held: impl Fn(usize) -> bool, at: usize) -> Option<Spell> {
         if self.closed {
             return None;
         }
         let mut spell = self.clone();
+        spell.at = at;
+        spell.before = Some(Box::new(self.clone()));
         if let Some((sym, slot, k)) = op.step() {
             spell.node = (slot == self.dest).then(|| TRIE.step(self.node, sym)).flatten()?;
             spell.matched.ks.push(k);
@@ -424,8 +485,10 @@ impl Spell {
     }
 
     /// Whether guard `kind` of `table` on this spell's value joins it, ending it.
-    fn join_guard(&mut self, kind: u8, table: usize) -> bool {
+    fn join_guard(&mut self, kind: u8, table: usize, at: usize) -> bool {
         let Some(node) = (!self.closed && table != self.dest).then(|| TRIE.step(self.node, Sym::Guard(kind))).flatten() else { return false };
+        self.before = Some(Box::new(self.clone()));
+        self.at = at;
         self.node = node;
         self.matched.table = Some(table);
         self.inputs.push(table);
@@ -448,6 +511,34 @@ impl Spell {
     pub fn rule(&self) -> &'static str {
         RULES[TRIE.rule[self.node].expect("a spell is a rule")].name
     }
+
+    /// Whether it is the same chain as `other`.
+    fn same(&self, other: &Spell) -> bool {
+        self.node == other.node && self.matched == other.matched && self.closed == other.closed
+    }
+
+    /// Whether it went on from `other`, so its check checks `other`'s.
+    fn went_on_from(&self, other: &Spell) -> bool {
+        std::iter::successors(self.before.as_deref(), |s| s.before.as_deref()).any(|s| s.same(other))
+    }
+
+    /// What it was before instruction `at`'s operations, if that wrote its slot.
+    fn before_instruction(&self, at: usize) -> Option<&Spell> {
+        let mut spell = self;
+        while spell.at == at {
+            spell = spell.before.as_deref()?;
+        }
+        (spell.dest == self.dest).then_some(spell)
+    }
+}
+
+/// A spell laid out: its op, whether it can fail, and where it can, what its cold way writes:
+/// the materializations of the spells not yet written, and the slots they leave unknown.
+pub struct Laid {
+    pub op: Rc<dyn Window>,
+    pub checked: bool,
+    pub exit: Vec<Rc<dyn Window>>,
+    pub unknown: Vec<usize>,
 }
 
 /// What the peephole makes of an operation offered to it.
@@ -469,12 +560,12 @@ pub struct Spells {
 
 impl Spells {
     /// Offer integer operation `op`: a spell of the value it reads and itself, or its own.
-    pub fn offer(&mut self, op: &IntOp) -> Offer {
+    pub fn offer(&mut self, op: &IntOp, at: usize) -> Offer {
         let holds = |slot: usize| self.spells.iter().any(|s| s.dest == slot);
         let read: Vec<usize> = op.reads().filter(|&slot| holds(slot)).collect();
         let spell = match read.as_slice() {
-            [] => Spell::start(op),
-            [value] => self.spells.iter().find(|s| s.dest == *value).unwrap().then(op, holds),
+            [] => Spell::start(op, at),
+            [value] => self.spells.iter().find(|s| s.dest == *value).unwrap().then(op, holds, at),
             _ => None,
         };
         let Some(spell) = spell else {
@@ -491,21 +582,34 @@ impl Spells {
         let mut next = self.clone();
         next.spells.retain(|s| s.dest != op.dest);
         next.spells.push(spell);
-        if next.order().is_none() {
+        if !next.last_can_fail() {
             return Offer::Flush;
         }
         *self = next;
         Offer::Held
     }
 
+    /// Whether the spell made last, with its instruction's operations, can be the last that can
+    /// fail: every spell needed after it is one it went on from; and they are in an order.
+    fn last_can_fail(&self) -> bool {
+        let (last, others) = self.spells.split_last().unwrap();
+        others.iter().all(|s| !last.inputs.contains(&s.dest) || last.went_on_from(s)) && self.order(last.at).is_some()
+    }
+
     /// Offer the guard `test`, held as passed: joining the spell of the key it tests.
-    pub fn offer_guard(&mut self, test: &dyn Window) -> bool {
+    pub fn offer_guard(&mut self, test: &dyn Window, at: usize) -> bool {
         let Some((kind, table, key)) = guard(test) else { return false };
         if self.spells.iter().any(|s| s.dest == table) {
             return false;
         }
         let mut next = self.clone();
-        if !next.spells.iter_mut().find(|s| s.dest == key).is_some_and(|s| s.join_guard(kind, table)) || next.order().is_none() {
+        let Some(i) = next.spells.iter().position(|s| s.dest == key) else { return false };
+        let mut spell = next.spells.remove(i);
+        if !spell.join_guard(kind, table, at) {
+            return false;
+        }
+        next.spells.push(spell);
+        if !next.last_can_fail() {
             return false;
         }
         *self = next;
@@ -513,8 +617,8 @@ impl Spells {
     }
 
     /// Whether the guard `test` would join a spell.
-    pub fn joins_guard(&self, test: &dyn Window) -> bool {
-        self.clone().offer_guard(test)
+    pub fn joins_guard(&self, test: &dyn Window, at: usize) -> bool {
+        self.clone().offer_guard(test, at)
     }
 
     /// Drop the spells of slots `writes` that something about to be laid out writes, reading
@@ -524,8 +628,8 @@ impl Spells {
     }
 
     /// The spells in an order where each reading a slot another writes comes before it, if
-    /// there is one.
-    pub fn order(&self) -> Option<Vec<usize>> {
+    /// there is one, those with operations of instruction `at` as late as they can be.
+    pub fn order(&self, at: usize) -> Option<Vec<usize>> {
         let n = self.spells.len();
         // `before[i]`: the spells reading what spell `i` writes.
         let before: Vec<Vec<usize>> = (0..n).map(|i| {
@@ -534,7 +638,8 @@ impl Spells {
         let mut order = Vec::with_capacity(n);
         let mut placed = vec![false; n];
         while order.len() < n {
-            let next = (0..n).find(|&i| !placed[i] && before[i].iter().all(|&j| placed[j]))?;
+            let ready = |i: &usize| !placed[*i] && before[*i].iter().all(|&j| placed[j]);
+            let next = (0..n).filter(ready).find(|&i| self.spells[i].at != at).or_else(|| (0..n).find(ready))?;
             placed[next] = true;
             order.push(next);
         }
@@ -543,6 +648,25 @@ impl Spells {
 
     pub fn is_empty(&self) -> bool {
         self.spells.is_empty()
+    }
+
+    /// The spells laid out in instruction `at`, in order: each one op, and where it can fail, its
+    /// cold way's materializations of it and those after it. See Note [Peephole fusion].
+    pub fn lay_out(&self, at: usize) -> Vec<Laid> {
+        let order: Vec<&Spell> = self.order(at).expect("held spells are in an order").into_iter().map(|i| &self.spells[i]).collect();
+        let mut laid = Vec::with_capacity(order.len());
+        for (k, spell) in order.iter().enumerate() {
+            let ops = spell.ops();
+            if !spell.can_fail() || order[..k].iter().any(|before| before.went_on_from(spell)) {
+                laid.push(Laid { op: ops.compute, checked: false, exit: Vec::new(), unknown: Vec::new() });
+                continue;
+            }
+            debug_assert!(order[..k].iter().all(|before| before.at != at), "a spell can fail after one with its instruction's operations");
+            let exit = order[k..].iter().filter_map(|s| if s.at == at { s.before_instruction(at) } else { Some(s) }).map(|s| s.ops().materialize).collect();
+            let unknown = order[k..].iter().map(|s| s.dest).collect();
+            laid.push(Laid { op: ops.fused, checked: true, exit, unknown });
+        }
+        laid
     }
 }
 
@@ -559,6 +683,23 @@ mod tests {
         spells.spells.iter().map(|s| (s.rule(), s.dest, s.inputs.clone())).collect()
     }
 
+    /// Offer each of `ops`, one per instruction from `at`, each held.
+    fn hold(spells: &mut Spells, at: usize, ops: &[IntOp]) {
+        for (i, o) in ops.iter().enumerate() {
+            assert_eq!(spells.offer(o, at + i), Offer::Held, "{o:?}");
+        }
+    }
+
+    /// The ops laid out in instruction `at`: each's name and operands, whether it can fail, and
+    /// its cold way's materializations' names and operands.
+    fn laid(spells: &Spells, at: usize) -> Vec<(&'static str, Vec<usize>, bool, Vec<(&'static str, Vec<usize>)>)> {
+        let named = |w: &Rc<dyn Window>| (w.name(), w.operands().to_vec());
+        spells.lay_out(at).iter().map(|l| {
+            let (name, operands) = named(&l.op);
+            (name, operands, l.checked, l.exit.iter().map(named).collect())
+        }).collect()
+    }
+
     #[test]
     fn every_prefix_is_a_rule() {
         LazyLock::force(&TRIE);
@@ -566,26 +707,28 @@ mod tests {
 
     #[test]
     fn an_index_computation_is_one_spell_with_its_guard() {
-        // s[(p - 1) % 256 + 1], p in slot 5, the key in slot 6, the table in slot 1.
+        // s[(p - 1) % 256 + 1], p in slot 5, the key in slot 6, the table in slot 1, the get at
+        // instruction 3.
         let mut spells = Spells::default();
-        for o in [op(Arith::Sub, Slot(5), K(1), 6), op(Arith::Mod, Slot(6), K(256), 6), op(Arith::Add, Slot(6), K(1), 6)] {
-            assert_eq!(spells.offer(&o), Offer::Held);
-        }
-        assert!(spells.offer_guard(&crate::generators::InArrayHeld::new(&[1, 6])));
+        hold(&mut spells, 0, &[op(Arith::Sub, Slot(5), K(1), 6), op(Arith::Mod, Slot(6), K(256), 6), op(Arith::Add, Slot(6), K(1), 6)]);
+        assert!(spells.offer_guard(&crate::generators::InArrayHeld::new(&[1, 6]), 3));
         assert_eq!(held(&spells), [("SUB_MASK_ADD_HELD", 6, vec![5, 1])]);
-        let ops = spells.spells[0].ops();
-        assert_eq!((ops.check.name(), ops.check.operands()), ("CheckSubMaskAddHeld", &[1, 5][..]));
-        assert_eq!((ops.compute.name(), ops.compute.operands()), ("ComputeSubMaskAddHeld", &[1, 5, 6][..]));
+        // One op; failing, the get runs again with the key as its operations made it.
+        assert_eq!(laid(&spells, 3), [("FusedSubMaskAddHeld", vec![1, 5, 6], true, vec![("MaterializeSubMaskAdd", vec![5, 6])])]);
     }
 
     #[test]
     fn interleaved_chains_are_held_apart() {
         // A B C D: x = x + 1; y = y - 2; x = x % 256; y = y % 16, on slots 1 and 2.
         let mut spells = Spells::default();
-        for o in [op(Arith::Add, Slot(1), K(1), 1), op(Arith::Sub, Slot(2), K(2), 2), op(Arith::Mod, Slot(1), K(256), 1), op(Arith::Mod, Slot(2), K(16), 2)] {
-            assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
-        }
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1), op(Arith::Sub, Slot(2), K(2), 2), op(Arith::Mod, Slot(1), K(256), 1), op(Arith::Mod, Slot(2), K(16), 2)]);
         assert_eq!(held(&spells), [("ADD_MASK", 1, vec![1]), ("SUB_MASK", 2, vec![2])]);
+        // Laid out by a later instruction: where the first fails, both are written as the
+        // operations would; where the second does, the first is written already.
+        assert_eq!(laid(&spells, 4), [
+            ("FusedAddMask", vec![1, 1], true, vec![("MaterializeAddMask", vec![1, 1]), ("MaterializeSubMask", vec![2, 2])]),
+            ("FusedSubMask", vec![2, 2], true, vec![("MaterializeSubMask", vec![2, 2])]),
+        ]);
     }
 
     #[test]
@@ -593,17 +736,17 @@ mod tests {
         // acc = acc + t * 256, t in slot 9 multiplied in place, acc in slot 8: the sum is a spell of
         // t's, t's held too; then t is overwritten unread, so only the sum's is left.
         let mut spells = Spells::default();
-        for o in [op(Arith::Mul, Slot(9), K(256), 9), op(Arith::Add, Slot(8), Slot(9), 8)] {
-            assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
-        }
+        hold(&mut spells, 0, &[op(Arith::Mul, Slot(9), K(256), 9), op(Arith::Add, Slot(8), Slot(9), 8)]);
         assert_eq!(held(&spells), [("MUL_", 9, vec![9]), ("MUL_RR_ADD", 8, vec![9, 8])]);
-        // The sum reads t as it was: it comes first.
-        assert_eq!(spells.order(), Some(vec![1, 0]));
-        let ops = spells.spells[1].ops();
-        assert_eq!((ops.check.operands(), ops.compute.operands()), (&[9, 8][..], &[9, 8, 8][..]));
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(3), K(1), 9)), Offer::Held);
+        // The sum reads t as it was: it comes first, and checks t's too, so t's only computes.
+        assert_eq!(spells.order(2), Some(vec![1, 0]));
+        assert_eq!(laid(&spells, 2), [
+            ("FusedMulPairAdd", vec![9, 8, 8], true, vec![("MaterializeMulPairAdd", vec![9, 8, 8]), ("MaterializeMul", vec![9, 9])]),
+            ("ComputeMul", vec![9, 9], false, vec![]),
+        ]);
+        hold(&mut spells, 2, &[op(Arith::Add, Slot(3), K(1), 9)]);
         assert_eq!(held(&spells), [("MUL_RR_ADD", 8, vec![9, 8]), ("ADD_", 9, vec![3])]);
-        assert_eq!(spells.order(), Some(vec![0, 1]));
+        assert_eq!(spells.order(3), Some(vec![0, 1]));
     }
 
     #[test]
@@ -611,40 +754,60 @@ mod tests {
         // a = b + 1, then b = (a) % 256, a spell of a's into b: a's reads b as it was, so it comes
         // first.
         let mut spells = Spells::default();
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(2), K(1), 1)), Offer::Held);
-        assert_eq!(spells.offer(&op(Arith::Mod, Slot(1), K(256), 2)), Offer::Held);
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(2), K(1), 1), op(Arith::Mod, Slot(1), K(256), 2)]);
         assert_eq!(held(&spells), [("ADD_", 1, vec![2]), ("ADD_MASK", 2, vec![2])]);
-        assert_eq!(spells.order(), Some(vec![0, 1]));
+        assert_eq!(spells.order(2), Some(vec![0, 1]));
         // Writing a slot a spell reads, from another, is ordered after it too.
         let mut spells = Spells::default();
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(2), K(1), 1)), Offer::Held);
-        assert_eq!(spells.offer(&op(Arith::Sub, Slot(3), K(4), 2)), Offer::Held);
-        assert_eq!(spells.order(), Some(vec![0, 1]));
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(2), K(1), 1), op(Arith::Sub, Slot(3), K(4), 2)]);
+        assert_eq!(spells.order(2), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn the_instructions_own_spell_fails_last() {
+        // x = y + 1 at 0, then z = w - 2 at 1, laid out by instruction 1 itself: z's comes last,
+        // failing to instruction 1 run again, so only x's, from instruction 0, is written; z's
+        // operation runs again.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(2), K(1), 1), op(Arith::Sub, Slot(4), K(2), 3)]);
+        assert_eq!(laid(&spells, 1), [
+            ("FusedAdd", vec![2, 1], true, vec![("MaterializeAdd", vec![2, 1])]),
+            ("FusedSub", vec![4, 3], true, vec![]),
+        ]);
+        // Going on in it, from instruction 0: written as it was before.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(2), K(1), 1), op(Arith::Mod, Slot(1), K(256), 1)]);
+        assert_eq!(laid(&spells, 1), [("FusedAddMask", vec![2, 1], true, vec![("MaterializeAdd", vec![2, 1])])]);
+    }
+
+    #[test]
+    fn a_spell_needing_another_after_it_is_held_only_if_it_checks_it() {
+        // a = s + 1 at 0, s = s + 2 at 1, then a = a % 256 at 2: a's reads s as it was, so s's
+        // comes after it, though its instruction is earlier, and s's isn't a's chain.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(5), K(1), 1), op(Arith::Add, Slot(5), K(2), 5)]);
+        assert_eq!(spells.offer(&op(Arith::Mod, Slot(1), K(256), 1), 2), Offer::Flush);
     }
 
     #[test]
     fn dead_values_are_never_laid_out() {
         // A chain overwritten unread: t = x + 1; t = t % 256; then t = y - 2.
         let mut spells = Spells::default();
-        for o in [op(Arith::Add, Slot(1), K(1), 3), op(Arith::Mod, Slot(3), K(256), 3), op(Arith::Sub, Slot(2), K(2), 3)] {
-            assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
-        }
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 3), op(Arith::Mod, Slot(3), K(256), 3), op(Arith::Sub, Slot(2), K(2), 3)]);
         assert_eq!(held(&spells), [("SUB_", 3, vec![2])]);
         // Among live ones: x = x + 1 lives on, t = y + 2 doesn't, overwritten by t = z + 5.
         let mut spells = Spells::default();
-        for o in [op(Arith::Add, Slot(1), K(1), 1), op(Arith::Add, Slot(2), K(2), 3), op(Arith::Add, Slot(4), K(5), 3)] {
-            assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
-        }
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1), op(Arith::Add, Slot(2), K(2), 3), op(Arith::Add, Slot(4), K(5), 3)]);
         assert_eq!(held(&spells), [("ADD_", 1, vec![1]), ("ADD_", 3, vec![4])]);
         // Overwritten by what can't be held: dropped, nothing left to lay out.
         let mut spells = Spells::default();
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(1), K(1), 3)), Offer::Held);
-        assert_eq!(spells.offer(&op(Arith::Mul, Slot(2), K(-2), 3)), Offer::Refused);
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 3)]);
+        assert_eq!(spells.offer(&op(Arith::Mul, Slot(2), K(-2), 3), 1), Offer::Refused);
         assert!(spells.is_empty());
         // Overwritten by something else laid out, as a constant loaded into it; one reading it
         // keeps it.
         let mut spells = Spells::default();
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(1), K(1), 3)), Offer::Held);
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 3)]);
         let mut kept = spells.clone();
         kept.drop_overwritten(&[3], &[3]);
         assert_eq!(kept.spells.len(), 1);
@@ -655,29 +818,27 @@ mod tests {
     #[test]
     fn what_lays_out_the_spells() {
         let mut spells = Spells::default();
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(1), K(1), 3)), Offer::Held);
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 3)]);
         // Reading a held value with no rule going on.
-        assert_eq!(spells.clone().offer(&op(Arith::Mul, Slot(3), K(-2), 3)), Offer::Flush);
-        assert_eq!(spells.clone().offer(&op(Arith::Mod, Slot(3), K(7), 4)), Offer::Flush);
+        assert_eq!(spells.clone().offer(&op(Arith::Mul, Slot(3), K(-2), 3), 1), Offer::Flush);
+        assert_eq!(spells.clone().offer(&op(Arith::Mod, Slot(3), K(7), 4), 1), Offer::Flush);
         // Reading two held values.
         let mut two = spells.clone();
-        assert_eq!(two.offer(&op(Arith::Add, Slot(5), K(1), 4)), Offer::Held);
-        assert_eq!(two.offer(&op(Arith::Add, Slot(3), Slot(4), 6)), Offer::Flush);
+        hold(&mut two, 1, &[op(Arith::Add, Slot(5), K(1), 4)]);
+        assert_eq!(two.offer(&op(Arith::Add, Slot(3), Slot(4), 6), 2), Offer::Flush);
         // A product that could be -0, with nothing held, is refused.
-        assert_eq!(Spells::default().offer(&op(Arith::Mul, Slot(3), K(-2), 3)), Offer::Refused);
+        assert_eq!(Spells::default().offer(&op(Arith::Mul, Slot(3), K(-2), 3), 0), Offer::Refused);
         // A guard on a key held is joined, ending its spell; on another, not.
-        assert!(!spells.joins_guard(&crate::generators::InArray::new(&[2, 5])));
-        assert!(spells.offer_guard(&crate::generators::InArray::new(&[2, 3])));
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(3), K(1), 3)), Offer::Flush);
+        assert!(!spells.joins_guard(&crate::generators::InArray::new(&[2, 5]), 1));
+        assert!(spells.offer_guard(&crate::generators::InArray::new(&[2, 3]), 1));
+        assert_eq!(spells.offer(&op(Arith::Add, Slot(3), K(1), 3), 2), Offer::Flush);
     }
 
     #[test]
     fn a_pair_and_its_steps() {
         // (p + k + 1) % 256 into slot 3: p in slot 1, k in slot 2.
         let mut spells = Spells::default();
-        for o in [op(Arith::Add, Slot(1), Slot(2), 3), op(Arith::Add, Slot(3), K(1), 3), op(Arith::Mod, Slot(3), K(256), 3)] {
-            assert_eq!(spells.offer(&o), Offer::Held, "{o:?}");
-        }
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), Slot(2), 3), op(Arith::Add, Slot(3), K(1), 3), op(Arith::Mod, Slot(3), K(256), 3)]);
         assert_eq!(held(&spells), [("RR_ADD_ADD_MASK", 3, vec![1, 2])]);
     }
 

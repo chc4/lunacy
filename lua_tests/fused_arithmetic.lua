@@ -8,7 +8,9 @@
 -- two chains of different values interleaved, held apart, one of which
 -- overflows near the largest integer. And values computed and overwritten
 -- before anything reads them, one overflowing, which the peephole never lays
--- out. Once, and in loops run often enough for JIT code.
+-- out. And two chains where the second overflows after the first is written in
+-- place, and a sum of a product, whose spell the product's goes on into, which
+-- overflows. Once, and in loops run often enough for JIT code.
 
 local function index(p)
   return (p - 1) % 256 + 1
@@ -61,12 +63,23 @@ local function dead(i, j)
   return t + u + v
 end
 
+local function second(i, j)
+  i = i + 1
+  j = j * 2
+  i = i % 1024
+  return i + j
+end
+
+local function word(acc, t)
+  return acc + t * 256
+end
+
 local function run(n)
   local t, u = {}, {}
   for i = 1, 16 do t[i] = i * i end
   for i = 1, 8 do u[i] = i end
   u[20] = 100
-  local s1, s2, s3, s4, s5, s6, s7 = 0, 0, 0, 0, 0, 0, 0
+  local s1, s2, s3, s4, s5, s6, s7, s8, s9 = 0, 0, 0, 0, 0, 0, 0, 0, 0
   for i = 1, n do
     s1 = s1 + index(i)
     s2 = s2 + around(t, i)
@@ -76,11 +89,13 @@ local function run(n)
     store(u, i)
     s6 = s6 + interleaved(i % 7 == 0 and 2147483646 or i, i * 3)
     s7 = s7 + dead(i % 5 == 0 and 2147483647 or i, i)
+    s8 = s8 + second(i, i % 11 == 0 and 1073741824 or i)
+    s9 = s9 + word(i, i % 13 == 0 and 8388608 or i)
   end
-  return s1, s2, s3, s4, s5, u[1] + u[8], s6, s7
+  return s1, s2, s3, s4, s5, u[1] + u[8], s6, s7, s8, s9
 end
 
 print(run(10))
 print(run(2000))
--- EXPECT: 55	1178	21474836470	4294966070	20	9	143	-15
--- EXPECT: 252008	998000	4294967293999	4298960000	506436	3993	230353	-1993000
+-- EXPECT: 55	1178	21474836470	4294966070	20	9	143	-15	175	14135
+-- EXPECT: 252008	998000	4294967293999	4298960000	506436	3993	230353	-1993000	388699181454	329040047976
