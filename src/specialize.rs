@@ -1756,7 +1756,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize) {
 // key) relies on the fact and consumes it: the slot's type then says what the fact would, and a
 // rebuild to a double, which would undo what the use relies on, is refused. A guard finding out
 // the slot's type at runtime consumes it too, deciding how the slot is used instead (one the
-// context answers decides nothing). Where the fact is never used, the code it was carried through
+// context answers decides nothing). A constant no load made, as a promote's guarded value or what
+// an operation of constants folds to (Note [Peephole fusion] in `peephole`), has no load to
+// rebuild, and isn't consumed. Where the fact is never used, the code it was carried through
 // is contracted. A whole constant passed to a function, stored into a table or an upvalue, or
 // passed to a native is the integer it was loaded as: a callee's versions, and a table's other
 // values, are out of the load's rebuild's reach.
@@ -2936,7 +2938,7 @@ impl Context {
     /// Slot `slot`'s type is found out at runtime: a fact that it holds a
     /// constant has had its use. See Note [Widening].
     fn used(&mut self, slot: usize) {
-        self.fragile.retain(|fact| !matches!(fact.fragile, Fragile::Constant { slot: held, .. } if held == slot));
+        self.fragile.retain(|fact| fact.origins.is_none() || !matches!(fact.fragile, Fragile::Constant { slot: held, .. } if held == slot));
     }
 
     /// Mark that code relies on the fact about `key`, so that it isn't
@@ -4724,8 +4726,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         if !crate::peephole::fuses() || !self.instruction.as_ref().is_some_and(|(at, _, holds)| *at == pc.0 && *holds) {
             return Hold::Not;
         }
-        let joined = match self.held.as_mut().map(|held| held.spells.offer(&int_op, pc.0)) {
+        // What it folds to, its operands constants the context knows no load made: a promote's
+        // guarded values, and those folded from them. A load's constant is left to contraction,
+        // which relying on it would refuse. See Note [Peephole fusion] in `peephole`.
+        let mut folded = None;
+        let known = ctx.clone();
+        let known = |slot: usize| known.fragile.iter().find_map(|fact| match fact.fragile {
+            Fragile::Constant { slot: held, value } if held == slot && fact.origins.is_none() => Some(value),
+            _ => None,
+        });
+        let joined = match self.held.as_mut().map(|held| held.spells.offer(&int_op, pc.0, known)) {
             Some(Offer::Held) => true,
+            Some(Offer::Folded(value)) => {
+                folded = Some(value);
+                true
+            },
             // Laid out first; or dropped, as what it overwrites, if nothing is left.
             Some(Offer::Flush | Offer::Refused) => {
                 let window = if optimistic { YieldOp::OptimisticExec(window.clone()) } else { YieldOp::ExecWindow(window.clone()) };
@@ -4738,8 +4753,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         };
         if !joined {
             let mut spells = Spells::default();
-            if spells.offer(&int_op, pc.0) != Offer::Held {
-                return Hold::Not;
+            match spells.offer(&int_op, pc.0, known) {
+                Offer::Held => {},
+                Offer::Folded(value) => folded = Some(value),
+                _ => return Hold::Not,
             }
             self.held = Some(Held { spells });
         }
@@ -4752,6 +4769,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if access.writes() {
                 Rc::make_mut(ctx).effect(Effect::Write(slot));
             }
+        }
+        if let Some(value) = folded {
+            Rc::make_mut(ctx).introduce(Fact { fragile: Fragile::Constant { slot: int_op.dest, value }, origins: None });
         }
         Hold::Held
     }
@@ -5127,6 +5147,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Some(_) => CType::Type(LType::Nil),
                 None => CType::Unknown,
             };
+            // A constant returned is the caller's constant.
+            known.effect(Effect::Write(call + i));
+            if returned.is_some_and(|returned| i < returned) {
+                let constant = ctx.fragile.iter().find(|fact| matches!(fact.fragile, Fragile::Constant { slot, .. } if slot == a + i));
+                if let Some(Fact { fragile: Fragile::Constant { value, .. }, origins }) = constant {
+                    known.introduce(Fact { fragile: Fragile::Constant { slot: call + i, value: *value }, origins: origins.clone() });
+                }
+            }
         }
         known.top = if c == 0 { returned.map(|returned| call + returned) } else { None };
         let callee = self.proto;

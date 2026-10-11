@@ -11,48 +11,25 @@ use crate::window::{windowed, Window};
 
 // Note [Peephole fusion]
 // ~~~~~~~~~~~~~~~~~~~~~~
-// Each integer operation in the integer encoding checks its own result fits, and boxes it, though
-// the next often only reads it to compute another: `(p - 1) % 256 + 1` checks and boxes three
-// times. A chain of integer operations computing one value can instead be one op.
+// Each integer op checks that its result fits and boxes it, though the next often only reads it to
+// compute another: `(p - 1) % 256 + 1` checks and boxes three times. The peephole sees the
+// generators' integer ops as the specializer lays them out and holds each as a spell, as witchcraft
+// does: one per slot, the slot's value as a computation of values from before any held op. An op
+// reading a held value extends its spell where a rule matches, and an array-part guard on a held key
+// joins it, so a chain becomes one op that checks once. A value overwritten unread is never computed.
+// Whatever reads a held value without extending it, or lays out code, lays every spell out.
 //
-// Every generator's yields pass through a peephole as the specializer lays them out. An integer
-// operation's generator says what its window computes before yielding it, and the peephole holds it
-// instead of laying it out, as a spell: the computation of the slot it writes, from the values its
-// operations read as they were before any of them, suspended. The generator goes on as if the
-// operation took its hot path, and so does the code after it, whichever instructions those are. An
-// operation reading a held value makes a spell of the value's spell and itself, where a rule matches
-// the chain that makes: writing the same slot, the spell goes on; writing another, it is a spell of
-// that slot, the value's spell held too. A guard of whether a held value is a key in a table's array
-// part (and the element there not nil), which a get or set yields before reading it, joins the
-// value's spell, as passed, and ends it. Anything writing a held value no one read drops its spell.
-// Spells of other values are held alongside, so chains of different values interleave.
+// Spells only read values from before any held op, so laying out those that read a slot before the
+// one that writes it computes each as its ops would have. Where one fails, those before it have
+// written and the rest haven't, and their inputs are intact; its exit computes the rest as Lua
+// would, and the code goes on from where the instruction that laid them out started, or from where
+// compiling went on in it, with those values unknown and that op not held. That instruction's own
+// ops run again, so the spell holding them must fail last and is written as it was before them.
 //
-// What the peephole holds it lays out when anything would read a held value but can't make a spell
-// of it, or would lay out code: every spell at once, those reading a slot before the one writing
-// it, so each reads what was there before any. Each spell is one op, computing its chain once and
-// writing it, with a cold path where a step doesn't fit or the guard it ends in fails, which writes
-// nothing it would need, and a `Branch` past it, as an optimistic integer op has (Note [Optimistic
-// ops] in `specialize`). A spell needn't check what one laid out before it checked already: one
-// whose chain another went on from, laid out after it, can't fail, nor can one only masking; those
-// only compute.
-//
-// Where a spell fails, those before it have written, and it and those after it haven't. Its cold
-// way goes on from the start of the instruction that laid them out, as if it ran then: it writes
-// each spell not yet written, as its operations would, from its inputs, still as they were, as
-// those reading a slot come before the one writing it; and the instruction runs again with them
-// unknown, as numbers its operations made, its own integer operation not held. A spell's
-// operations in that instruction itself run again, so only what it was before them is written.
-// Spells written already went on past any operations of the instruction, so a spell with some is
-// the last that can fail: anything laid out after it must be a chain it went on from, which its
-// check checked. Where an operation would make a spell needing another after it that isn't, all
-// held is laid out first.
-//
-// Spells needing one another written first, in a cycle, can't be held together: what would make one
-// is laid out after them.
-//
-// The rules are the chains code computes keys and bytes with, and every one of their prefixes, so a
-// spell is always one. A spell's operations make no -0, so a step that fits is the double its
-// operation would have computed.
+// A constant known as no load made it, a promote's guarded value or one folded from such, is folded
+// into what reads it: the versions past a promote are one per value already, so its constants add
+// none. A loaded constant isn't: contraction drops it where nothing relies on it, as where a loop's
+// back edge meets it, and folding it would make a loop's counter a version per iteration.
 
 /// An arithmetic operation of the integer encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -151,6 +128,8 @@ pub enum Sym {
     RR(u8),
     /// A guard on the value as a key.
     Guard(u8),
+    /// A constant: what an operation of constants folds to.
+    Const,
 }
 
 /// Step `S` of `x` by `k`: its result, if it fits.
@@ -212,6 +191,19 @@ fn lua_pair<const O: u8>(x: f64, y: f64) -> f64 {
         SUB => x - y,
         _ => unreachable!(),
     }
+}
+
+/// `op` of constants `l` and `r` as Lua computes it, if that is a value of the integer encoding:
+/// whole, in range, and not -0.
+fn fold(op: Arith, l: i32, r: i32) -> Option<i32> {
+    let (l, r) = (l as f64, r as f64);
+    let v = match op {
+        Arith::Add => l + r,
+        Arith::Sub => l - r,
+        Arith::Mul => l * r,
+        Arith::Mod => l - (l / r).floor() * r,
+    };
+    (v.fract() == 0.0 && v >= i32::MIN as f64 && v <= i32::MAX as f64 && v.to_bits() != (-0.0f64).to_bits()).then_some(v as i32)
 }
 
 /// Whether integer `key` passes guard `G` of `table`.
@@ -365,8 +357,18 @@ rule!(RR_ADD_SUB, FusedPairAddSub, ComputePairAddSub, MaterializePairAddSub = rr
 rule!(RR_ADD_SUB_MASK, FusedPairAddSubMask, ComputePairAddSubMask, MaterializePairAddSubMask = rr ADD [SUB a, MASK b]);
 rule!(MUL_RR_ADD, FusedMulPairAdd, ComputeMulPairAdd, MaterializeMulPairAdd = [MUL a] rr ADD);
 
+// A constant, stored.
+windowed!(StoreInt, [k: u64], [], |owner, state, base, tag| (out dest) {
+    *dest = LBoxed::from_int_tagged(k as i32, tag);
+});
+const CONST_: Rule = Rule { name: "CONST_", pattern: &[Sym::Const], make: |m| {
+    let store: Rc<dyn Window> = Rc::new(StoreInt::new(m.ks[0] as u32 as u64, &[m.dest]));
+    Ops { fused: store.clone(), compute: store.clone(), materialize: store }
+}};
+
 /// Every rule.
 pub static RULES: &[Rule] = &[
+    CONST_,
     ADD_, SUB_, MUL_, MASK_, SUB_MASK, ADD_MASK, MASK_ADD, SUB_MASK_ADD, ADD_MASK_ADD, ADD_MASK_SUB,
     ADD_IN, ADD_HELD, MASK_ADD_IN, MASK_ADD_HELD, SUB_MASK_ADD_IN, SUB_MASK_ADD_HELD, ADD_MASK_ADD_IN, ADD_MASK_ADD_HELD,
     RR_ADD, RR_ADD_MASK, RR_ADD_ADD, RR_ADD_ADD_MASK, RR_ADD_SUB, RR_ADD_SUB_MASK, MUL_RR_ADD,
@@ -439,6 +441,13 @@ pub struct Spell {
 }
 
 impl Spell {
+    /// The spell of slot `dest` holding constant `value`, an operation of instruction `at` folded.
+    fn constant(dest: usize, value: i32, at: usize) -> Spell {
+        let node = TRIE.step(0, Sym::Const).expect("a constant is a rule");
+        let matched = Matched { ks: vec![value], lhs: dest, rhs: None, table: None, dest };
+        Spell { node, dest, inputs: Vec::new(), matched, closed: true, at, before: None }
+    }
+
     /// The spell `op` begins, if a rule begins with it.
     fn start(op: &IntOp, at: usize) -> Option<Spell> {
         let (sym, matched, inputs) = if let Some((sym, slot, k)) = op.step() {
@@ -504,7 +513,7 @@ impl Spell {
     /// Whether it can fail: a step but a mask's, or a guard. One that can't is only its
     /// computation: its check's test would fold away.
     pub fn can_fail(&self) -> bool {
-        RULES[TRIE.rule[self.node].expect("a spell is a rule")].pattern.iter().any(|&sym| sym != Sym::K(MASK))
+        RULES[TRIE.rule[self.node].expect("a spell is a rule")].pattern.iter().any(|&sym| !matches!(sym, Sym::K(MASK) | Sym::Const))
     }
 
     /// Its rule's name.
@@ -546,6 +555,8 @@ pub struct Laid {
 pub enum Offer {
     /// It is held, in a spell.
     Held,
+    /// It is held, its operands constants, as the constant it folds to.
+    Folded(i32),
     /// Lay out every spell, then offer it again.
     Flush,
     /// It can't be held, with nothing held.
@@ -560,12 +571,23 @@ pub struct Spells {
 
 impl Spells {
     /// Offer integer operation `op`: a spell of the value it reads and itself, or its own.
-    pub fn offer(&mut self, op: &IntOp, at: usize) -> Offer {
+    pub fn offer(&mut self, op: &IntOp, at: usize, known: impl Fn(usize) -> Option<i32>) -> Offer {
+        // A slot known to hold a constant is that constant.
+        let constant = |o: Operand| match o {
+            Operand::Slot(slot) => known(slot).map_or(o, Operand::K),
+            k => k,
+        };
+        let op = &IntOp { lhs: constant(op.lhs), rhs: constant(op.rhs), ..*op };
         let holds = |slot: usize| self.spells.iter().any(|s| s.dest == slot);
         let read: Vec<usize> = op.reads().filter(|&slot| holds(slot)).collect();
-        let spell = match read.as_slice() {
-            [] => Spell::start(op, at),
-            [value] => self.spells.iter().find(|s| s.dest == *value).unwrap().then(op, holds, at),
+        let folded = match (op.lhs, op.rhs) {
+            (Operand::K(l), Operand::K(r)) => Some(fold(op.op, l, r)),
+            _ => None,
+        };
+        let spell = match (folded, read.as_slice()) {
+            (Some(value), _) => value.map(|value| Spell::constant(op.dest, value, at)),
+            (None, []) => Spell::start(op, at),
+            (None, [value]) => self.spells.iter().find(|s| s.dest == *value).unwrap().then(op, holds, at),
             _ => None,
         };
         let Some(spell) = spell else {
@@ -586,7 +608,10 @@ impl Spells {
             return Offer::Flush;
         }
         *self = next;
-        Offer::Held
+        match folded {
+            Some(Some(value)) => Offer::Folded(value),
+            _ => Offer::Held,
+        }
     }
 
     /// Whether the spell made last, with its instruction's operations, can be the last that can
@@ -679,6 +704,11 @@ mod tests {
         IntOp { op, lhs, rhs, dest }
     }
 
+    /// Knowing no slot holds a constant.
+    fn none(_: usize) -> Option<i32> {
+        None
+    }
+
     fn held(spells: &Spells) -> Vec<(&'static str, usize, Vec<usize>)> {
         spells.spells.iter().map(|s| (s.rule(), s.dest, s.inputs.clone())).collect()
     }
@@ -686,7 +716,7 @@ mod tests {
     /// Offer each of `ops`, one per instruction from `at`, each held.
     fn hold(spells: &mut Spells, at: usize, ops: &[IntOp]) {
         for (i, o) in ops.iter().enumerate() {
-            assert_eq!(spells.offer(o, at + i), Offer::Held, "{o:?}");
+            assert_eq!(spells.offer(o, at + i, none), Offer::Held, "{o:?}");
         }
     }
 
@@ -786,7 +816,26 @@ mod tests {
         // comes after it, though its instruction is earlier, and s's isn't a's chain.
         let mut spells = Spells::default();
         hold(&mut spells, 0, &[op(Arith::Add, Slot(5), K(1), 1), op(Arith::Add, Slot(5), K(2), 5)]);
-        assert_eq!(spells.offer(&op(Arith::Mod, Slot(1), K(256), 1), 2), Offer::Flush);
+        assert_eq!(spells.offer(&op(Arith::Mod, Slot(1), K(256), 1), 2, none), Offer::Flush);
+    }
+
+    #[test]
+    fn operations_of_constants_fold() {
+        // pc in slot 1 known to be 255: pc = (pc + 1) % 256 folds to 0, and what reads it then
+        // reads a constant; a chain from it is a constant store.
+        let known = |slot: usize| (slot == 1).then_some(255);
+        let mut spells = Spells::default();
+        assert_eq!(spells.offer(&op(Arith::Add, Slot(1), K(1), 2), 0, known), Offer::Folded(256));
+        assert_eq!(spells.offer(&op(Arith::Mod, Slot(2), K(256), 2), 1, |slot| (slot == 2).then_some(256)), Offer::Folded(0));
+        assert_eq!(held(&spells), [("CONST_", 2, vec![])]);
+        assert_eq!(laid(&spells, 2), [("StoreInt", vec![2], false, vec![])]);
+        // One constant operand is a step.
+        let mut spells = Spells::default();
+        assert_eq!(spells.offer(&op(Arith::Add, Slot(3), Slot(1), 4), 0, known), Offer::Held);
+        assert_eq!(held(&spells), [("ADD_", 4, vec![3])]);
+        // What doesn't fit isn't folded.
+        assert_eq!(Spells::default().offer(&op(Arith::Add, Slot(1), K(i32::MAX), 2), 0, known), Offer::Refused);
+        assert_eq!(Spells::default().offer(&op(Arith::Mul, Slot(1), K(0), 2), 0, |_| Some(-3)), Offer::Refused);
     }
 
     #[test]
@@ -802,7 +851,7 @@ mod tests {
         // Overwritten by what can't be held: dropped, nothing left to lay out.
         let mut spells = Spells::default();
         hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 3)]);
-        assert_eq!(spells.offer(&op(Arith::Mul, Slot(2), K(-2), 3), 1), Offer::Refused);
+        assert_eq!(spells.offer(&op(Arith::Mul, Slot(2), K(-2), 3), 1, none), Offer::Refused);
         assert!(spells.is_empty());
         // Overwritten by something else laid out, as a constant loaded into it; one reading it
         // keeps it.
@@ -820,18 +869,18 @@ mod tests {
         let mut spells = Spells::default();
         hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 3)]);
         // Reading a held value with no rule going on.
-        assert_eq!(spells.clone().offer(&op(Arith::Mul, Slot(3), K(-2), 3), 1), Offer::Flush);
-        assert_eq!(spells.clone().offer(&op(Arith::Mod, Slot(3), K(7), 4), 1), Offer::Flush);
+        assert_eq!(spells.clone().offer(&op(Arith::Mul, Slot(3), K(-2), 3), 1, none), Offer::Flush);
+        assert_eq!(spells.clone().offer(&op(Arith::Mod, Slot(3), K(7), 4), 1, none), Offer::Flush);
         // Reading two held values.
         let mut two = spells.clone();
         hold(&mut two, 1, &[op(Arith::Add, Slot(5), K(1), 4)]);
-        assert_eq!(two.offer(&op(Arith::Add, Slot(3), Slot(4), 6), 2), Offer::Flush);
+        assert_eq!(two.offer(&op(Arith::Add, Slot(3), Slot(4), 6), 2, none), Offer::Flush);
         // A product that could be -0, with nothing held, is refused.
-        assert_eq!(Spells::default().offer(&op(Arith::Mul, Slot(3), K(-2), 3), 0), Offer::Refused);
+        assert_eq!(Spells::default().offer(&op(Arith::Mul, Slot(3), K(-2), 3), 0, none), Offer::Refused);
         // A guard on a key held is joined, ending its spell; on another, not.
         assert!(!spells.joins_guard(&crate::generators::InArray::new(&[2, 5]), 1));
         assert!(spells.offer_guard(&crate::generators::InArray::new(&[2, 3]), 1));
-        assert_eq!(spells.offer(&op(Arith::Add, Slot(3), K(1), 3), 2), Offer::Flush);
+        assert_eq!(spells.offer(&op(Arith::Add, Slot(3), K(1), 3), 2, none), Offer::Flush);
     }
 
     #[test]
