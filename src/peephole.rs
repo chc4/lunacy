@@ -11,48 +11,34 @@ use crate::window::{windowed, Window};
 
 // Note [Peephole memory]
 // ~~~~~~~~~~~~~~~~~~~~~~
-// The peephole holds stores into elements of tables' array parts as it holds integer values, as
-// witchcraft holds stores: a store already known in the array part, of a value that isn't nil and
-// widens no kind, so it changes neither the part's length nor its kind. Cells are named as the
-// context knows values, by class: two are the same where their tables are and their keys are, as
-// classes or as constants; of different constant keys they are different, whatever their tables;
-// else they may be the same. A held store's registers are its inputs, held as a spell's are, so what the
-// context knows of them stays true while it is held.
+// The peephole holds stores into tables' array parts as it holds integer values, as witchcraft does,
+// but only those that leave the part's length and kind as they were, so nothing about the table but
+// the element changes while one is held.
 //
-// A store into a cell a held store is into makes that one dead, as a value overwritten unread. A
-// store into a cell that may be one a held store is into goes after it, as its dependency: there is
-// no order among the rest. A load of the cell exactly one held store is into, and no other may be,
-// is that store's value, with no load; any other load comes after the stores that may be into its
-// cell, laid out with their dependencies. What may read memory the context doesn't name, a window
-// op reading or writing it, a call, an exit, lays them all out, as it lays out the spells; what
-// reads only an array part's length and kind, as a guard on a key, doesn't.
+// An element is named by what the context knows of its table and key, the way witchcraft names
+// memory by its space: two are one element where both are known equal, are different where their
+// keys are different constants, and may be one otherwise. A store makes a held store into its
+// element dead and depends on held stores into elements that may be its; a load of an element only
+// one held store may be into is that store's value. A held store's registers are pinned as a spell's
+// inputs are, so what names its element stays true while it is held.
 
 // Note [Peephole fusion]
 // ~~~~~~~~~~~~~~~~~~~~~~
 // Each integer op checks that its result fits and boxes it, though the next often only reads it to
-// compute another: `(p - 1) % 256 + 1` checks and boxes three times. The peephole sees the
-// generators' integer ops as the specializer lays them out and holds each as a spell, as witchcraft
-// does: one per slot, the slot's value as a computation of values from before any held op. An op
-// reading a held value extends its spell where a rule matches, and an array-part guard on a held key
-// joins it, so a chain becomes one op that checks once. A value overwritten unread is never computed.
-// An integer's quotient by a constant is held as the double it is, and its floor is the floored
-// division. Whatever reads a held value without extending it, or lays out code, lays every spell
-// out; but a guard found out at runtime, of a value none holds, keeps them held on its ways, in code
-// of their own, unless one holds its instruction's operations, which a restart past it would repeat;
-// and so does a window op with no way out, touching no memory, computing from registers no spell
-// writes into registers none reads, which a restart running it again leaves as it was.
+// compute another. The peephole holds them as witchcraft holds ops: one spell per slot, its value a
+// computation of values from before anything held, so a chain is one op that checks once and a
+// value overwritten unread is never computed.
 //
-// Spells only read values from before any held op, so laying out those that read a slot before the
-// one that writes it computes each as its ops would have. Where one fails, those before it have
-// written and the rest haven't, and their inputs are intact; its exit computes the rest as Lua
-// would, and the code goes on from where the instruction that laid them out started, or from where
-// compiling went on in it, with those values unknown and that op not held. That instruction's own
-// ops run again, so the spell holding them must fail last and is written as it was before them.
+// What can't be held lays out only what it depends on, by witchcraft's two invariants: what it
+// reads, and, first, what reads a register it writes as that register was. The rest stays held,
+// unless what follows may observe it unwritten, by running again from before it or leaving for code
+// that doesn't know it.
 //
-// A constant known as no load made it, a promote's guarded value or one folded from such, is folded
-// into what reads it: the versions past a promote are one per value already, so its constants add
-// none. A loaded constant isn't: contraction drops it where nothing relies on it, as where a loop's
-// back edge meets it, and folding it would make a loop's counter a version per iteration.
+// A laid-out spell may fail. Its exit writes everything unwritten as Lua would and goes on from the
+// instruction that laid it out, which runs again, so that instruction's own ops fail last.
+//
+// Only a constant no load made is folded: a promote's values version the code already, but folding a
+// loaded one would make a version of a loop per value of its counter.
 
 /// An arithmetic operation of the integer encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,7 +85,7 @@ impl IntOp {
     }
 
     /// Its slot operands.
-    fn reads(&self) -> impl Iterator<Item = usize> {
+    pub fn reads(&self) -> impl Iterator<Item = usize> {
         [self.lhs, self.rhs].into_iter().filter_map(|o| match o { Operand::Slot(s) => Some(s), Operand::K(_) => None })
     }
 
@@ -183,6 +169,15 @@ impl Store {
         let value = match self.value { Stored::Slot(slot) => Some(slot), Stored::Boxed(_) => None };
         std::iter::once(self.cell.table).chain(key).chain(value)
     }
+}
+
+/// What an op the peephole doesn't hold needs of what it holds: the registers it reads and those
+/// it writes, and whether it may read or write memory. See Note [Peephole fusion].
+#[derive(Clone, Debug, Default)]
+pub struct Need {
+    pub reads: Vec<usize>,
+    pub writes: Vec<usize>,
+    pub memory: bool,
 }
 
 /// What a load of a cell becomes: the value a held store stores there, or itself, after the held
@@ -884,9 +879,46 @@ impl Spells {
         self.spells.is_empty() && self.stores.is_empty()
     }
 
-    /// The stores and spells laid out in instruction `at`, in order: each one op, and where it can
-    /// fail, its cold way's materializations of it and those after it. See Note [Peephole fusion].
-    pub fn lay_out(&self, at: usize) -> Vec<Laid> {
+    /// What to lay out before an op needing `need`, and what stays held, as witchcraft's
+    /// invariants have it: the spells whose values it reads, and the spells and stores reading a
+    /// register it writes, as it was, before it; then those reading what one of these writes, and
+    /// the stores one of these comes after; and every store, if it may touch memory. See Note
+    /// [Peephole fusion].
+    pub fn split(&self, need: &Need) -> (Spells, Spells) {
+        let mut spells: Vec<bool> = self.spells.iter().map(|s| need.reads.contains(&s.dest) || s.inputs.iter().any(|i| need.writes.contains(i))).collect();
+        let mut stores: Vec<bool> = self.stores.iter().map(|s| need.memory || s.inputs().any(|i| need.writes.contains(&i))).collect();
+        loop {
+            let written: Vec<usize> = self.spells.iter().zip(&spells).filter(|(_, laid)| **laid).map(|(s, _)| s.dest).collect();
+            let before: Vec<usize> = self.stores.iter().zip(&stores).filter(|(_, laid)| **laid).flat_map(|(s, _)| s.after.iter().copied()).collect();
+            let mut more = false;
+            for (s, laid) in self.spells.iter().zip(spells.iter_mut()) {
+                if !*laid && s.inputs.iter().any(|i| written.contains(i)) {
+                    *laid = true;
+                    more = true;
+                }
+            }
+            for (s, laid) in self.stores.iter().zip(stores.iter_mut()) {
+                if !*laid && (before.contains(&s.id) || s.inputs().any(|i| written.contains(&i))) {
+                    *laid = true;
+                    more = true;
+                }
+            }
+            if !more {
+                break;
+            }
+        }
+        let part = |laid: bool| Spells {
+            spells: self.spells.iter().zip(&spells).filter(|(_, l)| **l == laid).map(|(s, _)| s.clone()).collect(),
+            stores: self.stores.iter().zip(&stores).filter(|(_, l)| **l == laid).map(|(s, _)| s.clone()).collect(),
+            next: self.next,
+        };
+        (part(true), part(false))
+    }
+
+    /// The stores and spells laid out in instruction `at`, in order, with `held` held still: each
+    /// one op, and where it can fail, its cold way's materializations of it, those after it and
+    /// those held. See Note [Peephole fusion].
+    pub fn lay_out(&self, at: usize, held: &Spells) -> Vec<Laid> {
         let order: Vec<&Spell> = self.order(at).expect("held spells are in an order").into_iter().map(|i| &self.spells[i]).collect();
         let mut laid = Vec::with_capacity(self.stores.len() + order.len());
         // The stores first: they read registers as they were before any held operation, and write
@@ -901,8 +933,13 @@ impl Spells {
                 continue;
             }
             debug_assert!(order[..k].iter().all(|before| before.at != at), "a spell can fail after one with its instruction's operations");
-            let exit = order[k..].iter().filter_map(|s| if s.at == at { s.before_instruction(at) } else { Some(s) }).map(|s| s.ops().materialize).collect();
-            let unknown = order[k..].iter().map(|s| s.dest).collect();
+            // The held stores first, which read registers as they were, then the spells after it
+            // and those held, none of which reads what one before it wrote.
+            let unwritten = order[k..].iter().copied().chain(&held.spells);
+            let exit = held.stores.iter().map(|s| s.window.clone())
+                .chain(unwritten.clone().filter_map(|s| if s.at == at { s.before_instruction(at) } else { Some(s) }).map(|s| s.ops().materialize))
+                .collect();
+            let unknown = unwritten.map(|s| s.dest).collect();
             laid.push(Laid { op: ops.fused, checked: true, exit, unknown });
         }
         laid
@@ -938,7 +975,7 @@ mod tests {
     /// its cold way's materializations' names and operands.
     fn laid(spells: &Spells, at: usize) -> Vec<(&'static str, Vec<usize>, bool, Vec<(&'static str, Vec<usize>)>)> {
         let named = |w: &Rc<dyn Window>| (w.name(), w.operands().to_vec());
-        spells.lay_out(at).iter().map(|l| {
+        spells.lay_out(at, &Spells::default()).iter().map(|l| {
             let (name, operands) = named(&l.op);
             (name, operands, l.checked, l.exit.iter().map(named).collect())
         }).collect()
@@ -1094,7 +1131,76 @@ mod tests {
         store(&mut spells, element(1, K(1)), 5, 0);
         store(&mut spells, element(1, K(1)), 6, 1);
         assert_eq!(spells.stores.iter().map(|s| s.value).collect::<Vec<_>>(), [Stored::Slot(6)]);
-        assert_eq!(spells.lay_out(2).len(), 1);
+        assert_eq!(spells.lay_out(2, &Spells::default()).len(), 1);
+    }
+
+    /// What `split` lays out for `need`, and what it keeps: each's spells' registers and stores'
+    /// keys.
+    fn split(spells: &Spells, reads: &[usize], writes: &[usize], memory: bool) -> ((Vec<usize>, Vec<Operand>), (Vec<usize>, Vec<Operand>)) {
+        let need = Need { reads: reads.to_vec(), writes: writes.to_vec(), memory };
+        let (laid, kept) = spells.split(&need);
+        let regs = |s: &Spells| (s.spells.iter().map(|s| s.dest).collect(), s.stores.iter().map(|s| s.cell.key).collect());
+        (regs(&laid), regs(&kept))
+    }
+
+    #[test]
+    fn an_op_reading_a_spell_lays_out_only_it() {
+        // x = x + 1; y = y - 2; t[1] = z; then an op reading x: y's spell and the store stay held.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1), op(Arith::Sub, Slot(2), K(2), 2)]);
+        store(&mut spells, element(4, K(1)), 5, 2);
+        assert_eq!(split(&spells, &[1], &[6], false), ((vec![1], vec![]), (vec![2], vec![K(1)])));
+    }
+
+    #[test]
+    fn an_op_writing_what_a_spell_reads_lays_it_out() {
+        // y = x + 1, then an op writing x: y's spell reads x as it was, so it goes first; and so
+        // does a store of x.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 2), op(Arith::Sub, Slot(3), K(2), 3)]);
+        store(&mut spells, element(4, K(1)), 1, 1);
+        assert_eq!(split(&spells, &[], &[1], false), ((vec![2], vec![K(1)]), (vec![3], vec![])));
+    }
+
+    #[test]
+    fn what_reads_a_laid_out_spells_register_is_laid_out_before_it() {
+        // y = x + 1; x = x * 2; t[1] = x: an op reading x lays out x's spell, which writes x,
+        // which y's spell and the store read as it was.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 2), op(Arith::Mul, Slot(1), K(2), 1)]);
+        store(&mut spells, element(4, K(1)), 1, 2);
+        let ((mut laid, stores), kept) = split(&spells, &[1], &[6], false);
+        laid.sort();
+        assert_eq!((laid, stores, kept), (vec![1, 2], vec![K(1)], (vec![], vec![])));
+    }
+
+    #[test]
+    fn an_op_touching_memory_lays_out_the_stores() {
+        // t[1] = x; u[1] = y, the second after the first as they may be one element; then an op
+        // reading memory: both, and the spell stays held. Laying out the second alone lays out the
+        // first.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1)]);
+        store(&mut spells, element(4, K(1)), 5, 1);
+        store(&mut spells, element(6, K(1)), 7, 2);
+        assert_eq!(split(&spells, &[], &[], true), ((vec![], vec![K(1), K(1)]), (vec![1], vec![])));
+        assert_eq!(split(&spells, &[], &[7], false).0.1, vec![K(1), K(1)]);
+    }
+
+    #[test]
+    fn an_exit_writes_what_is_held_still() {
+        // x = x + 1, laid out; y = y + 2 and t[1] = z held still: where x's spell fails, its exit
+        // writes the store, then x and y as their operations would.
+        let mut spells = Spells::default();
+        hold(&mut spells, 0, &[op(Arith::Add, Slot(1), K(1), 1), op(Arith::Add, Slot(2), K(2), 2)]);
+        store(&mut spells, element(4, K(1)), 5, 2);
+        let (laid, kept) = spells.split(&Need { reads: vec![1], writes: vec![], memory: false });
+        let out = laid.lay_out(3, &kept);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].checked);
+        assert_eq!(out[0].exit.iter().map(|w| (w.name(), w.operands().to_vec())).collect::<Vec<_>>(),
+            [("TestStore", vec![4, 5]), ("MaterializeAdd", vec![1, 1]), ("MaterializeAdd", vec![2, 2])]);
+        assert_eq!(out[0].unknown, [1, 2]);
     }
 
     #[test]
@@ -1137,7 +1243,7 @@ mod tests {
         store(&mut spells, element(1, K(1)), 5, 0);
         store(&mut spells, element(2, K(1)), 6, 1);
         assert_eq!(spells.stores.len(), 2);
-        let laid: Vec<i32> = spells.lay_out(2).iter().map(|l| l.op.operands()[1] as i32).collect();
+        let laid: Vec<i32> = spells.lay_out(2, &Spells::default()).iter().map(|l| l.op.operands()[1] as i32).collect();
         assert_eq!(laid, [5, 6]);
     }
 
@@ -1151,7 +1257,7 @@ mod tests {
         store(&mut spells, element(1, K(2)), 5, 0);
         assert_eq!(load(&mut spells, element(1, K(2))), Ok(Stored::Slot(5)));
         assert!(!spells.untouched(&StoreNil::new(3, &[1])), "a store of nil lays out what is held");
-        let laid = spells.lay_out(2);
+        let laid = spells.lay_out(2, &Spells::default());
         assert_eq!(laid.iter().map(|l| l.op.name()).collect::<Vec<_>>(), ["TestStore"]);
         let mut after = Spells::default();
         assert!(after.across_guard(&crate::generators::InArrayK::new(2, &[1]), 3));
@@ -1269,7 +1375,7 @@ mod tests {
         // By a constant that isn't a power of two: the floored division.
         let mut spells = Spells::default();
         hold(&mut spells, 0, &[op(Arith::Div, Slot(1), K(10), 2), op(Arith::Floor, Slot(2), K(0), 3)]);
-        assert_eq!(spells.lay_out(2).iter().map(|l| l.op.name()).collect::<Vec<_>>(), ["ComputeDiv", "ComputeDivFloor"]);
+        assert_eq!(spells.lay_out(2, &Spells::default()).iter().map(|l| l.op.name()).collect::<Vec<_>>(), ["ComputeDiv", "ComputeDivFloor"]);
         // A floor of anything else isn't held.
         assert_eq!(Spells::default().offer(&op(Arith::Floor, Slot(2), K(0), 3), 0, none), Offer::Refused);
     }

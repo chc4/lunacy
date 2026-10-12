@@ -4261,7 +4261,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.entering = true;
             // What the peephole holds, before what lays out code here. See Note [Peephole fusion].
             // Its continuation goes on from before the instruction, to it: something before it was held.
-            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && self.held.is_some() && self.flush(owner, block_id, SubPc::new(pc - 1), &ctx, None, &[]) {
+            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && self.held.is_some() && self.flush(owner, block_id, SubPc::new(pc - 1), &ctx, None, &[], None) {
                 return ctx;
             }
             if let Some((next, nctx, ret)) = match inst.0.Opcode() {
@@ -4811,13 +4811,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 folded = Some(value);
                 true
             },
-            // Laid out first; or dropped, as what it overwrites, if nothing is left.
+            // What it needs laid out first, as witchcraft's invariants have it, then offered to
+            // what is held still; everything laid out first if that can't hold it either; or
+            // dropped, as what it overwrites, if nothing is left.
             Some(Offer::Flush | Offer::Refused) => {
                 let window = if optimistic { YieldOp::OptimisticExec(window.clone()) } else { YieldOp::ExecWindow(window.clone()) };
-                if self.flush(owner, block_id, pc, ctx, Some((Some(int_op), window, Box::new((**coro).clone()))), &[int_op.dest]) {
+                let then = || Some((Some(int_op), window.clone(), Box::new((**coro).clone()) as Box<dyn NativeGen>));
+                let need = crate::peephole::Need { reads: int_op.reads().collect(), writes: vec![int_op.dest], memory: false };
+                if self.flush(owner, block_id, pc, ctx, then(), &[int_op.dest], Some(need)) {
                     return Hold::Ended;
                 }
-                false
+                match self.held.as_mut().map(|held| held.spells.offer(&int_op, pc.0, known)) {
+                    Some(Offer::Held) => true,
+                    Some(Offer::Folded(value)) => {
+                        folded = Some(value);
+                        true
+                    },
+                    Some(Offer::Flush | Offer::Refused) => {
+                        if self.flush(owner, block_id, pc, ctx, then(), &[int_op.dest], None) {
+                            return Hold::Ended;
+                        }
+                        false
+                    },
+                    None => false,
+                }
             },
             None => false,
         };
@@ -4901,13 +4918,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    /// Lay out what the peephole holds at `pc` in `ctx`, in `block_id`, then `then`, the yield
-    /// laying it out, about to write `stale`. A spell that can fail ends its block in a `Branch`,
-    /// its cold way an exit, the code going on past the last; with none, the spells are laid out in
-    /// place. Whether it ended the block. See Note [Peephole fusion] in `peephole`.
-    fn flush(&mut self, owner: &mut Owner, block_id: BlockId, pc: SubPc, ctx: &Rc<Context>, then: AfterHeld, stale: &[usize]) -> bool {
-        let Some(held) = self.held.take() else { return false };
+    /// Lay out what the peephole holds at `pc` in `ctx`, in `block_id`, that `then`, the yield
+    /// laying it out, about to write `stale`, needs (`need`; everything without one), the rest held
+    /// still. A spell that can fail ends its block in a `Branch`, its cold way an exit, the code
+    /// going on past the last; with none, the spells are laid out in place. Whether it ended the
+    /// block. See Note [Peephole fusion] in `peephole`.
+    fn flush(&mut self, owner: &mut Owner, block_id: BlockId, pc: SubPc, ctx: &Rc<Context>, then: AfterHeld, stale: &[usize], need: Option<crate::peephole::Need>) -> bool {
+        let Some(all) = self.held.take() else { return false };
+        let (held, kept) = match &need {
+            Some(need) => all.spells.split(need),
+            None => (all.spells, crate::peephole::Spells::default()),
+        };
+        let held = Held { spells: held };
+        let kept = (!kept.is_empty()).then_some(Held { spells: kept });
+        if held.spells.is_empty() {
+            self.held = kept;
+            return false;
+        }
         let (at, restart, _) = self.instruction.clone().expect("spells are held in an instruction");
+        let still = kept.as_ref().map(|kept| kept.spells.clone()).unwrap_or_default();
         #[cfg(feature = "tracing")]
         crate::tracing::instant("peephole", "lay_out", &[
             ("line", self.traced_line(owner).into()),
@@ -4920,10 +4949,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }.as_str().into()),
             ("stores", (held.spells.stores.len() as u64).into()),
             ("spells", (held.spells.spells.len() as u64).into()),
-            ("windows", held.spells.lay_out(at).iter().map(|laid| laid.op.name()).collect::<Vec<_>>().join(" ").as_str().into()),
+            ("windows", held.spells.lay_out(at, &still).iter().map(|laid| laid.op.name()).collect::<Vec<_>>().join(" ").as_str().into()),
+            ("kept", ((still.stores.len() + still.spells.len()) as u64).into()),
         ]);
         let mut block = block_id;
-        for laid in held.spells.lay_out(at) {
+        for laid in held.spells.lay_out(at, &still) {
             if !laid.checked {
                 self.blocks[block.0].instructions.push(Residual::ExecWindow(laid.op));
                 continue;
@@ -4938,6 +4968,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.blocks[block.0].instructions.push(Residual::Branch { hot, cold });
             block = hot;
         }
+        // What `then` doesn't need, held past it.
+        self.held = kept;
         if block == block_id {
             return false;
         }
@@ -5016,7 +5048,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.held = Some(Held { spells: (*spells).clone() });
             let outer = vm.instruction.replace(restart.clone());
             let then: AfterHeld = Some((None, YieldOp::Call(CallTarget::Dynamic(a, b, c)), coro.clone()));
-            if !vm.flush(owner, block, pc, &ctx, then.clone(), &[]) {
+            if !vm.flush(owner, block, pc, &ctx, then.clone(), &[], None) {
                 // Laid out in place: the call goes on in the block.
                 if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx.clone(), Box::new(after_held(Rc::new(then))), ResumeArg::Start, block) {
                     vm.compile(owner, next, ctx, block);
@@ -6367,7 +6399,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let (writes, reads) = overwrites(&state).unwrap_or_default();
                 self.held.as_mut().unwrap().spells.drop_overwritten(&writes, &reads);
                 let CoroutineState::Yielded(then) = &state else { unreachable!("a generator's end lays out nothing") };
-                if self.flush(owner, block_id, pc, &ctx, Some((described, then.clone(), Box::new((*coro).clone()))), &writes) {
+                // A window op with no way out, writing no memory and updating no register in place,
+                // which a restart running it again leaves as it was, needs only what it reads,
+                // writes, and, reading memory, the stores. See Note [Peephole fusion] in `peephole`.
+                let need = match then {
+                    YieldOp::ExecWindow(w) if !w.selects() && !w.accesses().contains(&Access::Update)
+                        && matches!(w.memory(), crate::window::Memory::None | crate::window::Memory::Properties | crate::window::Memory::Reads) =>
+                        Some(crate::peephole::Need { reads: reads.clone(), writes: writes.clone(), memory: w.memory() == crate::window::Memory::Reads }),
+                    _ => None,
+                };
+                if self.flush(owner, block_id, pc, &ctx, Some((described, then.clone(), Box::new((*coro).clone()))), &writes, need) {
                     return None;
                 }
             } else if described.is_none() && matches!(state, CoroutineState::Yielded(YieldOp::ExecWindow(_))) && let Some(held) = self.held.as_mut() {

@@ -130,7 +130,7 @@ VIEWS = {
     'inline_return': ['line', 'callee', 'after', 'block', 'context'],
     'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'inlines', 'why'],
     'inline_refused': ['line', 'callee', 'call_block', 'reason'],
-    'peephole_lay_out': ['line', 'pc', 'block', 'trigger', 'stores', 'spells', 'windows'],
+    'peephole_lay_out': ['line', 'pc', 'block', 'trigger', 'stores', 'spells', 'windows', 'kept'],
     'peephole_store': ['line', 'pc', 'block', 'element', 'value', 'dead'],
     'peephole_load': ['line', 'pc', 'block', 'element', 'outcome'],
     'peephole_dead': ['line', 'pc', 'block', 'element', 'dead'],
