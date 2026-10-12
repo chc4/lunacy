@@ -231,6 +231,26 @@ jit-disasm benchmark times='10' features='unsafe':
 jit-code-size benchmark times='10': (jit-disasm benchmark times)
     python3 tools/jit_code_size.py working/jit_disasm.txt
 
+# `jit-disasm` of revision `ref`, from its compare worktree (as for
+# `hyperfine-vs`), on this checkout's compiled benchmark: in
+# working/jit_disasm-<ref>.txt.
+jit-disasm-rev ref benchmark times='10' features='unsafe':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _luac {{benchmark}}
+    just _compare-worktree {{ref}}
+    bin=$(realpath working/{{benchmark}}.bin)
+    dir=target/compare/{{ref}}
+    mkdir -p $dir/working
+    (cd $dir/working && {{SHARED}} cargo run --profile unsafe --no-default-features --features "{{features}} jit_disasm" --bin bench \
+        --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- $bin {{times}} > /dev/null)
+    mv $dir/working/jit_disasm.txt working/jit_disasm-{{ref}}.txt
+
+# How a benchmark's JIT code differs from revision `ref`'s, in bytes
+# (tools/jit_code_size.py --vs): by function, by kind of residual, and by pc.
+jit-code-size-vs ref benchmark times='10': (jit-disasm-rev ref benchmark times) (jit-disasm benchmark times)
+    python3 tools/jit_code_size.py working/jit_disasm.txt --vs working/jit_disasm-{{ref}}.txt --top 30
+
 # A golden test's JIT code, in bytes, as `jit-code-size` measures a benchmark's:
 # lua_tests/<name>.lua run by the unsafe build, as `jit-disasm` builds it (with
 # `magic`, for the tests that force JIT compiling).
