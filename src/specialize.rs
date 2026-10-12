@@ -478,7 +478,10 @@ impl Gen {
             YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
                 | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
                 | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_)
-                | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::Created(_) => true,
+                | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::Created(_) | YieldOp::Copy(..) => true,
+            // What the context knows of upvalues, and is told of them: no code.
+            YieldOp::LoadUpvalue(..) | YieldOp::UpvalueKnown(_) | YieldOp::UpvalueCell(_) | YieldOp::UpvalueHolds(..)
+                | YieldOp::Captures(..) | YieldOp::Close(_) => true,
             // Slots whose values are dead: what spells write there is never read, if none reads them.
             YieldOp::Clobber(from) => held.inputs().all(|slot| slot < *from),
             YieldOp::OptimisticExec(_) => described.is_some(),
@@ -517,6 +520,8 @@ impl Gen {
                 || held.spells.iter().all(|spell| spell.dest != *idx && spell.at != at),
             YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
             YieldOp::GuardCType(rk, expected) => rk & 0x100 != 0 || known(*rk, expected),
+            // Of a value the context knows: no code.
+            YieldOp::Promote(slot) => ctx.constant(*slot).is_some(),
             _ => false,
         }
     }
@@ -605,6 +610,16 @@ impl Gen {
     fn take(&mut self, yielded: YieldOp) {
         use crate::peephole::{MemOp, Need};
         match yielded {
+            // Of what the code holds where: a slot holding what it would be moved, which no spell
+            // writes, holds it.
+            YieldOp::HoldsValue(dest, src) => {
+                let ctx = self.ctx.as_ref().expect("a generator run in a context");
+                let unheld = |slot: usize| self.held.spells.iter().all(|spell| spell.dest != slot);
+                let holds = dest == src || (unheld(dest) && unheld(src)
+                    && ctx.values.members(Loc::root(Root::Slot(src as u16))).contains(&Root::Slot(dest as u16)));
+                self.next = Some(if holds { ResumeArg::Matched } else { ResumeArg::Failed });
+                return;
+            },
             YieldOp::IntegerOp(op) => {
                 self.described = Some(op);
                 self.next = Some(ResumeArg::Start);
@@ -638,8 +653,15 @@ impl Gen {
             // and, reading memory, the stores.
             let need = match &yielded {
                 YieldOp::ExecWindow(w) if !w.selects() && !w.accesses().contains(&Access::Update)
-                    && matches!(w.memory(), crate::window::Memory::None | crate::window::Memory::Properties | crate::window::Memory::Reads) =>
+                    && matches!(w.memory(), crate::window::Memory::None | crate::window::Memory::Properties | crate::window::Memory::Cells | crate::window::Memory::Reads) =>
                     Some(Need { reads: reads.clone(), writes: writes.clone(), memory: w.memory() == crate::window::Memory::Reads }),
+                // A guard found out at runtime, as one: what it reads, the rest held across it if
+                // they may be. See `Spells::across_guard`.
+                YieldOp::GuardDynamic(test) if !test.accesses().contains(&Access::Update)
+                    && matches!(test.memory(), crate::window::Memory::None | crate::window::Memory::Properties | crate::window::Memory::Cells | crate::window::Memory::Reads) => {
+                    let reads = test.operands().iter().zip(test.accesses()).filter(|(_, a)| a.reads()).map(|(s, _)| *s).collect();
+                    Some(Need { reads, writes: Vec::new(), memory: test.memory() == crate::window::Memory::Reads })
+                },
                 _ => None,
             };
             let trigger = match &yielded {
@@ -647,6 +669,9 @@ impl Gen {
                 yielded => format!("{yielded:?}").split(['(', ' ', '{']).next().unwrap_or("").to_string(),
             };
             self.lay_out(need, &writes, &trigger);
+            if let YieldOp::GuardDynamic(test) = &yielded && !self.held.is_empty() && !self.held.across_guard(&**test, self.at) {
+                self.lay_out(None, &writes, &trigger);
+            }
         } else if described.is_none() && matches!(yielded, YieldOp::ExecWindow(_)) {
             // Held across it: what it writes unread is dead.
             self.held.drop_overwritten(&writes, &reads);
@@ -819,6 +844,8 @@ pub enum YieldOp {
     Fused { op: Rc<dyn Window>, exit: Vec<Rc<dyn Window>>, unknown: Vec<usize> }, // What is held laid out, an op that
                                 // can fail: its exit writes `exit`, leaving `unknown` unknown
     Took, // A guard the peephole joined to what it holds, as passed
+    HoldsValue(usize, usize), // Resumed with Matched if STACK[dest] holds STACK[src]'s value
+                              // already, a move between them nothing. See Note [Peephole fusion]
     Created(usize), // STACK[idx] holds a table just made, which nothing watches. See Note [Watched tables]
     LayOut, // Lay out everything held
     LaidOut(Rc<dyn Window>), // What the peephole held, laid out: the context knew what it does when it was held
@@ -2586,6 +2613,7 @@ fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected
 
 /// The versions of a pc before jumps to it reuse one. See Note [Version compatibility].
 const MAX_VERSIONS: usize = 3;
+
 /// The values one version of a promote tests before it returns its argument
 /// unspecialized. See Note [Promoted values].
 pub const PROMOTE_VALUES: usize = 8;
@@ -5954,6 +5982,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
         }
         known.top = if c == 0 { returned.map(|returned| call + returned) } else { None };
+        // A parameter the callee's code never wrote holds what it was passed still: its slot past
+        // the results holds the caller's value. See Note [Inlined calls].
+        for &(n, root) in &continuation.args {
+            let slot = call + 1 + n as usize;
+            if slot >= call + count && slot < slots && ctx.values.members(Loc::root(Root::Arg(n))).contains(&Root::Slot(n as u16)) {
+                known.values.assign(Root::Slot(slot as u16), Loc::root(root));
+                known.types[slot] = match ctx.slot(n as usize) {
+                    CType::Shape(of, _) => CType::Type(of),
+                    ctype => ctype,
+                };
+            }
+        }
         (known, effects)
     }
 
@@ -7036,7 +7076,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.go_on(owner, compiled, inside);
                     return None;
                 },
-                CoroutineState::Yielded(YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_)) => unreachable!("the peephole takes what describes an op"),
+                CoroutineState::Yielded(YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_) | YieldOp::HoldsValue(..)) => unreachable!("the peephole takes what describes an op, or asks of what it holds"),
                 CoroutineState::Yielded(YieldOp::PeepholeTrace(_name, _fields)) => {
                     #[cfg(feature = "tracing")]
                     {

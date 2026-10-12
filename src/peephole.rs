@@ -801,7 +801,7 @@ impl Spells {
     /// computing only from registers no spell writes into registers none reads, so an exit going on
     /// from before it runs it again to the same end. What it overwrites unread is then dropped.
     pub fn untouched(&self, window: &dyn Window) -> bool {
-        window.memory() == crate::window::Memory::None && self.off_registers(window)
+        matches!(window.memory(), crate::window::Memory::None | crate::window::Memory::Cells) && self.off_registers(window)
     }
 
     /// Whether window op `window` has no way out, reads no register a spell writes, and writes none
@@ -846,7 +846,7 @@ impl Spells {
     /// and kind, which no held store changes, unless one holds its instruction's operations, which
     /// a restart past it would repeat.
     pub fn across_guard(&self, test: &dyn Window, at: usize) -> bool {
-        matches!(test.memory(), crate::window::Memory::None | crate::window::Memory::Properties)
+        matches!(test.memory(), crate::window::Memory::None | crate::window::Memory::Properties | crate::window::Memory::Cells)
             && self.spells.iter().all(|spell| !test.operands().contains(&spell.dest) && spell.at != at)
     }
 

@@ -447,6 +447,9 @@ pub enum Memory {
     /// a key is in it does. A store into an element already in it, of a value that isn't nil and
     /// widens no kind, changes neither, so it needn't be written before it.
     Properties,
+    /// Reads only upvalues' cells, never a table, nor through the running closure: a store into an
+    /// element changes nothing it reads.
+    Cells,
 }
 
 /// The owner of an op that touches no memory: nothing to reach the heap through. See Note
@@ -512,6 +515,9 @@ macro_rules! windowed {
     };
     (properties $($rest:tt)*) => {
         $crate::window::windowed!(@mem properties $($rest)*);
+    };
+    (cells $($rest:tt)*) => {
+        $crate::window::windowed!(@mem cells $($rest)*);
     };
     // Memory through the running closure: its upvalues, which it `upvalues` reads, or
     // `sets_upvalues` writes. See Note [Window memory].
@@ -647,6 +653,7 @@ macro_rules! windowed {
     (@owner frames, $owner:ident) => { $owner };
     (@owner properties, $owner:ident) => { &*$owner };
     (@owner upvalues, $owner:ident) => { &*$owner };
+    (@owner cells, $owner:ident) => { &*$owner };
     (@owner sets_upvalues, $owner:ident) => { $owner };
     (@memory none) => { $crate::window::Memory::None };
     (@memory reads) => { $crate::window::Memory::Reads };
@@ -654,6 +661,7 @@ macro_rules! windowed {
     (@memory frames) => { $crate::window::Memory::Frame };
     (@memory properties) => { $crate::window::Memory::Properties };
     (@memory upvalues) => { $crate::window::Memory::Reads };
+    (@memory cells) => { $crate::window::Memory::Cells };
     (@memory sets_upvalues) => { $crate::window::Memory::Writes };
     (@closure upvalues) => { true };
     (@closure sets_upvalues) => { true };

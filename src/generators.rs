@@ -1913,6 +1913,10 @@ pub fn emit_close(a: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return
 pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
+        // Into a slot holding its value already, nothing. See Note [Peephole fusion] in `peephole`.
+        if (yield YieldOp::HoldsValue(dest, src)) == ResumeArg::Matched {
+            return ResumeArg::Start;
+        }
         arg = yield YieldOp::Typeof(src);
         if let ResumeArg::Type(t) = arg.clone() {
             yield YieldOp::ExecWindow(Rc::new(Move::new(&[src, dest])));
@@ -1966,7 +1970,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
     move |mut arg: ResumeArg| {
         // An upvalue the context knows holds a native is that constant, not a
         // read. See Note [Fragile information].
-        windowed!(reads NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
+        windowed!(cells NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
             #[cfg(debug_assertions)]
             {
                 // The code's closure, below its frame, which needn't be the running one: an
@@ -1987,7 +1991,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
         });
         // One a slot is known to still hold is a move from that slot, or
         // nothing if it is the destination.
-        windowed!(reads HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
+        windowed!(cells HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
             #[cfg(debug_assertions)]
             {
                 // The code's closure, below its frame, which needn't be the running one: an
