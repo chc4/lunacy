@@ -29,7 +29,9 @@ use crate::window::{windowed, Window};
 // computation of values from before anything held, so a chain is one op that checks once and a
 // value overwritten unread is never computed. It is the coroutine the generators run in, so what it
 // holds is suspended with it wherever compiling is, and code compiled from a point where it holds
-// something is that point's own, never a version's.
+// something is that point's own, never a version's. An inlined call's frame is held as well, made
+// only once code inside it is laid out, so a callee whose code all folds returns into its caller's
+// code having made no frame.
 //
 // What can't be held lays out only what it depends on, by witchcraft's two invariants: what it
 // reads, and, first, what reads a register it writes as that register was. The rest stays held,
@@ -85,6 +87,11 @@ impl IntOp {
             _ => return None,
         };
         Some(IntOp { op, lhs, rhs, dest })
+    }
+
+    /// Loading constant `value` into `dest`: what it folds to, as the sum of it and nothing.
+    pub fn constant(value: i32, dest: usize) -> Self {
+        IntOp { op: Arith::Add, lhs: Operand::K(value), rhs: Operand::K(0), dest }
     }
 
     /// Its slot operands.
@@ -560,6 +567,24 @@ pub struct Spell {
 }
 
 impl Spell {
+    /// It, writing the slot `dest` names in place of its own, and reading those `input` does, as
+    /// instruction `at`'s.
+    fn renamed(&self, dest: &impl Fn(usize) -> usize, input: &impl Fn(usize) -> usize, at: usize) -> Spell {
+        let mut spell = self.clone();
+        spell.at = at;
+        spell.dest = dest(self.dest);
+        spell.inputs = self.inputs.iter().map(|&slot| input(slot)).collect();
+        spell.matched = Matched {
+            ks: self.matched.ks.clone(),
+            lhs: input(self.matched.lhs),
+            rhs: self.matched.rhs.map(input),
+            table: self.matched.table.map(input),
+            dest: dest(self.matched.dest),
+        };
+        spell.before = self.before.as_ref().map(|before| Box::new(before.renamed(dest, input, at)));
+        spell
+    }
+
     /// The spell of slot `dest` holding constant `value`, an operation of instruction `at` folded.
     fn constant(dest: usize, value: i32, at: usize) -> Spell {
         let node = TRIE.step(0, Sym::Const).expect("a constant is a rule");
@@ -785,6 +810,26 @@ impl Spells {
                 crate::window::Access::Write => self.inputs().all(|input| input != slot),
                 crate::window::Access::Update => false,
             })
+    }
+
+    /// What it holds, the spells of slots `keeps` keeps writing the slots `dest` names, and
+    /// everything reading the slots `input` does, as instruction `at`'s: a callee's, past its
+    /// return into its caller's code. See Note [Peephole fusion].
+    pub fn renamed(&self, dest: impl Fn(usize) -> usize, input: impl Fn(usize) -> usize, keeps: impl Fn(usize) -> bool, at: usize) -> Spells {
+        let spells = self.spells.iter().filter(|spell| keeps(spell.dest)).map(|spell| spell.renamed(&dest, &input, at)).collect();
+        let stores = self.stores.iter().map(|store| {
+            let mut store = store.clone();
+            let key = |key: Operand| match key { Operand::Slot(slot) => Operand::Slot(input(slot)), k => k };
+            store.cell = Element { table: input(store.cell.table), key: key(store.cell.key) };
+            if let Stored::Slot(slot) = store.value {
+                store.value = Stored::Slot(input(slot));
+            }
+            let operands: Vec<usize> = store.window.operands().iter().map(|&slot| input(slot)).collect();
+            store.window = store.window.with_operands(&operands);
+            store.at = at;
+            store
+        }).collect();
+        Spells { spells, stores, next: self.next }
     }
 
     /// Whether they stay held on both ways of guard `test` of instruction `at`, found out at

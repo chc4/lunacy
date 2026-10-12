@@ -328,6 +328,11 @@ pub trait Window: std::fmt::Debug {
     fn doubles(&self) -> u8 {
         0
     }
+    /// The same op on `operands` in place of its own, as `new` takes them.
+    fn with_operands(&self, operands: &[usize]) -> Rc<dyn Window> {
+        let _ = operands;
+        unimplemented!("{} on other operands", self.name())
+    }
     /// Its twin, if it has one: the same op on the same operands, taking some
     /// unboxed, which the JIT copies in its place. See `Twin`.
     fn twin(&self) -> Option<Rc<dyn Window>> {
@@ -838,6 +843,10 @@ macro_rules! windowed {
             fn operands(&self) -> &[usize] { &self.operands }
             fn accesses(&self) -> &'static [$crate::window::Access] { Self::ACCESSES }
             fn memory(&self) -> $crate::window::Memory { $crate::window::windowed!(@memory $mem) }
+            fn with_operands(&self, operands: &[usize]) -> std::rc::Rc<dyn $crate::window::Window> {
+                $crate::window::check_operands(stringify!($name), operands, Self::ACCESSES);
+                std::rc::Rc::new(Self { operands: operands.into(), ..self.clone() })
+            }
             fn captures(&self) -> $crate::window::Captures {
                 ::smallvec::smallvec![$($crate::window::Capture::to_bits(self.$cap)),*]
             }

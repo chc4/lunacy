@@ -170,6 +170,8 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
                 match yield YieldOp::EncodeK(dest, bx as usize) {
                     encoding if whole && encoding != ResumeArg::Type(CType::Type(LType::Double)) => {
                         let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(bx as usize)) else { unreachable!() };
+                        // A constant the peephole may hold. See Note [Peephole fusion] in `peephole`.
+                        yield YieldOp::IntegerOp(crate::peephole::IntOp::constant(k, dest));
                         yield YieldOp::ExecWindow(Rc::new(LoadK::new(LBoxed::from_int(k).bits(), &[dest])));
                         yield YieldOp::SetTypes(vec![(dest, LType::Integer)]);
                         // Rebuilt without the fact, it isn't introduced.
