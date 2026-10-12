@@ -544,9 +544,10 @@ impl Gen {
                     CType::NativeFunction(nf) => !nf.is_protected_call() && nf.generator().is_some(),
                     _ => true,
                 },
-            YieldOp::HashKey(_, key, _) => key & 0x100 == 0
-                // A constant key not a string has none either.
-                || !matches!(unsafe { &(&(*self.proto.unwrap()).constants.items)[key & 0xff] }, crate::chunk::Constant::String(_)),
+            // A field's key is no element: what it lays out reads and writes hash parts, of
+            // tables no held spell writes the register of. See Note [Peephole memory] in
+            // `peephole`.
+            YieldOp::HashKey(slot, key, _) => held.spells.iter().all(|spell| spell.dest != *slot && (key & 0x100 != 0 || spell.dest != *key)),
             YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
             // One found out at runtime keeps them held on its ways, if it reads none and none
             // holds its instruction's operations, which a restart past it would run again.
@@ -728,8 +729,12 @@ impl Gen {
             // and, reading memory, the stores.
             let need = match &yielded {
                 YieldOp::ExecWindow(w) if !w.selects() && !w.accesses().contains(&Access::Update)
-                    && matches!(w.memory(), crate::window::Memory::None | crate::window::Memory::Properties | crate::window::Memory::Cells | crate::window::Memory::Reads) =>
-                    Some(Need { reads: reads.clone(), writes: writes.clone(), memory: w.memory() == crate::window::Memory::Reads }),
+                    && matches!(w.memory(), crate::window::Memory::None | crate::window::Memory::Properties | crate::window::Memory::Cells | crate::window::Memory::Fields | crate::window::Memory::Reads) =>
+                    // A load described, what it reads of memory as it's held: `access`.
+                    Some(Need { reads: reads.clone(), writes: writes.clone(), memory: w.memory() == crate::window::Memory::Reads && memory.is_none() }),
+                // A field's key asked, what writes its table's or key's register. See Note [Peephole
+                // memory] in `peephole`.
+                YieldOp::HashKey(slot, key, _) => Some(Need { reads: [*slot].into_iter().chain((*key & 0x100 == 0).then_some(*key)).collect(), writes: Vec::new(), memory: false }),
                 // A guard found out at runtime, as one: what it reads, the rest held across it if
                 // they may be. See `Spells::across_guard`.
                 YieldOp::GuardDynamic(test) if !test.accesses().contains(&Access::Update)
@@ -1081,6 +1086,13 @@ fn cells(ctx: &Context, a: crate::peephole::Element, b: crate::peephole::Element
         Operand::K(k) => Some(k),
         Operand::Slot(slot) => ctx.constant(slot),
     };
+    // A table known watched is no held store's: a store into it trips first, in its instruction,
+    // and goes on elsewhere, and the elements code knows of it stay what they were. See Note
+    // [Watched tables].
+    let watched = |table: usize| ctx.values.fact(Loc::root(Root::Slot(table as u16)), WATCHED).is_some();
+    if watched(a.table) || watched(b.table) {
+        return Alias::Disjoint;
+    }
     // Different keys are different elements, whatever the tables.
     let keys = match (constant(a.key), constant(b.key), a.key, b.key) {
         (Some(x), Some(y), _, _) if x != y => return Alias::Disjoint,
@@ -1160,7 +1172,7 @@ pub enum ResumeArg {
 // witness; its cold path finds the key wherever it is (`href_init_slow`). Exit 0 if the table has
 // the key, where the field's type is guarded (`GuardWitness`), and 1 if not. See Notes [Hash
 // witnesses] and [Field types].
-windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
+windowed!(fields HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -1190,7 +1202,7 @@ windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table)
 // `HrefInit` for a hash key of a userdata, in its `__index` table: exit 0 if that has the key,
 // populating the witness, and 1 if not, or if it has no `__index` table. See Note [Userdata
 // fields].
-windowed!(writes select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (userdata) {
+windowed!(fields select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (userdata) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let LValue::Userdata(u) = userdata.unbox() else { unreachable!() };
     match u.ro(owner).index_table(owner, &state.index_key) {
@@ -1202,7 +1214,7 @@ windowed!(writes select HrefInitIndex, [at: u64, key: u64], [], |owner, state, b
 // `HrefInit` for a hash key at a place down its register's `__index` chain (`place`, as
 // `Place::bits`): exit 0 if the table there has the key, populating the witness, and 1 if not,
 // or if there's no table there. See Note [Table metatables].
-windowed!(writes select HrefInitAt, [at: u64, key: u64, place: u16], [], |owner, state, base| () {
+windowed!(fields select HrefInitAt, [at: u64, key: u64, place: u16], [], |owner, state, base| () {
     let (href, index) = (at as u8, (at >> 8) as usize);
     match state.place_table(owner, 0, Place::from_bits(place)) {
         Some(tab) => href_init_slow(owner, state, tab, href, index, key),

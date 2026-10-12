@@ -450,6 +450,9 @@ pub enum Memory {
     /// Reads only upvalues' cells, never a table, nor through the running closure: a store into an
     /// element changes nothing it reads.
     Cells,
+    /// Reads and writes only tables' hash parts, and the witnesses of their keys, never an array
+    /// part: no element a store into one is, nor one a load from one reads.
+    Fields,
 }
 
 /// The owner of an op that touches no memory: nothing to reach the heap through. See Note
@@ -518,6 +521,9 @@ macro_rules! windowed {
     };
     (cells $($rest:tt)*) => {
         $crate::window::windowed!(@mem cells $($rest)*);
+    };
+    (fields $($rest:tt)*) => {
+        $crate::window::windowed!(@mem fields $($rest)*);
     };
     // Memory through the running closure: its upvalues, which it `upvalues` reads, or
     // `sets_upvalues` writes. See Note [Window memory].
@@ -654,6 +660,7 @@ macro_rules! windowed {
     (@owner properties, $owner:ident) => { &*$owner };
     (@owner upvalues, $owner:ident) => { &*$owner };
     (@owner cells, $owner:ident) => { &*$owner };
+    (@owner fields, $owner:ident) => { $owner };
     (@owner sets_upvalues, $owner:ident) => { $owner };
     (@memory none) => { $crate::window::Memory::None };
     (@memory reads) => { $crate::window::Memory::Reads };
@@ -662,6 +669,7 @@ macro_rules! windowed {
     (@memory properties) => { $crate::window::Memory::Properties };
     (@memory upvalues) => { $crate::window::Memory::Reads };
     (@memory cells) => { $crate::window::Memory::Cells };
+    (@memory fields) => { $crate::window::Memory::Fields };
     (@memory sets_upvalues) => { $crate::window::Memory::Writes };
     (@closure upvalues) => { true };
     (@closure sets_upvalues) => { true };

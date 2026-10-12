@@ -268,7 +268,7 @@ windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
 // GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
 // [Global caches].
 // A cache that misses is refilled out of line.
-windowed!(writes GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
+windowed!(fields GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         Some(entry) => {
@@ -297,7 +297,7 @@ windowed!(writes GetGlobal, [cache: usize], [], |owner, state, base| (out dest) 
 });
 // A string's field, from the strings' table through the cache of its constant
 // key. See Note [String methods] in `specialize`.
-windowed!(writes GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
+windowed!(fields GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         Some(entry) => {
@@ -312,7 +312,7 @@ windowed!(writes GetStringMethod, [cache: usize], [], |owner, state, base| (out 
 });
 // A store that hits the cache and keeps the field's type stores in place; any
 // other, or one needing the write barrier, goes out of line.
-windowed!(writes SetGlobal, [cache: usize], [], |owner, state, base| (value) {
+windowed!(fields SetGlobal, [cache: usize], [], |owner, state, base| (value) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         // Hash keys of registers holding the environment know a field's type
@@ -680,7 +680,7 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
 }
 
 // Store through a hash key's witness into a register's table.
-windowed!(writes SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, state, base| (table, value) {
+windowed!(fields SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, state, base| (table, value) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     store_field(owner, state, &tab, value, href, expected, RETYPE);
     // Last. See Note [Write barriers].
@@ -689,7 +689,7 @@ windowed!(writes SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |ow
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.barrier_slow();
 });
-windowed!(writes SetTableHrefK, [href: u8, expected: Kind, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
+windowed!(fields SetTableHrefK, [href: u8, expected: Kind, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     // A constant's value lives as long as its prototype.
     let value = LBoxed::from_bits(value);
