@@ -2367,7 +2367,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // introduced the fact then becomes a thunk: code entering the block from its start ends there, as
 // the JIT and the trimming below read it, and the residuals after it are dead. Forced, the thunk
 // compiles the code from the origin again, as any thunk lays out its code (Note [Thunk patching]
-// in `jit`): in place, truncating the dead residuals.
+// in `jit`): in place, truncating the dead residuals. Origins sharing a residual, loads the
+// peephole held until one was laid out, share its thunk too: the earliest's, whose code loads the
+// rest again as each one's contraction decided.
 //
 // A fact can be rebuilt from the same origin another way: a constant that meets a double (Note
 // [Widening]) is loaded as a double instead, so every path from its load computes on the double.
@@ -3711,6 +3713,9 @@ pub struct Specializer<'src, 'intern> {
     unheld: Option<Pc>,
     /// Where each rebuilt block ends for code entering it from its start. See Note [Contraction].
     cuts: std::collections::HashMap<BlockId, usize, rustc_hash::FxBuildHasher>,
+    /// The instruction of the origin whose rebuild is yet to run at each place in a block. See
+    /// Note [Contraction].
+    rebuilding: std::collections::HashMap<(BlockId, usize), usize, rustc_hash::FxBuildHasher>,
     /// The targets of the code each rebuild replaced, whose blocks only it reaches are yet to be
     /// forgotten. See Note [Contraction].
     trimming: Vec<Vec<BlockId>>,
@@ -3782,6 +3787,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             entering: false,
             unheld: None,
             cuts: Default::default(),
+            rebuilding: Default::default(),
             trimming: Vec::new(),
             rebuilt: Default::default(),
             decided: Default::default(),
@@ -5110,12 +5116,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     block
                 };
+                vm.rebuilding.remove(&(block, offset));
                 let running = vm.proto;
                 vm.set_current(proto as LProto<'_, '_>);
                 let compiled = vm.compile_one(owner, pc, ctx.clone(), coro.clone(), how.clone(), at);
                 vm.go_on(owner, compiled, at);
                 vm.set_current(running);
             })));
+            // The earliest's of the origins sharing the residual. See Note [Contraction].
+            if vm.rebuilding.get(&(block, offset)).is_some_and(|&earlier| earlier < pc.0) {
+                return;
+            }
+            vm.rebuilding.insert((block, offset), pc.0);
             let residuals = &mut vm.blocks[block.0].instructions;
             if offset < residuals.len() {
                 residuals[offset] = Residual::Thunk(thunk);
