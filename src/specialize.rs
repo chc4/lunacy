@@ -679,6 +679,11 @@ impl Gen {
             }
         }
         let (writes, reads) = overwrites(&yielded);
+        // A held store named by a slot about to be written is named by another holding the value.
+        if !self.held.stores.is_empty() && !writes.is_empty() {
+            let ctx = self.ctx.clone().expect("a generator run in a context");
+            rehome(&mut self.held, &ctx, |slot| writes.contains(&slot));
+        }
         if !self.held.is_empty() && !self.passes(&yielded, described.as_ref(), memory.as_ref()) {
             // What writes a held value unread: that spell is dead.
             self.held.drop_overwritten(&writes, &reads);
@@ -2062,13 +2067,34 @@ fn makes_iterator<C>(proto: &crate::chunk::FunctionBlock<'_, C>, pc: Pc, a: usiz
     instructions.get(target).is_some_and(|inst| inst.0.Opcode() == Opcode::TFORLOOP && crate::vm::ABC::unpack(inst.0).0 as usize == a)
 }
 
+/// The lowest slot `ctx` knows holds the value slot `slot` does, of those `ok` takes: a name for
+/// what a held store names `slot` by. See Note [Peephole memory] in `peephole`.
+fn same_value(ctx: &Context, slot: usize, ok: impl Fn(usize) -> bool) -> Option<usize> {
+    ctx.values.members(Loc::root(Root::Slot(slot as u16))).into_iter()
+        .filter_map(|root| match root { Root::Slot(s) => Some(s as usize), _ => None })
+        .filter(|&s| s != slot && ok(s))
+        .min()
+}
+
+/// `held`'s stores naming no slot `dead` says is, in `ctx`, where another slot holds the value: a
+/// held store is of a value, whichever slot names it. See Note [Peephole memory] in `peephole`.
+fn rehome(held: &mut crate::peephole::Spells, ctx: &Context, dead: impl Fn(usize) -> bool) {
+    let written: Vec<usize> = held.spells.iter().map(|spell| spell.dest).collect();
+    held.rehome(|slot| dead(slot).then(|| same_value(ctx, slot, |s| !dead(s) && !written.contains(&s))).flatten());
+}
+
 /// What the peephole holds, `held`, at a call of R(A) with B of `callee` that is inlined: what's laid
 /// out first, as the callee's code names none of it, and what goes on held into the callee's code,
 /// in its slots. What names the caller's slots below the callee's frame is laid out, and what writes
 /// the frame past its arguments is dead, as entering it nils it, and what reads that laid out; one
 /// passed what's up to the top, or whose code is its return, takes nothing. See Note [Peephole fusion] in `peephole`.
-fn entering(held: &crate::peephole::Spells, callee: LProto<'static, 'static>, a: usize, b: usize) -> (crate::peephole::Spells, crate::peephole::Spells) {
+fn entering(held: &crate::peephole::Spells, calling: &Context, callee: LProto<'static, 'static>, a: usize, b: usize) -> (crate::peephole::Spells, crate::peephole::Spells) {
     let stack = unsafe { (*callee).max_stack } as usize;
+    // A store named by a slot below the frame is named by an argument holding the same value.
+    let mut held = held.clone();
+    if b != 0 {
+        rehome(&mut held, calling, |slot| !(a + 1..a + b).contains(&slot));
+    }
     // Code that is its return holds nothing to go on with.
     let returns = unsafe { (&(*callee).instructions.items)[0].0.Opcode() } == Opcode::RETURN;
     let (below, nilled): (Vec<usize>, Vec<usize>) = match b {
@@ -4919,6 +4945,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 self.blocks[after.0].promoted = known.promoted.clone();
                 self.blocks[block_id.0].instructions.push(Residual::Jump(after));
                 self.entering = true;
+                // The stores held named by the caller's locals where they name its temporaries.
+                let mut spells = spells;
+                let live = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(next).unwrap_or(usize::MAX);
+                rehome(&mut spells, &known, |slot| slot >= live);
                 self.compile_holding(owner, next, Rc::new(known), after, spells);
                 self.set_current(callee);
                 return ctx;
@@ -6137,7 +6167,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // The callee's code goes on from the peephole as it was at the call,
                             // holding what it held, but what can't go on into it, laid out first.
                             // See Note [Peephole fusion] in `peephole`.
-                            let (laid, kept) = entering(&coro.held, callee, a, b);
+                            let (laid, kept) = entering(&coro.held, &calling, callee, a, b);
                             let continuation = vm.continuation(&calling, ctx, captured, rest, a, c);
                             let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation, kept);
                             vm.held_first(owner, block, pc, &calling, laid, &restart, &mut vec![], Some(shift));
@@ -6528,7 +6558,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // From the call as it was, the peephole holding what it held there: where what it
                 // held is laid out goes on into the callee's code instead. See Note [Peephole
                 // fusion] in `peephole`.
-                let (laid, kept) = entering(&call.coro.held, call.callee, a, call.b);
+                let (laid, kept) = entering(&call.coro.held, &call.calling, call.callee, a, call.b);
                 let shift = vm.inline_call(owner, state, call.start.0, call.callee, a, call.b, entry, continuation, kept);
                 let into = if laid.is_empty() {
                     shift
@@ -7907,7 +7937,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         || self.continued.iter().any(|(of, at, known)| *of == proto && *at == target && **known == *ctx);
                     arg = match self.decode(target, &inst).filter(|_| !repeats) {
                         Some(generator) => {
-                            // What a jump there carries. See Note [Jumped-to contexts].
+                            // What a jump there carries, the stores held named by slots it keeps. See Note
+                            // [Jumped-to contexts].
+                            let live = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(target).unwrap_or(usize::MAX);
+                            rehome(&mut coro.held, &ctx, |slot| slot >= live);
                             ctx = self.jumping(owner, ctx, target);
                             // Only a call uses the top the instruction before left. See Note [Known top].
                             if ctx.top.is_some() && !matches!(inst.0.Opcode(), Opcode::CALL | Opcode::TAILCALL) {

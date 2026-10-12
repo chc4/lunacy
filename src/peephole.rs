@@ -815,6 +815,26 @@ impl Spells {
             })
     }
 
+    /// Its stores naming, in place of a slot, the one `name` gives for it, if any: a slot holding the
+    /// same value, which the store's cell is in as much. See Note [Peephole memory].
+    pub fn rehome(&mut self, name: impl Fn(usize) -> Option<usize>) {
+        let slot = |s: usize| name(s).unwrap_or(s);
+        for store in &mut self.stores {
+            let operands: Vec<usize> = store.window.operands().iter().map(|&s| slot(s)).collect();
+            if operands.as_slice() == store.window.operands() {
+                continue;
+            }
+            store.cell = Element {
+                table: slot(store.cell.table),
+                key: match store.cell.key { Operand::Slot(k) => Operand::Slot(slot(k)), k => k },
+            };
+            if let Stored::Slot(v) = store.value {
+                store.value = Stored::Slot(slot(v));
+            }
+            store.window = store.window.with_operands(&operands);
+        }
+    }
+
     /// Whether something it holds names slot `slot`: writes it, or reads it.
     pub fn names(&self, slot: usize) -> bool {
         self.spells.iter().any(|spell| spell.dest == slot || spell.inputs.contains(&slot))
