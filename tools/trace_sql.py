@@ -130,6 +130,10 @@ VIEWS = {
     'inline_return': ['line', 'callee', 'after', 'block', 'context'],
     'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'inlines', 'why'],
     'inline_refused': ['line', 'callee', 'call_block', 'reason'],
+    'peephole_lay_out': ['line', 'pc', 'block', 'trigger', 'stores', 'spells', 'windows'],
+    'peephole_store': ['line', 'pc', 'block', 'element', 'value', 'dead'],
+    'peephole_load': ['line', 'pc', 'block', 'element', 'outcome'],
+    'peephole_dead': ['line', 'pc', 'block', 'element', 'dead'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
@@ -138,7 +142,9 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'unreachable': ('spec', 'unreachable'), 'encoding': ('spec', 'encoding'),
           'widen': ('spec', 'widen'), 'evicted': ('spec', 'evicted'),
           'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return'),
-          'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused')}
+          'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused'),
+          'peephole_lay_out': ('peephole', 'lay_out'), 'peephole_store': ('peephole', 'store'),
+          'peephole_load': ('peephole', 'load'), 'peephole_dead': ('peephole', 'dead')}
 
 
 def connect(trace):

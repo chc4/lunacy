@@ -805,17 +805,26 @@ impl Spells {
 
     /// Hold the store of `value` into `cell`, as `window` stores it, in instruction `at`: a held
     /// store to the same cell is never read, and those to cells that may be its come before it.
-    /// `alias` says how two cells are. See Note [Peephole memory].
-    pub fn hold_store(&mut self, cell: Element, value: Stored, window: Rc<dyn Window>, at: usize, alias: impl Fn(Element, Element) -> Alias) {
+    /// `alias` says how two cells are. How many held stores it made dead. See Note [Peephole
+    /// memory].
+    pub fn hold_store(&mut self, cell: Element, value: Stored, window: Rc<dyn Window>, at: usize, alias: impl Fn(Element, Element) -> Alias) -> usize {
+        let dead = self.kill_stores(cell, &alias);
+        let after = self.stores.iter().filter(|s| alias(s.cell, cell) == Alias::May).map(|s| s.id).collect();
+        let id = self.next;
+        self.next += 1;
+        self.stores.push(Store { id, cell, value, window, at, after });
+        dead
+    }
+
+    /// Drop the held stores into `cell`, which a store about to run into it makes dead: nothing
+    /// reads the cell before it does. How many. See Note [Peephole memory].
+    pub fn kill_stores(&mut self, cell: Element, alias: impl Fn(Element, Element) -> Alias) -> usize {
         let dead: Vec<usize> = self.stores.iter().filter(|s| alias(s.cell, cell) == Alias::Same).map(|s| s.id).collect();
         self.stores.retain(|s| !dead.contains(&s.id));
         for store in &mut self.stores {
             store.after.retain(|id| !dead.contains(id));
         }
-        let after = self.stores.iter().filter(|s| alias(s.cell, cell) == Alias::May).map(|s| s.id).collect();
-        let id = self.next;
-        self.next += 1;
-        self.stores.push(Store { id, cell, value, window, at, after });
+        dead.len()
     }
 
     /// A load of `cell`: the value the one held store to it stores, if no other held store may be
@@ -1086,6 +1095,17 @@ mod tests {
         store(&mut spells, element(1, K(1)), 6, 1);
         assert_eq!(spells.stores.iter().map(|s| s.value).collect::<Vec<_>>(), [Stored::Slot(6)]);
         assert_eq!(spells.lay_out(2).len(), 1);
+    }
+
+    #[test]
+    fn a_store_about_to_run_kills_one_held_into_its_element() {
+        // t[1] = x; t[1] = y, the second laid out as it is: the first is dead whether or not the
+        // second is held, and t[2]'s store stays held.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        store(&mut spells, element(1, K(2)), 6, 1);
+        assert_eq!(spells.kill_stores(element(1, K(1)), alias), 1);
+        assert_eq!(spells.stores.iter().map(|s| s.cell).collect::<Vec<_>>(), [element(1, K(2))]);
     }
 
     #[test]

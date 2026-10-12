@@ -484,6 +484,8 @@ fn passes_held(held: &Held, ctx: &Context, at: usize, state: &CoroutineState<Yie
             // What a load from a frozen table, or a test, asks of what the context knows, and
             // what it learns of the register the load writes. See Note [Frozen tables].
             YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) => true,
+            // What a load from an array part learns of its register.
+            YieldOp::ArrayType(..) => true,
             // What a call asks of a native it may make a window op.
             YieldOp::NativeWindowArgs(..) => true,
             // A call of a native with a generator is compiled by it, holding them; of a function
@@ -4847,7 +4849,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Table access `op`, of window `window`, at `pc` in `ctx`: a store held, or a load of a cell a
     /// held store is into its value, or after the held stores that may be into it. Whether it laid
     /// the access out, or held it. See Note [Peephole memory] in `peephole`.
-    fn access(&mut self, block_id: BlockId, op: crate::peephole::MemOp, window: &Rc<dyn Window>, pc: SubPc, ctx: &mut Rc<Context>) -> bool {
+    fn access(&mut self, owner: &Owner, block_id: BlockId, op: crate::peephole::MemOp, window: &Rc<dyn Window>, pc: SubPc, ctx: &mut Rc<Context>) -> bool {
         use crate::peephole::{Load, MemOp, Stored};
         let holds = crate::peephole::fuses() && self.instruction.as_ref().is_some_and(|(at, _, holds)| *at == pc.0 && *holds);
         let known = ctx.clone();
@@ -4855,12 +4857,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         match op {
             MemOp::Store { cell, value } if holds => {
                 let held = self.held.get_or_insert_with(Held::default);
-                held.spells.hold_store(cell, value, window.clone(), pc.0, alias);
+                let _dead = held.spells.hold_store(cell, value, window.clone(), pc.0, alias);
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("peephole", "store", &[
+                    ("line", self.traced_line(owner).into()),
+                    ("pc", (pc.0 as u64).into()),
+                    ("block", (block_id.0 as u64).into()),
+                    ("element", format!("{cell:?}").as_str().into()),
+                    ("value", format!("{value:?}").as_str().into()),
+                    ("dead", (_dead as u64).into()),
+                ]);
                 true
             },
             MemOp::Load { cell, dest } => {
                 let Some(held) = self.held.as_mut().filter(|held| !held.spells.stores.is_empty()) else { return false };
-                let load = match held.spells.load(cell, alias) {
+                let outcome = held.spells.load(cell, alias);
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("peephole", "load", &[
+                    ("line", self.traced_line(owner).into()),
+                    ("pc", (pc.0 as u64).into()),
+                    ("block", (block_id.0 as u64).into()),
+                    ("element", format!("{cell:?}").as_str().into()),
+                    ("outcome", match &outcome {
+                        Load::Forward(value) => format!("forward {value:?}"),
+                        Load::After(stores) => format!("after {}", stores.len()),
+                    }.as_str().into()),
+                ]);
+                let load = match outcome {
                     Load::Forward(Stored::Slot(slot)) => Rc::new(crate::generators::Move::new(&[slot, dest])) as Rc<dyn Window>,
                     Load::Forward(Stored::Boxed(bits)) => Rc::new(crate::generators::LoadStored::new(bits, &[dest])),
                     Load::After(stores) => {
@@ -4885,6 +4908,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn flush(&mut self, owner: &mut Owner, block_id: BlockId, pc: SubPc, ctx: &Rc<Context>, then: AfterHeld, stale: &[usize]) -> bool {
         let Some(held) = self.held.take() else { return false };
         let (at, restart, _) = self.instruction.clone().expect("spells are held in an instruction");
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("peephole", "lay_out", &[
+            ("line", self.traced_line(owner).into()),
+            ("pc", (pc.0 as u64).into()),
+            ("block", (block_id.0 as u64).into()),
+            ("trigger", match &then {
+                Some((_, YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w), _)) => format!("window {}", w.name()),
+                Some((_, yielded, _)) => format!("{yielded:?}").split(['(', ' ', '{']).next().unwrap_or("").to_string(),
+                None => String::new(),
+            }.as_str().into()),
+            ("stores", (held.spells.stores.len() as u64).into()),
+            ("spells", (held.spells.spells.len() as u64).into()),
+            ("windows", held.spells.lay_out(at).iter().map(|laid| laid.op.name()).collect::<Vec<_>>().join(" ").as_str().into()),
+        ]);
         let mut block = block_id;
         for laid in held.spells.lay_out(at) {
             if !laid.checked {
@@ -6310,6 +6347,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut state = Pin::new(&mut coro).resume(arg);
             arg = ResumeArg::Start;
             'machine: loop {
+            // A store about to run makes held stores into its element dead, laid out first or not.
+            // See Note [Peephole memory] in `peephole`.
+            if let (Some(crate::peephole::MemOp::Store { cell, .. }), CoroutineState::Yielded(YieldOp::ExecWindow(_)), Some(held)) = (&memory, &state, self.held.as_mut()) {
+                let _dead = held.spells.kill_stores(*cell, |a, b| cells(&ctx, a, b));
+                #[cfg(feature = "tracing")]
+                if _dead > 0 {
+                    crate::tracing::instant("peephole", "dead", &[
+                        ("line", self.traced_line(owner).into()),
+                        ("pc", (pc.0 as u64).into()),
+                        ("block", (block_id.0 as u64).into()),
+                        ("element", format!("{cell:?}").as_str().into()),
+                        ("dead", (_dead as u64).into()),
+                    ]);
+                }
+            }
             if self.held.as_ref().is_some_and(|held| !passes_held(held, &ctx, pc.0, &state, described.as_ref(), memory.as_ref(), self.proto)) {
                 // What writes a held value unread: that spell is dead.
                 let (writes, reads) = overwrites(&state).unwrap_or_default();
@@ -6561,7 +6613,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::MemoryOp(op)) => {
                     memory = Some(op);
                 },
-                CoroutineState::Yielded(YieldOp::ExecWindow(ref w)) if let Some(op) = memory.take() && self.access(block_id, op, w, pc, &mut ctx) => {},
+                CoroutineState::Yielded(YieldOp::ExecWindow(ref w)) if let Some(op) = memory.take() && self.access(owner, block_id, op, w, pc, &mut ctx) => {},
                 CoroutineState::Yielded(YieldOp::OptimisticExec(ref op)) if let Some(int_op) = described.take() => {
                     match self.hold(owner, block_id, int_op, op, true, &coro, pc, &mut ctx) {
                         Hold::Held => {
