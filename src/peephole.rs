@@ -483,13 +483,10 @@ const DIV_FLOOR: Rule = Rule { name: "DIV_FLOOR", pattern: &[Sym::K(DIV), Sym::K
     Ops { fused: op.clone(), compute: op.clone(), materialize: op }
 }};
 
-// A constant, stored.
-windowed!(StoreInt, [k: u64], [], |owner, state, base, tag| (out dest) {
-    *dest = LBoxed::from_int_tagged(k as i32, tag);
-});
+// A constant, loaded.
 const CONST_: Rule = Rule { name: "CONST_", pattern: &[Sym::Const], make: |m| {
-    let store: Rc<dyn Window> = Rc::new(StoreInt::new(m.ks[0] as u32 as u64, &[m.dest]));
-    Ops { fused: store.clone(), compute: store.clone(), materialize: store }
+    let load: Rc<dyn Window> = Rc::new(crate::generators::LoadK::new(LBoxed::from_int(m.ks[0]).bits(), &[m.dest]));
+    Ops { fused: load.clone(), compute: load.clone(), materialize: load }
 }};
 
 /// Every rule.
@@ -1402,7 +1399,7 @@ mod tests {
         assert_eq!(spells.offer(&op(Arith::Add, Slot(1), K(1), 2), 0, known), Offer::Folded(256));
         assert_eq!(spells.offer(&op(Arith::Mod, Slot(2), K(256), 2), 1, |slot| (slot == 2).then_some(256)), Offer::Folded(0));
         assert_eq!(held(&spells), [("CONST_", 2, vec![])]);
-        assert_eq!(laid(&spells, 2), [("StoreInt", vec![2], false, vec![])]);
+        assert_eq!(laid(&spells, 2), [("LoadK", vec![2], false, vec![])]);
         // One constant operand is a step.
         let mut spells = Spells::default();
         assert_eq!(spells.offer(&op(Arith::Add, Slot(3), Slot(1), 4), 0, known), Offer::Held);

@@ -155,15 +155,16 @@ macro_rules! integer_operands {
     }};
 }
 
+// The constant's boxed value is the op's hole: a whole number is an integer, any other a double.
+// See Note [Integers] in `specialize`.
+windowed!(LoadK, [bits: u64], [], |owner, state, base| (out dest) {
+    // A constant's value lives as long as its prototype.
+    *dest = LBoxed::from_bits(bits);
+});
+
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // The constant's boxed value is the op's hole: a whole number is an integer,
-        // any other a double. See Note [Integers] in `specialize`.
-        windowed!(LoadK, [bits: u64], [], |owner, state, base| (out dest) {
-            // A constant's value lives as long as its prototype.
-            *dest = LBoxed::from_bits(bits);
-        });
         match c {
             LType::Integer | LType::Double => {
                 let whole = (yield YieldOp::IntegralK(bx as usize)) == ResumeArg::Matched;
