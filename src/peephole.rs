@@ -37,8 +37,9 @@ use crate::window::{windowed, Window};
 // A laid-out spell may fail. Its exit writes everything unwritten as Lua would and goes on from the
 // instruction that laid it out, which runs again, so that instruction's own ops fail last.
 //
-// Only a constant no load made is folded: a promote's values version the code already, but folding a
-// loaded one would make a version of a loop per value of its counter.
+// Every constant the context knows is folded, but what it folds to is known past it only if no load
+// made the constant: a loaded constant's fact is contraction's to drop, and knowing what a loop's
+// counter folds to would make a version of the loop per value.
 
 /// An arithmetic operation of the integer encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

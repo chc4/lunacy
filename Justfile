@@ -130,6 +130,16 @@ show-trace:
 trace-sql query:
     python3 tools/trace_sql.py "{{query}}"
 
+# Each golden test's versions, as `trace-golden` traces it: live at the end, the most live at one
+# point, and made in all (tools/trace_sql.py's point_versions).
+golden-versions +names:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for name in {{names}}; do
+        just trace-golden "$name" > /dev/null 2>&1
+        echo "$name: $(python3 tools/trace_sql.py 'SELECT sum(live) AS live, max(live) AS most, sum(created) AS created FROM point_versions' | tail -1)"
+    done
+
 # The named golden tests (lua_tests/<name>.lua), each against its expected
 # output, in one debug build with `test`'s golden suite's features: quicker than
 # the whole suite while iterating.

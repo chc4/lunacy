@@ -4796,15 +4796,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         if !crate::peephole::fuses() || !self.instruction.as_ref().is_some_and(|(at, _, holds)| *at == pc.0 && *holds) {
             return Hold::Not;
         }
-        // What it folds to, its operands constants the context knows no load made: a promote's
-        // guarded values, and those folded from them. A load's constant is left to contraction,
-        // which relying on it would refuse. See Note [Peephole fusion] in `peephole`.
+        // What it folds to, its operands constants the context knows: a fact past it only if no
+        // load made them, as a loaded constant's fact is left to contraction, which this code
+        // doesn't keep it from dropping. See Note [Peephole fusion] in `peephole`.
         let mut folded = None;
         let known = ctx.clone();
         let known = |slot: usize| match known.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT) {
-            Some(Known::Constant { value, origins: None }) => Some(*value),
+            Some(Known::Constant { value, .. }) => Some(*value),
             _ => None,
         };
+        let loaded: Vec<usize> = int_op.reads()
+            .filter(|&slot| matches!(ctx.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT), Some(Known::Constant { origins: Some(_), .. })))
+            .collect();
         let joined = match self.held.as_mut().map(|held| held.spells.offer(&int_op, pc.0, known)) {
             Some(Offer::Held) => true,
             Some(Offer::Folded(value)) => {
@@ -4857,7 +4860,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Rc::make_mut(ctx).effect(Effect::Write(slot));
             }
         }
-        if let Some(value) = folded {
+        if let Some(value) = folded && loaded.is_empty() {
             Rc::make_mut(ctx).values.learn(Loc::root(Root::Slot(int_op.dest as u16)), Known::Constant { value, origins: None });
         }
         Hold::Held
