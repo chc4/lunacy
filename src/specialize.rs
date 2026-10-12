@@ -345,7 +345,7 @@ impl Gen {
                 | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::IsKey(..)
                 | YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) | YieldOp::ArrayType(..)
                 | YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) | YieldOp::NativeWindowArgs(..)
-                | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Took | YieldOp::Holding { .. } => true,
+                | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Took | YieldOp::Holding { .. } | YieldOp::Created(_) => true,
             YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
             YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected)),
             YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
@@ -443,7 +443,7 @@ impl Gen {
             YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
                 | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
                 | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_)
-                | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) => true,
+                | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::Created(_) => true,
             // Slots whose values are dead: what spells write there is never read, if none reads them.
             YieldOp::Clobber(from) => held.inputs().all(|slot| slot < *from),
             YieldOp::OptimisticExec(_) => described.is_some(),
@@ -786,6 +786,7 @@ pub enum YieldOp {
     Fused { op: Rc<dyn Window>, exit: Vec<Rc<dyn Window>>, unknown: Vec<usize> }, // What is held laid out, an op that
                                 // can fail: its exit writes `exit`, leaving `unknown` unknown
     Took, // A guard the peephole joined to what it holds, as passed
+    Created(usize), // STACK[idx] holds a table just made, which nothing watches. See Note [Watched tables]
     LayOut, // Lay out everything held
     LaidOut(Rc<dyn Window>), // What the peephole held, laid out: the context knew what it does when it was held
     Frame(Residual), // Make an inlined call's frame, as the residual does, the code going on inside it
@@ -1707,6 +1708,10 @@ fn name_hash(name: &[u8]) -> u64 {
 // known of the table's contents goes. A trip is an effect, and what was learned through a watch is
 // whatever doesn't survive it: a domain learned that way says so, as any domain does of the
 // effects it survives (Note [Fragile information]).
+//
+// A store's check passed, or the table just made, the code after it knows the table unwatched, and
+// checks it no more until a watch may have made it watched. A watch is an effect too, which no table's being unwatched
+// survives, so a callee's reaches its caller as its other effects do (Note [Call effects]).
 
 // Note [Frozen tables]
 // ~~~~~~~~~~~~~~~~~~~~~
@@ -2729,6 +2734,8 @@ pub enum Known {
     Watched(u64),
     /// The value, boxed. See Note [Frozen tables].
     Value(u64),
+    /// The value is a table that isn't watched. See Note [Watched tables].
+    Unwatched,
 }
 
 /// The keys of `Known`'s domains.
@@ -2737,7 +2744,8 @@ pub const KIND: u8 = 1;
 pub const CONSTANT: u8 = 2;
 pub const WATCHED: u8 = 3;
 pub const VALUE: u8 = 4;
-const KEYS: [u8; 5] = [TYPE, KIND, CONSTANT, WATCHED, VALUE];
+pub const UNWATCHED: u8 = 5;
+const KEYS: [u8; 6] = [TYPE, KIND, CONSTANT, WATCHED, VALUE, UNWATCHED];
 
 /// What a context knows of values. See Note [Fragile information].
 pub type Values = crate::classes::Classes<Known>;
@@ -2762,6 +2770,7 @@ impl PartialEq for Known {
             (Known::Kind(a), Known::Kind(b)) => a == b,
             (Known::Constant { value: a, .. }, Known::Constant { value: b, .. }) => a == b,
             (Known::Watched(a), Known::Watched(b)) | (Known::Value(a), Known::Value(b)) => a == b,
+            (Known::Unwatched, Known::Unwatched) => true,
             _ => false,
         }
     }
@@ -2784,6 +2793,7 @@ impl std::hash::Hash for Known {
             Known::Constant { value, .. } => (CONSTANT, value).hash(state),
             Known::Watched(bits) => (WATCHED, bits).hash(state),
             Known::Value(bits) => (VALUE, bits).hash(state),
+            Known::Unwatched => UNWATCHED.hash(state),
         }
     }
 }
@@ -2796,6 +2806,7 @@ impl std::fmt::Debug for Known {
             Known::Constant { value, .. } => write!(f, "constant {value}"),
             Known::Watched(bits) => write!(f, "watched {bits:#x}"),
             Known::Value(bits) => write!(f, "value {bits:#x}"),
+            Known::Unwatched => write!(f, "unwatched"),
         }
     }
 }
@@ -2809,6 +2820,7 @@ impl crate::classes::ClassFact for Known {
             Known::Constant { .. } => CONSTANT,
             Known::Watched(_) => WATCHED,
             Known::Value(_) => VALUE,
+            Known::Unwatched => UNWATCHED,
         }
     }
     fn join(&self, other: &Self) -> Option<Self> {
@@ -2860,6 +2872,8 @@ pub enum Effect {
     /// A watched table's watchpoint trips: what was learned through a watch is dropped. See Note
     /// [Watched tables].
     Trip,
+    /// A table is watched: no table is known not to be. See Note [Watched tables].
+    Watch,
 }
 
 // Note [Call effects]
@@ -2896,8 +2910,10 @@ impl Effects {
     pub const UPVALUE: Effects = Effects(1 << 8);
     /// Some table's hash part is stored into.
     pub const HASH: Effects = Effects(1 << 9);
+    /// Some table is watched.
+    pub const WATCH: Effects = Effects(1 << 11);
     /// Code the specializer never saw ran: every other effect too.
-    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::OPAQUE_BIT);
+    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::WATCH.0 | Self::OPAQUE_BIT);
     /// The representations stored into some table's array part, as `LType::bit`s.
     const ARRAYS: u16 = {
         let mut bits = 0;
@@ -2927,6 +2943,7 @@ impl Effects {
             Effect::ArrayStore(Some(stored)) => Effects(stored.bit() as u16),
             // Its callers' code is replaced as it trips. See Note [Watched tables].
             Effect::Trip => Effects::NONE,
+            Effect::Watch => Effects::WATCH,
         }
     }
 
@@ -2946,6 +2963,9 @@ impl Effects {
         }
         if self.0 & Self::HASH.0 != 0 {
             ctx.set_hazards(None, None);
+        }
+        if self.0 & Self::WATCH.0 != 0 {
+            ctx.effect(Effect::Watch);
         }
         for stored in Self::REPRESENTATIONS.into_iter().filter(|stored| self.0 & stored.bit() as u16 != 0) {
             ctx.effect(Effect::ArrayStore(Some(stored)));
@@ -3090,6 +3110,7 @@ impl Context {
                 _ => true,
             }),
             Effect::Trip => self.values.retain_facts(Known::survives_trip),
+            Effect::Watch => self.values.retain_facts(|fact| !matches!(fact, Known::Unwatched)),
         }
         self.inlined(Effects::of(effect));
     }
@@ -6848,6 +6869,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     pc = pc.next_true();
                 },
                 CoroutineState::Yielded(YieldOp::LayOut) => {},
+                CoroutineState::Yielded(YieldOp::Created(slot)) => {
+                    Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Unwatched);
+                },
                 CoroutineState::Yielded(YieldOp::LaidOut(w)) => {
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
                 },
@@ -6941,6 +6965,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::Matched;
                 },
                 CoroutineState::Yielded(YieldOp::Watching(slot, freezes)) => {
+                    if freezes {
+                        Rc::make_mut(&mut ctx).effect(Effect::Watch);
+                        // See Note [Call effects].
+                        self.join_effects(owner, Effects::WATCH);
+                    }
                     let thunk = self.make_watch_thunk(block_id, coro.clone(), slot, pc, ctx.clone(), true, freezes);
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
@@ -6964,6 +6993,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         _ => ResumeArg::Failed,
                     };
                 },
+                // A table known unwatched is checked no more. See Note [Watched tables].
+                CoroutineState::Yielded(YieldOp::Trip(Some(slot))) if ctx.values.fact(Loc::root(Root::Slot(slot as u16)), UNWATCHED).is_some() => {
+                    pc = pc.next_true();
+                    arg = ResumeArg::Matched;
+                },
                 CoroutineState::Yielded(YieldOp::Trip(of)) => {
                     // Its cold way, the table watched, goes on knowing no element. See Note
                     // [Watched tables].
@@ -6973,7 +7007,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     };
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(check));
-                    let hot = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
+                    let mut passed = (*ctx).clone();
+                    if let Some(slot) = of {
+                        passed.values.learn(Loc::root(Root::Slot(slot as u16)), Known::Unwatched);
+                    }
+                    let hot = self.subblock(owner, pc.next_true(), Rc::new(passed), coro.clone(), ResumeArg::Matched);
                     let cold = self.new_block(pc.0);
                     let mut unwatched = (*ctx).clone();
                     unwatched.effect(Effect::Trip);

@@ -1021,8 +1021,9 @@ pub fn emit_newtable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         arg = yield YieldOp::Exec(ResidualExec::new("newtable", Rc::new(move |owner, state| {
             // TODO: properly decode the "floating point byte" size hints instead
             state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::Table(Tc::new(Table::new(b as usize, c as usize))));
-        })));
+        })).writing(&[a]));
         yield YieldOp::SetTypes(vec![(a, LType::Table)]);
+        yield YieldOp::Created(a);
         yield YieldOp::CollectGarbage;
         arg
     }
