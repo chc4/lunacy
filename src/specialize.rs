@@ -269,6 +269,8 @@ pub struct Gen {
     /// The integer op, or table access, the window the generator yields next is.
     described: Option<crate::peephole::IntOp>,
     memory: Option<crate::peephole::MemOp>,
+    /// What the instruction's generator returned, as the peephole asks for the next's.
+    done: Option<ResumeArg>,
 }
 
 impl Gen {
@@ -290,7 +292,21 @@ impl Gen {
             last: None,
             described: None,
             memory: None,
+            done: None,
         })
+    }
+
+    /// `inner`, a generator boxed, run holding `held`.
+    pub fn holding_of(held: crate::peephole::Spells, inner: Box<dyn NativeGen>) -> Box<Gen> {
+        let mut holding = Self::of(inner);
+        holding.held = held;
+        holding
+    }
+
+    /// Go on with the next instruction's generator, `inner`, holding what it holds: its answer to
+    /// `NextPc`. See Note [Peephole fusion] in `peephole`.
+    pub fn next_instruction(&mut self, inner: Box<dyn NativeGen>) {
+        self.inner = inner;
     }
 
     /// `inner`, run holding `held`.
@@ -709,13 +725,24 @@ impl Coroutine<ResumeArg> for Gen {
             if let Some(yielded) = this.out.pop_front() {
                 return CoroutineState::Yielded(yielded);
             }
+            // Its answer to `NextPc`: the next instruction's generator, given, or none, where the
+            // specializer goes on itself.
+            if let Some(done) = this.done.take() {
+                if answer.take() != Some(ResumeArg::Matched) {
+                    return CoroutineState::Complete(done);
+                }
+                answer = Some(ResumeArg::Start);
+            }
             let arg = match this.next.take() {
                 Some(own) => own,
                 None => answer.take().unwrap_or(ResumeArg::Start),
             };
             answer = None;
             match Pin::new(&mut *this.inner).resume(arg) {
-                CoroutineState::Complete(arg) => return CoroutineState::Complete(arg),
+                CoroutineState::Complete(arg) => {
+                    this.done = Some(arg);
+                    this.out.push_back(YieldOp::NextPc);
+                },
                 CoroutineState::Yielded(yielded) => this.take(yielded),
             }
         }
@@ -849,6 +876,8 @@ pub enum YieldOp {
     Created(usize), // STACK[idx] holds a table just made, which nothing watches. See Note [Watched tables]
     LayOut, // Lay out everything held
     LaidOut(Rc<dyn Window>), // What the peephole held, laid out: the context knew what it does when it was held
+    NextPc, // The instruction's generator is done: resumed with Matched once the peephole is given
+            // the next's, else Failed. See Note [Peephole fusion]
     Enter, // Move the base to the frames of the inlined calls the code is in that it isn't in
     MakeFrames, // Make the frames of the inlined calls the code is in that aren't, the code going on inside them
     PeepholeTrace(&'static str, Vec<(&'static str, String)>), // A trace event of what the peephole did
@@ -4830,141 +4859,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 self.entering = true;
                 return self.compile_holding(owner, pc, made, inside, Default::default());
             }
+            let decoded = self.decode(pc, &inst);
             if let Some((next, nctx, ret, held)) = match inst.0.Opcode() {
-                op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_numeric(op, a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                op @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_compare(op, a, b as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::TEST => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_test(a as usize, c, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::TESTSET => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_testset(a as usize, b as usize, c, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::NOT => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_not(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::CLOSE => {
-                    let (a, _) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_close(a as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::TFORLOOP => {
-                    let (a, _, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_tforloop(a as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::VARARG => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    let params = unsafe { (*self.proto).param_count as usize };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_vararg(a as usize, b as usize, params)), ResumeArg::Start, block_id)
-                },
-                Opcode::JMP => {
-                    let sbx = crate::vm::sBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
-                    //self.blocks[block_id].push(Residual::Jump(((pc as isize) + sbx as isize) as usize)); return ctx;
-                },
-                Opcode::UNM => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_unm(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::LEN => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_len(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::CONCAT => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_concat(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::LOADK => {
-                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let c: LValue<'src, 'intern> = unsafe { (&(&(*self.proto).constants.items)[bx as usize]).into() };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_loadk(bx, c.typeof_(), a as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::LOADNIL => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_loadnil(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::LOADBOOL => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_loadbool(a as usize, b != 0, c != 0, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::MOVE => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    debug!("move {} {}", a, b);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_move(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::FORPREP => {
-                    let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_forprep(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::FORLOOP => {
-                    let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_forloop(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::GETUPVAL => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::SETUPVAL => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_setupval(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::CLOSURE => {
-                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let proto = unsafe { &*self.proto };
-                    let count = proto.prototypes.items[bx as usize].upval_count as usize;
-                    let upvalues = proto.instructions.items[pc + 1..pc + 1 + count].iter()
-                        .map(|pseudo| (pseudo.0.Opcode(), crate::vm::AB::unpack(pseudo.0).1 as usize))
-                        .collect();
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_closure(a as usize, bx as usize, upvalues, pc + 1 + count)), ResumeArg::Start, block_id)
-                },
-                Opcode::SELF => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_self(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::CALL => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("{} {} {}", a, b, c);
-                    // TODO: this should try to compile a new block and jump to it, and only
-                    // fallback to a trace exit if we need to run the fully generic code
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_call(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::GETGLOBAL => {
-                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
-                    debug!("getglobal {} {} {:?}", a, bx, &kst);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_getglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::SETGLOBAL => {
-                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_setglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::GETTABLE => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("gettable {} {} {}", a, b, c);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_gettable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::SETTABLE => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("settable {} {} {}", a, b, c);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_settable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::NEWTABLE => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_newtable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::SETLIST => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding(std::mem::take(&mut carry), emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                _ if let Some(generator) = decoded => {
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding_of(std::mem::take(&mut carry), generator), ResumeArg::Start, block_id)
                 },
                 Opcode::TAILCALL => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
@@ -5028,6 +4926,150 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 debug_assert!(carry.is_empty(), "a block ended holding integer ops");
                 return ctx;
             }
+        }
+    }
+
+    /// The generator of instruction `inst` at `pc`, compiled as a coroutine run in the peephole, if
+    /// it is: all but what the specializer lays out itself. See Note [Peephole fusion] in
+    /// `peephole`.
+    fn decode(&self, pc: Pc, inst: &crate::chunk::Instruction) -> Option<Box<dyn NativeGen>> {
+        match inst.0.Opcode() {
+            op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("{a} {b} {c}");
+                Some(Box::new(emit_numeric(op, a as usize, b as usize, c as usize)))
+            },
+            op @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("{a} {b} {c}");
+                Some(Box::new(emit_compare(op, a, b as usize, c as usize, pc + 1)))
+            },
+            Opcode::TEST => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_test(a as usize, c, pc + 1)))
+            },
+            Opcode::TESTSET => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_testset(a as usize, b as usize, c, pc + 1)))
+            },
+            Opcode::NOT => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_not(a as usize, b as usize)))
+            },
+            Opcode::CLOSE => {
+                let (a, _) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_close(a as usize)))
+            },
+            Opcode::TFORLOOP => {
+                let (a, _, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_tforloop(a as usize, c as usize, pc + 1)))
+            },
+            Opcode::VARARG => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                let params = unsafe { (*self.proto).param_count as usize };
+                Some(Box::new(emit_vararg(a as usize, b as usize, params)))
+            },
+            Opcode::JMP => {
+                let sbx = crate::vm::sBx::unpack(inst.0);
+                Some(Box::new(emit_jmp(sbx, pc + 1)))
+                //self.blocks[block_id].push(Residual::Jump(((pc as isize) + sbx as isize) as usize)); return ctx;
+            },
+            Opcode::UNM => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_unm(a as usize, b as usize)))
+            },
+            Opcode::LEN => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_len(a as usize, b as usize)))
+            },
+            Opcode::CONCAT => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_concat(a as usize, b as usize, c as usize)))
+            },
+            Opcode::LOADK => {
+                let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                let c: LValue<'src, 'intern> = unsafe { (&(&(*self.proto).constants.items)[bx as usize]).into() };
+                Some(Box::new(emit_loadk(bx, c.typeof_(), a as usize)))
+            },
+            Opcode::LOADNIL => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_loadnil(a as usize, b as usize)))
+            },
+            Opcode::LOADBOOL => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_loadbool(a as usize, b != 0, c != 0, pc + 1)))
+            },
+            Opcode::MOVE => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                debug!("move {} {}", a, b);
+                Some(Box::new(emit_move(a as usize, b as usize)))
+            },
+            Opcode::FORPREP => {
+                let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
+                Some(Box::new(emit_forprep(a as usize, sbx, pc + 1)))
+            },
+            Opcode::FORLOOP => {
+                let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
+                Some(Box::new(emit_forloop(a as usize, sbx, pc + 1)))
+            },
+            Opcode::GETUPVAL => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_getupval(a as usize, b as usize)))
+            },
+            Opcode::SETUPVAL => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_setupval(a as usize, b as usize)))
+            },
+            Opcode::CLOSURE => {
+                let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                let proto = unsafe { &*self.proto };
+                let count = proto.prototypes.items[bx as usize].upval_count as usize;
+                let upvalues = proto.instructions.items[pc + 1..pc + 1 + count].iter()
+                    .map(|pseudo| (pseudo.0.Opcode(), crate::vm::AB::unpack(pseudo.0).1 as usize))
+                    .collect();
+                Some(Box::new(emit_closure(a as usize, bx as usize, upvalues, pc + 1 + count)))
+            },
+            Opcode::SELF => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_self(a as usize, b as usize, c as usize)))
+            },
+            Opcode::CALL => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("{} {} {}", a, b, c);
+                // TODO: this should try to compile a new block and jump to it, and only
+                // fallback to a trace exit if we need to run the fully generic code
+                Some(Box::new(emit_call(a as usize, b as usize, c as usize)))
+            },
+            Opcode::GETGLOBAL => {
+                let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
+                debug!("getglobal {} {} {:?}", a, bx, &kst);
+                Some(Box::new(emit_getglobal(a as usize, bx as usize)))
+            },
+            Opcode::SETGLOBAL => {
+                let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
+                Some(Box::new(emit_setglobal(a as usize, bx as usize)))
+            },
+            Opcode::GETTABLE => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("gettable {} {} {}", a, b, c);
+                Some(Box::new(emit_gettable(a as usize, b as usize, c as usize)))
+            },
+            Opcode::SETTABLE => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("settable {} {} {}", a, b, c);
+                Some(Box::new(emit_settable(a as usize, b as usize, c as usize)))
+            },
+            Opcode::NEWTABLE => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_newtable(a as usize, b as usize, c as usize)))
+            },
+            Opcode::SETLIST => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_setlist(a as usize, b as usize, c as usize)))
+            },
+            _ => None,
         }
     }
 
@@ -7753,6 +7795,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(Residual::Jump(dest_block));
                     // If it was a jump, stop pumping the coroutine
                     return None;
+                },
+                // The next instruction, streamed into the peephole holding what it holds, if it is one
+                // compiled as a coroutine. See Note [Peephole fusion] in `peephole`.
+                CoroutineState::Yielded(YieldOp::NextPc) => {
+                    let next = pc.0 + 1;
+                    let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[next].clone() };
+                    arg = match self.decode(next, &inst) {
+                        Some(generator) => {
+                            // Only a call uses the top the instruction before left. See Note [Known top].
+                            if ctx.top.is_some() && !matches!(inst.0.Opcode(), Opcode::CALL | Opcode::TAILCALL) {
+                                Rc::make_mut(&mut ctx).top = None;
+                            }
+                            let holds = self.unheld.take() != Some(next);
+                            self.instruction = Some((next, Restart::Start(ctx.clone()), holds));
+                            coro.next_instruction(generator);
+                            pc = SubPc::new(next);
+                            ResumeArg::Matched
+                        },
+                        None => ResumeArg::Failed,
+                    };
                 },
                 CoroutineState::Complete(r) => {
                     return Some((pc.0 + 1, ctx, r, coro.take_held()));
