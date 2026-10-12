@@ -271,6 +271,10 @@ pub struct Gen {
     memory: Option<crate::peephole::MemOp>,
     /// What the instruction's generator returned, as the peephole asks for the next's.
     done: Option<ResumeArg>,
+    /// The jump's target the peephole asked to go on at, straight on, and whether it looks ahead
+    /// at the jump it's at.
+    continuing: Option<Pc>,
+    looked: bool,
 }
 
 impl Gen {
@@ -293,6 +297,8 @@ impl Gen {
             described: None,
             memory: None,
             done: None,
+            continuing: None,
+            looked: false,
         })
     }
 
@@ -431,14 +437,6 @@ impl Gen {
         self.memory = None;
     }
 
-    /// Lay everything out, then pass on the yield it passed on last again.
-    pub fn lay_out_again(&mut self) {
-        self.lay_out(None, &[], "again");
-        let last = self.last.clone().expect("a yield passed on");
-        self.out.push_back(last);
-        self.next = None;
-    }
-
     /// What it knows of `slot`'s constant value.
     fn constant(&self, slot: usize) -> Option<i32> {
         match self.ctx.as_ref()?.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT) {
@@ -518,12 +516,12 @@ impl Gen {
             YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) => true,
             // What a call asks of a native it may make a window op.
             YieldOp::NativeWindowArgs(..) => true,
-            // A call of a native with a generator is compiled by it, holding them; of a function
-            // found out at runtime, its thunk holds them for one, else lays them out first.
+            // A call's thunk holds them: into its callee's code, or laid out before a call. See
+            // Note [Peephole fusion] in `peephole`.
+            // A known native without a generator is laid out here, observing them.
             YieldOp::Call(CallTarget::Dynamic(a, _, _)) => held.spells.iter().all(|spell| spell.dest != *a && spell.at != at)
                 && match &ctx.types[*a] {
                     CType::NativeFunction(nf) => !nf.is_protected_call() && nf.generator().is_some(),
-                    CType::LuaFunction(_) => false,
                     _ => true,
                 },
             YieldOp::HashKey(_, key, _) => key & 0x100 == 0
@@ -536,8 +534,9 @@ impl Gen {
                 || held.spells.iter().all(|spell| spell.dest != *idx && spell.at != at),
             YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
             YieldOp::GuardCType(rk, expected) => rk & 0x100 != 0 || known(*rk, expected),
-            // Of a value the context knows: no code.
-            YieldOp::Promote(slot) => ctx.constant(*slot).is_some(),
+            // Of a value the context knows: no code; else its thunk holds them, guarding only the
+            // slot. See Note [Promoted values].
+            YieldOp::Promote(slot) => ctx.constant(*slot).is_some() || held.spells.iter().all(|spell| spell.dest != *slot && spell.at != at),
             _ => false,
         }
     }
@@ -625,7 +624,26 @@ impl Gen {
     /// needs first.
     fn take(&mut self, yielded: YieldOp) {
         use crate::peephole::{MemOp, Need};
+        // A jump that is the only way on, its generator's next yield a jump to its target, goes on
+        // at the target holding what it holds: the target is straight on, no block's. See Note
+        // [Peephole fusion] in `peephole`.
+        if let YieldOp::GetBlock(target) = yielded && !std::mem::take(&mut self.looked) && self.holds_any() {
+            const AHEAD: BlockId = BlockId(usize::MAX);
+            let mut ahead = self.inner.clone();
+            if let CoroutineState::Yielded(YieldOp::Jump(AHEAD)) = Pin::new(&mut *ahead).resume(ResumeArg::BlockId(AHEAD)) {
+                self.continuing = Some(target);
+                self.out.push_back(YieldOp::Continue(target));
+                return;
+            }
+        }
         match yielded {
+            // Of how much of the frame the code is in is made.
+            YieldOp::FrameUnmade => {
+                let ctx = self.ctx.as_ref().expect("a generator run in a context");
+                let called = ctx.inline.last().filter(|frame| frame.made != Made::Yes).and_then(|frame| frame.closure);
+                self.next = Some(called.map_or(ResumeArg::Failed, ResumeArg::Boxed));
+                return;
+            },
             // Of what the code holds where: a slot holding what it would be moved, which no spell
             // writes, holds it.
             YieldOp::HoldsValue(dest, src) => {
@@ -724,6 +742,17 @@ impl Coroutine<ResumeArg> for Gen {
         loop {
             if let Some(yielded) = this.out.pop_front() {
                 return CoroutineState::Yielded(yielded);
+            }
+            // Its answer to `Continue`: the target's generator, given, or none, where the jump is
+            // made as any is.
+            if let Some(target) = this.continuing.take() {
+                if answer.take() == Some(ResumeArg::Matched) {
+                    answer = Some(ResumeArg::Start);
+                } else {
+                    this.looked = true;
+                    this.take(YieldOp::GetBlock(target));
+                    continue;
+                }
             }
             // Its answer to `NextPc`: the next instruction's generator, given, or none, where the
             // specializer goes on itself.
@@ -871,11 +900,15 @@ pub enum YieldOp {
     Fused { op: Rc<dyn Window>, exit: Vec<Rc<dyn Window>>, unknown: Vec<usize> }, // What is held laid out, an op that
                                 // can fail: its exit writes `exit`, leaving `unknown` unknown
     Took, // A guard the peephole joined to what it holds, as passed
+    FrameUnmade, // Resumed with the closure the code's inlined call calls, Boxed, if its frame isn't
+                 // made and the closure is known, else Failed. See Note [Peephole fusion]
     HoldsValue(usize, usize), // Resumed with Matched if STACK[dest] holds STACK[src]'s value
                               // already, a move between them nothing. See Note [Peephole fusion]
     Created(usize), // STACK[idx] holds a table just made, which nothing watches. See Note [Watched tables]
     LayOut, // Lay out everything held
     LaidOut(Rc<dyn Window>), // What the peephole held, laid out: the context knew what it does when it was held
+    Continue(Pc), // The code goes on at pc straight on: resumed with Matched once the peephole is given
+                  // its generator, else Failed. See Note [Peephole fusion]
     NextPc, // The instruction's generator is done: resumed with Matched once the peephole is given
             // the next's, else Failed. See Note [Peephole fusion]
     Enter, // Move the base to the frames of the inlined calls the code is in that it isn't in
@@ -1892,6 +1925,8 @@ pub struct InlineFrame {
     pub b: u16,
     pub params: u8,
     pub stack: u8,
+    /// The closure it calls, boxed, if the caller knows which.
+    pub closure: Option<u64>,
     pub cells: u32,
     pub continuation: *const Continuation,
 }
@@ -1972,7 +2007,9 @@ impl Rest {
 }
 
 /// A Lua call laid out, which its continuation may inline: the block and offset of its `LuaCall`,
-/// its point, the callee's prototype, the context at the call and its B. See Note [Inlined calls].
+/// its point, the callee's prototype, the context at the call and its B, and the peephole as it
+/// was at the call, where what it held is laid out (`start`), which the call inlined goes on from,
+/// and the call's restart. See Notes [Inlined calls] and [Peephole fusion] in `peephole`.
 struct InlineCall {
     block: BlockId,
     off: usize,
@@ -1980,6 +2017,9 @@ struct InlineCall {
     callee: LProto<'static, 'static>,
     calling: Rc<Context>,
     b: usize,
+    coro: Box<Gen>,
+    start: Location,
+    restart: Option<(Pc, Restart, bool)>,
 }
 
 /// How many inlined calls deep code can be. See Note [Inlined calls].
@@ -2020,6 +2060,39 @@ fn makes_iterator<C>(proto: &crate::chunk::FunctionBlock<'_, C>, pc: Pc, a: usiz
     let Some(jmp) = instructions.get(pc + 1).filter(|inst| inst.0.Opcode() == Opcode::JMP) else { return false };
     let target = ((pc + 2) as isize + crate::vm::sBx::unpack(jmp.0) as isize) as usize;
     instructions.get(target).is_some_and(|inst| inst.0.Opcode() == Opcode::TFORLOOP && crate::vm::ABC::unpack(inst.0).0 as usize == a)
+}
+
+/// What the peephole holds, `held`, at a call of R(A) with B of `callee` that is inlined: what's laid
+/// out first, as the callee's code names none of it, and what goes on held into the callee's code,
+/// in its slots. What names the caller's slots below the callee's frame is laid out, and what writes
+/// the frame past its arguments is dead, as entering it nils it, and what reads that laid out; one
+/// passed what's up to the top, or whose code is its return, takes nothing. See Note [Peephole fusion] in `peephole`.
+fn entering(held: &crate::peephole::Spells, callee: LProto<'static, 'static>, a: usize, b: usize) -> (crate::peephole::Spells, crate::peephole::Spells) {
+    let stack = unsafe { (*callee).max_stack } as usize;
+    // Code that is its return holds nothing to go on with.
+    let returns = unsafe { (&(*callee).instructions.items)[0].0.Opcode() } == Opcode::RETURN;
+    let (below, nilled): (Vec<usize>, Vec<usize>) = match b {
+        _ if returns => ((0..a + 1 + stack).collect(), Vec::new()),
+        0 => ((0..a + 1 + stack).collect(), Vec::new()),
+        b => ((0..=a).collect(), (a + b..a + 1 + stack).collect()),
+    };
+    let writes: Vec<usize> = below.iter().chain(&nilled).copied().collect();
+    let (laid, kept) = held.split(&crate::peephole::Need { reads: below, writes, memory: false });
+    (laid, kept.renamed(|slot| slot - a - 1, |slot| slot - a - 1, |slot| !nilled.contains(&slot), usize::MAX))
+}
+
+/// For a Lua callee's continuation, which applies only what the callee's effects falsify: the
+/// context `ctx` before the call of R(A), but for the callee's frame, from `a` on, and the slots
+/// below it closures capture of `captured`. See Note [Call effects].
+fn before_call(owner: &mut Owner, ctx: &Context, captured: &[usize], a: usize) -> (Rc<Context>, Rc<[usize]>) {
+    let mut before = ctx.clone();
+    for idx in a..before.types.len() {
+        before.effect(Effect::Write(idx));
+    }
+    let frame = (a..before.types.len()).map(|idx| (idx, CType::Unknown)).collect();
+    before.set_types(owner, frame);
+    let captured: Rc<[usize]> = captured.iter().copied().filter(|&slot| slot < a).collect();
+    (Rc::new(before), captured)
 }
 
 /// Whether a call of R(A) in `caller`, of the context `calling`, can inline `callee`, whatever its
@@ -2642,6 +2715,9 @@ fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected
 
 /// The versions of a pc before jumps to it reuse one. See Note [Version compatibility].
 const MAX_VERSIONS: usize = 3;
+/// The jumps' targets code goes on at straight on before one is a block's. See Note [Peephole
+/// fusion] in `peephole`.
+const MAX_CONTINUED: usize = 64;
 
 /// The values one version of a promote tests before it returns its argument
 /// unspecialized. See Note [Promoted values].
@@ -3871,6 +3947,9 @@ pub struct Specializer<'src, 'intern> {
     /// The instruction an exit of what the peephole held runs again, compiled next, its integer
     /// op not held. See Note [Peephole fusion] in `peephole`.
     unheld: Option<Pc>,
+    /// The jumps' targets the code being compiled went on at straight on, by function and context.
+    /// See Note [Peephole fusion] in `peephole`.
+    continued: Vec<(usize, Pc, Rc<Context>)>,
     /// Where each rebuilt block ends for code entering it from its start. See Note [Contraction].
     cuts: std::collections::HashMap<BlockId, usize, rustc_hash::FxBuildHasher>,
     /// The instruction of the origin whose rebuild is yet to run at each place in a block. See
@@ -3946,6 +4025,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             instruction: None,
             entering: false,
             unheld: None,
+            continued: Vec::new(),
             cuts: Default::default(),
             rebuilding: Default::default(),
             trimming: Vec::new(),
@@ -5439,38 +5519,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// The thunk a `Learn` of `slot` ends its block in: forced, the code after it with the string
     /// keys of the table there then, in order. See `jit.learn` in `library`.
-    /// The thunk a call of R(A) with B and C ends its block in, its callee found out at runtime,
-    /// with `coro` holding something, from `restart`: forced on a native with a generator, its
-    /// identity guard and the generator's code, holding it still; on anything else, what is held
-    /// is laid out, and the call goes on as any does. See Note [Peephole fusion] in `peephole`.
-    fn make_held_call_thunk(&self, block_id: BlockId, restart: (Pc, Restart, bool), coro: Box<Gen>, pc: SubPc, ctx: Rc<Context>, a: usize, b: usize, c: usize, identities: usize) -> ThunkRef {
-        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            let block = vm.new_block(pc.0);
-            vm.jump_thunk(block_id, thunk_pc, block);
-            let callee = state.vals[state.base + a].unbox();
-            let outer = vm.instruction.replace(restart.clone());
-            if let LValue::NClosure(nf) = &callee && !nf.is_protected_call() && let Some(generator) = nf.generator() && identities < MAX_VERSIONS {
-                let other = vm.make_held_call_thunk(block, restart.clone(), coro.clone(), pc, ctx.clone(), a, b, c, identities + 1);
-                let mut known = (*ctx).clone();
-                known.types[a] = callee.ctypeof_();
-                let mut body = coro.clone();
-                body.generate(generator(nf.native(), a, b, c));
-                let at = vm.new_block(pc.0);
-                vm.entering = true;
-                let compiled = vm.compile_one(owner, pc, Rc::new(known), body, ResumeArg::Start, at);
-                vm.go_on(owner, compiled, at);
-                vm.blocks[block.0].instructions.extend([Residual::NativeGuard { idx: a, ptr: nf.get_ptr() }, Residual::Thunk(other), Residual::Jump(at)]);
-            } else {
-                let mut again = coro.clone();
-                again.lay_out_again();
-                vm.entering = true;
-                let compiled = vm.compile_one(owner, pc, ctx.clone(), again, ResumeArg::Start, block);
-                vm.go_on(owner, compiled, block);
-            }
-            vm.instruction = outer;
-        })))
-    }
-
     fn make_learn_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table") };
@@ -6049,12 +6097,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// below it, and the pc after it, a Lua function's call continues at a thunk
     /// specializing it to the return. See Notes [Call sites], [Call
     /// continuations] and [Call effects].
-    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, coro: Box<Gen>, restart: Option<(Pc, Restart, bool)>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
             // is a guard's failure, with the rest of the layout after it. See Note
             // [Thunk patching].
-            let block = if !appends || vm.compiled(block_id) {
+            let mut block = if !appends || vm.compiled(block_id) {
                 let block = vm.new_block(vm.blocks[block_id.0].pc);
                 vm.jump_thunk(block_id, thunk_pc, block);
                 block
@@ -6063,14 +6111,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 block_id
             };
             let (a16, b16, c16) = (a as u16, b as u16, c as u16);
-            let next = |vm: &Specializer| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), pc, a, b, c, after.clone(), continuation.clone(), identities + 1, false));
+            let next = |vm: &Specializer, block: BlockId| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), coro.clone(), restart.clone(), pc, a, b, c, after.clone(), continuation.clone(), identities + 1, false));
             let mut layout = vec![];
             match state.vals[state.base + a].unbox() {
                 LValue::LClosure(lclos) if matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS => {
                     let proto = lclos.ro(owner).prototype;
                     if !matches!(calling.types[a], CType::LuaFunction(_)) {
                         layout.push(Residual::LuaGuard { idx: a, ptr: proto.cast() });
-                        layout.push(next(vm));
+                        layout.push(next(vm, block));
                     }
                     // A call a continuation decided to inline in a context its callee's entry
                     // accepts this one's in inlines from the first, as does one making a generic
@@ -6086,19 +6134,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let decided = vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known)));
                         if decided || makes_iterator(unsafe { &*vm.proto }, pc.0, a) {
                             vm.blocks[block.0].instructions.extend(layout);
+                            // The callee's code goes on from the peephole as it was at the call,
+                            // holding what it held, but what can't go on into it, laid out first.
+                            // See Note [Peephole fusion] in `peephole`.
+                            let (laid, kept) = entering(&coro.held, callee, a, b);
                             let continuation = vm.continuation(&calling, ctx, captured, rest, a, c);
-                            let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation);
-                            vm.blocks[block.0].instructions.push(Residual::Jump(shift));
+                            let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation, kept);
+                            vm.held_first(owner, block, pc, &calling, laid, &restart, &mut vec![], Some(shift));
                             return;
                         }
                     }
+                    // A call observes what the peephole holds: laid out first, where its
+                    // continuation inlining it goes on from instead. See Note [Peephole fusion] in
+                    // `peephole`.
+                    let start = Location(block, vm.blocks[block.0].instructions.len() + layout.len());
+                    block = vm.held_first(owner, block, pc, &calling, coro.held.clone(), &restart, &mut layout, None);
                     let (stack, vararg) = unsafe { ((*proto).max_stack, (*proto).is_vararg != 0) };
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let off = vm.blocks[block.0].instructions.len() + layout.len();
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg, callee: proto as LProto<'static, 'static> });
                     if let Some((ctx, captured, rest)) = &continuation {
                         // See Notes [Call continuations] and [Inlined calls].
-                        let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
+                        let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b, coro: coro.clone(), start, restart: restart.clone() };
                         layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), rest.clone(), a, c, after.clone(), Some(Rc::new(call)), 0, true)));
                         // Where its returns go on. See Note [Watched tables].
                         vm.continuation_sites.insert(Location(block, off + 1), ContinuationSite { ctx: ctx.clone(), captured: captured.clone(), rest: rest.clone(), a, c, after: after.clone() });
@@ -6112,7 +6169,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // An error raised in it continues after it. See Note [Errors].
                 LValue::NClosure(nf) if nf.is_protected_call() && identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
-                    layout.push(next(vm));
+                    layout.push(next(vm, block));
+                    block = vm.held_first(owner, block, pc, &calling, coro.held.clone(), &restart, &mut layout, None);
                     let after = after.block(vm, owner);
                     layout.extend(Self::protected_call(a, b, c, after));
                     layout.push(Residual::Jump(after));
@@ -6122,21 +6180,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
-                    layout.push(next(vm));
+                    layout.push(next(vm, block));
                     // Past the guard, a native with a generator is compiled by it, as an opcode is,
                     // and the code after the call is a version. See Note [Native generators] in
                     // `library`.
                     if let (Some(generator), After::Version(..)) = (nf.generator(), &after) {
                         vm.blocks[block.0].instructions.extend(layout);
-                        let mut coro = Gen::of(generator(nf.native(), a, b, c));
-                        coro.unheld = true;
-                        if let Some((next, ctx, _, _)) = vm.compile_one(owner, pc, calling.clone(), coro, ResumeArg::Start, block) {
+                        // Compiled by the peephole as it was at the call, holding what it held.
+                        let mut body = coro.clone();
+                        body.generate(generator(nf.native(), a, b, c));
+                        let outer = std::mem::replace(&mut vm.instruction, restart.clone());
+                        vm.entering = true;
+                        let compiled = vm.compile_one(owner, pc, calling.clone(), body, ResumeArg::Start, block);
+                        vm.instruction = outer;
+                        if let Some((next, ctx, _, held)) = compiled {
+                            debug_assert!(held.is_empty(), "a native's call holding what the peephole held past it");
                             let ctx = vm.jumping(owner, ctx, next);
                             let version = After::Version(next, ctx).block(vm, owner);
                             vm.blocks[block.0].instructions.push(Residual::Jump(version));
                         }
                         return;
                     }
+                    block = vm.held_first(owner, block, pc, &calling, coro.held.clone(), &restart, &mut layout, None);
                     // Past the guard the native is known: it runs as its window op if
                     // the call's arguments have the types the op assumes. See Note
                     // [Native windows].
@@ -6182,6 +6247,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 _ => {
+                    block = vm.held_first(owner, block, pc, &calling, coro.held.clone(), &restart, &mut layout, None);
                     layout.push(Residual::Call { a: a16, b: b16, c: c16 });
                     layout.push(Residual::Arrive { a: a16, c: c16 });
                     // It may call a native, which may allocate.
@@ -6193,6 +6259,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             layout.push(Residual::Jump(after.block(vm, owner)));
             vm.blocks[block.0].instructions.extend(layout);
         })))
+    }
+
+    /// The block a call thunk's layout goes on in past `layout`, laid out in `block`: past `held`,
+    /// what the peephole held at the call, laid out from the call's `restart`, if anything, or
+    /// `to`, jumped to past it. See Note [Peephole fusion] in `peephole`.
+    fn held_first(&mut self, owner: &mut Owner, block: BlockId, pc: SubPc, ctx: &Rc<Context>, held: crate::peephole::Spells, restart: &Option<(Pc, Restart, bool)>, layout: &mut Vec<Residual>, to: Option<BlockId>) -> BlockId {
+        self.blocks[block.0].instructions.extend(layout.drain(..));
+        if held.is_empty() {
+            if let Some(to) = to {
+                self.blocks[block.0].instructions.push(Residual::Jump(to));
+            }
+            return block;
+        }
+        let rest = to.unwrap_or_else(|| self.new_block(self.blocks[block.0].pc));
+        let outer = std::mem::replace(&mut self.instruction, restart.clone());
+        self.entering = true;
+        self.compile_one(owner, pc, ctx.clone(), Gen::holding(held, crate::generators::emit_lay_out_to(rest)), ResumeArg::Start, block);
+        self.instruction = outer;
+        rest
     }
 
     /// What inlining the callee entered at its version `entry` would cost, as its first call ran it,
@@ -6318,6 +6403,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let frame = InlineFrame {
             call, proto, a: a as u16, effects: Effects::NONE, passed, made: Made::No,
             b: b as u16, params: unsafe { (*callee).param_count }, stack: unsafe { (*callee).max_stack }, cells: 0, continuation: std::ptr::null(),
+            closure: match calling.values.fact(Loc::root(Root::Slot(a as u16)), VALUE) {
+                Some(&Known::Value(bits)) => Some(bits),
+                _ => None,
+            },
         };
         inline_entry(calling, unsafe { &*callee }, a, b, frame)
     }
@@ -6347,7 +6436,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
     /// callee's frame in, then goes on to its version for `entry`, its returns continuing
     /// `continuation`. See Note [Inlined calls].
-    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context, continuation: Continuation) -> BlockId {
+    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context, continuation: Continuation, held: crate::peephole::Spells) -> BlockId {
         // The outermost function's frame holds the callee's.
         let outermost = entry.inline.first().expect("an inlined call's frame").proto;
         if unsafe { (*outermost).frame_size.grow(inline_offset(&entry) + (*callee).max_stack as usize) } {
@@ -6374,7 +6463,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let mut entry = entry;
         let frame = entry.inline.last_mut().expect("an inlined call's frame");
         (frame.cells, frame.continuation) = (cells, pointer);
-        self.compile_holding(owner, 0, Rc::new(entry), shift, Default::default());
+        self.compile_holding(owner, 0, Rc::new(entry), shift, held);
         self.set_current(caller);
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline", &[
@@ -6425,7 +6514,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
             if let Some(call) = &inline
-                && !vm.compiled(call.block)
+                && !vm.compiled(call.block) && !vm.compiled(call.start.0)
                 && let Some(&Residual::LuaCall { entry: CallEntry::Block(entry), .. }) = vm.blocks[call.block.0].instructions.get(call.off)
                 && inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee }, a)
                 && state.returned & !0xffff_ffff == crate::vm::RETURNED
@@ -6436,8 +6525,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 decided.inline = Vec::new();
                 vm.inlined.entry((vm.proto, call.pc, call.callee as LProto<'_, '_>)).or_default().push(decided);
                 let continuation = vm.continuation(&call.calling, &ctx, &captured, &rest, a, c);
-                let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry, continuation);
-                vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
+                // From the call as it was, the peephole holding what it held there: where what it
+                // held is laid out goes on into the callee's code instead. See Note [Peephole
+                // fusion] in `peephole`.
+                let (laid, kept) = entering(&call.coro.held, call.callee, a, call.b);
+                let shift = vm.inline_call(owner, state, call.start.0, call.callee, a, call.b, entry, continuation, kept);
+                let into = if laid.is_empty() {
+                    shift
+                } else {
+                    let edge = vm.new_block(vm.blocks[call.start.0.0].pc);
+                    vm.held_first(owner, edge, call.pc, &call.calling, laid, &call.restart, &mut vec![], Some(shift));
+                    edge
+                };
+                let Location(block, off) = call.start;
+                if off < vm.blocks[block.0].instructions.len() {
+                    vm.blocks[block.0].instructions[off] = Residual::Jump(into);
+                } else {
+                    vm.blocks[block.0].instructions.push(Residual::Jump(into));
+                }
             }
             // In place, as for a call thunk. See Note [Thunk patching].
             let block = if !appends || vm.compiled(block_id) {
@@ -6788,6 +6893,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     pub fn compile_one(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<Gen>, arg: ResumeArg, block_id: BlockId) -> Compiled
     {
+        let continued = self.continued.len();
+        let compiled = self.compile_one_of(owner, pc, ctx, coro, arg, block_id);
+        self.continued.truncate(continued);
+        compiled
+    }
+
+    fn compile_one_of(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<Gen>, arg: ResumeArg, block_id: BlockId) -> Compiled
+    {
         // Going on in an instruction, not starting it: an exit of what the peephole holds from
         // here goes on from here. See Note [Peephole fusion] in `peephole`.
         if std::mem::take(&mut self.entering) {
@@ -7118,7 +7231,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.go_on(owner, compiled, inside);
                     return None;
                 },
-                CoroutineState::Yielded(YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_) | YieldOp::HoldsValue(..)) => unreachable!("the peephole takes what describes an op, or asks of what it holds"),
+                CoroutineState::Yielded(YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_) | YieldOp::HoldsValue(..) | YieldOp::FrameUnmade) => unreachable!("the peephole takes what describes an op, or asks of what it holds"),
                 CoroutineState::Yielded(YieldOp::PeepholeTrace(_name, _fields)) => {
                     #[cfg(feature = "tracing")]
                     {
@@ -7515,16 +7628,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                         },
                         CallTarget::Dynamic(a, b, c) => {
-                            // A callee found out at runtime, with spells held. See Note [Peephole
-                            // fusion] in `peephole`.
-                            let generates = matches!(&ctx.types[a], CType::NativeFunction(nf) if !nf.is_protected_call() && nf.generator().is_some());
-                            if !generates && !resumes && coro.holds_any() {
-                                let restart = self.instruction.clone().expect("spells are held in an instruction");
-                                let thunk = self.make_held_call_thunk(block_id, restart, coro.clone(), pc, ctx.clone(), a, b, c, 0);
-                                self.end_block(block_id);
-                                self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
-                                return None;
-                            }
                             // The result's type, if known. A window op's has one; it and a pure
                             // native's call have no effects. See Note [Library natives].
                             let mut result = None;
@@ -7580,16 +7683,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // For a Lua callee's continuation, which applies only what the
                             // callee's effects falsify: the context before the call, but for
                             // the callee's frame, from `a` on. See Note [Call effects].
-                            let before = (!native).then(|| {
-                                let mut before = (*ctx).clone();
-                                for idx in a..before.types.len() {
-                                    before.effect(Effect::Write(idx));
-                                }
-                                let frame = (a..before.types.len()).map(|idx| (idx, CType::Unknown)).collect();
-                                before.set_types(owner, frame);
-                                let captured: Rc<[usize]> = captured.iter().copied().filter(|&slot| slot < a).collect();
-                                (Rc::new(before), captured)
-                            });
+                            let before = (!native).then(|| before_call(owner, &ctx, &captured, a));
                             if !pure {
                                 // An unknown call may invalidate any fragile information.
                                 // See Note [Fragile information].
@@ -7627,7 +7721,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             }
                             // In a version of the call's point, for the context at the call. See
                             // Note [Call sites].
-                            let found = self.versions.get(&self.proto).unwrap().get(&(pc, calling.clone())).copied();
+                            // Its own while the peephole holds something, which the context doesn't
+                            // say. See Note [Peephole fusion] in `peephole`.
+                            let holds = coro.holds_any();
+                            let found = self.versions.get(&self.proto).unwrap().get(&(pc, calling.clone())).copied().filter(|_| !holds);
                             let call_block = match found {
                                 Some(call_block) if call_block != block_id => {
                                     self.end_block(block_id);
@@ -7637,8 +7734,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 Some(call_block) => call_block,
                                 None => {
                                     let call_block = self.new_block(pc.0);
-                                    self.blocks[call_block.0].context = Some(calling.clone());
-                                    self.versions.get_mut(&self.proto).unwrap().insert((pc, calling.clone()), call_block);
+                                    if !holds {
+                                        self.blocks[call_block.0].context = Some(calling.clone());
+                                        self.versions.get_mut(&self.proto).unwrap().insert((pc, calling.clone()), call_block);
+                                    }
                                     #[cfg(feature = "tracing")]
                                     {
                                         let context = calling.tostring(owner);
@@ -7675,7 +7774,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 (After::Version(pc.0 + 1, after), continuation)
                             };
                             self.end_block(call_block);
-                            let thunk = self.make_call_thunk(call_block, calling, pc, a, b, c, after, continuation, 0, true);
+                            let thunk = self.make_call_thunk(call_block, calling, coro.clone(), self.instruction.clone(), pc, a, b, c, after, continuation, 0, true);
                             self.blocks[call_block.0].instructions.push(Residual::Thunk(thunk));
                             return None;
                         },
@@ -7798,6 +7897,32 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 // The next instruction, streamed into the peephole holding what it holds, if it is one
                 // compiled as a coroutine. See Note [Peephole fusion] in `peephole`.
+                // A jump's target, the only way on, streamed into the peephole holding what it holds,
+                // unless it is one the stream went on through, in the same context, or too many: a
+                // loop is a block's. See Note [Peephole fusion] in `peephole`.
+                CoroutineState::Yielded(YieldOp::Continue(target)) => {
+                    let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[target].clone() };
+                    let proto = self.proto as usize;
+                    let repeats = self.continued.len() >= MAX_CONTINUED
+                        || self.continued.iter().any(|(of, at, known)| *of == proto && *at == target && **known == *ctx);
+                    arg = match self.decode(target, &inst).filter(|_| !repeats) {
+                        Some(generator) => {
+                            // What a jump there carries. See Note [Jumped-to contexts].
+                            ctx = self.jumping(owner, ctx, target);
+                            // Only a call uses the top the instruction before left. See Note [Known top].
+                            if ctx.top.is_some() && !matches!(inst.0.Opcode(), Opcode::CALL | Opcode::TAILCALL) {
+                                Rc::make_mut(&mut ctx).top = None;
+                            }
+                            let holds = self.unheld.take() != Some(target);
+                            self.instruction = Some((target, Restart::Start(ctx.clone()), holds));
+                            self.continued.push((proto, target, ctx.clone()));
+                            coro.next_instruction(generator);
+                            pc = SubPc::new(target);
+                            ResumeArg::Matched
+                        },
+                        None => ResumeArg::Failed,
+                    };
+                },
                 CoroutineState::Yielded(YieldOp::NextPc) => {
                     let next = pc.0 + 1;
                     let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[next].clone() };
