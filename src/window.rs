@@ -322,6 +322,11 @@ pub trait Window: std::fmt::Debug {
     fn memory(&self) -> Memory {
         Memory::Writes
     }
+    /// Whether that memory is the running closure's, its upvalues, which code in an inlined call's
+    /// frame finds only once the frame is made. See Note [Peephole fusion] in `peephole`.
+    fn closure(&self) -> bool {
+        false
+    }
     /// The operands its stencils take and give as unboxed doubles, in their
     /// window registers' paired XMM registers: bit `i` for operand `i`. See
     /// Note [Unboxed doubles] in `window_alloc`.
@@ -508,6 +513,14 @@ macro_rules! windowed {
     (properties $($rest:tt)*) => {
         $crate::window::windowed!(@mem properties $($rest)*);
     };
+    // Memory through the running closure: its upvalues, which it `upvalues` reads, or
+    // `sets_upvalues` writes. See Note [Window memory].
+    (upvalues $($rest:tt)*) => {
+        $crate::window::windowed!(@mem upvalues $($rest)*);
+    };
+    (sets_upvalues $($rest:tt)*) => {
+        $crate::window::windowed!(@mem sets_upvalues $($rest)*);
+    };
     (
         @mem $mem:ident
         $(#[$meta:meta])*
@@ -633,11 +646,18 @@ macro_rules! windowed {
     (@owner writes, $owner:ident) => { $owner };
     (@owner frames, $owner:ident) => { $owner };
     (@owner properties, $owner:ident) => { &*$owner };
+    (@owner upvalues, $owner:ident) => { &*$owner };
+    (@owner sets_upvalues, $owner:ident) => { $owner };
     (@memory none) => { $crate::window::Memory::None };
     (@memory reads) => { $crate::window::Memory::Reads };
     (@memory writes) => { $crate::window::Memory::Writes };
     (@memory frames) => { $crate::window::Memory::Frame };
     (@memory properties) => { $crate::window::Memory::Properties };
+    (@memory upvalues) => { $crate::window::Memory::Reads };
+    (@memory sets_upvalues) => { $crate::window::Memory::Writes };
+    (@closure upvalues) => { true };
+    (@closure sets_upvalues) => { true };
+    (@closure $other:ident) => { false };
     (@cold_body []) => {
         { 0 }
     };
@@ -843,6 +863,7 @@ macro_rules! windowed {
             fn operands(&self) -> &[usize] { &self.operands }
             fn accesses(&self) -> &'static [$crate::window::Access] { Self::ACCESSES }
             fn memory(&self) -> $crate::window::Memory { $crate::window::windowed!(@memory $mem) }
+            fn closure(&self) -> bool { $crate::window::windowed!(@closure $mem) }
             fn with_operands(&self, operands: &[usize]) -> std::rc::Rc<dyn $crate::window::Window> {
                 $crate::window::check_operands(stringify!($name), operands, Self::ACCESSES);
                 std::rc::Rc::new(Self { operands: operands.into(), ..self.clone() })

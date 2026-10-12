@@ -1821,6 +1821,9 @@ pub struct RunState<'src, 'intern> {
     /// How many frames JIT code called past the callstack's, which have no
     /// entries in it. See Note [Frame ops] in `specialize`.
     pub jit_depth: usize,
+    /// How many slots past the base of the innermost frame made the base is: the frames of inlined
+    /// calls `Enter` moved it to without making them. See Note [Peephole fusion] in `peephole`.
+    pub shifted: usize,
     /// How many entries past the callstack's length a bailout through frames
     /// JIT code called has written, as their calls unwind. See Note [Frame ops]
     /// in `specialize`.
@@ -2002,7 +2005,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// base plus its function's frame size, or for an inlined call's frame, its `max_stack`, as the
     /// frame of the function inlining it holds whatever it inlines in turn. See Note [Stack frames].
     fn frames_end(&self, owner: &Owner) -> usize {
-        let frames = self.callstack.iter().map(|call| (call.frame, &call.clos)).chain([(self.base, &self.clos)]);
+        // The running closure's frame is where its base was before `Enter` moved it on: the frames
+        // of its inlined calls it moved to are in its outermost function's frame size.
+        let frames = self.callstack.iter().map(|call| (call.frame, &call.clos)).chain([(self.base - self.shifted, &self.clos)]);
         // A frame is an inlined call's if the entry below it, its caller's, returns to inlining code.
         let inlined = [false].into_iter().chain(self.callstack.iter().map(|call| matches!(call.ret, Return::Inlined(_))));
         frames.zip(inlined).map(|((base, clos), inlined)| {
@@ -2771,6 +2776,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 select: 0,
                 trap: false,
                 jit_depth: 0,
+                shifted: 0,
                 unwound: 0,
                 error: None,
                 handlers: vec![].into(),

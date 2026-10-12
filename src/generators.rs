@@ -430,7 +430,7 @@ crate::window::windowed!(properties guard InArrayHeldK, [k: i32], [], |owner, st
 /// `specialize`. It writes only R(A): it follows `__index` through tables, running
 /// no Lua code.
 fn gettable(a: usize, b: usize, c: usize) -> ResidualExec {
-    ResidualExec::new("gettable", Rc::new(move |owner, state| {
+    ResidualExec::framed("gettable", Rc::new(move |owner, state| {
         let kc: Cow<'_, LValue<'_, '_>> = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
             Ok(c) => Cow::Owned(LValue::from(c)),
             Err(lv) => Cow::Owned(lv.unbox()),
@@ -710,7 +710,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             yield YieldOp::Trip(Some(a));
         }
         if arg != ResumeArg::Matched {
-            arg = yield YieldOp::Exec(ResidualExec::new("settable_meta", Rc::new(move |owner, state| {
+            arg = yield YieldOp::Exec(ResidualExec::framed("settable_meta", Rc::new(move |owner, state| {
                 let key: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                     Ok(b) => LValue::from(b),
                     Err(lv) => lv.unbox(),
@@ -913,7 +913,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             // A closure for each way of widening, which it knows as a constant.
             macro_rules! make {
                 ($W:tt) => {
-                    ResidualExec::new("settable_array", Rc::new(move |owner, state| {
+                    ResidualExec::framed("settable_array", Rc::new(move |owner, state| {
                         let kb: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                             Ok(b) => LValue::from(b),
                             Err(lv) => lv.unbox(),
@@ -982,7 +982,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Retype::Known | Retype::Unknown => yield YieldOp::UpdateHashRef(hb, new_type),
                 };
             } else {
-                arg = yield YieldOp::Exec(ResidualExec::new("settable_hash", Rc::new(move |owner, state| {
+                arg = yield YieldOp::Exec(ResidualExec::framed("settable_hash", Rc::new(move |owner, state| {
                     let kb: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                         Ok(b) => LBoxed::from(b),
                         Err(lv) => *lv,
@@ -1035,7 +1035,7 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
         // We don't need to guard on LType::Table, because this instruction is only ever used for
         // table initialization, which means it is definitely a table and doesn't e.g. have a
         // metatable we have to chain to.
-        arg = yield YieldOp::Exec(ResidualExec::new("setlist", Rc::new(move |owner, state| {
+        arg = yield YieldOp::Exec(ResidualExec::framed("setlist", Rc::new(move |owner, state| {
             match state.vals[state.base + a as usize].unbox() {
                 LValue::Table(tab) => {
                     assert_ne!(c, 0);
@@ -1885,7 +1885,7 @@ pub fn emit_testset(a: usize, b: usize, c: u16, pc: usize) -> impl Coroutine<Res
 pub fn emit_vararg(a: usize, b: usize, params: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        arg = yield YieldOp::Exec(ResidualExec::new("vararg", Rc::new(move |owner, state| {
+        arg = yield YieldOp::Exec(ResidualExec::framed("vararg", Rc::new(move |owner, state| {
             state.vararg(owner, a, b, params);
         })));
         if b == 0 {
@@ -1930,7 +1930,7 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
 pub const NO_CELL: usize = usize::MAX;
 
 // An upvalue's value, which JIT code also stores into its `cell`, if it has one.
-windowed!(reads GetUpval, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
+windowed!(upvalues GetUpval, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
     let _ = cell;
     let upval = state.upvalue(owner, index);
     debug!("upval {:?}", &upval);
@@ -1938,13 +1938,13 @@ windowed!(reads GetUpval, [index: usize, cell: usize], [], |owner, state, base| 
 });
 // An upvalue's value, which JIT code loads from its `cell`, holding it. See Note [Upvalue cells]
 // in `jit`.
-windowed!(reads UpvalCell, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
+windowed!(upvalues UpvalCell, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
     let _ = cell;
     *dest = state.upvalue(owner, index);
 });
 // A store into an upvalue, which JIT code also stores into its `cell`, if it has one. A closed
 // upvalue is stored out of line.
-windowed!(writes SetUpval, [index: usize, cell: usize], [], |owner, state, base| (value) {
+windowed!(sets_upvalues SetUpval, [index: usize, cell: usize], [], |owner, state, base| (value) {
     let _ = cell;
     let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
     match upval {
@@ -1969,7 +1969,14 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
         windowed!(reads NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
             #[cfg(debug_assertions)]
             {
-                let held = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {
+                // The code's closure, below its frame, which needn't be the running one: an
+                // inlined call's frame isn't made until something observes it. See Note
+                // [Peephole fusion] in `peephole`.
+                let clos = match state.vals[state.base - 1].unbox() {
+                    LValue::LClosure(clos) => clos,
+                    _ => state.clos.clone(),
+                };
+                let held = match clos.ro(owner).upvalues[index].deref().ro(owner) {
                     Upvalue::Open(o) => state.vals[*o as usize],
                     Upvalue::Closed(c) => *c.ro(owner),
                 };
@@ -1983,7 +1990,14 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
         windowed!(reads HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
             #[cfg(debug_assertions)]
             {
-                let held = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {
+                // The code's closure, below its frame, which needn't be the running one: an
+                // inlined call's frame isn't made until something observes it. See Note
+                // [Peephole fusion] in `peephole`.
+                let clos = match state.vals[state.base - 1].unbox() {
+                    LValue::LClosure(clos) => clos,
+                    _ => state.clos.clone(),
+                };
+                let held = match clos.ro(owner).upvalues[index].deref().ro(owner) {
                     Upvalue::Open(o) => state.vals[*o as usize],
                     Upvalue::Closed(c) => *c.ro(owner),
                 };
@@ -2028,7 +2042,7 @@ pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: u
         let skip = !upvalues.is_empty();
         let captured = upvalues.clone();
         let upvalues = upvalues.clone();
-        arg = yield YieldOp::Exec(ResidualExec::new("closure", Rc::new(move |owner, state| {
+        arg = yield YieldOp::Exec(ResidualExec::framed("closure", Rc::new(move |owner, state| {
             let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx] };
             let mut fresh = LClosure::new(proto as *const _);
             for &(from, b) in upvalues.iter() {

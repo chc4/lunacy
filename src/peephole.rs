@@ -29,9 +29,15 @@ use crate::window::{windowed, Window};
 // computation of values from before anything held, so a chain is one op that checks once and a
 // value overwritten unread is never computed. It is the coroutine the generators run in, so what it
 // holds is suspended with it wherever compiling is, and code compiled from a point where it holds
-// something is that point's own, never a version's. An inlined call's frame is held as well, made
-// only once code inside it is laid out, so a callee whose code all folds returns into its caller's
-// code having made no frame.
+// something is that point's own, never a version's.
+//
+// An inlined call's frame is made in two halves, each only once code needs it: the base moved to
+// it (`Enter`), nilling it past the arguments, before code naming its slots, and the rest, its
+// callstack entry and running closure, before code observing them, as an upvalue's access, a call
+// not inlined, a safepoint, or an exit to the interpreter does. A callee whose code all folds
+// returns into its caller's having made none of its frame, and one naming only slots, none but the
+// base. How much of each frame is made is known to the context, so versions differ by it, and is
+// what the code of a block's function runs in, whatever closure is running.
 //
 // What can't be held lays out only what it depends on, by witchcraft's two invariants: what it
 // reads, and, first, what reads a register it writes as that register was. The rest stays held,
@@ -807,6 +813,12 @@ impl Spells {
                 crate::window::Access::Write => self.inputs().all(|input| input != slot),
                 crate::window::Access::Update => false,
             })
+    }
+
+    /// Whether something it holds names slot `slot`: writes it, or reads it.
+    pub fn names(&self, slot: usize) -> bool {
+        self.spells.iter().any(|spell| spell.dest == slot || spell.inputs.contains(&slot))
+            || self.stores.iter().any(|store| store.window.operands().contains(&slot))
     }
 
     /// What it holds, the spells of slots `keeps` keeps writing the slots `dest` names, and

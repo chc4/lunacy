@@ -508,6 +508,8 @@ fn offset_past(res: &Residual, offset: usize) -> usize {
     match res {
         Residual::Inline { a, .. } => offset + *a as usize + 1,
         Residual::InlineReturn { call, .. } => offset - (*call as usize + 1),
+        Residual::Enter(by) => offset + *by as usize,
+        Residual::Leave(by) => offset - *by as usize,
         _ => offset,
     }
 }
@@ -2252,6 +2254,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 events.extend(inline_kills(res, at).iter().map(Event::Write));
                             }
                             res if keeps_frame(res) => {}
+                            // The base moved, the window kept. See Note [Peephole fusion] in `peephole`.
+                            Residual::Enter(_) | Residual::Leave(_) => {}
                             // Reads its field through the witness, no slot.
                             Residual::GuardWitness { .. } => {}
                             Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Select(_) | Residual::Branch { .. } => {
@@ -2392,6 +2396,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         steps.push(Step::Kill(inline_kills(res, at)));
                     }
                     res if keeps_frame(res) => {}
+                    Residual::Enter(_) | Residual::Leave(_) => {}
                     Residual::GuardWitness { .. } => {}
                     Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Select(_) | Residual::Branch { .. } => {
                         for target in jump_targets(res) {
@@ -2675,7 +2680,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // the caller's frame kept before it. See Note [Inlined calls] in `specialize`.
             let shifted = inline_shift(res).map(Residual::ExecWindow);
             let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_) | Residual::Tripped(_) | Residual::GuardWitness { .. })
-                || shifted.is_some() || keeps_frame(res);
+                || shifted.is_some() || keeps_frame(res) || matches!(res, Residual::Enter(_) | Residual::Leave(_));
             if window(res) && prev.is_some_and(|p| window(p)) {
                 // Inside a run of window residuals, charged for with its first.
             } else {
@@ -3305,6 +3310,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     depth.set(depth.get() + 1);
                     offset.set(offset_past(res, offset.get()));
                     pool.deepest = pool.deepest.max(depth.get());
+                },
+                // The base moved to an inlined call's frame, or back, none of it made: the window
+                // names slots from the outermost frame's base, so it keeps. See Note [Peephole
+                // fusion] in `peephole`.
+                Residual::Enter(by) | Residual::Leave(by) => {
+                    let by = if matches!(res, Residual::Enter(_)) { *by as i32 } else { -(*by as i32) };
+                    jit_note!(self.jctx, ops, "        move the base");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; add QWORD r12 => RunState.base, by
+                        ; add QWORD r12 => RunState.shifted, by
+                        ; add r13, by * 8
+                    );
+                    offset.set(offset_past(res, offset.get()));
                 },
                 Residual::InlineReturn { .. } if keeps_frame(res) => {
                     // Its results moved by the window ops after it, the caller's frame put back

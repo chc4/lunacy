@@ -80,6 +80,9 @@ pub struct Block {
     pub cells: u32,
     /// The promoted values its context has, which the JIT's notes show. See Note [Promoted values].
     pub promoted: SmallVec<[(Pc, i32); 2]>,
+    /// The function whose code it is, which needn't be the running frame's: an inlined call's
+    /// frame isn't made until something observes it. See Note [Peephole fusion] in `peephole`.
+    pub proto: usize,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
     /// Times the interpreter entered the block, shown by `dump`.
@@ -108,6 +111,7 @@ impl Block {
             context: None,
             cells: u32::MAX,
             promoted: SmallVec::new(),
+            proto: 0,
             #[cfg(feature = "jit")]
             jit_info: JitInfo::new(),
             #[cfg(feature = "graph")]
@@ -135,6 +139,9 @@ pub struct ResidualExec {
     pub template: Option<Rc<dyn Fn()->()>>,
     /// The slots it writes, if it says: else any. See Note [Fragile information].
     pub writes: Option<Vec<usize>>,
+    /// Whether it reads the frame it runs in past its slots: its closure, the callstack, or the
+    /// top. See Note [Peephole fusion] in `peephole`.
+    pub frame: bool,
 }
 
 /// A residual as the graph and window dumps label it.
@@ -169,6 +176,8 @@ impl std::fmt::Display for Residual {
             Residual::Ret(..) => write!(f, "ret"),
             Residual::Inline { a, b, .. } => write!(f, "inline({}, {})", a, b),
             Residual::InlineReturn { a, b, .. } => write!(f, "inline_ret({}, {})", a, b),
+            Residual::Enter(by) => write!(f, "enter({by})"),
+            Residual::Leave(by) => write!(f, "leave({by})"),
             Residual::GC => write!(f, "gc"),
         }
     }
@@ -186,7 +195,12 @@ fn window_label(w: &dyn Window) -> String {
 
 impl ResidualExec {
     pub fn new(name: &'static str, body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)>) -> Self {
-        Self { name, body, template: None, writes: None }
+        Self { name, body, template: None, writes: None, frame: false }
+    }
+
+    /// One reading the frame it runs in past its slots. See `frame`.
+    pub fn framed(name: &'static str, body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)>) -> Self {
+        Self { frame: true, ..Self::new(name, body) }
     }
 
     /// It, saying it writes only the slots `slots`.
@@ -226,29 +240,6 @@ impl Clone for Box<dyn NativeGen> {
     }
 }
 
-/// What the peephole holds: spells and stores, and the frames of inlined calls not made yet. See
-/// Note [Peephole fusion] in `peephole`.
-#[derive(Clone, Default)]
-pub struct Held {
-    pub spells: crate::peephole::Spells,
-    frames: Vec<Frame>,
-}
-
-impl Held {
-    pub fn is_empty(&self) -> bool {
-        self.spells.is_empty() && self.frames.is_empty()
-    }
-}
-
-/// An inlined call's frame the peephole holds unmade, as `push` makes it: made only once code
-/// inside it is laid out, and never if none is, the call's code folding into its caller's. See
-/// Note [Peephole fusion] in `peephole`.
-#[derive(Clone)]
-struct Frame {
-    push: Residual,
-    continuation: Rc<Continuation>,
-}
-
 /// The coroutine compiling code: a generator, run by the peephole, which holds what it can of what
 /// the generator yields and yields the rest, laying out first what that needs of what it holds.
 /// What it holds is suspended with it, in whatever suspends it. See Note [Peephole fusion] in
@@ -258,8 +249,6 @@ pub struct Gen {
     inner: Box<dyn NativeGen>,
     /// What it holds.
     held: crate::peephole::Spells,
-    /// The frames of inlined calls it holds unmade, outermost first.
-    frames: Vec<Frame>,
     /// What the code is compiled in, as of its last resumption: what is known of values, and the
     /// function.
     ctx: Option<Rc<Context>>,
@@ -291,7 +280,6 @@ impl Gen {
         Box::new(Gen {
             inner,
             held: Default::default(),
-            frames: Vec::new(),
             ctx: None,
             proto: None,
             at: 0,
@@ -306,28 +294,75 @@ impl Gen {
     }
 
     /// `inner`, run holding `held`.
-    pub fn holding(held: Held, inner: impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static) -> Box<Gen> {
+    pub fn holding(held: crate::peephole::Spells, inner: impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static) -> Box<Gen> {
         let mut holding = Self::boxed(inner);
-        holding.held = held.spells;
-        holding.frames = held.frames;
+        holding.held = held;
         holding
     }
 
     /// Whether it holds anything: code compiled from it then is its own, never a version's, as
     /// what it holds isn't in the context.
     pub fn holds_any(&self) -> bool {
-        !self.held.is_empty() || !self.frames.is_empty()
+        !self.held.is_empty()
     }
 
     /// What it holds, which the next instruction's generator is run holding.
-    pub fn take_held(&mut self) -> Held {
-        Held { spells: std::mem::take(&mut self.held), frames: std::mem::take(&mut self.frames) }
+    pub fn take_held(&mut self) -> crate::peephole::Spells {
+        std::mem::take(&mut self.held)
     }
 
-    /// Make the frames it holds, before code inside them is laid out.
-    fn make_frames(&mut self) {
-        for frame in self.frames.drain(..) {
-            self.out.push_back(YieldOp::Frame(frame.push));
+    /// What `yielded` needs of the frames of the inlined calls the code is in: made, if it may
+    /// observe them; else their base moved to, if it may lay out code naming their slots. See Note
+    /// [Peephole fusion] in `peephole`.
+    fn frames_for(&mut self, yielded: &YieldOp) {
+        let Some(ctx) = self.ctx.as_ref() else { return };
+        if ctx.inline.iter().all(|frame| frame.made == Made::Yes) {
+            return;
+        }
+        if self.observes(yielded) {
+            for frame in &mut Rc::make_mut(self.ctx.as_mut().unwrap()).inline {
+                frame.made = Made::Yes;
+            }
+            self.out.push_back(YieldOp::MakeFrames);
+        } else if self.lays_out(yielded) {
+            self.enter();
+        }
+    }
+
+    /// Move the base to the frames of the inlined calls the code is in, if it isn't, before code
+    /// naming their slots is laid out.
+    fn enter(&mut self) {
+        let Some(ctx) = self.ctx.as_mut() else { return };
+        // A frame its call passed what's up to the top is made: what it was passed is found only
+        // then.
+        if ctx.inline.iter().any(|frame| frame.made == Made::No && frame.b == 0) {
+            for frame in &mut Rc::make_mut(ctx).inline {
+                frame.made = Made::Yes;
+            }
+            self.out.push_back(YieldOp::MakeFrames);
+            return;
+        }
+        if ctx.inline.iter().any(|frame| frame.made == Made::No) {
+            for frame in Rc::make_mut(ctx).inline.iter_mut().filter(|frame| frame.made == Made::No) {
+                frame.made = Made::Base;
+            }
+            self.out.push_back(YieldOp::Enter);
+        }
+    }
+
+    /// Whether `yielded` may lay out code reading the frame it runs in past the slots it names: its
+    /// closure, the callstack, or the top, or an upvalue's value a guard finds. See Note [Peephole
+    /// fusion] in `peephole`.
+    fn observes(&self, yielded: &YieldOp) -> bool {
+        let ctx = self.ctx.as_ref().expect("a generator run in a context");
+        let upvalue = |slot: usize| ctx.values.members(Loc::root(Root::Slot(slot as u16))).into_iter().any(|root| matches!(root, Root::Upvalue(_)));
+        match yielded {
+            YieldOp::Exec(func) => func.frame,
+            YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) | YieldOp::GuardDynamic(w) => w.closure(),
+            YieldOp::Call(_) | YieldOp::CallResume(_) | YieldOp::NativeCall { .. } | YieldOp::CollectGarbage => true,
+            YieldOp::Guard(idx, _) => upvalue(*idx),
+            YieldOp::GuardRk(rk, _) | YieldOp::GuardCType(rk, _) => rk & 0x100 == 0 && upvalue(*rk),
+            _ => false,
         }
     }
 
@@ -342,7 +377,7 @@ impl Gen {
         !match yielded {
             YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
                 | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
-                | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::IsKey(..)
+                | YieldOp::Effect(_) | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::IsKey(..)
                 | YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) | YieldOp::ArrayType(..)
                 | YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) | YieldOp::NativeWindowArgs(..)
                 | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Took | YieldOp::Holding { .. } | YieldOp::Created(_) => true,
@@ -408,7 +443,7 @@ impl Gen {
             self.held = kept;
             return;
         }
-        self.make_frames();
+        self.enter();
         let ops = laid.lay_out(self.at, &kept);
         #[cfg(feature = "tracing")]
         self.out.push_back(YieldOp::PeepholeTrace("lay_out", vec![
@@ -629,9 +664,7 @@ impl Gen {
             YieldOp::Clobber(from) => self.held.spells.retain(|spell| spell.dest < *from),
             _ => {},
         }
-        if !self.frames.is_empty() && self.lays_out(&yielded) {
-            self.make_frames();
-        }
+        self.frames_for(&yielded);
         self.out.push_back(yielded.clone());
         self.last = Some(yielded);
         self.next = None;
@@ -789,7 +822,8 @@ pub enum YieldOp {
     Created(usize), // STACK[idx] holds a table just made, which nothing watches. See Note [Watched tables]
     LayOut, // Lay out everything held
     LaidOut(Rc<dyn Window>), // What the peephole held, laid out: the context knew what it does when it was held
-    Frame(Residual), // Make an inlined call's frame, as the residual does, the code going on inside it
+    Enter, // Move the base to the frames of the inlined calls the code is in that it isn't in
+    MakeFrames, // Make the frames of the inlined calls the code is in that aren't, the code going on inside them
     PeepholeTrace(&'static str, Vec<(&'static str, String)>), // A trace event of what the peephole did
     Watching(usize, bool), // A watch site of STACK[idx]'s table, frozen first if the bool says so:
                            // resumed with Matched, the code after knowing which table it is,
@@ -936,10 +970,22 @@ enum Restart {
     Resume(SubPc, Rc<Context>, Box<Gen>, ResumeArg),
 }
 
+impl Restart {
+    /// It, the frames of its inlined calls as made as `now`'s: what is laid out moving the base or
+    /// making them stays, so a restart from before goes on from there. See Note [Peephole fusion]
+    /// in `peephole`.
+    fn made_as(&mut self, now: &Context) {
+        let (Restart::Start(ctx) | Restart::Resume(_, ctx, _, _)) = self;
+        for (frame, now) in Rc::make_mut(ctx).inline.iter_mut().zip(&now.inline) {
+            frame.made = now.made;
+        }
+    }
+}
+
 /// Where compiling an instruction went on to, if it went on in the block: the next instruction, in
 /// what context, what its generator returned, and what the peephole holds still. See Note
 /// [Peephole fusion] in `peephole`.
-pub type Compiled = Option<(Pc, Rc<Context>, ResumeArg, Held)>;
+pub type Compiled = Option<(Pc, Rc<Context>, ResumeArg, crate::peephole::Spells)>;
 
 /// Whether an integer op's result fits the integer encoding for the values its operands have.
 /// See Note [Optimistic ops].
@@ -1438,7 +1484,7 @@ windowed!(properties guard KindIs, [kind: LType], [], |owner, state, base| (tabl
     tab.ro(owner).kind == kind.bit()
 });
 // The same of the table in the running closure's upvalue `index`.
-windowed!(properties guard UpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| () {
+windowed!(upvalues guard UpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| () {
     let LValue::Table(tab) = state.upvalue(owner, index).unbox() else { unreachable!() };
     tab.ro(owner).kind == kind.bit()
 });
@@ -1577,6 +1623,11 @@ pub enum Residual {
     /// results to the call's R(A), `call`, if `moves`, and the caller's frame back. See Note
     /// [Inlined calls].
     InlineReturn { a: u16, b: u16, closes: bool, call: u16, moves: bool },
+    /// The base moved on `by` slots to an inlined call's frame, which isn't made: its code naming
+    /// only slots runs there. See Note [Peephole fusion] in `peephole`.
+    Enter(u16),
+    /// The base moved back `by` slots from the frame `Enter` moved it to.
+    Leave(u16),
     GC,
 }
 
@@ -1625,9 +1676,10 @@ pub enum CallEntry {
 // run, continues compiling the caller's code after the call from that context, with the results'
 // types, less what the callee's code may have falsified (its effects, applied as a continuation
 // applies a callee's; Note [Call effects]), with no guard on the return between, and becomes the
-// return and a jump to that code; but where the callee's frame was never made, none of its code
-// needing it, the caller's code is compiled on from the return itself, the peephole holding the
-// results (Note [Peephole fusion] in `peephole`). What the callee learns of a value it was
+// return and a jump to that code; but where the callee's frame isn't made, none of its code
+// observing it, the caller's code is compiled on from the return itself, the base moved back if
+// it was, the results the peephole holds held and the rest moved (Note [Peephole fusion] in
+// `peephole`). What the callee learns of a value it was
 // passed, as a table's array kind, the caller's places holding it know on the return: the value
 // of each argument is a place of the callee's code (`Root::Arg`) that none of it writes.
 //
@@ -1777,9 +1829,39 @@ pub struct InlineFrame {
     pub a: u16,
     pub effects: Effects,
     pub passed: SmallVec<[(u16, u16); 2]>,
+    /// How much of the frame code past here has made. See Note [Peephole fusion] in `peephole`.
+    pub made: Made,
+    /// The call's B, the callee's parameters and frame size, its cells, and its returns'
+    /// continuation: what makes the frame.
+    pub b: u16,
+    pub params: u8,
+    pub stack: u8,
+    pub cells: u32,
+    pub continuation: *const Continuation,
+}
+
+/// How much of an inlined call's frame is made: none, the base moved to it (`Enter`), or all of it,
+/// its callstack entry and closure too (`Inline`). See Note [Peephole fusion] in `peephole`.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum Made {
+    No,
+    Base,
+    Yes,
 }
 
 impl InlineFrame {
+    /// The residual making the frame from its caller's: nilling it past its arguments, unless code
+    /// in it ran already, which nilled its parameters past them (`Enter`).
+    fn push(&self) -> Residual {
+        let b = if self.made == Made::Base { self.stack as u16 + 1 } else { self.b };
+        Residual::Inline { a: self.a, b, stack: self.stack, cells: self.cells, continuation: self.continuation }
+    }
+
+    /// The slots `Enter` moves the base on by to it.
+    fn by(&self) -> usize {
+        self.a as usize + 1
+    }
+
     /// The caller's slot holding the table parameter `param` was passed, if it still holds it in
     /// `ctx`: a write to it forgets the shape it entered with.
     fn owner(&self, ctx: &Context, param: usize) -> Option<usize> {
@@ -4604,7 +4686,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// `compile`, the peephole holding `held`. See Note [Peephole fusion] in `peephole`.
-    fn compile_holding(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>, block_id: BlockId, held: Held) -> Rc<Context> {
+    fn compile_holding(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>, block_id: BlockId, held: crate::peephole::Spells) -> Rc<Context> {
         // The instruction compiling this, if any, goes on after it.
         let outer = self.instruction.take();
         let ctx = self.compile_instructions(owner, pc, ctx, block_id, held);
@@ -4612,16 +4694,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         ctx
     }
 
-    /// Make the frame `push` makes, ending `block`: the block the code inside it goes on in, from
-    /// `pc` in `ctx`. See Note [Peephole fusion] in `peephole`.
-    fn make_frame(&mut self, block: BlockId, push: Residual, pc: Pc, ctx: &Context) -> BlockId {
+    /// Make the frames of the inlined calls code in `ctx` is in that aren't, ending `block`: the
+    /// block the code goes on in, from `pc`, inside them, and its context. See Note [Peephole
+    /// fusion] in `peephole`.
+    fn make_frames(&mut self, block: BlockId, pc: Pc, ctx: &Context) -> (BlockId, Rc<Context>) {
+        let mut made = ctx.clone();
         self.end_block(block);
-        self.blocks[block.0].instructions.push(push);
+        let moved: usize = made.inline.iter().filter(|frame| frame.made == Made::Base).map(InlineFrame::by).sum();
+        if moved > 0 {
+            self.blocks[block.0].instructions.push(Residual::Leave(moved as u16));
+        }
+        for frame in made.inline.iter_mut().filter(|frame| frame.made != Made::Yes) {
+            self.blocks[block.0].instructions.push(frame.push());
+            frame.made = Made::Yes;
+        }
         let inside = self.new_block(pc);
-        self.blocks[inside.0].cells = ctx.filled_cells();
-        self.blocks[inside.0].promoted = ctx.promoted.clone();
+        self.blocks[inside.0].cells = made.filled_cells();
+        self.blocks[inside.0].promoted = made.promoted.clone();
         self.blocks[block.0].instructions.push(Residual::Jump(inside));
-        inside
+        (inside, Rc::new(made))
     }
 
     /// Compile on in `block` from where compiling an instruction went on to, if it went on there.
@@ -4631,7 +4722,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    fn compile_instructions(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId, mut carry: Held) -> Rc<Context> {
+    fn compile_instructions(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId, mut carry: crate::peephole::Spells) -> Rc<Context> {
+        debug_assert_eq!(ctx.types.len(), unsafe { (*self.proto).max_stack } as usize, "a context of another function's frame");
         loop {
             let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[pc].clone() };
             // Only a call uses the top the instruction before left. See Note [Known top].
@@ -4642,45 +4734,73 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let holds = self.unheld.take() != Some(pc);
             self.instruction = Some((pc, Restart::Start(ctx.clone()), holds));
             self.entering = true;
-            // An inlined call's return whose frame was never made, its results held: the caller's
-            // code after the call goes on here, the results held in its slots. See Note [Peephole
-            // fusion] in `peephole`.
-            if inst.0.Opcode() == Opcode::RETURN && let Some(frame) = carry.frames.last()
-                && let (a, b) = crate::vm::AB::unpack(inst.0) && b != 0
-                && let (call, c) = (frame.continuation.a as usize, frame.continuation.c as usize) && c != 0 && c <= b as usize
-                && let Rest::Next(next) = frame.continuation.rest
-                && (0..c - 1).all(|i| carry.spells.spells.iter().any(|spell| spell.dest == a as usize + i))
-            {
-                let frame = carry.frames.pop().unwrap();
-                let a = a as usize;
-                let results = a..a + c - 1;
-                let (known, effects) = self.returned_context(owner, &ctx, &frame.continuation, a, b as usize);
-                // Of no instruction of the caller's.
-                let spells = carry.spells.renamed(|slot| call + slot - a, |slot| call + 1 + slot, |slot| results.contains(&slot), usize::MAX);
+            // An inlined call's return whose frame isn't made: the caller's code after the call goes
+            // on here, the base moved back if it was moved, the results the peephole holds held in
+            // the call's slots and the rest moved there. See Note [Peephole fusion] in `peephole`.
+            let folds = match ctx.inline.last() {
+                Some(frame) if inst.0.Opcode() == Opcode::RETURN && frame.made != Made::Yes => {
+                    let (a, b) = crate::vm::AB::unpack(inst.0);
+                    let (a, b) = (a as usize, b as usize);
+                    // SAFETY: an inlined call's continuation lives as long as the code.
+                    let continuation = unsafe { &*frame.continuation };
+                    let (call, c) = (continuation.a as usize, continuation.c as usize);
+                    let results = a..a + c.saturating_sub(1);
+                    // Of no instruction of the caller's.
+                    let spells = carry.renamed(|slot| call + slot - a, |slot| call + 1 + slot, |slot| results.contains(&slot), usize::MAX);
+                    let moves: Vec<(usize, usize)> = results.clone().filter(|&slot| !carry.spells.iter().any(|spell| spell.dest == slot)).map(|slot| (call + 1 + slot, call + slot - a)).collect();
+                    match continuation.rest {
+                        Rest::Next(next) if b != 0 && c != 0 && c <= b && frame.b != 0 && !moves.iter().any(|&(_, to)| spells.names(to)) => Some((frame.clone(), a, b, next, spells, moves)),
+                        _ => None,
+                    }
+                },
+                _ => None,
+            };
+            if let Some((frame, a, b, next, spells, moves)) = folds {
+                let continuation = unsafe { &*frame.continuation };
+                let moved = frame.made == Made::Base;
+                let by = frame.by();
+                let (known, effects) = self.returned_context(owner, &ctx, continuation, a, b);
+                self.end_block(block_id);
+                if moved {
+                    self.blocks[block_id.0].instructions.push(Residual::Leave(by as u16));
+                }
+                // A slot past the arguments of a frame its code never moved the base to is nil.
+                let passed = continuation.a as usize + frame.b as usize;
+                for (from, to) in moves {
+                    let result: Rc<dyn Window> = if !moved && from >= passed {
+                        Rc::new(crate::generators::LoadNil::new(&[to]))
+                    } else {
+                        Rc::new(crate::generators::Move::new(&[from, to]))
+                    };
+                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(result));
+                }
                 let callee = self.proto;
-                self.set_current(frame.continuation.proto as LProto<'_, '_>);
+                self.set_current(continuation.proto as LProto<'_, '_>);
                 self.join_effects(owner, effects);
-                self.compile_holding(owner, next, Rc::new(known), block_id, Held { spells, frames: std::mem::take(&mut carry.frames) });
+                let after = self.new_block(next);
+                self.blocks[after.0].cells = known.filled_cells();
+                self.blocks[after.0].promoted = known.promoted.clone();
+                self.blocks[block_id.0].instructions.push(Residual::Jump(after));
+                self.entering = true;
+                self.compile_holding(owner, next, Rc::new(known), after, spells);
                 self.set_current(callee);
                 return ctx;
             }
             // What the peephole holds, laid out before what lays out code here, as if from before
             // the instruction, going on to it. See Note [Peephole fusion] in `peephole`.
-            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && carry.spells.is_empty() && !carry.frames.is_empty() {
-                let mut block_id = block_id;
-                for frame in std::mem::take(&mut carry.frames) {
-                    block_id = self.make_frame(block_id, frame.push, pc, &ctx);
-                }
-                self.entering = true;
-                return self.compile_holding(owner, pc, ctx, block_id, Held::default());
-            }
-            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && !carry.spells.is_empty() {
+            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && !carry.is_empty() {
                 let held = std::mem::take(&mut carry);
                 match self.compile_one(owner, SubPc::new(pc - 1), ctx.clone(), Gen::holding(held, emit_lay_out()), ResumeArg::Start, block_id) {
                     Some((_, laid, _, _)) => ctx = laid,
                     None => return ctx,
                 }
                 self.entering = true;
+            }
+            // Any other return of an inlined call: from its frame, made. See Note [Inlined calls].
+            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && ctx.inline.iter().any(|frame| frame.made != Made::Yes) {
+                let (inside, made) = self.make_frames(block_id, pc, &ctx);
+                self.entering = true;
+                return self.compile_holding(owner, pc, made, inside, Default::default());
             }
             if let Some((next, nctx, ret, held)) = match inst.0.Opcode() {
                 op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
@@ -4939,7 +5059,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// A new, empty block starting at `pc` (see `Block::pc`).
     pub fn new_block(&mut self, pc: Pc) -> BlockId {
-        self.blocks.push(Block::new(pc));
+        self.blocks.push(Block { proto: self.proto as usize, ..Block::new(pc) });
         BlockId(self.blocks.len() - 1)
     }
 
@@ -5362,7 +5482,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let ret = match state.callstack[i].ret {
                 Return::To(at) => match self.continuation_sites.get(&at).cloned() {
                     Some(site) if site.ctx.trips() => {
+                        // The code of the function the frame runs, which needn't be the tripping one.
                         let block = self.new_block(self.blocks[at.0.0].pc);
+                        self.blocks[block.0].proto = self.blocks[at.0.0].proto;
                         let mut ctx = (*site.ctx).clone();
                         ctx.effect(Effect::Trip);
                         let after = match site.after {
@@ -5749,6 +5871,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let effects = ctx.inline.last().expect("an inlined call's frame").effects;
         let caller = &continuation.caller;
         let mut known = caller.clone();
+        // Its frames as the callee's code made them. See Note [Peephole fusion] in `peephole`.
+        for (frame, now) in known.inline.iter_mut().zip(&ctx.inline) {
+            frame.made = now.made;
+        }
         // The hash keys the callee leaves, in the witnesses it shared: the caller's own it kept
         // are the caller's again, and any other, of the callee's frame or put in place of one of
         // the caller's, is free. See Note [Inlined calls].
@@ -6107,7 +6233,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .map(|owner| (param as u16, owner as u16)),
             _ => None,
         }).collect();
-        let frame = InlineFrame { call, proto, a: a as u16, effects: Effects::NONE, passed };
+        let frame = InlineFrame {
+            call, proto, a: a as u16, effects: Effects::NONE, passed, made: Made::No,
+            b: b as u16, params: unsafe { (*callee).param_count }, stack: unsafe { (*callee).max_stack }, cells: 0, continuation: std::ptr::null(),
+        };
         inline_entry(calling, unsafe { &*callee }, a, b, frame)
     }
 
@@ -6156,12 +6285,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // entered. See Note [Upvalue cells].
         let own = (1u32 << UPVALUE_CELLS) - 1;
         let cells = entry.filled_cells() & own << (entry.depth() * UPVALUE_CELLS);
-        // Its code from the call's block, its frame held unmade, so code that lays out nothing
-        // inside it folds into its caller's. See Note [Peephole fusion] in `peephole`.
+        // Its code from the call's block, its frame unmade until code observes it, so code naming
+        // only its slots runs in its caller's, and code laying out nothing folds into it. See Note
+        // [Peephole fusion] in `peephole`.
         let shift = self.new_block(self.blocks[block.0].pc);
-        let stack = unsafe { (*callee).max_stack };
-        let frame = Frame { push: Residual::Inline { a: a as u16, b: b as u16, stack, cells, continuation: pointer }, continuation: self.continuations.last().unwrap().clone() };
-        self.compile_holding(owner, 0, Rc::new(entry), shift, Held { spells: Default::default(), frames: vec![frame] });
+        let mut entry = entry;
+        let frame = entry.inline.last_mut().expect("an inlined call's frame");
+        (frame.cells, frame.continuation) = (cells, pointer);
+        self.compile_holding(owner, 0, Rc::new(entry), shift, Default::default());
         self.set_current(caller);
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline", &[
@@ -6875,13 +7006,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::LaidOut(w)) => {
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
                 },
-                // An inlined call's frame the peephole held, made: the code goes on inside it, in a
-                // block of its own, as a call's code goes on. See Note [Peephole fusion] in
-                // `peephole`.
-                CoroutineState::Yielded(YieldOp::Frame(push)) => {
-                    let inside = self.make_frame(block_id, push, pc.0, &ctx);
+                // The base moved to the frames of the inlined calls the code is in, before code naming
+                // their slots, making none of them. See Note [Peephole fusion] in `peephole`.
+                CoroutineState::Yielded(YieldOp::Enter) => {
+                    // Each frame nil past its arguments, as making it would: its code reads a local
+                    // its first instruction declares as nil. Laid out before anything held, what
+                    // the context knows of the slots stays.
+                    let entered = Rc::make_mut(&mut ctx);
+                    for frame in entered.inline.iter_mut().filter(|frame| frame.made == Made::No) {
+                        frame.made = Made::Base;
+                        self.blocks[block_id.0].instructions.push(Residual::Enter(frame.by() as u16));
+                        for slot in frame.b as usize - 1..frame.stack as usize {
+                            self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::LoadNil::new(&[slot]))));
+                        }
+                    }
+                    if let Some((_, restart, _)) = &mut self.instruction {
+                        restart.made_as(&ctx);
+                    }
+                },
+                // Their frames made, before code observing them: the code goes on inside them, in a
+                // block of its own, as a call's code goes on.
+                CoroutineState::Yielded(YieldOp::MakeFrames) => {
+                    let (inside, made) = self.make_frames(block_id, pc.0, &ctx);
+                    if let Some((_, restart, _)) = &mut self.instruction {
+                        restart.made_as(&made);
+                    }
                     self.entering = true;
-                    let compiled = self.compile_one(owner, pc, ctx, coro, ResumeArg::Start, inside);
+                    let compiled = self.compile_one(owner, pc, made, coro, ResumeArg::Start, inside);
                     self.go_on(owner, compiled, inside);
                     return None;
                 },
@@ -7604,7 +7755,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // the interpreter has for them, the callstack's last. See Note [Inlined
                         // calls].
                         let depth = state.callstack.iter().rev().take_while(|entry| entry.returns_to().is_none()).count();
-                        let offset = state.callstack.len().checked_sub(depth).filter(|_| depth > 0).map_or(0, |outer| state.base - state.callstack[outer].frame);
+                        let offset = state.callstack.len().checked_sub(depth).filter(|_| depth > 0).map_or(state.shifted, |outer| state.base - state.callstack[outer].frame);
                         self.jit_compile(id, owner, depth, offset);
                     }
 
@@ -7620,7 +7771,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     let next_off = (ret >> 32) as i32 as isize;
                     let next_id = (ret & 0xFFFFFFFF) as usize;
-                    self.proto = state.clos.ro(owner).prototype;
 
                     #[cfg(feature = "tracing")]
                     self.trace_bailout(owner, &state, next_off, next_id);
@@ -7682,6 +7832,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 println!("out of gas return stack: {:?}", state.callstack);
                 state.gas -= 1;
             }
+            // See `Block::proto`.
+            self.proto = self.blocks[id.0].proto as LProto<'src, 'intern>;
             // Borrowed, not cloned: an arm that needs `self` mutably (a thunk forcing, a call
             // finding its callee's version) first copies out what it uses, so no residual is
             // replaced while borrowed.
@@ -7866,6 +8018,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     state.shift_frame::<true>(owner, callee, a as usize, b as usize, stack, true, continuation as u64);
                     self.set_current(state.clos.ro(owner).prototype);
                 },
+                &Residual::Enter(by) => {
+                    off += 1;
+                    state.base += by as usize;
+                    state.shifted += by as usize;
+                },
+                &Residual::Leave(by) => {
+                    off += 1;
+                    state.base -= by as usize;
+                    state.shifted -= by as usize;
+                },
                 &Residual::InlineReturn { a, b, closes, moves, .. } => {
                     off += 1;
                     state.unshift_frame::<true>(owner, moves.then_some((a as usize, b as usize)), closes);
@@ -7953,6 +8115,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             state.witness_base = witness_frame;
             state.witness_top = witness_top;
         }
+        // A protected call is made from a frame made. See Note [Peephole fusion] in `peephole`.
+        state.shifted = 0;
         // `c - 1` results, or both with C = 0, the top just past them.
         let results = [LBoxed::from_bool(false), error];
         let wanted = if handler.c == 0 { 2 } else { handler.c as usize - 1 };
