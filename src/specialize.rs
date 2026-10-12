@@ -372,6 +372,26 @@ impl Gen {
         }
     }
 
+    /// The slots `yielded` may lay out code reading, if it says: else any.
+    fn slots_read(&self, yielded: &YieldOp) -> Option<Vec<usize>> {
+        let reading = |w: &Rc<dyn Window>| w.operands().iter().zip(w.accesses()).filter(|(_, a)| a.reads()).map(|(s, _)| *s).collect();
+        Some(match yielded {
+            YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) | YieldOp::GuardDynamic(w) => reading(w),
+            YieldOp::Guard(idx, _) | YieldOp::Narrow(idx) | YieldOp::Promote(idx) | YieldOp::Trip(Some(idx)) => vec![*idx],
+            YieldOp::GuardRk(rk, _) | YieldOp::GuardCType(rk, _) => if rk & 0x100 != 0 { Vec::new() } else { vec![*rk] },
+            YieldOp::Trip(None) => Vec::new(),
+            // Asking what the context knows of a table's keys reads it, and the key.
+            YieldOp::HashKey(slot, key, _) => [*slot].into_iter().chain((*key & 0x100 == 0).then_some(*key)).collect(),
+            YieldOp::LoadUpvalue(..) | YieldOp::UpvalueKnown(_) | YieldOp::UpvalueCell(_) | YieldOp::UpvalueHolds(..)
+                | YieldOp::FrameUnmade | YieldOp::HoldsValue(..) => Vec::new(),
+            // Decided as it compiles while it holds anything, reading no slot. See Note [Optimistic
+            // ops].
+            YieldOp::Encoding(_) if self.holds_any() => Vec::new(),
+            yielded if !self.lays_out(yielded) => Vec::new(),
+            _ => return None,
+        })
+    }
+
     /// Whether `yielded` may lay out code reading the frame it runs in past the slots it names: its
     /// closure, the callstack, or the top, or an upvalue's value a guard finds. See Note [Peephole
     /// fusion] in `peephole`.
@@ -678,7 +698,23 @@ impl Gen {
                 self.out.push_back(YieldOp::PeepholeTrace("dead", vec![("element", format!("{cell:?}")), ("dead", _dead.to_string())]));
             }
         }
+        // A read of an unset slot gets its nil first, what's held reading the slot as it was laid
+        // out before it. See Note [Peephole memory] in `peephole`.
+        if !self.held.unset.is_empty() {
+            let nils: Vec<usize> = match self.slots_read(&yielded) {
+                Some(slots) => self.held.unset.iter().copied().filter(|slot| slots.contains(slot)).collect(),
+                None => self.held.unset.clone(),
+            };
+            if !nils.is_empty() {
+                let trigger = match &yielded {
+                    YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) | YieldOp::GuardDynamic(w) => format!("unset, window {}", w.name()),
+                    yielded => format!("unset, {}", format!("{yielded:?}").split(['(', ' ', '{']).next().unwrap_or("")),
+                };
+                self.lay_out(Some(Need { reads: nils, writes: Vec::new(), memory: false }), &[], &trigger);
+            }
+        }
         let (writes, reads) = overwrites(&yielded);
+        self.held.unset.retain(|slot| !writes.contains(slot));
         // A held store named by a slot about to be written is named by another holding the value.
         if !self.held.stores.is_empty() && !writes.is_empty() {
             let ctx = self.ctx.clone().expect("a generator run in a context");
@@ -2085,9 +2121,10 @@ fn rehome(held: &mut crate::peephole::Spells, ctx: &Context, dead: impl Fn(usize
 
 /// What the peephole holds, `held`, at a call of R(A) with B of `callee` that is inlined: what's laid
 /// out first, as the callee's code names none of it, and what goes on held into the callee's code,
-/// in its slots. What names the caller's slots below the callee's frame is laid out, and what writes
-/// the frame past its arguments is dead, as entering it nils it, and what reads that laid out; one
-/// passed what's up to the top, or whose code is its return, takes nothing. See Note [Peephole fusion] in `peephole`.
+/// in its slots. What names the caller's slots below the callee's frame is laid out; what writes the
+/// frame past its arguments is dead, as entering it leaves those slots unset, nil to its code, and
+/// what reads them reads them as they were. One passed what's up to the top, or whose code is its
+/// return, takes nothing. See Note [Peephole fusion] in `peephole`.
 fn entering(held: &crate::peephole::Spells, calling: &Context, callee: LProto<'static, 'static>, a: usize, b: usize) -> (crate::peephole::Spells, crate::peephole::Spells) {
     let stack = unsafe { (*callee).max_stack } as usize;
     // A store named by a slot below the frame is named by an argument holding the same value.
@@ -2102,9 +2139,16 @@ fn entering(held: &crate::peephole::Spells, calling: &Context, callee: LProto<'s
         0 => ((0..a + 1 + stack).collect(), Vec::new()),
         b => ((0..=a).collect(), (a + b..a + 1 + stack).collect()),
     };
-    let writes: Vec<usize> = below.iter().chain(&nilled).copied().collect();
-    let (laid, kept) = held.split(&crate::peephole::Need { reads: below, writes, memory: false });
-    (laid, kept.renamed(|slot| slot - a - 1, |slot| slot - a - 1, |slot| !nilled.contains(&slot), usize::MAX))
+    // What reads the frame's slots past the arguments reads them as they were: entering it writes
+    // none of them, holding them unset.
+    let (laid, kept) = held.split(&crate::peephole::Need { reads: below.clone(), writes: below, memory: false });
+    let mut kept = kept.renamed(|slot| slot - a - 1, |slot| slot - a - 1, |slot| !nilled.contains(&slot), usize::MAX);
+    // Its frame is nil past its arguments, as the peephole holds it, unset.
+    if b != 0 {
+        let fresh: Vec<usize> = (b - 1..stack).filter(|slot| !kept.unset.contains(slot)).collect();
+        kept.unset.extend(fresh);
+    }
+    (laid, kept)
 }
 
 /// For a Lua callee's continuation, which applies only what the callee's effects falsify: the
@@ -4927,10 +4971,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if moved {
                     self.blocks[block_id.0].instructions.push(Residual::Leave(by as u16));
                 }
-                // A slot past the arguments of a frame its code never moved the base to is nil.
-                let passed = continuation.a as usize + frame.b as usize;
+                // A result in a slot still unset is nil; the frame's other unset slots are its
+                // caller's temporaries, never read before written.
+                let mut spells = spells;
+                let unset = std::mem::take(&mut spells.unset);
                 for (from, to) in moves {
-                    let result: Rc<dyn Window> = if !moved && from >= passed {
+                    let result: Rc<dyn Window> = if unset.contains(&from) {
                         Rc::new(crate::generators::LoadNil::new(&[to]))
                     } else {
                         Rc::new(crate::generators::Move::new(&[from, to]))
@@ -4952,6 +4998,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 self.compile_holding(owner, next, Rc::new(known), after, spells);
                 self.set_current(callee);
                 return ctx;
+            }
+            // A frame never entered is made nil past its arguments: nothing of it is unset.
+            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && ctx.inline.last().is_some_and(|frame| frame.made == Made::No) {
+                carry.unset.clear();
             }
             // What the peephole holds, laid out before what lays out code here, as if from before
             // the instruction, going on to it. See Note [Peephole fusion] in `peephole`.
@@ -7234,16 +7284,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // The base moved to the frames of the inlined calls the code is in, before code naming
                 // their slots, making none of them. See Note [Peephole fusion] in `peephole`.
                 CoroutineState::Yielded(YieldOp::Enter) => {
-                    // Each frame nil past its arguments, as making it would: its code reads a local
-                    // its first instruction declares as nil. Laid out before anything held, what
-                    // the context knows of the slots stays.
+                    // Each frame's slots past its arguments are nil as the peephole holds them unset,
+                    // a nil laid out for each only where read. See Note [Peephole memory] in
+                    // `peephole`.
                     let entered = Rc::make_mut(&mut ctx);
                     for frame in entered.inline.iter_mut().filter(|frame| frame.made == Made::No) {
                         frame.made = Made::Base;
                         self.blocks[block_id.0].instructions.push(Residual::Enter(frame.by() as u16));
-                        for slot in frame.b as usize - 1..frame.stack as usize {
-                            self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::LoadNil::new(&[slot]))));
-                        }
                     }
                     if let Some((_, restart, _)) = &mut self.instruction {
                         restart.made_as(&ctx);

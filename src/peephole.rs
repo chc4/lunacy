@@ -569,6 +569,11 @@ pub struct Spell {
     before: Option<Box<Spell>>,
 }
 
+/// The nil of an unset slot, laid out.
+fn nil(slot: usize) -> Rc<dyn Window> {
+    Rc::new(crate::generators::LoadNil::new(&[slot]))
+}
+
 impl Spell {
     /// It, writing the slot `dest` names in place of its own, and reading those `input` does, as
     /// instruction `at`'s.
@@ -718,6 +723,9 @@ pub struct Spells {
     pub stores: Vec<Store>,
     /// The next store's id.
     next: usize,
+    /// The slots an inlined call's frame starts nil in, not written yet: what's held reads them as
+    /// they were, and a new reader gets a nil laid out first. See Note [Peephole memory].
+    pub unset: Vec<usize>,
 }
 
 impl Spells {
@@ -841,6 +849,11 @@ impl Spells {
             || self.stores.iter().any(|store| store.window.operands().contains(&slot))
     }
 
+    /// Whether slot `slot` is unset.
+    pub fn unset(&self, slot: usize) -> bool {
+        self.unset.contains(&slot)
+    }
+
     /// What it holds, the spells of slots `keeps` keeps writing the slots `dest` names, and
     /// everything reading the slots `input` does, as instruction `at`'s: a callee's, past its
     /// return into its caller's code. See Note [Peephole fusion].
@@ -858,7 +871,7 @@ impl Spells {
             store.at = at;
             store
         }).collect();
-        Spells { spells, stores, next: self.next }
+        Spells { spells, stores, next: self.next, unset: self.unset.iter().map(|&slot| input(slot)).collect() }
     }
 
     /// Whether they stay held on both ways of guard `test` of instruction `at`, found out at
@@ -953,7 +966,7 @@ impl Spells {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.spells.is_empty() && self.stores.is_empty()
+        self.spells.is_empty() && self.stores.is_empty() && self.unset.is_empty()
     }
 
     /// What to lay out before an op needing `need`, and what stays held, as witchcraft's
@@ -962,8 +975,11 @@ impl Spells {
     /// the stores one of these comes after; and every store, if it may touch memory. See Note
     /// [Peephole fusion].
     pub fn split(&self, need: &Need) -> (Spells, Spells) {
-        let mut spells: Vec<bool> = self.spells.iter().map(|s| need.reads.contains(&s.dest) || s.inputs.iter().any(|i| need.writes.contains(i))).collect();
-        let mut stores: Vec<bool> = self.stores.iter().map(|s| need.memory || s.inputs().any(|i| need.writes.contains(&i))).collect();
+        // An unset slot read gets its nil, which writes it.
+        let nils: Vec<usize> = self.unset.iter().copied().filter(|slot| need.reads.contains(slot)).collect();
+        let writes: Vec<usize> = need.writes.iter().chain(&nils).copied().collect();
+        let mut spells: Vec<bool> = self.spells.iter().map(|s| need.reads.contains(&s.dest) || s.inputs.iter().any(|i| writes.contains(i))).collect();
+        let mut stores: Vec<bool> = self.stores.iter().map(|s| need.memory || s.inputs().any(|i| writes.contains(&i))).collect();
         loop {
             let written: Vec<usize> = self.spells.iter().zip(&spells).filter(|(_, laid)| **laid).map(|(s, _)| s.dest).collect();
             let before: Vec<usize> = self.stores.iter().zip(&stores).filter(|(_, laid)| **laid).flat_map(|(s, _)| s.after.iter().copied()).collect();
@@ -988,6 +1004,7 @@ impl Spells {
             spells: self.spells.iter().zip(&spells).filter(|(_, l)| **l == laid).map(|(s, _)| s.clone()).collect(),
             stores: self.stores.iter().zip(&stores).filter(|(_, l)| **l == laid).map(|(s, _)| s.clone()).collect(),
             next: self.next,
+            unset: self.unset.iter().copied().filter(|slot| nils.contains(slot) == laid).collect(),
         };
         (part(true), part(false))
     }
@@ -1015,10 +1032,13 @@ impl Spells {
             let unwritten = order[k..].iter().copied().chain(&held.spells);
             let exit = held.stores.iter().map(|s| s.window.clone())
                 .chain(unwritten.clone().filter_map(|s| if s.at == at { s.before_instruction(at) } else { Some(s) }).map(|s| s.ops().materialize))
+                .chain(self.unset.iter().chain(&held.unset).map(|&slot| nil(slot)))
                 .collect();
             let unknown = unwritten.map(|s| s.dest).collect();
             laid.push(Laid { op: ops.fused, checked: true, exit, unknown });
         }
+        // The nils last: what's laid out read the slots as they were.
+        laid.extend(self.unset.iter().map(|&slot| Laid { op: nil(slot), checked: false, exit: Vec::new(), unknown: Vec::new() }));
         laid
     }
 }
