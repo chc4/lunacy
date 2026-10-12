@@ -226,6 +226,32 @@ impl Clone for Box<dyn NativeGen> {
     }
 }
 
+/// The coroutine compiling code: a generator, run by the peephole. See Note [Peephole fusion] in
+/// `peephole`.
+#[derive(Clone)]
+pub struct Gen {
+    inner: Box<dyn NativeGen>,
+}
+
+impl Gen {
+    pub fn boxed(inner: impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static) -> Box<Gen> {
+        Self::of(Box::new(inner))
+    }
+
+    pub fn of(inner: Box<dyn NativeGen>) -> Box<Gen> {
+        Box::new(Gen { inner })
+    }
+}
+
+impl Coroutine<ResumeArg> for Gen {
+    type Yield = YieldOp;
+    type Return = ResumeArg;
+
+    fn resume(mut self: Pin<&mut Self>, arg: ResumeArg) -> CoroutineState<YieldOp, ResumeArg> {
+        Pin::new(&mut *self.inner).resume(arg)
+    }
+}
+
 /// A native's generator for its call CALL A B C, given the native itself, for a call of it the
 /// generator lays out as any native's (`YieldOp::NativeCall`).
 pub type NativeGenerator = fn(crate::vm::NativeFunc, usize, usize, usize) -> Box<dyn NativeGen>;
@@ -3551,7 +3577,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         return block_id;
     }
 
-    pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
+    pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, mut coro: Box<Gen>, arg: ResumeArg) -> BlockId {
         let ctx = Context::canonical_free(ctx);
         if let Some(((_, ectx), &exists)) = self.versions.get(&self.proto).unwrap().get_key_value(&(pc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
@@ -4268,88 +4294,88 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_numeric(op, a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_numeric(op, a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 op @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_compare(op, a, b as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_compare(op, a, b as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::TEST => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_test(a as usize, c, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_test(a as usize, c, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::TESTSET => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_testset(a as usize, b as usize, c, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_testset(a as usize, b as usize, c, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::NOT => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_not(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_not(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::CLOSE => {
                     let (a, _) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_close(a as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_close(a as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::TFORLOOP => {
                     let (a, _, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_tforloop(a as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_tforloop(a as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::VARARG => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     let params = unsafe { (*self.proto).param_count as usize };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_vararg(a as usize, b as usize, params)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_vararg(a as usize, b as usize, params)), ResumeArg::Start, block_id)
                 },
                 Opcode::JMP => {
                     let sbx = crate::vm::sBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
                     //self.blocks[block_id].push(Residual::Jump(((pc as isize) + sbx as isize) as usize)); return ctx;
                 },
                 Opcode::UNM => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_unm(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_unm(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LEN => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_len(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_len(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::CONCAT => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_concat(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_concat(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LOADK => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let c: LValue<'src, 'intern> = unsafe { (&(&(*self.proto).constants.items)[bx as usize]).into() };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadk(bx, c.typeof_(), a as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_loadk(bx, c.typeof_(), a as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LOADNIL => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadnil(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_loadnil(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::LOADBOOL => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadbool(a as usize, b != 0, c != 0, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_loadbool(a as usize, b != 0, c != 0, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::MOVE => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     debug!("move {} {}", a, b);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_move(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_move(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::FORPREP => {
                     let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_forprep(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_forprep(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::FORLOOP => {
                     let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_forloop(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_forloop(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETUPVAL => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETUPVAL => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setupval(a as usize, b as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_setupval(a as usize, b as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::CLOSURE => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
@@ -4358,47 +4384,47 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let upvalues = proto.instructions.items[pc + 1..pc + 1 + count].iter()
                         .map(|pseudo| (pseudo.0.Opcode(), crate::vm::AB::unpack(pseudo.0).1 as usize))
                         .collect();
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_closure(a as usize, bx as usize, upvalues, pc + 1 + count)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_closure(a as usize, bx as usize, upvalues, pc + 1 + count)), ResumeArg::Start, block_id)
                 },
                 Opcode::SELF => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_self(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_self(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::CALL => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("{} {} {}", a, b, c);
                     // TODO: this should try to compile a new block and jump to it, and only
                     // fallback to a trace exit if we need to run the fully generic code
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_call(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_call(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
                     debug!("getglobal {} {} {:?}", a, bx, &kst);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_getglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETGLOBAL => {
                     let (a, bx) = crate::vm::ABx::unpack(inst.0);
                     let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_setglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::GETTABLE => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("gettable {} {} {}", a, b, c);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_gettable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_gettable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETTABLE => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
                     debug!("settable {} {} {}", a, b, c);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_settable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_settable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::NEWTABLE => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_newtable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_newtable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::SETLIST => {
                     let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
+                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::boxed(emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
                 },
                 Opcode::TAILCALL => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
@@ -4556,7 +4582,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `GuardDynamic` yield ends its block in. See Note [Dynamic guards].
     /// What the peephole holds, `held`, stays held on both its ways. See Note [Peephole fusion] in
     /// `peephole`.
-    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>, held: Option<Rc<crate::peephole::Spells>>) -> ThunkRef {
+    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>, held: Option<Rc<crate::peephole::Spells>>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             test.interp(owner, state);
             let passed = state.select == 1;
@@ -4595,7 +4621,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `Promote` of `slot` ends its block in: forced, it guards the
     /// slot equal to the integer it holds, and continues past the guard with
     /// that value promoted, the guard's other way promoting again. See Note [Promoted values].
-    fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Integer(value) = state.vals[state.base + slot].unbox() else { unreachable!("a promote's argument is an integer") };
             if !vm.promotes(pc.0, value) {
@@ -4630,7 +4656,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// place when first taken. See Note [Dynamic guards].
     /// The thunk a `Narrow` of `slot`, a double, ends its block in. See Note
     /// [Narrowing].
-    fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let value = state.vals[state.base + slot];
             let whole = value.representation() == LType::Double && value.as_number().is_some_and(crate::lboxed::is_integer);
@@ -4695,7 +4721,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Where the yield of `coro` at `pc` in `ctx` introduces a fact: rebuilding
     /// truncates `block` there and resumes `coro` in `ctx`, without the fact.
     /// See Note [Contraction].
-    fn origin(&self, block: BlockId, coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, ctx: Rc<Context>) -> Origin {
+    fn origin(&self, block: BlockId, coro: Box<Gen>, pc: SubPc, ctx: Rc<Context>) -> Origin {
         let offset = self.blocks[block.0].instructions.len();
         // The origin becomes a thunk laying out the rebuilt code. See Note [Contraction].
         let rebuild = move |vm: &mut Specializer, owner: &mut Owner, how: ResumeArg| {
@@ -4733,7 +4759,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk an optimistic integer op's `Encoding` ends its block in: forced, it lays out the
     /// op as the integer one, from an origin its first overflow rebuilds it from, if its result
     /// fits for its operands' values, and else as the double one. See Note [Optimistic ops].
-    fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
+    fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, pc: SubPc, thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump. See Note
             // [Thunk patching].
@@ -4769,7 +4795,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// An optimistic op's cold way, as `make_side_thunk`'s, which the first time it's taken also
     /// queues where the op's encoding was asked, if anywhere, to be rebuilt computing it in the
     /// double encoding. See Note [Optimistic ops].
-    fn make_overflow_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, asked: Option<Origin>) -> ThunkRef {
+    fn make_overflow_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, pc: SubPc, thunk_ctx: Rc<Context>, asked: Option<Origin>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
             vm.jump_thunk(block_id, thunk_pc, side);
@@ -4787,8 +4813,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Hold integer op `int_op`, of `window`, as its generator `coro` yielded the window at `pc` in
     /// `ctx`, laying out what the peephole holds first where it must. See Note [Peephole fusion] in
     /// `peephole`.
-    fn hold<C>(&mut self, owner: &mut Owner, block_id: BlockId, int_op: crate::peephole::IntOp, window: &Rc<dyn Window>, optimistic: bool, coro: &Box<C>, pc: SubPc, ctx: &mut Rc<Context>) -> Hold
-    where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
+    fn hold(&mut self, owner: &mut Owner, block_id: BlockId, int_op: crate::peephole::IntOp, window: &Rc<dyn Window>, optimistic: bool, coro: &Box<Gen>, pc: SubPc, ctx: &mut Rc<Context>) -> Hold
     {
         use crate::peephole::{Offer, Spells};
         // Only in an instruction whose start an exit can go on from, and not one an exit runs
@@ -4977,7 +5002,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return false;
         }
         // Never another version's, though their contexts be the same: what was held isn't in it.
-        if let Some((next, ctx, _)) = self.compile_one(owner, pc, ctx.clone(), Box::new(after_held(Rc::new(then))), ResumeArg::Start, block) {
+        if let Some((next, ctx, _)) = self.compile_one(owner, pc, ctx.clone(), Gen::boxed(after_held(Rc::new(then))), ResumeArg::Start, block) {
             self.compile(owner, next, ctx, block);
         }
         true
@@ -5009,7 +5034,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Restart::Resume(pc, ctx, coro, arg) => {
                     let ctx = unknowing(owner, ctx.clone());
-                    if let Some((next, ctx, _)) = vm.compile_one(owner, *pc, ctx, Box::new(coro.clone()), arg.clone(), exit) {
+                    if let Some((next, ctx, _)) = vm.compile_one(owner, *pc, ctx, Gen::of(coro.clone()), arg.clone(), exit) {
                         vm.compile(owner, next, ctx, exit);
                     }
                 },
@@ -5021,7 +5046,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The code from `pc` in `ctx`, as `subblock` compiles it, holding `held` if anything: then in
     /// a block of its own, as what is held isn't in the context. See Note [Peephole fusion] in
     /// `peephole`.
-    fn carried(&mut self, owner: &mut Owner, held: Option<&crate::peephole::Spells>, pc: SubPc, ctx: Rc<Context>, coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
+    fn carried(&mut self, owner: &mut Owner, held: Option<&crate::peephole::Spells>, pc: SubPc, ctx: Rc<Context>, coro: Box<Gen>, arg: ResumeArg) -> BlockId {
         let Some(held) = held else { return self.subblock(owner, pc, ctx, coro, arg) };
         let block = self.new_block(pc.0);
         self.held = Some(Held { spells: held.clone() });
@@ -5044,7 +5069,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let other = vm.make_held_call_thunk(block, spells.clone(), restart.clone(), coro.clone(), pc, ctx.clone(), a, b, c, identities + 1);
                 let mut known = (*ctx).clone();
                 known.types[a] = callee.ctypeof_();
-                let body = vm.carried(owner, Some(&spells), pc, Rc::new(known), Box::new(generator(nf.native(), a, b, c)), ResumeArg::Start);
+                let body = vm.carried(owner, Some(&spells), pc, Rc::new(known), Gen::of(generator(nf.native(), a, b, c)), ResumeArg::Start);
                 vm.blocks[block.0].instructions.extend([Residual::NativeGuard { idx: a, ptr: nf.get_ptr() }, Residual::Thunk(other), Residual::Jump(body)]);
                 return;
             }
@@ -5053,7 +5078,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let then: AfterHeld = Some((None, YieldOp::Call(CallTarget::Dynamic(a, b, c)), coro.clone()));
             if !vm.flush(owner, block, pc, &ctx, then.clone(), &[], None) {
                 // Laid out in place: the call goes on in the block.
-                if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx.clone(), Box::new(after_held(Rc::new(then))), ResumeArg::Start, block) {
+                if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx.clone(), Gen::boxed(after_held(Rc::new(then))), ResumeArg::Start, block) {
                     vm.compile(owner, next, ctx, block);
                 }
             }
@@ -5063,7 +5088,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// The thunk a `Learn` of `slot` ends its block in: forced, the code after it with the string
     /// keys of the table there then, in order. See `jit.learn` in `library`.
-    fn make_learn_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_learn_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table") };
             let mut keys: Vec<LConstant<'static, 'static>> = tab.ro(owner).hash.keys().filter_map(|key| match key.boxed().unbox() {
@@ -5083,7 +5108,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `LearnKind` of `slot` ends its block in: forced on a table whose array part is of
     /// one kind, a guard of it, past which the context knows it; else the code after it, knowing
     /// nothing more. See `jit.learn` in `library`.
-    fn make_learn_kind_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_learn_kind_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table's field") };
             let kind = tab.ro(owner).kind;
@@ -5182,7 +5207,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// if `watches`, it is one of the table's watch sites, the code after it knowing the table is
     /// still watched; else, as the site a trip puts back, the code after it knowing nothing. See
     /// Note [Watched tables].
-    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>, watches: bool, freezes: bool) -> ThunkRef {
+    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>, watches: bool, freezes: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let boxed = state.vals[state.base + slot];
             let LValue::Table(tab) = boxed.unbox() else { unreachable!("a watch site of a table") };
@@ -5253,14 +5278,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// A side not yet taken, as `make_side_thunk`'s, holding `held`. See Note [Peephole fusion] in
     /// `peephole`.
-    fn make_carried_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg, held: Option<Rc<crate::peephole::Spells>>) -> ThunkRef {
+    fn make_carried_side_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg, held: Option<Rc<crate::peephole::Spells>>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, _: &mut RunState, thunk_pc: usize| {
             let side = vm.carried(owner, held.as_deref(), pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
             vm.jump_thunk(block_id, thunk_pc, side);
         })))
     }
 
-    fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
+    fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
             vm.jump_thunk(block_id, thunk_pc, side);
@@ -5270,7 +5295,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `Versions` ends its block in: forced, it lays out the code after with the
     /// count, at a point of its own: at the call's, the version found would be the one the
     /// thunk is in. See `jit.versions` in `library`.
-    fn make_versions_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_versions_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let count = vm.versions_entering(owner, block_id);
             let rest = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Integer(count as i32));
@@ -5321,7 +5346,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// A function found gets its identity guarded too, unless the chain of
     /// thunks this one is in guards `identities` of them already, `MAX_VERSIONS`
     /// (Note [Call sites]).
-    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize, held: Option<Rc<crate::peephole::Spells>>) -> ThunkRef {
+    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize, held: Option<Rc<crate::peephole::Spells>>) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // Each forcing patches the thunk where it was forced, in `block_id`: one
@@ -5702,7 +5727,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // `library`.
                     if let (Some(generator), After::Version(..)) = (nf.generator(), &after) {
                         vm.blocks[block.0].instructions.extend(layout);
-                        let coro = Box::new(generator(nf.native(), a, b, c));
+                        let coro = Gen::of(generator(nf.native(), a, b, c));
                         if let Some((next, ctx, _)) = vm.compile_one(owner, pc, calling.clone(), coro, ResumeArg::Start, block) {
                             let ctx = vm.jumping(owner, ctx, next);
                             let version = After::Version(next, ctx).block(vm, owner);
@@ -6162,7 +6187,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// nil, in a table whose metatable has an `__index` table goes on down the chain; any other key
     /// a load can't find, or a store's table lacks, continues the generator without it, in
     /// `fail_ctx`. See Notes [Field types] and [Table metatables].
-    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
+    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // Each forcing patches the thunk where it was forced, in `block_id`.
             let mut block_id = block_id;
@@ -6275,7 +6300,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// thunk of the hash key after it (`next`), and its failure finding the field's type and
     /// guarding that in turn: a load's field found nil, or an `__index` no longer a table, is
     /// found again instead. See Notes [Field types] and [Table metatables].
-    fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) {
+    fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<Gen>, idx: usize, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) {
         let mut typed_ctx = ctx.clone();
         Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(Kind::Of(expected));
         let pass = match next {
@@ -6305,7 +6330,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block.0].instructions.push(Residual::Jump(pass));
     }
 
-    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId, chains: bool) {
+    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<Gen>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId, chains: bool) {
         // In order to assert that an href is still valid, we need to check that the witnessed
         // epoch is still the same: if so, all of its keys still have the same type as the
         // cached hashkey, and no additional hashkeys were inserted (which may otherwise cause
@@ -6353,8 +6378,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
     }
 
-    pub fn compile_one<C>(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<C>, arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
-    where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
+    pub fn compile_one(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<Gen>, arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
     {
         // Going on in an instruction, not starting it: an exit of what the peephole holds from
         // here goes on from here. See Note [Peephole fusion] in `peephole`.
@@ -6369,8 +6393,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         compiled
     }
 
-    fn compile_yields<C>(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
-    where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
+    fn compile_yields(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<Gen>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
     {
         // Where the constant being loaded was, for its fact's origin.
         let mut loading: Option<Origin> = None;
@@ -7077,7 +7100,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // A native with a generator is compiled by it, as an opcode is. See Note
                             // [Native generators] in `library`.
                             if native && !resumes && let CType::NativeFunction(nf) = &ctx.types[a] && let Some(generator) = nf.generator() {
-                                let coro = Box::new(generator(nf.native(), a, b, c));
+                                let coro = Gen::of(generator(nf.native(), a, b, c));
                                 return self.compile_one(owner, pc, ctx, coro, ResumeArg::Start, block_id);
                             }
                             if native && let CType::NativeFunction(nf) = &ctx.types[a] {
