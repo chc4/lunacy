@@ -1695,6 +1695,15 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
     }
 }
 
+/// Lay out what the peephole holds. See Note [Peephole fusion] in `peephole`.
+pub fn emit_lay_out() -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |_: ResumeArg| {
+        yield YieldOp::LayOut;
+        ResumeArg::Start
+    }
+}
+
 pub fn emit_jmp(sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {

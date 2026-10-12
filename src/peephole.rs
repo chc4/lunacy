@@ -27,7 +27,9 @@ use crate::window::{windowed, Window};
 // Each integer op checks that its result fits and boxes it, though the next often only reads it to
 // compute another. The peephole holds them as witchcraft holds ops: one spell per slot, its value a
 // computation of values from before anything held, so a chain is one op that checks once and a
-// value overwritten unread is never computed.
+// value overwritten unread is never computed. It is the coroutine the generators run in, so what it
+// holds is suspended with it wherever compiling is, and code compiled from a point where it holds
+// something is that point's own, never a version's.
 //
 // What can't be held lays out only what it depends on, by witchcraft's two invariants: what it
 // reads, and, first, what reads a register it writes as that register was. The rest stays held,
