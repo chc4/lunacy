@@ -807,6 +807,47 @@ fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> 
     })
 }
 
+/// `jit.disjoint`'s generator: for `disjoint(...)` of tables keeping no result, a check they are
+/// different tables, from each other and from the unique ones, and code past it knowing them
+/// unique. Any other call is the native's. See Note [Disjoint tables] in `specialize`.
+#[cfg(feature = "magic")]
+fn disjoint_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{ResumeArg, YieldOp};
+    crate::window::windowed!(guard Distinct, [], [], |owner, state, base| (x, y) {
+        x.bits() != y.bits()
+    });
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b > 1 && c == 1 {
+            let args: Vec<usize> = (a + 1..a + b).collect();
+            let mut tables = true;
+            for i in 0..args.len() {
+                if (yield YieldOp::Guard(args[i], LType::Table)) != ResumeArg::Matched {
+                    tables = false;
+                    break;
+                }
+            }
+            if tables && let ResumeArg::Slots(uniques) = (yield YieldOp::Uniques(args.clone())) {
+                let mut apart = true;
+                'pairs: for i in 0..args.len() {
+                    for j in i + 1..args.len() + uniques.len() {
+                        let other = if j < args.len() { args[j] } else { uniques[j - args.len()] };
+                        if (yield YieldOp::GuardDynamic(std::rc::Rc::new(Distinct::new(&[args[i], other])))) != ResumeArg::Matched {
+                            apart = false;
+                            break 'pairs;
+                        }
+                    }
+                }
+                if apart {
+                    yield YieldOp::Unique(args);
+                    return ResumeArg::Start;
+                }
+            }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
 /// `jit.tripped`'s generator: for `tripped(t)` of a table keeping one result, a watch site: code
 /// past it knows `t` is still watched, as it was when the code was first run, its result `false`
 /// with no test, until a store into `t` trips its watchpoint; any other call is the native's. See
@@ -1245,6 +1286,9 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         ("tripped", native!(pure generator: tripped_generator, |owner, args| {
             vec![LBoxed::from_bool(!table(arg(&args, 0)).ro(owner).watched)]
         })),
+        // `jit.disjoint(...)`: nothing, and code past it knowing its tables are different ones.
+        // See Note [Disjoint tables] in `specialize`.
+        ("disjoint", native!(pure generator: disjoint_generator, |owner, args| Vec::new())),
     ]);
 
     MODULES.with_borrow_mut(|modules| {

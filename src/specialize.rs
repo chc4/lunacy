@@ -422,7 +422,7 @@ impl Gen {
                 | YieldOp::Effect(_) | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::IsKey(..)
                 | YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) | YieldOp::ArrayType(..)
                 | YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) | YieldOp::NativeWindowArgs(..)
-                | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Took | YieldOp::Holding { .. } | YieldOp::Created(_) => true,
+                | YieldOp::Uniques(_) | YieldOp::Unique(_) | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Took | YieldOp::Holding { .. } | YieldOp::Created(_) => true,
             YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
             YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected)),
             YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
@@ -512,7 +512,8 @@ impl Gen {
             YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
                 | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
                 | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_)
-                | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::Created(_) | YieldOp::Copy(..) => true,
+                | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::Created(_) | YieldOp::Copy(..)
+                | YieldOp::Uniques(_) | YieldOp::Unique(_) => true,
             // What the context knows of upvalues, and is told of them: no code.
             YieldOp::LoadUpvalue(..) | YieldOp::UpvalueKnown(_) | YieldOp::UpvalueCell(_) | YieldOp::UpvalueHolds(..)
                 | YieldOp::Captures(..) | YieldOp::Close(_) => true,
@@ -968,6 +969,9 @@ pub enum YieldOp {
     Discovered(usize, u64, CType, Option<i32>), // STACK[idx] holds the element `Element` resumed with.
                                                 // See Note [Frozen tables]
     ValueOf(usize), // STACK[idx]'s value, if known: resumed with Boxed, else Failed
+    Uniques(Vec<usize>), // A slot of each class known unique but the slots', resumed with Slots, else
+                         // Failed if one has none. See Note [Disjoint tables]
+    Unique(Vec<usize>), // STACK[idx]'s values are known unique. See Note [Disjoint tables]
     Trip(Option<usize>), // A store into STACK[idx]'s table, or with none the environment, is about
                          // to be laid out: resumed with Matched. See Note [Watched tables]
     Learn(usize), // Resumed with Keys: the string keys of STACK[idx]'s table, once the code runs. See
@@ -1093,6 +1097,11 @@ fn cells(ctx: &Context, a: crate::peephole::Element, b: crate::peephole::Element
     if watched(a.table) || watched(b.table) {
         return Alias::Disjoint;
     }
+    // Two unique classes are two tables. See Note [Disjoint tables].
+    let unique = |table: usize| ctx.values.fact(Loc::root(Root::Slot(table as u16)), UNIQUE).is_some();
+    if unique(a.table) && unique(b.table) && !same(a.table, b.table) {
+        return Alias::Disjoint;
+    }
     // Different keys are different elements, whatever the tables.
     let keys = match (constant(a.key), constant(b.key), a.key, b.key) {
         (Some(x), Some(y), _, _) if x != y => return Alias::Disjoint,
@@ -1165,6 +1174,7 @@ pub enum ResumeArg {
     Cell(usize, bool),
     /// A table's string keys. See `jit.learn` in `library`.
     Keys(Rc<[LConstant<'static, 'static>]>),
+    Slots(Rc<[usize]>),
 }
 
 // Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
@@ -1916,6 +1926,16 @@ fn name_hash(name: &[u8]) -> u64 {
 // only through the watch, so code relying on it is unpublished by a trip as the watch's is. The
 // table is kept alive until it trips, and a load reads it only until then; nothing reads a value
 // back from what is known of it.
+
+// Note [Disjoint tables]
+// ~~~~~~~~~~~~~~~~~~~~~~~
+// A class can be known unique (`jit.disjoint`): its value is no other unique class's, so elements
+// of tables in two unique classes are different elements. A disjoint site checks its arguments
+// are different tables, from each other and from a value of each class already unique, as a value
+// may reach an argument through a name the context doesn't connect to it; a unique class no slot
+// holds makes the site learn nothing. Classes otherwise say only which values are equal: a join
+// keeps a class unique only if no other unique class is of its class on either side, and a
+// context is accepted only if its classes for two unique ones are two.
 
 /// Where a Lua call's returns go on, and how the code after it is compiled: as
 /// `make_continuation_thunk` takes it. See Note [Watched tables].
@@ -3033,6 +3053,8 @@ pub enum Known {
     Value(u64),
     /// The value is a table that isn't watched. See Note [Watched tables].
     Unwatched,
+    /// The value is no other class's known so. See Note [Disjoint tables].
+    Unique,
 }
 
 /// The keys of `Known`'s domains.
@@ -3042,7 +3064,8 @@ pub const CONSTANT: u8 = 2;
 pub const WATCHED: u8 = 3;
 pub const VALUE: u8 = 4;
 pub const UNWATCHED: u8 = 5;
-const KEYS: [u8; 6] = [TYPE, KIND, CONSTANT, WATCHED, VALUE, UNWATCHED];
+pub const UNIQUE: u8 = 6;
+const KEYS: [u8; 7] = [TYPE, KIND, CONSTANT, WATCHED, VALUE, UNWATCHED, UNIQUE];
 
 /// What a context knows of values. See Note [Fragile information].
 pub type Values = crate::classes::Classes<Known>;
@@ -3067,7 +3090,7 @@ impl PartialEq for Known {
             (Known::Kind(a), Known::Kind(b)) => a == b,
             (Known::Constant { value: a, .. }, Known::Constant { value: b, .. }) => a == b,
             (Known::Watched(a), Known::Watched(b)) | (Known::Value(a), Known::Value(b)) => a == b,
-            (Known::Unwatched, Known::Unwatched) => true,
+            (Known::Unwatched, Known::Unwatched) | (Known::Unique, Known::Unique) => true,
             _ => false,
         }
     }
@@ -3091,6 +3114,7 @@ impl std::hash::Hash for Known {
             Known::Watched(bits) => (WATCHED, bits).hash(state),
             Known::Value(bits) => (VALUE, bits).hash(state),
             Known::Unwatched => UNWATCHED.hash(state),
+            Known::Unique => UNIQUE.hash(state),
         }
     }
 }
@@ -3104,6 +3128,7 @@ impl std::fmt::Debug for Known {
             Known::Watched(bits) => write!(f, "watched {bits:#x}"),
             Known::Value(bits) => write!(f, "value {bits:#x}"),
             Known::Unwatched => write!(f, "unwatched"),
+            Known::Unique => write!(f, "unique"),
         }
     }
 }
@@ -3118,6 +3143,7 @@ impl crate::classes::ClassFact for Known {
             Known::Watched(_) => WATCHED,
             Known::Value(_) => VALUE,
             Known::Unwatched => UNWATCHED,
+            Known::Unique => UNIQUE,
         }
     }
     fn join(&self, other: &Self) -> Option<Self> {
@@ -3125,6 +3151,9 @@ impl crate::classes::ClassFact for Known {
     }
     fn implies(&self, weaker: &Self) -> bool {
         self == weaker
+    }
+    fn distinct(&self) -> bool {
+        matches!(self, Known::Unique)
     }
 }
 
@@ -7421,6 +7450,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ctx.values.learn(at, Known::Constant { value, origins: None });
                     }
                     ctx.values.learn(at, Known::Value(bits));
+                },
+                CoroutineState::Yielded(YieldOp::Uniques(of)) => {
+                    let theirs = |roots: &Vec<Root>| roots.iter().any(|root| of.iter().any(|&slot| *root == Root::Slot(slot as u16)));
+                    let slots: Option<Vec<usize>> = ctx.values.knowing(UNIQUE).iter().filter(|roots| !theirs(roots))
+                        .map(|roots| roots.iter().find_map(|root| match root { Root::Slot(slot) => Some(*slot as usize), _ => None }))
+                        .collect();
+                    arg = slots.map_or(ResumeArg::Failed, |slots| ResumeArg::Slots(slots.into()));
+                },
+                CoroutineState::Yielded(YieldOp::Unique(slots)) => {
+                    let ctx = Rc::make_mut(&mut ctx);
+                    for slot in slots {
+                        ctx.values.learn(Loc::root(Root::Slot(slot as u16)), Known::Unique);
+                    }
                 },
                 CoroutineState::Yielded(YieldOp::ValueOf(slot)) => {
                     arg = match ctx.values.fact(Loc::root(Root::Slot(slot as u16)), VALUE) {
