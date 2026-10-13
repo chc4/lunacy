@@ -45,6 +45,11 @@ The specializer's are also views, one column per argument:
       each place code makes the frames of the inlined calls it is in, in
       `block` of the function at `line`: `by` the yield observing them, or
       the return opcode returning from one.
+  judged(key, judged, by)
+      each inlined call's judgement of whether its code makes its frame, as it
+      changes: `Returned` at its first return, `Yes` as something observes it or
+      JIT code is compiled first, `Whited` as its frame is whited out. `key` is
+      `inline`'s.
   alloc_step(trace, step, line, block, pc, off)
       each step of each trace the window planner planned: the block it is in
       and, for a residual, its offset (a block's start's is 2^64-1).
@@ -130,11 +135,12 @@ VIEWS = {
     'encoding': ['line', 'pc', 'block', 'encoding'],
     'widen': ['line', 'slot', 'block', 'origins', 'queued'],
     'evicted': ['line', 'pc', 'blocks'],
-    'inline': ['line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
+    'inline': ['line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context', 'key'],
     'inline_return': ['line', 'callee', 'after', 'block', 'context'],
     'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'inlines', 'why'],
     'inline_refused': ['line', 'callee', 'call_block', 'reason'],
     'frames_made': ['line', 'pc', 'block', 'by'],
+    'judged': ['key', 'judged', 'by'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
@@ -144,7 +150,7 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'widen': ('spec', 'widen'), 'evicted': ('spec', 'evicted'),
           'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return'),
           'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused'),
-          'frames_made': ('spec', 'frames_made')}
+          'frames_made': ('spec', 'frames_made'), 'judged': ('spec', 'judged')}
 
 
 def connect(trace):

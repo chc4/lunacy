@@ -1260,18 +1260,31 @@ pub enum CallEntry {
 
 // Note [Inlined frames]
 // ~~~~~~~~~~~~~~~~~~~~~~
-// An inlined call's frame is made in two halves, each only once code needs it: the base moved to
-// it (`Enter`), nilling it past the arguments, before code naming its slots, and the rest, its
-// callstack entry and running closure (`Inline`), before code observing them, as an upvalue's
-// access through the closure, a call not inlined, a safepoint, or an exit to the interpreter does;
-// a native's call that runs as a window op is no call.
-// A callee whose code lays out nothing returns into its caller's having made none of its frame,
-// and one naming only slots, none but the base, which its return moves back (`Leave`). How much of
-// each frame is made is known to the context, so versions differ by it, and is what the code of a
-// block's function runs in, whatever closure is running: an upvalue of a callee whose frame isn't
-// made is loaded through the closure the call is known to call (`CalledUpval`). An upvalue's value
-// a slot also holds is that slot's, so code naming the slot observes nothing: only a guard whose
-// failure finds an array's kind through an upvalue, holding the table no slot holds, needs it.
+// An inlined call's frame is in two halves: the base moved to it, nilling it past the arguments,
+// and the rest, its callstack entry and running closure, which only code observing them needs, as
+// an upvalue's access through the closure, a call not inlined, a safepoint, or an exit to the
+// interpreter does. An upvalue's value a slot also holds is that slot's, so code naming the slot
+// observes nothing, and a native's call that runs as a window op is no call. A callee whose code
+// lays out nothing returns into its caller's having made none of its frame.
+//
+// Code that lays out anything first makes the whole frame, as the code would run without
+// inlining, inside its callers' frames if they are made. Whether that was needed is judged once
+// for each inlined call, by the first of its code to decide: code observing the frame keeps it
+// for good, and a return compiled with none of the code before it observing the frame decides it
+// isn't needed. Its code compiled from then on is compiled with only the base moved, and once the
+// thunk compiling it is done, every making and unmaking of the frame its code laid out before is
+// whited out to the base's move alone, and any of its frames running unmade, so that no code ever
+// runs with a frame its residuals don't account for. Code compiled after that which observes the
+// frame makes it itself, the frames of the calls it is in too, and unmakes it at its return: a
+// call's thunk, which doesn't know whether it calls until it runs, makes them as it lays out the
+// call, and its continuations know them made.
+//
+// JIT code is compiled from the residuals as they are, so compiling it first decides every
+// judgement yet to be decided: the frame is kept. How much of each frame the code made itself is
+// in the context, so versions differ by it; a frame made as its judgement has it isn't, and is
+// what the code of a block's function runs in, whatever closure is running: an upvalue of a
+// callee whose frame isn't made is loaded through the closure the call is known to call
+// (`CalledUpval`).
 
 /// A field's or a global's name, hashed: what a store with a key of that name may change. See
 /// Note [Field facts].
@@ -1380,13 +1393,33 @@ pub struct InlineFrame {
     pub continuation: *const Continuation,
 }
 
-/// How much of an inlined call's frame is made: none, the base moved to it (`Enter`), or all of it,
-/// its callstack entry and closure too (`Inline`). See Note [Inlined frames].
+/// How much of an inlined call's frame the code has made: none; the base moved to it, the rest as
+/// the call's judgement has it (`Judged`); or all of it, by the code's own `Inline`. See Note
+/// [Inlined frames].
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Made {
     No,
     Base,
     Yes,
+}
+
+/// Whether an inlined call's code that moved the base to its frame makes the rest of it: as it is
+/// laid out, until its first return (`Returned`) or what observes the frame (`Yes`) decides, and
+/// then for good, once whited out (`Whited`) or observed. See Note [Inlined frames].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Judged {
+    Maybe,
+    Returned,
+    Whited,
+    Yes,
+}
+
+/// An inlined call's judgement: where its code makes and unmakes its frame, which whiting it out
+/// overwrites, and the call it is inlined into. See Note [Inlined frames].
+struct Judgement {
+    judged: Judged,
+    sites: Vec<Location>,
+    parent: Option<u64>,
 }
 
 impl InlineFrame {
@@ -1400,6 +1433,11 @@ impl InlineFrame {
     /// The slots `Enter` moves the base on by to it.
     fn by(&self) -> usize {
         self.a as usize + 1
+    }
+
+    /// Its call's judgement's key: its continuation, which its callstack entry holds.
+    fn key(&self) -> u64 {
+        self.continuation as u64
     }
 
     /// The caller's slot holding the table parameter `param` was passed, if it still holds it in
@@ -3411,6 +3449,9 @@ pub struct Specializer<'src, 'intern> {
     next_key_index: HashMap<LProto<'src, 'intern>, u8, rustc_hash::FxBuildHasher>,
     /// The code after each inlined call, its returns continue compiling. See Note [Inlined calls].
     continuations: Vec<Rc<Continuation>>,
+    /// Each inlined call's judgement of whether its code makes its frame, by its key. See Note
+    /// [Inlined frames].
+    judgements: RefCell<HashMap<u64, Judgement, rustc_hash::FxBuildHasher>>,
     /// Each Lua call's continuation, by where its returns go on. See Note [Watched tables].
     continuation_sites: HashMap<Location, ContinuationSite>,
     /// The watch sites of each watched table, by its address. See Note [Watched tables].
@@ -3465,6 +3506,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             key_indexes: Default::default(),
             next_key_index: Default::default(),
             continuations: Vec::new(),
+            judgements: Default::default(),
             continuation_sites: HashMap::default(),
             watches: HashMap::default(),
             watch_versions: HashMap::default(),
@@ -4239,17 +4281,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.versions.get(&self.proto).unwrap().get(&(pc, ctx.clone())).cloned()
     }
 
-    /// Make the frames of the inlined calls code in `ctx` is in that aren't, ending `block`: the
-    /// block the code goes on in, from `pc`, inside them, and its context. See Note [Inlined
-    /// frames].
-    fn make_frames(&mut self, block: BlockId, pc: Pc, ctx: &Context) -> (BlockId, Rc<Context>) {
-        let mut made = ctx.clone();
+    /// Make the frames of the inlined calls code in `ctx` is in, in `block`: those whose code
+    /// moved the base to them made as their calls' judgements have it, the others by the code
+    /// itself, ending `block` if it makes any. The block the code goes on in, from `pc`, inside
+    /// them, and its context. `observes`, it observes them: their calls' judgements are that the
+    /// frames are made. See Note [Inlined frames].
+    fn make_frames(&mut self, block: BlockId, pc: Pc, ctx: &Context, observes: bool) -> (BlockId, Rc<Context>) {
+        let mut made = Rc::new(ctx.clone());
+        self.enter(&mut made, block);
+        let first = (0..made.inline.len()).find(|&level| !self.pushed(&made, level));
+        if observes {
+            self.observed(&made, first.unwrap_or(made.inline.len()));
+        }
+        let Some(first) = first else { return (block, made) };
         self.end_block(block);
-        let moved: usize = made.inline.iter().filter(|frame| frame.made == Made::Base).map(InlineFrame::by).sum();
+        let made_mut = Rc::make_mut(&mut made);
+        let moved: usize = made_mut.inline[first..].iter().filter(|frame| frame.made == Made::Base).map(InlineFrame::by).sum();
         if moved > 0 {
             self.blocks[block.0].instructions.push(Residual::Leave(moved as u16));
         }
-        for frame in made.inline.iter_mut().filter(|frame| frame.made != Made::Yes) {
+        for frame in &mut made_mut.inline[first..] {
             self.blocks[block.0].instructions.push(frame.push());
             frame.made = Made::Yes;
         }
@@ -4257,18 +4308,148 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[inside.0].cells = made.filled_cells();
         self.blocks[inside.0].promoted = made.promoted.clone();
         self.blocks[block.0].instructions.push(Residual::Jump(inside));
-        (inside, Rc::new(made))
+        (inside, made)
     }
 
     /// Move the base to the frames of the inlined calls code in `ctx` is in that it isn't in, in
     /// `block`, nilling each past its arguments, as making it would: its code reads a local its
-    /// first instruction declares as nil. See Note [Inlined frames].
+    /// first instruction declares as nil. Each frame whose callers' frames are made is made too,
+    /// until its call's judgement whites it out; a frame its call passed what's up to the top, and
+    /// any inside it, isn't entered: what it was passed is found only as it is made. See Note
+    /// [Inlined frames].
     fn enter(&mut self, ctx: &mut Rc<Context>, block: BlockId) {
-        for frame in Rc::make_mut(ctx).inline.iter_mut().filter(|frame| frame.made == Made::No) {
-            frame.made = Made::Base;
-            self.blocks[block.0].instructions.push(Residual::Enter(frame.by() as u16));
+        for level in 0..ctx.inline.len() {
+            let frame = ctx.inline[level].clone();
+            if frame.made != Made::No {
+                continue;
+            }
+            if frame.b == 0 {
+                break;
+            }
+            let outer = (0..level).all(|outer| self.pushed(ctx, outer));
+            let mut judgements = self.judgements.borrow_mut();
+            let judgement = judgements.get_mut(&frame.key()).expect("an inlined call's judgement");
+            if outer && matches!(judgement.judged, Judged::Maybe | Judged::Yes) {
+                if judgement.judged == Judged::Maybe {
+                    judgement.sites.push(Location(block, self.blocks[block.0].instructions.len()));
+                }
+                let made = InlineFrame { made: Made::Base, ..frame.clone() };
+                self.blocks[block.0].instructions.push(made.push());
+            } else {
+                self.blocks[block.0].instructions.push(Residual::Enter(frame.by() as u16));
+            }
+            drop(judgements);
             for slot in frame.b as usize - 1..frame.stack as usize {
                 self.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::LoadNil::new(&[slot]))));
+            }
+            Rc::make_mut(ctx).inline[level].made = Made::Base;
+        }
+    }
+
+    /// The trace's record of inlined call `key`'s judgement becoming `judged`, `by` what.
+    #[cfg(feature = "tracing")]
+    fn traced_judgement(key: u64, judged: Judged, by: &str) {
+        crate::tracing::instant("spec", "judged", &[
+            ("key", key.into()),
+            ("judged", format!("{judged:?}").as_str().into()),
+            ("by", by.into()),
+        ]);
+    }
+
+    /// Whether the code in `ctx` runs in frame `level` of the inlined calls it is in, made: by
+    /// itself, or, having moved the base to it, as its call's judgement has it, inside frames
+    /// made. A judgement that the frame isn't needed is the code's from then on, though its
+    /// whiteout comes after. See Note [Inlined frames].
+    fn pushed(&self, ctx: &Context, level: usize) -> bool {
+        let frame = &ctx.inline[level];
+        match frame.made {
+            Made::No => false,
+            Made::Yes => true,
+            Made::Base => {
+                let judged = self.judgements.borrow().get(&frame.key()).map_or(Judged::Yes, |judgement| judgement.judged);
+                matches!(judged, Judged::Maybe | Judged::Yes) && (0..level).all(|outer| self.pushed(ctx, outer))
+            },
+        }
+    }
+
+    /// Code in `ctx` observes the frames of the inlined calls it is in, of which the first `pushed`
+    /// are made: the calls whose judgement isn't decided keep their frames. See Note [Inlined
+    /// frames].
+    fn observed(&self, ctx: &Context, pushed: usize) {
+        let mut judgements = self.judgements.borrow_mut();
+        for frame in ctx.inline[..pushed].iter().filter(|frame| frame.made == Made::Base) {
+            if let Some(judgement) = judgements.get_mut(&frame.key()) && judgement.judged == Judged::Maybe {
+                judgement.judged = Judged::Yes;
+                judgement.sites.clear();
+                #[cfg(feature = "tracing")]
+                Self::traced_judgement(frame.key(), Judged::Yes, "observed");
+            }
+        }
+    }
+
+    /// White out the frames of the inlined calls whose code returned with none of it observing
+    /// them, and of those inlined into them yet to decide: any of their frames running, the
+    /// innermost the code runs in, is unmade, the base kept. See Note [Inlined frames].
+    fn whiteout(&mut self, owner: &mut Owner, state: &mut RunState) {
+        let judgements = self.judgements.get_mut();
+        let returned: Vec<u64> = judgements.iter().filter(|(_, judgement)| judgement.judged == Judged::Returned).map(|(&key, _)| key).collect();
+        for key in returned {
+            let inside = |mut at: u64| loop {
+                if at == key {
+                    return true;
+                }
+                match judgements.get(&at).and_then(|judgement| judgement.parent) {
+                    Some(parent) => at = parent,
+                    None => return false,
+                }
+            };
+            let whited: Vec<u64> = judgements.iter()
+                .filter(|&(&at, judgement)| inside(at) && matches!(judgement.judged, Judged::Maybe | Judged::Returned))
+                .map(|(&at, _)| at)
+                .collect();
+            // Each running is past any frame made by the code itself: what made it observed its
+            // callers' frames too.
+            let base = state.base;
+            let mut unmade = false;
+            while let Some(&CallstackEntry { ret: Return::Inlined(at), .. }) = state.callstack.last() && whited.contains(&at) {
+                state.unshift_frame::<true>(owner, None, false);
+                unmade = true;
+            }
+            if unmade {
+                state.shifted = base - state.base;
+                state.base = base;
+            }
+            debug_assert!(!state.callstack.iter().any(|entry| matches!(entry.ret, Return::Inlined(at) if whited.contains(&at))), "a frame whited out under another");
+            for at in whited {
+                let judgement = judgements.get_mut(&at).expect("a judgement");
+                judgement.judged = Judged::Whited;
+                #[cfg(feature = "tracing")]
+                Self::traced_judgement(at, Judged::Whited, "whiteout");
+                for Location(block, off) in std::mem::take(&mut judgement.sites) {
+                    #[cfg(feature = "jit")]
+                    debug_assert!(!self.jctx.blocks.contains_key(&block), "a whiteout of JIT code");
+                    let res = &mut self.blocks[block.0].instructions[off];
+                    *res = match *res {
+                        Residual::Inline { a, .. } => Residual::Enter(a + 1),
+                        Residual::InlineReturn { call, .. } => Residual::Leave(call + 1),
+                        _ => continue,
+                    };
+                }
+            }
+        }
+    }
+
+    /// JIT code is compiled from the residuals as they are, whited out first: every call's
+    /// judgement yet to decide keeps its frame for good. See Note [Inlined frames].
+    #[cfg(feature = "jit")]
+    fn saturate(&mut self) {
+        for (_key, judgement) in self.judgements.get_mut().iter_mut() {
+            debug_assert!(judgement.judged != Judged::Returned, "a judgement not whited out");
+            if judgement.judged == Judged::Maybe {
+                #[cfg(feature = "tracing")]
+                Self::traced_judgement(*_key, Judged::Yes, "jit");
+                judgement.judged = Judged::Yes;
+                judgement.sites.clear();
             }
         }
     }
@@ -4290,9 +4471,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Rc::make_mut(&mut ctx).top = None;
             }
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
-            // An inlined call's return whose frame isn't made: the caller's code after the call goes
-            // on here, the base moved back if it was moved, the results moved to the call's slots.
-            // See Note [Inlined frames].
+            // An inlined call's return whose frame its code didn't make itself: the caller's code
+            // after the call goes on here, the frame unmade as its call's judgement has it made,
+            // or the base moved back if it was moved, the results moved to the call's slots. The
+            // first return of a call whose judgement isn't decided decides its frame isn't needed,
+            // unless what observes it comes first. See Note [Inlined frames].
             if let Some(frame) = ctx.inline.last() && inst.0.Opcode() == Opcode::RETURN && frame.made != Made::Yes {
                 let (a, b) = crate::vm::AB::unpack(inst.0);
                 let (a, b) = (a as usize, b as usize);
@@ -4300,11 +4483,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let continuation = unsafe { &*frame.continuation };
                 let (call, c) = (continuation.a as usize, continuation.c as usize);
                 if let Rest::Next(next) = continuation.rest && b != 0 && c != 0 && c <= b && frame.b != 0 {
-                    let moved = frame.made == Made::Base;
+                    let pushed = self.pushed(&ctx, ctx.inline.len() - 1);
                     let by = frame.by();
                     let (known, effects) = self.returned_context(owner, &ctx, continuation, a, b);
                     self.end_block(block_id);
-                    if moved {
+                    if pushed {
+                        let closes = !captured_slots(unsafe { &*self.proto }).is_empty();
+                        let at = Location(block_id, self.blocks[block_id.0].instructions.len());
+                        self.blocks[block_id.0].instructions.push(Residual::InlineReturn { a: a as u16, b: b as u16, closes, call: continuation.a, moves: false });
+                        if let Some(judgement) = self.judgements.get_mut().get_mut(&frame.key()) && judgement.judged == Judged::Maybe {
+                            #[cfg(feature = "tracing")]
+                            Self::traced_judgement(frame.key(), Judged::Returned, "return");
+                            judgement.judged = Judged::Returned;
+                            judgement.sites.push(at);
+                        }
+                    } else if frame.made == Made::Base {
                         self.blocks[block_id.0].instructions.push(Residual::Leave(by as u16));
                     }
                     // A result past the arguments of a frame never entered is nil.
@@ -4337,7 +4530,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ("block", block_id.0.into()),
                     ("by", format!("{:?}", inst.0.Opcode()).as_str().into()),
                 ]);
-                (block_id, ctx) = self.make_frames(block_id, pc, &ctx);
+                (block_id, ctx) = self.make_frames(block_id, pc, &ctx, true);
             }
             let compiled = match (self.decode(pc, &inst), inst.0.Opcode()) {
                 (Some(generator), _) => self.compile_one(owner, SubPc::new(pc), ctx.clone(), generator, ResumeArg::Start, block_id),
@@ -5436,6 +5629,48 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// below it, and the pc after it, a Lua function's call continues at a thunk
     /// specializing it to the return. See Notes [Call sites], [Call
     /// continuations] and [Call effects].
+    /// Whether the call thunk of R(A) with B at `pc` in the context `calling`, of `value`, inlines
+    /// its callee from the first, as `make_call_thunk` decides: with a continuation, past fewer
+    /// than `MAX_VERSIONS` identity guards (`identities`). See Note [Inlined calls].
+    fn inlines_first(&self, owner: &Owner, calling: &Context, value: LBoxed<'_, '_>, pc: SubPc, a: usize, b: usize, continues: bool, identities: usize) -> bool {
+        let LValue::LClosure(lclos) = value.unbox() else { return false };
+        if !continues || !(matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS) {
+            return false;
+        }
+        let proto = lclos.ro(owner).prototype;
+        if !inlines(calling, unsafe { &*self.proto }, unsafe { &*proto }, a) {
+            return false;
+        }
+        let mut known = Self::inline_frame(calling, proto as LProto<'static, 'static>, Location(BlockId(0), 0), self.proto as LProto<'static, 'static>, a, b);
+        known.inline = Vec::new();
+        let decided = self.inlined.get(&(self.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known)));
+        decided || makes_iterator(unsafe { &*self.proto }, pc.0, a)
+    }
+
+    /// A call thunk's call, from code in `calling` at `pc`, observing the frames of the inlined
+    /// calls it is in, laid out in `block`: those whited out made by the code itself, the block it
+    /// goes on in, and the contexts at the call, before it (`continuation`'s) and after it
+    /// (`after`'s) knowing them made. See Note [Inlined frames].
+    fn calls_from(&mut self, block: BlockId, pc: SubPc, calling: &Rc<Context>, continuation: &Option<(Rc<Context>, Rc<[usize]>, Rest)>, after: &After) -> (BlockId, Rc<Context>, Option<(Rc<Context>, Rc<[usize]>, Rest)>, After) {
+        let (block, made) = self.make_frames(block, pc.0, calling, true);
+        if made.inline == calling.inline {
+            return (block, calling.clone(), continuation.clone(), after.clone());
+        }
+        let remade = |ctx: &Rc<Context>| {
+            let mut ctx = (**ctx).clone();
+            for (frame, made) in ctx.inline.iter_mut().zip(&made.inline) {
+                frame.made = made.made;
+            }
+            Rc::new(ctx)
+        };
+        let continuation = continuation.as_ref().map(|(before, captured, rest)| (remade(before), captured.clone(), rest.clone()));
+        let after = match after {
+            After::Version(next, ctx) => After::Version(*next, remade(ctx)),
+            After::Block(_) => unreachable!("a call made in a frame whited out continuing at a block"),
+        };
+        (block, made, continuation, after)
+    }
+
     fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
@@ -5449,6 +5684,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 vm.blocks[block_id.0].instructions.truncate(thunk_pc);
                 block_id
             };
+            // Any call but one inlined observes the frames of the inlined calls it is in, made here
+            // if they were whited out. See Note [Inlined frames].
+            let inlined = vm.inlines_first(owner, &calling, state.vals[state.base + a], pc, a, b, continuation.is_some(), identities);
+            let (block, calling, continuation, after) = match inlined {
+                true => (block, calling.clone(), continuation.clone(), after.clone()),
+                false => vm.calls_from(block, pc, &calling, &continuation, &after),
+            };
+            let mut block = block;
             let (a16, b16, c16) = (a as u16, b as u16, c as u16);
             let next = |vm: &Specializer, block: BlockId| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), pc, a, b, c, after.clone(), continuation.clone(), identities + 1, false));
             let mut layout = vec![];
@@ -5757,13 +6000,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // entered. See Note [Upvalue cells].
         let own = (1u32 << UPVALUE_CELLS) - 1;
         let cells = entry.filled_cells() & own << (entry.depth() * UPVALUE_CELLS);
-        // Its code from the call's block, its frame unmade until code observes it, so code naming
-        // only its slots runs in its caller's, and code laying out nothing folds into it. See Note
+        // Its code from the call's block, its frame made with its base, until its judgement
+        // decides it needn't be, so code laying out nothing folds into its caller's. See Note
         // [Inlined frames].
         let shift = self.new_block(self.blocks[block.0].pc);
         let mut entry = entry;
         let frame = entry.inline.last_mut().expect("an inlined call's frame");
         (frame.cells, frame.continuation) = (cells, pointer);
+        let parent = entry.inline.len().checked_sub(2).map(|outer| entry.inline[outer].key());
+        let judgement = Judgement { judged: Judged::Maybe, sites: Vec::new(), parent };
+        self.judgements.get_mut().insert(pointer as u64, judgement);
         self.compile(owner, 0, Rc::new(entry), shift);
         self.set_current(caller);
         #[cfg(feature = "tracing")]
@@ -5775,6 +6021,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ("shift", shift.0.into()),
             ("entry", shift.0.into()),
             ("context", _entry.as_str().into()),
+            ("key", (pointer as u64).into()),
         ]);
         shift
     }
@@ -6187,11 +6434,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             arg = ResumeArg::Start;
             'machine: loop {
             // What it needs of the frames of the inlined calls the code is in: made, if it may
-            // observe them, or, a frame passed what's up to the top, may lay out code; else their
-            // base moved to, if it may lay out code. See Note [Inlined frames].
+            // observe them, or, a frame passed what's up to the top, may lay out code; made but
+            // not yet observed, for a call its thunk may yet inline; else their base moved to, if
+            // it may lay out code. See Note [Inlined frames].
             if let CoroutineState::Yielded(yielded) = &state && ctx.inline.iter().any(|frame| frame.made != Made::Yes) {
                 let unpassed = ctx.inline.iter().any(|frame| frame.made == Made::No && frame.b == 0);
-                if observes(&ctx, yielded) || (unpassed && lays_out(&ctx, yielded)) {
+                let deferred = matches!(yielded, YieldOp::Call(CallTarget::Dynamic(a, ..)) if !matches!(ctx.types[*a], CType::NativeFunction(_)));
+                if deferred {
+                    (block_id, ctx) = self.make_frames(block_id, pc.0, &ctx, false);
+                } else if observes(&ctx, yielded) || (unpassed && lays_out(&ctx, yielded)) {
                     #[cfg(feature = "tracing")]
                     crate::tracing::instant("spec", "frames_made", &[
                         ("line", self.traced_line(owner).into()),
@@ -6199,7 +6450,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ("block", block_id.0.into()),
                         ("by", format!("{yielded:?}").as_str().into()),
                     ]);
-                    (block_id, ctx) = self.make_frames(block_id, pc.0, &ctx);
+                    (block_id, ctx) = self.make_frames(block_id, pc.0, &ctx, true);
                 } else if lays_out(&ctx, yielded) {
                     self.enter(&mut ctx, block_id);
                 }
@@ -7129,11 +7380,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 } else {
                     if block.jit_info.entry.is_none() {
                         debug!("jit compile {id:?}");
+                        self.whiteout(owner, &mut state);
                         // As many inlined calls deep as the running frame's code is: the entries
                         // the interpreter has for them, the callstack's last. See Note [Inlined
                         // calls].
                         let depth = state.callstack.iter().rev().take_while(|entry| entry.returns_to().is_none()).count();
                         let offset = state.callstack.len().checked_sub(depth).filter(|_| depth > 0).map_or(state.shifted, |outer| state.base - state.callstack[outer].frame);
+                        self.saturate();
                         self.jit_compile(id, owner, depth, offset);
                     }
 
@@ -7426,6 +7679,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let thunk = thunk.clone();
                     (thunk.0.borrow_mut())(self, owner, &mut state, off);
                     self.contract(owner, &state, Location(id, off));
+                    self.whiteout(owner, &mut state);
                 },
                 &Residual::Arrive { a, c } | &Residual::Arrived { a, c, .. } => {
                     off += 1;
