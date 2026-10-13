@@ -472,7 +472,7 @@ impl Gen {
             },
             _ => return false,
         };
-        lo >= 1 && self.held.length(table).is_some_and(|length| hi <= length)
+        lo >= 1 && self.length(table).is_some_and(|length| hi <= length)
     }
 
     /// What in-array test `test`, passed, says of its table's array part. See Note [Peephole
@@ -494,7 +494,28 @@ impl Gen {
     /// The range of `slot`'s integer value: the peephole's, or its constant's. See Note [Peephole
     /// memory] in `peephole`.
     fn range(&self, slot: usize) -> Option<(i32, i32)> {
-        self.held.range(slot).or_else(|| (!self.held.unset(slot)).then(|| self.constant(slot)).flatten().map(|k| (k, k)))
+        if self.held.unset(slot) {
+            return None;
+        }
+        self.holders(slot).find_map(|s| self.held.range(s)).or_else(|| self.constant(slot).map(|k| (k, k)))
+    }
+
+    /// How long at least the array part of `slot`'s table is, as the peephole knows of any slot
+    /// holding it. See Note [Peephole memory] in `peephole`.
+    fn length(&self, slot: usize) -> Option<i32> {
+        if self.held.unset(slot) {
+            return None;
+        }
+        self.holders(slot).find_map(|s| self.held.length(s))
+    }
+
+    /// The slots holding what `slot` does, as the context knows: it, then the rest of its class.
+    fn holders(&self, slot: usize) -> impl Iterator<Item = usize> + '_ {
+        let members = self.ctx.as_ref().map(|ctx| ctx.values.members(Loc::root(Root::Slot(slot as u16)))).unwrap_or_default();
+        std::iter::once(slot).chain(members.into_iter().filter_map(move |root| match root {
+            Root::Slot(s) if s as usize != slot => Some(s as usize),
+            _ => None,
+        }))
     }
 
     /// What it knows of `slot`'s constant value.
@@ -829,6 +850,12 @@ impl Gen {
             }
         }
         let (writes, reads) = overwrites(&yielded);
+        // What it holds and knows named by a slot about to be written is named by another holding
+        // the value.
+        if !(self.held.stores.is_empty() && self.held.lengths.is_empty() && self.held.ranges.is_empty()) && !writes.is_empty() {
+            let ctx = self.ctx.clone().expect("a generator run in a context");
+            rehome(&mut self.held, &ctx, |slot| writes.contains(&slot));
+        }
         // The ranges of integer values past it. See Note [Peephole memory] in `peephole`.
         let computed = described.as_ref().map(|op| (op.dest, crate::peephole::range_of(op, |slot| self.range(slot))));
         let fits = described.as_ref().is_some_and(|op| crate::peephole::fits(op, |slot| self.range(slot)));
@@ -837,13 +864,19 @@ impl Gen {
                 let range = self.range(*from);
                 self.held.set_range(*to, range);
                 self.held.lengths.retain(|l| l.0 != *to);
-                if let Some(length) = self.held.length(*from) {
+                if let Some(length) = self.length(*from) {
                     self.held.learn_length(*to, length);
                 }
             },
             YieldOp::Clobber(from) => {
                 self.held.ranges.retain(|r| r.0 < *from);
                 self.held.lengths.retain(|l| l.0 < *from);
+            },
+            // A call writes its frame; an inlined one's code is the peephole's to see, and code past
+            // one that isn't is a version's, knowing nothing of it.
+            YieldOp::Call(CallTarget::Dynamic(a, _, _)) => {
+                self.held.ranges.retain(|r| r.0 < *a);
+                self.held.lengths.retain(|l| l.0 < *a);
             },
             // What may shrink an array part.
             YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) if !matches!(w.memory(), crate::window::Memory::None
@@ -875,11 +908,6 @@ impl Gen {
             self.held.set_range(slot, range);
         }
         self.held.unset.retain(|slot| !writes.contains(slot));
-        // A held store named by a slot about to be written is named by another holding the value.
-        if !(self.held.stores.is_empty() && self.held.lengths.is_empty()) && !writes.is_empty() {
-            let ctx = self.ctx.clone().expect("a generator run in a context");
-            rehome(&mut self.held, &ctx, |slot| writes.contains(&slot));
-        }
         if !self.held.is_empty() && !self.passes(&yielded, described.as_ref(), memory.as_ref()) {
             // What writes a held value unread: that spell is dead.
             self.held.drop_overwritten(&writes, &reads);

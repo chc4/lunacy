@@ -932,6 +932,9 @@ impl Spells {
         for length in &mut self.lengths {
             length.0 = slot(length.0);
         }
+        for range in &mut self.ranges {
+            range.0 = slot(range.0);
+        }
     }
 
     /// Whether something it holds names slot `slot`: writes it, or reads it.
