@@ -1,7 +1,6 @@
--- An inlined call looping over another inlined call: neither frame is needed by the code that
--- runs most, so both are whited out. Code compiled after that needing them makes them itself: a
--- native call in the inner callee, and a call that can't be inlined (a vararg function) in the
--- outer one's loop, each first reached long after.
+-- An inlined call looping over another inlined call: neither frame is made by the code that runs
+-- most. Code needing them makes them: a native call in the inner callee, and a call that can't be
+-- inlined (a vararg function) in the outer one's loop, each first reached long after.
 
 local function count(...)
   local a, b, c = ...
