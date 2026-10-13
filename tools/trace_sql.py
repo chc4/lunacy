@@ -103,6 +103,12 @@ The specializer's are also views, one column per argument:
   inline_return(ts, line, callee, after, block, context)
       the code after an inlined call, of the function at `line` at pc `after`,
       for a return in the inlined callee's code: its block and context.
+  peephole_ahead(ts, line, pc, why)
+      a straight jump to pc of the function at `line` the peephole held
+      something at, run ahead: what it held was of use there (`consumed`),
+      or reached a way out of straight code first (`unused`, `complete`), or
+      the run ahead couldn't tell (`unknown`, `bound`); it goes on there but
+      for `unused` and `complete`.
   peephole_return(ts, line, pc, block, held, why)
       a return of an inlined callee, of the function at `line`, compiled in
       `block`, whether the peephole held anything there, and whether the
@@ -143,6 +149,7 @@ VIEWS = {
     'peephole_dead': ['line', 'pc', 'block', 'element', 'dead'],
     'peephole_return': ['line', 'pc', 'block', 'held', 'why'],
     'peephole_range': ['line', 'pc', 'block', 'what'],
+    'peephole_ahead': ['line', 'pc', 'why'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
@@ -154,7 +161,8 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused'),
           'peephole_lay_out': ('peephole', 'lay_out'), 'peephole_store': ('peephole', 'store'),
           'peephole_load': ('peephole', 'load'), 'peephole_dead': ('peephole', 'dead'),
-          'peephole_return': ('peephole', 'return'), 'peephole_range': ('peephole', 'range')}
+          'peephole_return': ('peephole', 'return'), 'peephole_range': ('peephole', 'range'),
+          'peephole_ahead': ('peephole', 'ahead')}
 
 
 def connect(trace):

@@ -1185,6 +1185,19 @@ hyperfines-knob knob: unsafe-compile
     for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; {{TIMED}} hyperfine --warmup {{WARMUP}} --export-json working/knob/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{knob}}" "env {{knob}} ./target/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
     python3 tools/knob_table.py working/knob/*.json
 
+# Every HYPERFINES run in the unsafe build without and with cargo feature
+# `feature` (built into target/feature-<feature>), and the change in each's
+# median (tools/knob_table.py); a run that fails is skipped. Its json in
+# working/feature/.
+hyperfines-feature feature: unsafe-compile
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{SHARED}} cargo build --profile unsafe --no-default-features --features "unsafe {{feature}}" --bin bench \
+        --target-dir target/feature-{{feature}} -Z build-std="core,std,panic_abort"
+    rm -rf working/feature && mkdir -p working/feature
+    for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; {{TIMED}} hyperfine --warmup {{WARMUP}} --export-json working/feature/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{feature}}" "./target/feature-{{feature}}/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
+    python3 tools/knob_table.py working/feature/*.json
+
 hyperfines-full:
     #!/usr/bin/env bash
     set -euo pipefail

@@ -25,6 +25,7 @@ tracing = [] # Write a Perfetto trace (Fuchsia trace format) of the run to lunac
 alloc_stats = ["mimalloc/extended", "dep:libmimalloc-sys"] # bench prints mimalloc's statistics
 alloc_debug = ["dep:libmimalloc-sys", "libmimalloc-sys/debug"] # mimalloc checks its heap, to find a write past or after an allocation
 window_dump = ["jit"] # Dump the JIT's window allocation to window_dump.txt
+no_peephole = [] # The peephole holds nothing and knows nothing of values, to compare (see src/peephole.rs)
 align_loops = ["jit"] # Loop headers' JIT code starts LOOP_ALIGN-aligned
 align_selects = ["jit"] # A branch on `select` never crosses a cache line
 jit_disasm = ["jit", "yaxpeax-x86/fmt", "dep:rustc-demangle"] # Disassemble the JIT's code, annotated, to jit_disasm.txt when it's dropped

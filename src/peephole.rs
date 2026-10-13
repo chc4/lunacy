@@ -33,6 +33,13 @@ use crate::window::{windowed, Window};
 // laid out as its computation, unchecked. A table's array part the peephole knows is at least as
 // long as an in-array test that passed on it found, until something else writes its register or
 // may shrink an array part; a test of a key whose range is within that passes, laid out as nothing.
+//
+// A straight jump the peephole holds something at goes on at its target only if what it holds is
+// of use there: it runs ahead, a fork of itself given the target's instructions, and looks for what
+// it holds, but a constant, read into an operation it holds, or a store of it forwarded to a load
+// or made dead, before a way out of straight code, which would lay it out unused. Running ahead it
+// knows only what the context says and takes every test found out at runtime as passed; what it
+// can't run ahead through, or a few instructions without either, goes on as if of use.
 
 // Note [Peephole fusion]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -193,6 +200,10 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
     /// The registers it reads, as they were before any held operation.
     fn inputs(&self) -> impl Iterator<Item = usize> + '_ {
         let key = match self.cell.key { Operand::Slot(slot) => Some(slot), Operand::K(_) => None };
@@ -270,9 +281,17 @@ fn bounds(op: &IntOp, range: impl Fn(usize) -> Option<(i32, i32)>) -> Option<(i6
     Some((lo, hi))
 }
 
+/// Whether the peephole rewrites what it's given (Note [Peephole fusion]): with feature
+/// `no_peephole`, it holds nothing and knows nothing of values, every yield passed on as it comes
+/// but the nils of an inlined frame's unset slots, to compare.
+pub const REWRITES: bool = !cfg!(feature = "no_peephole");
+
 /// Whether integer operations are held to fuse (Note [Peephole fusion]); set `LUNACY_NO_FUSION`
 /// for none, to compare.
 pub fn fuses() -> bool {
+    if !REWRITES {
+        return false;
+    }
     static FUSES: LazyLock<bool> = LazyLock::new(|| std::env::var_os("LUNACY_NO_FUSION").is_none());
     *FUSES
 }
@@ -739,6 +758,11 @@ impl Spell {
             Sym::Guard(_) => true,
             _ => !self.fits,
         })
+    }
+
+    /// Whether it is a constant, which laying it out loads.
+    pub fn is_constant(&self) -> bool {
+        RULES[TRIE.rule[self.node].expect("a spell is a rule")].pattern == [Sym::Const]
     }
 
     /// Its rule's name.

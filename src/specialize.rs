@@ -275,6 +275,10 @@ pub struct Gen {
     /// at the jump it's at.
     continuing: Option<Pc>,
     looked: bool,
+    /// Running ahead: the slots of the spells and the stores it held at the jump, and whether one
+    /// is of use. See Note [Peephole memory] in `peephole`.
+    watch: Option<(Vec<usize>, Vec<usize>)>,
+    consumed: bool,
 }
 
 impl Gen {
@@ -299,7 +303,30 @@ impl Gen {
             done: None,
             continuing: None,
             looked: false,
+            watch: None,
+            consumed: false,
         })
+    }
+
+    /// Run ahead, looking for what it holds now being of use. See Note [Peephole memory] in
+    /// `peephole`.
+    fn watch_held(&mut self) {
+        self.watch = Some((self.held.spells.iter().map(|spell| spell.dest).collect(), self.held.stores.iter().map(|store| store.id()).collect()));
+        self.consumed = false;
+    }
+
+    /// The stores it held at the jump it runs ahead of that it holds still.
+    fn watched_stores(&self) -> Vec<usize> {
+        let Some((_, ids)) = &self.watch else { return Vec::new() };
+        self.held.stores.iter().map(|store| store.id()).filter(|id| ids.contains(id)).collect()
+    }
+
+    /// One of those stores no more, but laid out: made dead.
+    fn killed(&mut self, before: &[usize]) {
+        let now = self.watched_stores();
+        if before.iter().any(|id| !now.contains(id)) {
+            self.consumed = true;
+        }
     }
 
     /// `inner`, a generator boxed, run holding `held`.
@@ -645,6 +672,7 @@ impl Gen {
             _ => None,
         };
         let trigger = format!("window {}", window.name());
+        let chains = self.watch.as_ref().is_some_and(|(dests, _)| op.reads().any(|slot| dests.contains(&slot) && self.held.spells.iter().any(|spell| spell.dest == slot && !spell.is_constant())));
         let mut folded = None;
         // What it needs laid out, as witchcraft's invariants have it, then everything, then
         // nothing held: offered again after each.
@@ -667,6 +695,7 @@ impl Gen {
         if !held {
             return false;
         }
+        self.consumed |= chains;
         let writes = window.operands().iter().zip(window.accesses()).filter(|(_, a)| a.writes()).map(|(s, _)| *s).collect();
         // A constant loaded, of no slot, is known as its load makes it known.
         let constant = folded.filter(|_| op.reads().next().is_some()).map(|value| (op.dest, value));
@@ -685,7 +714,9 @@ impl Gen {
         match op {
             MemOp::Store { cell, value } if crate::peephole::fuses() && self.holds => {
                 let range = match value { Stored::Slot(slot) => self.range(slot), Stored::Boxed(_) => None };
+                let before = self.watched_stores();
                 let _dead = self.held.hold_store(cell, value, range, window.clone(), self.at, alias);
+                self.killed(&before);
                 #[cfg(feature = "tracing")]
                 self.out.push_back(YieldOp::PeepholeTrace("store", vec![("element", format!("{cell:?}")), ("value", format!("{value:?} {range:?}")), ("dead", _dead.to_string())]));
             },
@@ -719,7 +750,7 @@ impl Gen {
         // A jump that is the only way on, its generator's next yield a jump to its target, goes on
         // at the target holding what it holds: the target is straight on, no block's. See Note
         // [Peephole fusion] in `peephole`.
-        if let YieldOp::GetBlock(target) = yielded && !std::mem::take(&mut self.looked) && self.holds_any() {
+        if let YieldOp::GetBlock(target) = yielded && !std::mem::take(&mut self.looked) && self.holds_any() && crate::peephole::REWRITES {
             const AHEAD: BlockId = BlockId(usize::MAX);
             let mut ahead = self.inner.clone();
             if let CoroutineState::Yielded(YieldOp::Jump(AHEAD)) = Pin::new(&mut *ahead).resume(ResumeArg::BlockId(AHEAD)) {
@@ -738,6 +769,10 @@ impl Gen {
             },
             // Of what the code holds where: a slot holding what it would be moved, which no spell
             // writes, holds it.
+            YieldOp::HoldsValue(..) if !crate::peephole::REWRITES => {
+                self.next = Some(ResumeArg::Failed);
+                return;
+            },
             YieldOp::HoldsValue(dest, src) => {
                 let ctx = self.ctx.as_ref().expect("a generator run in a context");
                 let unheld = |slot: usize| self.held.spells.iter().all(|spell| spell.dest != slot);
@@ -748,7 +783,7 @@ impl Gen {
             },
             // An in-array test of a key whose range is within what the table's array part is known
             // to be at least: as passed. See Note [Peephole memory] in `peephole`.
-            YieldOp::GuardDynamic(ref test) if self.in_array(&**test) => {
+            YieldOp::GuardDynamic(ref test) if crate::peephole::REWRITES && self.in_array(&**test) => {
                 #[cfg(feature = "tracing")]
                 self.out.push_back(YieldOp::PeepholeTrace("range", vec![("what", format!("passes {} {:?}", test.name(), test.operands()))]));
                 self.out.push_back(YieldOp::Took);
@@ -782,6 +817,8 @@ impl Gen {
                 let ctx = self.ctx.clone().expect("a generator run in a context");
                 match self.held.clone().load(cell, dest, |a, b| cells(&ctx, a, b)) {
                     crate::peephole::Load::Forward(value, range) => {
+                        let from = self.held.stores.iter().rev().find(|store| cells(&ctx, store.cell, cell) != crate::peephole::Alias::Disjoint).map(|store| store.id());
+                        self.consumed |= from.is_some_and(|id| self.watched_stores().contains(&id));
                         #[cfg(feature = "tracing")]
                         self.out.push_back(YieldOp::PeepholeTrace("load", vec![("element", format!("{cell:?}")), ("outcome", format!("forward {value:?} {range:?}"))]));
                         memory = None;
@@ -828,7 +865,9 @@ impl Gen {
         // See Note [Peephole memory] in `peephole`.
         if let (Some(MemOp::Store { cell, .. }), YieldOp::ExecWindow(_)) = (&memory, &yielded) {
             let ctx = self.ctx.clone().expect("a generator run in a context");
+            let before = self.watched_stores();
             let _dead = self.held.kill_stores(*cell, |a, b| cells(&ctx, a, b));
+            self.killed(&before);
             #[cfg(feature = "tracing")]
             if _dead > 0 {
                 self.out.push_back(YieldOp::PeepholeTrace("dead", vec![("element", format!("{cell:?}")), ("dead", _dead.to_string())]));
@@ -5539,6 +5578,98 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// fragile facts about them, and which array a value of known type was
     /// loaded from, which lets paths that differ only in them share the target's
     /// version. See Note [Jumped-to contexts].
+    /// Whether going on at `target` straight on, with `generator`, is worth what `coro` holds: a
+    /// fork of it run ahead finds it of use, or can't tell. See Note [Peephole memory] in
+    /// `peephole`.
+    fn worth_continuing(&mut self, owner: &mut Owner, ctx: &Rc<Context>, coro: &Gen, target: Pc, generator: Box<dyn NativeGen>) -> bool {
+        const INSTRUCTIONS: usize = 8;
+        let mut ahead = Box::new(coro.clone());
+        ahead.watch_held();
+        let mut ctx = self.jumping(owner, ctx.clone(), target);
+        let proto = self.proto;
+        let constant = |k: usize| unsafe { &(&(*proto).constants.items)[k] };
+        let (mut pc, mut instructions) = (SubPc::new(target), 0);
+        let mut generator = Some(generator);
+        // Its answer to `Continue`: the target's generator, given.
+        let mut arg = ResumeArg::Matched;
+        let why = loop {
+            if let Some(generator) = generator.take() {
+                ahead.next_instruction(generator);
+            }
+            ahead.see(&ctx, proto, Some((pc.0, true)));
+            let yielded = match Pin::new(&mut *ahead).resume(arg) {
+                CoroutineState::Yielded(yielded) => yielded,
+                CoroutineState::Complete(_) => break "complete",
+            };
+            if ahead.consumed {
+                break "consumed";
+            }
+            arg = ResumeArg::Start;
+            match yielded {
+                YieldOp::TypeofK(k) => arg = ResumeArg::Type(constant_ctype(constant(k))),
+                YieldOp::Typeof(slot) => arg = ResumeArg::Type(ctx.types[slot].clone()),
+                YieldOp::TypeofRk(rk) if rk & 0x100 != 0 => arg = ResumeArg::Type(constant_ctype(constant(rk & 0xff))),
+                YieldOp::TypeofRk(slot) => arg = ResumeArg::Type(ctx.types[slot].clone()),
+                YieldOp::IntegerK(k) => match constant(k) {
+                    crate::chunk::Constant::Number(n) => arg = ResumeArg::Integer(n.0 as i32),
+                    _ => break "unknown",
+                },
+                YieldOp::IntegralK(k) => arg = if integral_constant(constant(k)) { ResumeArg::Matched } else { ResumeArg::Failed },
+                YieldOp::NumberK(k) => match constant(k) {
+                    crate::chunk::Constant::Number(n) => arg = ResumeArg::Number(if n.0.is_nan() { f64::NAN } else { n.0 }),
+                    _ => break "unknown",
+                },
+                YieldOp::BoxedK(k) => arg = ResumeArg::Boxed(LBoxed::from(constant(k)).bits()),
+                YieldOp::GuardRk(rk, expected) | YieldOp::Guard(rk, expected) if rk & 0x100 != 0 => {
+                    let ty = constant_ctype_for(constant(rk & 0xff), &CType::Type(expected));
+                    arg = if CType::Type(expected).accepts(&ty) { ResumeArg::MatchedConst(rk & 0xff) } else { ResumeArg::Failed };
+                },
+                YieldOp::GuardRk(slot, expected) | YieldOp::Guard(slot, expected) => {
+                    let (expected, known) = (CType::Type(expected), ctx.types[slot].clone());
+                    arg = if !expected.accepts(&known) && !known.accepts(&expected) { ResumeArg::Failed } else { ResumeArg::Matched };
+                },
+                YieldOp::GuardCType(rk, expected) => {
+                    let known = if rk & 0x100 != 0 { constant_ctype_for(constant(rk & 0xff), &expected) } else { ctx.types[rk].clone() };
+                    arg = if expected.accepts(&known) || !known.accepts(&expected) { navigate(pc, &expected, &known).1 } else { ResumeArg::Matched };
+                    if rk & 0x100 != 0 && arg == ResumeArg::Matched {
+                        arg = ResumeArg::MatchedConst(rk & 0xff);
+                    }
+                },
+                // Found out at runtime: as passed.
+                YieldOp::GuardDynamic(_) | YieldOp::OptimisticExec(_) => arg = ResumeArg::Matched,
+                YieldOp::Encoding(_) => arg = ResumeArg::Type(CType::Type(LType::Integer)),
+                YieldOp::SetCTypes(types) => Rc::make_mut(&mut ctx).set_types(owner, types),
+                // What it lays out, and what tells or asks nothing it answers.
+                YieldOp::Holding { .. } | YieldOp::Fused { .. } | YieldOp::LaidOut(_) | YieldOp::Took | YieldOp::PeepholeTrace(..)
+                    | YieldOp::Enter | YieldOp::MakeFrames | YieldOp::ExecWindow(_) | YieldOp::Exec(_) | YieldOp::Effect(_)
+                    | YieldOp::Decided(_) | YieldOp::Narrow(_) | YieldOp::Copy(..) | YieldOp::Clobber(_) => {},
+                YieldOp::NextPc => {
+                    instructions += 1;
+                    let next = pc.0 + 1;
+                    let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[next].clone() };
+                    match self.decode(next, &inst) {
+                        Some(next_generator) if instructions < INSTRUCTIONS => {
+                            generator = Some(next_generator);
+                            pc = SubPc::new(next);
+                            arg = ResumeArg::Matched;
+                        },
+                        _ => break "bound",
+                    }
+                },
+                // A way out of straight code, what it holds unused.
+                YieldOp::GetBlock(_) | YieldOp::Jump(_) | YieldOp::Select(_) | YieldOp::Continue(_) => break "unused",
+                _ => break "unknown",
+            }
+        };
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("peephole", "ahead", &[
+            ("line", self.traced_line(owner).into()),
+            ("pc", target.into()),
+            ("why", why.into()),
+        ]);
+        why != "unused" && why != "complete"
+    }
+
     fn jumping(&self, owner: &mut Owner, ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
         self.jumping_keeping(owner, ctx, dest_pc, None)
     }
@@ -8273,7 +8404,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let proto = self.proto as usize;
                     let repeats = self.continued.len() >= MAX_CONTINUED
                         || self.continued.iter().any(|(of, at, known)| *of == proto && *at == target && **known == *ctx);
-                    arg = match self.decode(target, &inst).filter(|_| !repeats) {
+                    // Only where what it holds is of use there. See Note [Peephole memory] in `peephole`.
+                    let worth = !repeats && self.decode(target, &inst).is_some_and(|generator| self.worth_continuing(owner, &ctx, &coro, target, generator));
+                    arg = match self.decode(target, &inst).filter(|_| !repeats && worth) {
                         Some(generator) => {
                             // What a jump there carries, the stores held named by slots it keeps. See Note
                             // [Jumped-to contexts].
