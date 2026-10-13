@@ -203,6 +203,12 @@ pub enum Load {
     After(Vec<Rc<dyn Window>>),
 }
 
+impl Load {
+    pub fn is_forward(&self) -> bool {
+        matches!(self, Load::Forward(_))
+    }
+}
+
 /// Whether integer operations are held to fuse (Note [Peephole fusion]); set `LUNACY_NO_FUSION`
 /// for none, to compare.
 pub fn fuses() -> bool {
@@ -912,18 +918,29 @@ impl Spells {
         dead.len()
     }
 
-    /// A load of `cell`: the value the one held store to it stores, if no other held store may be
-    /// to it; else itself, after those that may be, and those before them, laid out. See Note
-    /// [Peephole memory].
-    pub fn load(&mut self, cell: Element, alias: impl Fn(Element, Element) -> Alias) -> Load {
+    /// A load of `cell` into `dest`: the value the held store to it stores, if it was held after
+    /// every other that may be to it, and its register holds it still, unset by no frame and
+    /// written by no spell, or is `dest`; else itself, after those that may be, and those before
+    /// them, laid out. See Note [Peephole memory].
+    pub fn load(&mut self, cell: Element, dest: usize, alias: impl Fn(Element, Element) -> Alias) -> Load {
         let to: Vec<(usize, Alias)> = self.stores.iter().map(|s| (s.id, alias(s.cell, cell))).filter(|(_, a)| *a != Alias::Disjoint).collect();
-        if let [(id, Alias::Same)] = to.as_slice() {
-            return Load::Forward(self.stores.iter().find(|s| s.id == *id).unwrap().value);
+        if let Some(&(id, Alias::Same)) = to.last() {
+            let value = self.stores.iter().find(|s| s.id == id).unwrap().value;
+            let holds = |slot: usize| slot == dest || (!self.unset(slot) && self.spells.iter().all(|spell| spell.dest != slot));
+            if let Stored::Boxed(_) = value {
+                return Load::Forward(value);
+            }
+            if let Stored::Slot(slot) = value && holds(slot) {
+                return Load::Forward(value);
+            }
         }
         let mut laid: Vec<usize> = to.iter().map(|(id, _)| *id).collect();
         let mut i = 0;
         while i < laid.len() {
-            let store = self.stores.iter().find(|s| s.id == laid[i]).unwrap();
+            let Some(store) = self.stores.iter().find(|s| s.id == laid[i]) else {
+                i += 1;
+                continue;
+            };
             for &before in &store.after {
                 if !laid.contains(&before) {
                     laid.push(before);
@@ -1002,7 +1019,12 @@ impl Spells {
         }
         let part = |laid: bool| Spells {
             spells: self.spells.iter().zip(&spells).filter(|(_, l)| **l == laid).map(|(s, _)| s.clone()).collect(),
-            stores: self.stores.iter().zip(&stores).filter(|(_, l)| **l == laid).map(|(s, _)| s.clone()).collect(),
+            // Each after only what it holds still.
+            stores: self.stores.iter().zip(&stores).filter(|(_, l)| **l == laid).map(|(s, _)| {
+                let mut store = s.clone();
+                store.after.retain(|id| self.stores.iter().zip(&stores).any(|(other, l)| other.id == *id && *l == laid));
+                store
+            }).collect(),
             next: self.next,
             unset: self.unset.iter().copied().filter(|slot| nils.contains(slot) == laid).collect(),
         };
@@ -1206,7 +1228,7 @@ mod tests {
     /// What a load of `at` becomes: the register forwarded, or the stores laid out before it, by
     /// their keys.
     fn load(spells: &mut Spells, at: Element) -> Result<Stored, Vec<i32>> {
-        match spells.load(at, alias) {
+        match spells.load(at, usize::MAX, alias) {
             Load::Forward(value) => Ok(value),
             Load::After(stores) => Err(stores.iter().map(|w| w.captures()[0] as i32).collect()),
         }
@@ -1322,15 +1344,41 @@ mod tests {
 
     #[test]
     fn a_load_that_may_alias_comes_after_the_stores() {
-        // t[1] = x; u[1] = y; t[2] = w; z = u[1]: t may be u, so its store may be the element
-        // too; the store to t[2] can't be, and stays held.
+        // u[1] = y; t[1] = x; t[2] = w; z = u[1]: t may be u, so its store, held last, may be
+        // the element too; the store to t[2] can't be, and stays held.
         let mut spells = Spells::default();
-        store(&mut spells, element(1, K(1)), 5, 0);
-        store(&mut spells, element(2, K(1)), 6, 1);
+        store(&mut spells, element(2, K(1)), 6, 0);
+        store(&mut spells, element(1, K(1)), 5, 1);
         store(&mut spells, element(1, K(2)), 7, 2);
         assert_eq!(load(&mut spells, element(2, K(1))), Err(vec![1, 1]));
         assert_eq!(spells.stores.len(), 1);
         assert_eq!(spells.stores[0].cell, element(1, K(2)));
+    }
+
+    #[test]
+    fn a_load_forwards_only_from_a_register_holding_the_value() {
+        // t[1] = x, x's register then unset by a frame entered, or written by a spell: the
+        // register holds it no more, but for a load into it.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        spells.unset.push(5);
+        assert_eq!(spells.clone().load(element(1, K(1)), 6, alias).is_forward(), false);
+        assert_eq!(spells.clone().load(element(1, K(1)), 5, alias).is_forward(), true);
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        hold(&mut spells, 1, &[op(Arith::Add, Slot(4), K(1), 5)]);
+        assert_eq!(spells.clone().load(element(1, K(1)), 6, alias).is_forward(), false);
+        assert_eq!(spells.clone().load(element(1, K(1)), 5, alias).is_forward(), true);
+    }
+
+    #[test]
+    fn a_load_of_the_last_store_into_its_element_is_its_value() {
+        // t[1] = x; u[1] = y; z = u[1]: whatever t is, u[1] is y, and both stay held.
+        let mut spells = Spells::default();
+        store(&mut spells, element(1, K(1)), 5, 0);
+        store(&mut spells, element(2, K(1)), 6, 1);
+        assert_eq!(load(&mut spells, element(2, K(1))), Ok(Stored::Slot(6)));
+        assert_eq!(spells.stores.len(), 2);
     }
 
     #[test]

@@ -780,6 +780,16 @@ _uxn-promote-commands benchmark times full:
     printf 'lunacy unsafe\t%s\n' "env $jit ./target/unsafe/bench working/$b.bin {{times}}"
     printf 'lunacy unsafe magic\t%s\n' "env $jit ./target/magic/unsafe/bench working/$b.bin {{times}}"
 
+# What lunacy's unsafe builds, with and without `magic`, print running a uxn_*
+# benchmark as `hyperfine-uxn-promote` runs them, and their exit statuses.
+run-uxn-promote benchmark times='1': unsafe-compile unsafe-magic-compile
+    #!/usr/bin/env bash
+    set -uo pipefail
+    while IFS=$'\t' read -r name command; do
+        echo "== $name"
+        {{SHARED}} $command; echo "== exit $?"
+    done < <(just _uxn-promote-commands {{benchmark}} {{times}} "" | grep '^lunacy')
+
 # Cycles (`perf stat`, the mean of `runs`) of each implementation
 # `hyperfine-uxn-promote-full` times on a uxn_* benchmark, pinned as it pins
 # them, and those cycles over `iterations`, the iterations of the ROM's loop: a

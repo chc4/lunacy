@@ -486,6 +486,8 @@ impl Gen {
             ("spells", laid.spells.len().to_string()),
             ("windows", ops.iter().map(|laid| laid.op.name()).collect::<Vec<_>>().join(" ")),
             ("kept", (kept.stores.len() + kept.spells.len()).to_string()),
+            ("need", need.as_ref().map_or("everything".to_string(), |need| format!("reads {:?} writes {:?}{}", need.reads, need.writes, if need.memory { " memory" } else { "" }))),
+            ("laid", laid.stores.iter().map(|store| format!("{:?}={:?}", store.cell, store.value)).collect::<Vec<_>>().join(" ")),
         ]));
         for laid in ops {
             if laid.checked {
@@ -620,7 +622,7 @@ impl Gen {
                 self.out.push_back(YieldOp::PeepholeTrace("store", vec![("element", format!("{cell:?}")), ("value", format!("{value:?}")), ("dead", _dead.to_string())]));
             },
             MemOp::Load { cell, dest } if !self.held.stores.is_empty() => {
-                let outcome = self.held.load(cell, alias);
+                let outcome = self.held.load(cell, dest, alias);
                 #[cfg(feature = "tracing")]
                 self.out.push_back(YieldOp::PeepholeTrace("load", vec![("element", format!("{cell:?}")), ("outcome", match &outcome {
                     Load::Forward(value) => format!("forward {value:?}"),
@@ -689,7 +691,35 @@ impl Gen {
             _ => {},
         }
         let described = self.described.take();
-        let memory = self.memory.take();
+        let mut memory = self.memory.take();
+        // A load a held store is the last into is a move of the value it stores, and none into the
+        // slot holding it. See Note [Peephole memory] in `peephole`.
+        let yielded = match (memory, yielded) {
+            (Some(MemOp::Load { cell, dest }), YieldOp::ExecWindow(window)) if !self.held.stores.is_empty() => {
+                let ctx = self.ctx.clone().expect("a generator run in a context");
+                match self.held.clone().load(cell, dest, |a, b| cells(&ctx, a, b)) {
+                    crate::peephole::Load::Forward(value) => {
+                        #[cfg(feature = "tracing")]
+                        self.out.push_back(YieldOp::PeepholeTrace("load", vec![("element", format!("{cell:?}")), ("outcome", format!("forward {value:?}"))]));
+                        memory = None;
+                        match value {
+                            // Its register holds the value, as it was before anything held: what
+                            // would write it is dead, and it is set.
+                            crate::peephole::Stored::Slot(slot) if slot == dest => {
+                                self.held.drop_overwritten(&[dest], &[]);
+                                self.held.unset.retain(|&slot| slot != dest);
+                                self.next = Some(ResumeArg::Start);
+                                return;
+                            },
+                            crate::peephole::Stored::Slot(slot) => YieldOp::ExecWindow(Rc::new(crate::generators::Move::new(&[slot, dest]))),
+                            crate::peephole::Stored::Boxed(bits) => YieldOp::ExecWindow(Rc::new(crate::generators::LoadStored::new(bits, &[dest]))),
+                        }
+                    },
+                    crate::peephole::Load::After(_) => YieldOp::ExecWindow(window),
+                }
+            },
+            (_, yielded) => yielded,
+        };
         // A store about to run makes held stores into its element dead, laid out first or not.
         // See Note [Peephole memory] in `peephole`.
         if let (Some(MemOp::Store { cell, .. }), YieldOp::ExecWindow(_)) = (&memory, &yielded) {
@@ -5003,6 +5033,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 _ => None,
             };
+            // Whether an inlined call's return folds, and if not why.
+            #[cfg(feature = "tracing")]
+            if inst.0.Opcode() == Opcode::RETURN && let Some(frame) = ctx.inline.last() {
+                let (_, b) = crate::vm::AB::unpack(inst.0);
+                // SAFETY: an inlined call's continuation lives as long as the code.
+                let continuation = unsafe { &*frame.continuation };
+                let why = match () {
+                    _ if folds.is_some() => "folds",
+                    _ if frame.made == Made::Yes => "made",
+                    _ if matches!(continuation.rest, Rest::Resume(..)) => "resumes",
+                    _ if b == 0 || frame.b == 0 => "multiple values",
+                    _ if continuation.c == 0 || continuation.c as usize > b as usize => "results",
+                    _ => "result slot held",
+                };
+                crate::tracing::instant("peephole", "return", &[
+                    ("line", self.traced_line(owner).into()),
+                    ("pc", pc.into()),
+                    ("block", block_id.0.into()),
+                    ("held", (if carry.is_empty() { "no" } else { "yes" }).into()),
+                    ("why", why.into()),
+                ]);
+            }
             if let Some((frame, a, b, next, spells, moves)) = folds {
                 let continuation = unsafe { &*frame.continuation };
                 let moved = frame.made == Made::Base;
