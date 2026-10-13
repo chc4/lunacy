@@ -459,6 +459,38 @@ impl Gen {
         self.memory = None;
     }
 
+    /// Whether in-array test `test` passes, as the key's range and the table's known length have it.
+    fn in_array(&self, test: &dyn Window) -> bool {
+        let (table, (lo, hi)) = match (test.name(), test.operands()) {
+            ("InArray", &[table, key]) => match self.range(key) {
+                Some(range) => (table, range),
+                None => return false,
+            },
+            ("InArrayK", &[table]) => {
+                let k = test.captures()[0] as i32;
+                (table, (k, k))
+            },
+            _ => return false,
+        };
+        lo >= 1 && self.held.length(table).is_some_and(|length| hi <= length)
+    }
+
+    /// What in-array test `test`, passed, says of its table's array part. See Note [Peephole
+    /// memory] in `peephole`.
+    fn passed(&mut self, test: &dyn Window) {
+        let (table, at_least) = match (test.name(), test.operands()) {
+            ("InArray" | "InArrayHeld", &[table, key]) => match self.range(key) {
+                Some((lo, _)) => (table, lo),
+                None => return,
+            },
+            ("InArrayK" | "InArrayHeldK", &[table]) => (table, test.captures()[0] as i32),
+            _ => return,
+        };
+        if at_least >= 1 {
+            self.held.learn_length(table, at_least);
+        }
+    }
+
     /// The range of `slot`'s integer value: the peephole's, or its constant's. See Note [Peephole
     /// memory] in `peephole`.
     fn range(&self, slot: usize) -> Option<(i32, i32)> {
@@ -478,12 +510,14 @@ impl Gen {
     fn lay_out(&mut self, need: Option<crate::peephole::Need>, stale: &[usize], _trigger: &str) {
         let all = std::mem::take(&mut self.held);
         let ranges: Vec<(usize, i32, i32)> = all.ranges.iter().copied().filter(|r| !all.unset(r.0)).collect();
+        let lengths: Vec<(usize, i32)> = all.lengths.iter().copied().filter(|l| !all.unset(l.0)).collect();
         let (laid, mut kept) = match &need {
             Some(need) => all.split(need),
             None => (all, crate::peephole::Spells::default()),
         };
         // What's laid out holds its values as they were.
         kept.ranges = ranges;
+        kept.lengths = lengths;
         if laid.is_empty() {
             self.held = kept;
             return;
@@ -579,7 +613,7 @@ impl Gen {
 
     /// Hold integer op `op`, of `window`, laying out first what it must of what it holds; whether
     /// it did. See Note [Peephole fusion] in `peephole`.
-    fn hold(&mut self, op: crate::peephole::IntOp, window: &Rc<dyn Window>, optimistic: bool) -> bool {
+    fn hold(&mut self, op: crate::peephole::IntOp, window: &Rc<dyn Window>, optimistic: bool, fits: bool) -> bool {
         use crate::peephole::{Need, Offer};
         if !crate::peephole::fuses() || !self.holds {
             return false;
@@ -595,7 +629,7 @@ impl Gen {
         // nothing held: offered again after each.
         let mut laid = 0;
         let held = loop {
-            match self.held.offer(&op, self.at, known) {
+            match self.held.offer_fitting(&op, self.at, known, fits) {
                 Offer::Held => break true,
                 Offer::Folded(value) => {
                     folded = Some(value);
@@ -689,6 +723,15 @@ impl Gen {
                 let holds = dest == src || (unheld(dest) && unheld(src)
                     && ctx.values.members(Loc::root(Root::Slot(src as u16))).contains(&Root::Slot(dest as u16)));
                 self.next = Some(if holds { ResumeArg::Matched } else { ResumeArg::Failed });
+                return;
+            },
+            // An in-array test of a key whose range is within what the table's array part is known
+            // to be at least: as passed. See Note [Peephole memory] in `peephole`.
+            YieldOp::GuardDynamic(ref test) if self.in_array(&**test) => {
+                #[cfg(feature = "tracing")]
+                self.out.push_back(YieldOp::PeepholeTrace("range", vec![("what", format!("passes {} {:?}", test.name(), test.operands()))]));
+                self.out.push_back(YieldOp::Took);
+                self.next = Some(ResumeArg::Matched);
                 return;
             },
             YieldOp::IntegerOp(op) => {
@@ -788,12 +831,24 @@ impl Gen {
         let (writes, reads) = overwrites(&yielded);
         // The ranges of integer values past it. See Note [Peephole memory] in `peephole`.
         let computed = described.as_ref().map(|op| (op.dest, crate::peephole::range_of(op, |slot| self.range(slot))));
+        let fits = described.as_ref().is_some_and(|op| crate::peephole::fits(op, |slot| self.range(slot)));
         match &yielded {
             YieldOp::Copy(to, from) => {
                 let range = self.range(*from);
                 self.held.set_range(*to, range);
+                self.held.lengths.retain(|l| l.0 != *to);
+                if let Some(length) = self.held.length(*from) {
+                    self.held.learn_length(*to, length);
+                }
             },
-            YieldOp::Clobber(from) => self.held.ranges.retain(|r| r.0 < *from),
+            YieldOp::Clobber(from) => {
+                self.held.ranges.retain(|r| r.0 < *from);
+                self.held.lengths.retain(|l| l.0 < *from);
+            },
+            // What may shrink an array part.
+            YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) if !matches!(w.memory(), crate::window::Memory::None
+                | crate::window::Memory::Properties | crate::window::Memory::Cells | crate::window::Memory::Fields | crate::window::Memory::Reads)
+                && memory.is_none() => self.held.lengths.clear(),
             YieldOp::ExecWindow(_) | YieldOp::OptimisticExec(_) | YieldOp::Guard(..) | YieldOp::GuardRk(..) | YieldOp::GuardCType(..)
                 | YieldOp::GuardDynamic(_) | YieldOp::GetBlock(_) | YieldOp::Jump(_) | YieldOp::Trip(_) | YieldOp::HashKey(..)
                 | YieldOp::Promote(_) | YieldOp::Encoding(_) | YieldOp::Narrow(_) => {},
@@ -804,11 +859,13 @@ impl Gen {
                     self.out.push_back(YieldOp::PeepholeTrace("range", vec![("what", format!("cleared by {yielded:?}").chars().take(80).collect())]));
                 }
                 self.held.ranges.clear();
+                self.held.lengths.clear();
             },
             _ => {},
         }
         for &slot in &writes {
             self.held.set_range(slot, None);
+            self.held.lengths.retain(|l| l.0 != slot);
         }
         #[cfg(feature = "tracing")]
         if let Some((_, range)) = computed {
@@ -819,7 +876,7 @@ impl Gen {
         }
         self.held.unset.retain(|slot| !writes.contains(slot));
         // A held store named by a slot about to be written is named by another holding the value.
-        if !self.held.stores.is_empty() && !writes.is_empty() {
+        if !(self.held.stores.is_empty() && self.held.lengths.is_empty()) && !writes.is_empty() {
             let ctx = self.ctx.clone().expect("a generator run in a context");
             rehome(&mut self.held, &ctx, |slot| writes.contains(&slot));
         }
@@ -861,7 +918,7 @@ impl Gen {
         match &yielded {
             YieldOp::ExecWindow(w) if let Some(op) = memory && self.access(op, w) => return,
             YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) if let Some(op) = described
-                && self.hold(op, w, matches!(yielded, YieldOp::OptimisticExec(_))) => return,
+                && self.hold(op, w, matches!(yielded, YieldOp::OptimisticExec(_)), fits) => return,
             // A guard joining a held spell: as passed.
             YieldOp::GuardDynamic(test) if self.held.offer_guard(&**test, self.at) => {
                 self.out.push_back(YieldOp::Took);
@@ -912,7 +969,14 @@ impl Coroutine<ResumeArg> for Gen {
             }
             let arg = match this.next.take() {
                 Some(own) => own,
-                None => answer.take().unwrap_or(ResumeArg::Start),
+                None => {
+                    let arg = answer.take().unwrap_or(ResumeArg::Start);
+                    // A test found out at runtime, passed.
+                    if arg == ResumeArg::Matched && let Some(YieldOp::GuardDynamic(test)) = this.last.clone() {
+                        this.passed(&*test);
+                    }
+                    arg
+                },
             };
             answer = None;
             match Pin::new(&mut *this.inner).resume(arg) {
@@ -2283,6 +2347,7 @@ fn entering(held: &crate::peephole::Spells, calling: &Context, callee: LProto<'s
     let (laid, mut kept) = held.split(&crate::peephole::Need { reads: below.clone(), writes: below, memory: false });
     // Of the ranges, the frame's arguments'.
     kept.ranges.retain(|r| r.0 > a && !nilled.contains(&r.0));
+    kept.lengths.retain(|l| l.0 > a && !nilled.contains(&l.0));
     let mut kept = kept.renamed(|slot| slot - a - 1, |slot| slot - a - 1, |slot| !nilled.contains(&slot), usize::MAX);
     // Its frame is nil past its arguments, as the peephole holds it, unset.
     if b != 0 {
@@ -5158,6 +5223,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
                 let unset_slots = spells.unset.clone();
                 spells.ranges.retain(|r| !unset_slots.contains(&r.0));
+                spells.lengths.retain(|l| !unset_slots.contains(&l.0) && !moves.iter().any(|&(_, to)| to == l.0));
                 let unset = std::mem::take(&mut spells.unset);
                 for (from, to) in moves {
                     let result: Rc<dyn Window> = if unset.contains(&from) {

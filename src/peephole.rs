@@ -28,6 +28,11 @@ use crate::window::{windowed, Window};
 // access was made, as they stay while it is held: a key whose range leaves out another key is
 // another element. Ranges are the peephole's, never the context's: knowing them there would make
 // versions per range.
+//
+// A spell whose every operation's result its operands' ranges keep in an integer can't fail: it is
+// laid out as its computation, unchecked. A table's array part the peephole knows is at least as
+// long as an in-array test that passed on it found, until something else writes its register or
+// may shrink an array part; a test of a key whose range is within that passes, laid out as nothing.
 
 // Note [Peephole fusion]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -221,6 +226,20 @@ impl Load {
 /// The range of `op`'s result, its operands' ranges as `range` has them, if known. See Note
 /// [Peephole memory].
 pub fn range_of(op: &IntOp, range: impl Fn(usize) -> Option<(i32, i32)>) -> Option<(i32, i32)> {
+    let (lo, hi) = bounds(op, range)?;
+    // An integer op's result fits, or it fails.
+    let (lo, hi) = (lo.max(i32::MIN as i64), hi.min(i32::MAX as i64));
+    (lo <= hi).then_some((lo as i32, hi as i32))
+}
+
+/// Whether `op`'s result fits an integer whatever its operands are in their ranges, as `range`
+/// has them. See Note [Peephole memory].
+pub fn fits(op: &IntOp, range: impl Fn(usize) -> Option<(i32, i32)>) -> bool {
+    bounds(op, range).is_some_and(|(lo, hi)| lo >= i32::MIN as i64 && hi <= i32::MAX as i64)
+}
+
+/// The bounds of `op`'s result, its operands' ranges as `range` has them, if known.
+fn bounds(op: &IntOp, range: impl Fn(usize) -> Option<(i32, i32)>) -> Option<(i64, i64)> {
     let of = |o: Operand| match o {
         Operand::K(k) => Some((k as i64, k as i64)),
         Operand::Slot(slot) => range(slot).map(|(lo, hi)| (lo as i64, hi as i64)),
@@ -248,9 +267,7 @@ pub fn range_of(op: &IntOp, range: impl Fn(usize) -> Option<(i32, i32)>) -> Opti
         (Arith::Floor, _) => of(op.lhs)?,
         _ => return None,
     };
-    // An integer op's result fits, or it fails.
-    let (lo, hi) = (lo.max(i32::MIN as i64), hi.min(i32::MAX as i64));
-    (lo <= hi).then_some((lo as i32, hi as i32))
+    Some((lo, hi))
 }
 
 /// Whether integer operations are held to fuse (Note [Peephole fusion]); set `LUNACY_NO_FUSION`
@@ -613,6 +630,8 @@ pub struct Spell {
     matched: Matched,
     /// Ended in a guard.
     closed: bool,
+    /// Every operation's result fits an integer, as its operands' ranges have it.
+    fits: bool,
     /// The instruction its last operation, or guard, is of.
     pub at: usize,
     /// What it was before that.
@@ -647,7 +666,7 @@ impl Spell {
     fn constant(dest: usize, value: i32, at: usize) -> Spell {
         let node = TRIE.step(0, Sym::Const).expect("a constant is a rule");
         let matched = Matched { ks: vec![value], lhs: dest, rhs: None, table: None, dest };
-        Spell { node, dest, inputs: Vec::new(), matched, closed: true, at, before: None }
+        Spell { node, dest, inputs: Vec::new(), matched, closed: true, fits: true, at, before: None }
     }
 
     /// The spell `op` begins, if a rule begins with it.
@@ -659,7 +678,7 @@ impl Spell {
             (sym, Matched { ks: Vec::new(), lhs: l, rhs: Some(r), table: None, dest: op.dest }, vec![l, r])
         };
         let node = TRIE.step(0, sym)?;
-        Some(Spell { node, dest: op.dest, inputs, matched, closed: false, at, before: None })
+        Some(Spell { node, dest: op.dest, inputs, matched, closed: false, fits: true, at, before: None })
     }
 
     /// The spell of this spell's value then `op`, which reads it, into `op`'s slot, as a rule goes
@@ -712,10 +731,14 @@ impl Spell {
         (RULES[TRIE.rule[self.node].expect("a spell is a rule")].make)(&self.matched)
     }
 
-    /// Whether it can fail: a step but a mask's, or a guard. One that can't is only its
-    /// computation: its check's test would fold away.
+    /// Whether it can fail: a step but a mask's, unless every result fits, or a guard. One that
+    /// can't is only its computation: its check's test would fold away.
     pub fn can_fail(&self) -> bool {
-        RULES[TRIE.rule[self.node].expect("a spell is a rule")].pattern.iter().any(|&sym| !matches!(sym, Sym::K(MASK | DIV | FLOOR) | Sym::Const))
+        RULES[TRIE.rule[self.node].expect("a spell is a rule")].pattern.iter().any(|&sym| match sym {
+            Sym::K(MASK | DIV | FLOOR) | Sym::Const => false,
+            Sym::Guard(_) => true,
+            _ => !self.fits,
+        })
     }
 
     /// Its rule's name.
@@ -778,11 +801,19 @@ pub struct Spells {
     pub unset: Vec<usize>,
     /// The range of each register's integer value it knows. See Note [Peephole memory].
     pub ranges: Vec<(usize, i32, i32)>,
+    /// How long at least the array part of each register's table is, as it knows. See Note
+    /// [Peephole memory].
+    pub lengths: Vec<(usize, i32)>,
 }
 
 impl Spells {
     /// Offer integer operation `op`: a spell of the value it reads and itself, or its own.
     pub fn offer(&mut self, op: &IntOp, at: usize, known: impl Fn(usize) -> Option<i32>) -> Offer {
+        self.offer_fitting(op, at, known, false)
+    }
+
+    /// Offer integer operation `op`, whose result `fits` an integer if it says so.
+    pub fn offer_fitting(&mut self, op: &IntOp, at: usize, known: impl Fn(usize) -> Option<i32>, fits: bool) -> Offer {
         // A slot known to hold a constant is that constant.
         let constant = |o: Operand| match o {
             Operand::Slot(slot) => known(slot).map_or(o, Operand::K),
@@ -801,6 +832,10 @@ impl Spells {
             (None, [value]) => self.spells.iter().find(|s| s.dest == *value).unwrap().then(op, holds, at),
             _ => None,
         };
+        let spell = spell.map(|mut spell| {
+            spell.fits &= fits || folded.is_some();
+            spell
+        });
         let Some(spell) = spell else {
             // It is laid out as it is: what it overwrites unread isn't, and the rest first.
             if read.is_empty() {
@@ -894,6 +929,9 @@ impl Spells {
             }
             store.window = store.window.with_operands(&operands);
         }
+        for length in &mut self.lengths {
+            length.0 = slot(length.0);
+        }
     }
 
     /// Whether something it holds names slot `slot`: writes it, or reads it.
@@ -913,6 +951,23 @@ impl Spells {
             return None;
         }
         self.ranges.iter().find(|r| r.0 == slot).map(|r| (r.1, r.2))
+    }
+
+    /// How long at least the array part of slot `slot`'s table is, if it knows: none while it is
+    /// unset.
+    pub fn length(&self, slot: usize) -> Option<i32> {
+        if self.unset(slot) {
+            return None;
+        }
+        self.lengths.iter().find(|l| l.0 == slot).map(|l| l.1)
+    }
+
+    /// Slot `slot`'s table's array part at least `length` long.
+    pub fn learn_length(&mut self, slot: usize, length: i32) {
+        match self.lengths.iter_mut().find(|l| l.0 == slot) {
+            Some(known) => known.1 = known.1.max(length),
+            None => self.lengths.push((slot, length)),
+        }
     }
 
     /// Slot `slot`'s integer value of range `range`, or of none known.
@@ -941,7 +996,8 @@ impl Spells {
             store
         }).collect();
         let ranges = self.ranges.iter().map(|&(slot, lo, hi)| (input(slot), lo, hi)).collect();
-        Spells { spells, stores, next: self.next, unset: self.unset.iter().map(|&slot| input(slot)).collect(), ranges }
+        let lengths = self.lengths.iter().map(|&(slot, length)| (input(slot), length)).collect();
+        Spells { spells, stores, next: self.next, unset: self.unset.iter().map(|&slot| input(slot)).collect(), ranges, lengths }
     }
 
     /// Whether they stay held on both ways of guard `test` of instruction `at`, found out at
@@ -1092,6 +1148,7 @@ impl Spells {
             next: self.next,
             unset: self.unset.iter().copied().filter(|slot| nils.contains(slot) == laid).collect(),
             ranges: self.ranges.iter().copied().filter(|r| !nils.contains(&r.0)).collect(),
+            lengths: self.lengths.iter().copied().filter(|l| !nils.contains(&l.0)).collect(),
         };
         (part(true), part(false))
     }
