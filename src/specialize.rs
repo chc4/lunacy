@@ -236,13 +236,14 @@ impl Clone for Box<dyn NativeGen> {
 }
 
 /// Whether `yielded` may lay out code reading the frame it runs in past the slots it names: its
-/// closure, the callstack, or the top, or an upvalue's value a guard finds. See Note [Inlined
-/// frames].
+/// closure, the callstack, or the top, or the table of an upvalue a guard on its element finds. See
+/// Note [Inlined frames].
 fn observes(ctx: &Context, yielded: &YieldOp) -> bool {
-    let upvalue = |slot: usize| ctx.values.members(Loc::root(Root::Slot(slot as u16))).into_iter().any(|root| matches!(root, Root::Upvalue(_)));
+    let upvalue = |slot: usize| matches!(ctx.element_of(slot), Some(Root::Upvalue(_)));
     match yielded {
         YieldOp::Exec(func) => func.frame,
         YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) | YieldOp::GuardDynamic(w) => w.closure(),
+        YieldOp::Call(CallTarget::Dynamic(a, b, c)) => windowed_call(ctx, *a, *b, *c).is_none(),
         YieldOp::Call(_) | YieldOp::CallResume(_) | YieldOp::NativeCall { .. } | YieldOp::CollectGarbage => true,
         YieldOp::Guard(idx, _) => upvalue(*idx),
         YieldOp::GuardRk(rk, _) | YieldOp::GuardCType(rk, _) => rk & 0x100 == 0 && upvalue(*rk),
@@ -718,6 +719,13 @@ fn native_window(ctx: &Context, a: usize, b: usize, c: usize) -> Option<(usize, 
     let CType::NativeFunction(nf) = &ctx.types[a] else { return None };
     native_op(ctx, nf, a, b, c)
 }
+
+/// The window op `CALL A B C` in `ctx` runs as, its arguments known to be of the types it assumes.
+/// See Note [Native windows].
+fn windowed_call(ctx: &Context, a: usize, b: usize, c: usize) -> Option<crate::vm::NativeOp> {
+    native_window(ctx, a, b, c).filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(&ctx.types[slot]))).map(|(_, op)| op)
+}
+
 
 /// `native_window`, for the native `nf` in R(A) however it is known.
 fn native_op(ctx: &Context, nf: &NClosure, a: usize, b: usize, c: usize) -> Option<(usize, crate::vm::NativeOp)> {
@@ -1255,12 +1263,15 @@ pub enum CallEntry {
 // An inlined call's frame is made in two halves, each only once code needs it: the base moved to
 // it (`Enter`), nilling it past the arguments, before code naming its slots, and the rest, its
 // callstack entry and running closure (`Inline`), before code observing them, as an upvalue's
-// access through the closure, a call not inlined, a safepoint, or an exit to the interpreter does.
+// access through the closure, a call not inlined, a safepoint, or an exit to the interpreter does;
+// a native's call that runs as a window op is no call.
 // A callee whose code lays out nothing returns into its caller's having made none of its frame,
 // and one naming only slots, none but the base, which its return moves back (`Leave`). How much of
 // each frame is made is known to the context, so versions differ by it, and is what the code of a
 // block's function runs in, whatever closure is running: an upvalue of a callee whose frame isn't
-// made is loaded through the closure the call is known to call (`CalledUpval`).
+// made is loaded through the closure the call is known to call (`CalledUpval`). An upvalue's value
+// a slot also holds is that slot's, so code naming the slot observes nothing: only a guard whose
+// failure finds an array's kind through an upvalue, holding the table no slot holds, needs it.
 
 /// A field's or a global's name, hashed: what a store with a key of that name may change. See
 /// Note [Field facts].
@@ -2783,7 +2794,8 @@ impl Context {
     /// a slot, else an upvalue. See Note [Array kinds].
     fn element_of(&self, slot: usize) -> Option<Root> {
         let path = [Label::ElementOf];
-        self.values.members(Loc { root: Root::Slot(slot as u16), path: &path }).into_iter().find(|root| matches!(root, Root::Slot(_) | Root::Upvalue(_)))
+        let members = self.values.members(Loc { root: Root::Slot(slot as u16), path: &path });
+        members.iter().find(|root| matches!(root, Root::Slot(_))).or_else(|| members.iter().find(|root| matches!(root, Root::Upvalue(_)))).copied()
     }
 
     /// A slot holding the integer slot `slot`'s value is the quotient of, and the constant. See
@@ -4318,6 +4330,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             // Any other return of an inlined call: from its frame, made. See Note [Inlined calls].
             if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && ctx.inline.iter().any(|frame| frame.made != Made::Yes) {
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("spec", "frames_made", &[
+                    ("line", self.traced_line(owner).into()),
+                    ("pc", pc.into()),
+                    ("block", block_id.0.into()),
+                    ("by", format!("{:?}", inst.0.Opcode()).as_str().into()),
+                ]);
                 (block_id, ctx) = self.make_frames(block_id, pc, &ctx);
             }
             let compiled = match (self.decode(pc, &inst), inst.0.Opcode()) {
@@ -6173,6 +6192,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if let CoroutineState::Yielded(yielded) = &state && ctx.inline.iter().any(|frame| frame.made != Made::Yes) {
                 let unpassed = ctx.inline.iter().any(|frame| frame.made == Made::No && frame.b == 0);
                 if observes(&ctx, yielded) || (unpassed && lays_out(&ctx, yielded)) {
+                    #[cfg(feature = "tracing")]
+                    crate::tracing::instant("spec", "frames_made", &[
+                        ("line", self.traced_line(owner).into()),
+                        ("pc", pc.0.into()),
+                        ("block", block_id.0.into()),
+                        ("by", format!("{yielded:?}").as_str().into()),
+                    ]);
                     (block_id, ctx) = self.make_frames(block_id, pc.0, &ctx);
                 } else if lays_out(&ctx, yielded) {
                     self.enter(&mut ctx, block_id);
@@ -6828,11 +6854,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 // arguments of the type it assumes. It gives one result, even with
                                 // C = 0.
                                 // See Note [Native windows].
-                                let window = native_window(&ctx, a, b, c)
-                                    .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(&ctx.types[slot])))
-                                    .map(|(_, op)| op);
-
-                                if let Some(op) = window {
+                                if let Some(op) = windowed_call(&ctx, a, b, c) {
                                     Rc::make_mut(&mut ctx).effect(Effect::Write(a));
                                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op.window));
                                     if c == 0 {

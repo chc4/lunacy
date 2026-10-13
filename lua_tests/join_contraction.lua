@@ -3,14 +3,16 @@
 -- value nothing is known of. Where the value from before the loop and the one
 -- from its back edge meet, the loop is one version, whichever first.
 -- `jit.versions()` tells how many versions the code it is in has; the most it
--- told in loops run often enough for JIT code is printed. The first loop
--- runs are peeled on the `versions` upvalue's identity, which they learn.
+-- told in loops run often enough for JIT code is printed. Each function calls
+-- it once before its loop, so the loop is entered knowing the `versions`
+-- upvalue's identity, as its back edge does: no version of the loop is told
+-- apart by learning it.
 
 local versions = jit.versions
 
 -- From another constant.
 local function constants(n)
-  local a, seen = 0, 0
+  local a, seen = 0, versions()
   for i = 1, n do
     seen = versions()
     a = 1
@@ -20,7 +22,7 @@ end
 
 -- From a value nothing is known of: the back edge comes with the constant.
 local function constant(n, start)
-  local a, seen = start * 3, 0
+  local a, seen = start * 3, versions()
   for i = 1, n do
     seen = versions()
     a = 1
@@ -30,7 +32,7 @@ end
 
 -- From a double: the back edge comes with the quotient.
 local function quotient(n, start)
-  local q, seen = start * 0.5, 0
+  local q, seen = start * 0.5, versions()
   for i = 1, n do
     seen = versions()
     q = i / 2
