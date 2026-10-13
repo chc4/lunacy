@@ -919,14 +919,14 @@ impl Spells {
     }
 
     /// A load of `cell` into `dest`: the value the held store to it stores, if it was held after
-    /// every other that may be to it, and its register holds it still, unset by no frame and
-    /// written by no spell, or is `dest`; else itself, after those that may be, and those before
-    /// them, laid out. See Note [Peephole memory].
+    /// every other that may be to it, and its register holds it still, written by no spell, or is
+    /// `dest`; else itself, after those that may be, and those before them, laid out. See Note
+    /// [Peephole memory].
     pub fn load(&mut self, cell: Element, dest: usize, alias: impl Fn(Element, Element) -> Alias) -> Load {
         let to: Vec<(usize, Alias)> = self.stores.iter().map(|s| (s.id, alias(s.cell, cell))).filter(|(_, a)| *a != Alias::Disjoint).collect();
         if let Some(&(id, Alias::Same)) = to.last() {
             let value = self.stores.iter().find(|s| s.id == id).unwrap().value;
-            let holds = |slot: usize| slot == dest || (!self.unset(slot) && self.spells.iter().all(|spell| spell.dest != slot));
+            let holds = |slot: usize| slot == dest || self.spells.iter().all(|spell| spell.dest != slot);
             if let Stored::Boxed(_) = value {
                 return Load::Forward(value);
             }
@@ -1357,13 +1357,12 @@ mod tests {
 
     #[test]
     fn a_load_forwards_only_from_a_register_holding_the_value() {
-        // t[1] = x, x's register then unset by a frame entered, or written by a spell: the
-        // register holds it no more, but for a load into it.
+        // t[1] = x, x's register then unset by a frame entered, which holds it till its nil, or
+        // written by a spell, which holds it no more, but for a load into it.
         let mut spells = Spells::default();
         store(&mut spells, element(1, K(1)), 5, 0);
         spells.unset.push(5);
-        assert_eq!(spells.clone().load(element(1, K(1)), 6, alias).is_forward(), false);
-        assert_eq!(spells.clone().load(element(1, K(1)), 5, alias).is_forward(), true);
+        assert_eq!(spells.clone().load(element(1, K(1)), 6, alias).is_forward(), true);
         let mut spells = Spells::default();
         store(&mut spells, element(1, K(1)), 5, 0);
         hold(&mut spells, 1, &[op(Arith::Add, Slot(4), K(1), 5)]);

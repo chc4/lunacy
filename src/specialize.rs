@@ -711,6 +711,19 @@ impl Gen {
                                 self.next = Some(ResumeArg::Start);
                                 return;
                             },
+                            // From an unset register, as it was: after what reads its destination
+                            // as that was, before its nil.
+                            crate::peephole::Stored::Slot(slot) if self.held.unset(slot) => {
+                                self.held.drop_overwritten(&[dest], &[]);
+                                self.lay_out(Some(Need { reads: Vec::new(), writes: vec![dest], memory: false }), &[dest], "forward");
+                                self.held.unset.retain(|&slot| slot != dest);
+                                self.enter();
+                                let moved = YieldOp::ExecWindow(Rc::new(crate::generators::Move::new(&[slot, dest])));
+                                self.out.push_back(moved.clone());
+                                self.last = Some(moved);
+                                self.next = None;
+                                return;
+                            },
                             crate::peephole::Stored::Slot(slot) => YieldOp::ExecWindow(Rc::new(crate::generators::Move::new(&[slot, dest]))),
                             crate::peephole::Stored::Boxed(bits) => YieldOp::ExecWindow(Rc::new(crate::generators::LoadStored::new(bits, &[dest]))),
                         }
