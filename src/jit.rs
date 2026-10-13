@@ -2254,7 +2254,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 events.extend(inline_kills(res, at).iter().map(Event::Write));
                             }
                             res if keeps_frame(res) => {}
-                            // The base moved, the window kept. See Note [Peephole fusion] in `peephole`.
+                            // The base moved, the window kept. See Note [Inlined frames] in `specialize`.
                             Residual::Enter(_) | Residual::Leave(_) => {}
                             // Reads its field through the witness, no slot.
                             Residual::GuardWitness { .. } => {}
@@ -3312,8 +3312,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     pool.deepest = pool.deepest.max(depth.get());
                 },
                 // The base moved to an inlined call's frame, or back, none of it made: the window
-                // names slots from the outermost frame's base, so it keeps. See Note [Peephole
-                // fusion] in `peephole`.
+                // names slots from the outermost frame's base, so it keeps. See Note [Inlined
+                // frames] in `specialize`.
                 Residual::Enter(by) | Residual::Leave(by) => {
                     let by = if matches!(res, Residual::Enter(_)) { *by as i32 } else { -(*by as i32) };
                     jit_note!(self.jctx, ops, "        move the base");

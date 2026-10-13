@@ -81,7 +81,7 @@ pub struct Block {
     /// The promoted values its context has, which the JIT's notes show. See Note [Promoted values].
     pub promoted: SmallVec<[(Pc, i32); 2]>,
     /// The function whose code it is, which needn't be the running frame's: an inlined call's
-    /// frame isn't made until something observes it. See Note [Peephole fusion] in `peephole`.
+    /// frame isn't made until something observes it. See Note [Inlined frames].
     pub proto: usize,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
@@ -127,11 +127,6 @@ macro_rules! unreachable {
     ($($message:tt)*) => { unsafe { core::hint::unreachable_unchecked() } }
 }
 
-#[derive(Debug)]
-pub enum ExecEffect {
-    Jump(BlockId),
-    Call(usize, usize, u16),
-}
 #[derive(Clone)]
 pub struct ResidualExec {
     pub name: &'static str,
@@ -140,7 +135,7 @@ pub struct ResidualExec {
     /// The slots it writes, if it says: else any. See Note [Fragile information].
     pub writes: Option<Vec<usize>>,
     /// Whether it reads the frame it runs in past its slots: its closure, the callstack, or the
-    /// top. See Note [Peephole fusion] in `peephole`.
+    /// top. See Note [Inlined frames].
     pub frame: bool,
 }
 
@@ -240,834 +235,40 @@ impl Clone for Box<dyn NativeGen> {
     }
 }
 
-/// The coroutine compiling code: a generator, run by the peephole, which holds what it can of what
-/// the generator yields and yields the rest, laying out first what that needs of what it holds.
-/// What it holds is suspended with it, in whatever suspends it. See Note [Peephole fusion] in
-/// `peephole`.
-#[derive(Clone)]
-pub struct Gen {
-    inner: Box<dyn NativeGen>,
-    /// What it holds.
-    held: crate::peephole::Spells,
-    /// What the code is compiled in, as of its last resumption: what is known of values, and the
-    /// function.
-    ctx: Option<Rc<Context>>,
-    proto: Option<LProto<'static, 'static>>,
-    /// The instruction its generator compiles, and whether it may hold its operations: not those
-    /// of one an exit runs again.
-    at: Pc,
-    holds: bool,
-    /// Whether it holds nothing ever: its code jumps to a version after it.
-    pub unheld: bool,
-    /// What it yields before resuming the generator.
-    out: VecDeque<YieldOp>,
-    /// What it resumes the generator with, where it answered the generator itself; else the
-    /// generator gets the answer to the last of `out`, its yield passed on.
-    next: Option<ResumeArg>,
-    /// The yield passed on last, which laying everything out passes on again.
-    last: Option<YieldOp>,
-    /// The integer op, or table access, the window the generator yields next is.
-    described: Option<crate::peephole::IntOp>,
-    memory: Option<crate::peephole::MemOp>,
-    /// What the instruction's generator returned, as the peephole asks for the next's.
-    done: Option<ResumeArg>,
-    /// The jump's target the peephole asked to go on at, straight on, and whether it looks ahead
-    /// at the jump it's at.
-    continuing: Option<Pc>,
-    looked: bool,
-    /// Running ahead: the slots of the spells and the stores it held at the jump, and whether one
-    /// is of use. See Note [Peephole memory] in `peephole`.
-    watch: Option<(Vec<usize>, Vec<usize>)>,
-    consumed: bool,
-}
-
-impl Gen {
-    pub fn boxed(inner: impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static) -> Box<Gen> {
-        Self::of(Box::new(inner))
-    }
-
-    pub fn of(inner: Box<dyn NativeGen>) -> Box<Gen> {
-        Box::new(Gen {
-            inner,
-            held: Default::default(),
-            ctx: None,
-            proto: None,
-            at: 0,
-            holds: false,
-            unheld: false,
-            out: VecDeque::new(),
-            next: None,
-            last: None,
-            described: None,
-            memory: None,
-            done: None,
-            continuing: None,
-            looked: false,
-            watch: None,
-            consumed: false,
-        })
-    }
-
-    /// Run ahead, looking for what it holds now being of use. See Note [Peephole memory] in
-    /// `peephole`.
-    fn watch_held(&mut self) {
-        self.watch = Some((self.held.spells.iter().map(|spell| spell.dest).collect(), self.held.stores.iter().map(|store| store.id()).collect()));
-        self.consumed = false;
-    }
-
-    /// The stores it held at the jump it runs ahead of that it holds still.
-    fn watched_stores(&self) -> Vec<usize> {
-        let Some((_, ids)) = &self.watch else { return Vec::new() };
-        self.held.stores.iter().map(|store| store.id()).filter(|id| ids.contains(id)).collect()
-    }
-
-    /// One of those stores no more, but laid out: made dead.
-    fn killed(&mut self, before: &[usize]) {
-        let now = self.watched_stores();
-        if before.iter().any(|id| !now.contains(id)) {
-            self.consumed = true;
-        }
-    }
-
-    /// `inner`, a generator boxed, run holding `held`.
-    pub fn holding_of(held: crate::peephole::Spells, inner: Box<dyn NativeGen>) -> Box<Gen> {
-        let mut holding = Self::of(inner);
-        holding.held = held;
-        holding
-    }
-
-    /// Go on with the next instruction's generator, `inner`, holding what it holds: its answer to
-    /// `NextPc`. See Note [Peephole fusion] in `peephole`.
-    pub fn next_instruction(&mut self, inner: Box<dyn NativeGen>) {
-        self.inner = inner;
-    }
-
-    /// `inner`, run holding `held`.
-    pub fn holding(held: crate::peephole::Spells, inner: impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static) -> Box<Gen> {
-        let mut holding = Self::boxed(inner);
-        holding.held = held;
-        holding
-    }
-
-    /// Whether it holds anything: code compiled from it then is its own, never a version's, as
-    /// what it holds isn't in the context.
-    pub fn holds_any(&self) -> bool {
-        !self.held.is_empty()
-    }
-
-    /// What it holds, which the next instruction's generator is run holding.
-    pub fn take_held(&mut self) -> crate::peephole::Spells {
-        std::mem::take(&mut self.held)
-    }
-
-    /// What `yielded` needs of the frames of the inlined calls the code is in: made, if it may
-    /// observe them; else their base moved to, if it may lay out code naming their slots. See Note
-    /// [Peephole fusion] in `peephole`.
-    fn frames_for(&mut self, yielded: &YieldOp) {
-        let Some(ctx) = self.ctx.as_ref() else { return };
-        if ctx.inline.iter().all(|frame| frame.made == Made::Yes) {
-            return;
-        }
-        if self.observes(yielded) {
-            for frame in &mut Rc::make_mut(self.ctx.as_mut().unwrap()).inline {
-                frame.made = Made::Yes;
-            }
-            self.out.push_back(YieldOp::MakeFrames);
-        } else if self.lays_out(yielded) {
-            self.enter();
-        }
-    }
-
-    /// Move the base to the frames of the inlined calls the code is in, if it isn't, before code
-    /// naming their slots is laid out.
-    fn enter(&mut self) {
-        let Some(ctx) = self.ctx.as_mut() else { return };
-        // A frame its call passed what's up to the top is made: what it was passed is found only
-        // then.
-        if ctx.inline.iter().any(|frame| frame.made == Made::No && frame.b == 0) {
-            for frame in &mut Rc::make_mut(ctx).inline {
-                frame.made = Made::Yes;
-            }
-            self.out.push_back(YieldOp::MakeFrames);
-            return;
-        }
-        if ctx.inline.iter().any(|frame| frame.made == Made::No) {
-            for frame in Rc::make_mut(ctx).inline.iter_mut().filter(|frame| frame.made == Made::No) {
-                frame.made = Made::Base;
-            }
-            self.out.push_back(YieldOp::Enter);
-        }
-    }
-
-    /// The slots `yielded` may lay out code reading, if it says: else any.
-    fn slots_read(&self, yielded: &YieldOp) -> Option<Vec<usize>> {
-        let reading = |w: &Rc<dyn Window>| w.operands().iter().zip(w.accesses()).filter(|(_, a)| a.reads()).map(|(s, _)| *s).collect();
-        Some(match yielded {
-            YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) | YieldOp::GuardDynamic(w) => reading(w),
-            YieldOp::Guard(idx, _) | YieldOp::Narrow(idx) | YieldOp::Promote(idx) | YieldOp::Trip(Some(idx)) => vec![*idx],
-            YieldOp::GuardRk(rk, _) | YieldOp::GuardCType(rk, _) => if rk & 0x100 != 0 { Vec::new() } else { vec![*rk] },
-            YieldOp::Trip(None) => Vec::new(),
-            // Asking what the context knows of a table's keys reads it, and the key.
-            // A register's key is no hash key, whatever it holds.
-            YieldOp::HashKey(_, key, _) if key & 0x100 == 0 => Vec::new(),
-            YieldOp::HashKey(slot, _, _) => vec![*slot],
-            YieldOp::LoadUpvalue(..) | YieldOp::UpvalueKnown(_) | YieldOp::UpvalueCell(_) | YieldOp::UpvalueHolds(..)
-                | YieldOp::FrameUnmade | YieldOp::HoldsValue(..) => Vec::new(),
-            // Decided as it compiles while it holds anything, reading no slot. See Note [Optimistic
-            // ops].
-            YieldOp::Encoding(_) if self.holds_any() => Vec::new(),
-            yielded if !self.lays_out(yielded) => Vec::new(),
-            _ => return None,
-        })
-    }
-
-    /// Whether `yielded` may lay out code reading the frame it runs in past the slots it names: its
-    /// closure, the callstack, or the top, or an upvalue's value a guard finds. See Note [Peephole
-    /// fusion] in `peephole`.
-    fn observes(&self, yielded: &YieldOp) -> bool {
-        let ctx = self.ctx.as_ref().expect("a generator run in a context");
-        let upvalue = |slot: usize| ctx.values.members(Loc::root(Root::Slot(slot as u16))).into_iter().any(|root| matches!(root, Root::Upvalue(_)));
-        match yielded {
-            YieldOp::Exec(func) => func.frame,
-            YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) | YieldOp::GuardDynamic(w) => w.closure(),
-            YieldOp::Call(_) | YieldOp::CallResume(_) | YieldOp::NativeCall { .. } | YieldOp::CollectGarbage => true,
-            YieldOp::Guard(idx, _) => upvalue(*idx),
-            YieldOp::GuardRk(rk, _) | YieldOp::GuardCType(rk, _) => rk & 0x100 == 0 && upvalue(*rk),
-            _ => false,
-        }
-    }
-
-    /// Whether `yielded` may lay out code, or only asks of or tells the context. See Note [Peephole
-    /// fusion] in `peephole`.
-    fn lays_out(&self, yielded: &YieldOp) -> bool {
-        let ctx = self.ctx.as_ref().expect("a generator run in a context");
-        let known = |slot: usize, expected: &CType| {
-            let found = &ctx.types[slot];
-            expected.accepts(found) || !found.accepts(expected)
-        };
-        !match yielded {
-            YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
-                | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
-                | YieldOp::Effect(_) | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::IsKey(..)
-                | YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) | YieldOp::ArrayType(..)
-                | YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) | YieldOp::NativeWindowArgs(..)
-                | YieldOp::Uniques(_) | YieldOp::Unique(_) | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Took | YieldOp::Holding { .. } | YieldOp::Created(_) => true,
-            YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
-            YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected)),
-            YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
-            YieldOp::GuardCType(rk, expected) => rk & 0x100 != 0 || known(*rk, expected),
-            _ => false,
-        }
-    }
-
-    /// It, as an exit going on from where it was goes on: what it held written, nothing held.
-    pub fn forgetting(&self) -> Box<Gen> {
-        let mut again = Box::new(self.clone());
-        again.held = Default::default();
-        again.out.clear();
-        again
-    }
-
-    /// What it sees of the code it compiles, before it is resumed.
-    fn see(&mut self, ctx: &Rc<Context>, proto: LProto, instruction: Option<(Pc, bool)>) {
-        self.ctx = Some(ctx.clone());
-        self.proto = Some(proto as LProto<'static, 'static>);
-        (self.at, self.holds) = instruction.unwrap_or((self.at, false));
-        self.holds &= !self.unheld;
-    }
-
-    /// Go on running `inner` in place of its generator, holding what it holds: a native's
-    /// generator, compiling its call.
-    pub fn generate(&mut self, inner: Box<dyn NativeGen>) {
-        self.inner = inner;
-        self.next = Some(ResumeArg::Start);
-        self.last = None;
-        self.described = None;
-        self.memory = None;
-    }
-
-    /// Whether in-array test `test` passes, as the key's range and the table's known length have it.
-    fn in_array(&self, test: &dyn Window) -> bool {
-        let (table, (lo, hi)) = match (test.name(), test.operands()) {
-            ("InArray", &[table, key]) => match self.range(key) {
-                Some(range) => (table, range),
-                None => return false,
-            },
-            ("InArrayK", &[table]) => {
-                let k = test.captures()[0] as i32;
-                (table, (k, k))
-            },
-            _ => return false,
-        };
-        lo >= 1 && self.length(table).is_some_and(|length| hi <= length)
-    }
-
-    /// What in-array test `test`, passed, says of its table's array part. See Note [Peephole
-    /// memory] in `peephole`.
-    fn passed(&mut self, test: &dyn Window) {
-        let (table, at_least) = match (test.name(), test.operands()) {
-            ("InArray" | "InArrayHeld", &[table, key]) => match self.range(key) {
-                Some((lo, _)) => (table, lo),
-                None => return,
-            },
-            ("InArrayK" | "InArrayHeldK", &[table]) => (table, test.captures()[0] as i32),
-            _ => return,
-        };
-        if at_least >= 1 {
-            self.held.learn_length(table, at_least);
-        }
-    }
-
-    /// The range of `slot`'s integer value: the peephole's, or its constant's. See Note [Peephole
-    /// memory] in `peephole`.
-    fn range(&self, slot: usize) -> Option<(i32, i32)> {
-        if self.held.unset(slot) {
-            return None;
-        }
-        self.holders(slot).find_map(|s| self.held.range(s)).or_else(|| self.constant(slot).map(|k| (k, k)))
-    }
-
-    /// How long at least the array part of `slot`'s table is, as the peephole knows of any slot
-    /// holding it. See Note [Peephole memory] in `peephole`.
-    fn length(&self, slot: usize) -> Option<i32> {
-        if self.held.unset(slot) {
-            return None;
-        }
-        self.holders(slot).find_map(|s| self.held.length(s))
-    }
-
-    /// The slots holding what `slot` does, as the context knows: it, then the rest of its class.
-    fn holders(&self, slot: usize) -> impl Iterator<Item = usize> + '_ {
-        let members = self.ctx.as_ref().map(|ctx| ctx.values.members(Loc::root(Root::Slot(slot as u16)))).unwrap_or_default();
-        std::iter::once(slot).chain(members.into_iter().filter_map(move |root| match root {
-            Root::Slot(s) if s as usize != slot => Some(s as usize),
-            _ => None,
-        }))
-    }
-
-    /// What it knows of `slot`'s constant value.
-    fn constant(&self, slot: usize) -> Option<i32> {
-        match self.ctx.as_ref()?.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT) {
-            Some(Known::Constant { value, .. }) => Some(*value),
-            _ => None,
-        }
-    }
-
-    /// Lay out what an op needing `need` needs of what it holds (everything without one), about
-    /// to write `stale`. See Note [Peephole fusion] in `peephole`.
-    fn lay_out(&mut self, need: Option<crate::peephole::Need>, stale: &[usize], _trigger: &str) {
-        let all = std::mem::take(&mut self.held);
-        let ranges: Vec<(usize, i32, i32)> = all.ranges.iter().copied().filter(|r| !all.unset(r.0)).collect();
-        let lengths: Vec<(usize, i32)> = all.lengths.iter().copied().filter(|l| !all.unset(l.0)).collect();
-        let (laid, mut kept) = match &need {
-            Some(need) => all.split(need),
-            None => (all, crate::peephole::Spells::default()),
-        };
-        // What's laid out holds its values as they were.
-        kept.ranges = ranges;
-        kept.lengths = lengths;
-        if laid.is_empty() {
-            self.held = kept;
-            return;
-        }
-        self.enter();
-        let ops = laid.lay_out(self.at, &kept);
-        #[cfg(feature = "tracing")]
-        self.out.push_back(YieldOp::PeepholeTrace("lay_out", vec![
-            ("trigger", _trigger.to_string()),
-            ("stores", laid.stores.len().to_string()),
-            ("spells", laid.spells.len().to_string()),
-            ("windows", ops.iter().map(|laid| laid.op.name()).collect::<Vec<_>>().join(" ")),
-            ("kept", (kept.stores.len() + kept.spells.len()).to_string()),
-            ("need", need.as_ref().map_or("everything".to_string(), |need| format!("reads {:?} writes {:?}{}", need.reads, need.writes, if need.memory { " memory" } else { "" }))),
-            ("laid", laid.stores.iter().map(|store| format!("{:?}={:?}", store.cell, store.value)).collect::<Vec<_>>().join(" ")),
-        ]));
-        for laid in ops {
-            if laid.checked {
-                let unknown = laid.unknown.iter().chain(stale).copied().collect();
-                self.out.push_back(YieldOp::Fused { op: laid.op, exit: laid.exit, unknown });
-            } else {
-                self.out.push_back(YieldOp::LaidOut(laid.op));
-            }
-        }
-        self.held = kept;
-    }
-
-    /// Whether `yielded` leaves what it holds held, laying out no code: with the window after
-    /// `described` or `memory` if they say, which it is offered.
-    fn passes(&self, yielded: &YieldOp, described: Option<&crate::peephole::IntOp>, memory: Option<&crate::peephole::MemOp>) -> bool {
-        let ctx = self.ctx.as_ref().expect("a generator run in a context");
-        let held = &self.held;
-        let at = self.at;
-        let known = |slot: usize, expected: &CType| {
-            let found = &ctx.types[slot];
-            expected.accepts(found) || !found.accepts(expected)
-        };
-        match yielded {
-            YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
-                | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
-                | YieldOp::Encoding(_) | YieldOp::Effect(_) | YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_)
-                | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::Created(_) | YieldOp::Copy(..)
-                | YieldOp::Uniques(_) | YieldOp::Unique(_) => true,
-            // What the context knows of upvalues, and is told of them: no code.
-            YieldOp::LoadUpvalue(..) | YieldOp::UpvalueKnown(_) | YieldOp::UpvalueCell(_) | YieldOp::UpvalueHolds(..)
-                | YieldOp::Captures(..) | YieldOp::Close(_) => true,
-            // Slots whose values are dead: what spells write there is never read, if none reads them.
-            YieldOp::Clobber(from) => held.inputs().all(|slot| slot < *from),
-            YieldOp::OptimisticExec(_) => described.is_some(),
-            // An access it is told of holds them as it touches memory. See Note [Peephole memory]
-            // in `peephole`.
-            YieldOp::ExecWindow(window) => described.is_some() || (memory.is_some() && held.off_registers(&**window))
-                || held.untouched(&**window),
-            // Its check reads only whether the table is watched.
-            YieldOp::Trip(of) => of.is_none_or(|slot| held.spells.iter().all(|spell| spell.dest != slot)),
-            // One joining a spell, or, as a type guard found out at runtime, one reading neither
-            // what they hold nor memory a held store may change.
-            YieldOp::GuardDynamic(test) => held.joins_guard(&**test, at) || held.across_guard(&**test, at),
-            // What a get or set asks before its guard on the key, and what a load learns of its
-            // register.
-            YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) | YieldOp::ArrayType(..) => true,
-            // What a load from a frozen table, or a test, asks of what the context knows, and
-            // what it learns of the register the load writes. See Note [Frozen tables].
-            YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) => true,
-            // What a call asks of a native it may make a window op.
-            YieldOp::NativeWindowArgs(..) => true,
-            // A call's thunk holds them: into its callee's code, or laid out before a call. See
-            // Note [Peephole fusion] in `peephole`.
-            // A known native without a generator is laid out here, observing them.
-            YieldOp::Call(CallTarget::Dynamic(a, _, _)) => held.spells.iter().all(|spell| spell.dest != *a && spell.at != at)
-                && match &ctx.types[*a] {
-                    CType::NativeFunction(nf) => !nf.is_protected_call() && nf.generator().is_some(),
-                    _ => true,
-                },
-            // A field's key is no element: what it lays out reads and writes hash parts, of
-            // tables no held spell writes the register of. See Note [Peephole memory] in
-            // `peephole`.
-            // A register's key is no hash key, whatever it holds: asked of no code.
-            YieldOp::HashKey(slot, key, _) => key & 0x100 == 0 || held.spells.iter().all(|spell| spell.dest != *slot),
-            YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
-            // One found out at runtime keeps them held on its ways, if it reads none and none
-            // holds its instruction's operations, which a restart past it would run again.
-            YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected))
-                || held.spells.iter().all(|spell| spell.dest != *idx && spell.at != at),
-            YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
-            YieldOp::GuardCType(rk, expected) => rk & 0x100 != 0 || known(*rk, expected),
-            // Of a value the context knows: no code; else its thunk holds them, guarding only the
-            // slot. See Note [Promoted values].
-            YieldOp::Promote(slot) => ctx.constant(*slot).is_some() || held.spells.iter().all(|spell| spell.dest != *slot && spell.at != at),
-            _ => false,
-        }
-    }
-
-    /// Hold integer op `op`, of `window`, laying out first what it must of what it holds; whether
-    /// it did. See Note [Peephole fusion] in `peephole`.
-    fn hold(&mut self, op: crate::peephole::IntOp, window: &Rc<dyn Window>, optimistic: bool, fits: bool) -> bool {
-        use crate::peephole::{Need, Offer};
-        if !crate::peephole::fuses() || !self.holds {
-            return false;
-        }
-        let ctx = self.ctx.clone().expect("a generator run in a context");
-        let known = |slot: usize| match ctx.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT) {
-            Some(Known::Constant { value, .. }) => Some(*value),
-            _ => None,
-        };
-        let trigger = format!("window {}", window.name());
-        let chains = self.watch.as_ref().is_some_and(|(dests, _)| op.reads().any(|slot| dests.contains(&slot) && self.held.spells.iter().any(|spell| spell.dest == slot && !spell.is_constant())));
-        let mut folded = None;
-        // What it needs laid out, as witchcraft's invariants have it, then everything, then
-        // nothing held: offered again after each.
-        let mut laid = 0;
-        let held = loop {
-            match self.held.offer_fitting(&op, self.at, known, fits) {
-                Offer::Held => break true,
-                Offer::Folded(value) => {
-                    folded = Some(value);
-                    break true;
-                },
-                Offer::Flush | Offer::Refused if !self.held.is_empty() && laid < 2 => {
-                    let need = (laid == 0).then(|| Need { reads: op.reads().collect(), writes: vec![op.dest], memory: false });
-                    self.lay_out(need, &[op.dest], &trigger);
-                    laid += 1;
-                },
-                _ => break false,
-            }
-        };
-        if !held {
-            return false;
-        }
-        self.consumed |= chains;
-        let writes = window.operands().iter().zip(window.accesses()).filter(|(_, a)| a.writes()).map(|(s, _)| *s).collect();
-        // A constant loaded, of no slot, is known as its load makes it known.
-        let constant = folded.filter(|_| op.reads().next().is_some()).map(|value| (op.dest, value));
-        self.out.push_back(YieldOp::Holding { writes, reads: op.reads().collect(), constant, optimistic });
-        self.next = Some(if optimistic { ResumeArg::Matched } else { ResumeArg::Start });
-        true
-    }
-
-    /// Table access `op`, of `window`: a store held, or a load of an element a held store is into
-    /// its value, or after the held stores that may be into it. Whether it took it. See Note
-    /// [Peephole memory] in `peephole`.
-    fn access(&mut self, op: crate::peephole::MemOp, window: &Rc<dyn Window>) -> bool {
-        use crate::peephole::{Load, MemOp, Stored};
-        let ctx = self.ctx.clone().expect("a generator run in a context");
-        let alias = |a, b| cells(&ctx, a, b);
-        match op {
-            MemOp::Store { cell, value } if crate::peephole::fuses() && self.holds => {
-                let range = match value { Stored::Slot(slot) => self.range(slot), Stored::Boxed(_) => None };
-                let before = self.watched_stores();
-                let _dead = self.held.hold_store(cell, value, range, window.clone(), self.at, alias);
-                self.killed(&before);
-                #[cfg(feature = "tracing")]
-                self.out.push_back(YieldOp::PeepholeTrace("store", vec![("element", format!("{cell:?}")), ("value", format!("{value:?} {range:?}")), ("dead", _dead.to_string())]));
-            },
-            MemOp::Load { cell, dest } if !self.held.stores.is_empty() => {
-                let outcome = self.held.load(cell, dest, alias);
-                #[cfg(feature = "tracing")]
-                self.out.push_back(YieldOp::PeepholeTrace("load", vec![("element", format!("{cell:?}")), ("outcome", match &outcome {
-                    Load::Forward(value, _) => format!("forward {value:?}"),
-                    Load::After(stores) => format!("after {}", stores.len()),
-                })]));
-                let load = match outcome {
-                    Load::Forward(Stored::Slot(slot), _) => Rc::new(crate::generators::Move::new(&[slot, dest])) as Rc<dyn Window>,
-                    Load::Forward(Stored::Boxed(bits), _) => Rc::new(crate::generators::LoadStored::new(bits, &[dest])),
-                    Load::After(stores) => {
-                        self.out.extend(stores.into_iter().map(YieldOp::ExecWindow));
-                        window.clone()
-                    },
-                };
-                self.out.push_back(YieldOp::ExecWindow(load));
-            },
-            _ => return false,
-        }
-        self.next = Some(ResumeArg::Start);
-        true
-    }
-
-    /// Take the generator's `yielded`: hold it, or answer it, or pass it on, laying out what it
-    /// needs first.
-    fn take(&mut self, yielded: YieldOp) {
-        use crate::peephole::{MemOp, Need};
-        // A jump that is the only way on, its generator's next yield a jump to its target, goes on
-        // at the target holding what it holds: the target is straight on, no block's. See Note
-        // [Peephole fusion] in `peephole`.
-        if let YieldOp::GetBlock(target) = yielded && !std::mem::take(&mut self.looked) && self.holds_any() && crate::peephole::REWRITES {
-            const AHEAD: BlockId = BlockId(usize::MAX);
-            let mut ahead = self.inner.clone();
-            if let CoroutineState::Yielded(YieldOp::Jump(AHEAD)) = Pin::new(&mut *ahead).resume(ResumeArg::BlockId(AHEAD)) {
-                self.continuing = Some(target);
-                self.out.push_back(YieldOp::Continue(target));
-                return;
-            }
-        }
-        match yielded {
-            // Of how much of the frame the code is in is made.
-            YieldOp::FrameUnmade => {
-                let ctx = self.ctx.as_ref().expect("a generator run in a context");
-                let called = ctx.inline.last().filter(|frame| frame.made != Made::Yes).and_then(|frame| frame.closure);
-                self.next = Some(called.map_or(ResumeArg::Failed, ResumeArg::Boxed));
-                return;
-            },
-            // Of what the code holds where: a slot holding what it would be moved, which no spell
-            // writes, holds it.
-            YieldOp::HoldsValue(..) if !crate::peephole::REWRITES => {
-                self.next = Some(ResumeArg::Failed);
-                return;
-            },
-            YieldOp::HoldsValue(dest, src) => {
-                let ctx = self.ctx.as_ref().expect("a generator run in a context");
-                let unheld = |slot: usize| self.held.spells.iter().all(|spell| spell.dest != slot);
-                let holds = dest == src || (unheld(dest) && unheld(src)
-                    && ctx.values.members(Loc::root(Root::Slot(src as u16))).contains(&Root::Slot(dest as u16)));
-                self.next = Some(if holds { ResumeArg::Matched } else { ResumeArg::Failed });
-                return;
-            },
-            // An in-array test of a key whose range is within what the table's array part is known
-            // to be at least: as passed. See Note [Peephole memory] in `peephole`.
-            YieldOp::GuardDynamic(ref test) if crate::peephole::REWRITES && self.in_array(&**test) => {
-                #[cfg(feature = "tracing")]
-                self.out.push_back(YieldOp::PeepholeTrace("range", vec![("what", format!("passes {} {:?}", test.name(), test.operands()))]));
-                self.out.push_back(YieldOp::Took);
-                self.next = Some(ResumeArg::Matched);
-                return;
-            },
-            YieldOp::IntegerOp(op) => {
-                self.described = Some(op);
-                self.next = Some(ResumeArg::Start);
-                return;
-            },
-            // Its key's range, as it is now. See Note [Peephole memory] in `peephole`.
-            YieldOp::MemoryOp(mut op) => {
-                let (crate::peephole::MemOp::Load { cell, .. } | crate::peephole::MemOp::Store { cell, .. }) = &mut op;
-                if let crate::peephole::Operand::Slot(key) = cell.key {
-                    cell.range = self.range(key);
-                }
-                self.memory = Some(op);
-                self.next = Some(ResumeArg::Start);
-                return;
-            },
-            _ => {},
-        }
-        let described = self.described.take();
-        let mut memory = self.memory.take();
-        // A load a held store is the last into is a move of the value it stores, and none into the
-        // slot holding it. See Note [Peephole memory] in `peephole`.
-        let mut forwarded = None;
-        let yielded = match (memory, yielded) {
-            (Some(MemOp::Load { cell, dest }), YieldOp::ExecWindow(window)) if !self.held.stores.is_empty() => {
-                let ctx = self.ctx.clone().expect("a generator run in a context");
-                match self.held.clone().load(cell, dest, |a, b| cells(&ctx, a, b)) {
-                    crate::peephole::Load::Forward(value, range) => {
-                        let from = self.held.stores.iter().rev().find(|store| cells(&ctx, store.cell, cell) != crate::peephole::Alias::Disjoint).map(|store| store.id());
-                        self.consumed |= from.is_some_and(|id| self.watched_stores().contains(&id));
-                        #[cfg(feature = "tracing")]
-                        self.out.push_back(YieldOp::PeepholeTrace("load", vec![("element", format!("{cell:?}")), ("outcome", format!("forward {value:?} {range:?}"))]));
-                        memory = None;
-                        match value {
-                            // Its register holds the value, as it was before anything held: what
-                            // would write it is dead, and it is set.
-                            crate::peephole::Stored::Slot(slot) if slot == dest => {
-                                self.held.drop_overwritten(&[dest], &[]);
-                                self.held.unset.retain(|&slot| slot != dest);
-                                self.held.set_range(dest, range);
-                                self.next = Some(ResumeArg::Start);
-                                return;
-                            },
-                            // From an unset register, as it was: after what reads its destination
-                            // as that was, before its nil.
-                            crate::peephole::Stored::Slot(slot) if self.held.unset(slot) => {
-                                self.held.drop_overwritten(&[dest], &[]);
-                                self.lay_out(Some(Need { reads: Vec::new(), writes: vec![dest], memory: false }), &[dest], "forward");
-                                self.held.unset.retain(|&slot| slot != dest);
-                                self.held.set_range(dest, range);
-                                self.enter();
-                                let moved = YieldOp::ExecWindow(Rc::new(crate::generators::Move::new(&[slot, dest])));
-                                self.out.push_back(moved.clone());
-                                self.last = Some(moved);
-                                self.next = None;
-                                return;
-                            },
-                            crate::peephole::Stored::Slot(slot) => {
-                                forwarded = Some((dest, range));
-                                YieldOp::ExecWindow(Rc::new(crate::generators::Move::new(&[slot, dest])))
-                            },
-                            crate::peephole::Stored::Boxed(bits) => {
-                                forwarded = Some((dest, range));
-                                YieldOp::ExecWindow(Rc::new(crate::generators::LoadStored::new(bits, &[dest])))
-                            },
-                        }
-                    },
-                    crate::peephole::Load::After(_) => YieldOp::ExecWindow(window),
-                }
-            },
-            (_, yielded) => yielded,
-        };
-        // A store about to run makes held stores into its element dead, laid out first or not.
-        // See Note [Peephole memory] in `peephole`.
-        if let (Some(MemOp::Store { cell, .. }), YieldOp::ExecWindow(_)) = (&memory, &yielded) {
-            let ctx = self.ctx.clone().expect("a generator run in a context");
-            let before = self.watched_stores();
-            let _dead = self.held.kill_stores(*cell, |a, b| cells(&ctx, a, b));
-            self.killed(&before);
-            #[cfg(feature = "tracing")]
-            if _dead > 0 {
-                self.out.push_back(YieldOp::PeepholeTrace("dead", vec![("element", format!("{cell:?}")), ("dead", _dead.to_string())]));
-            }
-        }
-        // A read of an unset slot gets its nil first, what's held reading the slot as it was laid
-        // out before it. See Note [Peephole memory] in `peephole`.
-        if !self.held.unset.is_empty() {
-            let nils: Vec<usize> = match self.slots_read(&yielded) {
-                Some(slots) => self.held.unset.iter().copied().filter(|slot| slots.contains(slot)).collect(),
-                None => self.held.unset.clone(),
-            };
-            if !nils.is_empty() {
-                let trigger = match &yielded {
-                    YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) | YieldOp::GuardDynamic(w) => format!("unset, window {}", w.name()),
-                    yielded => format!("unset, {}", format!("{yielded:?}").split(['(', ' ', '{']).next().unwrap_or("")),
-                };
-                self.lay_out(Some(Need { reads: nils, writes: Vec::new(), memory: false }), &[], &trigger);
-            }
-        }
-        let (writes, reads) = overwrites(&yielded);
-        // What it holds and knows named by a slot about to be written is named by another holding
-        // the value.
-        if !(self.held.stores.is_empty() && self.held.lengths.is_empty() && self.held.ranges.is_empty()) && !writes.is_empty() {
-            let ctx = self.ctx.clone().expect("a generator run in a context");
-            rehome(&mut self.held, &ctx, |slot| writes.contains(&slot));
-        }
-        // The ranges of integer values past it. See Note [Peephole memory] in `peephole`.
-        let computed = described.as_ref().map(|op| (op.dest, crate::peephole::range_of(op, |slot| self.range(slot))));
-        let fits = described.as_ref().is_some_and(|op| crate::peephole::fits(op, |slot| self.range(slot)));
-        match &yielded {
-            YieldOp::Copy(to, from) => {
-                let range = self.range(*from);
-                self.held.set_range(*to, range);
-                self.held.lengths.retain(|l| l.0 != *to);
-                if let Some(length) = self.length(*from) {
-                    self.held.learn_length(*to, length);
-                }
-            },
-            YieldOp::Clobber(from) => {
-                self.held.ranges.retain(|r| r.0 < *from);
-                self.held.lengths.retain(|l| l.0 < *from);
-            },
-            // A call writes its frame; an inlined one's code is the peephole's to see, and code past
-            // one that isn't is a version's, knowing nothing of it.
-            YieldOp::Call(CallTarget::Dynamic(a, _, _)) => {
-                self.held.ranges.retain(|r| r.0 < *a);
-                self.held.lengths.retain(|l| l.0 < *a);
-            },
-            // What may shrink an array part.
-            YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) if !matches!(w.memory(), crate::window::Memory::None
-                | crate::window::Memory::Properties | crate::window::Memory::Cells | crate::window::Memory::Fields | crate::window::Memory::Reads)
-                && memory.is_none() => self.held.lengths.clear(),
-            YieldOp::ExecWindow(_) | YieldOp::OptimisticExec(_) | YieldOp::Guard(..) | YieldOp::GuardRk(..) | YieldOp::GuardCType(..)
-                | YieldOp::GuardDynamic(_) | YieldOp::GetBlock(_) | YieldOp::Jump(_) | YieldOp::Trip(_) | YieldOp::HashKey(..)
-                | YieldOp::Promote(_) | YieldOp::Encoding(_) | YieldOp::Narrow(_) => {},
-            // Code writing registers it doesn't say.
-            yielded if self.lays_out(yielded) => {
-                #[cfg(feature = "tracing")]
-                if !self.held.ranges.is_empty() {
-                    self.out.push_back(YieldOp::PeepholeTrace("range", vec![("what", format!("cleared by {yielded:?}").chars().take(80).collect())]));
-                }
-                self.held.ranges.clear();
-                self.held.lengths.clear();
-            },
-            _ => {},
-        }
-        for &slot in &writes {
-            self.held.set_range(slot, None);
-            self.held.lengths.retain(|l| l.0 != slot);
-        }
-        #[cfg(feature = "tracing")]
-        if let Some((_, range)) = computed {
-            self.out.push_back(YieldOp::PeepholeTrace("range", vec![("what", format!("{:?} {range:?}", described.unwrap()))]));
-        }
-        for (slot, range) in computed.into_iter().chain(forwarded) {
-            self.held.set_range(slot, range);
-        }
-        self.held.unset.retain(|slot| !writes.contains(slot));
-        if !self.held.is_empty() && !self.passes(&yielded, described.as_ref(), memory.as_ref()) {
-            // What writes a held value unread: that spell is dead.
-            self.held.drop_overwritten(&writes, &reads);
-            // A window op with no way out, writing no memory and updating no register in place,
-            // which a restart running it again leaves as it was, needs only what it reads, writes,
-            // and, reading memory, the stores.
-            let need = match &yielded {
-                YieldOp::ExecWindow(w) if !w.selects() && !w.accesses().contains(&Access::Update)
-                    && matches!(w.memory(), crate::window::Memory::None | crate::window::Memory::Properties | crate::window::Memory::Cells | crate::window::Memory::Fields | crate::window::Memory::Reads) =>
-                    // A load described, what it reads of memory as it's held: `access`.
-                    Some(Need { reads: reads.clone(), writes: writes.clone(), memory: w.memory() == crate::window::Memory::Reads && memory.is_none() }),
-                // A field's key asked, what writes its table's or key's register. See Note [Peephole
-                // memory] in `peephole`.
-                YieldOp::HashKey(slot, _, _) => Some(Need { reads: vec![*slot], writes: Vec::new(), memory: false }),
-                // A guard found out at runtime, as one: what it reads, the rest held across it if
-                // they may be. See `Spells::across_guard`.
-                YieldOp::GuardDynamic(test) if !test.accesses().contains(&Access::Update)
-                    && matches!(test.memory(), crate::window::Memory::None | crate::window::Memory::Properties | crate::window::Memory::Cells | crate::window::Memory::Reads) => {
-                    let reads = test.operands().iter().zip(test.accesses()).filter(|(_, a)| a.reads()).map(|(s, _)| *s).collect();
-                    Some(Need { reads, writes: Vec::new(), memory: test.memory() == crate::window::Memory::Reads })
-                },
-                _ => None,
-            };
-            let trigger = match &yielded {
-                YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) => format!("window {}", w.name()),
-                yielded => format!("{yielded:?}").split(['(', ' ', '{']).next().unwrap_or("").to_string(),
-            };
-            self.lay_out(need, &writes, &trigger);
-            if let YieldOp::GuardDynamic(test) = &yielded && !self.held.is_empty() && !self.held.across_guard(&**test, self.at) {
-                self.lay_out(None, &writes, &trigger);
-            }
-        } else if described.is_none() && matches!(yielded, YieldOp::ExecWindow(_)) {
-            // Held across it: what it writes unread is dead.
-            self.held.drop_overwritten(&writes, &reads);
-        }
-        match &yielded {
-            YieldOp::ExecWindow(w) if let Some(op) = memory && self.access(op, w) => return,
-            YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) if let Some(op) = described
-                && self.hold(op, w, matches!(yielded, YieldOp::OptimisticExec(_)), fits) => return,
-            // A guard joining a held spell: as passed.
-            YieldOp::GuardDynamic(test) if self.held.offer_guard(&**test, self.at) => {
-                self.out.push_back(YieldOp::Took);
-                self.next = Some(ResumeArg::Matched);
-                return;
-            },
-            YieldOp::Clobber(from) => self.held.spells.retain(|spell| spell.dest < *from),
-            _ => {},
-        }
-        self.frames_for(&yielded);
-        self.out.push_back(yielded.clone());
-        self.last = Some(yielded);
-        self.next = None;
-    }
-}
-
-impl Coroutine<ResumeArg> for Gen {
-    type Yield = YieldOp;
-    type Return = ResumeArg;
-
-    fn resume(self: Pin<&mut Self>, arg: ResumeArg) -> CoroutineState<YieldOp, ResumeArg> {
-        let this = self.get_mut();
-        // The specializer's answer to what it yielded last: the generator's, if that was its
-        // yield passed on.
-        let mut answer = Some(arg);
-        loop {
-            if let Some(yielded) = this.out.pop_front() {
-                return CoroutineState::Yielded(yielded);
-            }
-            // Its answer to `Continue`: the target's generator, given, or none, where the jump is
-            // made as any is.
-            if let Some(target) = this.continuing.take() {
-                if answer.take() == Some(ResumeArg::Matched) {
-                    answer = Some(ResumeArg::Start);
-                } else {
-                    this.looked = true;
-                    this.take(YieldOp::GetBlock(target));
-                    continue;
-                }
-            }
-            // Its answer to `NextPc`: the next instruction's generator, given, or none, where the
-            // specializer goes on itself.
-            if let Some(done) = this.done.take() {
-                if answer.take() != Some(ResumeArg::Matched) {
-                    return CoroutineState::Complete(done);
-                }
-                answer = Some(ResumeArg::Start);
-            }
-            let arg = match this.next.take() {
-                Some(own) => own,
-                None => {
-                    let arg = answer.take().unwrap_or(ResumeArg::Start);
-                    // A test found out at runtime, passed.
-                    if arg == ResumeArg::Matched && let Some(YieldOp::GuardDynamic(test)) = this.last.clone() {
-                        this.passed(&*test);
-                    }
-                    arg
-                },
-            };
-            answer = None;
-            match Pin::new(&mut *this.inner).resume(arg) {
-                CoroutineState::Complete(arg) => {
-                    this.done = Some(arg);
-                    this.out.push_back(YieldOp::NextPc);
-                },
-                CoroutineState::Yielded(yielded) => this.take(yielded),
-            }
-        }
-    }
-}
-
-/// The slots a yield is about to write, and those it reads: a window's, or a constant load's. See
-/// Note [Peephole fusion] in `peephole`.
-fn overwrites(yielded: &YieldOp) -> (Vec<usize>, Vec<usize>) {
+/// Whether `yielded` may lay out code reading the frame it runs in past the slots it names: its
+/// closure, the callstack, or the top, or an upvalue's value a guard finds. See Note [Inlined
+/// frames].
+fn observes(ctx: &Context, yielded: &YieldOp) -> bool {
+    let upvalue = |slot: usize| ctx.values.members(Loc::root(Root::Slot(slot as u16))).into_iter().any(|root| matches!(root, Root::Upvalue(_)));
     match yielded {
-        YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) => {
-            let accesses = || w.operands().iter().zip(w.accesses());
-            (accesses().filter(|(_, a)| **a == Access::Write).map(|(s, _)| *s).collect(),
-             accesses().filter(|(_, a)| a.reads()).map(|(s, _)| *s).collect())
-        },
-        YieldOp::EncodeK(slot, _) => (vec![*slot], Vec::new()),
-        _ => Default::default(),
+        YieldOp::Exec(func) => func.frame,
+        YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) | YieldOp::GuardDynamic(w) => w.closure(),
+        YieldOp::Call(_) | YieldOp::CallResume(_) | YieldOp::NativeCall { .. } | YieldOp::CollectGarbage => true,
+        YieldOp::Guard(idx, _) => upvalue(*idx),
+        YieldOp::GuardRk(rk, _) | YieldOp::GuardCType(rk, _) => rk & 0x100 == 0 && upvalue(*rk),
+        _ => false,
+    }
+}
+
+/// Whether `yielded` may lay out code, or only asks of or tells the context. See Note [Inlined
+/// frames].
+fn lays_out(ctx: &Context, yielded: &YieldOp) -> bool {
+    let known = |slot: usize, expected: &CType| {
+        let found = &ctx.types[slot];
+        expected.accepts(found) || !found.accepts(expected)
+    };
+    !match yielded {
+        YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
+            | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
+            | YieldOp::Effect(_) | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::IsKey(..)
+            | YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) | YieldOp::ArrayType(..)
+            | YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) | YieldOp::NativeWindowArgs(..)
+            | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Created(_) | YieldOp::HoldsValue(..) | YieldOp::FrameUnmade => true,
+        YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
+        YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected)),
+        YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
+        YieldOp::GuardCType(rk, expected) => rk & 0x100 != 0 || known(*rk, expected),
+        _ => false,
     }
 }
 
@@ -1105,8 +306,6 @@ pub enum YieldOp {
     OptimisticExec(Rc<dyn Window>), // An op with a cold path, which selects 0 on its hot path and
                                     // 1 on its cold. Resumed with Matched on the hot path, and
                                     // Failed on the cold. See Note [Optimistic ops]
-    IntegerOp(crate::peephole::IntOp), // The window yielded next computes this integer op, which the
-                                       // peephole may hold. See Note [Peephole fusion] in `peephole`
     Decided(bool), // A guard whose outcome is known, emitting nothing: steps the SubPc as a guard
                    // with that outcome does, for a way meeting ones that take it. Resumed with
                    // Matched or Failed. See Note [Subblocks]
@@ -1172,27 +371,11 @@ pub enum YieldOp {
 
     HashKey(usize, usize, bool), // Looks up or allocates an HREF for STACK[idx][key]; down its `__index` chain if true (a load). See Note [Table metatables]
     HashKeyNamed(usize, LConstant<'static, 'static>, bool), // `HashKey` of a key known by its value
-    MemoryOp(crate::peephole::MemOp), // The table access the window yielded next is. See Note [Peephole memory]
-    // What the peephole yields. See Note [Peephole fusion] in `peephole`.
-    Holding { writes: Vec<usize>, reads: Vec<usize>, constant: Option<(usize, i32)>, optimistic: bool }, // An integer op held:
-                                // writing `writes` from `reads`, folded to `constant` if it says
-    Fused { op: Rc<dyn Window>, exit: Vec<Rc<dyn Window>>, unknown: Vec<usize> }, // What is held laid out, an op that
-                                // can fail: its exit writes `exit`, leaving `unknown` unknown
-    Took, // A guard the peephole joined to what it holds, as passed
     FrameUnmade, // Resumed with the closure the code's inlined call calls, Boxed, if its frame isn't
-                 // made and the closure is known, else Failed. See Note [Peephole fusion]
+                 // made and the closure is known, else Failed. See Note [Inlined frames]
     HoldsValue(usize, usize), // Resumed with Matched if STACK[dest] holds STACK[src]'s value
-                              // already, a move between them nothing. See Note [Peephole fusion]
+                              // already, a move between them nothing
     Created(usize), // STACK[idx] holds a table just made, which nothing watches. See Note [Watched tables]
-    LayOut, // Lay out everything held
-    LaidOut(Rc<dyn Window>), // What the peephole held, laid out: the context knew what it does when it was held
-    Continue(Pc), // The code goes on at pc straight on: resumed with Matched once the peephole is given
-                  // its generator, else Failed. See Note [Peephole fusion]
-    NextPc, // The instruction's generator is done: resumed with Matched once the peephole is given
-            // the next's, else Failed. See Note [Peephole fusion]
-    Enter, // Move the base to the frames of the inlined calls the code is in that it isn't in
-    MakeFrames, // Make the frames of the inlined calls the code is in that aren't, the code going on inside them
-    PeepholeTrace(&'static str, Vec<(&'static str, String)>), // A trace event of what the peephole did
     Watching(usize, bool), // A watch site of STACK[idx]'s table, frozen first if the bool says so:
                            // resumed with Matched, the code after knowing which table it is,
                            // while it is watched, else Failed. See Note [Watched tables]
@@ -1201,9 +384,6 @@ pub enum YieldOp {
     Discovered(usize, u64, CType, Option<i32>), // STACK[idx] holds the element `Element` resumed with.
                                                 // See Note [Frozen tables]
     ValueOf(usize), // STACK[idx]'s value, if known: resumed with Boxed, else Failed
-    Uniques(Vec<usize>), // A slot of each class known unique but the slots', resumed with Slots, else
-                         // Failed if one has none. See Note [Disjoint tables]
-    Unique(Vec<usize>), // STACK[idx]'s values are known unique. See Note [Disjoint tables]
     Trip(Option<usize>), // A store into STACK[idx]'s table, or with none the environment, is about
                          // to be laid out: resumed with Matched. See Note [Watched tables]
     Learn(usize), // Resumed with Keys: the string keys of STACK[idx]'s table, once the code runs. See
@@ -1314,67 +494,9 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 }
 
 
-/// How two cells are, as `ctx` knows their tables and keys. See Note [Peephole memory] in `peephole`.
-fn cells(ctx: &Context, a: crate::peephole::Element, b: crate::peephole::Element) -> crate::peephole::Alias {
-    use crate::peephole::{Alias, Operand};
-    let same = |x: usize, y: usize| x == y || ctx.values.same(Loc::root(Root::Slot(x as u16)), Loc::root(Root::Slot(y as u16)));
-    let constant = |key: Operand| match key {
-        Operand::K(k) => Some(k),
-        Operand::Slot(slot) => ctx.constant(slot),
-    };
-    // A table known watched is no held store's: a store into it trips first, in its instruction,
-    // and goes on elsewhere, and the elements code knows of it stay what they were. See Note
-    // [Watched tables].
-    let watched = |table: usize| ctx.values.fact(Loc::root(Root::Slot(table as u16)), WATCHED).is_some();
-    if watched(a.table) || watched(b.table) {
-        return Alias::Disjoint;
-    }
-    // Two unique classes are two tables. See Note [Disjoint tables].
-    let unique = |table: usize| ctx.values.fact(Loc::root(Root::Slot(table as u16)), UNIQUE).is_some();
-    if unique(a.table) && unique(b.table) && !same(a.table, b.table) {
-        return Alias::Disjoint;
-    }
-    // A key whose range leaves out the other is another. See Note [Peephole memory] in
-    // `peephole`.
-    let range = |e: crate::peephole::Element| constant(e.key).map(|k| (k, k)).or(e.range);
-    if let (Some((a_lo, a_hi)), Some((b_lo, b_hi))) = (range(a), range(b)) && (a_hi < b_lo || b_hi < a_lo) {
-        return Alias::Disjoint;
-    }
-    // Different keys are different elements, whatever the tables.
-    let keys = match (constant(a.key), constant(b.key), a.key, b.key) {
-        (Some(x), Some(y), _, _) if x != y => return Alias::Disjoint,
-        (Some(_), Some(_), _, _) => true,
-        (_, _, Operand::Slot(x), Operand::Slot(y)) => same(x, y),
-        _ => false,
-    };
-    if keys && same(a.table, b.table) { Alias::Same } else { Alias::May }
-}
-
-/// Where an exit of what the peephole holds goes on from: the start of an instruction, in its
-/// context, or where compiling went on in one, nothing held: at a pc, in a context, with a
-/// generator and what it resumes with. See Note [Peephole fusion] in `peephole`.
-#[derive(Clone)]
-enum Restart {
-    Start(Rc<Context>),
-    Resume(SubPc, Rc<Context>, Box<Gen>, ResumeArg),
-}
-
-impl Restart {
-    /// It, the frames of its inlined calls as made as `now`'s: what is laid out moving the base or
-    /// making them stays, so a restart from before goes on from there. See Note [Peephole fusion]
-    /// in `peephole`.
-    fn made_as(&mut self, now: &Context) {
-        let (Restart::Start(ctx) | Restart::Resume(_, ctx, _, _)) = self;
-        for (frame, now) in Rc::make_mut(ctx).inline.iter_mut().zip(&now.inline) {
-            frame.made = now.made;
-        }
-    }
-}
-
-/// Where compiling an instruction went on to, if it went on in the block: the next instruction, in
-/// what context, what its generator returned, and what the peephole holds still. See Note
-/// [Peephole fusion] in `peephole`.
-pub type Compiled = Option<(Pc, Rc<Context>, ResumeArg, crate::peephole::Spells)>;
+/// Where compiling an instruction went on to, if it went on: the next instruction, in what context,
+/// what its generator returned, and the block it goes on in.
+pub type Compiled = Option<(Pc, Rc<Context>, ResumeArg, BlockId)>;
 
 /// Whether an integer op's result fits the integer encoding for the values its operands have.
 /// See Note [Optimistic ops].
@@ -1412,7 +534,6 @@ pub enum ResumeArg {
     Cell(usize, bool),
     /// A table's string keys. See `jit.learn` in `library`.
     Keys(Rc<[LConstant<'static, 'static>]>),
-    Slots(Rc<[usize]>),
 }
 
 // Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
@@ -1420,7 +541,7 @@ pub enum ResumeArg {
 // witness; its cold path finds the key wherever it is (`href_init_slow`). Exit 0 if the table has
 // the key, where the field's type is guarded (`GuardWitness`), and 1 if not. See Notes [Hash
 // witnesses] and [Field types].
-windowed!(fields HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
+windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -1450,7 +571,7 @@ windowed!(fields HrefInit, [at: u64, key: u64], [], |owner, state, base| (table)
 // `HrefInit` for a hash key of a userdata, in its `__index` table: exit 0 if that has the key,
 // populating the witness, and 1 if not, or if it has no `__index` table. See Note [Userdata
 // fields].
-windowed!(fields select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (userdata) {
+windowed!(writes select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (userdata) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let LValue::Userdata(u) = userdata.unbox() else { unreachable!() };
     match u.ro(owner).index_table(owner, &state.index_key) {
@@ -1462,7 +583,7 @@ windowed!(fields select HrefInitIndex, [at: u64, key: u64], [], |owner, state, b
 // `HrefInit` for a hash key at a place down its register's `__index` chain (`place`, as
 // `Place::bits`): exit 0 if the table there has the key, populating the witness, and 1 if not,
 // or if there's no table there. See Note [Table metatables].
-windowed!(fields select HrefInitAt, [at: u64, key: u64, place: u16], [], |owner, state, base| () {
+windowed!(writes select HrefInitAt, [at: u64, key: u64, place: u16], [], |owner, state, base| () {
     let (href, index) = (at as u8, (at >> 8) as usize);
     match state.place_table(owner, 0, Place::from_bits(place)) {
         Some(tab) => href_init_slow(owner, state, tab, href, index, key),
@@ -1795,7 +916,7 @@ impl Count {
 // callee: the JIT code's copy's own, which the JIT patches as it grows. Requires nilling the
 // callee's frame if `FILLS`, or else the JIT code does. The callee isn't vararg. See Notes [Frame
 // ops] and [Inlined calls].
-windowed!(frames frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(writes frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
     state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), A.lift(a), B.lift(b), frame as usize, FILLS);
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
@@ -1804,7 +925,7 @@ windowed!(frames frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A:
 // `effects` and `callee` the addresses of the running function's effects and the callee's, which
 // the first is joined into (Note [Tail calls]). Closing upvalues if `CLOSES`, from a vararg
 // function if `VARARG`. See Note [Frame ops].
-windowed!(frames frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(writes frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
     unsafe { *(callee as *mut u16) |= *(effects as *const u16) };
     state.tail_call(owner, a, b, CLOSES, VARARG);
@@ -1815,7 +936,7 @@ windowed!(frames frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES:
 // `effects` (Note [Call effects]); `at` (a `PackedLocation`) is where it is. Closing upvalues if
 // `CLOSES`, returning from a vararg function if `VARARG`. A return from a frame JIT code called
 // is the op; one from a frame with an entry, or the outermost, its cold path. See Note [Frame ops].
-windowed!(frames frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(writes frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     state.returned_at = at;
     if state.jit_depth > 0 {
         let _ = state.leave::<false>(owner, A.lift(a), B.lift(b), CLOSES, VARARG);
@@ -1849,13 +970,13 @@ windowed!(frames frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at
 // (`a` and `b` as `Count::hold` holds them), of a callee whose `max_stack` is `stack`, keeping the
 // window: the JIT code nils the callee's frame. See Notes [Inlined calls] and [Count case
 // analysis].
-windowed!(frames ShiftFrame, [a: u64, b: u64, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
+windowed!(writes ShiftFrame, [a: u64, b: u64, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
     state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false, 0);
 });
 
 // `ShiftFrame` as a frame op, nilling the callee's frame past its arguments, as many as there are
 // or up to the top. See Notes [Inlined calls] and [Count case analysis].
-windowed!(frames frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| () {
+windowed!(writes frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| () {
     let callee = state.vals[state.base + A.lift(a)];
     state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, true, 0);
 });
@@ -1863,13 +984,13 @@ windowed!(frames frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count,
 // `unshift_frame` without the callstack's entry, for an inlined callee's RETURN A B (`a` and `b`
 // as `Count::hold` holds them), closing its frame's open upvalues if `CLOSES`, moving its results
 // if `MOVES`. See Notes [Inlined calls] and [Count case analysis].
-windowed!(frames frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, MOVES: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(writes frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, MOVES: bool, A: Count, B: Count], |owner, state, base| () {
     state.unshift_frame::<false>(owner, MOVES.then(|| (A.lift(a), B.lift(b))), CLOSES);
 });
 
 // Whether a table's array part has kind `kind`, testing an element loaded from it in place of
 // the element's own tag. See Note [Array kinds].
-windowed!(properties guard KindIs, [kind: LType], [], |owner, state, base| (table) {
+windowed!(reads guard KindIs, [kind: LType], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).kind == kind.bit()
 });
@@ -1918,9 +1039,6 @@ pub struct SubPc(usize, u128);
 impl SubPc {
     pub fn new(pc: Pc) -> Self {
         SubPc(pc, 1)
-    }
-    fn next_pc(&self) -> Self {
-        Self::new(self.0 + 1)
     }
     fn next_true(&self) -> Self {
         assert!(self.1 < (1 << 126));
@@ -2014,7 +1132,7 @@ pub enum Residual {
     /// [Inlined calls].
     InlineReturn { a: u16, b: u16, closes: bool, call: u16, moves: bool },
     /// The base moved on `by` slots to an inlined call's frame, which isn't made: its code naming
-    /// only slots runs there. See Note [Peephole fusion] in `peephole`.
+    /// only slots runs there. See Note [Inlined frames].
     Enter(u16),
     /// The base moved back `by` slots from the frame `Enter` moved it to.
     Leave(u16),
@@ -2068,8 +1186,7 @@ pub enum CallEntry {
 // applies a callee's; Note [Call effects]), with no guard on the return between, and becomes the
 // return and a jump to that code; but where the callee's frame isn't made, none of its code
 // observing it, the caller's code is compiled on from the return itself, the base moved back if
-// it was, the results the peephole holds held and the rest moved (Note [Peephole fusion] in
-// `peephole`). What the callee learns of a value it was
+// it was and the results moved (Note [Inlined frames]). What the callee learns of a value it was
 // passed, as a table's array kind, the caller's places holding it know on the return: the value
 // of each argument is a place of the callee's code (`Root::Arg`) that none of it writes.
 //
@@ -2125,6 +1242,18 @@ pub enum CallEntry {
 // callee runs in the caller's context: a guard of a value loaded from an upvalue (Note [Upvalue
 // paths]), and a hash key's guard. A call inlines if what is left is within `MAX_INLINE_COST`.
 
+// Note [Inlined frames]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// An inlined call's frame is made in two halves, each only once code needs it: the base moved to
+// it (`Enter`), nilling it past the arguments, before code naming its slots, and the rest, its
+// callstack entry and running closure (`Inline`), before code observing them, as an upvalue's
+// access through the closure, a call not inlined, a safepoint, or an exit to the interpreter does.
+// A callee whose code lays out nothing returns into its caller's having made none of its frame,
+// and one naming only slots, none but the base, which its return moves back (`Leave`). How much of
+// each frame is made is known to the context, so versions differ by it, and is what the code of a
+// block's function runs in, whatever closure is running: an upvalue of a callee whose frame isn't
+// made is loaded through the closure the call is known to call (`CalledUpval`).
+
 /// A field's or a global's name, hashed: what a store with a key of that name may change. See
 /// Note [Field facts].
 fn name_hash(name: &[u8]) -> u64 {
@@ -2164,16 +1293,6 @@ fn name_hash(name: &[u8]) -> u64 {
 // only through the watch, so code relying on it is unpublished by a trip as the watch's is. The
 // table is kept alive until it trips, and a load reads it only until then; nothing reads a value
 // back from what is known of it.
-
-// Note [Disjoint tables]
-// ~~~~~~~~~~~~~~~~~~~~~~~
-// A class can be known unique (`jit.disjoint`): its value is no other unique class's, so elements
-// of tables in two unique classes are different elements. A disjoint site checks its arguments
-// are different tables, from each other and from a value of each class already unique, as a value
-// may reach an argument through a name the context doesn't connect to it; a unique class no slot
-// holds makes the site learn nothing. Classes otherwise say only which values are equal: a join
-// keeps a class unique only if no other unique class is of its class on either side, and a
-// context is accepted only if its classes for two unique ones are two.
 
 /// Where a Lua call's returns go on, and how the code after it is compiled: as
 /// `make_continuation_thunk` takes it. See Note [Watched tables].
@@ -2229,7 +1348,7 @@ pub struct InlineFrame {
     pub a: u16,
     pub effects: Effects,
     pub passed: SmallVec<[(u16, u16); 2]>,
-    /// How much of the frame code past here has made. See Note [Peephole fusion] in `peephole`.
+    /// How much of the frame code past here has made. See Note [Inlined frames].
     pub made: Made,
     /// The call's B, the callee's parameters and frame size, its cells, and its returns'
     /// continuation: what makes the frame.
@@ -2243,7 +1362,7 @@ pub struct InlineFrame {
 }
 
 /// How much of an inlined call's frame is made: none, the base moved to it (`Enter`), or all of it,
-/// its callstack entry and closure too (`Inline`). See Note [Peephole fusion] in `peephole`.
+/// its callstack entry and closure too (`Inline`). See Note [Inlined frames].
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Made {
     No,
@@ -2318,9 +1437,8 @@ impl Rest {
 }
 
 /// A Lua call laid out, which its continuation may inline: the block and offset of its `LuaCall`,
-/// its point, the callee's prototype, the context at the call and its B, and the peephole as it
-/// was at the call, where what it held is laid out (`start`), which the call inlined goes on from,
-/// and the call's restart. See Notes [Inlined calls] and [Peephole fusion] in `peephole`.
+/// its point, the callee's prototype, and the context at the call and its B. See Note [Inlined
+/// calls].
 struct InlineCall {
     block: BlockId,
     off: usize,
@@ -2328,9 +1446,6 @@ struct InlineCall {
     callee: LProto<'static, 'static>,
     calling: Rc<Context>,
     b: usize,
-    coro: Box<Gen>,
-    start: Location,
-    restart: Option<(Pc, Restart, bool)>,
 }
 
 /// How many inlined calls deep code can be. See Note [Inlined calls].
@@ -2371,57 +1486,6 @@ fn makes_iterator<C>(proto: &crate::chunk::FunctionBlock<'_, C>, pc: Pc, a: usiz
     let Some(jmp) = instructions.get(pc + 1).filter(|inst| inst.0.Opcode() == Opcode::JMP) else { return false };
     let target = ((pc + 2) as isize + crate::vm::sBx::unpack(jmp.0) as isize) as usize;
     instructions.get(target).is_some_and(|inst| inst.0.Opcode() == Opcode::TFORLOOP && crate::vm::ABC::unpack(inst.0).0 as usize == a)
-}
-
-/// The lowest slot `ctx` knows holds the value slot `slot` does, of those `ok` takes: a name for
-/// what a held store names `slot` by. See Note [Peephole memory] in `peephole`.
-fn same_value(ctx: &Context, slot: usize, ok: impl Fn(usize) -> bool) -> Option<usize> {
-    ctx.values.members(Loc::root(Root::Slot(slot as u16))).into_iter()
-        .filter_map(|root| match root { Root::Slot(s) => Some(s as usize), _ => None })
-        .filter(|&s| s != slot && ok(s))
-        .min()
-}
-
-/// `held`'s stores naming no slot `dead` says is, in `ctx`, where another slot holds the value: a
-/// held store is of a value, whichever slot names it. See Note [Peephole memory] in `peephole`.
-fn rehome(held: &mut crate::peephole::Spells, ctx: &Context, dead: impl Fn(usize) -> bool) {
-    let written: Vec<usize> = held.spells.iter().map(|spell| spell.dest).collect();
-    held.rehome(|slot| dead(slot).then(|| same_value(ctx, slot, |s| !dead(s) && !written.contains(&s))).flatten());
-}
-
-/// What the peephole holds, `held`, at a call of R(A) with B of `callee` that is inlined: what's laid
-/// out first, as the callee's code names none of it, and what goes on held into the callee's code,
-/// in its slots. What names the caller's slots below the callee's frame is laid out; what writes the
-/// frame past its arguments is dead, as entering it leaves those slots unset, nil to its code, and
-/// what reads them reads them as they were. One passed what's up to the top, or whose code is its
-/// return, takes nothing. See Note [Peephole fusion] in `peephole`.
-fn entering(held: &crate::peephole::Spells, calling: &Context, callee: LProto<'static, 'static>, a: usize, b: usize) -> (crate::peephole::Spells, crate::peephole::Spells) {
-    let stack = unsafe { (*callee).max_stack } as usize;
-    // A store named by a slot below the frame is named by an argument holding the same value.
-    let mut held = held.clone();
-    if b != 0 {
-        rehome(&mut held, calling, |slot| !(a + 1..a + b).contains(&slot));
-    }
-    // Code that is its return holds nothing to go on with.
-    let returns = unsafe { (&(*callee).instructions.items)[0].0.Opcode() } == Opcode::RETURN;
-    let (below, nilled): (Vec<usize>, Vec<usize>) = match b {
-        _ if returns => ((0..a + 1 + stack).collect(), Vec::new()),
-        0 => ((0..a + 1 + stack).collect(), Vec::new()),
-        b => ((0..=a).collect(), (a + b..a + 1 + stack).collect()),
-    };
-    // What reads the frame's slots past the arguments reads them as they were: entering it writes
-    // none of them, holding them unset.
-    let (laid, mut kept) = held.split(&crate::peephole::Need { reads: below.clone(), writes: below, memory: false });
-    // Of the ranges, the frame's arguments'.
-    kept.ranges.retain(|r| r.0 > a && !nilled.contains(&r.0));
-    kept.lengths.retain(|l| l.0 > a && !nilled.contains(&l.0));
-    let mut kept = kept.renamed(|slot| slot - a - 1, |slot| slot - a - 1, |slot| !nilled.contains(&slot), usize::MAX);
-    // Its frame is nil past its arguments, as the peephole holds it, unset.
-    if b != 0 {
-        let fresh: Vec<usize> = (b - 1..stack).filter(|slot| !kept.unset.contains(slot)).collect();
-        kept.unset.extend(fresh);
-    }
-    (laid, kept)
 }
 
 /// For a Lua callee's continuation, which applies only what the callee's effects falsify: the
@@ -2882,9 +1946,8 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // key) relies on the fact and consumes it: the slot's type then says what the fact would, and a
 // rebuild to a double, which would undo what the use relies on, is refused. A guard finding out
 // the slot's type at runtime consumes it too, deciding how the slot is used instead (one the
-// context answers decides nothing). A constant no load made, as a promote's guarded value or what
-// an operation of constants folds to (Note [Peephole fusion] in `peephole`), has no load to
-// rebuild, and isn't consumed. Where the fact is never used, the code it was carried through
+// context answers decides nothing). A constant no load made, as a promote's guarded value, has no
+// load to rebuild, and isn't consumed. Where the fact is never used, the code it was carried through
 // is contracted. A whole constant passed to a function, stored into a table or an upvalue, or
 // passed to a native is the integer it was loaded as: a callee's versions, and a table's other
 // values, are out of the load's rebuild's reach. One a field store takes as its operand is stored
@@ -2926,9 +1989,8 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // introduced the fact then becomes a thunk: code entering the block from its start ends there, as
 // the JIT and the trimming below read it, and the residuals after it are dead. Forced, the thunk
 // compiles the code from the origin again, as any thunk lays out its code (Note [Thunk patching]
-// in `jit`): in place, truncating the dead residuals. Origins sharing a residual, loads the
-// peephole held until one was laid out, share its thunk too: the earliest's, whose code loads the
-// rest again as each one's contraction decided.
+// in `jit`): in place, truncating the dead residuals. Origins sharing a residual share its thunk
+// too: the earliest's, whose code loads the rest again as each one's contraction decided.
 //
 // A fact can be rebuilt from the same origin another way: a constant that meets a double (Note
 // [Widening]) is loaded as a double instead, so every path from its load computes on the double.
@@ -3058,9 +2120,6 @@ fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected
 
 /// The versions of a pc before jumps to it reuse one. See Note [Version compatibility].
 const MAX_VERSIONS: usize = 3;
-/// The jumps' targets code goes on at straight on before one is a block's. See Note [Peephole
-/// fusion] in `peephole`.
-const MAX_CONTINUED: usize = 64;
 
 /// The values one version of a promote tests before it returns its argument
 /// unspecialized. See Note [Promoted values].
@@ -3294,8 +2353,6 @@ pub enum Known {
     Value(u64),
     /// The value is a table that isn't watched. See Note [Watched tables].
     Unwatched,
-    /// The value is no other class's known so. See Note [Disjoint tables].
-    Unique,
 }
 
 /// The keys of `Known`'s domains.
@@ -3305,8 +2362,7 @@ pub const CONSTANT: u8 = 2;
 pub const WATCHED: u8 = 3;
 pub const VALUE: u8 = 4;
 pub const UNWATCHED: u8 = 5;
-pub const UNIQUE: u8 = 6;
-const KEYS: [u8; 7] = [TYPE, KIND, CONSTANT, WATCHED, VALUE, UNWATCHED, UNIQUE];
+const KEYS: [u8; 6] = [TYPE, KIND, CONSTANT, WATCHED, VALUE, UNWATCHED];
 
 /// What a context knows of values. See Note [Fragile information].
 pub type Values = crate::classes::Classes<Known>;
@@ -3331,7 +2387,7 @@ impl PartialEq for Known {
             (Known::Kind(a), Known::Kind(b)) => a == b,
             (Known::Constant { value: a, .. }, Known::Constant { value: b, .. }) => a == b,
             (Known::Watched(a), Known::Watched(b)) | (Known::Value(a), Known::Value(b)) => a == b,
-            (Known::Unwatched, Known::Unwatched) | (Known::Unique, Known::Unique) => true,
+            (Known::Unwatched, Known::Unwatched) => true,
             _ => false,
         }
     }
@@ -3355,7 +2411,6 @@ impl std::hash::Hash for Known {
             Known::Watched(bits) => (WATCHED, bits).hash(state),
             Known::Value(bits) => (VALUE, bits).hash(state),
             Known::Unwatched => UNWATCHED.hash(state),
-            Known::Unique => UNIQUE.hash(state),
         }
     }
 }
@@ -3369,7 +2424,6 @@ impl std::fmt::Debug for Known {
             Known::Watched(bits) => write!(f, "watched {bits:#x}"),
             Known::Value(bits) => write!(f, "value {bits:#x}"),
             Known::Unwatched => write!(f, "unwatched"),
-            Known::Unique => write!(f, "unique"),
         }
     }
 }
@@ -3384,7 +2438,6 @@ impl crate::classes::ClassFact for Known {
             Known::Watched(_) => WATCHED,
             Known::Value(_) => VALUE,
             Known::Unwatched => UNWATCHED,
-            Known::Unique => UNIQUE,
         }
     }
     fn join(&self, other: &Self) -> Option<Self> {
@@ -3392,9 +2445,6 @@ impl crate::classes::ClassFact for Known {
     }
     fn implies(&self, weaker: &Self) -> bool {
         self == weaker
-    }
-    fn distinct(&self) -> bool {
-        matches!(self, Known::Unique)
     }
 }
 
@@ -4289,19 +3339,6 @@ pub struct Specializer<'src, 'intern> {
     /// Where the optimistic integer op being laid out was decided to be one, which its first
     /// overflow rebuilds it from. See Note [Optimistic ops].
     encoding: Option<Origin>,
-    /// The integer ops the peephole holds. See Note [Peephole fusion] in `peephole`.
-    /// The instruction being compiled: its pc, where an exit of what the peephole holds goes on
-    /// from, and whether the peephole holds its integer op. See Note [Peephole fusion] in
-    /// `peephole`.
-    instruction: Option<(Pc, Restart, bool)>,
-    /// Whether the next `compile_one` starts the instruction `instruction` is.
-    entering: bool,
-    /// The instruction an exit of what the peephole held runs again, compiled next, its integer
-    /// op not held. See Note [Peephole fusion] in `peephole`.
-    unheld: Option<Pc>,
-    /// The jumps' targets the code being compiled went on at straight on, by function and context.
-    /// See Note [Peephole fusion] in `peephole`.
-    continued: Vec<(usize, Pc, Rc<Context>)>,
     /// Where each rebuilt block ends for code entering it from its start. See Note [Contraction].
     cuts: std::collections::HashMap<BlockId, usize, rustc_hash::FxBuildHasher>,
     /// The instruction of the origin whose rebuild is yet to run at each place in a block. See
@@ -4374,10 +3411,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             effects: HashMap::default(),
             contractions: Vec::new(),
             encoding: None,
-            instruction: None,
-            entering: false,
-            unheld: None,
-            continued: Vec::new(),
             cuts: Default::default(),
             rebuilding: Default::default(),
             trimming: Vec::new(),
@@ -4475,15 +3508,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         return block_id;
     }
 
-    pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, mut coro: Box<Gen>, arg: ResumeArg) -> BlockId {
-        // Never another version's, though their contexts be the same, while the peephole holds
-        // something: what it holds isn't in the context. See Note [Peephole fusion] in `peephole`.
-        if coro.holds_any() {
-            let block = self.new_block(pc.0);
-            let compiled = self.compile_one(owner, pc, ctx, coro, arg, block);
-            self.go_on(owner, compiled, block);
-            return block;
-        }
+    pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<dyn NativeGen>, arg: ResumeArg) -> BlockId {
         let ctx = Context::canonical_free(ctx);
         if let Some(((_, ectx), &exists)) = self.versions.get(&self.proto).unwrap().get_key_value(&(pc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
@@ -4504,9 +3529,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[new_block.0].promoted = ctx.promoted.clone();
         self.versions.get_mut(&self.proto).unwrap().insert((pc, ctx.clone()), new_block);
         let compiled = self.compile_one(owner, pc, ctx, coro, arg, new_block);
-        self.go_on(owner, compiled, new_block);
-
-        return new_block;
+        self.go_on(owner, compiled);
+        new_block
     }
 
     /// The block a jump to `pc` in `ctx` enters: a version for `ctx`, or one
@@ -5164,28 +4188,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
     }
 
-    /// Return a specialized block for a given PC and context, compiling a new one if necessary
+    /// The version of `pc` for exactly `ctx`, if there is one.
     pub fn find(&mut self, owner: &mut Owner, pc: SubPc, ctx: &Rc<Context>) -> Option<BlockId>
     {
         self.versions.get(&self.proto).unwrap().get(&(pc, ctx.clone())).cloned()
     }
 
-    pub fn compile(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
-        self.compile_holding(owner, pc, ctx, block_id, Default::default())
-    }
-
-    /// `compile`, the peephole holding `held`. See Note [Peephole fusion] in `peephole`.
-    fn compile_holding(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>, block_id: BlockId, held: crate::peephole::Spells) -> Rc<Context> {
-        // The instruction compiling this, if any, goes on after it.
-        let outer = self.instruction.take();
-        let ctx = self.compile_instructions(owner, pc, ctx, block_id, held);
-        self.instruction = outer;
-        ctx
-    }
-
     /// Make the frames of the inlined calls code in `ctx` is in that aren't, ending `block`: the
-    /// block the code goes on in, from `pc`, inside them, and its context. See Note [Peephole
-    /// fusion] in `peephole`.
+    /// block the code goes on in, from `pc`, inside them, and its context. See Note [Inlined
+    /// frames].
     fn make_frames(&mut self, block: BlockId, pc: Pc, ctx: &Context) -> (BlockId, Rc<Context>) {
         let mut made = ctx.clone();
         self.end_block(block);
@@ -5204,14 +4215,28 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         (inside, Rc::new(made))
     }
 
-    /// Compile on in `block` from where compiling an instruction went on to, if it went on there.
-    fn go_on(&mut self, owner: &mut Owner, compiled: Compiled, block: BlockId) {
-        if let Some((next, ctx, _, held)) = compiled {
-            self.compile_holding(owner, next, ctx, block, held);
+    /// Move the base to the frames of the inlined calls code in `ctx` is in that it isn't in, in
+    /// `block`, nilling each past its arguments, as making it would: its code reads a local its
+    /// first instruction declares as nil. See Note [Inlined frames].
+    fn enter(&mut self, ctx: &mut Rc<Context>, block: BlockId) {
+        for frame in Rc::make_mut(ctx).inline.iter_mut().filter(|frame| frame.made == Made::No) {
+            frame.made = Made::Base;
+            self.blocks[block.0].instructions.push(Residual::Enter(frame.by() as u16));
+            for slot in frame.b as usize - 1..frame.stack as usize {
+                self.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::LoadNil::new(&[slot]))));
+            }
         }
     }
 
-    fn compile_instructions(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId, mut carry: crate::peephole::Spells) -> Rc<Context> {
+    /// Compile on from where compiling an instruction went on to, if it went on.
+    fn go_on(&mut self, owner: &mut Owner, compiled: Compiled) {
+        if let Some((next, ctx, _, block)) = compiled {
+            self.compile(owner, next, ctx, block);
+        }
+    }
+
+    /// Compile the code from `pc`, in `ctx`, into `block_id` and the blocks it goes on in.
+    pub fn compile(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, mut block_id: BlockId) -> Rc<Context> {
         debug_assert_eq!(ctx.types.len(), unsafe { (*self.proto).max_stack } as usize, "a context of another function's frame");
         loop {
             let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[pc].clone() };
@@ -5220,128 +4245,51 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Rc::make_mut(&mut ctx).top = None;
             }
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
-            let holds = self.unheld.take() != Some(pc);
-            self.instruction = Some((pc, Restart::Start(ctx.clone()), holds));
-            self.entering = true;
             // An inlined call's return whose frame isn't made: the caller's code after the call goes
-            // on here, the base moved back if it was moved, the results the peephole holds held in
-            // the call's slots and the rest moved there. See Note [Peephole fusion] in `peephole`.
-            let folds = match ctx.inline.last() {
-                Some(frame) if inst.0.Opcode() == Opcode::RETURN && frame.made != Made::Yes => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    let (a, b) = (a as usize, b as usize);
-                    // SAFETY: an inlined call's continuation lives as long as the code.
-                    let continuation = unsafe { &*frame.continuation };
-                    let (call, c) = (continuation.a as usize, continuation.c as usize);
-                    let results = a..a + c.saturating_sub(1);
-                    // Of no instruction of the caller's.
-                    let spells = carry.renamed(|slot| call + slot - a, |slot| call + 1 + slot, |slot| results.contains(&slot), usize::MAX);
-                    let moves: Vec<(usize, usize)> = results.clone().filter(|&slot| !carry.spells.iter().any(|spell| spell.dest == slot)).map(|slot| (call + 1 + slot, call + slot - a)).collect();
-                    match continuation.rest {
-                        Rest::Next(next) if b != 0 && c != 0 && c <= b && frame.b != 0 && !moves.iter().any(|&(_, to)| spells.names(to)) => Some((frame.clone(), a, b, next, spells, moves)),
-                        _ => None,
-                    }
-                },
-                _ => None,
-            };
-            // Whether an inlined call's return folds, and if not why.
-            #[cfg(feature = "tracing")]
-            if inst.0.Opcode() == Opcode::RETURN && let Some(frame) = ctx.inline.last() {
-                let (_, b) = crate::vm::AB::unpack(inst.0);
+            // on here, the base moved back if it was moved, the results moved to the call's slots.
+            // See Note [Inlined frames].
+            if let Some(frame) = ctx.inline.last() && inst.0.Opcode() == Opcode::RETURN && frame.made != Made::Yes {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                let (a, b) = (a as usize, b as usize);
                 // SAFETY: an inlined call's continuation lives as long as the code.
                 let continuation = unsafe { &*frame.continuation };
-                let why = match () {
-                    _ if folds.is_some() => "folds",
-                    _ if frame.made == Made::Yes => "made",
-                    _ if matches!(continuation.rest, Rest::Resume(..)) => "resumes",
-                    _ if b == 0 || frame.b == 0 => "multiple values",
-                    _ if continuation.c == 0 || continuation.c as usize > b as usize => "results",
-                    _ => "result slot held",
-                };
-                crate::tracing::instant("peephole", "return", &[
-                    ("line", self.traced_line(owner).into()),
-                    ("pc", pc.into()),
-                    ("block", block_id.0.into()),
-                    ("held", (if carry.is_empty() { "no" } else { "yes" }).into()),
-                    ("why", why.into()),
-                ]);
-            }
-            if let Some((frame, a, b, next, spells, moves)) = folds {
-                let continuation = unsafe { &*frame.continuation };
-                let moved = frame.made == Made::Base;
-                let by = frame.by();
-                let (known, effects) = self.returned_context(owner, &ctx, continuation, a, b);
-                self.end_block(block_id);
-                if moved {
-                    self.blocks[block_id.0].instructions.push(Residual::Leave(by as u16));
-                }
-                // A result in a slot still unset is nil; the frame's other unset slots are its
-                // caller's temporaries, never read before written.
-                let mut spells = spells;
                 let (call, c) = (continuation.a as usize, continuation.c as usize);
-                let results = a..a + c.saturating_sub(1);
-                for &(from, to) in &moves {
-                    let range = spells.range(from);
-                    spells.set_range(to, range);
+                if let Rest::Next(next) = continuation.rest && b != 0 && c != 0 && c <= b && frame.b != 0 {
+                    let moved = frame.made == Made::Base;
+                    let by = frame.by();
+                    let (known, effects) = self.returned_context(owner, &ctx, continuation, a, b);
+                    self.end_block(block_id);
+                    if moved {
+                        self.blocks[block_id.0].instructions.push(Residual::Leave(by as u16));
+                    }
+                    // A result past the arguments of a frame never entered is nil.
+                    let unset = (frame.made == Made::No).then(|| frame.b as usize - 1);
+                    for slot in a..a + c - 1 {
+                        let result: Rc<dyn Window> = match unset {
+                            Some(past) if slot >= past => Rc::new(crate::generators::LoadNil::new(&[call + slot - a])),
+                            _ => Rc::new(crate::generators::Move::new(&[call + 1 + slot, call + slot - a])),
+                        };
+                        self.blocks[block_id.0].instructions.push(Residual::ExecWindow(result));
+                    }
+                    let callee = self.proto;
+                    self.set_current(continuation.proto as LProto<'_, '_>);
+                    self.join_effects(owner, effects);
+                    let after = self.new_block(next);
+                    self.blocks[after.0].cells = known.filled_cells();
+                    self.blocks[after.0].promoted = known.promoted.clone();
+                    self.blocks[block_id.0].instructions.push(Residual::Jump(after));
+                    self.compile(owner, next, Rc::new(known), after);
+                    self.set_current(callee);
+                    return ctx;
                 }
-                for slot in results.clone().filter(|slot| !moves.iter().any(|&(_, to)| to == call + slot - a)) {
-                    let range = spells.range(call + 1 + slot);
-                    spells.set_range(call + slot - a, range);
-                }
-                let unset_slots = spells.unset.clone();
-                spells.ranges.retain(|r| !unset_slots.contains(&r.0));
-                spells.lengths.retain(|l| !unset_slots.contains(&l.0) && !moves.iter().any(|&(_, to)| to == l.0));
-                let unset = std::mem::take(&mut spells.unset);
-                for (from, to) in moves {
-                    let result: Rc<dyn Window> = if unset.contains(&from) {
-                        Rc::new(crate::generators::LoadNil::new(&[to]))
-                    } else {
-                        Rc::new(crate::generators::Move::new(&[from, to]))
-                    };
-                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(result));
-                }
-                let callee = self.proto;
-                self.set_current(continuation.proto as LProto<'_, '_>);
-                self.join_effects(owner, effects);
-                let after = self.new_block(next);
-                self.blocks[after.0].cells = known.filled_cells();
-                self.blocks[after.0].promoted = known.promoted.clone();
-                self.blocks[block_id.0].instructions.push(Residual::Jump(after));
-                self.entering = true;
-                // The stores held named by the caller's locals where they name its temporaries.
-                let mut spells = spells;
-                let live = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(next).unwrap_or(usize::MAX);
-                rehome(&mut spells, &known, |slot| slot >= live);
-                self.compile_holding(owner, next, Rc::new(known), after, spells);
-                self.set_current(callee);
-                return ctx;
-            }
-            // A frame never entered is made nil past its arguments: nothing of it is unset.
-            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && ctx.inline.last().is_some_and(|frame| frame.made == Made::No) {
-                carry.unset.clear();
-            }
-            // What the peephole holds, laid out before what lays out code here, as if from before
-            // the instruction, going on to it. See Note [Peephole fusion] in `peephole`.
-            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && !carry.is_empty() {
-                let held = std::mem::take(&mut carry);
-                match self.compile_one(owner, SubPc::new(pc - 1), ctx.clone(), Gen::holding(held, emit_lay_out()), ResumeArg::Start, block_id) {
-                    Some((_, laid, _, _)) => ctx = laid,
-                    None => return ctx,
-                }
-                self.entering = true;
             }
             // Any other return of an inlined call: from its frame, made. See Note [Inlined calls].
             if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && ctx.inline.iter().any(|frame| frame.made != Made::Yes) {
-                let (inside, made) = self.make_frames(block_id, pc, &ctx);
-                self.entering = true;
-                return self.compile_holding(owner, pc, made, inside, Default::default());
+                (block_id, ctx) = self.make_frames(block_id, pc, &ctx);
             }
-            let decoded = self.decode(pc, &inst);
-            if let Some((next, nctx, ret, held)) = match inst.0.Opcode() {
-                _ if let Some(generator) = decoded => {
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Gen::holding_of(std::mem::take(&mut carry), generator), ResumeArg::Start, block_id)
-                },
-                Opcode::TAILCALL => {
+            let compiled = match (self.decode(pc, &inst), inst.0.Opcode()) {
+                (Some(generator), _) => self.compile_one(owner, SubPc::new(pc), ctx.clone(), generator, ResumeArg::Start, block_id),
+                (None, Opcode::TAILCALL) => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.end_block(block_id);
                     let proto = self.proto;
@@ -5351,9 +4299,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // See Note [Tail calls].
                     let site = TailSite { calling: ctx.clone(), pc, a: a as usize, b: b as usize, closes, vararg, effects };
                     let thunk = self.make_tail_call_thunk(block_id, Rc::new(site), 0, true);
-                    self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk)); None
+                    self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                    None
                 },
-                Opcode::RETURN => {
+                (None, Opcode::RETURN) => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.end_block(block_id);
                     let proto = unsafe { &*self.proto };
@@ -5381,34 +4330,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     None
                 },
-                x => {
-                    #[cfg(debug_assertions)]
-                    {
-                        unreachable!("{:?}", x)
-                    }
-                    panic!("{:?}", x);
-                    let proto = self.proto;
-                    let vararg = unsafe { (*proto).is_vararg != 0 };
-                    let effects: *const Cell<Effects> = self.effects_of(proto);
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, vararg, UNKNOWN_RETURN, effects)); None
-                },
-            } {
-                self.entering = false;
-                pc = next;
-                ctx = nctx;
-                carry = held;
-                debug!("-> {}", next);
-            } else {
-                self.entering = false;
-                debug_assert!(carry.is_empty(), "a block ended holding integer ops");
-                return ctx;
-            }
+                (None, op) => unreachable!("{op:?}"),
+            };
+            let Some((next, nctx, _, block)) = compiled else { return ctx };
+            (pc, ctx, block_id) = (next, nctx, block);
         }
     }
 
-    /// The generator of instruction `inst` at `pc`, compiled as a coroutine run in the peephole, if
-    /// it is: all but what the specializer lays out itself. See Note [Peephole fusion] in
-    /// `peephole`.
+    /// The generator of instruction `inst` at `pc`, if it is compiled by one: all but what the
+    /// specializer lays out itself.
     fn decode(&self, pc: Pc, inst: &crate::chunk::Instruction) -> Option<Box<dyn NativeGen>> {
         match inst.0.Opcode() {
             op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
@@ -5578,98 +4508,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// fragile facts about them, and which array a value of known type was
     /// loaded from, which lets paths that differ only in them share the target's
     /// version. See Note [Jumped-to contexts].
-    /// Whether going on at `target` straight on, with `generator`, is worth what `coro` holds: a
-    /// fork of it run ahead finds it of use, or can't tell. See Note [Peephole memory] in
-    /// `peephole`.
-    fn worth_continuing(&mut self, owner: &mut Owner, ctx: &Rc<Context>, coro: &Gen, target: Pc, generator: Box<dyn NativeGen>) -> bool {
-        const INSTRUCTIONS: usize = 8;
-        let mut ahead = Box::new(coro.clone());
-        ahead.watch_held();
-        let mut ctx = self.jumping(owner, ctx.clone(), target);
-        let proto = self.proto;
-        let constant = |k: usize| unsafe { &(&(*proto).constants.items)[k] };
-        let (mut pc, mut instructions) = (SubPc::new(target), 0);
-        let mut generator = Some(generator);
-        // Its answer to `Continue`: the target's generator, given.
-        let mut arg = ResumeArg::Matched;
-        let why = loop {
-            if let Some(generator) = generator.take() {
-                ahead.next_instruction(generator);
-            }
-            ahead.see(&ctx, proto, Some((pc.0, true)));
-            let yielded = match Pin::new(&mut *ahead).resume(arg) {
-                CoroutineState::Yielded(yielded) => yielded,
-                CoroutineState::Complete(_) => break "complete",
-            };
-            if ahead.consumed {
-                break "consumed";
-            }
-            arg = ResumeArg::Start;
-            match yielded {
-                YieldOp::TypeofK(k) => arg = ResumeArg::Type(constant_ctype(constant(k))),
-                YieldOp::Typeof(slot) => arg = ResumeArg::Type(ctx.types[slot].clone()),
-                YieldOp::TypeofRk(rk) if rk & 0x100 != 0 => arg = ResumeArg::Type(constant_ctype(constant(rk & 0xff))),
-                YieldOp::TypeofRk(slot) => arg = ResumeArg::Type(ctx.types[slot].clone()),
-                YieldOp::IntegerK(k) => match constant(k) {
-                    crate::chunk::Constant::Number(n) => arg = ResumeArg::Integer(n.0 as i32),
-                    _ => break "unknown",
-                },
-                YieldOp::IntegralK(k) => arg = if integral_constant(constant(k)) { ResumeArg::Matched } else { ResumeArg::Failed },
-                YieldOp::NumberK(k) => match constant(k) {
-                    crate::chunk::Constant::Number(n) => arg = ResumeArg::Number(if n.0.is_nan() { f64::NAN } else { n.0 }),
-                    _ => break "unknown",
-                },
-                YieldOp::BoxedK(k) => arg = ResumeArg::Boxed(LBoxed::from(constant(k)).bits()),
-                YieldOp::GuardRk(rk, expected) | YieldOp::Guard(rk, expected) if rk & 0x100 != 0 => {
-                    let ty = constant_ctype_for(constant(rk & 0xff), &CType::Type(expected));
-                    arg = if CType::Type(expected).accepts(&ty) { ResumeArg::MatchedConst(rk & 0xff) } else { ResumeArg::Failed };
-                },
-                YieldOp::GuardRk(slot, expected) | YieldOp::Guard(slot, expected) => {
-                    let (expected, known) = (CType::Type(expected), ctx.types[slot].clone());
-                    arg = if !expected.accepts(&known) && !known.accepts(&expected) { ResumeArg::Failed } else { ResumeArg::Matched };
-                },
-                YieldOp::GuardCType(rk, expected) => {
-                    let known = if rk & 0x100 != 0 { constant_ctype_for(constant(rk & 0xff), &expected) } else { ctx.types[rk].clone() };
-                    arg = if expected.accepts(&known) || !known.accepts(&expected) { navigate(pc, &expected, &known).1 } else { ResumeArg::Matched };
-                    if rk & 0x100 != 0 && arg == ResumeArg::Matched {
-                        arg = ResumeArg::MatchedConst(rk & 0xff);
-                    }
-                },
-                // Found out at runtime: as passed.
-                YieldOp::GuardDynamic(_) | YieldOp::OptimisticExec(_) => arg = ResumeArg::Matched,
-                YieldOp::Encoding(_) => arg = ResumeArg::Type(CType::Type(LType::Integer)),
-                YieldOp::SetCTypes(types) => Rc::make_mut(&mut ctx).set_types(owner, types),
-                // What it lays out, and what tells or asks nothing it answers.
-                YieldOp::Holding { .. } | YieldOp::Fused { .. } | YieldOp::LaidOut(_) | YieldOp::Took | YieldOp::PeepholeTrace(..)
-                    | YieldOp::Enter | YieldOp::MakeFrames | YieldOp::ExecWindow(_) | YieldOp::Exec(_) | YieldOp::Effect(_)
-                    | YieldOp::Decided(_) | YieldOp::Narrow(_) | YieldOp::Copy(..) | YieldOp::Clobber(_) => {},
-                YieldOp::NextPc => {
-                    instructions += 1;
-                    let next = pc.0 + 1;
-                    let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[next].clone() };
-                    match self.decode(next, &inst) {
-                        Some(next_generator) if instructions < INSTRUCTIONS => {
-                            generator = Some(next_generator);
-                            pc = SubPc::new(next);
-                            arg = ResumeArg::Matched;
-                        },
-                        _ => break "bound",
-                    }
-                },
-                // A way out of straight code, what it holds unused.
-                YieldOp::GetBlock(_) | YieldOp::Jump(_) | YieldOp::Select(_) | YieldOp::Continue(_) => break "unused",
-                _ => break "unknown",
-            }
-        };
-        #[cfg(feature = "tracing")]
-        crate::tracing::instant("peephole", "ahead", &[
-            ("line", self.traced_line(owner).into()),
-            ("pc", target.into()),
-            ("why", why.into()),
-        ]);
-        why != "unused" && why != "complete"
-    }
-
     fn jumping(&self, owner: &mut Owner, ctx: Rc<Context>, dest_pc: Pc) -> Rc<Context> {
         self.jumping_keeping(owner, ctx, dest_pc, None)
     }
@@ -5702,18 +4540,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         BlockId(self.blocks.len() - 1)
     }
 
-    // We have to be careful here, where rustc is very unhappy about generator -> thunk ->
-    // generator and will either think our types are recursive, require an infinite chain of
-    // implications to prove a Coroutine: Clone, or ICE (depending on the time of day) if we use
-    // slightly different structure.
-    fn yield_one(one: YieldOp) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
-        #[coroutine] |mut arg: ResumeArg| {
-            let arg = yield one;
-            debug!("yield one resulted in {arg:?}");
-            return arg;
-        }
-    }
-
     /// Replace the thunk at `off` in `block` with a jump to `target`, and its
     /// JIT code too, if any, once `target` has some. See Note [Thunk patching].
     pub fn jump_thunk(&mut self, block: BlockId, off: usize, target: BlockId) {
@@ -5732,9 +4558,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// The thunk a `GuardDynamic` yield ends its block in. See Note [Dynamic guards].
-    /// What the peephole holds, `held`, stays held on both its ways. See Note [Peephole fusion] in
-    /// `peephole`.
-    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             test.interp(owner, state);
             let passed = state.select == 1;
@@ -5773,7 +4597,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `Promote` of `slot` ends its block in: forced, it guards the
     /// slot equal to the integer it holds, and continues past the guard with
     /// that value promoted, the guard's other way promoting again. See Note [Promoted values].
-    fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Integer(value) = state.vals[state.base + slot].unbox() else { unreachable!("a promote's argument is an integer") };
             if !vm.promotes(pc.0, value) {
@@ -5808,7 +4632,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// place when first taken. See Note [Dynamic guards].
     /// The thunk a `Narrow` of `slot`, a double, ends its block in. See Note
     /// [Narrowing].
-    fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let value = state.vals[state.base + slot];
             let whole = value.representation() == LType::Double && value.as_number().is_some_and(crate::lboxed::is_integer);
@@ -5873,10 +4697,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Where the yield of `coro` at `pc` in `ctx` introduces a fact: rebuilding
     /// truncates `block` there and resumes `coro` in `ctx`, without the fact.
     /// See Note [Contraction].
-    fn origin(&self, block: BlockId, coro: Box<Gen>, pc: SubPc, ctx: Rc<Context>) -> Origin {
+    fn origin(&self, block: BlockId, coro: Box<dyn NativeGen>, pc: SubPc, ctx: Rc<Context>) -> Origin {
         let offset = self.blocks[block.0].instructions.len();
-        // Its function's, which needn't be the frame's it runs in: an inlined call's frame the
-        // peephole holds isn't made. See Note [Peephole fusion] in `peephole`.
+        // Its function's, which needn't be the frame's it runs in: an inlined call's frame
+        // needn't be made. See Note [Inlined frames].
         let proto = self.proto as LProto<'static, 'static>;
         // The origin becomes a thunk laying out the rebuilt code. See Note [Contraction].
         let rebuild = move |vm: &mut Specializer, owner: &mut Owner, how: ResumeArg| {
@@ -5900,7 +4724,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let running = vm.proto;
                 vm.set_current(proto as LProto<'_, '_>);
                 let compiled = vm.compile_one(owner, pc, ctx.clone(), coro.clone(), how.clone(), at);
-                vm.go_on(owner, compiled, at);
+                vm.go_on(owner, compiled);
                 vm.set_current(running);
             })));
             // The earliest's of the origins sharing the residual. See Note [Contraction].
@@ -5922,7 +4746,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk an optimistic integer op's `Encoding` ends its block in: forced, it lays out the
     /// op as the integer one, from an origin its first overflow rebuilds it from, if its result
     /// fits for its operands' values, and else as the double one. See Note [Optimistic ops].
-    fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, pc: SubPc, thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
+    fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump. See Note
             // [Thunk patching].
@@ -5949,7 +4773,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ResumeArg::Type(CType::Type(LType::Double))
             };
             let compiled = vm.compile_one(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), answer, at);
-            vm.go_on(owner, compiled, at);
+            vm.go_on(owner, compiled);
             vm.encoding = None;
         })))
     }
@@ -5957,7 +4781,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// An optimistic op's cold way, as `make_side_thunk`'s, which the first time it's taken also
     /// queues where the op's encoding was asked, if anywhere, to be rebuilt computing it in the
     /// double encoding. See Note [Optimistic ops].
-    fn make_overflow_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, pc: SubPc, thunk_ctx: Rc<Context>, asked: Option<Origin>) -> ThunkRef {
+    fn make_overflow_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, asked: Option<Origin>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
             vm.jump_thunk(block_id, thunk_pc, side);
@@ -5972,43 +4796,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    /// The exit a held spell failing takes, from `block`: it writes `materialize`, the spells not
-    /// yet written, as their operations would, and goes on from `restart`, in instruction `at`,
-    /// with slots `unknown` unknown, the instruction's integer op not held. Never another
-    /// version's, which might hold it. See Note [Peephole fusion] in `peephole`.
-    fn make_held_exit(&self, block: BlockId, materialize: Vec<Rc<dyn Window>>, unknown: Vec<usize>, at: Pc, restart: Restart) -> ThunkRef {
-        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            let exit = vm.new_block(at);
-            for window in &materialize {
-                vm.blocks[exit.0].instructions.push(Residual::ExecWindow(window.clone()));
-            }
-            let unknowing = |owner: &mut Owner, mut ctx: Rc<Context>| {
-                let ctx_mut = Rc::make_mut(&mut ctx);
-                ctx_mut.set_types(owner, unknown.iter().map(|&slot| (slot, CType::Unknown)).collect());
-                for &slot in &unknown {
-                    ctx_mut.effect(Effect::Write(slot));
-                }
-                ctx
-            };
-            vm.unheld = Some(at);
-            match &restart {
-                Restart::Start(start) => {
-                    let ctx = unknowing(owner, start.clone());
-                    vm.compile(owner, at, ctx, exit);
-                },
-                Restart::Resume(pc, ctx, coro, arg) => {
-                    let ctx = unknowing(owner, ctx.clone());
-                    let compiled = vm.compile_one(owner, *pc, ctx, coro.forgetting(), arg.clone(), exit);
-                    vm.go_on(owner, compiled, exit);
-                },
-            }
-            vm.jump_thunk(block, thunk_pc, exit);
-        })))
-    }
-
-    /// The thunk a `Learn` of `slot` ends its block in: forced, the code after it with the string
-    /// keys of the table there then, in order. See `jit.learn` in `library`.
-    fn make_learn_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_learn_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table") };
             let mut keys: Vec<LConstant<'static, 'static>> = tab.ro(owner).hash.keys().filter_map(|key| match key.boxed().unbox() {
@@ -6028,7 +4816,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `LearnKind` of `slot` ends its block in: forced on a table whose array part is of
     /// one kind, a guard of it, past which the context knows it; else the code after it, knowing
     /// nothing more. See `jit.learn` in `library`.
-    fn make_learn_kind_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_learn_kind_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table's field") };
             let kind = tab.ro(owner).kind;
@@ -6129,7 +4917,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// if `watches`, it is one of the table's watch sites, the code after it knowing the table is
     /// still watched; else, as the site a trip puts back, the code after it knowing nothing. See
     /// Note [Watched tables].
-    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>, watches: bool, freezes: bool) -> ThunkRef {
+    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>, watches: bool, freezes: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let boxed = state.vals[state.base + slot];
             let LValue::Table(tab) = boxed.unbox() else { unreachable!("a watch site of a table") };
@@ -6198,7 +4986,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Some(ResumeArg::Element(element.bits(), value.ctypeof_(), constant))
     }
 
-    fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
+    fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
             vm.jump_thunk(block_id, thunk_pc, side);
@@ -6208,7 +4996,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `Versions` ends its block in: forced, it lays out the code after with the
     /// count, at a point of its own: at the call's, the version found would be the one the
     /// thunk is in. See `jit.versions` in `library`.
-    fn make_versions_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_versions_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let count = vm.versions_entering(owner, block_id);
             let rest = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Integer(count as i32));
@@ -6259,7 +5047,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// A function found gets its identity guarded too, unless the chain of
     /// thunks this one is in guards `identities` of them already, `MAX_VERSIONS`
     /// (Note [Call sites]).
-    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
+    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // Each forcing patches the thunk where it was forced, in `block_id`: one
@@ -6478,7 +5266,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let effects = ctx.inline.last().expect("an inlined call's frame").effects;
         let caller = &continuation.caller;
         let mut known = caller.clone();
-        // Its frames as the callee's code made them. See Note [Peephole fusion] in `peephole`.
+        // Its frames as the callee's code made them. See Note [Inlined frames].
         for (frame, now) in known.inline.iter_mut().zip(&ctx.inline) {
             frame.made = now.made;
         }
@@ -6586,7 +5374,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// below it, and the pc after it, a Lua function's call continues at a thunk
     /// specializing it to the return. See Notes [Call sites], [Call
     /// continuations] and [Call effects].
-    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, coro: Box<Gen>, restart: Option<(Pc, Restart, bool)>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // In place, unless the thunk's JIT code can only be patched to a jump, or it
             // is a guard's failure, with the rest of the layout after it. See Note
@@ -6600,7 +5388,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 block_id
             };
             let (a16, b16, c16) = (a as u16, b as u16, c as u16);
-            let next = |vm: &Specializer, block: BlockId| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), coro.clone(), restart.clone(), pc, a, b, c, after.clone(), continuation.clone(), identities + 1, false));
+            let next = |vm: &Specializer, block: BlockId| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), pc, a, b, c, after.clone(), continuation.clone(), identities + 1, false));
             let mut layout = vec![];
             match state.vals[state.base + a].unbox() {
                 LValue::LClosure(lclos) if matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS => {
@@ -6623,28 +5411,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let decided = vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known)));
                         if decided || makes_iterator(unsafe { &*vm.proto }, pc.0, a) {
                             vm.blocks[block.0].instructions.extend(layout);
-                            // The callee's code goes on from the peephole as it was at the call,
-                            // holding what it held, but what can't go on into it, laid out first.
-                            // See Note [Peephole fusion] in `peephole`.
-                            let (laid, kept) = entering(&coro.held, &calling, callee, a, b);
                             let continuation = vm.continuation(&calling, ctx, captured, rest, a, c);
-                            let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation, kept);
-                            vm.held_first(owner, block, pc, &calling, laid, &restart, &mut vec![], Some(shift));
+                            let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation);
+                            vm.blocks[block.0].instructions.push(Residual::Jump(shift));
                             return;
                         }
                     }
-                    // A call observes what the peephole holds: laid out first, where its
-                    // continuation inlining it goes on from instead. See Note [Peephole fusion] in
-                    // `peephole`.
-                    let start = Location(block, vm.blocks[block.0].instructions.len() + layout.len());
-                    block = vm.held_first(owner, block, pc, &calling, coro.held.clone(), &restart, &mut layout, None);
                     let (stack, vararg) = unsafe { ((*proto).max_stack, (*proto).is_vararg != 0) };
                     let entry = Rc::new(entry_context(&calling, unsafe { &*proto }, a, b));
                     let off = vm.blocks[block.0].instructions.len() + layout.len();
                     layout.push(Residual::LuaCall { entry: CallEntry::Context(entry), a: a16, b: b16, c: c16, stack, vararg, callee: proto as LProto<'static, 'static> });
                     if let Some((ctx, captured, rest)) = &continuation {
                         // See Notes [Call continuations] and [Inlined calls].
-                        let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b, coro: coro.clone(), start, restart: restart.clone() };
+                        let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
                         layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), rest.clone(), a, c, after.clone(), Some(Rc::new(call)), 0, true)));
                         // Where its returns go on. See Note [Watched tables].
                         vm.continuation_sites.insert(Location(block, off + 1), ContinuationSite { ctx: ctx.clone(), captured: captured.clone(), rest: rest.clone(), a, c, after: after.clone() });
@@ -6659,7 +5438,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 LValue::NClosure(nf) if nf.is_protected_call() && identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
                     layout.push(next(vm, block));
-                    block = vm.held_first(owner, block, pc, &calling, coro.held.clone(), &restart, &mut layout, None);
                     let after = after.block(vm, owner);
                     layout.extend(Self::protected_call(a, b, c, after));
                     layout.push(Residual::Jump(after));
@@ -6675,22 +5453,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // `library`.
                     if let (Some(generator), After::Version(..)) = (nf.generator(), &after) {
                         vm.blocks[block.0].instructions.extend(layout);
-                        // Compiled by the peephole as it was at the call, holding what it held.
-                        let mut body = coro.clone();
-                        body.generate(generator(nf.native(), a, b, c));
-                        let outer = std::mem::replace(&mut vm.instruction, restart.clone());
-                        vm.entering = true;
-                        let compiled = vm.compile_one(owner, pc, calling.clone(), body, ResumeArg::Start, block);
-                        vm.instruction = outer;
-                        if let Some((next, ctx, _, held)) = compiled {
-                            debug_assert!(held.is_empty(), "a native's call holding what the peephole held past it");
+                        let compiled = vm.compile_one(owner, pc, calling.clone(), generator(nf.native(), a, b, c), ResumeArg::Start, block);
+                        if let Some((next, ctx, _, block)) = compiled {
                             let ctx = vm.jumping(owner, ctx, next);
                             let version = After::Version(next, ctx).block(vm, owner);
                             vm.blocks[block.0].instructions.push(Residual::Jump(version));
                         }
                         return;
                     }
-                    block = vm.held_first(owner, block, pc, &calling, coro.held.clone(), &restart, &mut layout, None);
                     // Past the guard the native is known: it runs as its window op if
                     // the call's arguments have the types the op assumes. See Note
                     // [Native windows].
@@ -6736,7 +5506,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 _ => {
-                    block = vm.held_first(owner, block, pc, &calling, coro.held.clone(), &restart, &mut layout, None);
                     layout.push(Residual::Call { a: a16, b: b16, c: c16 });
                     layout.push(Residual::Arrive { a: a16, c: c16 });
                     // It may call a native, which may allocate.
@@ -6748,25 +5517,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             layout.push(Residual::Jump(after.block(vm, owner)));
             vm.blocks[block.0].instructions.extend(layout);
         })))
-    }
-
-    /// The block a call thunk's layout goes on in past `layout`, laid out in `block`: past `held`,
-    /// what the peephole held at the call, laid out from the call's `restart`, if anything, or
-    /// `to`, jumped to past it. See Note [Peephole fusion] in `peephole`.
-    fn held_first(&mut self, owner: &mut Owner, block: BlockId, pc: SubPc, ctx: &Rc<Context>, held: crate::peephole::Spells, restart: &Option<(Pc, Restart, bool)>, layout: &mut Vec<Residual>, to: Option<BlockId>) -> BlockId {
-        self.blocks[block.0].instructions.extend(layout.drain(..));
-        if held.is_empty() {
-            if let Some(to) = to {
-                self.blocks[block.0].instructions.push(Residual::Jump(to));
-            }
-            return block;
-        }
-        let rest = to.unwrap_or_else(|| self.new_block(self.blocks[block.0].pc));
-        let outer = std::mem::replace(&mut self.instruction, restart.clone());
-        self.entering = true;
-        self.compile_one(owner, pc, ctx.clone(), Gen::holding(held, crate::generators::emit_lay_out_to(rest)), ResumeArg::Start, block);
-        self.instruction = outer;
-        rest
     }
 
     /// What inlining the callee entered at its version `entry` would cost, as its first call ran it,
@@ -6925,7 +5675,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
     /// callee's frame in, then goes on to its version for `entry`, its returns continuing
     /// `continuation`. See Note [Inlined calls].
-    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context, continuation: Continuation, held: crate::peephole::Spells) -> BlockId {
+    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context, continuation: Continuation) -> BlockId {
         // The outermost function's frame holds the callee's.
         let outermost = entry.inline.first().expect("an inlined call's frame").proto;
         if unsafe { (*outermost).frame_size.grow(inline_offset(&entry) + (*callee).max_stack as usize) } {
@@ -6947,12 +5697,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let cells = entry.filled_cells() & own << (entry.depth() * UPVALUE_CELLS);
         // Its code from the call's block, its frame unmade until code observes it, so code naming
         // only its slots runs in its caller's, and code laying out nothing folds into it. See Note
-        // [Peephole fusion] in `peephole`.
+        // [Inlined frames].
         let shift = self.new_block(self.blocks[block.0].pc);
         let mut entry = entry;
         let frame = entry.inline.last_mut().expect("an inlined call's frame");
         (frame.cells, frame.continuation) = (cells, pointer);
-        self.compile_holding(owner, 0, Rc::new(entry), shift, held);
+        self.compile(owner, 0, Rc::new(entry), shift);
         self.set_current(caller);
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline", &[
@@ -7003,7 +5753,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
             if let Some(call) = &inline
-                && !vm.compiled(call.block) && !vm.compiled(call.start.0)
+                && !vm.compiled(call.block)
                 && let Some(&Residual::LuaCall { entry: CallEntry::Block(entry), .. }) = vm.blocks[call.block.0].instructions.get(call.off)
                 && inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee }, a)
                 && state.returned & !0xffff_ffff == crate::vm::RETURNED
@@ -7014,24 +5764,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 decided.inline = Vec::new();
                 vm.inlined.entry((vm.proto, call.pc, call.callee as LProto<'_, '_>)).or_default().push(decided);
                 let continuation = vm.continuation(&call.calling, &ctx, &captured, &rest, a, c);
-                // From the call as it was, the peephole holding what it held there: where what it
-                // held is laid out goes on into the callee's code instead. See Note [Peephole
-                // fusion] in `peephole`.
-                let (laid, kept) = entering(&call.coro.held, &call.calling, call.callee, a, call.b);
-                let shift = vm.inline_call(owner, state, call.start.0, call.callee, a, call.b, entry, continuation, kept);
-                let into = if laid.is_empty() {
-                    shift
-                } else {
-                    let edge = vm.new_block(vm.blocks[call.start.0.0].pc);
-                    vm.held_first(owner, edge, call.pc, &call.calling, laid, &call.restart, &mut vec![], Some(shift));
-                    edge
-                };
-                let Location(block, off) = call.start;
-                if off < vm.blocks[block.0].instructions.len() {
-                    vm.blocks[block.0].instructions[off] = Residual::Jump(into);
-                } else {
-                    vm.blocks[block.0].instructions.push(Residual::Jump(into));
-                }
+                let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry, continuation);
+                vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
             }
             // In place, as for a call thunk. See Note [Thunk patching].
             let block = if !appends || vm.compiled(block_id) {
@@ -7190,7 +5924,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// nil, in a table whose metatable has an `__index` table goes on down the chain; any other key
     /// a load can't find, or a store's table lacks, continues the generator without it, in
     /// `fail_ctx`. See Notes [Field types] and [Table metatables].
-    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<Gen>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
+    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // Each forcing patches the thunk where it was forced, in `block_id`.
             let mut block_id = block_id;
@@ -7216,7 +5950,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if !usable {
                 let fail_block = vm.new_block(pc.0);
                 let compiled = vm.compile_one(owner, pc.next_false(), fail_ctx.clone(), thunk_coro, ResumeArg::Failed, fail_block);
-                vm.go_on(owner, compiled, fail_block);
+                vm.go_on(owner, compiled);
                 vm.jump_thunk(block_id, thunk_pc, fail_block);
                 return;
             }
@@ -7302,7 +6036,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// thunk of the hash key after it (`next`), and its failure finding the field's type and
     /// guarding that in turn: a load's field found nil, or an `__index` no longer a table, is
     /// found again instead. See Notes [Field types] and [Table metatables].
-    fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<Gen>, idx: usize, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) {
+    fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) {
         let mut typed_ctx = ctx.clone();
         Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(Kind::Of(expected));
         let pass = match next {
@@ -7332,7 +6066,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block.0].instructions.push(Residual::Jump(pass));
     }
 
-    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<Gen>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId, chains: bool) {
+    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId, chains: bool) {
         // In order to assert that an href is still valid, we need to check that the witnessed
         // epoch is still the same: if so, all of its keys still have the same type as the
         // cached hashkey, and no additional hashkeys were inserted (which may otherwise cause
@@ -7380,40 +6114,27 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
     }
 
-    pub fn compile_one(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<Gen>, arg: ResumeArg, block_id: BlockId) -> Compiled
-    {
-        let continued = self.continued.len();
-        let compiled = self.compile_one_of(owner, pc, ctx, coro, arg, block_id);
-        self.continued.truncate(continued);
-        compiled
-    }
-
-    fn compile_one_of(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<Gen>, arg: ResumeArg, block_id: BlockId) -> Compiled
-    {
-        // Going on in an instruction, not starting it: an exit of what the peephole holds from
-        // here goes on from here. See Note [Peephole fusion] in `peephole`.
-        if std::mem::take(&mut self.entering) {
-            return self.compile_yields(owner, pc, ctx, coro, arg, block_id);
-        }
-        let holds = self.unheld.take() != Some(pc.0);
-        let restart = Restart::Resume(pc, ctx.clone(), coro.clone(), arg.clone());
-        let outer = self.instruction.replace((pc.0, restart, holds));
-        let compiled = self.compile_yields(owner, pc, ctx, coro, arg, block_id);
-        self.instruction = outer;
-        compiled
-    }
-
-    fn compile_yields(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<Gen>, mut arg: ResumeArg, block_id: BlockId) -> Compiled
+    /// Compile what generator `coro` yields from `pc`, resumed with `arg`, in `block_id` and the
+    /// blocks it goes on in.
+    pub fn compile_one(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<dyn NativeGen>, mut arg: ResumeArg, mut block_id: BlockId) -> Compiled
     {
         // Where the constant being loaded was, for its fact's origin.
         let mut loading: Option<Origin> = None;
         loop {
-            // What the peephole sees of the code it compiles. See Note [Peephole fusion] in
-            // `peephole`.
-            coro.see(&ctx, self.proto, self.instruction.as_ref().map(|(at, _, holds)| (*at, *holds)));
-            let mut state = Pin::new(&mut coro).resume(arg);
+            let mut state = Pin::new(&mut *coro).resume(arg);
             arg = ResumeArg::Start;
             'machine: loop {
+            // What it needs of the frames of the inlined calls the code is in: made, if it may
+            // observe them, or, a frame passed what's up to the top, may lay out code; else their
+            // base moved to, if it may lay out code. See Note [Inlined frames].
+            if let CoroutineState::Yielded(yielded) = &state && ctx.inline.iter().any(|frame| frame.made != Made::Yes) {
+                let unpassed = ctx.inline.iter().any(|frame| frame.made == Made::No && frame.b == 0);
+                if observes(&ctx, yielded) || (unpassed && lays_out(&ctx, yielded)) {
+                    (block_id, ctx) = self.make_frames(block_id, pc.0, &ctx);
+                } else if lays_out(&ctx, yielded) {
+                    self.enter(&mut ctx, block_id);
+                }
+            }
             match state {
                 CoroutineState::Yielded(YieldOp::TypeofK(k)) => {
                     let proto = self.proto;
@@ -7635,10 +6356,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Encoding(_)) if let Some(how) = self.decision(owner, pc) => {
                     arg = how;
                 },
-                // An integer op while the peephole holds: as it fits. See Note [Peephole fusion].
-                CoroutineState::Yielded(YieldOp::Encoding(_)) if coro.holds_any() => {
-                    arg = ResumeArg::Type(CType::Type(LType::Integer));
-                },
                 CoroutineState::Yielded(YieldOp::Encoding(fits)) => {
                     // Decided by its operands the first time it runs. See Note [Optimistic ops].
                     let thunk = Residual::Thunk(self.make_encoding_thunk(block_id, coro.clone(), pc, ctx.clone(), fits));
@@ -7646,89 +6363,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(thunk);
                     return None;
                 },
-                // An integer op the peephole holds: what laying it out would do to what the context
-                // knows. See Note [Peephole fusion] in `peephole`.
-                CoroutineState::Yielded(YieldOp::Holding { writes, reads, constant, optimistic }) => {
-                    let loaded = reads.iter().any(|&slot| matches!(ctx.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT), Some(Known::Constant { origins: Some(_), .. })));
-                    for slot in writes {
-                        Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
-                    }
-                    if let Some((dest, value)) = constant && !loaded {
-                        Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(dest as u16)), Known::Constant { value, origins: None });
-                    }
-                    // Its encoding was asked of the peephole, not decided. See Note [Optimistic ops].
-                    if optimistic {
-                        self.encoding = None;
-                        pc = pc.next_true();
-                    }
-                },
-                // What the peephole holds, laid out: an op that can fail, whose cold way is an exit
-                // writing what is still unwritten, from the instruction's restart. The code goes on
-                // past it, the peephole holding what it holds still.
-                CoroutineState::Yielded(YieldOp::Fused { op, exit, unknown }) => {
-                    let (at, restart, _) = self.instruction.clone().expect("spells are held in an instruction");
-                    self.end_block(block_id);
-                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op));
-                    let cold = self.new_block(pc.0);
-                    let exit = self.make_held_exit(cold, exit, unknown, at, restart);
-                    self.blocks[cold.0].instructions.push(Residual::Thunk(exit));
-                    let hot = self.new_block(pc.0);
-                    self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
-                    self.entering = true;
-                    let compiled = self.compile_one(owner, pc, ctx, coro, ResumeArg::Matched, hot);
-                    self.go_on(owner, compiled, hot);
-                    return None;
-                },
-                // A guard the peephole joined to a spell: as passed.
-                CoroutineState::Yielded(YieldOp::Took) => {
-                    pc = pc.next_true();
-                },
-                CoroutineState::Yielded(YieldOp::LayOut) => {},
                 CoroutineState::Yielded(YieldOp::Created(slot)) => {
                     Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Unwatched);
                 },
-                CoroutineState::Yielded(YieldOp::LaidOut(w)) => {
-                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
+                // A slot holding what a move into it would: the move is nothing.
+                CoroutineState::Yielded(YieldOp::HoldsValue(dest, src)) => {
+                    let holds = dest == src || ctx.values.members(Loc::root(Root::Slot(src as u16))).contains(&Root::Slot(dest as u16));
+                    arg = if holds { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
-                // The base moved to the frames of the inlined calls the code is in, before code naming
-                // their slots, making none of them. See Note [Peephole fusion] in `peephole`.
-                CoroutineState::Yielded(YieldOp::Enter) => {
-                    // Each frame's slots past its arguments are nil as the peephole holds them unset,
-                    // a nil laid out for each only where read. See Note [Peephole memory] in
-                    // `peephole`.
-                    let entered = Rc::make_mut(&mut ctx);
-                    for frame in entered.inline.iter_mut().filter(|frame| frame.made == Made::No) {
-                        frame.made = Made::Base;
-                        self.blocks[block_id.0].instructions.push(Residual::Enter(frame.by() as u16));
-                    }
-                    if let Some((_, restart, _)) = &mut self.instruction {
-                        restart.made_as(&ctx);
-                    }
-                },
-                // Their frames made, before code observing them: the code goes on inside them, in a
-                // block of its own, as a call's code goes on.
-                CoroutineState::Yielded(YieldOp::MakeFrames) => {
-                    let (inside, made) = self.make_frames(block_id, pc.0, &ctx);
-                    if let Some((_, restart, _)) = &mut self.instruction {
-                        restart.made_as(&made);
-                    }
-                    self.entering = true;
-                    let compiled = self.compile_one(owner, pc, made, coro, ResumeArg::Start, inside);
-                    self.go_on(owner, compiled, inside);
-                    return None;
-                },
-                CoroutineState::Yielded(YieldOp::IntegerOp(_) | YieldOp::MemoryOp(_) | YieldOp::HoldsValue(..) | YieldOp::FrameUnmade) => unreachable!("the peephole takes what describes an op, or asks of what it holds"),
-                CoroutineState::Yielded(YieldOp::PeepholeTrace(_name, _fields)) => {
-                    #[cfg(feature = "tracing")]
-                    {
-                        let mut args: Vec<(&str, crate::tracing::TraceValue)> = vec![
-                            ("line", self.traced_line(owner).into()),
-                            ("pc", (pc.0 as u64).into()),
-                            ("block", (block_id.0 as u64).into()),
-                        ];
-                        args.extend(_fields.iter().map(|(key, value)| (*key, value.as_str().into())));
-                        crate::tracing::instant("peephole", _name, &args);
-                    }
+                // The closure an inlined call whose frame isn't made calls, if known. See Note
+                // [Inlined frames].
+                CoroutineState::Yielded(YieldOp::FrameUnmade) => {
+                    let called = ctx.inline.last().filter(|frame| frame.made != Made::Yes).and_then(|frame| frame.closure);
+                    arg = called.map_or(ResumeArg::Failed, ResumeArg::Boxed);
                 },
                 CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
                     // Its outputs are written whichever path it takes. See Note [Optimistic ops].
@@ -7819,19 +6466,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     ctx.values.learn(at, Known::Value(bits));
                 },
-                CoroutineState::Yielded(YieldOp::Uniques(of)) => {
-                    let theirs = |roots: &Vec<Root>| roots.iter().any(|root| of.iter().any(|&slot| *root == Root::Slot(slot as u16)));
-                    let slots: Option<Vec<usize>> = ctx.values.knowing(UNIQUE).iter().filter(|roots| !theirs(roots))
-                        .map(|roots| roots.iter().find_map(|root| match root { Root::Slot(slot) => Some(*slot as usize), _ => None }))
-                        .collect();
-                    arg = slots.map_or(ResumeArg::Failed, |slots| ResumeArg::Slots(slots.into()));
-                },
-                CoroutineState::Yielded(YieldOp::Unique(slots)) => {
-                    let ctx = Rc::make_mut(&mut ctx);
-                    for slot in slots {
-                        ctx.values.learn(Loc::root(Root::Slot(slot as u16)), Known::Unique);
-                    }
-                },
                 CoroutineState::Yielded(YieldOp::ValueOf(slot)) => {
                     arg = match ctx.values.fact(Loc::root(Root::Slot(slot as u16)), VALUE) {
                         Some(&Known::Value(bits)) => ResumeArg::Boxed(bits),
@@ -7904,8 +6538,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let thunk_coro = coro.clone();
                         let thunk_ctx = ctx.clone();
                         debug!("emitting discovery thunk");
-                        // What the peephole holds, the guard's ways hold too. See Note [Peephole
-                        // fusion] in `peephole`.
                         let thunk = Residual::Thunk(self.make_discovery_thunk(block_id, thunk_coro, idx, CType::Type(expected), None, pc, thunk_ctx, true, 0));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
@@ -8138,7 +6770,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // A native with a generator is compiled by it, as an opcode is. See Note
                             // [Native generators] in `library`.
                             if native && !resumes && let CType::NativeFunction(nf) = &ctx.types[a] && let Some(generator) = nf.generator() {
-                                coro.generate(generator(nf.native(), a, b, c));
+                                coro = generator(nf.native(), a, b, c);
                                 arg = ResumeArg::Start;
                                 break 'machine;
                             }
@@ -8216,14 +6848,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     pc = pc.next_true();
                                     break 'machine;
                                 }
-                                return Some((pc.0 + 1, ctx, ResumeArg::Start, coro.take_held()));
+                                return Some((pc.0 + 1, ctx, ResumeArg::Start, block_id));
                             }
                             // In a version of the call's point, for the context at the call. See
                             // Note [Call sites].
-                            // Its own while the peephole holds something, which the context doesn't
-                            // say. See Note [Peephole fusion] in `peephole`.
-                            let holds = coro.holds_any();
-                            let found = self.versions.get(&self.proto).unwrap().get(&(pc, calling.clone())).copied().filter(|_| !holds);
+                            let found = self.versions.get(&self.proto).unwrap().get(&(pc, calling.clone())).copied();
                             let call_block = match found {
                                 Some(call_block) if call_block != block_id => {
                                     self.end_block(block_id);
@@ -8233,10 +6862,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 Some(call_block) => call_block,
                                 None => {
                                     let call_block = self.new_block(pc.0);
-                                    if !holds {
-                                        self.blocks[call_block.0].context = Some(calling.clone());
-                                        self.versions.get_mut(&self.proto).unwrap().insert((pc, calling.clone()), call_block);
-                                    }
+                                    self.blocks[call_block.0].context = Some(calling.clone());
+                                    self.versions.get_mut(&self.proto).unwrap().insert((pc, calling.clone()), call_block);
                                     #[cfg(feature = "tracing")]
                                     {
                                         let context = calling.tostring(owner);
@@ -8273,7 +6900,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 (After::Version(pc.0 + 1, after), continuation)
                             };
                             self.end_block(call_block);
-                            let thunk = self.make_call_thunk(call_block, calling, coro.clone(), self.instruction.clone(), pc, a, b, c, after, continuation, 0, true);
+                            let thunk = self.make_call_thunk(call_block, calling, pc, a, b, c, after, continuation, 0, true);
                             self.blocks[call_block.0].instructions.push(Residual::Thunk(thunk));
                             return None;
                         },
@@ -8394,59 +7021,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // If it was a jump, stop pumping the coroutine
                     return None;
                 },
-                // The next instruction, streamed into the peephole holding what it holds, if it is one
-                // compiled as a coroutine. See Note [Peephole fusion] in `peephole`.
-                // A jump's target, the only way on, streamed into the peephole holding what it holds,
-                // unless it is one the stream went on through, in the same context, or too many: a
-                // loop is a block's. See Note [Peephole fusion] in `peephole`.
-                CoroutineState::Yielded(YieldOp::Continue(target)) => {
-                    let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[target].clone() };
-                    let proto = self.proto as usize;
-                    let repeats = self.continued.len() >= MAX_CONTINUED
-                        || self.continued.iter().any(|(of, at, known)| *of == proto && *at == target && **known == *ctx);
-                    // Only where what it holds is of use there. See Note [Peephole memory] in `peephole`.
-                    let worth = !repeats && self.decode(target, &inst).is_some_and(|generator| self.worth_continuing(owner, &ctx, &coro, target, generator));
-                    arg = match self.decode(target, &inst).filter(|_| !repeats && worth) {
-                        Some(generator) => {
-                            // What a jump there carries, the stores held named by slots it keeps. See Note
-                            // [Jumped-to contexts].
-                            let live = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(target).unwrap_or(usize::MAX);
-                            rehome(&mut coro.held, &ctx, |slot| slot >= live);
-                            ctx = self.jumping(owner, ctx, target);
-                            // Only a call uses the top the instruction before left. See Note [Known top].
-                            if ctx.top.is_some() && !matches!(inst.0.Opcode(), Opcode::CALL | Opcode::TAILCALL) {
-                                Rc::make_mut(&mut ctx).top = None;
-                            }
-                            let holds = self.unheld.take() != Some(target);
-                            self.instruction = Some((target, Restart::Start(ctx.clone()), holds));
-                            self.continued.push((proto, target, ctx.clone()));
-                            coro.next_instruction(generator);
-                            pc = SubPc::new(target);
-                            ResumeArg::Matched
-                        },
-                        None => ResumeArg::Failed,
-                    };
-                },
-                CoroutineState::Yielded(YieldOp::NextPc) => {
-                    let next = pc.0 + 1;
-                    let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[next].clone() };
-                    arg = match self.decode(next, &inst) {
-                        Some(generator) => {
-                            // Only a call uses the top the instruction before left. See Note [Known top].
-                            if ctx.top.is_some() && !matches!(inst.0.Opcode(), Opcode::CALL | Opcode::TAILCALL) {
-                                Rc::make_mut(&mut ctx).top = None;
-                            }
-                            let holds = self.unheld.take() != Some(next);
-                            self.instruction = Some((next, Restart::Start(ctx.clone()), holds));
-                            coro.next_instruction(generator);
-                            pc = SubPc::new(next);
-                            ResumeArg::Matched
-                        },
-                        None => ResumeArg::Failed,
-                    };
-                },
                 CoroutineState::Complete(r) => {
-                    return Some((pc.0 + 1, ctx, r, coro.take_held()));
+                    return Some((pc.0 + 1, ctx, r, block_id));
                 }
             } break 'machine; }
         }
@@ -8846,7 +7422,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             state.witness_base = witness_frame;
             state.witness_top = witness_top;
         }
-        // A protected call is made from a frame made. See Note [Peephole fusion] in `peephole`.
+        // A protected call is made from a frame made. See Note [Inlined frames].
         state.shifted = 0;
         // `c - 1` results, or both with C = 0, the top just past them.
         let results = [LBoxed::from_bool(false), error];

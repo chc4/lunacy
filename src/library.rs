@@ -728,12 +728,6 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
                     crate::lboxed::is_integer(math1::<OP>(unsafe { checked_number(state.vals[state.base + a + 1]) }))
                 }));
                 if (yield YieldOp::Encoding(fits)) != ResumeArg::Type(CType::Type(LType::Double)) {
-                    // A floor of a quotient by a constant is the floored division. See Note
-                    // [Peephole fusion] in `peephole`.
-                    if OP == FLOOR {
-                        use crate::peephole::{Arith, IntOp, Operand};
-                        yield YieldOp::IntegerOp(IntOp { op: Arith::Floor, lhs: Operand::Slot(a + 1), rhs: Operand::K(0), dest: a });
-                    }
                     let fit = yield YieldOp::OptimisticExec(std::rc::Rc::new(WholeOptimistic::<OP>::new(&[a + 1, a])));
                     let ty = if fit == ResumeArg::Matched { LType::Integer } else { LType::Double };
                     yield YieldOp::SetCTypes(vec![(a, CType::Type(ty))]);
@@ -801,47 +795,6 @@ fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> 
             yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Table))]);
             yield YieldOp::Copy(a, a + 1);
             return ResumeArg::Start;
-        }
-        yield YieldOp::NativeCall { nf, a, b, c };
-        ResumeArg::Start
-    })
-}
-
-/// `jit.disjoint`'s generator: for `disjoint(...)` of tables keeping no result, a check they are
-/// different tables, from each other and from the unique ones, and code past it knowing them
-/// unique. Any other call is the native's. See Note [Disjoint tables] in `specialize`.
-#[cfg(feature = "magic")]
-fn disjoint_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
-    use crate::specialize::{ResumeArg, YieldOp};
-    crate::window::windowed!(guard Distinct, [], [], |owner, state, base| (x, y) {
-        x.bits() != y.bits()
-    });
-    Box::new(#[coroutine] move |_: ResumeArg| {
-        if b > 1 && c == 1 {
-            let args: Vec<usize> = (a + 1..a + b).collect();
-            let mut tables = true;
-            for i in 0..args.len() {
-                if (yield YieldOp::Guard(args[i], LType::Table)) != ResumeArg::Matched {
-                    tables = false;
-                    break;
-                }
-            }
-            if tables && let ResumeArg::Slots(uniques) = (yield YieldOp::Uniques(args.clone())) {
-                let mut apart = true;
-                'pairs: for i in 0..args.len() {
-                    for j in i + 1..args.len() + uniques.len() {
-                        let other = if j < args.len() { args[j] } else { uniques[j - args.len()] };
-                        if (yield YieldOp::GuardDynamic(std::rc::Rc::new(Distinct::new(&[args[i], other])))) != ResumeArg::Matched {
-                            apart = false;
-                            break 'pairs;
-                        }
-                    }
-                }
-                if apart {
-                    yield YieldOp::Unique(args);
-                    return ResumeArg::Start;
-                }
-            }
         }
         yield YieldOp::NativeCall { nf, a, b, c };
         ResumeArg::Start
@@ -1286,9 +1239,6 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         ("tripped", native!(pure generator: tripped_generator, |owner, args| {
             vec![LBoxed::from_bool(!table(arg(&args, 0)).ro(owner).watched)]
         })),
-        // `jit.disjoint(...)`: nothing, and code past it knowing its tables are different ones.
-        // See Note [Disjoint tables] in `specialize`.
-        ("disjoint", native!(pure generator: disjoint_generator, |owner, args| Vec::new())),
     ]);
 
     MODULES.with_borrow_mut(|modules| {

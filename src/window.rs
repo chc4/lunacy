@@ -318,12 +318,9 @@ pub trait Window: std::fmt::Debug {
     fn selects(&self) -> bool {
         false
     }
-    /// What it may do to memory besides its operands. See Note [Window memory].
-    fn memory(&self) -> Memory {
-        Memory::Writes
-    }
-    /// Whether that memory is the running closure's, its upvalues, which code in an inlined call's
-    /// frame finds only once the frame is made. See Note [Peephole fusion] in `peephole`.
+    /// Whether the memory it touches is the running closure's, its upvalues, which code in an
+    /// inlined call's frame finds only once the frame is made. See Note [Inlined frames] in
+    /// `specialize`.
     fn closure(&self) -> bool {
         false
     }
@@ -426,34 +423,10 @@ pub(crate) use bind_record;
 // ~~~~~~~~~~~~~~~~~~~~~
 // A window op reads and writes its operands, which it declares, and may read or write memory
 // besides: the heap, through the owner of its cells, a table's elements and fields, upvalues, the
-// running closure. What it may do to memory is part of its declaration, as `reads` or `writes`
-// before it, and only an op declaring it is given the owner, shared to read or not to write:
-// without it, its body can't reach the heap. The peephole holds what an op that touches no memory
-// can't observe or change across it.
-
-/// What a window op may do to memory besides its operands. See Note [Window memory].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Memory {
-    None,
-    Reads,
-    /// Reads, and writes.
-    Writes,
-    /// Writes the frames of calls, never a table: pushing or popping one, with its callstack
-    /// entry, and closing its open upvalues into their cells. It needs the owner as a writer
-    /// does, for the closure and the cells, but no table's elements are among what it touches,
-    /// so whatever is known or held of them stays as it was across it.
-    Frame,
-    /// Reads only the properties of a table's array part, its length and its kind, as a guard that
-    /// a key is in it does. A store into an element already in it, of a value that isn't nil and
-    /// widens no kind, changes neither, so it needn't be written before it.
-    Properties,
-    /// Reads only upvalues' cells, never a table, nor through the running closure: a store into an
-    /// element changes nothing it reads.
-    Cells,
-    /// Reads and writes only tables' hash parts, and the witnesses of their keys, never an array
-    /// part: no element a store into one is, nor one a load from one reads.
-    Fields,
-}
+// running closure. Whether it may is part of its declaration, as `reads` or `writes` before it,
+// and only an op declaring it is given the owner, shared to read or not to write: without it, its
+// body can't reach the heap. One reaching memory through the running closure, its upvalues,
+// declares `upvalues` or `sets_upvalues` instead.
 
 /// The owner of an op that touches no memory: nothing to reach the heap through. See Note
 /// [Window memory].
@@ -490,9 +463,7 @@ pub struct NoMemory;
 /// goes on at the op's only exit: the op selects nothing.
 ///
 /// `windowed!(reads Name, ...)` or `windowed!(writes ...)` declares an op that reads, or writes,
-/// memory besides its operands: only one does is given `owner`. `windowed!(frames ...)` declares
-/// one that writes only the frames of calls (`Memory::Frame`), and `windowed!(properties ...)` one
-/// that reads only an array part's length and kind (`Memory::Properties`). See Note [Window memory].
+/// memory besides its operands: only one does is given `owner`. See Note [Window memory].
 ///
 /// `windowed!(guard Name, ...)` declares a dynamic guard's op, whose body
 /// evaluates to whether it passes: the op selects 0 when it does, and its
@@ -512,18 +483,6 @@ macro_rules! windowed {
     };
     (writes $($rest:tt)*) => {
         $crate::window::windowed!(@mem writes $($rest)*);
-    };
-    (frames $($rest:tt)*) => {
-        $crate::window::windowed!(@mem frames $($rest)*);
-    };
-    (properties $($rest:tt)*) => {
-        $crate::window::windowed!(@mem properties $($rest)*);
-    };
-    (cells $($rest:tt)*) => {
-        $crate::window::windowed!(@mem cells $($rest)*);
-    };
-    (fields $($rest:tt)*) => {
-        $crate::window::windowed!(@mem fields $($rest)*);
     };
     // Memory through the running closure: its upvalues, which it `upvalues` reads, or
     // `sets_upvalues` writes. See Note [Window memory].
@@ -656,21 +615,8 @@ macro_rules! windowed {
     (@owner none, $owner:ident) => { $crate::window::NoMemory };
     (@owner reads, $owner:ident) => { &*$owner };
     (@owner writes, $owner:ident) => { $owner };
-    (@owner frames, $owner:ident) => { $owner };
-    (@owner properties, $owner:ident) => { &*$owner };
     (@owner upvalues, $owner:ident) => { &*$owner };
-    (@owner cells, $owner:ident) => { &*$owner };
-    (@owner fields, $owner:ident) => { $owner };
     (@owner sets_upvalues, $owner:ident) => { $owner };
-    (@memory none) => { $crate::window::Memory::None };
-    (@memory reads) => { $crate::window::Memory::Reads };
-    (@memory writes) => { $crate::window::Memory::Writes };
-    (@memory frames) => { $crate::window::Memory::Frame };
-    (@memory properties) => { $crate::window::Memory::Properties };
-    (@memory upvalues) => { $crate::window::Memory::Reads };
-    (@memory cells) => { $crate::window::Memory::Cells };
-    (@memory fields) => { $crate::window::Memory::Fields };
-    (@memory sets_upvalues) => { $crate::window::Memory::Writes };
     (@closure upvalues) => { true };
     (@closure sets_upvalues) => { true };
     (@closure $other:ident) => { false };
@@ -878,7 +824,6 @@ macro_rules! windowed {
             fn name(&self) -> &'static str { stringify!($name) }
             fn operands(&self) -> &[usize] { &self.operands }
             fn accesses(&self) -> &'static [$crate::window::Access] { Self::ACCESSES }
-            fn memory(&self) -> $crate::window::Memory { $crate::window::windowed!(@memory $mem) }
             fn closure(&self) -> bool { $crate::window::windowed!(@closure $mem) }
             fn with_operands(&self, operands: &[usize]) -> std::rc::Rc<dyn $crate::window::Window> {
                 $crate::window::check_operands(stringify!($name), operands, Self::ACCESSES);

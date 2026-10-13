@@ -1,7 +1,6 @@
--- A load from a frozen table is of no element a store held in the peephole
--- writes: a store into the frozen table trips first. A loop holds a store,
--- loads from a frozen table, and loads the stored element again; then a store
--- into the frozen table through another name, seen by the next load.
+-- A loop stores into a table, loads from a frozen table, and loads the stored
+-- element again; then a store into the frozen table through another name, seen
+-- by the next load.
 
 local frozen = jit and jit.frozen or function(t) return t end
 

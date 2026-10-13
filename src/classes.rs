@@ -94,10 +94,6 @@ pub trait ClassFact: Clone + Eq + Hash + Debug {
     fn join(&self, other: &Self) -> Option<Self>;
     /// Whether a value known as `self` is known as `weaker`, of the same key, too.
     fn implies(&self, weaker: &Self) -> bool;
-    /// Whether a class known as `self` holds a value no other class known as it holds.
-    fn distinct(&self) -> bool {
-        false
-    }
 }
 
 /// What a field holds: a class, an open slot's value whatever it is now, or a class in a cell
@@ -582,29 +578,8 @@ impl<F: ClassFact> Classes<F> {
                 joined.fields.push((class, label, target));
             }
         }
-        // A class holding a value no other one known so holds does in the join only if no other
-        // one known so is of its class on either side.
-        let distinct: Vec<(u32, u32, u32, F::Key)> = pairs.iter()
-            .flat_map(|(&(a, b), &class)| joined.facts.iter().filter(move |(c, _)| *c == class)
-                .flat_map(|(_, facts)| facts.iter().filter(|f| f.distinct()).map(|f| f.key()))
-                .map(move |key| (a, b, class, key)))
-            .collect();
-        for (class, facts) in &mut joined.facts {
-            let Some(&(a, b, _, _)) = distinct.iter().find(|d| d.2 == *class) else { continue };
-            facts.retain(|fact| !fact.distinct()
-                || !distinct.iter().any(|&(x, y, c, key)| c != *class && key == fact.key() && (x == a || y == b)));
-        }
-        joined.facts.retain(|(_, facts)| !facts.is_empty());
         joined.normalize();
         joined
-    }
-
-    /// Each class knowing a fact of `key`, as its roots.
-    pub fn knowing(&self, key: F::Key) -> Vec<Vec<Root>> {
-        self.facts.iter()
-            .filter(|(_, facts)| facts.iter().any(|f| f.key() == key))
-            .map(|&(class, _)| self.roots.iter().filter(|&&(_, c)| c == class).map(|&(root, _)| root).collect())
-            .collect()
     }
 
     /// Whether code relying on what `self` knows can run in `other`: `other` knows at least as
@@ -647,16 +622,6 @@ impl<F: ClassFact> Classes<F> {
                     },
                     (Target::Open(x), Some(Target::Open(y))) if x == y => {},
                     _ => return false,
-                }
-            }
-        }
-        // Classes holding values no other one known so holds are different classes in `other`.
-        let mut apart: HashMap<(u32, F::Key), u32> = HashMap::new();
-        for (class, facts) in &self.facts {
-            let Some(&theirs) = mapped.get(class) else { continue };
-            for fact in facts.iter().filter(|f| f.distinct()) {
-                if apart.insert((theirs, fact.key()), *class).is_some() {
-                    return false;
                 }
             }
         }

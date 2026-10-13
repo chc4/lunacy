@@ -1,18 +1,15 @@
--- Runs of integer arithmetic, which the peephole fuses into one operation: a
--- stack index as uxn.lua computes it, a run around a table read, one whose
--- intermediate result doesn't fit an integer though what it leaves does, and
--- one whose result doesn't fit once its inputs grow, which takes the fused
--- operation's cold path. And runs computing a key a get or a set then checks
--- is in a table's array part, which they fuse with: one whose key is sometimes
--- past it, in the hash part or nil there, which takes the cold path too. And
--- two chains of different values interleaved, held apart, one of which
+-- Runs of integer arithmetic: a stack index as uxn.lua computes it, a run
+-- around a table read, one whose intermediate result doesn't fit an integer
+-- though what it leaves does, and one whose result doesn't fit once its inputs
+-- grow. And runs computing a key a get or a set then checks is in a table's
+-- array part: one whose key is sometimes past it, in the hash part or nil
+-- there. And two chains of different values interleaved, one of which
 -- overflows near the largest integer. And values computed and overwritten
--- before anything reads them, one overflowing, which the peephole never lays
--- out. And two chains where the second overflows after the first is written in
--- place, and a sum of a product, whose spell the product's goes on into, which
--- overflows. And the floor of an integer's quotient by a constant, a shift or
--- a floored division, past the guards on the function called. Once, and in
--- loops run often enough for JIT code.
+-- before anything reads them, one overflowing. And two chains where the second
+-- overflows after the first is written in place, and a sum of a product which
+-- overflows. And the floor of an integer's quotient by a constant, past the
+-- guards on the function called. Once, and in loops run often enough for JIT
+-- code.
 
 local function index(p)
   return (p - 1) % 256 + 1
@@ -54,7 +51,7 @@ local function interleaved(i, j)
 end
 
 local function dead(i, j)
-  -- Overwritten by a chain, a constant and an op the peephole can't hold.
+  -- Overwritten by a chain, a constant and an op of no integers.
   local t = i + 1
   t = t % 256
   t = j - 3

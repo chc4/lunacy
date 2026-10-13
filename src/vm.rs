@@ -1822,7 +1822,7 @@ pub struct RunState<'src, 'intern> {
     /// entries in it. See Note [Frame ops] in `specialize`.
     pub jit_depth: usize,
     /// How many slots past the base of the innermost frame made the base is: the frames of inlined
-    /// calls `Enter` moved it to without making them. See Note [Peephole fusion] in `peephole`.
+    /// calls `Enter` moved it to without making them. See Note [Inlined frames] in `specialize`.
     pub shifted: usize,
     /// How many entries past the callstack's length a bailout through frames
     /// JIT code called has written, as their calls unwind. See Note [Frame ops]

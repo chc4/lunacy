@@ -1,5 +1,5 @@
--- Stores into array parts the peephole holds, and loads of what they store,
--- through tables that may be one another: each loop runs often enough for JIT
+-- Stores into array parts, and loads of what they store, through tables that
+-- may be one another: each loop runs often enough for JIT
 -- code, and reads back what it stored, through the same table, another local
 -- holding it, or another table, at constant and register keys.
 

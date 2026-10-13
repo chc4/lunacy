@@ -1,6 +1,5 @@
--- What the peephole holds goes on held through a jump that is an instruction's only way on, and is
--- laid out on each edge of a branch: a loop whose body computes a value, replaces it on one way
--- of a branch, and sums it.
+-- A value computed before a jump that is an instruction's only way on, and before a branch: a loop
+-- whose body computes a value, replaces it on one way of a branch, and sums it.
 
 local function run(n, low)
   local sum = 0

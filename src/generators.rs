@@ -22,7 +22,6 @@ use crate::vm::InternedHasher;
 use crate::chunk::Constant;
 use crate::chunk::Instruction;
 use crate::window::{windowed, Access, Window};
-use crate::peephole::{Element, MemOp, Operand, Stored};
 // The native code generator (`JitContext`) and its per-block `JitInfo` (dynasm
 // buffer + hotness tiering) are only needed with the `jit` feature.
 #[cfg(feature = "jit")]
@@ -171,8 +170,6 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
                 match yield YieldOp::EncodeK(dest, bx as usize) {
                     encoding if whole && encoding != ResumeArg::Type(CType::Type(LType::Double)) => {
                         let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(bx as usize)) else { unreachable!() };
-                        // A constant the peephole may hold. See Note [Peephole fusion] in `peephole`.
-                        yield YieldOp::IntegerOp(crate::peephole::IntOp::constant(k, dest));
                         yield YieldOp::ExecWindow(Rc::new(LoadK::new(LBoxed::from_int(k).bits(), &[dest])));
                         yield YieldOp::SetTypes(vec![(dest, LType::Integer)]);
                         // Rebuilt without the fact, it isn't introduced.
@@ -268,7 +265,7 @@ windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
 // GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
 // [Global caches].
 // A cache that misses is refilled out of line.
-windowed!(fields GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
+windowed!(writes GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         Some(entry) => {
@@ -297,7 +294,7 @@ windowed!(fields GetGlobal, [cache: usize], [], |owner, state, base| (out dest) 
 });
 // A string's field, from the strings' table through the cache of its constant
 // key. See Note [String methods] in `specialize`.
-windowed!(fields GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
+windowed!(writes GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         Some(entry) => {
@@ -312,7 +309,7 @@ windowed!(fields GetStringMethod, [cache: usize], [], |owner, state, base| (out 
 });
 // A store that hits the cache and keeps the field's type stores in place; any
 // other, or one needing the write barrier, goes out of line.
-windowed!(fields SetGlobal, [cache: usize], [], |owner, state, base| (value) {
+windowed!(writes SetGlobal, [cache: usize], [], |owner, state, base| (value) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         // Hash keys of registers holding the environment know a field's type
@@ -387,11 +384,11 @@ pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield =
 
 // `GuardDynamic` tests: whether a `CType::Type(LType::Integer)` key, in a register or the
 // constant `k`, is in a table's array part. See Note [Dynamic guards].
-crate::window::windowed!(properties guard InArray, [], [], |owner, state, base| (table, key) {
+crate::window::windowed!(reads guard InArray, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(key.as_int()) < tab.ro(owner).array.len()
 });
-crate::window::windowed!(properties guard InArrayK, [k: i32], [], |owner, state, base| (table) {
+crate::window::windowed!(reads guard InArrayK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(k) < tab.ro(owner).array.len()
 });
@@ -405,21 +402,16 @@ crate::window::windowed!(guard IsValue, [bits: u64], [], |owner, state, base| (v
 windowed!(LoadFrozen, [bits: u64], [], |owner, state, base| (out dest) {
     *dest = LBoxed::from_bits(bits);
 });
-// The value a store the peephole holds stores, as its cell's load. See Note [Peephole memory] in
-// `peephole`: a constant's lives as long as its prototype.
-windowed!(LoadStored, [bits: u64], [], |owner, state, base| (out dest) {
-    *dest = LBoxed::from_bits(bits);
-});
 // Whether an integer is `k`: a promote's guard. See Note [Promoted values] in `specialize`.
 crate::window::windowed!(guard EqualsK, [k: i32], [], |owner, state, base| (value) {
     value.as_int() == k
 });
 // And whether the element there isn't nil.
-crate::window::windowed!(properties guard InArrayHeld, [], [], |owner, state, base| (table, key) {
+crate::window::windowed!(reads guard InArrayHeld, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).array.get(integer_slot(key.as_int())).is_some_and(|v| !v.is_nil())
 });
-crate::window::windowed!(properties guard InArrayHeldK, [k: i32], [], |owner, state, base| (table) {
+crate::window::windowed!(reads guard InArrayHeldK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).array.get(integer_slot(k)).is_some_and(|v| !v.is_nil())
 });
@@ -548,27 +540,25 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             } cold {
                 1
             });
-            // The key, a constant or not, of a load in the array part. Its ops are made as they are
-            // yielded, never kept across a yield: a clone of this coroutine clones what it kept
-            // there even moved out of, which may be an op nothing else holds by then.
+            // The key of a load in the array part: a constant, or none for the key's register. Its
+            // ops are made as they are yielded, never kept across a yield: a clone of this
+            // coroutine clones what it kept there even moved out of, which may be an op nothing
+            // else holds by then.
             let key = match (integer, &in_array) {
-                (Some(Some(k)), ResumeArg::Matched) => Some(Operand::K(k)),
-                (Some(None), ResumeArg::Matched) => Some(Operand::Slot(c)),
+                (Some(key), ResumeArg::Matched) => Some(key),
                 _ => None,
             };
             if let Some(key) = key {
                 // As one step each way, as the nil test is. See Note [Subblocks].
                 if !chains {
                     yield YieldOp::Decided(true);
-                    // See Note [Peephole memory] in `peephole`.
-                    yield YieldOp::MemoryOp(MemOp::Load { cell: Element { table: b, key, range: None }, dest: a });
                     arg = yield YieldOp::ExecWindow(match key {
-                        Operand::K(k) => Rc::new(GetTableArray::new(k, &[b, a])),
-                        Operand::Slot(_) => Rc::new(GetTableInteger::new(&[b, c, a])),
+                        Some(k) => Rc::new(GetTableArray::new(k, &[b, a])),
+                        None => Rc::new(GetTableInteger::new(&[b, c, a])),
                     });
                 } else if (yield YieldOp::OptimisticExec(match key {
-                    Operand::K(k) => Rc::new(GetTableArrayChain::new(k, &[b, a])),
-                    Operand::Slot(_) => Rc::new(GetTableIntegerChain::new(&[b, c, a])),
+                    Some(k) => Rc::new(GetTableArrayChain::new(k, &[b, a])),
+                    None => Rc::new(GetTableIntegerChain::new(&[b, c, a])),
                 })) != ResumeArg::Matched {
                     arg = yield YieldOp::Exec(gettable(a, b, c));
                     yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
@@ -680,7 +670,7 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
 }
 
 // Store through a hash key's witness into a register's table.
-windowed!(fields SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, state, base| (table, value) {
+windowed!(writes SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, state, base| (table, value) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     store_field(owner, state, &tab, value, href, expected, RETYPE);
     // Last. See Note [Write barriers].
@@ -689,7 +679,7 @@ windowed!(fields SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |ow
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.barrier_slow();
 });
-windowed!(fields SetTableHrefK, [href: u8, expected: Kind, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
+windowed!(writes SetTableHrefK, [href: u8, expected: Kind, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     // A constant's value lives as long as its prototype.
     let value = LBoxed::from_bits(value);
@@ -844,11 +834,6 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 tab.barrier_slow();
             });
-            // One keeping the array part's length and kind. See Note [Peephole memory] in `peephole`.
-            if how == Widen::No && !nil {
-                let value = match constant { Some(bits) => Stored::Boxed(bits), None => Stored::Slot(c) };
-                yield YieldOp::MemoryOp(MemOp::Store { cell: Element { table: a, key: Operand::K(k), range: None }, value });
-            }
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {
                     macro_rules! make { ($W:tt) => { if nil { Rc::new(SetTableArray::<$W, true>::new(k, &[a, c])) as Rc<dyn Window> } else { Rc::new(SetTableArray::<$W, false>::new(k, &[a, c])) as Rc<dyn Window> } } }
@@ -886,11 +871,6 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 tab.barrier_slow();
             });
-            // One keeping the array part's length and kind. See Note [Peephole memory] in `peephole`.
-            if how == Widen::No && !nil {
-                let value = match constant { Some(bits) => Stored::Boxed(bits), None => Stored::Slot(c) };
-                yield YieldOp::MemoryOp(MemOp::Store { cell: Element { table: a, key: Operand::Slot(b), range: None }, value });
-            }
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {
                     macro_rules! make { ($W:tt) => { if nil { Rc::new(SetTableInteger::<$W, true>::new(&[a, b, c])) as Rc<dyn Window> } else { Rc::new(SetTableInteger::<$W, false>::new(&[a, b, c])) as Rc<dyn Window> } } }
@@ -1213,12 +1193,9 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             // Notes [Integers] and [Optimistic ops].
             let integers = integer_operands!(lhs, rhs);
             let (lk, rk) = ((lhs & 0x100) != 0, (rhs & 0x100) != 0);
-            // The op, and whether its result can fail to fit. A constant operand is its
-            // value, as `k`. luac folds two.
             // The op, whether its result can fail to fit, and whether it fits for the values its
-            // operands have. A constant operand is its value, as `k`.
-            use crate::peephole::{IntOp, Operand};
-            let op: Option<(Rc<dyn Window>, bool, Option<crate::specialize::Fits>, Option<IntOp>)> = if !integers || (lk && rk) {
+            // operands have. A constant operand is its value, as `k`; luac folds two.
+            let op: Option<(Rc<dyn Window>, bool, Option<crate::specialize::Fits>)> = if !integers || (lk && rk) {
                 None
             } else if lk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(lhs & 0xff)) else { unreachable!() };
@@ -1232,7 +1209,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     1
                 });
                 let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| integer_fits(opcode, k, unsafe { state.vals[state.base + rhs].as_int() })));
-                Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true, Some(fits), IntOp::of(opcode, Operand::K(k), Operand::Slot(rhs), dest)))
+                Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true, Some(fits)))
             } else if rk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rhs & 0xff)) else { unreachable!() };
                 crate::window::windowed!(IntegerRK, [k: i32], [OP: Opcode], |owner, state, base, tag| (lhs, out dest) {
@@ -1253,13 +1230,12 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 crate::window::windowed!(MaskRK, [mask: i32], [], |owner, state, base, tag| (lhs, out dest) {
                     *dest = LBoxed::from_int_tagged(lhs.as_int() & mask, tag);
                 });
-                let int_op = IntOp::of(opcode, Operand::Slot(lhs), Operand::K(k), dest);
                 Some(match opcode == Opcode::MOD && k != 0 {
-                    true if k > 0 && k & (k - 1) == 0 => (Rc::new(MaskRK::new(k - 1, &[lhs, dest])) as Rc<dyn Window>, false, None, int_op),
-                    true => (Rc::new(ModRK::new(k, &[lhs, dest])) as Rc<dyn Window>, false, None, int_op),
+                    true if k > 0 && k & (k - 1) == 0 => (Rc::new(MaskRK::new(k - 1, &[lhs, dest])) as Rc<dyn Window>, false, None),
+                    true => (Rc::new(ModRK::new(k, &[lhs, dest])) as Rc<dyn Window>, false, None),
                     false => {
                         let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| integer_fits(opcode, unsafe { state.vals[state.base + lhs].as_int() }, k)));
-                        (dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest])), true, Some(fits), int_op)
+                        (dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest])), true, Some(fits))
                     },
                 })
             } else {
@@ -1275,24 +1251,19 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| unsafe {
                     integer_fits(opcode, state.vals[state.base + lhs].as_int(), state.vals[state.base + rhs].as_int())
                 }));
-                Some((dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest])), true, Some(fits), IntOp::of(opcode, Operand::Slot(lhs), Operand::Slot(rhs), dest)))
+                Some((dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest])), true, Some(fits)))
             };
             // As one step each way, as a guard of whether the result fits is
             // (Note [Subblocks]). Cloned out of, never moved: cloning the generator
             // across these yields clones `op` too, which must stay whole.
-            let window = |op: &Option<(Rc<dyn Window>, bool, Option<crate::specialize::Fits>, Option<IntOp>)>| op.as_ref().unwrap().0.clone();
-            // What its window computes, for the peephole. See Note [Peephole fusion] in `peephole`.
-            let int_op = op.as_ref().and_then(|op| op.3);
-            match op.as_ref().map(|(_, fallible, fits, _)| (*fallible, fits.is_some())) {
+            let window = |op: &Option<(Rc<dyn Window>, bool, Option<crate::specialize::Fits>)>| op.as_ref().unwrap().0.clone();
+            match op.as_ref().map(|(_, fallible, fits)| (*fallible, fits.is_some())) {
                 Some((true, true)) => {
                     // In the integer encoding if it fits when it first runs, until it
                     // overflows, which rebuilds it to compute in the double one. See Note
                     // [Optimistic ops] in `specialize`.
-                    let fits = op.as_ref().and_then(|(_, _, fits, _)| fits.clone()).unwrap();
+                    let fits = op.as_ref().and_then(|(_, _, fits)| fits.clone()).unwrap();
                     if (yield YieldOp::Encoding(fits)) != ResumeArg::Type(CType::Type(LType::Double)) {
-                        if let Some(int_op) = int_op {
-                            yield YieldOp::IntegerOp(int_op);
-                        }
                         let fits = yield YieldOp::OptimisticExec(window(&op));
                         let ty = if fits == ResumeArg::Matched { LType::Integer } else { LType::Double };
                         yield YieldOp::SetCTypes(vec![(dest, CType::Type(ty))]);
@@ -1302,9 +1273,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 },
                 Some(_) => {
                     yield YieldOp::Decided(true);
-                    if let Some(int_op) = int_op {
-                        yield YieldOp::IntegerOp(int_op);
-                    }
                     yield YieldOp::ExecWindow(window(&op));
                     yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Integer))]);
                     return arg;
@@ -1350,12 +1318,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(rhsc)) else { unreachable!() };
-                // An integer's quotient by a positive whole constant, which a floor of it can
-                // compute from the integer. See Note [Peephole fusion] in `peephole`.
-                if opcode == Opcode::DIV && lint && k >= 1.0 && k <= i32::MAX as f64 && k.fract() == 0.0 {
-                    use crate::peephole::{Arith, IntOp, Operand};
-                    yield YieldOp::IntegerOp(IntOp { op: Arith::Div, lhs: Operand::Slot(lhs), rhs: Operand::K(k as i32), dest });
-                }
                 Some(numeric_rk(opcode, lint, k, &[lhs, dest]))
             },
             _ => None,
@@ -1699,25 +1661,6 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
     }
 }
 
-/// Lay out what the peephole holds. See Note [Peephole fusion] in `peephole`.
-pub fn emit_lay_out() -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
-    #[coroutine]
-    move |_: ResumeArg| {
-        yield YieldOp::LayOut;
-        ResumeArg::Start
-    }
-}
-
-/// What the peephole holds laid out, then the jump to `to`: an edge into code what it holds can't
-/// go on held into. See Note [Peephole fusion] in `peephole`.
-pub fn emit_lay_out_to(to: BlockId) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
-    #[coroutine]
-    move |_: ResumeArg| {
-        yield YieldOp::LayOut;
-        yield YieldOp::Jump(to)
-    }
-}
-
 pub fn emit_jmp(sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -1923,7 +1866,7 @@ pub fn emit_close(a: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return
 pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // Into a slot holding its value already, nothing. See Note [Peephole fusion] in `peephole`.
+        // Into a slot holding its value already, nothing.
         if (yield YieldOp::HoldsValue(dest, src)) == ResumeArg::Matched {
             return ResumeArg::Start;
         }
@@ -1951,8 +1894,8 @@ windowed!(upvalues GetUpval, [index: usize, cell: usize], [], |owner, state, bas
     *dest = upval;
 });
 // An upvalue of `closure`, the closure an inlined call whose frame isn't made calls, known: the
-// running closure is its caller's until it is. See Note [Peephole fusion] in `peephole`.
-windowed!(cells CalledUpval, [closure: u64, index: usize], [], |owner, state, base| (out dest) {
+// running closure is its caller's until it is. See Note [Inlined frames] in `specialize`.
+windowed!(reads CalledUpval, [closure: u64, index: usize], [], |owner, state, base| (out dest) {
     let LValue::LClosure(clos) = LBoxed::from_bits(closure).unbox() else { unreachable!("an inlined call's closure") };
     *dest = state.upvalue_of(owner, &clos, index);
 });
@@ -1986,12 +1929,12 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
     move |mut arg: ResumeArg| {
         // An upvalue the context knows holds a native is that constant, not a
         // read. See Note [Fragile information].
-        windowed!(cells NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
+        windowed!(reads NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
             #[cfg(debug_assertions)]
             {
                 // The code's closure, below its frame, which needn't be the running one: an
                 // inlined call's frame isn't made until something observes it. See Note
-                // [Peephole fusion] in `peephole`.
+                // [Inlined frames] in `specialize`.
                 let clos = match state.vals[state.base - 1].unbox() {
                     LValue::LClosure(clos) => clos,
                     _ => state.clos.clone(),
@@ -2007,12 +1950,12 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
         });
         // One a slot is known to still hold is a move from that slot, or
         // nothing if it is the destination.
-        windowed!(cells HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
+        windowed!(reads HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
             #[cfg(debug_assertions)]
             {
                 // The code's closure, below its frame, which needn't be the running one: an
                 // inlined call's frame isn't made until something observes it. See Note
-                // [Peephole fusion] in `peephole`.
+                // [Inlined frames] in `specialize`.
                 let clos = match state.vals[state.base - 1].unbox() {
                     LValue::LClosure(clos) => clos,
                     _ => state.clos.clone(),
@@ -2039,7 +1982,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
                 yield YieldOp::ExecWindow(Rc::new(HeldUpval::new(b, &[slot as usize, a])));
             },
             // In an inlined call's frame not made, through its closure, below it. See Note
-            // [Peephole fusion] in `peephole`.
+            // [Inlined frames] in `specialize`.
             _ if let Some(closure) = called => {
                 yield YieldOp::ExecWindow(Rc::new(CalledUpval::new(closure, b, &[a])));
             },
