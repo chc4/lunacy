@@ -263,7 +263,8 @@ fn lays_out(ctx: &Context, yielded: &YieldOp) -> bool {
             | YieldOp::Effect(_) | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::IsKey(..)
             | YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) | YieldOp::ArrayType(..)
             | YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) | YieldOp::NativeWindowArgs(..)
-            | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Created(_) | YieldOp::HoldsValue(..) | YieldOp::FrameUnmade => true,
+            | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Created(_) | YieldOp::HoldsValue(..) | YieldOp::FrameUnmade
+            | YieldOp::Quotient(..) | YieldOp::QuotientOf(_) => true,
         YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
         YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected)),
         YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
@@ -375,6 +376,10 @@ pub enum YieldOp {
                  // made and the closure is known, else Failed. See Note [Inlined frames]
     HoldsValue(usize, usize), // Resumed with Matched if STACK[dest] holds STACK[src]'s value
                               // already, a move between them nothing
+    Quotient(usize, usize, i32), // STACK[idx] was just computed as STACK[of] / by, of an integer by a
+                                 // positive constant. See Note [Quotients]
+    QuotientOf(usize), // Resumed with Quotient if STACK[idx] holds such a quotient of what a slot
+                       // holds, else Failed. See Note [Quotients]
     Created(usize), // STACK[idx] holds a table just made, which nothing watches. See Note [Watched tables]
     Watching(usize, bool), // A watch site of STACK[idx]'s table, frozen first if the bool says so:
                            // resumed with Matched, the code after knowing which table it is,
@@ -534,6 +539,9 @@ pub enum ResumeArg {
     Cell(usize, bool),
     /// A table's string keys. See `jit.learn` in `library`.
     Keys(Rc<[LConstant<'static, 'static>]>),
+    /// The slot holding the integer a value is the quotient of, and the constant. See Note
+    /// [Quotients].
+    Quotient(usize, i32),
 }
 
 // Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
@@ -2023,6 +2031,17 @@ fn overflow_rebuilds() -> bool {
     *REBUILDS
 }
 
+// Note [Quotients]
+// ~~~~~~~~~~~~~~~~
+// Lua's `/` is a double's division, so `math.floor(n / k)` divides in doubles and rounds back,
+// though for an integer `n` and a positive whole `k` it is the floored integer division of `n` by
+// `k`, a shift where `k` is a power of two. A division of an integer slot by such a constant gives
+// its result's value a field, the integer it is the quotient of (`Label::Quotient`); `math.floor`
+// of a value with that field computes the floored division from a slot holding the integer
+// instead. The division itself is still computed, for any other reader. The field is dropped at
+// jumps, as an element's table is (Note [Array kinds]), so it never tells versions apart: a
+// division and its floor are one block's.
+
 // Note [Optimistic ops]
 // ~~~~~~~~~~~~~~~~~~~~~
 // An op can do its common case on its hot path and the rest on its cold path (Note [Cold
@@ -2765,6 +2784,20 @@ impl Context {
     fn element_of(&self, slot: usize) -> Option<Root> {
         let path = [Label::ElementOf];
         self.values.members(Loc { root: Root::Slot(slot as u16), path: &path }).into_iter().find(|root| matches!(root, Root::Slot(_) | Root::Upvalue(_)))
+    }
+
+    /// A slot holding the integer slot `slot`'s value is the quotient of, and the constant. See
+    /// Note [Quotients].
+    fn quotient(&self, slot: usize) -> Option<(usize, i32)> {
+        let at = Loc::root(Root::Slot(slot as u16));
+        self.values.labels(at).into_iter().find_map(|label| {
+            let Label::Quotient(by) = label else { return None };
+            let path = [label];
+            self.values.members(Loc { root: at.root, path: &path }).into_iter().find_map(|root| match root {
+                Root::Slot(of) => Some((of as usize, by)),
+                _ => None,
+            })
+        })
     }
 
     /// The running function's upvalue whose value slot `slot` holds, if known.
@@ -4529,6 +4562,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let known = Rc::make_mut(&mut ctx);
             for slot in typed {
                 known.values.unlink(Loc::root(Root::Slot(slot as u16)), Label::ElementOf);
+            }
+        }
+        // Nor what a quotient was divided from. See Note [Quotients].
+        let quotients: Vec<(usize, Label)> = (0..ctx.types.len())
+            .flat_map(|slot| ctx.values.labels(Loc::root(Root::Slot(slot as u16))).into_iter().filter(|label| matches!(label, Label::Quotient(_))).map(move |label| (slot, label)))
+            .collect();
+        if !quotients.is_empty() {
+            let known = Rc::make_mut(&mut ctx);
+            for (slot, label) in quotients {
+                known.values.unlink(Loc::root(Root::Slot(slot as u16)), label);
             }
         }
         ctx
@@ -6365,6 +6408,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Created(slot)) => {
                     Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Unwatched);
+                },
+                CoroutineState::Yielded(YieldOp::Quotient(slot, of, by)) => {
+                    Rc::make_mut(&mut ctx).values.link(Loc::root(Root::Slot(slot as u16)), Label::Quotient(by), Loc::root(Root::Slot(of as u16)));
+                },
+                CoroutineState::Yielded(YieldOp::QuotientOf(slot)) => {
+                    arg = ctx.quotient(slot).map_or(ResumeArg::Failed, |(of, by)| ResumeArg::Quotient(of, by));
                 },
                 // A slot holding what a move into it would: the move is nothing.
                 CoroutineState::Yielded(YieldOp::HoldsValue(dest, src)) => {

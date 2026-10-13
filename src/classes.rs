@@ -71,6 +71,9 @@ pub enum Label {
     ElementOf,
     /// The hash field of a name, by its hash, of the table it is.
     Field(u64),
+    /// The integer it is the quotient of by a positive constant. See Note [Quotients] in
+    /// `specialize`.
+    Quotient(i32),
 }
 
 /// A place: a root, or a field reached from one along `path`.
@@ -461,6 +464,11 @@ impl<F: ClassFact> Classes<F> {
     /// Whether anything is known of the value `root` holds.
     pub fn has(&self, root: Root) -> bool {
         self.root_class(root).is_some()
+    }
+
+    /// The labels of the fields of the value `loc` holds that are known.
+    pub fn labels(&self, loc: Loc) -> Vec<Label> {
+        self.find(loc).map_or_else(Vec::new, |class| self.fields.iter().filter(|&&(c, _, _)| c == class).map(|&(_, label, _)| label).collect())
     }
 
     /// Whether field `label` of the value `loc` holds is known.
