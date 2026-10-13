@@ -21,6 +21,13 @@ use crate::window::{windowed, Window};
 // element dead and depends on held stores into elements that may be its; a load of an element only
 // one held store may be into is that store's value. A held store's registers are pinned as a spell's
 // inputs are, so what names its element stays true while it is held.
+//
+// It knows the range of each register's integer value as the integer ops it is told of compute it,
+// a constant's, or a stored value's loaded back, until something else writes the register, and
+// none of an unset one's. An element's key and a stored value have the range they had when the
+// access was made, as they stay while it is held: a key whose range leaves out another key is
+// another element. Ranges are the peephole's, never the context's: knowing them there would make
+// versions per range.
 
 // Note [Peephole fusion]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -135,11 +142,12 @@ impl IntOp {
 }
 
 /// An element of a table's array part: the table's register, and the key, a register or a
-/// constant. See Note [Peephole memory].
+/// constant, with the range its integer value has, if known. See Note [Peephole memory].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Element {
     pub table: usize,
     pub key: Operand,
+    pub range: Option<(i32, i32)>,
 }
 
 /// Whether two cells are the same, can't be, or may be. See Note [Peephole memory].
@@ -166,13 +174,14 @@ pub enum MemOp {
     Store { cell: Element, value: Stored },
 }
 
-/// A store held, unwritten: of `value` into `cell`, as `window` stores it, in instruction `at`,
-/// after the held stores `after` whose cells may be its own.
+/// A store held, unwritten: of `value`, of integer range `range` if known, into `cell`, as `window`
+/// stores it, in instruction `at`, after the held stores `after` whose cells may be its own.
 #[derive(Clone, Debug)]
 pub struct Store {
     id: usize,
     pub cell: Element,
     pub value: Stored,
+    pub range: Option<(i32, i32)>,
     pub window: Rc<dyn Window>,
     pub at: usize,
     after: Vec<usize>,
@@ -196,17 +205,52 @@ pub struct Need {
     pub memory: bool,
 }
 
-/// What a load of a cell becomes: the value a held store stores there, or itself, after the held
-/// stores whose cells may be its, laid out.
+/// What a load of a cell becomes: the value a held store stores there, with its range, or itself,
+/// after the held stores whose cells may be its, laid out.
 pub enum Load {
-    Forward(Stored),
+    Forward(Stored, Option<(i32, i32)>),
     After(Vec<Rc<dyn Window>>),
 }
 
 impl Load {
     pub fn is_forward(&self) -> bool {
-        matches!(self, Load::Forward(_))
+        matches!(self, Load::Forward(..))
     }
+}
+
+/// The range of `op`'s result, its operands' ranges as `range` has them, if known. See Note
+/// [Peephole memory].
+pub fn range_of(op: &IntOp, range: impl Fn(usize) -> Option<(i32, i32)>) -> Option<(i32, i32)> {
+    let of = |o: Operand| match o {
+        Operand::K(k) => Some((k as i64, k as i64)),
+        Operand::Slot(slot) => range(slot).map(|(lo, hi)| (lo as i64, hi as i64)),
+    };
+    let (lo, hi) = match (op.op, op.rhs) {
+        // Floored: of the divisor's sign, whatever the dividend.
+        (Arith::Mod, Operand::K(k)) if k > 0 => match of(op.lhs) {
+            Some((lo, hi)) if lo >= 0 && hi < k as i64 => (lo, hi),
+            _ => (0, k as i64 - 1),
+        },
+        (Arith::Mod, Operand::K(k)) if k < 0 => (k as i64 + 1, 0),
+        (Arith::Add, _) => {
+            let ((a, b), (c, d)) = (of(op.lhs)?, of(op.rhs)?);
+            (a + c, b + d)
+        },
+        (Arith::Sub, _) => {
+            let ((a, b), (c, d)) = (of(op.lhs)?, of(op.rhs)?);
+            (a - d, b - c)
+        },
+        (Arith::Mul, _) => {
+            let ((a, b), (c, d)) = (of(op.lhs)?, of(op.rhs)?);
+            let products = [a * c, a * d, b * c, b * d];
+            (*products.iter().min().unwrap(), *products.iter().max().unwrap())
+        },
+        (Arith::Floor, _) => of(op.lhs)?,
+        _ => return None,
+    };
+    // An integer op's result fits, or it fails.
+    let (lo, hi) = (lo.max(i32::MIN as i64), hi.min(i32::MAX as i64));
+    (lo <= hi).then_some((lo as i32, hi as i32))
 }
 
 /// Whether integer operations are held to fuse (Note [Peephole fusion]); set `LUNACY_NO_FUSION`
@@ -732,6 +776,8 @@ pub struct Spells {
     /// The slots an inlined call's frame starts nil in, not written yet: what's held reads them as
     /// they were, and a new reader gets a nil laid out first. See Note [Peephole memory].
     pub unset: Vec<usize>,
+    /// The range of each register's integer value it knows. See Note [Peephole memory].
+    pub ranges: Vec<(usize, i32, i32)>,
 }
 
 impl Spells {
@@ -841,6 +887,7 @@ impl Spells {
             store.cell = Element {
                 table: slot(store.cell.table),
                 key: match store.cell.key { Operand::Slot(k) => Operand::Slot(slot(k)), k => k },
+                range: store.cell.range,
             };
             if let Stored::Slot(v) = store.value {
                 store.value = Stored::Slot(slot(v));
@@ -860,6 +907,22 @@ impl Spells {
         self.unset.contains(&slot)
     }
 
+    /// The range of slot `slot`'s integer value, if it knows it: none while it is unset.
+    pub fn range(&self, slot: usize) -> Option<(i32, i32)> {
+        if self.unset(slot) {
+            return None;
+        }
+        self.ranges.iter().find(|r| r.0 == slot).map(|r| (r.1, r.2))
+    }
+
+    /// Slot `slot`'s integer value of range `range`, or of none known.
+    pub fn set_range(&mut self, slot: usize, range: Option<(i32, i32)>) {
+        self.ranges.retain(|r| r.0 != slot);
+        if let Some((lo, hi)) = range {
+            self.ranges.push((slot, lo, hi));
+        }
+    }
+
     /// What it holds, the spells of slots `keeps` keeps writing the slots `dest` names, and
     /// everything reading the slots `input` does, as instruction `at`'s: a callee's, past its
     /// return into its caller's code. See Note [Peephole fusion].
@@ -868,7 +931,7 @@ impl Spells {
         let stores = self.stores.iter().map(|store| {
             let mut store = store.clone();
             let key = |key: Operand| match key { Operand::Slot(slot) => Operand::Slot(input(slot)), k => k };
-            store.cell = Element { table: input(store.cell.table), key: key(store.cell.key) };
+            store.cell = Element { table: input(store.cell.table), key: key(store.cell.key), range: store.cell.range };
             if let Stored::Slot(slot) = store.value {
                 store.value = Stored::Slot(input(slot));
             }
@@ -877,7 +940,8 @@ impl Spells {
             store.at = at;
             store
         }).collect();
-        Spells { spells, stores, next: self.next, unset: self.unset.iter().map(|&slot| input(slot)).collect() }
+        let ranges = self.ranges.iter().map(|&(slot, lo, hi)| (input(slot), lo, hi)).collect();
+        Spells { spells, stores, next: self.next, unset: self.unset.iter().map(|&slot| input(slot)).collect(), ranges }
     }
 
     /// Whether they stay held on both ways of guard `test` of instruction `at`, found out at
@@ -898,12 +962,12 @@ impl Spells {
     /// store to the same cell is never read, and those to cells that may be its come before it.
     /// `alias` says how two cells are. How many held stores it made dead. See Note [Peephole
     /// memory].
-    pub fn hold_store(&mut self, cell: Element, value: Stored, window: Rc<dyn Window>, at: usize, alias: impl Fn(Element, Element) -> Alias) -> usize {
+    pub fn hold_store(&mut self, cell: Element, value: Stored, range: Option<(i32, i32)>, window: Rc<dyn Window>, at: usize, alias: impl Fn(Element, Element) -> Alias) -> usize {
         let dead = self.kill_stores(cell, &alias);
         let after = self.stores.iter().filter(|s| alias(s.cell, cell) == Alias::May).map(|s| s.id).collect();
         let id = self.next;
         self.next += 1;
-        self.stores.push(Store { id, cell, value, window, at, after });
+        self.stores.push(Store { id, cell, value, range, window, at, after });
         dead
     }
 
@@ -925,13 +989,13 @@ impl Spells {
     pub fn load(&mut self, cell: Element, dest: usize, alias: impl Fn(Element, Element) -> Alias) -> Load {
         let to: Vec<(usize, Alias)> = self.stores.iter().map(|s| (s.id, alias(s.cell, cell))).filter(|(_, a)| *a != Alias::Disjoint).collect();
         if let Some(&(id, Alias::Same)) = to.last() {
-            let value = self.stores.iter().find(|s| s.id == id).unwrap().value;
+            let store = self.stores.iter().find(|s| s.id == id).unwrap();
             let holds = |slot: usize| slot == dest || self.spells.iter().all(|spell| spell.dest != slot);
-            if let Stored::Boxed(_) = value {
-                return Load::Forward(value);
+            if let Stored::Boxed(_) = store.value {
+                return Load::Forward(store.value, store.range);
             }
-            if let Stored::Slot(slot) = value && holds(slot) {
-                return Load::Forward(value);
+            if let Stored::Slot(slot) = store.value && holds(slot) {
+                return Load::Forward(store.value, store.range);
             }
         }
         let mut laid: Vec<usize> = to.iter().map(|(id, _)| *id).collect();
@@ -1027,6 +1091,7 @@ impl Spells {
             }).collect(),
             next: self.next,
             unset: self.unset.iter().copied().filter(|slot| nils.contains(slot) == laid).collect(),
+            ranges: self.ranges.iter().copied().filter(|r| !nils.contains(&r.0)).collect(),
         };
         (part(true), part(false))
     }
@@ -1206,7 +1271,7 @@ mod tests {
 
     /// The element of the table in register `table` at `key`.
     fn element(table: usize, key: Operand) -> Element {
-        Element { table, key }
+        Element { table, key, range: None }
     }
 
     /// How two elements are, as the context would know them knowing only that a register is
@@ -1222,14 +1287,14 @@ mod tests {
     /// Hold the store of register `value` into `at`, as instruction `pc`.
     fn store(spells: &mut Spells, at: Element, value: usize, pc: usize) {
         let K(k) = at.key else { panic!("a test stores at a constant key") };
-        spells.hold_store(at, Stored::Slot(value), Rc::new(TestStore::new(k, &[at.table, value])), pc, alias);
+        spells.hold_store(at, Stored::Slot(value), None, Rc::new(TestStore::new(k, &[at.table, value])), pc, alias);
     }
 
     /// What a load of `at` becomes: the register forwarded, or the stores laid out before it, by
     /// their keys.
     fn load(spells: &mut Spells, at: Element) -> Result<Stored, Vec<i32>> {
         match spells.load(at, usize::MAX, alias) {
-            Load::Forward(value) => Ok(value),
+            Load::Forward(value, _) => Ok(value),
             Load::After(stores) => Err(stores.iter().map(|w| w.captures()[0] as i32).collect()),
         }
     }
@@ -1368,6 +1433,22 @@ mod tests {
         hold(&mut spells, 1, &[op(Arith::Add, Slot(4), K(1), 5)]);
         assert_eq!(spells.clone().load(element(1, K(1)), 6, alias).is_forward(), false);
         assert_eq!(spells.clone().load(element(1, K(1)), 5, alias).is_forward(), true);
+    }
+
+    #[test]
+    fn ranges_follow_the_arithmetic() {
+        let known = |slot: usize| (slot == 1).then_some((0, 255));
+        // A floored remainder is of its divisor's sign, whatever is divided.
+        assert_eq!(range_of(&op(Arith::Mod, Slot(2), K(256), 3), known), Some((0, 255)));
+        assert_eq!(range_of(&op(Arith::Mod, Slot(2), K(-4), 3), known), Some((-3, 0)));
+        assert_eq!(range_of(&op(Arith::Mod, Slot(1), K(512), 3), known), Some((0, 255)));
+        assert_eq!(range_of(&op(Arith::Add, Slot(1), K(1), 3), known), Some((1, 256)));
+        assert_eq!(range_of(&op(Arith::Sub, K(2), Slot(1), 3), known), Some((-253, 2)));
+        assert_eq!(range_of(&op(Arith::Mul, Slot(1), K(-2), 3), known), Some((-510, 0)));
+        assert_eq!(range_of(&op(Arith::Add, Slot(1), Slot(2), 3), known), None);
+        assert_eq!(range_of(&op(Arith::Div, Slot(1), K(2), 3), known), None);
+        // An integer op's result fits.
+        assert_eq!(range_of(&op(Arith::Mul, K(i32::MAX), K(2), 3), known), None);
     }
 
     #[test]

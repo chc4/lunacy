@@ -381,7 +381,9 @@ impl Gen {
             YieldOp::GuardRk(rk, _) | YieldOp::GuardCType(rk, _) => if rk & 0x100 != 0 { Vec::new() } else { vec![*rk] },
             YieldOp::Trip(None) => Vec::new(),
             // Asking what the context knows of a table's keys reads it, and the key.
-            YieldOp::HashKey(slot, key, _) => [*slot].into_iter().chain((*key & 0x100 == 0).then_some(*key)).collect(),
+            // A register's key is no hash key, whatever it holds.
+            YieldOp::HashKey(_, key, _) if key & 0x100 == 0 => Vec::new(),
+            YieldOp::HashKey(slot, _, _) => vec![*slot],
             YieldOp::LoadUpvalue(..) | YieldOp::UpvalueKnown(_) | YieldOp::UpvalueCell(_) | YieldOp::UpvalueHolds(..)
                 | YieldOp::FrameUnmade | YieldOp::HoldsValue(..) => Vec::new(),
             // Decided as it compiles while it holds anything, reading no slot. See Note [Optimistic
@@ -457,6 +459,12 @@ impl Gen {
         self.memory = None;
     }
 
+    /// The range of `slot`'s integer value: the peephole's, or its constant's. See Note [Peephole
+    /// memory] in `peephole`.
+    fn range(&self, slot: usize) -> Option<(i32, i32)> {
+        self.held.range(slot).or_else(|| (!self.held.unset(slot)).then(|| self.constant(slot)).flatten().map(|k| (k, k)))
+    }
+
     /// What it knows of `slot`'s constant value.
     fn constant(&self, slot: usize) -> Option<i32> {
         match self.ctx.as_ref()?.values.fact(Loc::root(Root::Slot(slot as u16)), CONSTANT) {
@@ -469,10 +477,13 @@ impl Gen {
     /// to write `stale`. See Note [Peephole fusion] in `peephole`.
     fn lay_out(&mut self, need: Option<crate::peephole::Need>, stale: &[usize], _trigger: &str) {
         let all = std::mem::take(&mut self.held);
-        let (laid, kept) = match &need {
+        let ranges: Vec<(usize, i32, i32)> = all.ranges.iter().copied().filter(|r| !all.unset(r.0)).collect();
+        let (laid, mut kept) = match &need {
             Some(need) => all.split(need),
             None => (all, crate::peephole::Spells::default()),
         };
+        // What's laid out holds its values as they were.
+        kept.ranges = ranges;
         if laid.is_empty() {
             self.held = kept;
             return;
@@ -550,7 +561,8 @@ impl Gen {
             // A field's key is no element: what it lays out reads and writes hash parts, of
             // tables no held spell writes the register of. See Note [Peephole memory] in
             // `peephole`.
-            YieldOp::HashKey(slot, key, _) => held.spells.iter().all(|spell| spell.dest != *slot && (key & 0x100 != 0 || spell.dest != *key)),
+            // A register's key is no hash key, whatever it holds: asked of no code.
+            YieldOp::HashKey(slot, key, _) => key & 0x100 == 0 || held.spells.iter().all(|spell| spell.dest != *slot),
             YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
             // One found out at runtime keeps them held on its ways, if it reads none and none
             // holds its instruction's operations, which a restart past it would run again.
@@ -617,20 +629,21 @@ impl Gen {
         let alias = |a, b| cells(&ctx, a, b);
         match op {
             MemOp::Store { cell, value } if crate::peephole::fuses() && self.holds => {
-                let _dead = self.held.hold_store(cell, value, window.clone(), self.at, alias);
+                let range = match value { Stored::Slot(slot) => self.range(slot), Stored::Boxed(_) => None };
+                let _dead = self.held.hold_store(cell, value, range, window.clone(), self.at, alias);
                 #[cfg(feature = "tracing")]
-                self.out.push_back(YieldOp::PeepholeTrace("store", vec![("element", format!("{cell:?}")), ("value", format!("{value:?}")), ("dead", _dead.to_string())]));
+                self.out.push_back(YieldOp::PeepholeTrace("store", vec![("element", format!("{cell:?}")), ("value", format!("{value:?} {range:?}")), ("dead", _dead.to_string())]));
             },
             MemOp::Load { cell, dest } if !self.held.stores.is_empty() => {
                 let outcome = self.held.load(cell, dest, alias);
                 #[cfg(feature = "tracing")]
                 self.out.push_back(YieldOp::PeepholeTrace("load", vec![("element", format!("{cell:?}")), ("outcome", match &outcome {
-                    Load::Forward(value) => format!("forward {value:?}"),
+                    Load::Forward(value, _) => format!("forward {value:?}"),
                     Load::After(stores) => format!("after {}", stores.len()),
                 })]));
                 let load = match outcome {
-                    Load::Forward(Stored::Slot(slot)) => Rc::new(crate::generators::Move::new(&[slot, dest])) as Rc<dyn Window>,
-                    Load::Forward(Stored::Boxed(bits)) => Rc::new(crate::generators::LoadStored::new(bits, &[dest])),
+                    Load::Forward(Stored::Slot(slot), _) => Rc::new(crate::generators::Move::new(&[slot, dest])) as Rc<dyn Window>,
+                    Load::Forward(Stored::Boxed(bits), _) => Rc::new(crate::generators::LoadStored::new(bits, &[dest])),
                     Load::After(stores) => {
                         self.out.extend(stores.into_iter().map(YieldOp::ExecWindow));
                         window.clone()
@@ -683,7 +696,12 @@ impl Gen {
                 self.next = Some(ResumeArg::Start);
                 return;
             },
-            YieldOp::MemoryOp(op) => {
+            // Its key's range, as it is now. See Note [Peephole memory] in `peephole`.
+            YieldOp::MemoryOp(mut op) => {
+                let (crate::peephole::MemOp::Load { cell, .. } | crate::peephole::MemOp::Store { cell, .. }) = &mut op;
+                if let crate::peephole::Operand::Slot(key) = cell.key {
+                    cell.range = self.range(key);
+                }
                 self.memory = Some(op);
                 self.next = Some(ResumeArg::Start);
                 return;
@@ -694,13 +712,14 @@ impl Gen {
         let mut memory = self.memory.take();
         // A load a held store is the last into is a move of the value it stores, and none into the
         // slot holding it. See Note [Peephole memory] in `peephole`.
+        let mut forwarded = None;
         let yielded = match (memory, yielded) {
             (Some(MemOp::Load { cell, dest }), YieldOp::ExecWindow(window)) if !self.held.stores.is_empty() => {
                 let ctx = self.ctx.clone().expect("a generator run in a context");
                 match self.held.clone().load(cell, dest, |a, b| cells(&ctx, a, b)) {
-                    crate::peephole::Load::Forward(value) => {
+                    crate::peephole::Load::Forward(value, range) => {
                         #[cfg(feature = "tracing")]
-                        self.out.push_back(YieldOp::PeepholeTrace("load", vec![("element", format!("{cell:?}")), ("outcome", format!("forward {value:?}"))]));
+                        self.out.push_back(YieldOp::PeepholeTrace("load", vec![("element", format!("{cell:?}")), ("outcome", format!("forward {value:?} {range:?}"))]));
                         memory = None;
                         match value {
                             // Its register holds the value, as it was before anything held: what
@@ -708,6 +727,7 @@ impl Gen {
                             crate::peephole::Stored::Slot(slot) if slot == dest => {
                                 self.held.drop_overwritten(&[dest], &[]);
                                 self.held.unset.retain(|&slot| slot != dest);
+                                self.held.set_range(dest, range);
                                 self.next = Some(ResumeArg::Start);
                                 return;
                             },
@@ -717,6 +737,7 @@ impl Gen {
                                 self.held.drop_overwritten(&[dest], &[]);
                                 self.lay_out(Some(Need { reads: Vec::new(), writes: vec![dest], memory: false }), &[dest], "forward");
                                 self.held.unset.retain(|&slot| slot != dest);
+                                self.held.set_range(dest, range);
                                 self.enter();
                                 let moved = YieldOp::ExecWindow(Rc::new(crate::generators::Move::new(&[slot, dest])));
                                 self.out.push_back(moved.clone());
@@ -724,8 +745,14 @@ impl Gen {
                                 self.next = None;
                                 return;
                             },
-                            crate::peephole::Stored::Slot(slot) => YieldOp::ExecWindow(Rc::new(crate::generators::Move::new(&[slot, dest]))),
-                            crate::peephole::Stored::Boxed(bits) => YieldOp::ExecWindow(Rc::new(crate::generators::LoadStored::new(bits, &[dest]))),
+                            crate::peephole::Stored::Slot(slot) => {
+                                forwarded = Some((dest, range));
+                                YieldOp::ExecWindow(Rc::new(crate::generators::Move::new(&[slot, dest])))
+                            },
+                            crate::peephole::Stored::Boxed(bits) => {
+                                forwarded = Some((dest, range));
+                                YieldOp::ExecWindow(Rc::new(crate::generators::LoadStored::new(bits, &[dest])))
+                            },
                         }
                     },
                     crate::peephole::Load::After(_) => YieldOp::ExecWindow(window),
@@ -759,6 +786,37 @@ impl Gen {
             }
         }
         let (writes, reads) = overwrites(&yielded);
+        // The ranges of integer values past it. See Note [Peephole memory] in `peephole`.
+        let computed = described.as_ref().map(|op| (op.dest, crate::peephole::range_of(op, |slot| self.range(slot))));
+        match &yielded {
+            YieldOp::Copy(to, from) => {
+                let range = self.range(*from);
+                self.held.set_range(*to, range);
+            },
+            YieldOp::Clobber(from) => self.held.ranges.retain(|r| r.0 < *from),
+            YieldOp::ExecWindow(_) | YieldOp::OptimisticExec(_) | YieldOp::Guard(..) | YieldOp::GuardRk(..) | YieldOp::GuardCType(..)
+                | YieldOp::GuardDynamic(_) | YieldOp::GetBlock(_) | YieldOp::Jump(_) | YieldOp::Trip(_) | YieldOp::HashKey(..)
+                | YieldOp::Promote(_) | YieldOp::Encoding(_) | YieldOp::Narrow(_) => {},
+            // Code writing registers it doesn't say.
+            yielded if self.lays_out(yielded) => {
+                #[cfg(feature = "tracing")]
+                if !self.held.ranges.is_empty() {
+                    self.out.push_back(YieldOp::PeepholeTrace("range", vec![("what", format!("cleared by {yielded:?}").chars().take(80).collect())]));
+                }
+                self.held.ranges.clear();
+            },
+            _ => {},
+        }
+        for &slot in &writes {
+            self.held.set_range(slot, None);
+        }
+        #[cfg(feature = "tracing")]
+        if let Some((_, range)) = computed {
+            self.out.push_back(YieldOp::PeepholeTrace("range", vec![("what", format!("{:?} {range:?}", described.unwrap()))]));
+        }
+        for (slot, range) in computed.into_iter().chain(forwarded) {
+            self.held.set_range(slot, range);
+        }
         self.held.unset.retain(|slot| !writes.contains(slot));
         // A held store named by a slot about to be written is named by another holding the value.
         if !self.held.stores.is_empty() && !writes.is_empty() {
@@ -778,7 +836,7 @@ impl Gen {
                     Some(Need { reads: reads.clone(), writes: writes.clone(), memory: w.memory() == crate::window::Memory::Reads && memory.is_none() }),
                 // A field's key asked, what writes its table's or key's register. See Note [Peephole
                 // memory] in `peephole`.
-                YieldOp::HashKey(slot, key, _) => Some(Need { reads: [*slot].into_iter().chain((*key & 0x100 == 0).then_some(*key)).collect(), writes: Vec::new(), memory: false }),
+                YieldOp::HashKey(slot, _, _) => Some(Need { reads: vec![*slot], writes: Vec::new(), memory: false }),
                 // A guard found out at runtime, as one: what it reads, the rest held across it if
                 // they may be. See `Spells::across_guard`.
                 YieldOp::GuardDynamic(test) if !test.accesses().contains(&Access::Update)
@@ -1143,6 +1201,12 @@ fn cells(ctx: &Context, a: crate::peephole::Element, b: crate::peephole::Element
     // Two unique classes are two tables. See Note [Disjoint tables].
     let unique = |table: usize| ctx.values.fact(Loc::root(Root::Slot(table as u16)), UNIQUE).is_some();
     if unique(a.table) && unique(b.table) && !same(a.table, b.table) {
+        return Alias::Disjoint;
+    }
+    // A key whose range leaves out the other is another. See Note [Peephole memory] in
+    // `peephole`.
+    let range = |e: crate::peephole::Element| constant(e.key).map(|k| (k, k)).or(e.range);
+    if let (Some((a_lo, a_hi)), Some((b_lo, b_hi))) = (range(a), range(b)) && (a_hi < b_lo || b_hi < a_lo) {
         return Alias::Disjoint;
     }
     // Different keys are different elements, whatever the tables.
@@ -2216,7 +2280,9 @@ fn entering(held: &crate::peephole::Spells, calling: &Context, callee: LProto<'s
     };
     // What reads the frame's slots past the arguments reads them as they were: entering it writes
     // none of them, holding them unset.
-    let (laid, kept) = held.split(&crate::peephole::Need { reads: below.clone(), writes: below, memory: false });
+    let (laid, mut kept) = held.split(&crate::peephole::Need { reads: below.clone(), writes: below, memory: false });
+    // Of the ranges, the frame's arguments'.
+    kept.ranges.retain(|r| r.0 > a && !nilled.contains(&r.0));
     let mut kept = kept.renamed(|slot| slot - a - 1, |slot| slot - a - 1, |slot| !nilled.contains(&slot), usize::MAX);
     // Its frame is nil past its arguments, as the peephole holds it, unset.
     if b != 0 {
@@ -5080,6 +5146,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // A result in a slot still unset is nil; the frame's other unset slots are its
                 // caller's temporaries, never read before written.
                 let mut spells = spells;
+                let (call, c) = (continuation.a as usize, continuation.c as usize);
+                let results = a..a + c.saturating_sub(1);
+                for &(from, to) in &moves {
+                    let range = spells.range(from);
+                    spells.set_range(to, range);
+                }
+                for slot in results.clone().filter(|slot| !moves.iter().any(|&(_, to)| to == call + slot - a)) {
+                    let range = spells.range(call + 1 + slot);
+                    spells.set_range(call + slot - a, range);
+                }
+                let unset_slots = spells.unset.clone();
+                spells.ranges.retain(|r| !unset_slots.contains(&r.0));
                 let unset = std::mem::take(&mut spells.unset);
                 for (from, to) in moves {
                     let result: Rc<dyn Window> = if unset.contains(&from) {

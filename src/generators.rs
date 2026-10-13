@@ -561,7 +561,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 if !chains {
                     yield YieldOp::Decided(true);
                     // See Note [Peephole memory] in `peephole`.
-                    yield YieldOp::MemoryOp(MemOp::Load { cell: Element { table: b, key }, dest: a });
+                    yield YieldOp::MemoryOp(MemOp::Load { cell: Element { table: b, key, range: None }, dest: a });
                     arg = yield YieldOp::ExecWindow(match key {
                         Operand::K(k) => Rc::new(GetTableArray::new(k, &[b, a])),
                         Operand::Slot(_) => Rc::new(GetTableInteger::new(&[b, c, a])),
@@ -847,7 +847,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             // One keeping the array part's length and kind. See Note [Peephole memory] in `peephole`.
             if how == Widen::No && !nil {
                 let value = match constant { Some(bits) => Stored::Boxed(bits), None => Stored::Slot(c) };
-                yield YieldOp::MemoryOp(MemOp::Store { cell: Element { table: a, key: Operand::K(k) }, value });
+                yield YieldOp::MemoryOp(MemOp::Store { cell: Element { table: a, key: Operand::K(k), range: None }, value });
             }
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {
@@ -889,7 +889,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             // One keeping the array part's length and kind. See Note [Peephole memory] in `peephole`.
             if how == Widen::No && !nil {
                 let value = match constant { Some(bits) => Stored::Boxed(bits), None => Stored::Slot(c) };
-                yield YieldOp::MemoryOp(MemOp::Store { cell: Element { table: a, key: Operand::Slot(b) }, value });
+                yield YieldOp::MemoryOp(MemOp::Store { cell: Element { table: a, key: Operand::Slot(b), range: None }, value });
             }
             arg = yield YieldOp::ExecWindow(match constant {
                 None => {

@@ -142,6 +142,7 @@ VIEWS = {
     'peephole_load': ['line', 'pc', 'block', 'element', 'outcome'],
     'peephole_dead': ['line', 'pc', 'block', 'element', 'dead'],
     'peephole_return': ['line', 'pc', 'block', 'held', 'why'],
+    'peephole_range': ['line', 'pc', 'block', 'what'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
@@ -153,7 +154,7 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused'),
           'peephole_lay_out': ('peephole', 'lay_out'), 'peephole_store': ('peephole', 'store'),
           'peephole_load': ('peephole', 'load'), 'peephole_dead': ('peephole', 'dead'),
-          'peephole_return': ('peephole', 'return')}
+          'peephole_return': ('peephole', 'return'), 'peephole_range': ('peephole', 'range')}
 
 
 def connect(trace):
