@@ -140,6 +140,16 @@ golden-versions +names:
         echo "$name: $(python3 tools/trace_sql.py 'SELECT sum(live) AS live, max(live) AS most, sum(created) AS created FROM point_versions' | tail -1)"
     done
 
+# `golden-versions` at revision `ref`, each test traced as `trace-golden-rev`
+# traces it.
+golden-versions-rev ref +names:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for name in {{names}}; do
+        just trace-golden-rev {{ref}} "$name" > /dev/null 2>&1
+        echo "$name: $(python3 tools/trace_sql.py --trace working/lunacy-golden-$name-{{ref}}.fxt 'SELECT sum(live) AS live, max(live) AS most, sum(created) AS created FROM point_versions' | tail -1)"
+    done
+
 # The named golden tests (lua_tests/<name>.lua), each against its expected
 # output, in one debug build with `test`'s golden suite's features: quicker than
 # the whole suite while iterating.
