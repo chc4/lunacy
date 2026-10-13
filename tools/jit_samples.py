@@ -16,7 +16,11 @@ instruction with its count; `--hot-blocks` only the blocks with one, whole, in t
 laid out: a loop's body, the way its code falls through. `--op` sums the copies of what one note names
 (`PushFrame`, `window(GetTableInteger`) instruction by instruction, over the
 copies of the same code, and prints each code with its first copy's text.
-`--blocks-of` splits the samples of what one note names by block.
+`--blocks-of` splits the samples of what one note names by block. `--classes` splits the JIT's
+samples by kind of code (window ops, guards, control flow, calls and frames, region entry and
+exit) and, within each, by what the instruction is: a stack slot's load or store, the window's
+traffic with the frame; a move between registers, its shuffles into and out of a stencil's
+registers; one with the pinned tag, boxing or unboxing; or the rest. And the window ops' by op.
 """
 import argparse
 import re
@@ -28,6 +32,21 @@ RANGE = re.compile(r'^==== (.*) @ 0x([0-9a-f]+), (\d+) bytes$')
 NOTE = re.compile(r'^  ; ( *)(.*)$')
 INST = re.compile(r'^  ([0-9a-f]+) \+([0-9a-f]+)\s+(.*)$')
 INDEX = re.compile(r'^\d+ ')
+# A stack slot's load or store: the window's traffic with the frame, at the base pointer.
+SLOT = re.compile(r'\[r13( [+-] [^\]]+)?\]')
+# A move from one register to another.
+MOVE = re.compile(r'\s(?:mov|movq|movaps|vmovaps|vmovq|vmovsd)\s+(?:[re]?[a-z][a-z0-9]*|xmm\d+), (?:[re]?[a-z][a-z0-9]*|xmm\d+)\s*$')
+# An instruction with the pinned tag register: boxing or unboxing a value.
+TAG = re.compile(r'\br14\b')
+# The group of code each kind of note is, but for window ops' own.
+GROUPS = {
+    **dict.fromkeys(['guard', 'guard_dynamic', 'guard_witness', 'lua_guard', 'native_guard', 'epoch', 'tripped'], 'guard'),
+    **dict.fromkeys(['select', 'branch', 'jump', 'thunk', 'from', "an exit's way", 'into a cold stencil'], 'control'),
+    **dict.fromkeys(['lcall', 'ncall', 'call', 'ret', 'inline', 'inline_ret', 'enter', 'leave', 'exec',
+                     'arrive', 'arrived', 'returned', 'gc'], 'call/frame'),
+    **dict.fromkeys(['region entry: prologue', 'exit_jit: epilogue', 'load the entry window',
+                     'fill the upvalue cells the entry\'s facts are about', 'constant pool', 'block entry'], 'region'),
+}
 
 
 def kind(note):
@@ -68,6 +87,7 @@ def main():
     ap.add_argument('--hot-blocks', help='write the sampled blocks\' disassembly, with counts, here')
     ap.add_argument('--op', help='sum the copies of what this note names, by instruction')
     ap.add_argument('--blocks-of', help='the samples of what this note names, by block')
+    ap.add_argument('--classes', action='store_true', help="the JIT's samples by kind of code, and whether they load or store a stack slot")
     ap.add_argument('--top', type=int, default=25)
     args = ap.parse_args()
 
@@ -111,6 +131,38 @@ def main():
     print(f'\nJIT samples by block:')
     for k, n in by_block.most_common(args.top):
         print(f'  {n:7} {100 * n / total:5.1f}%  {k}')
+
+    if args.classes:
+        # Of the JIT's samples: what kind of code (a residual's group), and what the instruction
+        # is: a stack slot's load or store (the window's traffic with the frame), a move between
+        # registers (the window's shuffles into and out of a stencil's registers), one with the
+        # pinned tag (boxing or unboxing a value), or anything else.
+        classes = ['slot', 'move', 'tag', 'rest']
+        by_class = Counter()
+        ops = Counter()
+        for i, n in counts.items():
+            notes = insts[i][3]
+            kinds = [kind(note) for note in notes[1:]] or [kind(notes[0])] if notes else ['(no note)']
+            group = next((GROUPS[k] for k in reversed(kinds) if k in GROUPS), None)
+            if group is None:
+                group = 'op' if kinds[0].startswith('window(') else 'other'
+            text = INST.match(insts[i][2]).group(3)
+            what = 'slot' if SLOT.search(text) else 'move' if MOVE.search(text) else 'tag' if TAG.search(text) else 'rest'
+            by_class[(group, what)] += n
+            if group == 'op':
+                ops[(kinds[0], what)] += n
+        print(f'\nJIT samples by kind of code, and what the instruction is (of {jit}):')
+        print(f'  {"":12} {"all":>6}' + ''.join(f'  {c:>6}' for c in classes))
+        for group in ['op', 'guard', 'control', 'call/frame', 'region', 'other']:
+            row = [by_class[(group, c)] for c in classes]
+            if sum(row):
+                print(f'  {group:12} {100 * sum(row) / jit:5.1f}%' + ''.join(f'  {100 * n / jit:5.1f}%' for n in row))
+        print(f'\nWindow ops, by op:')
+        names = Counter()
+        for (op, _), n in ops.items():
+            names[op] += n
+        for op, n in names.most_common(args.top):
+            print(f'  {op:28} {100 * n / jit:5.1f}%' + ''.join(f'  {100 * ops[(op, c)] / jit:5.1f}%' for c in classes))
 
     if args.blocks_of:
         of = Counter()

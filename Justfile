@@ -281,7 +281,8 @@ luajit-mcode benchmark times='10':
 # Profile a benchmark with IBS (AMD's precise sampling: a sample is the
 # instruction that ran, with no skid), every `period` cycles, built as
 # `jit-disasm` builds with the perf map too, and join the samples on the JIT's
-# code to its disassembly (tools/jit_samples.py): by what emitted the code, and,
+# code to its disassembly (tools/jit_samples.py): by what emitted the code, by kind
+# of code and stack slot traffic, and,
 # with `op` (a disassembly note, like `PushFrame`), that code's instructions
 # summed over its copies. working/jit-profile.data, and the sampled
 # disassembly with counts in working/jit_samples.txt.
@@ -291,7 +292,19 @@ jit-profile benchmark times='10' op='' period='20000' features='unsafe':
         --target-dir target/jit_disasm -Z build-std="core,std,panic_abort"
     cd working && {{SAMPLED}} perf record -e ibs_op// -c {{period}} -o jit-profile.data ../target/jit_disasm/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
     cd working && perf script -i jit-profile.data -F ip,sym > jit-profile.samples
-    python3 tools/jit_samples.py working/jit_disasm.txt working/jit-profile.samples --out working/jit_samples.txt {{ if op != "" { "--op '" + op + "'" } else { "" } }}
+    python3 tools/jit_samples.py working/jit_disasm.txt working/jit-profile.samples --out working/jit_samples.txt --classes {{ if op != "" { "--op '" + op + "'" } else { "" } }}
+
+# `jit-profile` of each of `runs` (`benchmark:times`, as HYPERFINES has them): each one's
+# summary in working/jit-profile-<benchmark>.txt and its sampled disassembly in
+# working/jit_samples-<benchmark>.txt.
+jit-profiles +runs:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for run in {{runs}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        just jit-profile $benchmark $times > working/jit-profile-$benchmark.txt 2>&1 || echo "$benchmark: its profiled run failed"
+        cp working/jit_samples.txt working/jit_samples-$benchmark.txt
+    done
 
 # Save a benchmark's window dump as bench/window_dumps/<benchmark>.<name>.txt, a
 # reference to compare window allocators against with `just window-dump-stats`.
