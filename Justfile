@@ -1233,8 +1233,9 @@ hyperfines-features +sets:
 # `ref`, revision `ref`'s unsafe build too (it must read the variable), each at
 # every padding in the one run. Into the benchmark history as the build
 # `unsafe padded`: every padding's runs pooled, and each padding's kept
-# (tools/bench_history.py).
-hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
+# (tools/bench_history.py). With `feature`, this checkout's unsafe build with
+# that cargo feature too (built into target/feature-<feature>), not recorded.
+hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='' feature='':
     #!/usr/bin/env bash
     set -euo pipefail
     just unsafe-compile
@@ -1248,10 +1249,18 @@ hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
         builds=target/compare/{{ref}}/target/unsafe/bench,$builds
         out=$out-vs-{{ref}}
     fi
+    if [ -n "{{feature}}" ]; then
+        {{SHARED}} cargo build --profile unsafe --no-default-features --features "unsafe {{feature}}" --bin bench \
+            --target-dir target/feature-{{feature}} -Z build-std="core,std,panic_abort"
+        builds=$builds,./target/feature-{{feature}}/unsafe/bench
+        out=$out-{{feature}}
+    fi
     {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown $out.md --export-json $out.json \
         --parameter-list padding {{paddings}} --parameter-list build $builds \
         "LUNACY_JIT_PADDING={padding} {build} working/{{benchmark}}.bin {{times}}"
-    python3 tools/bench_history.py record $out.json --benchmark {{benchmark}} --arg {{times}} ${ref:+--ref $ref}
+    if [ -z "{{feature}}" ]; then
+        python3 tools/bench_history.py record $out.json --benchmark {{benchmark}} --arg {{times}} ${ref:+--ref $ref}
+    fi
 
 # Revision `head`'s times against revision `base`'s in the benchmark history, as
 # `build`, every run of each pooled: per benchmark their medians, at how many
