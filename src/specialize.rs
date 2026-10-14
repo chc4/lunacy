@@ -264,7 +264,7 @@ fn lays_out(ctx: &Context, yielded: &YieldOp) -> bool {
             | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
             | YieldOp::Effect(_) | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::IsKey(..)
             | YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) | YieldOp::ArrayType(..)
-            | YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) | YieldOp::NativeWindowArgs(..)
+            | YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) | YieldOp::KnownInteger(_) | YieldOp::NativeWindowArgs(..)
             | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Created(_) | YieldOp::HoldsValue(..) | YieldOp::FrameUnmade
             | YieldOp::Quotient(..) | YieldOp::QuotientOf(_) => true,
         YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
@@ -395,6 +395,8 @@ pub enum YieldOp {
     Discovered(usize, u64, CType, Option<i32>), // STACK[idx] holds the element `Element` resumed with.
                                                 // See Note [Frozen tables]
     ValueOf(usize), // STACK[idx]'s value, if known: resumed with Boxed, else Failed
+    KnownInteger(usize), // Resumed with Integer(v) if a fact says STACK[idx] holds the integer
+                         // constant v, relying on it, else Failed. See Note [Widening]
     Trip(Option<usize>), // A store into STACK[idx]'s table, or with none the environment, is about
                          // to be laid out: resumed with Matched. See Note [Watched tables]
     Learn(usize), // Resumed with Keys: the string keys of STACK[idx]'s table, once the code runs. See
@@ -6608,6 +6610,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ctx.values.learn(at, Known::Constant { value, origins: None });
                     }
                     ctx.values.learn(at, Known::Value(bits));
+                },
+                CoroutineState::Yielded(YieldOp::KnownInteger(slot)) => {
+                    arg = match ctx.constant(slot) {
+                        Some(value) => {
+                            ctx.rely(owner, slot);
+                            ResumeArg::Integer(value)
+                        }
+                        None => ResumeArg::Failed,
+                    };
                 },
                 CoroutineState::Yielded(YieldOp::ValueOf(slot)) => {
                     arg = match ctx.values.fact(Loc::root(Root::Slot(slot as u16)), VALUE) {

@@ -2342,7 +2342,25 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
                 let (ii, li, si) = (integer_encoded!(a), integer_encoded!(a + 1), integer_encoded!(a + 2));
-                yield YieldOp::ExecWindow(for_loop(ii, li, si, &[a, a + 1, a + 2, a + 3]));
+                use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+                // All three integers, the step a known constant: the compare its sign picks, the
+                // loop variable set between it and its jump, after every input is read. Exit 1
+                // leaves the loop.
+                crate::emitted::emitted!(select ForLoopInt, [], [UP: bool], |ops, exits| (idx, limit, out var) {
+                    dynasm!(ops ; .arch x64 ; cmp Rd(idx), Rd(limit) ; mov Rq(var), Rq(idx));
+                    if UP {
+                        dynasm!(ops ; .arch x64 ; jg =>exits.exit1);
+                    } else {
+                        dynasm!(ops ; .arch x64 ; jl =>exits.exit1);
+                    }
+                });
+                let step = if ii && li && si { yield YieldOp::KnownInteger(a + 2) } else { ResumeArg::Failed };
+                if let ResumeArg::Integer(step) = step {
+                    let operands = &[a, a + 1, a + 3];
+                    yield YieldOp::Emit(if step < 0 { Rc::new(ForLoopInt::<false>::new(operands)) } else { Rc::new(ForLoopInt::<true>::new(operands)) });
+                } else {
+                    yield YieldOp::ExecWindow(for_loop(ii, li, si, &[a, a + 1, a + 2, a + 3]));
+                }
                 let ResumeArg::Type(t) = (yield YieldOp::Typeof(a)) else { unreachable!() };
                 yield YieldOp::SetCTypes(vec![(a + 3, t)]);
             },

@@ -124,6 +124,9 @@ macro_rules! emitted {
     (select $name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block) => {
         $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, true, []] [] $($operands)*);
     };
+    (select $name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block cold |$record:ident| $cold:block) => {
+        $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, true, [|$record| $cold]] [] $($operands)*);
+    };
     ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block cold |$record:ident| $cold:block) => {
         $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, true, [|$record| $cold]] [] $($operands)*);
     };

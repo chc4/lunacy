@@ -194,9 +194,15 @@ def times_vs(args):
     """Each benchmark's pooled time for revision `base` and for `head`, as `build`,
     fastest change first: their medians and its change, at how many paddings
     `head`'s median is the lower, whether their quartile boxes are apart; and the
-    changes' geometric mean. `head` `dirty` is HEAD's newest dirty result."""
-    base = commit_info(args.base)[0]
-    head = 'dirty' if args.head == 'dirty' else commit_info(args.head)[0]
+    changes' geometric mean. `head` `dirty` is HEAD's newest dirty result, and
+    either `<commit>-dirty` that commit's."""
+    def revision(name):
+        if name == 'dirty':
+            return name
+        if name.endswith('-dirty'):
+            return commit_info(name[:-len('-dirty')])[0] + '-dirty'
+        return commit_info(name)[0]
+    base, head = revision(args.base), revision(args.head)
     data, _ = series()
     rows = []
     for key, builds in data.items():
@@ -278,14 +284,16 @@ def pool(a, b):
 
 def series():
     """(benchmark, arg) -> build -> commit -> all its clean results pooled, and
-    the newest dirty result of HEAD, keyed 'dirty' (each dirty result may be of
-    other changes); and the commits' info."""
+    the newest dirty result of HEAD, keyed 'dirty', and of each commit, keyed
+    '<commit>-dirty' (each dirty result may be of other changes); and the
+    commits' info."""
     head, _ = head_state()
     out = defaultdict(lambda: defaultdict(dict))
     commits = {}
     for r in load():
         key = (r['benchmark'], r['arg'])
         if r['dirty']:
+            out[key][r['build']][r['commit'] + '-dirty'] = r
             if r['commit'] == head:
                 out[key][r['build']]['dirty'] = r
             continue
