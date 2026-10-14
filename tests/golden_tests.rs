@@ -38,7 +38,7 @@ fn test_golden() {
     for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("lua") {
-            run_test_file(&path, false);
+            run_timed(&path, false);
         }
     }
 }
@@ -55,8 +55,39 @@ fn test_lua_baseline() {
     for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("lua") {
-            run_test_file(&path, true);
+            run_timed(&path, true);
         }
+    }
+}
+
+/// `run_test_file` on a thread of its own, failing if it runs past `LUNACY_GOLDEN_TIMEOUT`
+/// seconds (120 by default): a golden test is small, and one running that long is stuck. The
+/// thread is left running, and ends with the test process.
+fn run_timed(path: &Path, lua_baseline: bool) {
+    let limit = std::env::var("LUNACY_GOLDEN_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+    // `LUNACY_GOLDEN_GAS_SEED`: each test run with gas (feature `gas`) the seed and its name
+    // choose, from 1 to about a million, as likely small as large: JIT code stopping anywhere
+    // must leave the run as it would have been.
+    if let Some(seed) = std::env::var("LUNACY_GOLDEN_GAS_SEED").ok().filter(|_| !lua_baseline) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        (seed, path).hash(&mut hasher);
+        let bits = hasher.finish();
+        let gas = (1u64 << (bits % 21)) + (bits >> 32) % (1u64 << (bits % 21));
+        println!("{} with gas {gas}", path.display());
+        // Read when the run starts, on the test's thread; nothing else runs meanwhile.
+        unsafe { std::env::set_var("LUNACY_GAS", gas.to_string()) };
+    }
+    let owned = path.to_path_buf();
+    let (done, finished) = std::sync::mpsc::channel();
+    let test = std::thread::spawn(move || {
+        run_test_file(&owned, lua_baseline);
+        let _ = done.send(());
+    });
+    // A panic drops the sender: the test's own failure, from its thread.
+    match finished.recv_timeout(std::time::Duration::from_secs(limit)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{} ran past {limit}s", path.display()),
+        _ => if let Err(panic) = test.join() { std::panic::resume_unwind(panic) },
     }
 }
 

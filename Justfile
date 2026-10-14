@@ -171,6 +171,21 @@ golden-versions-rev ref +names:
 golden +names:
     LUNACY_GOLDEN={{replace(names, " ", ",")}} {{SHARED}} cargo test --features gc_sanitize --test golden_tests test_golden
 
+# The golden tests, each with random gas (`LUNACY_GOLDEN_GAS_SEED`, from `seed`, else
+# a random one, printed): JIT code stopped anywhere must leave a test's output as it
+# was, so a run failing is a JIT miscompile or an exit that loses state. Rerun with its
+# seed, and bisect the test with `gas-bisect`. Its whole output in working/golden-gas.log.
+golden-gas seed='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seed="{{seed}}"
+    [ -n "$seed" ] || seed=$RANDOM$RANDOM
+    echo "seed $seed"
+    status=0
+    LUNACY_GOLDEN_GAS_SEED=$seed {{SHARED}} cargo test --features "gc_sanitize gas" --test golden_tests test_golden -- --nocapture > working/golden-gas.log 2>&1 || status=$?
+    grep -E "panicked|ran past|test result|mismatch" -B1 working/golden-gas.log | grep -v "^--" | tail -n 20
+    exit $status
+
 # Golden tests, each against its expected output, under the default build,
 # immediate_jit, no_dynamic_guards and both (tools/golden_builds.py).
 golden-builds +tests:
