@@ -632,19 +632,20 @@ flamegraph-vs ref benchmark times='10' freq='997' top='25':
         perf report -i $data --no-children -g none --sort sym --stdio 2>/dev/null | grep '%' | head -n {{top}}
     done
 
-# `flamegraph` over HYPERFINES, sampling at `freq` Hz: for each run,
+# `flamegraph` over HYPERFINES, or `runs` (`benchmark:times`) if named, sampling at `freq` Hz: for each run,
 # working/perf-<benchmark>-<times>.data and flamegraph-<benchmark>-<times>.svg,
 # then each profile's share of time by tier, and its time in each
 # (tools/tiers.py): JIT code, the interpreter, specializing, contracting,
 # compiling to machine code, and GC. perf runs the benchmark itself: under
 # `cargo flamegraph`, samples from the run's start are the pre-exec process's,
 # which perf can't resolve.
-flamegraphs freq='19997':
+flamegraphs freq='19997' *runs:
     #!/usr/bin/env bash
     set -euo pipefail
     {{SHARED}} cargo build --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -Z build-std="core,std,panic_abort"
     profiles=()
-    for run in {{HYPERFINES}}; do
+    runs="{{runs}}"
+    for run in ${runs:-{{HYPERFINES}}}; do
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark
         # A run that fails is left out, and said so.

@@ -625,12 +625,50 @@ windowed!(writes select HrefInitIndex, [at: u64, key: u64], [], |owner, state, b
     }
 });
 
-// `HrefInit` for a hash key at a place down its register's `__index` chain (`place`, as
-// `Place::bits`): exit 0 if the table there has the key, populating the witness, and 1 if not,
-// or if there's no table there. See Note [Table metatables].
-windowed!(writes select HrefInitAt, [at: u64, key: u64, place: u16], [], |owner, state, base| () {
+/// The table at a place down an `__index` chain, from the witness of the hash key `link` before
+/// it: with `META`, the metatable of the table it witnesses (`Place::Metatable`), else the table
+/// it witnesses as its value (`Place::Index`). See Note [Table metatables].
+#[inline(always)]
+fn table_at<'src, 'intern, const META: bool>(owner: &Owner, state: &RunState<'src, 'intern>, link: u8) -> Option<Tc<Table<'src, 'intern>>> {
+    let witness = state.hash_witnesses[state.witness_base + link as usize];
+    if META {
+        // Its witness holds, so its table is alive.
+        let tab: Tc<Table<'src, 'intern>> = Tc(unsafe { crate::gc::Gc::from_addr(witness.table) });
+        tab.ro(owner).metatable.clone()
+    } else {
+        unsafe { *witness.value.cast::<LBoxed<'src, 'intern>>() }.as_table()
+    }
+}
+
+// `HrefInit` for a hash key at a place down its register's `__index` chain, the table found
+// from the hash key `link`'s witness as `table_at` says: its hot path, `HrefInit`'s, on that
+// table, and its cold path finding the key wherever it is. Exit 0 if the table has the key,
+// populating the witness, and 1 if not, or if there's no table there. See Note [Table
+// metatables].
+windowed!(writes HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |owner, state, base| () {
     let (href, index) = (at as u8, (at >> 8) as usize);
-    match state.place_table(owner, 0, Place::from_bits(place)) {
+    let hidx = state.witness_base + href as usize;
+    // No table there is a miss, which the cold path finds again.
+    let hit = table_at::<META>(owner, state, link).and_then(|tab| {
+        let address = tab.0.to_addr();
+        let tab = tab.rw(owner);
+        let epoch = tab.epoch;
+        match tab.hash.get_index_mut(index) {
+            Some((k, value)) if k.boxed().bits() == key => Some((epoch, value as *mut LBoxed<'_, '_>, address)),
+            _ => None,
+        }
+    });
+    match hit {
+        Some((epoch, value, address)) if hidx < state.hash_witnesses.len() => {
+            state.witness_top = state.witness_top.max(hidx + 1);
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast(), table: address };
+            false
+        },
+        _ => true,
+    }
+} cold {
+    let (href, index) = (at as u8, (at >> 8) as usize);
+    match table_at::<META>(owner, state, link) {
         Some(tab) => href_init_slow(owner, state, tab, href, index, key),
         None => 1,
     }
@@ -6224,7 +6262,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 (Place::Register, LType::Table) => Rc::new(HrefInit::new(at, kbits, &[idx])) as Rc<dyn Window>,
                 (Place::Register, LType::Userdata) => Rc::new(HrefInitIndex::new(at, kbits, &[idx])),
                 (Place::Register, _) => unreachable!("a hash key of a {receiver}"),
-                (place, _) => Rc::new(HrefInitAt::new(at, kbits, place.bits(), &[])),
+                (Place::Metatable(link), _) => Rc::new(HrefInitAt::<true>::new(at, kbits, link.0, &[])),
+                (Place::Index(link), _) => Rc::new(HrefInitAt::<false>::new(at, kbits, link.0, &[])),
             });
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
