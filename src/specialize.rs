@@ -5403,7 +5403,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let passed = |slot: usize| frame.owner(ctx, slot);
         let mut gained: Vec<(usize, HashRef)> = Vec::new();
         known.hkeys = ctx.hkeys.iter().enumerate().map(|(i, hkey)| match caller.hkeys.get(i) {
-            Some(mine) if !hkey.orphan() && hkey.idx == OUTER && !mine.orphan() => mine.clone(),
+            // Its field's type as the callee left it: a store through another register holding
+            // the table may have changed it, moving the witness to the table's new epoch.
+            Some(mine) if !hkey.orphan() && hkey.idx == OUTER && !mine.orphan() => HashKey { known_type: hkey.known_type.clone(), ..mine.clone() },
             _ if !hkey.orphan() && hkey.place == Place::Register && let Some(owner) = passed(hkey.idx) => {
                 let mut theirs = hkey.clone();
                 theirs.idx = owner;
