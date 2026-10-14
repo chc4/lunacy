@@ -415,7 +415,7 @@ pub enum YieldOp {
     CollectGarbage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct HashKey<'src, 'intern> {
     /// The slot of the table the key is in.
     pub idx: usize,
@@ -433,6 +433,35 @@ pub struct HashKey<'src, 'intern> {
     /// For a key its table lacks, or has nil, found down the table's `__index`
     /// chain: the hash key it's found at. See Note [Table metatables].
     pub chain: Option<HashRef>,
+    /// Where an integer field type was found, which a store making the field a double
+    /// contracts. See Note [Field types].
+    pub origins: FieldOrigins,
+}
+
+/// A hash key's integer type's origins, if any: where it came from, not what it says, so not
+/// part of the hash key's equality. See Note [Contraction].
+#[derive(Clone, Default)]
+pub struct FieldOrigins(pub Option<Origins>);
+
+impl std::fmt::Debug for FieldOrigins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", if self.0.is_some() { "origins" } else { "-" })
+    }
+}
+
+impl PartialEq for HashKey<'_, '_> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.idx, &self.key, &self.known_type, &self.hazards, self.place, self.chain)
+            == (other.idx, &other.key, &other.known_type, &other.hazards, other.place, other.chain)
+    }
+}
+
+impl Eq for HashKey<'_, '_> {}
+
+impl std::hash::Hash for HashKey<'_, '_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.idx, &self.key, &self.known_type, &self.hazards, self.place, self.chain).hash(state)
+    }
 }
 
 /// The slot a hash key of a frame an inlined callee is inlined into is in, as the callee sees it:
@@ -459,7 +488,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 
     /// A new hash key, its index reserved until its href thunk finds its type.
     fn new(idx: usize, key: LConstant<'src, 'intern>) -> Self {
-        HashKey { idx, key, known_type: None, hazards: Default::default(), place: Place::Register, chain: None }
+        HashKey { idx, key, known_type: None, hazards: Default::default(), place: Place::Register, chain: None, origins: FieldOrigins::default() }
     }
 
     /// Whether access through slot `at` needs no epoch check.
@@ -488,7 +517,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     /// A free index, as every free index is: what the hash key there was tells nothing. See
     /// Note [Version compatibility].
     fn free() -> Self {
-        HashKey { idx: OUTER, key: crate::chunk::Constant::Nil, known_type: None, hazards: SmallVec::new(), place: Place::Register, chain: None }
+        HashKey { idx: OUTER, key: crate::chunk::Constant::Nil, known_type: None, hazards: SmallVec::new(), place: Place::Register, chain: None, origins: FieldOrigins::default() }
     }
 
     /// Whether blocks compiled knowing `self` are correct for a context with
@@ -1822,6 +1851,16 @@ pub(crate) fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, Re
 //
 // A field's type is a representation, `Number` or `Unknown`, never a shape or a
 // function's identity: those describe a register, not a field.
+//
+// A guard finding a field an integer is an origin of the integer type (Note
+// [Contraction]), which the hash key carries, through joins of contexts agreeing on
+// it and an inlined callee's return. A store making the field a double contracts the
+// origins: the versions knowing the field an integer are forgotten, and each guard is
+// rebuilt as one finding the field's type again. A table holding an integer only
+// until its first store, as a loop's first pass over tables built from whole
+// constants, so leaves the loop's versions to doubles, not joined with integer ones
+// into `Number` where its points run out of versions. A guard is rebuilt once: one
+// finding an integer again makes no origin, as a field genuinely of both stays so.
 //
 // A field's hash key on a slot has the same index on every path through the
 // function's code whose witnesses it uses, and an inlined callee's on a table it
@@ -3162,6 +3201,13 @@ impl Context {
                 Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && theirs.place == mine.place && theirs.chain == mine.chain && mine.known_type.is_some() && theirs.known_type.is_some() => {
                     if mine.known_type != theirs.known_type {
                         mine.known_type = mine.known_type.as_ref().zip(theirs.known_type.as_ref()).map(|(mine, theirs)| mine.join(theirs));
+                        mine.origins = FieldOrigins::default();
+                    } else if let (Some(a), Some(b)) = (&mine.origins.0, &theirs.origins.0) && !Rc::ptr_eq(a, b) {
+                        let mut joined = owner.ro(a).clone();
+                        joined.extend(owner.ro(b).iter().filter(|origin| !owner.ro(a).iter().any(|known| Rc::ptr_eq(known, origin))).cloned());
+                        mine.origins = FieldOrigins(Some(Rc::new(TLCell::new(joined))));
+                    } else if mine.origins.0.is_none() {
+                        mine.origins = theirs.origins.clone();
                     }
                     for (slot, checked) in mine.hazards.iter_mut().enumerate() {
                         *checked &= theirs.hazards.get(slot) == Some(&true);
@@ -4030,9 +4076,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 self.contractions.push((of, origins, how));
                 continue;
             }
-            let carries = |ctx: &Context| ctx.values.all_facts().any(|fact| {
-                fact.origins().is_some_and(|set| owner.ro(set).iter().any(|origin| origins.iter().any(|known| Rc::ptr_eq(known, origin))))
-            });
+            let ours = |set: &Origins| owner.ro(set).iter().any(|origin| origins.iter().any(|known| Rc::ptr_eq(known, origin)));
+            let carries = |ctx: &Context| ctx.values.all_facts().any(|fact| fact.origins().is_some_and(ours))
+                || ctx.hkeys.iter().any(|hkey| hkey.origins.0.as_ref().is_some_and(ours));
             let versions = self.versions.get_mut(&proto).unwrap();
             let mut _forgotten: Vec<usize> = Vec::new();
             versions.retain(|(_, ctx), block| {
@@ -5159,9 +5205,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 work.extend(from.get(&at).into_iter().flatten().copied());
             }
         }
-        let doomed = |ctx: &Context| ctx.values.all_facts().any(|fact| fact.origins().is_some_and(|set| owner.ro(set).iter().any(|origin| {
+        let queued = |set: &Origins| owner.ro(set).iter().any(|origin| {
             self.contractions.iter().any(|(of, queued, _)| *of == self.proto && queued.iter().any(|known| Rc::ptr_eq(known, origin)))
-        })));
+        });
+        let doomed = |ctx: &Context| ctx.values.all_facts().any(|fact| fact.origins().is_some_and(queued))
+            || ctx.hkeys.iter().any(|hkey| hkey.origins.0.as_ref().is_some_and(queued));
         let versions = self.versions.get(&self.proto).unwrap();
         entries.iter().filter_map(|entry| versions.iter().find(|(_, block)| **block == *entry).map(|(key, _)| key)).map(|(at, ctx)| {
             versions.iter().filter(|((there, theirs), block)| there == at && theirs.same_point(ctx) && !self.unreachable.contains(*block) && !doomed(theirs)).count()
@@ -5411,7 +5459,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         known.hkeys = ctx.hkeys.iter().enumerate().map(|(i, hkey)| match caller.hkeys.get(i) {
             // Its field's type as the callee left it: a store through another register holding
             // the table may have changed it, moving the witness to the table's new epoch.
-            Some(mine) if !hkey.orphan() && hkey.idx == OUTER && !mine.orphan() => HashKey { known_type: hkey.known_type.clone(), ..mine.clone() },
+            Some(mine) if !hkey.orphan() && hkey.idx == OUTER && !mine.orphan() => HashKey { known_type: hkey.known_type.clone(), origins: hkey.origins.clone(), ..mine.clone() },
             _ if !hkey.orphan() && hkey.place == Place::Register && let Some(owner) = passed(hkey.idx) => {
                 let mut theirs = hkey.clone();
                 theirs.idx = owner;
@@ -6228,6 +6276,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) {
         let mut typed_ctx = ctx.clone();
         Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(CType::Type(expected));
+        // An integer found here is an origin, unless this guard was rebuilt from one already. See
+        // Note [Field types].
+        let rebuilt = self.decided.get(&self.proto).is_some_and(|decided| decided.contains_key(&pc));
+        let origin = (expected == LType::Integer && !rebuilt).then(|| {
+            let offset = self.blocks[block.0].instructions.len();
+            let (coro, ctx, fail_ctx) = (thunk_coro.clone(), ctx.clone(), fail_ctx.clone());
+            let rebuild = move |vm: &mut Specializer, _owner: &mut Owner, _how: ResumeArg| {
+                vm.blocks[block.0].instructions.truncate(offset);
+                let guard = vm.make_field_guard_thunk(block, coro, idx, href, pc, ctx, chains, next, fail_ctx);
+                vm.blocks[block.0].instructions.push(Residual::Thunk(guard));
+                vm.cuts.insert(block, offset + 1);
+            };
+            Rc::new(TLCell::new(OriginState { rebuild: Some(Box::new(rebuild)), block, offset, pc, used: false }))
+        });
+        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].origins = FieldOrigins(origin.map(|origin| Rc::new(TLCell::new(vec![origin]))));
         let pass = match next {
             Some(next) => {
                 let pass = self.new_block(pc.0);
@@ -6237,10 +6300,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             },
             None => self.subblock(owner, pc.next_true(), typed_ctx, thunk_coro.clone(), ResumeArg::HashRef(href, CType::Type(expected))),
         };
-        let fail = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+        let fail = self.make_field_guard_thunk(block, thunk_coro, idx, href, pc, ctx, chains, next, fail_ctx);
+        self.blocks[block.0].instructions.push(Residual::GuardWitness { href, expected });
+        self.blocks[block.0].instructions.push(Residual::Thunk(fail));
+        self.blocks[block.0].instructions.push(Residual::Jump(pass));
+    }
+
+    /// The thunk finding `href`'s field's type, in `block`, and guarding that (`guard_witness`):
+    /// a guard's failure, or a guard rebuilt from an origin. A load's field found nil, or an
+    /// `__index`'s hash key, is found again instead. See Note [Field types].
+    fn make_field_guard_thunk(&self, block: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
             let found = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() }.unbox().typeof_();
-            debug!("field of {href:?} found {found}, not {expected}");
+            debug!("field of {href:?} found {found}");
             let again = vm.new_block(pc.0);
             vm.jump_thunk(block, thunk_pc, again);
             if (chains && found == LType::Nil) || next.is_some() {
@@ -6249,10 +6322,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 return;
             }
             vm.guard_witness(owner, again, thunk_coro.clone(), idx, href, found, pc, ctx.clone(), chains, next, fail_ctx.clone());
-        })));
-        self.blocks[block.0].instructions.push(Residual::GuardWitness { href, expected });
-        self.blocks[block.0].instructions.push(Residual::Thunk(fail));
-        self.blocks[block.0].instructions.push(Residual::Jump(pass));
+        })))
     }
 
     fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId, chains: bool) {
@@ -6380,7 +6450,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // left the witness at the old epoch (`Retype::Unknown`).
                     let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
                     if let Some(ty) = *ty {
+                        // An integer field made a double: the code that found it an integer goes.
+                        // See Note [Field types].
+                        if let (Some(CType::Type(LType::Integer)), LType::Double, Some(origins)) = (&hkey.known_type, ty, hkey.origins.0.take()) {
+                            let origins = owner.ro(&origins).clone();
+                            let mut by_proto: Vec<(LProto<'src, 'intern>, Vec<Origin>)> = Vec::new();
+                            for origin in origins.into_iter().filter(|origin| owner.ro(origin).rebuild.is_some()) {
+                                let of = self.blocks[owner.ro(&origin).block.0].proto as LProto<'src, 'intern>;
+                                match by_proto.iter_mut().find(|(known, _)| *known == of) {
+                                    Some((_, set)) => set.push(origin),
+                                    None => by_proto.push((of, vec![origin])),
+                                }
+                            }
+                            for (of, set) in by_proto {
+                                self.contractions.push((of, set, ResumeArg::Failed));
+                            }
+                        }
+                        let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
                         hkey.known_type = Some(CType::Type(ty));
+                        hkey.origins = FieldOrigins::default();
                     }
                     // If we updated an href, then we also need to set optimization hazards for any
                     // potentially aliased ones. We also need to invalidate this stack slot as
