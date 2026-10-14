@@ -3190,9 +3190,15 @@ impl Context {
             // that has the issue of runtime hash_witness entries referring to the same
             // path-dependent index and having to emit shuffles if you take a
             // de-duplicated branch but with different indexes.
+            let mut dropped = SmallVec::new();
             if let CType::Shape(_, shape) = &self.types[idx] {
+                // A shape it still has keeps its hash keys.
+                let kept: SmallVec<[HashRef; 4]> = match &ty {
+                    CType::Shape(_, kept) => kept.clone(),
+                    _ => SmallVec::new(),
+                };
                 for (kidx, key) in self.hkeys.iter_mut().enumerate() {
-                    if key.idx != idx { continue; }
+                    if key.idx != idx || kept.contains(&HashRef(kidx as u8)) { continue; }
                     // Try to migrate
                     let mut migrated = false;
                     for (new_idx, other_type) in self.types.iter().enumerate() {
@@ -3216,11 +3222,35 @@ impl Context {
                 // to the array when we need a new HashKey in order to try and re-use
                 // the slot (and potentially end up with the same pre-SetTypes context
                 // entirely). See Note [Field types].
-                self.fix_chains();
-                while let Some(_) = self.hkeys.pop_if(|hkey| hkey.idx == idx) { }
+                dropped = self.fix_chains();
+                while self.hkeys.last().is_some_and(|hkey| hkey.idx == idx && !kept.contains(&HashRef((self.hkeys.len() - 1) as u8))) {
+                    self.hkeys.pop();
+                }
             }
             self.types[idx] = ty;
+            self.strip_shapes(&dropped);
             warn!("set types to {:?}", &self.types);
+        }
+    }
+
+    /// `fix_chains`, and the heads that go out of every shape holding them.
+    fn fix_shaped_chains(&mut self) {
+        let dropped = self.fix_chains();
+        self.strip_shapes(&dropped);
+    }
+
+    /// Hash keys `dropped` out of every shape holding them.
+    fn strip_shapes(&mut self, dropped: &[HashRef]) {
+        if dropped.is_empty() {
+            return;
+        }
+        for ty in &mut self.types {
+            if let CType::Shape(of, hrefs) = ty && hrefs.iter().any(|href| dropped.contains(href)) {
+                hrefs.retain(|href| !dropped.contains(href));
+                if hrefs.is_empty() {
+                    *ty = CType::Type(*of);
+                }
+            }
         }
     }
 
@@ -5388,6 +5418,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             known.types[slot] = if kept.is_empty() { CType::Type(*of) } else { CType::Shape(*of, kept) };
         }
+        // A chain of the caller's whose hash keys didn't all come back goes.
+        known.fix_shaped_chains();
         effects.apply(owner, &mut known, &continuation.captured);
         // See Note [Upvalue paths].
         let (call, c) = (continuation.a as usize, continuation.c as usize);
@@ -6095,7 +6127,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 hkey.check(idx);
             }
             // A chain it had before goes.
-            ctx_mut.fix_chains();
+            ctx_mut.fix_shaped_chains();
             let kbits = LCanon::constant(&ctx_mut.hkeys[href.0 as usize].key).boxed().bits();
             // The receiver's shape now has this hash key.
             if place == Place::Register {
