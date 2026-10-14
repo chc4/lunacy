@@ -1983,8 +1983,14 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // is contracted. A whole constant passed to a function, stored into a table or an upvalue, or
 // passed to a native is the integer it was loaded as: a callee's versions, and a table's other
 // values, are out of the load's rebuild's reach. One a field store takes as its operand is stored
-// as an integer where the field is known to hold integers, so the field keeps its type, and as
-// a double anywhere else, where it may be a double the program writes as a whole number.
+// as an integer too, but where the field is known to hold doubles, or both encodings (`Number`):
+// there as a double.
+//
+// A field holding integers in some tables and doubles in others is a `Number` where both reach
+// the same code, and a number stored into it there goes in as a double, the field then known to
+// hold doubles: so a loop over such tables holds integers in them only on its way in, and goes
+// round on doubles, in the versions every table of doubles reaches. A field only ever written
+// whole stays an integer. See Note [Field types].
 
 // Note [Contraction]
 // ~~~~~~~~~~~~~~~~~~

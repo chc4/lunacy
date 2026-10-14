@@ -671,8 +671,11 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
 }
 
 // Store through a hash key's witness into a register's table.
-windowed!(writes SetTableHref, [href: u8, expected: u8], [RETYPE: Retype], |owner, state, base| (table, value) {
+// With `DOUBLE`, an integer value is stored as a double: into a field that has held both,
+// which then holds doubles. See Note [Widening].
+windowed!(writes SetTableHref, [href: u8, expected: u8], [RETYPE: Retype, DOUBLE: bool], |owner, state, base| (table, value) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    let value = if DOUBLE && value.is_int() { LBoxed::from_double(value.as_int() as f64) } else { value };
     store_field(owner, state, &tab, value, href, expected, RETYPE);
     // Last. See Note [Write barriers].
     tab.barrier_pending()
@@ -917,14 +920,18 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 count_store!(field_stores);
                 // A whole constant stored into a field known to hold integers is stored as one, so
                 // the field keeps its type. See Note [Widening].
-                let whole = if c & 0x100 != 0 && htype == CType::Type(LType::Integer) && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
+                // A field that has held doubles holds doubles. See Note [Widening].
+                let doubles = matches!(htype, CType::Type(LType::Double) | CType::Number);
+                let whole = if c & 0x100 != 0 && !doubles && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
                     let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
                     Some(k)
                 } else {
                     None
                 };
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                let new_type = if whole.is_some() { Some(LType::Integer) } else { value_type.as_ltype() };
+                // A number stored into a field that has held both encodings goes in as a double.
+                let to_double = c & 0x100 == 0 && htype == CType::Number && matches!(value_type, CType::Number | CType::Type(LType::Integer));
+                let new_type = if whole.is_some() { Some(LType::Integer) } else if to_double { Some(LType::Double) } else { value_type.as_ltype() };
                 // A store to `__index` moves the table to a new epoch, whatever it
                 // stores. See Note [Table metatables].
                 let index = b & 0x100 != 0 && (yield YieldOp::IsKey(b & 0xff, b"__index")) == ResumeArg::Matched;
@@ -935,9 +942,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let expected = holds_bits(&htype);
                 if c & 0x100 == 0 {
                     arg = yield YieldOp::ExecWindow(match retype {
-                        Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
-                        Retype::Known => Rc::new(SetTableHref::<{ Retype::Known }>::new(hb.0, expected, &[a, c])),
-                        Retype::Unknown => Rc::new(SetTableHref::<{ Retype::Unknown }>::new(hb.0, expected, &[a, c])),
+                        Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }, false>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
+                        Retype::Known if to_double => Rc::new(SetTableHref::<{ Retype::Known }, true>::new(hb.0, expected, &[a, c])),
+                        Retype::Known => Rc::new(SetTableHref::<{ Retype::Known }, false>::new(hb.0, expected, &[a, c])),
+                        Retype::Unknown => Rc::new(SetTableHref::<{ Retype::Unknown }, false>::new(hb.0, expected, &[a, c])),
                     });
                 } else {
                     let value = match whole {
@@ -960,15 +968,24 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Retype::Known | Retype::Unknown => yield YieldOp::UpdateHashRef(hb, new_type),
                 };
             } else {
+                // A whole constant into a field not known to hold doubles is an integer. See Note
+                // [Widening].
+                let whole = if c & 0x100 != 0 && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
+                    let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
+                    Some(k)
+                } else {
+                    None
+                };
                 arg = yield YieldOp::Exec(ResidualExec::framed("settable_hash", Rc::new(move |owner, state| {
                     let kb: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                         Ok(b) => LBoxed::from(b),
                         Err(lv) => *lv,
                     };
                     let kb = LCanon::new(kb, state.intern);
-                    let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                        Ok(c) => LBoxed::from(c),
-                        Err(lv) => *lv,
+                    let kc: LBoxed = match (whole, Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16)) {
+                        (Some(k), _) => LBoxed::from_int(k),
+                        (None, Ok(c)) => LBoxed::from(c),
+                        (None, Err(lv)) => *lv,
                     };
                     let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
                     // A field's type is a number's encoding. See Note [Field types].
