@@ -1068,10 +1068,10 @@ bench-history:
 # What stops each benchmark of lua_benchmarking that HYPERFINES doesn't run:
 # each run once at its scaling under LuaJIT and lunacy's release build (the
 # unsafe build's panics have no message), with how each ended and its error
-# (tools/bench_blockers.py).
-bench-blockers:
+# (tools/bench_blockers.py); or only `benchmarks`, if named.
+bench-blockers *benchmarks:
     {{SHARED}} cargo build --release --bin bench
-    python3 tools/bench_blockers.py --exclude "{{HYPERFINES}}"
+    {{SAMPLED}} python3 tools/bench_blockers.py --exclude "{{HYPERFINES}}" {{benchmarks}}
 
 # The latest commit's times from the benchmark history as a grouped bar chart,
 # a group per benchmark, in rows of `per_row` each on its own scale, in
@@ -1119,12 +1119,12 @@ hyperfine-unsafe benchmark: unsafe-compile
 # The benchmarks lunacy runs, as `benchmark:times`, each run enough times for a
 # stable mean; life twice, as for `hyperfines-traces`. euler14's count is the
 # bound of its search.
-HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10 nsieve:9 binarytrees:2 partialsums:2000000 series:2 mandelbrot:1000 mandelbrot_bit:1000 array3d:120 quicksort:300000 table_cmpsort:100000 recursive_fib:35 recursive_ack:10 spectralnorm:2 bounce:30000 md5:140"
+HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10 nsieve:9 binarytrees:2 partialsums:2000000 series:2 mandelbrot:1000 mandelbrot_bit:1000 array3d:120 quicksort:300000 table_cmpsort:100000 recursive_fib:35 recursive_ack:10 spectralnorm:2 bounce:30000 md5:140 heapsort:100000 jsonlua_encode:10"
 
 # Which benchmarks lunacy runs (tools/bench_runs.py): each of lua_benchmarking's,
 # or those named, at `fraction` of its benchinfo.json scaling, against LuaJIT.
 bench-runs fraction='0.1' *benchmarks:
-    python3 tools/bench_runs.py --fraction {{fraction}} {{benchmarks}}
+    {{SAMPLED}} python3 tools/bench_runs.py --fraction {{fraction}} {{benchmarks}}
 
 # The array part stores and hash field stores each run of HYPERFINES does, by
 # what the specializer knew of each stored value's type: nothing, that it's a

@@ -1160,6 +1160,29 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let j = number_or(arg(&args, 2), array.len() as f64) as i64;
         (i..=j).map(|k| if k >= 1 { array.get(k as usize - 1).copied().unwrap_or(LBoxed::NIL) } else { LBoxed::NIL }).collect()
     });
+    // Lua's `next(t, k)`: the entry after key `k`'s, or the first, for nil; nil past the last.
+    let next = native!(pure |owner, args| {
+        match table(arg(&args, 0)).ro(owner).next(arg(&args, 1)) {
+            Ok(Some((key, value))) => vec![key, value],
+            Ok(None) => vec![LBoxed::NIL],
+            Err(()) => return Err(error_value("invalid key to 'next'".into())),
+        }
+    });
+    // Lua's `select(n, ...)`: its arguments from the `n`th, or with "#" how many.
+    let select = native!(pure |owner, args| {
+        let rest = &args[1.min(args.len())..];
+        match arg(&args, 0).unbox() {
+            LValue::OwnedString(_) | LValue::InternedString(_) if &*arg_bytes(&args, 0) == b"#" => vec![LBoxed::from_int(rest.len() as i32)],
+            _ => {
+                let n = number(arg(&args, 0)) as i64;
+                let from = if n < 0 { rest.len() as i64 + n } else { n - 1 };
+                if from < 0 {
+                    return Err(error_value("bad argument #1 to 'select' (index out of range)".into()));
+                }
+                rest.get(from as usize..).unwrap_or(&[]).to_vec()
+            }
+        }
+    });
     // Lua 5.1's `newproxy`: a new userdata with no metatable, with a new empty
     // one (`true`), or sharing a userdata's, which it must have.
     let newproxy = native!(pure |owner, args| {
@@ -1227,7 +1250,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     let require = native!(pure |owner, args| {
         let name = arg_bytes(&args, 0);
         let found = MODULES.with_borrow(|modules| modules.iter().find(|(m, _)| m.as_bytes() == name).map(|(_, v)| *v));
-        let Some(module) = found else { panic!("require: no built-in module {:?}", String::from_utf8_lossy(&name)) };
+        let Some(module) = found else { return Err(error_value(format!("module '{}' not found", String::from_utf8_lossy(&name)))) };
         // SAFETY: the value is alive, held by the global table; see `MODULES`.
         vec![unsafe { std::mem::transmute::<LBoxed<'static, 'static>, LBoxed<'_, '_>>(module) }]
     });
@@ -1269,6 +1292,8 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "tonumber"), tonumber),
         (InternString::intern(intern, "require"), require),
         (InternString::intern(intern, "unpack"), unpack),
+        (InternString::intern(intern, "next"), next),
+        (InternString::intern(intern, "select"), select),
         (InternString::intern(intern, "error"), error),
         (InternString::intern(intern, "pcall"), pcall),
         (InternString::intern(intern, "setmetatable"), setmetatable),

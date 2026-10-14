@@ -553,6 +553,34 @@ pub fn env_moves() -> u64 {
 }
 
 impl<'src, 'intern> Table<'src, 'intern> {
+    /// Lua's `next`: the entry after `key`'s, or the first, for nil, that isn't nil, the array
+    /// part's in order and then the hash part's, or none past the last; or `Err` for a key it
+    /// doesn't hold. The keys it gives back are canonical, but for the array part's, integers.
+    pub fn next(&self, key: LBoxed<'src, 'intern>) -> Result<Option<(LBoxed<'src, 'intern>, LBoxed<'src, 'intern>)>, ()> {
+        let in_array = match key.unbox() {
+            LValue::Nil => Some(0),
+            _ => key.as_number().and_then(array_slot).filter(|&slot| slot < self.array.len()).map(|slot| slot + 1),
+        };
+        let from = match in_array {
+            Some(from) => {
+                if let Some((i, value)) = self.array[from..].iter().enumerate().find(|(_, value)| !value.is_nil()) {
+                    return Ok(Some((LBoxed::from_int((from + i + 1) as i32), *value)));
+                }
+                0
+            }
+            None => {
+                let at = match key.unbox() {
+                    LValue::OwnedString(g) => self.hash.get_index_of(&StringBytes(g.as_slice())),
+                    LValue::Integer(i) => self.hash.get_index_of(&LCanon::number(i as f64)),
+                    LValue::Double(n) => self.hash.get_index_of(&LCanon::number(n.0)),
+                    _ => self.hash.get_index_of(&LCanon(key)),
+                };
+                at.ok_or(())? + 1
+            }
+        };
+        Ok((from..self.hash.len()).filter_map(|i| self.hash.get_index(i)).find(|(_, value)| !value.is_nil()).map(|(key, value)| (key.boxed(), *value)))
+    }
+
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
             array: Vec::with_capacity(array).into(),

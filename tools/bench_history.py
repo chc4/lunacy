@@ -190,19 +190,23 @@ def sizes_vs(args):
         print(f"{bench + ' ' + arg:24} {cells[0]} {cells[1]} {change:>8}")
 
 
+def times_vs_revision(name):
+    """The key `series` has a revision's results under: `dirty` HEAD's newest dirty
+    result, `<commit>-dirty` that commit's, else the commit's clean ones."""
+    if name == 'dirty':
+        return name
+    if name.endswith('-dirty'):
+        return commit_info(name[:-len('-dirty')])[0] + '-dirty'
+    return commit_info(name)[0]
+
+
 def times_vs(args):
     """Each benchmark's pooled time for revision `base` and for `head`, as `build`,
     fastest change first: their medians and its change, at how many paddings
     `head`'s median is the lower, whether their quartile boxes are apart; and the
     changes' geometric mean. `head` `dirty` is HEAD's newest dirty result, and
     either `<commit>-dirty` that commit's."""
-    def revision(name):
-        if name == 'dirty':
-            return name
-        if name.endswith('-dirty'):
-            return commit_info(name[:-len('-dirty')])[0] + '-dirty'
-        return commit_info(name)[0]
-    base, head = revision(args.base), revision(args.head)
+    base, head = times_vs_revision(args.base), times_vs_revision(args.head)
     data, _ = series()
     rows = []
     for key, builds in data.items():
@@ -221,6 +225,27 @@ def times_vs(args):
     if rows:
         geomean = statistics.geometric_mean([1 + r[0] for r in rows]) - 1
         print(f"geometric mean of {len(rows)}: {geomean * 100:+.2f}%")
+
+
+def builds_vs(args):
+    """Each benchmark's median for revision `rev` (as `vs` names one) on each of
+    `builds`, and each later build's time over the first's, the benchmarks the
+    first is slowest against the second first; and each ratio's geometric mean."""
+    rev = times_vs_revision(args.rev)
+    builds = args.builds.split(',')
+    data, _ = series()
+    rows = []
+    for (bench, arg), by_build in data.items():
+        medians = [box(by_build[b][rev])['median'] if rev in by_build.get(b, {}) else None for b in builds]
+        if None not in medians:
+            rows.append((bench + ' ' + arg, medians))
+    rows.sort(key=lambda r: -r[1][0] / r[1][1])
+    print(f"{'benchmark':24}" + ''.join(f"{b[:12]:>13}" for b in builds) + ''.join(f"{(b[:9] + '/' + builds[0][:6]):>17}" for b in builds[1:]))
+    for name, medians in rows:
+        print(f"{name:24}" + ''.join(f"{m:13.4f}" for m in medians) + ''.join(f"{medians[0] / m:17.2f}" for m in medians[1:]))
+    if rows:
+        print(f"{'geometric mean':24}" + ' ' * 13 * len(builds)
+              + ''.join(f"{statistics.geometric_mean([r[1][0] / r[1][i] for r in rows]):17.2f}" for i in range(1, len(builds))))
 
 
 def attach_times(args):
@@ -542,6 +567,10 @@ def main():
     v = sub.add_parser('sizes-vs', help="this checkout's JIT code sizes against a revision's")
     v.add_argument('ref')
     v.set_defaults(func=sizes_vs)
+    bv = sub.add_parser('builds', help="one revision's times on several builds, against the first")
+    bv.add_argument('rev')
+    bv.add_argument('--builds', default='unsafe,luajit -joff,luajit')
+    bv.set_defaults(func=builds_vs)
     w = sub.add_parser('vs', help="one revision's times against another's, every run of each pooled")
     w.add_argument('base')
     w.add_argument('head')

@@ -143,3 +143,23 @@ end
 function table.sort(t, lt)
   auxsort(t, 1, #t, lt or less)
 end
+
+-- Lua's `ipairs(t)`: t[1], t[2], ... up to the first nil, each with its index.
+local function ipairs_next(t, i)
+  i = i + 1
+  local v = t[i]
+  if v ~= nil then
+    return i, v
+  end
+end
+
+function ipairs(t)
+  return ipairs_next, t, 0
+end
+
+-- Lua's `pairs(t)`: every entry of `t`, as `next` walks them.
+local next = next
+
+function pairs(t)
+  return next, t, nil
+end
