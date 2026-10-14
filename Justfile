@@ -130,6 +130,19 @@ show-trace:
 trace-sql query:
     python3 tools/trace_sql.py "{{query}}"
 
+# Each of `runs` (`benchmark:times`) traced, and its versions (`point_versions`):
+# by function, and its points with the most, in working/versions-<benchmark>.txt.
+version-summaries +runs:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for run in {{runs}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        out=working/versions-$benchmark.txt
+        if ! just trace $benchmark $times > $out 2>&1; then echo "$benchmark: its traced run failed"; continue; fi
+        { python3 tools/trace_sql.py "SELECT line, COUNT(*) AS points, SUM(created) AS created, SUM(live) AS live, SUM(unreachable) AS unreachable, MAX(live + unreachable) AS most FROM point_versions GROUP BY line ORDER BY live DESC LIMIT 10"
+          python3 tools/trace_sql.py "SELECT line, pc, created, live, unreachable, evicted, forgotten FROM point_versions ORDER BY live + unreachable DESC LIMIT 10"; } > $out 2>&1
+    done
+
 # Each golden test's versions, as `trace-golden` traces it: live at the end, the most live at one
 # point, and made in all (tools/trace_sql.py's point_versions).
 golden-versions +names:
@@ -240,6 +253,16 @@ jit-disasm benchmark times='10' features='unsafe':
 # disassembly (`jit-disasm`).
 jit-code-size benchmark times='10': (jit-disasm benchmark times)
     python3 tools/jit_code_size.py working/jit_disasm.txt
+
+# `jit-code-size` of each of `runs` (`benchmark:times`, as HYPERFINES has them):
+# each one's in working/jit-code-size-<benchmark>.txt.
+jit-code-sizes +runs:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for run in {{runs}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        just jit-code-size $benchmark $times > working/jit-code-size-$benchmark.txt 2>&1 || echo "$benchmark: its run failed"
+    done
 
 # `jit-disasm` of revision `ref`, from its compare worktree (as for
 # `hyperfine-vs`), on this checkout's compiled benchmark: in
@@ -1122,9 +1145,11 @@ hyperfine-unsafe benchmark: unsafe-compile
 HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10 nsieve:9 binarytrees:2 partialsums:2000000 series:2 mandelbrot:1000 mandelbrot_bit:1000 array3d:120 quicksort:300000 table_cmpsort:100000 recursive_fib:35 recursive_ack:10 spectralnorm:2 bounce:30000 md5:140 heapsort:100000 jsonlua_encode:10"
 
 # Which benchmarks lunacy runs (tools/bench_runs.py): each of lua_benchmarking's,
-# or those named, at `fraction` of its benchinfo.json scaling, against LuaJIT.
-bench-runs fraction='0.1' *benchmarks:
-    {{SAMPLED}} python3 tools/bench_runs.py --fraction {{fraction}} {{benchmarks}}
+# or those named, at `fraction` of its benchinfo.json scaling, against LuaJIT, in
+# lunacy's `build` (`unsafe`, or `release` for panics' messages), built first.
+bench-runs fraction='0.1' build='unsafe' *benchmarks:
+    {{ if build == "unsafe" { "just unsafe-compile" } else { SHARED + " cargo build --release --bin bench" } }}
+    {{SAMPLED}} python3 tools/bench_runs.py --fraction {{fraction}} --build {{build}} {{benchmarks}}
 
 # The array part stores and hash field stores each run of HYPERFINES does, by
 # what the specializer knew of each stored value's type: nothing, that it's a

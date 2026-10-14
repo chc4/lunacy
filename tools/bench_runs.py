@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Which benchmarks lunacy runs: each of lua_benchmarking's (or those named), at a
 fraction of its benchinfo.json scaling, compiled by `just _luac` and `_luajitc`,
-run by lunacy's release build and by LuaJIT. Per benchmark, each run's time or
-how it failed (lunacy's panic message), and whether their outputs agree.
+run by lunacy's `--build` (`unsafe`, as benchmarks are timed, or `release`, whose
+panics have messages) and by LuaJIT. Per benchmark, each run's time or how it
+failed (lunacy's panic message, in a release build), and whether their outputs agree.
 
-    bench_runs.py [--fraction F] [--timeout S] [benchmark ...]
+    bench_runs.py [--fraction F] [--timeout S] [--build B] [benchmark ...]
 """
 import argparse
 import json
@@ -38,6 +39,7 @@ def main():
     parser.add_argument("benchmarks", nargs="*")
     parser.add_argument("--fraction", type=float, default=0.1)
     parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--build", default="unsafe")
     args = parser.parse_args()
 
     # benchinfo.json has trailing commas.
@@ -52,7 +54,7 @@ def main():
         if not compiled:
             print(f"{name} {n}: doesn't compile")
             continue
-        ours, our_err, our_out = run(["./target/release/bench", f"working/{name}.bin", str(n)], args.timeout)
+        ours, our_err, our_out = run([f"./target/{args.build}/bench", f"working/{name}.bin", str(n)], args.timeout)
         theirs, their_err, their_out = run(["luajit", "bench.lua", "--", f"working/{name}.luajit.bin", str(n)], args.timeout)
         show = lambda t, e: f"{t:.2f}s" if e is None else f"failed: {e}"
         # lunacy's report of its run isn't the benchmark's output.

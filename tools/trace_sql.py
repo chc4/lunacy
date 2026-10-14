@@ -196,7 +196,8 @@ def fates(tp):
             fate, at = 'forgotten', until
         else:
             fate, at = ('unreachable' if block in unreachable else 'live'), None
-        rows.append(f"({ts}, {block}, {line}, {pc}, '{fate}', {'NULL' if at is None else at})")
+        sql = lambda v: 'NULL' if v is None else v
+        rows.append(f"({ts}, {sql(block)}, {sql(line)}, {sql(pc)}, '{fate}', {sql(at)})")
     tp.query("CREATE PERFETTO TABLE version_fate AS WITH fates(ts, block, line, pc, fate, at) AS "
              f"(VALUES {', '.join(rows)}) SELECT * FROM fates")
     tp.query("CREATE PERFETTO VIEW point_versions AS SELECT line, pc, COUNT(*) AS created, "
