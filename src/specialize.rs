@@ -3579,11 +3579,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         #[cfg(feature = "tracing")]
         {
             let context = ctx.tostring(owner);
+            let inline = self.traced_inline(&ctx);
             crate::tracing::instant("spec", "block", &[
                 ("block", block_id.0.into()),
                 ("line", self.traced_line(owner).into()),
                 ("pc", entry.into()),
                 ("context", context.as_str().into()),
+                ("inline", inline.as_str().into()),
             ]);
         }
         self.blocks[block_id.0].cells = ctx.filled_cells();
@@ -4203,6 +4205,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     #[cfg(feature = "tracing")]
     fn traced_line(&self, owner: &Owner) -> u64 {
         Vm::info(self.proto).1 as u64
+    }
+
+    /// The inlined calls code in `ctx` is in, for the trace: each caller's line, at the block
+    /// its call is in, then the running function's line, as `jit_disasm` names functions
+    /// (`101@b5-71`).
+    #[cfg(feature = "tracing")]
+    fn traced_inline(&self, ctx: &Context) -> String {
+        let line = |proto: LProto<'_, '_>| unsafe { (*proto).line_defined };
+        let mut chain: Vec<String> = ctx.inline.iter().map(|frame| format!("{}@b{}", line(frame.proto.cast()), frame.call.0.0)).collect();
+        chain.push(line(self.proto).to_string());
+        chain.join("-")
     }
 
     /// `version`'s choice, for the trace (`spec`/`version`, see
@@ -7056,11 +7069,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     #[cfg(feature = "tracing")]
                                     {
                                         let context = calling.tostring(owner);
+                                        let inline = self.traced_inline(&calling);
                                         crate::tracing::instant("spec", "block", &[
                                             ("block", call_block.0.into()),
                                             ("line", self.traced_line(owner).into()),
                                             ("pc", pc.0.into()),
                                             ("context", context.as_str().into()),
+                                            ("inline", inline.as_str().into()),
                                         ]);
                                     }
                                     self.end_block(block_id);

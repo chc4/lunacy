@@ -11,9 +11,12 @@ The specializer's are also views, one column per argument:
       block, the versions at the pc after it, the context requested, the join
       (if one was made), how many of the context's shapes it lost, and where
       each of its fragile facts was introduced (`fact <- block@offset,...`).
-  spec_block(ts, block, line, pc, context)
+  spec_block(ts, block, line, pc, context, inline)
       each version created, whatever became of it since: counting its rows
       counts versions ever made, not versions in the graph (`point_versions`).
+      `inline` is the inlined calls it is in, as `jit_disasm` names
+      functions: each caller's line at the block its call is in, then its own
+      line (`101@b5-71`).
   version_fate(ts, block, line, pc, fate, at)
       each version created (as `spec_block`), and what became of it: `live`,
       in the graph at the end; `forgotten` by a contraction, or `evicted` from
@@ -24,7 +27,8 @@ The specializer's are also views, one column per argument:
       fate is that of its id until the id's next version.
   point_versions(line, pc, created, live, unreachable, evicted, forgotten)
       per point, its versions by fate: `live` and `unreachable` are what the
-      graph has there at the end. How often a version ran isn't in a trace:
+      graph has there at the end. Every inlined copy of a function's point
+      is pooled; `site_versions(inline, pc, ...)` counts each copy's apart. How often a version ran isn't in a trace:
       `just jit-profile` samples the JIT's, the interpreter tier's graph dump
       (`just window-runs`) counts every entry.
   block_summary(block, line, pc, residuals, code, context, hotness, jit_entry, compiled, returns, returned_from, unreachable)
@@ -117,7 +121,7 @@ from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 VIEWS = {
     'spec_version': ['line', 'pc', 'outcome', 'block', 'versions', 'context', 'joined', 'shapes_dropped', 'origins'],
-    'spec_block': ['block', 'line', 'pc', 'context'],
+    'spec_block': ['block', 'line', 'pc', 'context', 'inline'],
     'block_summary': ['block', 'line', 'pc', 'residuals', 'code', 'context', 'hotness', 'jit_entry', 'compiled', 'returns', 'returned_from', 'unreachable'],
     'alloc_step': ['trace', 'step', 'line', 'block', 'pc', 'off'],
     'alloc_start': ['trace', 'step', 'rise', 'arrives', 'worth', 'entry'],
@@ -167,7 +171,7 @@ def ids(text):
 def fates(tp):
     """The `version_fate` table and its `point_versions` summary: each version's
     fate, found from the events forgetting versions, within its block id's life."""
-    created = [(r.ts, r.block, r.line, r.pc) for r in tp.query("SELECT ts, block, line, pc FROM spec_block ORDER BY ts")]
+    created = [(r.ts, r.block, r.line, r.pc, r.inline) for r in tp.query("SELECT ts, block, line, pc, inline FROM spec_block ORDER BY ts")]
     if not created:
         return
     # Each block id's events forgetting its version, in time order.
@@ -182,12 +186,12 @@ def fates(tp):
     # When each block id's next version is created.
     following = {}
     last = {}
-    for i, (ts, block, _, _) in enumerate(created):
+    for i, (ts, block, _, _, _) in enumerate(created):
         if block in last:
             following[last[block]] = ts
         last[block] = i
     rows = []
-    for i, (ts, block, line, pc) in enumerate(created):
+    for i, (ts, block, line, pc, inline) in enumerate(created):
         until = following.get(i)
         end = next(((at, fate) for at, fate in sorted(ends.get(block, [])) if at >= ts and (until is None or at < until)), None)
         if end:
@@ -197,9 +201,13 @@ def fates(tp):
         else:
             fate, at = ('unreachable' if block in unreachable else 'live'), None
         sql = lambda v: 'NULL' if v is None else v
-        rows.append(f"({ts}, {sql(block)}, {sql(line)}, {sql(pc)}, '{fate}', {sql(at)})")
-    tp.query("CREATE PERFETTO TABLE version_fate AS WITH fates(ts, block, line, pc, fate, at) AS "
+        rows.append(f"({ts}, {sql(block)}, {sql(line)}, {sql(pc)}, '{fate}', {sql(at)}, {'NULL' if inline is None else repr(str(inline))})")
+    tp.query("CREATE PERFETTO TABLE version_fate AS WITH fates(ts, block, line, pc, fate, at, inline) AS "
              f"(VALUES {', '.join(rows)}) SELECT * FROM fates")
+    tp.query("CREATE PERFETTO VIEW site_versions AS SELECT inline, pc, COUNT(*) AS created, "
+             "SUM(fate = 'live') AS live, SUM(fate = 'unreachable') AS unreachable, "
+             "SUM(fate = 'evicted') AS evicted, SUM(fate = 'forgotten') AS forgotten "
+             "FROM version_fate GROUP BY inline, pc")
     tp.query("CREATE PERFETTO VIEW point_versions AS SELECT line, pc, COUNT(*) AS created, "
              "SUM(fate = 'live') AS live, SUM(fate = 'unreachable') AS unreachable, "
              "SUM(fate = 'evicted') AS evicted, SUM(fate = 'forgotten') AS forgotten "

@@ -131,7 +131,8 @@ trace-sql query:
     python3 tools/trace_sql.py "{{query}}"
 
 # Each of `runs` (`benchmark:times`) traced, and its versions (`point_versions`):
-# by function, and its points with the most, in working/versions-<benchmark>.txt.
+# by function, its points with the most, and the inlined copies of points with the
+# most (`site_versions`), in working/versions-<benchmark>.txt.
 version-summaries +runs:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -140,7 +141,8 @@ version-summaries +runs:
         out=working/versions-$benchmark.txt
         if ! just trace $benchmark $times > $out 2>&1; then echo "$benchmark: its traced run failed"; continue; fi
         { python3 tools/trace_sql.py "SELECT line, COUNT(*) AS points, SUM(created) AS created, SUM(live) AS live, SUM(unreachable) AS unreachable, MAX(live + unreachable) AS most FROM point_versions GROUP BY line ORDER BY live DESC LIMIT 10"
-          python3 tools/trace_sql.py "SELECT line, pc, created, live, unreachable, evicted, forgotten FROM point_versions ORDER BY live + unreachable DESC LIMIT 10"; } > $out 2>&1
+          python3 tools/trace_sql.py "SELECT line, pc, created, live, unreachable, evicted, forgotten FROM point_versions ORDER BY live + unreachable DESC LIMIT 10"
+          python3 tools/trace_sql.py "SELECT inline, pc, created, live, unreachable, evicted, forgotten FROM site_versions ORDER BY live + unreachable DESC LIMIT 15"; } > $out 2>&1
     done
 
 # Each golden test's versions, as `trace-golden` traces it: live at the end, the most live at one
