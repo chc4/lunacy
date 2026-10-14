@@ -403,6 +403,22 @@ gdb-test name gdb_args='' features='': (_luac-test name)
     gdb {{gdb_args}} --args ./target/release/lunacy working/{{name}}.bin
 
 # Compile lua_tests/<name>.lua to working/<name>.bin.
+# `source`'s residual graphs (working/func_<line>.dot), run by the release
+# `lunacy` with TEST_FEATURES and `gas` of it: a gas-bisect's run just short of
+# going wrong.
+graph-gas source gas:
+    {{SHARED}} cargo build --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    cd working && LUNACY_GAS={{gas}} {{SAMPLED}} ../target/release/lunacy gas-bisect.bin > graph-gas.log 2>&1
+
+# The least gas with which `source`'s run goes wrong, against Lua 5.1's
+# (tools/gas_bisect.py): where JIT code miscompiles, run by the release `lunacy`
+# with TEST_FEATURES (`gas`).
+gas-bisect source signature='':
+    {{SHARED}} cargo build --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    {{SAMPLED}} python3 tools/gas_bisect.py working/gas-bisect.bin {{source}} target/release/lunacy --signature "{{signature}}"
+
 _luac-test name:
     mkdir -p working
     luac5.1 -o working/{{name}}.bin lua_tests/{{name}}.lua

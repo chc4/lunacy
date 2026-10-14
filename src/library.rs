@@ -774,7 +774,7 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
 /// call is the native's, which does too.
 #[cfg(feature = "magic")]
 fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
-    use crate::specialize::{Kind, ResumeArg, YieldOp};
+    use crate::specialize::{CType, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c <= 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
             if let ResumeArg::Keys(keys) = (yield YieldOp::Learn(a + 1)) {
@@ -782,7 +782,7 @@ fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> B
                     if let ResumeArg::HashRef(href, kind) = (yield YieldOp::HashKeyNamed(a + 1, keys[i].clone(), true)) {
                         yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::GetTableHref::new(href.0, &[a])));
                         yield YieldOp::FieldType(a, href);
-                        if kind == Kind::Of(LType::Table) {
+                        if kind == CType::Type(LType::Table) {
                             yield YieldOp::LearnKind(a);
                         }
                     }

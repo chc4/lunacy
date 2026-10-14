@@ -630,18 +630,27 @@ macro_rules! with_widen {
 /// How storing a value of type `new_type` changes a field known as `htype`. A
 /// field whose type isn't known yet is never `Same`: its value may have any
 /// type. See Note [Field types].
-fn retype(new_type: Option<LType>, htype: Kind) -> Retype {
+fn retype(new_type: Option<LType>, htype: &CType) -> Retype {
     match new_type {
-        Some(new_type) if htype == Kind::Of(new_type) => Retype::Same,
+        Some(new_type) if *htype == CType::Type(new_type) => Retype::Same,
         None => Retype::Unknown,
         Some(_) => Retype::Known,
     }
 }
 
+/// The representations a field of type `htype` may hold, as `LType::bit`s.
+fn holds_bits(htype: &CType) -> u8 {
+    match htype {
+        CType::Type(t) => t.bit(),
+        CType::Number => LType::Integer.bit() | LType::Double.bit(),
+        _ => u8::MAX,
+    }
+}
+
 /// Store through `href`'s witness into `tab`, bumping the table's epoch if the
 /// field's type changes (see `Retype`), and leaving its write barrier to the
-/// caller, after it.
-fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: Kind, retype: Retype) {
+/// caller, after it. `expected` is the representations the field holds, as `holds_bits`.
+fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: u8, retype: Retype) {
     let hidx = state.witness_base + href as usize;
     let witness = state.hash_witnesses[hidx];
     debug!("settable_href with {:?} {:?}", &witness, expected);
@@ -649,7 +658,7 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
     let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
     debug!("settable_href {:?} {:?}", &val1, expected);
     #[cfg(debug_assertions)]
-    assert!(expected.holds(val1.unbox().typeof_()));
+    assert!(expected & val1.unbox().typeof_().bit() != 0);
     *val1 = value;
     match retype {
         Retype::Same => {}
@@ -662,7 +671,7 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
 }
 
 // Store through a hash key's witness into a register's table.
-windowed!(writes SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, state, base| (table, value) {
+windowed!(writes SetTableHref, [href: u8, expected: u8], [RETYPE: Retype], |owner, state, base| (table, value) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     store_field(owner, state, &tab, value, href, expected, RETYPE);
     // Last. See Note [Write barriers].
@@ -671,7 +680,7 @@ windowed!(writes SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |ow
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.barrier_slow();
 });
-windowed!(writes SetTableHrefK, [href: u8, expected: Kind, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
+windowed!(writes SetTableHrefK, [href: u8, expected: u8, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     // A constant's value lives as long as its prototype.
     let value = LBoxed::from_bits(value);
@@ -908,7 +917,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 count_store!(field_stores);
                 // A whole constant stored into a field known to hold integers is stored as one, so
                 // the field keeps its type. See Note [Widening].
-                let whole = if c & 0x100 != 0 && htype == Kind::Of(LType::Integer) && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
+                let whole = if c & 0x100 != 0 && htype == CType::Type(LType::Integer) && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
                     let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
                     Some(k)
                 } else {
@@ -919,11 +928,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // A store to `__index` moves the table to a new epoch, whatever it
                 // stores. See Note [Table metatables].
                 let index = b & 0x100 != 0 && (yield YieldOp::IsKey(b & 0xff, b"__index")) == ResumeArg::Matched;
-                let retype = match retype(new_type, htype) {
+                let retype = match retype(new_type, &htype) {
                     Retype::Same if index => Retype::Known,
                     retype => retype,
                 };
-                let expected = htype;
+                let expected = holds_bits(&htype);
                 if c & 0x100 == 0 {
                     arg = yield YieldOp::ExecWindow(match retype {
                         Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
