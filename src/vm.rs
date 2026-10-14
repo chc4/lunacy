@@ -32,7 +32,7 @@ pub struct BlockId(pub usize);
 pub struct HashRef(pub u8);
 
 /// Where the table a hash key's field is in comes from. See Note [Table
-/// metatables] in `specialize`.
+/// metatables].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Place {
     /// The hash key's register's: a table's own, or a userdata's `__index`
@@ -445,7 +445,7 @@ impl std::hash::BuildHasher for InternedHasher {
 
 /// A userdata: a value with an identity and a metatable, and no contents Lua
 /// can read. Its metatable is fixed when it's made, which compiled code reading
-/// its fields relies on. See Note [Userdata fields] in `specialize`.
+/// its fields relies on. See Note [Userdata fields].
 ///
 /// A native making one can give it data of its own, which the natives taking it
 /// read (`data`), and which is dropped with it. The GC doesn't trace the data, so
@@ -496,30 +496,30 @@ pub struct Table<'src, 'intern> {
     pub epoch: usize,
     /// Whether caches hold its entries' addresses, which moving its entries
     /// invalidates: the global environment's, and the strings' table's. See
-    /// Notes [Global caches] and [String methods] in `specialize`.
+    /// Notes [Global caches] and [String methods].
     pub cached: bool,
     /// The array part's kind: the representations of the values stored in it
     /// since it was last emptied, a bit each (`LType::bit`). It is of a single
-    /// kind when one bit is set. See Note [Array kinds] in `specialize`.
+    /// kind when one bit is set. See Note [Array kinds].
     pub kind: u8,
     /// Its metatable, which only `setmetatable` changes. See Note [Table
-    /// metatables] in `specialize`.
+    /// metatables].
     pub metatable: Option<Tc<Table<'src, 'intern>>>,
     /// Whether code the specializer compiled relies on its contents: a store
-    /// into it trips first. See Note [Watched tables] in `specialize`.
+    /// into it trips first. See Note [Watched tables].
     pub watched: bool,
 }
 
 /// Whether a native's store tripped a watched table's watchpoint, which the run loop then
 /// handles: the tables, by address, in `PENDING_TRIPS`. JIT code reads the flag after a native call,
-/// as a plain static. See Note [Watched tables] in `specialize`.
+/// as a plain static. See Note [Watched tables].
 pub static TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 thread_local! {
     pub static PENDING_TRIPS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl<'src, 'intern> Tc<Table<'src, 'intern>> {
-    /// A native's store into it: if watched, it trips. See Note [Watched tables] in `specialize`.
+    /// A native's store into it: if watched, it trips. See Note [Watched tables].
     pub fn trip(&self, owner: &mut Owner) {
         if self.ro(owner).watched {
             self.rw(owner).watched = false;
@@ -529,8 +529,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     }
 }
 
-/// How a store into an array part widens its kind. See Note [Array kinds] in
-/// `specialize`.
+/// How a store into an array part widens its kind. See Note [Array kinds].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
 pub enum Widen {
     /// The kind has the value's representation already.
@@ -544,7 +543,7 @@ pub enum Widen {
 thread_local! {
     /// How many times a `cached` table's hash entries have moved: caches
     /// holding an entry's address are valid while it's unchanged. See Note
-    /// [Global caches] in `specialize`.
+    /// [Global caches].
     static ENV_MOVES: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -567,7 +566,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
     }
 
     /// Note a value of representation `t` stored in the array part. See Note
-    /// [Array kinds] in `specialize`.
+    /// [Array kinds].
     #[inline(always)]
     pub fn widen_kind(&mut self, t: LType) {
         self.kind |= t.bit();
@@ -689,7 +688,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
         }
         self.barrier_back();
         let k = LCanon::new(key, intern);
-        // See Note [Table metatables] in `specialize`.
+        // See Note [Table metatables].
         if matches!(k.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == b"__newindex") {
             unimplemented!("__newindex");
         }
@@ -699,7 +698,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
 
     /// `t[key]` as Lua reads it: its raw value, or else its metatable's
     /// `__index` table's, chained, as far as Lua follows one. See Note [Table
-    /// metatables] in `specialize`.
+    /// metatables].
     pub fn index(&self, owner: &Owner, key: &LBoxed<'src, 'intern>, intern: &'intern internment::Arena<IStr<'src>>) -> LBoxed<'src, 'intern> {
         let value = self.get(owner, key, intern).unwrap_or(LBoxed::NIL);
         if value.bits() != LBoxed::NIL.bits() || self.ro(owner).metatable.is_none() {
@@ -724,7 +723,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     }
 
     /// Its metatable's `__index`, if it's a table: where a key it lacks is
-    /// looked up next. See Note [Table metatables] in `specialize`.
+    /// looked up next. See Note [Table metatables].
     pub fn index_table(&self, owner: &Owner) -> Option<Tc<Table<'src, 'intern>>> {
         let index = self.ro(owner).metatable.as_ref()?.get_string(owner, b"__index");
         match index.unbox() {
@@ -873,7 +872,7 @@ pub enum LValue<'src, 'intern> {
     Nil = 0,
     Bool(bool) = 1,
     // Numbers, in the encoding their box has: the integer one, or the double
-    // one (Note [Integer encoding] in `lboxed`). Lua can't tell 2 from 2.0:
+    // one (Note [Integer encoding]). Lua can't tell 2 from 2.0:
     // equality and comparisons are by value.
     Integer(i32) = 2,
     Double(Number) = 16,
@@ -933,7 +932,7 @@ impl<'src, 'intern> crate::gc::CellKind for TLCell<TlcOwner, Userdata<'src, 'int
 // `owner`. `LCanon::new` does the canonicalizing: an owned string is interned, which the
 // arena dedups to the one pointer shared by every string with those bytes, and a number
 // is boxed canonically (`LBoxed::from_number`), as an integer and the equal double are
-// one key (Note [Integer encoding] in `lboxed`), as are 0 and -0. Everything else is
+// one key (Note [Integer encoding]), as are 0 and -0. Everything else is
 // already canonical: interned strings are that unique pointer, tables, closures and
 // userdata compare by identity, and bool/nil are their own bits.
 //
@@ -1037,7 +1036,7 @@ pub enum LType {
     String,
     Closure,
     Table,
-    /// A number in the integer encoding. See Note [Integer encoding] in `lboxed`.
+    /// A number in the integer encoding. See Note [Integer encoding].
     Integer,
     /// A number in the double encoding.
     Double,
@@ -1046,7 +1045,7 @@ pub enum LType {
 
 impl LType {
     /// This representation's bit in an array part's kind. See Note [Array
-    /// kinds] in `specialize`.
+    /// kinds].
     #[inline(always)]
     pub const fn bit(self) -> u8 {
         1 << self as u8
@@ -1302,16 +1301,15 @@ impl<'src, 'intern> Debug for LClosure<'src, 'intern> {
 }
 
 /// A native function: from its arguments, it writes its results into the slots
-/// for them (which overlap the arguments; see Note [Library natives] in
-/// `library`), and returns how many it wrote, or the error it raises (Note
-/// [Errors] in `specialize`).
+/// for them (which overlap the arguments; see Note [Library natives]), and returns how many it wrote, or the error it raises (Note
+/// [Errors]).
 pub type NativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &mut Owner) -> Result<usize, LBoxed<'src, 'intern>>;
 /// A native function given the owner shared, so it writes no object the
-/// program can see. See Note [Library natives] in `library`.
+/// program can see. See Note [Library natives].
 pub type PureNativeFunc = for<'id, 'a, 'src, 'intern> fn(LCellOwner<'id>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &'a LCell<'id, [LBoxed<'src, 'intern>]>, &Owner) -> Result<usize, LBoxed<'src, 'intern>>;
 /// A native's window op for a call to it (the `CALL`'s `a`, `b`, `c`), with
 /// which of its arguments are in the integer encoding (`ints`), if it has one
-/// for that call's arity. See Note [Native windows] in `library`.
+/// for that call's arity. See Note [Native windows].
 pub type NativeWindow = fn(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<NativeOp>;
 
 /// A call to a native run as a window op: the op, the type every argument must
@@ -1370,20 +1368,20 @@ impl NClosure {
         NClosure { cell: NClosureCell::leak(native, None, None, false, false) }
     }
 
-    /// A pure native. See Note [Library natives] in `library`.
+    /// A pure native. See Note [Library natives].
     pub fn pure(native: PureNativeFunc) -> Self {
         NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, false) }
     }
 
     /// `pcall`, whose call is laid out as a protected call of its first
     /// argument, `native` running only for a call site that doesn't specialize.
-    /// See Note [Errors] in `specialize`.
+    /// See Note [Errors].
     pub fn protected_call(native: PureNativeFunc) -> Self {
         NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, true) }
     }
 
     /// Whether a call of it is a protected call of its first argument. See
-    /// Note [Errors] in `specialize`.
+    /// Note [Errors].
     pub fn is_protected_call(&self) -> bool {
         self.cell.protects
     }
@@ -1394,13 +1392,13 @@ impl NClosure {
     }
 
     /// A pure native whose call is compiled by `generator`, as an opcode's is. See Note [Native
-    /// generators] in `library`.
+    /// generators].
     pub fn pure_generated(native: PureNativeFunc, generator: crate::specialize::NativeGenerator) -> Self {
         NClosure { cell: NClosureCell::leak(Self::called(native), None, Some(generator), true, false) }
     }
 
     /// A native whose call is compiled by `generator`, as an opcode's is. See Note [Native
-    /// generators] in `library`.
+    /// generators].
     pub fn generated(native: NativeFunc, generator: crate::specialize::NativeGenerator) -> Self {
         NClosure { cell: NClosureCell::leak(native, None, Some(generator), false, false) }
     }
@@ -1419,7 +1417,7 @@ impl NClosure {
     }
 
     /// Whether it writes no object the program can see. See Note [Library
-    /// natives] in `library`.
+    /// natives].
     pub fn is_pure(&self) -> bool {
         self.cell.pure
     }
@@ -1445,8 +1443,7 @@ pub struct Vm<'src, 'intern> {
     pub top_level: LProto<'src, 'intern>,
 }
 
-/// The library written in Lua, compiled by `build.rs`. See Note [Library natives]
-/// in `library`.
+/// The library written in Lua, compiled by `build.rs`. See Note [Library natives].
 static LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/library.luac"));
 
 /// Branded view of a VM and its arena inside a [`Vm::scope`], at a fresh invariant `'gc`. The
@@ -1456,7 +1453,7 @@ pub struct Scoped<'gc> {
     vm: *const (),
     intern: *const (),
     /// The library written in Lua's chunk (`LProto`), type-erased as `vm` is.
-    /// See Note [Library natives] in `library`.
+    /// See Note [Library natives].
     library: *const (),
     // The scope's rooting token; its `'gc` makes `Scoped` invariant (which pins the brand — see
     // the SAFETY note on `Vm::scope`) and unlocks the crate-private `Vm::run`/`global_env`.
@@ -1480,7 +1477,7 @@ impl<'gc> Scoped<'gc> {
     }
 
     /// Build the global environment table, and run the library written in Lua
-    /// in it (Note [Library natives] in `library`): before any value of the
+    /// in it (Note [Library natives]): before any value of the
     /// caller's exists, which nothing would root while it runs. Scope-gated; see
     /// Note [Scoped heap].
     pub fn global_env(&self, owner: &mut Owner) -> Tc<Table<'gc, 'gc>> {
@@ -1567,7 +1564,7 @@ impl Location {
 /// What a return leaves JIT code with, or last sets `RunState::returned` to:
 /// `RETURNED | effects << EFFECTS_SHIFT | id`, `id` naming what it returned
 /// and `effects` its function's. See Notes [Call continuations] and [Call
-/// effects] in `specialize`.
+/// effects].
 pub const RETURNED: u64 = (-5i32 as u64) << 32;
 /// Where a return's effects are in what it returns, above its id. See
 /// `RETURNED`.
@@ -1577,7 +1574,7 @@ pub const EFFECTS_SHIFT: u32 = 20;
 // ~~~~~~~~~~~~~~~~~~~~
 // A call frame occupies its function's frame size (`FrameSize`) of slots of the register file
 // (`vals`) from its `base`: its `max_stack` registers, and past them the frames of the calls
-// inlined into it (Note [Inlined calls] in `specialize`). `RunState::top` is its dynamic Lua top
+// inlined into it (Note [Inlined calls]). `RunState::top` is its dynamic Lua top
 // (the variable-count-span cursor), which starts past its registers.
 // `call_lua` records the caller's state and the callee's function slot in a
 // `CallstackEntry` and makes the stack long enough for the callee's frame; a return pops it and restores that state
@@ -1591,7 +1588,7 @@ pub const EFFECTS_SHIFT: u32 = 20;
 // past them while results a call returned all of (C = 0) are still to be
 // consumed. It is computed when the GC runs, from the callstack, rather than
 // kept on each call and return. While frames JIT code called are running, which
-// have no entries (Note [Frame ops] in `specialize`), it is the whole stack.
+// have no entries (Note [Frame ops]), it is the whole stack.
 //
 // Marking the stack shrinks it to its live extent (`RunState::mark`), and the
 // GC marks the roots again, the mutator stopped, before it sweeps: so a slot
@@ -1617,12 +1614,12 @@ pub const EFFECTS_SHIFT: u32 = 20;
 
 /// The words JIT code keeps on the native stack for an inlined call's frame: the callee's base
 /// pointer, the code after the call, and its caller's hash witnesses' top and base, base and
-/// closure. See Note [Inlined calls] in `specialize`.
+/// closure. See Note [Inlined calls].
 pub const INLINE_KEPT: usize = 6;
 
 /// Where a frame returns to: the residual after its call in its caller's code, or, for an inlined
 /// call's frame, the code inlining it, which its returns continue compiling (a `Continuation`'s
-/// address). See Note [Inlined calls] in `specialize`.
+/// address). See Note [Inlined calls].
 #[derive(Debug)]
 pub enum Return {
     To(Location),
@@ -1668,7 +1665,7 @@ impl<'src, 'intern> CallstackEntry<'src, 'intern> {
 }
 
 /// A protected call's handler: where an error raised in it goes. See Note
-/// [Errors] in `specialize`.
+/// [Errors].
 #[derive(Debug, Clone, Copy)]
 pub struct Handler {
     /// The callstack's length at the call: the frames above it are the call's.
@@ -1708,7 +1705,7 @@ impl Default for HashWitness {
 // function's entry context has no hash keys and a hash key's `href_init` runs
 // before any use of it. An inlined call's frame has its caller's region, and its
 // entry context its caller's hash keys: its code reads and writes the caller's
-// witnesses as the caller's own code would (Note [Inlined calls] in `specialize`),
+// witnesses as the caller's own code would (Note [Inlined calls]),
 // and its return leaves `witness_top` where the callee raised it, as the hash keys
 // the callee leaves the caller are past where the caller's top was: a call after
 // it starts past them.
@@ -1717,7 +1714,7 @@ impl Default for HashWitness {
 // the one it saw, at the epoch it saw: a table's hash part only reallocates or moves an
 // entry when a key is inserted or removed, which bumps the epoch, and the
 // collector doesn't move tables. The table a hash key's slot reaches can change
-// with no write to the slot (Note [Userdata fields] in `specialize`), so a
+// with no write to the slot (Note [Userdata fields]), so a
 // witness is checked against the table as well as its epoch. Field reads and
 // writes go through the address; the paths repairing a witness after the epoch
 // changes find the entry again by its index.
@@ -1782,22 +1779,22 @@ pub struct RunState<'src, 'intern> {
     pub _G: Tc<Table<'src, 'intern>>,
     pub clos: Tc<LClosure<'src, 'intern>>,
     /// The run's outermost frame's closure, which has no function's slot to keep it while it calls
-    /// from JIT code. See Note [Frame ops] in `specialize`.
+    /// from JIT code. See Note [Frame ops].
     pub entry: Tc<LClosure<'src, 'intern>>,
     pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Tc<Upvalue<'src, 'intern>>>)>,
     pub callstack: FVec<CallstackEntry<'src, 'intern>>,
     pub counters: PerfCounters,
     pub select: usize,
     /// The record of the site whose window op's cold stencil is running. See
-    /// Note [Cold stencils] in `window`.
+    /// Note [Cold stencils].
     pub cold_site: *const u64,
     /// The last return's `RETURNED | effects << EFFECTS_SHIFT | id`, `id`
     /// naming what it returned and `effects` its function's, which
     /// the continuation of the call it returned from guards on. See Note [Call
-    /// continuations] in `specialize`.
+    /// continuations].
     pub returned: u64,
     /// Where the last return is, a `PackedLocation`: the exit its call took, which the call's
-    /// continuation measures inlining the callee on. See Note [Inlined calls] in `specialize`.
+    /// continuation measures inlining the callee on. See Note [Inlined calls].
     pub returned_at: u64,
     /// Where the caller of the last return from JIT code continues, a
     /// `PackedLocation`, for the run loop: the return itself leaves the code
@@ -1808,25 +1805,23 @@ pub struct RunState<'src, 'intern> {
     pub witness_top: usize,
     pub hash_witnesses: Witnesses,
     pub trap: bool,
-    /// The error raised and not yet handled. See Note [Errors] in `specialize`.
+    /// The error raised and not yet handled. See Note [Errors].
     pub error: Option<LBoxed<'src, 'intern>>,
-    /// The protected calls running, innermost last. See Note [Errors] in
-    /// `specialize`.
+    /// The protected calls running, innermost last. See Note [Errors].
     pub handlers: FVec<Handler>,
     pub current_off: u16,
     /// What a return from JIT code leaves the JIT code with: where its caller
     /// continues (a `PackedLocation`), or -2 for a return from the entry
-    /// frame. `PopFrame` writes it. See Note [Frame ops] in `specialize`.
+    /// frame. `PopFrame` writes it. See Note [Frame ops].
     pub exit: u64,
     /// How many frames JIT code called past the callstack's, which have no
-    /// entries in it. See Note [Frame ops] in `specialize`.
+    /// entries in it. See Note [Frame ops].
     pub jit_depth: usize,
     /// How many slots past the base of the innermost frame made the base is: the frames of inlined
-    /// calls `Enter` moved it to without making them. See Note [Inlined frames] in `specialize`.
+    /// calls `Enter` moved it to without making them. See Note [Inlined frames].
     pub shifted: usize,
     /// How many entries past the callstack's length a bailout through frames
-    /// JIT code called has written, as their calls unwind. See Note [Frame ops]
-    /// in `specialize`.
+    /// JIT code called has written, as their calls unwind. See Note [Frame ops].
     pub unwound: usize,
     pub gas: i64,
     /// Prototypes whose entry blocks `closure.__jit = ...` asked to compile, for
@@ -1838,7 +1833,7 @@ pub struct RunState<'src, 'intern> {
     /// The key `__index`, canonical.
     pub index_key: LCanon<'src, 'intern>,
     /// The strings' table, the `string` library, which indexing a string reads.
-    /// See Note [String methods] in `specialize`.
+    /// See Note [String methods].
     pub strings: Tc<Table<'src, 'intern>>,
 }
 
@@ -1859,7 +1854,7 @@ impl<'src, 'intern> Debug for RunState<'src, 'intern> {
 impl<'src, 'intern> RunState<'src, 'intern> {
     /// Close the running frame's open upvalues, the slots from `base` up: each takes the
     /// slot's value into a cell of its own, as it leaves the stack. An enclosing frame's
-    /// stay open. See Note [Captured slots] in `specialize`.
+    /// stay open. See Note [Captured slots].
     pub fn close_upvalues(&mut self, owner: &mut Owner)
     {
         self.close_upvalues_from(owner, self.base)
@@ -1994,7 +1989,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
     /// Make the stack long enough for every live frame, the running one's and each caller's, as
     /// their functions' frame sizes say: one grew as a call inlined into its function. See Notes
-    /// [Stack frames] and [Inlined calls] in `specialize`.
+    /// [Stack frames] and [Inlined calls].
     pub fn fit_frames(&mut self, owner: &Owner) {
         debug_assert_eq!(self.jit_depth, 0, "frames JIT code called have no entries to fit");
         let end = self.frames_end(owner);
@@ -2037,7 +2032,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     }
 
     /// `call_lua`, inlined into the window op pushing a frame in JIT code
-    /// (`PushFrame`). See Note [Frame ops] in `specialize`.
+    /// (`PushFrame`). See Note [Frame ops].
     ///
     /// The callee's frame past its arguments is nil when it starts, as Lua's
     /// is: luac emits no LOADNIL for a local declared at a function's first
@@ -2049,7 +2044,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// With `ENTRY`, the caller's state is recorded in a `CallstackEntry`
     /// returning to `ret`; without, for a call from JIT code of a function that
     /// isn't vararg, the frame is only counted (`jit_depth`), the caller keeping
-    /// that state, and `ret` is unused. See Note [Frame ops] in `specialize`.
+    /// that state, and `ret` is unused. See Note [Frame ops].
     #[inline(always)]
     pub fn push_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, ret: PackedLocation, a: usize, b: usize, frame: usize, fills: bool) -> usize {
         let entry = ENTRY.then(|| CallstackEntry {
@@ -2097,7 +2092,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// function inlining it. With `ENTRY`, its entry returns to the code inlining it, `continuation`
     /// (`Return::Inlined`), and its top starts past its registers; without, in JIT code, it is only
     /// counted (`jit_depth`), the JIT code keeping what its entry would hold, and its top is left,
-    /// as code reading it sets it first. See Note [Inlined calls] in `specialize`.
+    /// as code reading it sets it first. See Note [Inlined calls].
     #[inline(always)]
     pub fn shift_frame<const ENTRY: bool>(&mut self, owner: &Owner, callee: LBoxed<'src, 'intern>, a: usize, b: usize, stack: u8, fills: bool, continuation: u64) {
         debug_assert!(matches!(callee.unbox(), LValue::LClosure(_)), "an inlined call of what isn't a Lua function");
@@ -2135,7 +2130,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// if `closes`, and for `results`, RETURN's A and B, its results to its function's slot, as
     /// `leave` moves them; without, the code after it moves them. With `ENTRY`, its entry is
     /// popped, the caller's frame running again; without, in JIT code, which puts the caller's
-    /// frame back itself, it is only no longer counted. See Note [Inlined calls] in `specialize`.
+    /// frame back itself, it is only no longer counted. See Note [Inlined calls].
     #[inline(always)]
     pub fn unshift_frame<const ENTRY: bool>(&mut self, owner: &mut Owner, results: Option<(usize, usize)>, closes: bool) {
         if closes && !self.upvals.is_empty() {
@@ -2165,8 +2160,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// frames].
     pub fn vararg(&mut self, owner: &Owner, a: usize, b: usize, params: usize) {
         debug_assert!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, "VARARG in a function that isn't vararg");
-        // Only a frame JIT code didn't call is a vararg function's. See Note [Frame ops] in
-        // `specialize`.
+        // Only a frame JIT code didn't call is a vararg function's. See Note [Frame ops].
         assert_eq!(self.jit_depth, 0, "VARARG in a frame JIT code called");
         // The outermost frame, a chunk, has none.
         let extra = self.callstack.last().map_or(0, |entry| {
@@ -2221,7 +2215,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// its base, and its caller, which kept the rest, puts it back; `None`.
     ///
     /// Inlined into the window op popping a frame in JIT code (`PopFrame`). See
-    /// Note [Frame ops] in `specialize`.
+    /// Note [Frame ops].
     #[inline(always)]
     pub fn leave<const ENTRY: bool>(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> Result<Option<Location>, std::ops::Range<usize>> {
         debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, vararg, "a return's vararg isn't its function's");
@@ -2289,10 +2283,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// returns where it would have; from the outermost frame, which has no slot
     /// for its function, the callee's arguments start at its base. `vararg` is
     /// whether the running function is vararg. The callee's `max_stack`. See
-    /// Note [Tail calls] in `specialize`.
+    /// Note [Tail calls].
     ///
     /// Inlined into the window op replacing a frame in JIT code (`TailFrame`).
-    /// See Note [Frame ops] in `specialize`.
+    /// See Note [Frame ops].
     #[inline(always)]
     pub fn tail_call(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> usize {
         debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, vararg, "a tail call's vararg isn't its function's");
@@ -2314,7 +2308,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let (stack, callee_vararg, params, frame) = (proto.max_stack as usize, proto.is_vararg != 0, proto.param_count as usize, proto.frame_size.get());
         let next_base = match self.callstack.last() {
             // A frame JIT code called is no vararg function's, and its entry isn't there to
-            // record a vararg callee's function slot. See Note [Frame ops] in `specialize`.
+            // record a vararg callee's function slot. See Note [Frame ops].
             _ if self.jit_depth > 0 => {
                 assert!(!vararg && !callee_vararg, "not implemented: a tail call of a vararg function in a frame JIT code called");
                 self.move_down(from, count, self.base - 1);
@@ -2398,7 +2392,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// The entry of the frame JIT code called at `jit_depth`, written as its call unwinds a bailout,
     /// from what its caller kept: its closure, base, and hash witnesses' range, and the call's
     /// return location. The first room is made for every frame JIT code called. See Note [Frame
-    /// ops] in `specialize`.
+    /// ops].
     pub fn unwind_jit_frame(&mut self, clos: Tc<LClosure<'src, 'intern>>, frame: usize, witness_frame: usize, witness_top: usize, ret: Return) {
         if self.unwound == 0 {
             self.callstack.reserve(self.jit_depth);
@@ -2426,8 +2420,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// JIT code entered in the innermost keeps them: each frame's caller's closure, base and hash
     /// witnesses' range, as `ShiftFrame`'s code pushes them, written to `kept` innermost first,
     /// each frame's base pointer above its caller's state, and the base pointer of the outermost's
-    /// caller past them all, where the region keeps its own. See Note [Inlined calls] in
-    /// `specialize`.
+    /// caller past them all, where the region keeps its own. See Note [Inlined calls].
     pub fn adopt_inlined(&mut self, kept: &mut [u64], depth: usize) {
         let len = self.callstack.len();
         let stack = unsafe { self.vals.stack_ptr.as_non_null_ptr().as_ptr() } as u64;
@@ -2444,7 +2437,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     }
 
     /// Raise `error`: the run loop unwinds to the innermost protected call, and
-    /// JIT code exits to it first. See Note [Errors] in `specialize`.
+    /// JIT code exits to it first. See Note [Errors].
     pub fn raise(&mut self, error: LBoxed<'src, 'intern>) {
         self.error = Some(error);
         self.trap = true;
@@ -2452,7 +2445,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
     /// The table whose hash part the hash keys of `slot` of the running frame
     /// are in: a table's own, or a userdata's `__index` table, if it has one.
-    /// See Note [Userdata fields] in `specialize`.
+    /// See Note [Userdata fields].
     pub fn hash_part_at(&self, owner: &Owner, slot: usize) -> Option<Tc<Table<'src, 'intern>>> {
         match self.vals[self.base + slot].unbox() {
             LValue::Table(tab) => Some(tab),
@@ -2463,8 +2456,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
 
     /// The table at `place`, for a hash key of `slot`: the one a key found
     /// down a table's `__index` chain is in comes from the witnesses of the
-    /// hash keys before it, which hold. See Note [Table metatables] in
-    /// `specialize`.
+    /// hash keys before it, which hold. See Note [Table metatables].
     pub fn place_table(&self, owner: &Owner, slot: usize, place: Place) -> Option<Tc<Table<'src, 'intern>>> {
         match place {
             Place::Register => self.hash_part_at(owner, slot),
@@ -2524,8 +2516,7 @@ impl<'src, 'intern> Mark for RunState<'src, 'intern> {
                 cell.mark(owner);
             }
         }
-        // Inside JIT code, the frames it called have no entries here (Note [Frame ops] in
-        // `specialize`): each one's closure is in its function's slot, in its caller's frame, which
+        // Inside JIT code, the frames it called have no entries here (Note [Frame ops]): each one's closure is in its function's slot, in its caller's frame, which
         // the stack marks.
         for call in self.callstack.iter() {
             call.clos.mark(owner);
@@ -2642,7 +2633,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let _guard = ScopeGuard::enter();
         let root_scope = Heap::root_scope();
         // The library written in Lua, for the scope's whole heap: its closures are
-        // values in it. See Note [Library natives] in `library`.
+        // values in it. See Note [Library natives].
         let (_, library) = crate::chunk::header(LIBRARY).expect("the library's bytecode");
         let library = library.globally_intern(intern);
         // SAFETY: `Scoped::vm`/`intern` read the erased pointers back at `'gc`, which must not

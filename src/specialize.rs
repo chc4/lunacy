@@ -149,6 +149,7 @@ impl std::fmt::Display for Residual {
             Residual::LuaGuard { idx, ptr } => write!(f, "lua_guard({}, {:p})", idx, *ptr),
             Residual::Exec(ResidualExec { name, .. }) => write!(f, "exec({})", name),
             Residual::ExecWindow(w) => write!(f, "window({})", window_label(&**w)),
+            Residual::Emit(op) => write!(f, "emit({})", &**op),
             Residual::GuardDynamic(w) => write!(f, "guard_dynamic({})", window_label(&**w)),
             Residual::Jump(target) => write!(f, "jump({})", target.0),
             Residual::PatchableJump(target) => write!(f, "patchable_jump({})", target.0),
@@ -218,7 +219,7 @@ pub enum CallTarget {
 }
 
 /// A native's generator, of an opcode's generator's type, boxed: a native's call is compiled by
-/// it as an opcode is by its own. See Note [Native generators] in `library`.
+/// it as an opcode is by its own. See Note [Native generators].
 pub trait NativeGen: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Unpin {
     fn clone_box(&self) -> Box<dyn NativeGen>;
 }
@@ -314,6 +315,8 @@ pub enum YieldOp {
 
     Exec(ResidualExec), // Emit a residual operation that will be executed
     ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op. See Note [Register window].
+    Emit(Rc<dyn crate::emitted::Emitted>), // An op on the window whose code the JIT emits itself.
+                                           // See Note [Emitted ops]
     Jump(BlockId), // Emit a jump to the given BlockId
     Call(CallTarget), // Call a block target.
     CallResume(CallTarget), // Call, and then resumed with Start, once the call's results arrive.
@@ -339,7 +342,7 @@ pub enum YieldOp {
                     // with the double type to compute it in the double encoding instead, else with
                     // the integer one. See Note [Optimistic ops]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
-    NativeCall { nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize }, // Emit a call of a pure native, its results from STACK[a] on of unknown type. See Note [Native generators] in `library`.
+    NativeCall { nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize }, // Emit a call of a pure native, its results from STACK[a] on of unknown type. See Note [Native generators].
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
                       // knows it, else Failed. See Note [Array kinds]
     IsElementOf(usize, usize), // Resumed with Matched if STACK[a] was loaded from STACK[b]'s array
@@ -367,7 +370,7 @@ pub enum YieldOp {
     UpvalueHolds(usize, usize), // Inform the executor that UpValue[a] holds STACK[b]'s value. See
                                 // Note [Upvalue paths]
     Copy(usize, usize), // Inform the executor that STACK[a] holds STACK[b]'s value. See Note
-                        // [Value classes] in `classes`
+                        // [Value classes]
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
                     // Note [Fragile information]
 
@@ -685,7 +688,7 @@ pub(crate) use drain;
 //
 // A closure may read or write a slot it captured whenever it runs, which is during a call. For
 // that reason, the type of a slot any CLOSURE of a function captures (`captured_slots`) is
-// forgotten after each call that isn't a pure native's (Note [Library natives] in `library`), and
+// forgotten after each call that isn't a pure native's (Note [Library natives]), and
 // no context types a captured slot with what a call may have changed.
 //
 // GETUPVAL and SETUPVAL read and write an open cell's slot in memory, never the
@@ -865,11 +868,11 @@ impl After {
 // leaves, the run loop takes them into the callstack (`finish_unwinding`), in order.
 //
 // Only a frame JIT code didn't call can be a vararg function's: its entry records its function's
-// slot (Note [Vararg frames] in `vm`). A call from JIT code that would make one, or reach the
+// slot (Note [Vararg frames]). A call from JIT code that would make one, or reach the
 // interpreter's call path, while frames JIT code called are running, goes to the interpreter
 // instead, which makes the callstack whole first. The frames JIT code called stay rooted for the
 // collector without entries: each one's closure is in its function's slot, in its caller's frame,
-// and while any runs, the collector marks the whole stack (Note [Stack frames] in `vm`). So is the
+// and while any runs, the collector marks the whole stack (Note [Stack frames]). So is the
 // closure of each frame that called one, which its call keeps on the native stack, but for the
 // run's outermost frame, which has no function's slot: the run's state keeps that one
 // (`RunState::entry`).
@@ -1085,6 +1088,8 @@ pub enum Residual {
     Exec(ResidualExec),
     /// A copy&patch window op (see `crate::window`) to execute.
     ExecWindow(Rc<dyn Window>),
+    /// An op on the window whose code the JIT emits itself. See Note [Emitted ops].
+    Emit(Rc<dyn crate::emitted::Emitted>),
     /// A guard whose test is a window op: it selects 1 if passed, or 0 if failed. See Note
     /// [Dynamic guards].
     GuardDynamic(Rc<dyn Window>),
@@ -1236,7 +1241,7 @@ pub enum CallEntry {
 // Entered from the interpreter inside inlined calls, JIT code takes their entries onto the native
 // stack first (`RunState::adopt_inlined`).
 //
-// The callee's hash keys are the caller's (Note [Hash witnesses] in `vm`): its frame has its
+// The callee's hash keys are the caller's (Note [Hash witnesses]): its frame has its
 // caller's witnesses, and its entry context the caller's hash keys at their indexes, an argument's
 // its parameter's, with its shape, and every other's the caller's own, which the callee's code
 // keeps, naming no slot of it (`OUTER`). So the callee's code finds a field of a table it was
@@ -1903,7 +1908,7 @@ fn forgets(ctx: &Context, live: usize) -> bool {
 // type, and what the target does with it (return it, pass it) needs it; a CLOSURE's jump past its
 // pseudo-instructions leaves its closure in a temporary until it is returned or stored. Such a
 // jump keeps what it knows of the register its instruction wrote: its type, and its value's class
-// (Note [Value classes] in `classes`), so both ways in agree.
+// (Note [Value classes]), so both ways in agree.
 
 /// Forget, for a jump to a target where the registers from `live` on hold no
 /// local, those registers' types and the fragile facts about them, but `kept`'s.
@@ -1918,7 +1923,7 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // Note [Dynamic guards]
 // ~~~~~~~~~~~~~~~~~~~~~~
 // A `GuardDynamic` residual's test is a window op that reads its operands and selects its exit, 1
-// to pass and 0 to fail (Note [Window exits] in `window`), and is otherwise pure. Its two edges continue the generator at
+// to pass and 0 to fail (Note [Window exits]), and is otherwise pure. Its two edges continue the generator at
 // different `SubPc`s, resumed with `Matched` or `Failed`, so their versions are told apart by the
 // outcome and needn't differ in context: a test can speculate on what no ctype names, like whether
 // a key is in a table's array part (`InArray`), for the instruction's next op alone. Nothing
@@ -2009,9 +2014,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // is dropped if an origin has JIT code, or a fact was used since. The residual where the origin
 // introduced the fact then becomes a thunk: code entering the block from its start ends there, as
 // the JIT and the trimming below read it, and the residuals after it are dead. Forced, the thunk
-// compiles the code from the origin again, as any thunk lays out its code (Note [Thunk patching]
-// in `jit`): in place, truncating the dead residuals. Origins sharing a residual share its thunk
-// too: the earliest's, whose code loads the rest again as each one's contraction decided.
+// compiles the code from the origin again, as any thunk lays out its code (Note [Thunk patching]):
+// in place, truncating the dead residuals. Origins sharing a residual share its thunk too: the
+// earliest's, whose code loads the rest again as each one's contraction decided.
 //
 // A fact can be rebuilt from the same origin another way: a constant that meets a double (Note
 // [Widening]) is loaded as a double instead, so every path from its load computes on the double.
@@ -2058,7 +2063,7 @@ fn overflow_rebuilds() -> bool {
 // Note [Optimistic ops]
 // ~~~~~~~~~~~~~~~~~~~~~
 // An op can do its common case on its hot path and the rest on its cold path (Note [Cold
-// stencils] in `window`), and select which it took, 0 or 1. Yielded as `OptimisticExec`, the op
+// stencils]), and select which it took, 0 or 1. Yielded as `OptimisticExec`, the op
 // is followed by a `Branch` to two ways on: its generator continues on the hot one, resumed with
 // `Matched`, and on the cold one, behind a thunk, only once it is taken, resumed with `Failed`. So
 // the code after the op can know what its common case gives, as an integer op's result in the
@@ -2077,9 +2082,9 @@ fn overflow_rebuilds() -> bool {
 // JIT code by its first overflow keeps both ways.
 //
 // In JIT code the `Branch` tests no `select`, as a guard's copy tests none (Note [Guard
-// stencils] in `window`): the op's hot path falls through to the hot way, as the next block if
+// stencils]): the op's hot path falls through to the hot way, as the next block if
 // it is laid out next, and its cold stencil, which ends in a jump to its site record's
-// continuation (Note [Cold stencils] in `window`), continues at the cold way, laid out after the
+// continuation (Note [Cold stencils]), continues at the cold way, laid out after the
 // region's blocks, as such an op's record's continuation.
 
 /// The type of a constant, as a value: a number is a double. See Note
@@ -2247,7 +2252,7 @@ pub struct Context {
 // doesn't see all of it is dropped. The known top (Note [Known top]) is information of this kind.
 //
 // It is in the context, as what is known of the values its places hold (`Context::values`; Note
-// [Value classes] in `classes`), so it is part of every block's key. A block compiled
+// [Value classes]), so it is part of every block's key. A block compiled
 // relying on a fact is only entered by paths that established it and kept it since, as any path
 // reaching a block with an equal context shares it. It is per activation: a function's entry block
 // has none, and a call's continuation only what the callee's effects keep (Note [Call effects]).
@@ -2255,7 +2260,7 @@ pub struct Context {
 // Effects come from the residuals as they are yielded (`Context::effect`). A window op writes the
 // slots its accesses say it writes (`Effect::Write`), an exec those it says it writes, else any
 // slot (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op or a pure native's
-// (Note [Library natives] in `library`) is `Effect::Opaque`, and what a residual can't show a
+// (Note [Library natives]) is `Effect::Opaque`, and what a residual can't show a
 // yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A store into a table is always
 // yielded as one, `Effect::ArrayStore` or the hash hazards it sets: an exec's writes are of its own
 // frame, and a caller sees only the store (Note [Call effects]).
@@ -2327,8 +2332,7 @@ impl std::fmt::Display for Kind {
 
 // Note [Field facts]
 // ~~~~~~~~~~~~~~~~~~
-// A table's hash field and a global are places as an upvalue is (Note [Value classes] in
-// `classes`): a global a root, and a field an edge from the table's class, each by its name. A
+// A table's hash field and a global are places as an upvalue is (Note [Value classes]): a global a root, and a field an edge from the table's class, each by its name. A
 // slot loaded from one is in its class, so what a guard finds of either is known of both, and a
 // load needs no guard one before it passed: a global library's functions, or a machine's stacks
 // kept in its fields, are known after their first guards. Only a table or a function is kept so: a
@@ -2340,7 +2344,7 @@ impl std::fmt::Display for Kind {
 
 // Note [Upvalue paths]
 // ~~~~~~~~~~~~~~~~~~~~
-// A fact about an upvalue is one about the value it holds (Note [Value classes] in `classes`): the
+// A fact about an upvalue is one about the value it holds (Note [Value classes]): the
 // running function's own upvalue j is a root, and upvalue n of a closure is a field of the
 // closure's class. Only a closure's prototype is known (what its identity guard compares), not
 // the closure, so what is known of its upvalues is known of their values, not of its cells.
@@ -2373,7 +2377,7 @@ impl std::fmt::Display for Kind {
 /// What is known of a value, besides the type the slots holding it have: an upvalue's value's type
 /// (`Type`, Note [Upvalue paths]), a table's array part's kind (`Kind`, Note [Array kinds]), and a
 /// number constant an i32 holds exactly, with where it was loaded (`Constant`, Note [Widening]).
-/// Each is a domain of its own. See Notes [Fragile information] and [Value classes] in `classes`.
+/// Each is a domain of its own. See Notes [Fragile information] and [Value classes].
 #[derive(Clone)]
 pub enum Known {
     Type(CType),
@@ -2536,8 +2540,7 @@ pub enum Effect {
 // (`Specializer::effects`), which only grows. It is kept out of the context, so it never makes a
 // version of its own: whatever path code for the prototype is compiled on adds to the one join. A
 // call adds its callee's effects once its continuation knows them (Note [Call continuations]),
-// and opaque where nothing does: a call to a native that isn't pure (Note [Library natives] in
-// `library`), a call the call site doesn't specialize, and a continuation that doesn't know the
+// and opaque where nothing does: a call to a native that isn't pure (Note [Library natives]), a call the call site doesn't specialize, and a continuation that doesn't know the
 // return.
 //
 // A return reads its prototype's join when it runs, and returns it with the id of what it returns
@@ -4770,7 +4773,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let rebuild = move |vm: &mut Specializer, owner: &mut Owner, how: ResumeArg| {
             let thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
                 // In place, unless the thunk's JIT code can only be patched to a jump (Note [Thunk
-                // patching] in `jit`). Nothing returns into the residuals after it, which it
+                // patching]). Nothing returns into the residuals after it, which it
                 // truncates: the rebuild waited until nothing ran past it.
                 assert!(!state.callstack.iter().filter_map(|entry| entry.returns_to()).any(|ret| ret.0 == block && ret.1 > thunk_pc), "a frame returns past a rebuilt origin");
                 let at = if vm.compiled(block) {
@@ -5563,8 +5566,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
                     layout.push(next(vm, block));
                     // Past the guard, a native with a generator is compiled by it, as an opcode is,
-                    // and the code after the call is a version. See Note [Native generators] in
-                    // `library`.
+                    // and the code after the call is a version. See Note [Native generators].
                     if let (Some(generator), After::Version(..)) = (nf.generator(), &after) {
                         vm.blocks[block.0].instructions.extend(layout);
                         let compiled = vm.compile_one(owner, pc, calling.clone(), generator(nf.native(), a, b, c), ResumeArg::Start, block);
@@ -5605,7 +5607,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             known = None;
                         }
                     }
-                    // See Note [Library natives] in `library`.
+                    // See Note [Library natives].
                     if let Some((known, rest)) = known {
                         let after = match rest {
                             Rest::Next(pc) => {
@@ -5721,6 +5723,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     _ => 1,
                 };
                 match res {
+                    Residual::Emit(op) => {
+                        for (&slot, _) in op.operands().iter().zip(op.accesses()).filter(|(_, access)| access.writes()) {
+                            upvalued.retain(|held| *held != slot);
+                        }
+                    }
                     Residual::ExecWindow(w) => {
                         let written = w.operands().iter().zip(w.accesses()).filter(|(_, access)| access.writes()).map(|(&slot, _)| slot);
                         let loads = matches!(w.name(), "GetUpval" | "HeldUpval" | "NativeUpval");
@@ -6690,6 +6697,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
                 },
+                CoroutineState::Yielded(YieldOp::Emit(op)) => {
+                    for (&slot, access) in op.operands().iter().zip(op.accesses()) {
+                        if access.writes() {
+                            Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
+                        }
+                    }
+                    self.blocks[block_id.0].instructions.push(Residual::Emit(op));
+                },
                 CoroutineState::Yielded(YieldOp::NativeCall { nf, a, b, c }) => {
                     self.blocks[block_id.0].instructions.push(Residual::NativeCall { nf, a: a as u16, b: b as u16, c: c as u16 });
                     // A native may allocate (a table, a string).
@@ -6720,8 +6735,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Copy(dest, src)) => {
                     // A copy's class tells more than its slots' type only of a value that can
-                    // have fields or a kind, or is a known constant. See Note [Value classes] in
-                    // `classes`.
+                    // have fields or a kind, or is a known constant. See Note [Value classes].
                     let plain = matches!(ctx.slot(src), CType::Number | CType::Type(LType::Nil | LType::Bool | LType::String | LType::Integer | LType::Double));
                     if dest != src && (!plain || ctx.constant(src).is_some()) {
                         Rc::make_mut(&mut ctx).values.assign(Root::Slot(dest as u16), Loc::root(Root::Slot(src as u16)));
@@ -6897,7 +6911,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // needs a continuation for it to unwind to. See Note [Errors].
                             let native = matches!(&ctx.types[a], CType::NativeFunction(nf) if !nf.is_protected_call());
                             // A native with a generator is compiled by it, as an opcode is. See Note
-                            // [Native generators] in `library`.
+                            // [Native generators].
                             if native && !resumes && let CType::NativeFunction(nf) = &ctx.types[a] && let Some(generator) = nf.generator() {
                                 coro = generator(nf.native(), a, b, c);
                                 arg = ResumeArg::Start;
@@ -7348,6 +7362,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::ExecWindow(w) => {
                     off += 1;
                     w.interp(owner, &mut state);
+                },
+                Residual::Emit(op) => {
+                    off += 1;
+                    crate::emitted::interp(&**op, &mut state);
                 },
                 Residual::GuardDynamic(w) => {
                     w.interp(owner, &mut state);

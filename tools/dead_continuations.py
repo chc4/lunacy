@@ -15,7 +15,7 @@ import argparse
 import shutil
 from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
-# Note [Call continuations] in `specialize`: the id with every bit below the
+# Note [Call continuations]: the id with every bit below the
 # effects set.
 EFFECTS_SHIFT = 20
 UNKNOWN_RETURN = (1 << EFFECTS_SHIFT) - 1

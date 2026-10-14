@@ -71,8 +71,7 @@ pub enum Label {
     ElementOf,
     /// The hash field of a name, by its hash, of the table it is.
     Field(u64),
-    /// The integer it is the quotient of by a positive constant. See Note [Quotients] in
-    /// `specialize`.
+    /// The integer it is the quotient of by a positive constant. See Note [Quotients].
     Quotient(i32),
 }
 

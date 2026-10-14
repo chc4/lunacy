@@ -84,8 +84,7 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
 //
 // A target compiled with a thunk waiting to be linked into it, the thunk whose
 // path got it hot, plans its region from that thunk's window: it is the hint
-// its entry window starts from (see Note [Trace allocation] in
-// `window_alloc`).
+// its entry window starts from (see Note [Trace allocation]).
 
 // Note [Snapshots]
 // ~~~~~~~~~~~~~~~~
@@ -108,7 +107,7 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
 //
 // A store of an unboxed register names its XMM half, which `flush_snapshot`
 // saves next to the general registers and boxes as it stores it. See Note
-// [Unboxed doubles] in `window_alloc`.
+// [Unboxed doubles].
 
 /// A five-byte nop: the room a thunk site leaves for a `jmp rel32`.
 const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
@@ -185,7 +184,7 @@ impl JitHelper {
                 LValue::NClosure(ncall) => {
                     state.call_native(ncall.native(), a, b, c, owner);
                     // A tripped watchpoint exits, past the call's `Arrive`. See Note [Watched
-                    // tables] in `specialize`.
+                    // tables].
                     if crate::vm::TRIPPED.load(std::sync::atomic::Ordering::Relaxed) {
                         state.trap = true;
                         state.current_off = (Location::unpack(PackedLocation::from_bits(ret as usize)).1 + 1) as _;
@@ -193,7 +192,7 @@ impl JitHelper {
                     1
                 }
                 // Inside frames JIT code called, the interpreter makes the call, once the callstack
-                // is whole. See Note [Frame ops] in `specialize`.
+                // is whole. See Note [Frame ops].
                 LValue::LClosure(_) if state.jit_depth > 0 => 0,
                 LValue::LClosure(lclos) => {
                     let Some(entry) = spec.lua_entry(owner, &lclos) else { return 0 };
@@ -209,7 +208,7 @@ impl JitHelper {
     /// The entry of the frame a call from JIT code made, which a bailout is unwinding, from what
     /// the call kept on the native stack at `kept` (the frame's caller's hash witnesses' top and
     /// base, base, and closure, in that order up the stack) and its return location `ret`. Gives
-    /// back the bailout's `exit`, for the call to leave with. See Note [Frame ops] in `specialize`.
+    /// back the bailout's `exit`, for the call to leave with. See Note [Frame ops].
     pub unsafe extern "C" fn unwind_frame(state: *mut (), kept: *const u64, ret: u64, exit: u64) -> u64 {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
@@ -222,7 +221,7 @@ impl JitHelper {
 
     /// The entry of the frame of the innermost inlined call JIT code is in, written as it unwinds
     /// a bailout, from what its code keeps on the native stack at `kept` (as `adopt_inlined` lays
-    /// it out). See Note [Inlined calls] in `specialize`.
+    /// it out). See Note [Inlined calls].
     /// Fill the upvalue cells `cells` names, of JIT code `depth` inlined calls deep: each frame's
     /// upvalue of its closure, the running one for the innermost frame, else the one `kept`
     /// keeps for it (as `RunState::adopt_inlined` lays them out). The cells are below `rbp`, the
@@ -272,7 +271,7 @@ impl JitHelper {
     }
 
     /// `RunState::adopt_inlined`, of `depth` inlined calls' entries, into the native stack at
-    /// `kept`, entering JIT code in the innermost. See Note [Inlined calls] in `specialize`.
+    /// `kept`, entering JIT code in the innermost. See Note [Inlined calls].
     pub unsafe extern "C" fn adopt_inlined(state: *mut (), kept: *mut u64, depth: usize) {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
@@ -280,8 +279,7 @@ impl JitHelper {
         }
     }
 
-    /// Raise `error`, a native's, called from JIT code. See Note [Errors] in
-    /// `specialize`.
+    /// Raise `error`, a native's, called from JIT code. See Note [Errors].
     pub unsafe extern "C" fn raise(state: *mut (), error: u64) {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
@@ -296,8 +294,7 @@ impl JitHelper {
             let state = &mut *(state as *mut RunState<'static, 'static>);
             let nf: crate::vm::NativeFunc = core::mem::transmute(nf);
             state.call_native(nf, a, b, 0, crate::forge_owner());
-            // A tripped watchpoint exits, after the call. See Note [Watched tables] in
-            // `specialize`.
+            // A tripped watchpoint exits, after the call. See Note [Watched tables].
             if crate::vm::TRIPPED.load(std::sync::atomic::Ordering::Relaxed) {
                 state.trap = true;
             }
@@ -317,7 +314,7 @@ impl JitHelper {
             if let Residual::LuaCall { entry: CallEntry::Block(entry), .. } = &specializer.blocks[block].instructions[call] {
                 if let Some(code) = specializer.blocks[entry.0].jit_info.entry {
                     let state = &mut *(state as *mut RunState<'static, 'static>);
-                    // As `dynamic_call`'s. See Note [Frame ops] in `specialize`.
+                    // As `dynamic_call`'s. See Note [Frame ops].
                     if state.jit_depth > 0 {
                         return 0;
                     }
@@ -435,7 +432,7 @@ enum PoolEntry {
     Snapshot(Snapshot),
     /// A site's record: the absolute address of where each of its exits goes,
     /// then the displacement from the record to each capture's value entry, as
-    /// an `i32`. See Note [Cold stencils] in `window`.
+    /// an `i32`. See Note [Cold stencils].
     /// With the op's name and captures, for disassembly.
     Record([DynamicLabel; EXITS], SmallVec<[DynamicLabel; 4]>, &'static str, Captures),
 }
@@ -444,7 +441,7 @@ enum PoolEntry {
 struct Snapshot {
     /// Where the flush is.
     location: PackedLocation,
-    /// How many inlined calls deep it is. See Note [Inlined calls] in `specialize`.
+    /// How many inlined calls deep it is. See Note [Inlined calls].
     depth: usize,
     /// The window register index, whether its value is unboxed, and slot of
     /// each store, past the running frame's base.
@@ -477,7 +474,7 @@ struct Pool {
     values: HashMap<u64, DynamicLabel, FxBuildHasher>,
     stubs: Vec<(DynamicLabel, Stub)>,
     /// The region's exit for code each number of inlined calls deep: writing those calls'
-    /// entries, then leaving. See Note [Inlined calls] in `specialize`.
+    /// entries, then leaving. See Note [Inlined calls].
     exits: Vec<DynamicLabel>,
     /// The most inlined calls deep the region's code is, past which it has no exits.
     deepest: usize,
@@ -488,22 +485,22 @@ enum Stub {
     /// A `PatchableJump`'s exit to the interpreter, with `snapshot`, once unlinked.
     Exit { snapshot: DynamicLabel },
     /// The way from a copy into its cold stencil: the site's record's address
-    /// into `cold_site`, then the jump. See Note [Cold stencils] in `window`.
+    /// into `cold_site`, then the jump. See Note [Cold stencils].
     ColdEntry { record: DynamicLabel, cold: usize },
     /// The way an op's exit takes, off the hot path, to a target of the
     /// `Select` or `Branch` after it: out of its copy's alignment if `aligned`,
-    /// the window's moves, then the jump. See Note [Window exits] in `window`.
+    /// the window's moves, then the jump. See Note [Window exits].
     /// With `count`, the window dump's counter of its moves.
     Way { aligned: bool, moves: SmallVec<[Emit; 16]>, to: JumpTo, count: Option<i64>, offset: usize },
     /// An exit of an op that selects with no `Select` or `Branch` after it:
     /// out of its copy's alignment if `aligned`, the exit to `select`, then on
-    /// at `join`. See Note [Window exits] in `window`.
+    /// at `join`. See Note [Window exits].
     Select { aligned: bool, exit: usize, join: DynamicLabel },
 }
 
 /// How many slots past the base of the frame of the code a window is of the frame of the code
 /// past `res` is, `offset` before it: the window names slots from that base, so a value keeps its
-/// name across an inlined call. See Note [Inlined calls] in `specialize`.
+/// name across an inlined call. See Note [Inlined calls].
 fn offset_past(res: &Residual, offset: usize) -> usize {
     match res {
         Residual::Inline { a, .. } => offset + *a as usize + 1,
@@ -545,7 +542,7 @@ impl Pool {
     }
 
     /// The label of a new entry holding the record of a site whose exits go
-    /// to `exits`, with `captures`. See Note [Cold stencils] in `window`.
+    /// to `exits`, with `captures`. See Note [Cold stencils].
     fn record(&mut self, ops: &mut Assembler, exits: [DynamicLabel; EXITS], name: &'static str, captures: &Captures) -> DynamicLabel {
         let values = captures.iter().map(|&value| self.value(ops, value)).collect();
         let label = ops.new_dynamic_label();
@@ -590,7 +587,7 @@ pub struct Stencils {
 impl Stencils {
     /// The op the JIT copies for `op`: its twin, which takes some operands
     /// unboxed, if it has one whose stencils copy, else `op` itself, the same
-    /// each time. See Note [Unboxed doubles] in `window_alloc`.
+    /// each time. See Note [Unboxed doubles].
     fn effective(&mut self, op: &Rc<dyn Window>) -> Rc<dyn Window> {
         let key = Rc::as_ptr(op) as *const () as usize;
         if let Some((_, w)) = self.twins.get(&key) {
@@ -605,7 +602,7 @@ impl Stencils {
     }
 
     /// The body of `op`'s stencil at `skip`, falling through to its exit
-    /// `fall_exit`. See Note [Exit stencils] in `window`.
+    /// `fall_exit`. See Note [Exit stencils].
     fn body(&mut self, op: &dyn Window, skip: usize, fall_exit: usize) -> Result<Rc<Body>, StencilError> {
         if !COPIES {
             return Err(StencilError::Disabled);
@@ -631,7 +628,7 @@ impl Stencils {
 }
 
 /// Load the pinned tag's register, r14: on entering a region, and after a
-/// frame op. See Note [Pinned tag] in `window`.
+/// frame op. See Note [Pinned tag].
 // Note [Upvalue cells]
 // ~~~~~~~~~~~~~~~~~~~~
 // Code reading an upvalue more than once would reload it each time through its closure and
@@ -768,14 +765,13 @@ fn emit_pin(ops: &mut Assembler) {
 
 /// The XMM register paired with window register `r`, as `WINDOW_REGS` names
 /// its general register: xmm`r`, the stencil ABI's `x{r}`, and for `SCRATCH`
-/// xmm15, which no stencil takes. See Note [Unboxed doubles] in `window_alloc`.
+/// xmm15, which no stencil takes. See Note [Unboxed doubles].
 fn xmm(r: usize) -> u8 {
     if r == SCRATCH { 15 } else { r as u8 }
 }
 
 /// Emit an allocator instruction other than `Emit::Op`. Boxing subtracts the
-/// pinned tag and unboxing adds it, as `LBoxed` does (see Note [Pinned tag] in
-/// `window`), through r10, never a window register.
+/// pinned tag and unboxing adds it, as `LBoxed` does (see Note [Pinned tag]), through r10, never a window register.
 fn emit_window_move(ops: &mut Assembler, emit: Emit, offset: usize) {
     let reg = |r: usize| WINDOW_REGS[r];
     // A slot's home, past the running frame's base: the window names it from its own frame's.
@@ -821,8 +817,8 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit, offset: usize) {
                 ; sub Rq(reg(dst.reg)), r14
             ),
         },
-        // An op is splatted by the caller.
-        Emit::Op { .. } => unreachable!(),
+        // An op is splatted, or emitted, by the caller.
+        Emit::Op { .. } | Emit::Emitted => unreachable!(),
     }
 }
 
@@ -831,14 +827,13 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit, offset: usize) {
 /// every other RIP-relative reference at its original target. The body is entered
 /// with the stack aligned as just after a call, as it was compiled to expect.
 /// Copy `op`, a window op with no operands, into the code at `SKIP` 0, the
-/// window empty: its stencil, or else a call of its body. See Note [Frame ops]
-/// in `specialize`.
+/// window empty: its stencil, or else a call of its body. See Note [Frame ops].
 /// The most slots of a callee's frame a call's JIT code nils itself, a store a
 /// slot, rather than `PushFrame` with a loop.
 const INLINE_NILS: usize = 16;
 
 /// The frame op `$op`, its const params `$pre` then a `Count` of each of
-/// `$counts` (see Note [Frame ops] in `specialize`), made from `$args`.
+/// `$counts` (see Note [Frame ops]), made from `$args`.
 /// `frame_op!`, of a window op with `operands`.
 macro_rules! window_op {
     ($op:ident [$($pre:tt)*] ($($args:expr),*) [$operands:expr];) => {
@@ -870,7 +865,7 @@ macro_rules! frame_op {
 
 /// The window op an `Inline` moves to the callee's frame by, keeping the window, if its call has a
 /// fixed count of arguments, past which its code nils the frame itself; else the frame op does,
-/// flushing the window. See Note [Inlined calls] in `specialize`.
+/// flushing the window. See Note [Inlined calls].
 fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
     let &Residual::Inline { a, b, stack, .. } = res else { return None };
     let passed = (b as usize).checked_sub(1)?;
@@ -883,8 +878,7 @@ fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
 }
 
 /// The slots, as the window names them at `offset`, that an `Inline`'s window op kills: the
-/// callee's frame past its arguments, which its code nils. See Note [Inlined calls] in
-/// `specialize`.
+/// callee's frame past its arguments, which its code nils. See Note [Inlined calls].
 fn inline_kills(res: &Residual, offset: usize) -> Slots {
     let mut kills = Slots::default();
     if let &Residual::Inline { a, b, stack, .. } = res {
@@ -897,7 +891,7 @@ fn inline_kills(res: &Residual, offset: usize) -> Slots {
 /// For an `InlineReturn` keeping the window at `off`, the residual after the window ops moving its
 /// results, where the callee's frame's values die, and the slot of the caller's frame past its
 /// results, from which they all do: the caller's temporaries past a call's results are dead. See
-/// Note [Inlined calls] in `specialize`.
+/// Note [Inlined calls].
 fn results_end(residuals: &[Residual], off: usize) -> Option<(usize, usize)> {
     let res = &residuals[off];
     let Residual::InlineReturn { call, .. } = res else { return None };
@@ -925,14 +919,13 @@ fn slots_from(end: usize, offset: usize) -> Slots {
 }
 
 /// Whether an `InlineReturn` keeps the window: its results moved by the window ops after it, and
-/// no upvalue to close, it only puts the caller's frame back. See Note [Inlined calls] in
-/// `specialize`.
+/// no upvalue to close, it only puts the caller's frame back. See Note [Inlined calls].
 fn keeps_frame(res: &Residual) -> bool {
     matches!(res, Residual::InlineReturn { moves: false, closes: false, .. })
 }
 
 /// A frame op's stencil, copied at `SKIP` 0, or, in a build that copies none, a
-/// call running its body. See Note [Frame ops] in `specialize`.
+/// call running its body. See Note [Frame ops].
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
     emit_frame_op_owning(ops, stencils, pool, op, None);
 }
@@ -966,7 +959,7 @@ fn emit_frame_op_owning(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut
 }
 
 /// How a copy between `sub rsp, 8` and `add rsp, 8` leaves from its middle by
-/// the exit it doesn't fall through to. See Note [Stencil alignment] in `window`.
+/// the exit it doesn't fall through to. See Note [Stencil alignment].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Unalign {
     /// Through an `add rsp, 8` after the copy, which its fall-through jumps
@@ -977,7 +970,7 @@ enum Unalign {
 }
 
 /// Copy `body`, its other exit, the one it doesn't fall through to, going to
-/// `other`, its cold path's exits too. See Note [Window exits] in `window`.
+/// `other`, its cold path's exits too. See Note [Window exits].
 fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool, other: Option<DynamicLabel>, unalign: Unalign) {
     splat_owning(ops, body, name, captures, pool, other, unalign, None);
 }
@@ -996,7 +989,7 @@ fn splat_owning(ops: &mut Assembler, body: &Body, name: &'static str, captures: 
         /// The address of where exit 0 goes, in the pool.
         Exit0Address,
         /// The site's record, which its site hole's `lea` gives. See Note
-        /// [Cold stencils] in `window`.
+        /// [Cold stencils].
         Record,
         /// Where exit 1 goes.
         Exit1,
@@ -1014,7 +1007,7 @@ fn splat_owning(ops: &mut Assembler, body: &Body, name: &'static str, captures: 
         false => way,
     });
     // The site's record, if the op has a cold path, and the way into its cold
-    // stencil. See Note [Cold stencils] in `window`.
+    // stencil. See Note [Cold stencils].
     let has_record = body.cold.is_some() || body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE);
     let record = has_record.then(|| pool.record(ops, exits.map(|exit| exit.unwrap_or(fall)), name, captures));
     let cold_entry = body.cold.map(|stencil| {
@@ -1127,7 +1120,7 @@ pub struct JitContext {
     /// [Thunk patching].
     thunk_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
     /// Each thunk site linked, by what `thunk_sites` had it as, to unlink. See Note [Watched
-    /// tables] in `specialize`.
+    /// tables].
     linked_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
     /// The thunk sites of the region being compiled, by offset in it.
     region_sites: Vec<(BlockId, usize, usize, Cache)>,
@@ -1137,8 +1130,7 @@ pub struct JitContext {
     /// The `PatchableJump`s of the region being compiled: by offset in it, and their exits.
     region_patchables: Vec<(BlockId, usize, usize, DynamicLabel, Cache)>,
     /// Where each call JIT code makes of a function holds the function's frame size, by the
-    /// function's prototype's address: patched as it grows. See Note [Inlined calls] in
-    /// `specialize`.
+    /// function's prototype's address: patched as it grows. See Note [Inlined calls].
     frame_sites: HashMap<usize, Vec<usize>, FxBuildHasher>,
     /// The frame size entries of the region being compiled: the prototype and the entry.
     region_frames: Vec<(usize, DynamicLabel)>,
@@ -1172,7 +1164,7 @@ pub struct JitContext {
     /// code, by the version. See Note [Call linking].
     tail_waiting: HashMap<BlockId, Vec<usize>, FxBuildHasher>,
     /// The frame ops the JIT's code has, which a call of an op's body refers to.
-    /// See Note [Frame ops] in `specialize`.
+    /// See Note [Frame ops].
     frame_ops: Vec<Rc<dyn Window>>,
     /// How regions are partitioned into traces (`LUNACY_TRACES`), or `None` to
     /// allocate streaming instead: no plan, each op placing itself in the window
@@ -1249,7 +1241,7 @@ pub struct JitBlock {
     ptr: JitPtr,
     window: Cache,
     /// How many inlined calls deep its code is entered, and its frame's offset (`offset_past`).
-    /// See Note [Inlined calls] in `specialize`.
+    /// See Note [Inlined calls].
     depth: usize,
     offset: usize,
 }
@@ -1296,12 +1288,11 @@ impl BlockPlan {
 /// The tag test of a guard of `expected` on the value in register `v`: a
 /// match jumps to `pass`, a mismatch falls through. `numeric` if the value is
 /// known to be a number. rax, never a window register, is scratch. A number's
-/// test is against the pinned tag, r14 (see Note [Pinned tag] in `window`).
+/// test is against the pinned tag, r14 (see Note [Pinned tag]).
 ///
 ///   * Integer  : it has all `NUMBER_TAG` bits: at least `NUMBER_TAG`, unsigned.
 ///   * Double   : some but not all: below `NUMBER_TAG`, and, unless the guard
-///     is numeric (the value a number), any set. See Note [Integers] in
-///     `specialize`.
+///     is numeric (the value a number), any set. See Note [Integers].
 ///   * Nil/Bool : exact immediate compare (nil = 2, false/true = 6/7).
 ///   * cell types (Table/Closure/String): the value is a raw pointer (no
 ///     `NOT_CELL_MASK` bits) whose offset-0 header byte is the kind. We must
@@ -1453,7 +1444,7 @@ fn pad(ops: &mut Assembler, base: usize, align: usize) -> usize {
 }
 
 /// How many of a block's residuals its code runs: up to its first jump or thunk no guard before
-/// it can skip. See Note [Contraction] in `specialize`.
+/// it can skip. See Note [Contraction].
 fn runs_to(residuals: &[Residual]) -> usize {
     // Whether the residual before can skip this one: a guard's side exit.
     let mut guarded = false;
@@ -1596,7 +1587,7 @@ impl JitContext {
         // A trap at the snapshot's block and `current_off`, what a region
         // returns for one: see `Specializer::run`.
         // The inlined calls the snapshot is inside write their entries first. See Note [Inlined
-        // calls] in `specialize`.
+        // calls].
         dynasm!(ops
             ; .arch x64
             ; call extern base.0 as usize + flush.0
@@ -1692,7 +1683,7 @@ impl JitContext {
     }
 
     /// The function of the prototype at `proto`'s frame size is now `size`: JIT code's calls of it
-    /// hold that. See Note [Inlined calls] in `specialize`.
+    /// hold that. See Note [Inlined calls].
     pub fn frame_grew(&mut self, proto: usize, size: usize) {
         for at in self.frame_sites.get(&proto).cloned().unwrap_or_default() {
             self.patch(at, &(size as u64).to_le_bytes());
@@ -1742,7 +1733,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         );
         emit_pin(&mut ops);
         // Entered inside inlined calls, the interpreter's entries for them kept as their code
-        // keeps them. See Note [Inlined calls] in `specialize`.
+        // keeps them. See Note [Inlined calls].
         if depth > 0 {
             jit_note!(self.jctx, ops, "adopt {depth} inlined calls' entries");
             dynasm!(ops
@@ -2063,7 +2054,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// Where a region is entered at `id` from the interpreter, and `id` starts
     /// with a continuation guard, the call's return value it compares, from
-    /// `RunState::returned`. See Note [Call continuations] in `specialize`.
+    /// `RunState::returned`. See Note [Call continuations].
     fn load_returned(&self, ops: &mut Assembler, id: BlockId) {
         if let Some(Residual::ReturnedFrom(_)) = self.blocks[id.0].instructions.first() {
             jit_note!(self.jctx, ops, "the return the entry's continuation guard compares");
@@ -2117,7 +2108,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// The thunk at `off` in `block` is a thunk again: its JIT code, if linked, exits again. See
-    /// Note [Watched tables] in `specialize`.
+    /// Note [Watched tables].
     pub fn unlink_thunk(&mut self, block: BlockId, off: usize) {
         if let Some((site, exit)) = self.jctx.patchable_sites.remove(&(block, off)) {
             let rel = i32::try_from(exit as isize - (site.at as isize + NOP5.len() as isize)).expect("a patchable jump's exit within rel32 of it");
@@ -2248,13 +2239,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot + at)));
                                 events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot + at)));
                             }
+                            Residual::Emit(e) => {
+                                let operands = e.operands().iter().zip(e.accesses());
+                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot + at)));
+                                events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot + at)));
+                            }
                             res if inline_guard(res) => events.push(Event::Read(guarded_slot(res) + at)),
                             Residual::Inline { a, .. } if !skips[off].is_empty() => {
                                 events.push(Event::Read(*a as usize + at));
                                 events.extend(inline_kills(res, at).iter().map(Event::Write));
                             }
                             res if keeps_frame(res) => {}
-                            // The base moved, the window kept. See Note [Inlined frames] in `specialize`.
+                            // The base moved, the window kept. See Note [Inlined frames].
                             Residual::Enter(_) | Residual::Leave(_) => {}
                             // Reads its field through the witness, no slot.
                             Residual::GuardWitness { .. } => {}
@@ -2389,6 +2385,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         of[off] = Some(steps.len());
                         steps.push(Step::Op(Framed::new(&**windows[b][off].as_ref().expect("a window op"), at), skips[b][off].clone()));
                     }
+                    Residual::Emit(e) => {
+                        of[off] = Some(steps.len());
+                        steps.push(Step::Op(Framed::emitted(&**e, at), SmallVec::new()));
+                    }
                     res if inline_guard(res) => steps.push(Step::Read(guarded_slot(res) + at)),
                     Residual::Inline { .. } if !skips[b][off].is_empty() => {
                         of[off] = Some(steps.len());
@@ -2462,7 +2462,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// compile.
     pub fn jit_block(&mut self, id: BlockId, depth: usize, offset: usize, ops: &mut Assembler, pool: &mut Pool, owner: &mut Owner, plans: &Plans) -> (AssemblyOffset, Option<BlockId>) {
         // How many inlined calls deep the code being emitted is, its frame's offset
-        // (`offset_past`), and each depth's exit. See Note [Inlined calls] in `specialize`.
+        // (`offset_past`), and each depth's exit. See Note [Inlined calls].
         let depth = core::cell::Cell::new(depth);
         let offset = core::cell::Cell::new(offset);
         let exits = pool.exits.clone();
@@ -2477,7 +2477,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // Where the op just copied has the exit it doesn't fall through to go,
         // whether its copy is aligned, and which it falls through to, for the
         // `Select` or `Branch` after it to lay its ways: that residual then tests
-        // no `select`. See Note [Window exits] in `window`.
+        // no `select`. See Note [Window exits].
         let mut fused: Option<(DynamicLabel, bool, usize)> = None;
         let entry = ops.offset();
         let x = self.jctx.memory.get_mut().as_ptr();
@@ -2624,8 +2624,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let past_arrive = insts[off + 2];
                 dynasm!(ops
                     ; .arch x64
-                    // A native's error exits as an exec's trap does. See Note [Errors] in
-                    // `specialize`.
+                    // A native's error exits as an exec's trap does. See Note [Errors].
                     ; cmp BYTE r12 => RunState.trap, 0
                     ; jz >no_trap
                     ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
@@ -2663,7 +2662,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; done:
             );
         };
-        let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_));
+        let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_) | Residual::Emit(_));
         let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Select(_) | Residual::Branch { .. });
         let end = runs_to(&block.instructions);
         let mut dies = None;
@@ -2677,7 +2676,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             jit_note!(self.jctx, ops, "  {off:3} {res}");
             let prev = off.checked_sub(1).map(|p| &block.instructions[p]);
             // An inlined call shifting to its callee's frame by a window op is laid out as the op,
-            // the caller's frame kept before it. See Note [Inlined calls] in `specialize`.
+            // the caller's frame kept before it. See Note [Inlined calls].
             let shifted = inline_shift(res).map(Residual::ExecWindow);
             let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_) | Residual::Tripped(_) | Residual::GuardWitness { .. })
                 || shifted.is_some() || keeps_frame(res) || matches!(res, Residual::Enter(_) | Residual::Leave(_));
@@ -2780,7 +2779,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::GuardWitness { href, expected } => {
                     // A `Guard` of hash key `href`'s field: its value, through the
-                    // frame's witness of it (Note [Hash witnesses] in `vm`), into r10,
+                    // frame's witness of it (Note [Hash witnesses]), into r10,
                     // then the same test, with the window live.
                     window_dump!(self.jctx, "      tests r10 <- witness {}", href.0);
                     let witnesses = (core::mem::offset_of!(RunState<'static, 'static>, hash_witnesses) + Witnesses::DATA) as i32;
@@ -2870,7 +2869,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // function the JIT doesn't know. See Note [Call sites].
                     // `PushFrame` pushes the frame of a function that isn't vararg
                     // only: a call of a vararg one goes as one to a function the JIT
-                    // doesn't know. See Note [Vararg frames] in `vm`.
+                    // doesn't know. See Note [Vararg frames].
                     let version = match entry {
                         CallEntry::Block(block) if !*vararg => Some(*block),
                         _ => None,
@@ -2889,7 +2888,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // The frame, pushed by `PushFrame` returning here, with what its
                             // entry would hold kept on the native stack: put back when it
                             // returns, or written as its entry if it bails out. See Note
-                            // [Frame ops] in `specialize`.
+                            // [Frame ops].
                             // The callee's frame past a fixed count of arguments is
                             // nilled here, a store a slot, but for a big one, which
                             // `PushFrame` nils, as it does past a count up to the top.
@@ -2899,7 +2898,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
                             // The callee's frame size, which the copy holds in an entry of its own
                             // that the JIT patches as the size grows; with no copy, the op reads it.
-                            // See Note [Inlined calls] in `specialize`.
+                            // See Note [Inlined calls].
                             let push = |frame: u64| match nils {
                                 Some(_) => frame_op!(PushFrame [false,] (held_a, held_b, frame); *a, *b),
                                 None => frame_op!(PushFrame [true,] (held_a, held_b, frame); *a, *b),
@@ -3001,7 +3000,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // The frame, replaced by `TailFrame`; then this code's own native
                     // frame is left, as the region's epilogue leaves it, and the callee's
                     // version's code entered with a jump, so its return is to what called
-                    // this code. See Note [Tail calls] in `specialize`.
+                    // this code. See Note [Tail calls].
                     let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     let (ab, effects, callee) = (hold(*a) | hold(*b) << 16, *effects as u64, *callee_effects as u64);
                     let tail = match (*closes, *vararg) {
@@ -3052,8 +3051,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::NativeCall { nf, a, b, c } if *c == 0 => {
                     // Taking every result, which may be more than the call's slots
                     // (`unpack`): `call_native` makes room for them.
-                    // An error it raises exits as an exec's trap does. See Note [Errors]
-                    // in `specialize`.
+                    // An error it raises exits as an exec's trap does. See Note [Errors].
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r12 // state
@@ -3113,7 +3111,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                     // It returns a `Result<usize, LBoxed>`: in al bit 0 whether it's an
                     // error, and in rdx the count or the error. An error exits as an
-                    // exec's trap does. See Note [Errors] in `specialize`.
+                    // exec's trap does. See Note [Errors].
                     dynasm!(ops
                         ; .arch x64
                         ; test al, 1
@@ -3126,8 +3124,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp =>exits[depth.get()]
                         ; native_ok:
                     );
-                    // A tripped watchpoint exits, after the call. See Note [Watched tables] in
-                    // `specialize`.
+                    // A tripped watchpoint exits, after the call. See Note [Watched tables].
                     dynasm!(ops
                         ; .arch x64
                         ; mov r10, QWORD (&crate::vm::TRIPPED as *const _ as i64)
@@ -3178,7 +3175,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::ReturnedFrom(from) => {
                     // The call's return value, still in rax, from the `Ret` expected: its
                     // continuation goes on to `off + 2`, else falls through to the thunk for the
-                    // next return. See Note [Call continuations] in `specialize`.
+                    // next return. See Note [Call continuations].
                     let from = pool.value(ops, *from);
                     dynasm!(ops
                         ; .arch x64
@@ -3188,7 +3185,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Arrived { a, c, returned } => {
                     // The results, as `Arrive` takes them, of a return of `returned`: the
-                    // missing ones nil. See Note [Call continuations] in `specialize`.
+                    // missing ones nil. See Note [Call continuations].
                     if *c != 0 {
                         let (at, end) = (*a as usize, *a as usize + *c as usize - 1);
                         let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
@@ -3209,7 +3206,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Arrive { a, c } => {
                     // The call's results, taken by `Arrive`, which keeps no register
                     // but `state`'s: the base pointer is loaded again. See Note
-                    // [Returns] in `specialize`.
+                    // [Returns].
                     let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     let arrive = frame_op!(Arrive [] (hold(*a) | hold(*c) << 16); *a, *c);
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &arrive);
@@ -3256,9 +3253,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // The frame, popped by `PopFrame`, and the JIT code left with the
                     // return (`RETURNED | effects << EFFECTS_SHIFT | id`), or for the
                     // outermost frame's, the exit. See Notes [Frame ops], [Call
-                    // continuations] and [Call effects] in `specialize`.
+                    // continuations] and [Call effects].
                     let hold = crate::specialize::Count::hold;
-                    // With the id of what it returns. See Note [Call continuations] in `specialize`.
+                    // With the id of what it returns. See Note [Call continuations].
                     let (held_a, held_b, returns) = (hold(*a as u16), hold(*b), *returns);
                     let (effects, at) = (*effects as u64, Location(BlockId(id.0), off).pack().bits() as u64);
                     let pop = match (*closes, *vararg) {
@@ -3282,7 +3279,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // but `state`'s and nils the frame; what the frame's entry would hold kept as
                     // `RunState::adopt_inlined` lays it out, the code after the call above the
                     // callee's base pointer, which is last, where the code after a call takes it
-                    // back from. See Note [Inlined calls] in `specialize`.
+                    // back from. See Note [Inlined calls].
                     let hold = crate::specialize::Count::hold;
                     let (held_a, held_b) = (hold(*a), hold(*b));
                     let shift = frame_op!(ShiftFrameFilled [] (held_a, held_b, *stack); *a, *b);
@@ -3313,7 +3310,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 // The base moved to an inlined call's frame, or back, none of it made: the window
                 // names slots from the outermost frame's base, so it keeps. See Note [Inlined
-                // frames] in `specialize`.
+                // frames].
                 Residual::Enter(by) | Residual::Leave(by) => {
                     let by = if matches!(res, Residual::Enter(_)) { *by as i32 } else { -(*by as i32) };
                     jit_note!(self.jctx, ops, "        move the base");
@@ -3327,14 +3324,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::InlineReturn { .. } if keeps_frame(res) => {
                     // Its results moved by the window ops after it, the caller's frame put back
-                    // from what `Inline` kept, keeping the window. See Note [Inlined calls] in
-                    // `specialize`.
+                    // from what `Inline` kept, keeping the window. See Note [Inlined calls].
                     jit_note!(self.jctx, ops, "        put back the caller's frame");
                     dynasm!(ops
                         ; .arch x64
                         ; dec QWORD r12 => RunState.jit_depth
                         // The witnesses it wrote are its caller's: the top stays. See Note
-                        // [Hash witnesses] in `vm`.
+                        // [Hash witnesses].
                         ; add rsp, 24
                         ; pop QWORD r12 => RunState.witness_base
                         ; pop QWORD r12 => RunState.base
@@ -3346,8 +3342,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::InlineReturn { a, b, closes, call, moves } => {
                     // The results moved by `UnshiftFrame`, then the caller's frame put back from
-                    // what `Inline` kept, and the base pointer with it. See Note [Inlined calls]
-                    // in `specialize`.
+                    // what `Inline` kept, and the base pointer with it. See Note [Inlined calls].
                     let _ = call;
                     let hold = crate::specialize::Count::hold;
                     let (held_a, held_b) = (hold(*a), hold(*b));
@@ -3364,7 +3359,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; .arch x64
                         // The witnesses it wrote are its caller's: the top stays. See Note
-                        // [Hash witnesses] in `vm`.
+                        // [Hash witnesses].
                         ; add rsp, 24
                         ; pop QWORD r12 => RunState.witness_base
                         ; pop QWORD r12 => RunState.base
@@ -3377,8 +3372,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Branch { hot, cold } => {
                     match fused.take() {
                         // The op falls through to exit 0, the hot way; exit 1, its cold
-                        // path's, goes off the hot path. See Notes [Window exits] in
-                        // `window` and [Optimistic ops] in `specialize`.
+                        // path's, goes off the hot path. See Notes [Window exits] and [Optimistic ops].
                         Some((label, aligned, _)) => {
                             let (moves, to, count, _) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
                             pool.stubs.push((label, Stub::Way { aligned, moves, to, count, offset: offset.get() }));
@@ -3398,7 +3392,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     successor = Some(*hot);
                 },
                 // The op before it took exit 0, falling through, or exit 1 to its
-                // way. See Note [Window exits] in `window`.
+                // way. See Note [Window exits].
                 Residual::Select(targets) if fused.is_some() => {
                     let (label, aligned, fall_exit) = fused.take().expect("a fused exit");
                     let first = targets[0].1;
@@ -3465,9 +3459,39 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
+                // Its code on the registers planned for its operands, or streaming, those the
+                // window has. See Note [Emitted ops].
+                Residual::Emit(e) => {
+                    let framed = Framed::emitted(&**e, offset.get());
+                    let (regs, emits) = match plans.get(&id).and_then(|plan| plan.placed[off]) {
+                        Some((out, want)) => {
+                            let want = want.unpack();
+                            let regs = framed.placed(&want, out as usize);
+                            let mut emits = alloc.reconcile(&want, &framed, &regs);
+                            emits.extend(alloc.emitted(&framed, &regs));
+                            (regs, emits)
+                        }
+                        None => {
+                            let regs = alloc.free_regs(&framed);
+                            let emits = alloc.emitted(&framed, &regs);
+                            (regs, emits)
+                        }
+                    };
+                    let counted = window_count!(self.jctx, ops, emits);
+                    window_dump!(self.jctx, "      {}{counted}", emits_line(&emits));
+                    let machine: SmallVec<[u8; WINDOW]> = regs.iter().enumerate()
+                        .map(|(i, &reg)| if e.doubles() >> i & 1 == 1 { xmm(reg) } else { WINDOW_REGS[reg] })
+                        .collect();
+                    for emit in emits {
+                        match emit {
+                            Emit::Emitted => e.emit(ops, &machine),
+                            emit => emit_window_move(ops, emit, offset.get()),
+                        }
+                    }
+                },
                 Residual::ExecWindow(w) | Residual::GuardDynamic(w) => {
                     // The op copied for it, as planning placed. See Note [Unboxed
-                    // doubles] in `window_alloc`.
+                    // doubles].
                     let w = self.jctx.stencils.effective(w);
                     let w = &w;
                     let stencils = &mut self.jctx.stencils;
@@ -3479,7 +3503,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             Some(alloc.rename(framed.slots()[0], framed.slots()[1], store))
                         }
                         Some(plan) => plan.placed[off].map(|(skip, want)| {
-                            let mut emits = alloc.reconcile(&want.unpack(), &Framed::new(&**w, offset.get()), skip as usize);
+                            let framed = Framed::new(&**w, offset.get());
+                            let mut emits = alloc.reconcile(&want.unpack(), &framed, &framed.run(skip as usize));
                             emits.extend(alloc.op(&Framed::new(&**w, offset.get()), [skip as usize]).expect("a placed op runs at its SKIP"));
                             emits
                         }),
@@ -3492,8 +3517,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // edge, exit 1 jumping to its pass edge; before a `Select` it falls
                     // through to exit 1's way, as the test of `select` would, when its
                     // stencil can (exit 1 only from its cold path otherwise); before a
-                    // `Branch`, to exit 0, the hot way. See Note [Window exits] in
-                    // `window`.
+                    // `Branch`, to exit 0, the hot way. See Note [Window exits].
                     let next = block.instructions.get(off + 1);
                     let fuses = match next {
                         Some(Residual::Branch { .. }) => true,
@@ -3605,7 +3629,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Thunk(_) | Residual::Tripped(_) => {
                     // Room for a `jmp rel32` past the exit, once the thunk is a
                     // jump. See Note [Thunk patching]. A trip always exits. See Note
-                    // [Watched tables] in `specialize`.
+                    // [Watched tables].
                     if matches!(res, Residual::Thunk(_)) {
                         self.jctx.region_sites.push((id, off, ops.offset().0, alloc.cache().clone()));
                         ops.extend(&NOP5);

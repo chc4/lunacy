@@ -266,8 +266,7 @@ pub const EXITS: usize = 2;
 /// A window op's twin: the same op on the same operands, taking and giving
 /// some unboxed (`Window::doubles`), which the JIT copies in the op's place, so
 /// the generators that emit the op know nothing of it. An op has one where an
-/// impl for its type says, the default none. See Note [Unboxed doubles] in
-/// `window_alloc`.
+/// impl for its type says, the default none. See Note [Unboxed doubles].
 pub trait Twin {
     fn twin(&self) -> Option<Rc<dyn Window>>;
 }
@@ -319,14 +318,13 @@ pub trait Window: std::fmt::Debug {
         false
     }
     /// Whether the memory it touches is the running closure's, its upvalues, which code in an
-    /// inlined call's frame finds only once the frame is made. See Note [Inlined frames] in
-    /// `specialize`.
+    /// inlined call's frame finds only once the frame is made. See Note [Inlined frames].
     fn closure(&self) -> bool {
         false
     }
     /// The operands its stencils take and give as unboxed doubles, in their
     /// window registers' paired XMM registers: bit `i` for operand `i`. See
-    /// Note [Unboxed doubles] in `window_alloc`.
+    /// Note [Unboxed doubles].
     fn doubles(&self) -> u8 {
         0
     }
@@ -641,7 +639,7 @@ macro_rules! windowed {
     };
     (@if_not_cold [$cold:block] $($code:tt)*) => {};
     // Sort the operands into inputs and outputs, each with its window offset
-    // and form (`f64` unboxed, see Note [Unboxed doubles] in `window_alloc`),
+    // and form (`f64` unboxed, see Note [Unboxed doubles]),
     // and their accesses in window order.
     (@sort $decl:tt [$($in:tt)*] [$($out:tt)*] [$($acc:tt)*] ($i:expr) out f64 $op:ident $(, $($rest:tt)*)?) => {
         $crate::window::windowed!(@sort $decl [$($in)*] [$($out)* ($op, $i, double)] [$($acc)* Write] ($i + 1) $($($rest)*)?);
@@ -1836,7 +1834,7 @@ const UD2: [u8; 2] = [0x0f, 0x0b];
 // Run by the interpreter, an op with a cold path selects 1 if it takes it and 0
 // if not, which its cold path may change; its stencils select nothing they don't
 // themselves, as JIT code taking the way on after an optimistic op needs no
-// `select` (Note [Optimistic ops] in `specialize`).
+// `select` (Note [Optimistic ops]).
 
 // Note [Exit stencils]
 // ~~~~~~~~~~~~~~~~~~~~
@@ -2099,7 +2097,7 @@ mod check {
         *out = [w0, w1, w2, w3, w4, w5, w6, w7].map(|w| w.bits());
     });
     // The same of the window's XMM halves, for an op giving its outputs
-    // unboxed. See Note [Unboxed doubles] in `window_alloc`.
+    // unboxed. See Note [Unboxed doubles].
     windowed!(CheckFlushX, [out: u64], [], |owner, state, base| (f64 x0, f64 x1, f64 x2, f64 x3, f64 x4, f64 x5, f64 x6, f64 x7) {
         let out = out as *mut [u64; WINDOW];
         *out = [x0, x1, x2, x3, x4, x5, x6, x7].map(f64::to_bits);

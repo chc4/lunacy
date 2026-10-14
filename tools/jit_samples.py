@@ -55,7 +55,7 @@ def kind(note):
     note = INDEX.sub('', note)
     if note.startswith('block '):
         return 'block entry'
-    if note.startswith('window('):
+    if note.startswith(('window(', 'emit(')):
         return note.split(',')[0].rstrip(')') + ')'
     return re.split(r'[( ]', note, 1)[0] if '(' in note else note
 
@@ -145,7 +145,7 @@ def main():
             kinds = [kind(note) for note in notes[1:]] or [kind(notes[0])] if notes else ['(no note)']
             group = next((GROUPS[k] for k in reversed(kinds) if k in GROUPS), None)
             if group is None:
-                group = 'op' if kinds[0].startswith('window(') else 'other'
+                group = 'op' if kinds[0].startswith(('window(', 'emit(')) else 'other'
             text = INST.match(insts[i][2]).group(3)
             what = 'slot' if SLOT.search(text) else 'move' if MOVE.search(text) else 'tag' if TAG.search(text) else 'rest'
             by_class[(group, what)] += n

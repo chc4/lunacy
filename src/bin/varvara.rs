@@ -90,8 +90,7 @@ fn string<'s, 'i>(bytes: &[u8]) -> LBoxed<'s, 'i> {
 }
 
 /// A native from `$body`, which takes its arguments (a slice) and the owner and
-/// gives its results, or an error message. See Note [Library natives] in
-/// `library`: the results fill the caller's result slots, nil past them, and
+/// gives its results, or an error message. See Note [Library natives]: the results fill the caller's result slots, nil past them, and
 /// there are only as many slots as the call's function and arguments.
 macro_rules! native {
     ($name:ident, |$args:ident, $owner:ident| $body:expr) => {

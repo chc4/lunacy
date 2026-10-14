@@ -67,9 +67,9 @@ thread_local! {
 // computing it as the native does (`bit1`, `bit2`). A call taking every result
 // (C = 0) gets exactly the one, and a call taking its arguments up to the top
 // (B = 0) has a fixed arity when the specializer knows the top. See Note [Known
-// top] in `specialize`.
+// top].
 
-/// An error with the message `message`. See Note [Errors] in `specialize`.
+/// An error with the message `message`. See Note [Errors].
 fn error_value<'s, 'i>(message: String) -> LBoxed<'s, 'i> {
     string(message.into_bytes())
 }
@@ -88,7 +88,7 @@ pub(crate) fn type_name(v: LBoxed) -> &'static [u8] {
 }
 
 /// A capture of a match in `src`: its bytes, or its position. See Note
-/// [Patterns] in `patterns`.
+/// [Patterns].
 fn capture<'s, 'i>(src: &[u8], capture: Capture) -> LBoxed<'s, 'i> {
     match capture {
         Capture::Bytes(range) => string(src[range].to_vec()),
@@ -299,7 +299,7 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
             let r = random();
             // A whole number from a range, in the integer encoding where an i32
             // holds it: the code using it computes on an integer. See Note
-            // [Narrowing] in `specialize`.
+            // [Narrowing].
             vec![match args.len() {
                 0 => LBoxed::from_double(r),
                 1 => LBoxed::from_number((r * number(args[0]).floor()).floor() + 1.0),
@@ -415,8 +415,7 @@ fn math1<const OP: u8>(x: f64) -> f64 {
 
 /// `math1::<OP>`'s result, a double like every number a native computes, but
 /// floor's and ceil's: a whole number, in the integer encoding where an i32
-/// holds it, so the code using it computes on an integer. See Note [Narrowing]
-/// in `specialize`.
+/// holds it, so the code using it computes on an integer. See Note [Narrowing].
 #[inline(always)]
 fn math1_boxed<'s, 'i, const OP: u8>(x: f64) -> LBoxed<'s, 'i> {
     match OP {
@@ -500,14 +499,14 @@ fn bit2<const OP: u8>(x: i32, y: i32) -> i32 {
 
 /// A bit op's window op's argument: in the integer encoding (`INT`), read as it
 /// is, or a number of either encoding the specializer checked, decoded with the
-/// pinned tag. See Note [Integers] in `specialize` and Note [Pinned tag] in `window`.
+/// pinned tag. See Note [Integers] and Note [Pinned tag].
 #[inline(always)]
 unsafe fn bit_arg<const INT: bool>(v: LBoxed, tag: u64) -> i32 {
     if INT { unsafe { v.as_int() } } else { to_bit(unsafe { v.as_number_tagged(tag) }) }
 }
 
 // A bit op's result is an i32, so it is in the integer encoding. See Note
-// [Integers] in `specialize`.
+// [Integers].
 crate::window::windowed!(BitUnary, [], [OP: u8, X: bool], |owner, state, base, tag| (x, out r) {
     *r = LBoxed::from_int_tagged(bit1::<OP>(bit_arg::<X>(x, tag)), tag);
 });
@@ -612,7 +611,7 @@ crate::window::windowed!(WholeOfInt, [], [], |owner, state, base| (x, out r) {
     *r = x;
 });
 // `math.floor` of an integer's quotient by a positive constant `by`, from the integer: the floored
-// division, a shift for a power of two. See Note [Quotients] in `specialize`.
+// division, a shift for a power of two. See Note [Quotients].
 crate::window::windowed!(FloorDivK, [by: i32], [], |owner, state, base, tag| (x, out r) {
     *r = LBoxed::from_int_tagged(x.as_int().div_euclid(by), tag);
 });
@@ -620,8 +619,7 @@ crate::window::windowed!(FloorShiftK, [shift: u32], [], |owner, state, base, tag
     *r = LBoxed::from_int_tagged(x.as_int() >> shift, tag);
 });
 // `OP` of a double, in the integer encoding where an i32 holds the result: a cold path for one it
-// doesn't, which is a double. As an integer op whose result doesn't fit. See Note [Optimistic ops]
-// in `specialize`.
+// doesn't, which is a double. As an integer op whose result doesn't fit. See Note [Optimistic ops].
 crate::window::windowed!(WholeOptimistic, [], [OP: u8], |owner, state, base, tag| (x, out r) {
     let whole = math1::<OP>(unsafe { x.as_number_tagged(tag) });
     if crate::lboxed::is_integer(whole) {
@@ -651,7 +649,7 @@ fn abs_boxed<'s, 'i>(x: LBoxed<'s, 'i>) -> LBoxed<'s, 'i> {
 
 // `math.abs` of an integer, an integer: a cold path for the one whose absolute value an i32
 // doesn't hold, which is a double. As an integer op whose result doesn't fit. See Note
-// [Optimistic ops] in `specialize`.
+// [Optimistic ops].
 crate::window::windowed!(AbsOptimistic, [], [], |owner, state, base, tag| (x, out r) {
     match unsafe { x.as_int() }.checked_abs() {
         Some(n) => { *r = LBoxed::from_int_tagged(n, tag); false },
@@ -669,7 +667,7 @@ crate::window::windowed!(AbsIntDouble, [], [], |owner, state, base| (x, out r) {
 /// `math.abs`'s generator: for a call of one number keeping one result, of an integer its result
 /// in the encoding an integer op's is, decided the first time it runs, and rebuilt to compute in
 /// doubles once one doesn't fit; of a double, a double; any other call is the native's. See Notes
-/// [Native generators] and [Optimistic ops] in `specialize`.
+/// [Native generators] and [Optimistic ops].
 fn abs_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
@@ -700,7 +698,7 @@ fn abs_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box
     })
 }
 
-// `assert`'s condition: exit 0 if it holds, 1 if not. See Note [Optimistic ops] in `specialize`.
+// `assert`'s condition: exit 0 if it holds, 1 if not. See Note [Optimistic ops].
 crate::window::windowed!(select AssertHolds, [], [], |owner, state, base| (condition) {
     if condition.truthy() { 0 } else { 1 }
 });
@@ -721,7 +719,7 @@ pub(crate) fn assert_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c:
 /// `math.floor`'s and `math.ceil`'s generator (`OP`): for a call of one number keeping one
 /// result, its result in the encoding an integer op's is, decided the first time it runs, and
 /// rebuilt to compute in doubles once one doesn't fit; any other call is the native's. See Notes
-/// [Native generators] and [Optimistic ops] in `specialize`.
+/// [Native generators] and [Optimistic ops].
 fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
@@ -733,7 +731,7 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
             }
             if (yield YieldOp::Guard(a + 1, LType::Double)) == ResumeArg::Matched {
                 // An integer's quotient by a positive constant, floored from the integer. See
-                // Note [Quotients] in `specialize`.
+                // Note [Quotients].
                 if OP == FLOOR && let ResumeArg::Quotient(of, by) = (yield YieldOp::QuotientOf(a + 1)) {
                     let op: std::rc::Rc<dyn crate::window::Window> = if by & (by - 1) == 0 {
                         std::rc::Rc::new(FloorShiftK::new(by.trailing_zeros(), &[of, a]))
@@ -805,7 +803,7 @@ fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> B
 
 /// `jit.frozen`'s generator: for `frozen(t)` of a table keeping one result, a watch site, which
 /// freezes it first: code past it knows which table it is while it stays frozen. Any other call is
-/// the native's. See Note [Frozen tables] in `specialize`.
+/// the native's. See Note [Frozen tables].
 #[cfg(feature = "magic")]
 fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
@@ -826,7 +824,7 @@ fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> 
 /// `jit.tripped`'s generator: for `tripped(t)` of a table keeping one result, a watch site: code
 /// past it knows `t` is still watched, as it was when the code was first run, its result `false`
 /// with no test, until a store into `t` trips its watchpoint; any other call is the native's. See
-/// Note [Watched tables] in `specialize`.
+/// Note [Watched tables].
 #[cfg(feature = "magic")]
 fn tripped_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
@@ -878,7 +876,7 @@ crate::window::windowed!(VersionsK, [n: i32], [], |owner, state, base| (out r) {
 
 /// `jit.promote`'s generator: for `promote(v)` keeping one result, of an integer (a whole double
 /// narrowed), `v` promoted, its value moved into the result's slot; any other call is the
-/// native's, which returns its argument. See Note [Promoted values] in `specialize`.
+/// native's, which returns its argument. See Note [Promoted values].
 #[cfg(feature = "magic")]
 fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp, PROMOTE_VALUES};
@@ -934,7 +932,7 @@ fn module<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, L
 }
 
 /// A library's table, `cached` if caches hold its entries' addresses. See Note
-/// [Global caches] in `specialize`.
+/// [Global caches].
 fn module_table<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, LValue<'s, 'i>)>, cached: bool) -> LValue<'s, 'i> {
     let mut t = Table::new(0, entries.len());
     t.cached = cached;
@@ -969,8 +967,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         vec![parsed.map_or(LBoxed::NIL, LBoxed::from_double)]
     });
 
-    // Indexing a string reads it, through caches. See Note [String methods] in
-    // `specialize`.
+    // Indexing a string reads it, through caches. See Note [String methods].
     let string_lib = module_table(intern, vec![
         ("lower", native!(pure |owner, args| vec![string(arg_bytes(&args, 0).to_ascii_lowercase())])),
         ("upper", native!(pure |owner, args| vec![string(arg_bytes(&args, 0).to_ascii_uppercase())])),
@@ -994,7 +991,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             vec![string(out)]
         })),
         ("format", native!(pure |owner, args| vec![string(format(&arg_bytes(&args, 0), args.get(1..).unwrap_or(&[])))])),
-        // See Note [Patterns] in `patterns`.
+        // See Note [Patterns].
         ("find", native!(pure |owner, args| {
             let (s, p) = (arg_bytes(&args, 0), arg_bytes(&args, 1));
             let init = init(s.len(), arg(&args, 2));
@@ -1178,7 +1175,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         }
     });
     // Lua's `setmetatable(t, mt)` on a table: its metatable changes, which moves it
-    // to a new epoch. See Note [Table metatables] in `specialize`.
+    // to a new epoch. See Note [Table metatables].
     let setmetatable = native!(|owner, args| {
         let Some(t) = arg(&args, 0).as_table() else {
             return Err(error_value(format!("bad argument #1 to 'setmetatable' (table expected, got {})", String::from_utf8_lossy(type_name(arg(&args, 0))))));
@@ -1202,7 +1199,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     });
     // Lua's `getmetatable`: a table's or a userdata's metatable, or its
     // `__metatable` field if it has one. A string has none here: its fields are the
-    // string library's directly. See Note [String methods] in `specialize`.
+    // string library's directly. See Note [String methods].
     let getmetatable = native!(pure |owner, args| {
         let metatable = match arg(&args, 0).unbox() {
             LValue::Table(t) => t.ro(owner).metatable.clone(),
@@ -1219,12 +1216,12 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     });
     // A call of `pcall` is a protected call of its first argument, which the specializer
     // lays out at the call site; this runs only for a call site that doesn't
-    // specialize. See Note [Errors] in `specialize`.
+    // specialize. See Note [Errors].
     let pcall = LValue::NClosure(NClosure::protected_call(native!(@fn owner, args, {
         let _ = &args;
         return Err(error_value("not implemented: pcall from a call site that isn't specialized".into()))
     })));
-    // Its argument, whatever it is, is the error. See Note [Errors] in `specialize`.
+    // Its argument, whatever it is, is the error. See Note [Errors].
     let error = native!(pure |owner, args| return Err(arg(&args, 0)));
 
     let require = native!(pure |owner, args| {
@@ -1241,7 +1238,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         unsafe { std::mem::transmute::<LBoxed<'s, 'i>, LBoxed<'static, 'static>>(boxed) }
     };
     // `jit.promote(v)`: `v`, and the code after it specialized to its value. See Note [Promoted
-    // values] in `specialize`. A global only: `require("jit")` is LuaJIT's, which code
+    // values]. A global only: `require("jit")` is LuaJIT's, which code
     // probes for. A magic JIT intrinsic (feature `magic`): without it there is no `jit`, as
     // in a Lua other than LuaJIT, and code probing for it runs without. `jit.versions()`: how many
     // versions the code it is in has (`versions_generator`), for tests.
@@ -1251,8 +1248,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         ("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])),
         ("learn", native!(pure generator: learn_generator, |owner, args| vec![arg(&args, 0)])),
         // `jit.frozen(t)`: `t`, frozen; `jit.tripped(t)`: whether a store into it tripped its
-        // watchpoint since, for tests. See Notes [Frozen tables] and [Watched tables] in
-        // `specialize`.
+        // watchpoint since, for tests. See Notes [Frozen tables] and [Watched tables].
         ("frozen", native!(generator: frozen_generator, |owner, args| {
             let t = table(arg(&args, 0));
             t.rw(owner).watched = true;

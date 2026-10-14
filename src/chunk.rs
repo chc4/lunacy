@@ -191,7 +191,7 @@ pub struct Header<'a, C> {
 }
 
 /// The slots a function's frame takes: its `max_stack` registers, and past them the frames of the
-/// calls inlined into it, growing as calls inline. See Note [Inlined calls] in `specialize`.
+/// calls inlined into it, growing as calls inline. See Note [Inlined calls].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameSize(core::cell::Cell<u16>);
 
