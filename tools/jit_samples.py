@@ -88,6 +88,7 @@ def main():
     ap.add_argument('--op', help='sum the copies of what this note names, by instruction')
     ap.add_argument('--blocks-of', help='the samples of what this note names, by block')
     ap.add_argument('--classes', action='store_true', help="the JIT's samples by kind of code, and whether they load or store a stack slot")
+    ap.add_argument('--footprint', action='store_true', help="the 64-byte lines holding the JIT's sampled code: how many hold each share of its samples, and the span they cover")
     ap.add_argument('--top', type=int, default=25)
     args = ap.parse_args()
 
@@ -120,6 +121,23 @@ def main():
     for i, n in counts.items():
         notes = insts[i][3]
         by_kind[' / '.join(kind(n) for n in notes[1:]) or kind(notes[0]) if notes else '(no note)'] += n
+    if args.footprint:
+        # The hot code's lines, hottest first: how many a loop's code takes in the op cache and
+        # instruction cache, which the same code laid out apart takes more of.
+        lines = Counter()
+        for i, n in counts.items():
+            lines[insts[i][0] // 64] += n
+        hottest = [line for line, _ in lines.most_common()]
+        print(f'\nJIT code footprint: {len(lines)} 64-byte lines sampled')
+        for share in (0.5, 0.8, 0.9, 0.95, 0.99):
+            run, taken = 0, []
+            for line in hottest:
+                if run >= share * jit:
+                    break
+                run += lines[line]
+                taken.append(line)
+            print(f'  {int(share * 100):3}% of samples: {len(taken):5} lines, spanning {(max(taken) - min(taken) + 1) * 64:7} bytes')
+
     print(f'\nJIT samples by what emitted the code (summed over copies):')
     for k, n in by_kind.most_common(args.top):
         print(f'  {n:7} {100 * n / total:5.1f}%  {k}')
