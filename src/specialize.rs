@@ -2253,7 +2253,7 @@ pub struct Context {
 // guard to check it: once established, a fact holds until an effect the specializer sees could
 // falsify it, where it is dropped without repair. Every effect that could falsify a fact must be
 // visible; where the closed world can't be shown to hold, such as across code the specializer
-// doesn't see all of it is dropped. The known top (Note [Known top]) is information of this kind.
+// doesn't see, all that code could falsify is dropped. The known top (Note [Known top]) is information of this kind.
 //
 // It is in the context, as what is known of the values its places hold (`Context::values`; Note
 // [Value classes]), so it is part of every block's key. A block compiled
@@ -2264,7 +2264,10 @@ pub struct Context {
 // Effects come from the residuals as they are yielded (`Context::effect`). A window op writes the
 // slots its accesses say it writes (`Effect::Write`), an exec those it says it writes, else any
 // slot (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op or a pure native's
-// (Note [Library natives]) is `Effect::Opaque`, and what a residual can't show a
+// (Note [Library natives]) is `Effect::Opaque`: code it doesn't see may write any table,
+// upvalue or global, but no slot of the frame but those the call writes, its own and its
+// callee's from its function's on, and those closures captured, which are written apart. So a
+// fact that a slot holds a constant survives it, and every other fact goes. What a residual can't show a
 // yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A store into a table is always
 // yielded as one, `Effect::ArrayStore` or the hash hazards it sets: an exec's writes are of its own
 // frame, and a caller sees only the store (Note [Call effects]).
@@ -2758,7 +2761,13 @@ impl Context {
                 self.values.retain_roots(|root| !matches!(root, Root::Upvalue(_)));
                 self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
             },
-            Effect::Opaque => self.values = Values::default(),
+            // Code it doesn't see writes any table, upvalue or global, but no slot of the frame:
+            // what slots the call does write are written apart. See Note [Fragile information].
+            Effect::Opaque => {
+                self.values.retain_fields(|_, _| false);
+                self.values.retain_roots(|root| matches!(root, Root::Slot(_)));
+                self.values.retain_facts(|fact| matches!(fact, Known::Constant { .. }));
+            },
             // Any table may be the one stored into: one of kind `kind` keeps it only for a value
             // of that kind, and a mixed one stays mixed.
             Effect::ArrayStore(stored) => self.values.retain_facts(|fact| match fact {

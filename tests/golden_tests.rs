@@ -124,6 +124,18 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
             })));
             _g.set(owner, print_key, custom_print, s.intern());
 
+            // `blackbox(...)`: its arguments, from a native that isn't pure, so a call of it is
+            // opaque to the specializer. A test runs under Lua 5.1 with an identity in its place.
+            let blackbox = vm::LBoxed::box_lvalue(vm::LValue::NClosure(vm::NClosure::new(|mut seq, args, returns, _owner| {
+                let args: Vec<vm::LBoxed> = args.ro(&seq).to_vec();
+                let returns = returns.rw(&mut seq);
+                for (i, slot) in returns.iter_mut().enumerate() {
+                    *slot = args.get(i).copied().unwrap_or(vm::LBoxed::NIL);
+                }
+                Ok(args.len().min(returns.len()))
+            })));
+            _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "blackbox")), blackbox, s.intern());
+
             // `make_userdata()`: a userdata whose metatable's `__index` table has `answer`, a
             // native returning 42, as a library's objects have methods.
             let mut index = vm::Table::new(0, 1);
