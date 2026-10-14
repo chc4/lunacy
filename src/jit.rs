@@ -478,15 +478,22 @@ struct Pool {
     exits: Vec<DynamicLabel>,
     /// The most inlined calls deep the region's code is, past which it has no exits.
     deepest: usize,
+    /// The cold code of each emitted op on each assignment of registers this region lays out, as
+    /// `JitContext::emitted_colds` keys them.
+    colds: HashMap<(&'static str, SmallVec<[u8; WINDOW]>), DynamicLabel, FxBuildHasher>,
 }
 
 /// Code a region lays out after its blocks, off its hot paths.
 enum Stub {
     /// A `PatchableJump`'s exit to the interpreter, with `snapshot`, once unlinked.
     Exit { snapshot: DynamicLabel },
-    /// The way from a copy into its cold stencil: the site's record's address
-    /// into `cold_site`, then the jump. See Note [Cold stencils].
-    ColdEntry { record: DynamicLabel, cold: usize },
+    /// The way from a copy into its cold stencil, or an emitted op's cold code: the site's
+    /// record's address into `cold_site`, then the jump. See Note [Cold stencils].
+    ColdEntry { record: DynamicLabel, cold: JumpTo },
+    /// An emitted op's cold code on `regs`, which every site of it on those registers shares,
+    /// `key` its key in `JitContext::emitted_colds`: the site's record's address into r10, then
+    /// the code. See Note [Emitted ops].
+    EmittedCold { cold: crate::emitted::Cold, regs: SmallVec<[u8; WINDOW]>, key: (&'static str, SmallVec<[u8; WINDOW]>) },
     /// The way an op's exit takes, off the hot path, to a target of the
     /// `Select` or `Branch` after it: out of its copy's alignment if `aligned`,
     /// the window's moves, then the jump. See Note [Window exits].
@@ -1012,7 +1019,7 @@ fn splat_owning(ops: &mut Assembler, body: &Body, name: &'static str, captures: 
     let record = has_record.then(|| pool.record(ops, exits.map(|exit| exit.unwrap_or(fall)), name, captures));
     let cold_entry = body.cold.map(|stencil| {
         let label = ops.new_dynamic_label();
-        pool.stubs.push((label, Stub::ColdEntry { record: record.expect("a record for a cold path"), cold: stencil }));
+        pool.stubs.push((label, Stub::ColdEntry { record: record.expect("a record for a cold path"), cold: JumpTo::Code(stencil) }));
         label
     });
     let mut sites: SmallVec<[(usize, usize, Site); 8]> = SmallVec::new();
@@ -1144,6 +1151,10 @@ pub struct JitContext {
     /// The address the region being compiled starts at, which alignment is
     /// relative to.
     region_base: usize,
+    /// The cold code of each emitted op on each assignment of registers, by the op's name and
+    /// those registers: one copy every site shares, each through its record. See Note [Emitted
+    /// ops].
+    emitted_colds: HashMap<(&'static str, SmallVec<[u8; WINDOW]>), usize, FxBuildHasher>,
     /// Thunk sites to patch once their target block has JIT code.
     waiting: HashMap<BlockId, Vec<ThunkSite>, FxBuildHasher>,
     /// The JIT entry of each prototype's all-unknown entry block, by the
@@ -1508,6 +1519,7 @@ impl JitContext {
             #[cfg(feature = "tracing")]
             traced_line: 0,
             region_base: 0,
+            emitted_colds: HashMap::default(),
             waiting: HashMap::default(),
             lua_entries: HashMap::default(),
             region_calls: Vec::new(),
@@ -1865,8 +1877,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; .arch x64
                         ; lea rax, [=>record]
                         ; mov QWORD r12 => RunState.cold_site, rax
-                        ; jmp extern cold
                     );
+                    match cold {
+                        JumpTo::Code(code) => dynasm!(ops ; .arch x64 ; jmp extern code),
+                        JumpTo::Label(label) => dynasm!(ops ; .arch x64 ; jmp =>label),
+                    }
+                }
+                Stub::EmittedCold { cold, regs, key } => {
+                    jit_note!(self.jctx, ops, "an emitted op's cold code");
+                    self.jctx.emitted_colds.insert(key, base.0 as usize + ops.offset().0);
+                    dynasm!(ops ; .arch x64 ; mov r10, QWORD r12 => RunState.cold_site);
+                    cold(&mut ops, &regs, &crate::emitted::Record);
                 }
                 Stub::Select { aligned, exit, join } => {
                     jit_note!(self.jctx, ops, "exit {exit}, selected");
@@ -1928,7 +1949,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.reserve(ops.offset().0 - epilogue.0);
 
         let pool_start = ops.offset();
-        ops.align(8, 0xcc);
+        // Its address aligned, not just its offset in the region: a region starts wherever the
+        // buffer's last code ended, and a misaligned 8 byte entry splits cache lines.
+        pad(&mut ops, base.0 as usize, 8);
         jit_note!(self.jctx, ops, "{}", crate::disasm::POOL);
         // Records last: their displacements are to value entries, which are
         // then placed.
@@ -3482,11 +3505,51 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let machine: SmallVec<[u8; WINDOW]> = regs.iter().enumerate()
                         .map(|(i, &reg)| if e.doubles() >> i & 1 == 1 { xmm(reg) } else { WINDOW_REGS[reg] })
                         .collect();
+                    // Its exits as a copied op's: before a `Branch` or `Select`, that residual's
+                    // ways, else stored to `select`; its cold path through the site's record into
+                    // the cold code every site on its registers shares. See Notes [Window exits],
+                    // [Cold stencils] and [Emitted ops].
+                    let fuses = match block.instructions.get(off + 1) {
+                        Some(Residual::Branch { .. }) => true,
+                        Some(Residual::Select(targets)) => targets.len() == EXITS,
+                        _ => false,
+                    };
+                    let fall = ops.new_dynamic_label();
+                    let other = e.selects().then(|| ops.new_dynamic_label());
+                    let exits = crate::emitted::Exits { exit1: other.unwrap_or(fall), cold: ops.new_dynamic_label() };
+                    if let Some(cold) = e.cold() {
+                        let record = pool.record(ops, [fall, other.unwrap_or(fall)], e.name(), &e.captures().into_iter().collect());
+                        let key = (e.name(), machine.clone());
+                        let to = match self.jctx.emitted_colds.get(&key) {
+                            Some(&code) => JumpTo::Code(code),
+                            None => JumpTo::Label(*pool.colds.entry(key.clone()).or_insert_with(|| {
+                                let label = ops.new_dynamic_label();
+                                pool.stubs.push((label, Stub::EmittedCold { cold, regs: machine.clone(), key }));
+                                label
+                            })),
+                        };
+                        pool.stubs.push((exits.cold, Stub::ColdEntry { record, cold: to }));
+                    }
                     for emit in emits {
                         match emit {
-                            Emit::Emitted => e.emit(ops, &machine),
+                            Emit::Emitted => e.emit(ops, &machine, &exits),
                             emit => emit_window_move(ops, emit, offset.get()),
                         }
+                    }
+                    dynasm!(ops ; .arch x64 ; =>fall);
+                    match other {
+                        Some(label) if fuses => fused = Some((label, false, 0)),
+                        // Selected, for whatever reads `select` after it.
+                        Some(label) => {
+                            let join = ops.new_dynamic_label();
+                            pool.stubs.push((label, Stub::Select { aligned: false, exit: 1, join }));
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov QWORD r12 => RunState.select, 0
+                                ; =>join
+                            );
+                        }
+                        None => {}
                     }
                 },
                 Residual::ExecWindow(w) | Residual::GuardDynamic(w) => {

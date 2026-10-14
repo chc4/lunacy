@@ -285,14 +285,35 @@ luajit-mcode benchmark times='10':
 # of code and stack slot traffic, and,
 # with `op` (a disassembly note, like `PushFrame`), that code's instructions
 # summed over its copies. working/jit-profile.data, and the sampled
-# disassembly with counts in working/jit_samples.txt.
-jit-profile benchmark times='10' op='' period='20000' features='unsafe':
+# disassembly with counts in working/jit_samples.txt. `event` samples another event
+# every `period` of it in place of IBS, as a raw counter (`r47`, misaligned
+# accesses on Zen 2): a counter's sample is taken at its overflow interrupt, so it
+# lands some instructions after the one that counted. `only` keeps the IBS samples of
+# ops with that flag of IBS's op data set (`DcMisAcc`, a misaligned access), from
+# its raw data (tools/ibs_samples.py).
+jit-profile benchmark times='10' op='' period='20000' features='unsafe' event='ibs_op//' only='':
     just _luac {{benchmark}}
     {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} perf jit_disasm" --bin bench \
         --target-dir target/jit_disasm -Z build-std="core,std,panic_abort"
-    cd working && {{SAMPLED}} perf record -e ibs_op// -c {{period}} -o jit-profile.data ../target/jit_disasm/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
-    cd working && perf script -i jit-profile.data -F ip,sym > jit-profile.samples
+    cd working && {{SAMPLED}} perf record -e {{event}} -c {{period}} {{ if only != "" { "-R" } else { "" } }} -o jit-profile.data ../target/jit_disasm/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
+    {{ if only != "" { "cd working && perf report -D -i jit-profile.data | python3 ../tools/ibs_samples.py " + only + " jit-profile.data > jit-profile.samples" } else { "cd working && perf script -i jit-profile.data -F ip,sym > jit-profile.samples" } }}
     python3 tools/jit_samples.py working/jit_disasm.txt working/jit-profile.samples --out working/jit_samples.txt --classes {{ if op != "" { "--op '" + op + "'" } else { "" } }}
+
+# `jit-profile` of revision `ref`, from its compare worktree (as for `hyperfine-vs`), on this
+# checkout's compiled benchmark: its sampled disassembly in working/jit_samples-<ref>.txt.
+jit-profile-rev ref benchmark times='10' period='20000' features='unsafe' event='ibs_op//':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _luac {{benchmark}}
+    just _compare-worktree {{ref}}
+    bin=$(realpath working/{{benchmark}}.bin)
+    dir=target/compare/{{ref}}
+    mkdir -p $dir/working
+    (cd $dir && {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} perf jit_disasm" --bin bench \
+        --target-dir target/jit_disasm -Z build-std="core,std,panic_abort")
+    (cd $dir/working && {{SAMPLED}} perf record -e {{event}} -c {{period}} -o jit-profile.data ../target/jit_disasm/unsafe/bench $bin {{times}} > /dev/null)
+    (cd $dir/working && perf script -i jit-profile.data -F ip,sym > jit-profile.samples)
+    python3 tools/jit_samples.py $dir/working/jit_disasm.txt $dir/working/jit-profile.samples --out working/jit_samples-{{ref}}.txt --classes
 
 # `jit-profile` of each of `runs` (`benchmark:times`, as HYPERFINES has them): each one's
 # summary in working/jit-profile-<benchmark>.txt and its sampled disassembly in

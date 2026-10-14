@@ -1182,6 +1182,91 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             // Notes [Integers] and [Optimistic ops].
             let integers = integer_operands!(lhs, rhs);
             let (lk, rk) = ((lhs & 0x100) != 0, (rhs & 0x100) != 0);
+            // `+`, `-` and `*` are emitted ops: the instruction on whichever registers their
+            // operands are in, overflowing into a cold path computing the double op's result,
+            // which takes exit 1. See Notes [Emitted ops] and [Optimistic ops].
+            use crate::emitted::{Assembler, Emitted};
+            use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+            // xmm15 `OP` xmm14, boxed into `dest`.
+            fn double_result(ops: &mut Assembler, op: Opcode, dest: u8) {
+                match op {
+                    Opcode::ADD => dynasm!(ops ; .arch x64 ; vaddsd xmm15, xmm15, xmm14),
+                    Opcode::SUB => dynasm!(ops ; .arch x64 ; vsubsd xmm15, xmm15, xmm14),
+                    _ => dynasm!(ops ; .arch x64 ; vmulsd xmm15, xmm15, xmm14),
+                }
+                dynasm!(ops ; .arch x64 ; vmovq rax, xmm15 ; sub rax, r14 ; mov Rq(dest), rax);
+            }
+            // Zero times a negative number is -0: a product of zero, in eax, takes the cold path if
+            // either factor is negative, their or in r10d.
+            fn negative_zero(ops: &mut Assembler, cold: dynasmrt::DynamicLabel) {
+                dynasm!(ops
+                    ; .arch x64
+                    ; test eax, eax
+                    ; jnz >product
+                    ; test r10d, r10d
+                    ; js =>cold
+                    ; product:
+                );
+            }
+            crate::emitted::emitted!(ArithRR, [], [OP: Opcode], |ops, exits| (lhs, rhs, out dest) {
+                dynasm!(ops ; .arch x64 ; mov eax, Rd(lhs));
+                match OP {
+                    Opcode::ADD => dynasm!(ops ; .arch x64 ; add eax, Rd(rhs) ; jo =>exits.cold),
+                    Opcode::SUB => dynasm!(ops ; .arch x64 ; sub eax, Rd(rhs) ; jo =>exits.cold),
+                    _ => {
+                        dynasm!(ops ; .arch x64 ; imul eax, Rd(rhs) ; jo =>exits.cold ; mov r10d, Rd(lhs) ; or r10d, Rd(rhs));
+                        negative_zero(ops, exits.cold);
+                    },
+                }
+                dynasm!(ops ; .arch x64 ; or rax, r14 ; mov Rq(dest), rax);
+            } cold |record| {
+                dynasm!(ops ; .arch x64 ; vcvtsi2sd xmm15, xmm15, Rd(lhs) ; vcvtsi2sd xmm14, xmm14, Rd(rhs));
+                double_result(ops, OP, dest);
+                record.exit(ops, 1);
+            });
+            crate::emitted::emitted!(ArithRK, [k: i32], [OP: Opcode], |ops, exits| (lhs, out dest) {
+                match OP {
+                    Opcode::ADD => dynasm!(ops ; .arch x64 ; mov eax, Rd(lhs) ; add eax, k ; jo =>exits.cold),
+                    Opcode::SUB => dynasm!(ops ; .arch x64 ; mov eax, Rd(lhs) ; sub eax, k ; jo =>exits.cold),
+                    _ => {
+                        dynasm!(ops ; .arch x64 ; imul eax, Rd(lhs), k ; jo =>exits.cold ; mov r10d, Rd(lhs) ; or r10d, k);
+                        negative_zero(ops, exits.cold);
+                    },
+                }
+                dynasm!(ops ; .arch x64 ; or rax, r14 ; mov Rq(dest), rax);
+            } cold |record| {
+                record.capture(ops, k, 0);
+                dynasm!(ops ; .arch x64 ; vcvtsi2sd xmm15, xmm15, Rd(lhs) ; vcvtsi2sd xmm14, xmm14, eax);
+                double_result(ops, OP, dest);
+                record.exit(ops, 1);
+            });
+            crate::emitted::emitted!(ArithKR, [k: i32], [OP: Opcode], |ops, exits| (rhs, out dest) {
+                match OP {
+                    Opcode::ADD => dynasm!(ops ; .arch x64 ; mov eax, Rd(rhs) ; add eax, k ; jo =>exits.cold),
+                    Opcode::SUB => dynasm!(ops ; .arch x64 ; mov eax, k ; sub eax, Rd(rhs) ; jo =>exits.cold),
+                    _ => {
+                        dynasm!(ops ; .arch x64 ; imul eax, Rd(rhs), k ; jo =>exits.cold ; mov r10d, Rd(rhs) ; or r10d, k);
+                        negative_zero(ops, exits.cold);
+                    },
+                }
+                dynasm!(ops ; .arch x64 ; or rax, r14 ; mov Rq(dest), rax);
+            } cold |record| {
+                record.capture(ops, k, 0);
+                dynasm!(ops ; .arch x64 ; vcvtsi2sd xmm15, xmm15, eax ; vcvtsi2sd xmm14, xmm14, Rd(rhs));
+                double_result(ops, OP, dest);
+                record.exit(ops, 1);
+            });
+            macro_rules! dispatch_arith {
+                ($name:ident, ($($arg:expr),*)) => {
+                    match opcode {
+                        Opcode::ADD => Some(Rc::new($name::<{Opcode::ADD}>::new($($arg),*)) as Rc<dyn Emitted>),
+                        Opcode::SUB => Some(Rc::new($name::<{Opcode::SUB}>::new($($arg),*))),
+                        Opcode::MUL => Some(Rc::new($name::<{Opcode::MUL}>::new($($arg),*))),
+                        _ => None,
+                    }
+                };
+            }
+            let mut emitted: Option<Rc<dyn Emitted>> = None;
             // The op, whether its result can fail to fit, and whether it fits for the values its
             // operands have. A constant operand is its value, as `k`; luac folds two.
             let op: Option<(Rc<dyn Window>, bool, Option<crate::specialize::Fits>)> = if !integers || (lk && rk) {
@@ -1198,6 +1283,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     1
                 });
                 let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| integer_fits(opcode, k, unsafe { state.vals[state.base + rhs].as_int() })));
+                emitted = dispatch_arith!(ArithKR, (k, &[rhs, dest]));
                 Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true, Some(fits)))
             } else if rk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rhs & 0xff)) else { unreachable!() };
@@ -1224,6 +1310,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     true => (Rc::new(ModRK::new(k, &[lhs, dest])) as Rc<dyn Window>, false, None),
                     false => {
                         let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| integer_fits(opcode, unsafe { state.vals[state.base + lhs].as_int() }, k)));
+                        emitted = dispatch_arith!(ArithRK, (k, &[lhs, dest]));
                         (dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest])), true, Some(fits))
                     },
                 })
@@ -1240,6 +1327,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| unsafe {
                     integer_fits(opcode, state.vals[state.base + lhs].as_int(), state.vals[state.base + rhs].as_int())
                 }));
+                emitted = dispatch_arith!(ArithRR, (&[lhs, rhs, dest]));
                 Some((dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest])), true, Some(fits)))
             };
             // As one step each way, as a guard of whether the result fits is
@@ -1253,7 +1341,10 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     // [Optimistic ops].
                     let fits = op.as_ref().and_then(|(_, _, fits)| fits.clone()).unwrap();
                     if (yield YieldOp::Encoding(fits)) != ResumeArg::Type(CType::Type(LType::Double)) {
-                        let fits = yield YieldOp::OptimisticExec(window(&op));
+                        let fits = match &emitted {
+                            Some(op) => yield YieldOp::OptimisticEmit(op.clone()),
+                            None => yield YieldOp::OptimisticExec(window(&op)),
+                        };
                         let ty = if fits == ResumeArg::Matched { LType::Integer } else { LType::Double };
                         yield YieldOp::SetCTypes(vec![(dest, CType::Type(ty))]);
                         return arg;
@@ -1303,15 +1394,15 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 _ => unreachable!("a double op emitted: {op:?}"),
             }
         }
-        crate::emitted::emitted!(DoubleRR, [op: Opcode], |ops| (f64 lhs, f64 rhs, out f64 dest) {
+        crate::emitted::emitted!(DoubleRR, [op: Opcode], [], |ops, exits| (f64 lhs, f64 rhs, out f64 dest) {
             double_op(ops, op, dest, lhs, rhs);
         });
         // `k` into xmm15, an emitted op's scratch.
-        crate::emitted::emitted!(DoubleRK, [op: Opcode, k: f64], |ops| (f64 lhs, out f64 dest) {
+        crate::emitted::emitted!(DoubleRK, [op: Opcode, k: f64], [], |ops, exits| (f64 lhs, out f64 dest) {
             dynasm!(ops ; .arch x64 ; mov rax, QWORD k.to_bits() as i64 ; vmovq xmm15, rax);
             double_op(ops, op, dest, lhs, 15);
         });
-        crate::emitted::emitted!(DoubleKR, [op: Opcode, k: f64], |ops| (f64 rhs, out f64 dest) {
+        crate::emitted::emitted!(DoubleKR, [op: Opcode, k: f64], [], |ops, exits| (f64 rhs, out f64 dest) {
             dynasm!(ops ; .arch x64 ; mov rax, QWORD k.to_bits() as i64 ; vmovq xmm15, rax);
             double_op(ops, op, dest, 15, rhs);
         });
@@ -1537,22 +1628,59 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
         // Compares of integers, a constant one its value `k`: known to be before, or
         // both registers found in the integer encoding by the guards above. See Note
         // [Integers].
+        // Of integers, emitted ops: a `cmp` of the operands' registers, and a jump to exit 1 if
+        // the condition is `a`. See Notes [Emitted ops] and [Window exits].
+        use crate::emitted::{Assembler, Emitted};
+        use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+        // To `exit1` if `OP` of the operands the flags compared, the other way round if
+        // `swapped`, is `a`.
+        fn compare_jump(ops: &mut Assembler, op: Opcode, a: u8, swapped: bool, exit1: dynasmrt::DynamicLabel) {
+            match (op, swapped, a != 0) {
+                (Opcode::EQ, _, true) => dynasm!(ops ; .arch x64 ; je =>exit1),
+                (Opcode::EQ, _, false) => dynasm!(ops ; .arch x64 ; jne =>exit1),
+                (Opcode::LT, false, true) => dynasm!(ops ; .arch x64 ; jl =>exit1),
+                (Opcode::LT, false, false) => dynasm!(ops ; .arch x64 ; jge =>exit1),
+                (Opcode::LT, true, true) => dynasm!(ops ; .arch x64 ; jg =>exit1),
+                (Opcode::LT, true, false) => dynasm!(ops ; .arch x64 ; jle =>exit1),
+                (Opcode::LE, false, true) => dynasm!(ops ; .arch x64 ; jle =>exit1),
+                (Opcode::LE, false, false) => dynasm!(ops ; .arch x64 ; jg =>exit1),
+                (Opcode::LE, true, true) => dynasm!(ops ; .arch x64 ; jge =>exit1),
+                (Opcode::LE, true, false) => dynasm!(ops ; .arch x64 ; jl =>exit1),
+                _ => unreachable!("an integer compare of {op:?}"),
+            }
+        }
+        crate::emitted::emitted!(select CompareIntRR, [a: u8], [OP: Opcode], |ops, exits| (lhs, rhs) {
+            dynasm!(ops ; .arch x64 ; cmp Rd(lhs), Rd(rhs));
+            compare_jump(ops, OP, a, false, exits.exit1);
+        });
+        crate::emitted::emitted!(select CompareIntKR, [a: u8, k: i32], [OP: Opcode], |ops, exits| (rhs) {
+            dynasm!(ops ; .arch x64 ; cmp Rd(rhs), k);
+            compare_jump(ops, OP, a, true, exits.exit1);
+        });
+        crate::emitted::emitted!(select CompareIntRK, [a: u8, k: i32], [OP: Opcode], |ops, exits| (lhs) {
+            dynasm!(ops ; .arch x64 ; cmp Rd(lhs), k);
+            compare_jump(ops, OP, a, false, exits.exit1);
+        });
+        macro_rules! dispatch_compare {
+            ($name:ident, ($($arg:expr),*)) => {
+                match opcode {
+                    Opcode::EQ => Rc::new($name::<{Opcode::EQ}>::new($($arg),*)) as Rc<dyn Emitted>,
+                    Opcode::LT => Rc::new($name::<{Opcode::LT}>::new($($arg),*)),
+                    Opcode::LE => Rc::new($name::<{Opcode::LE}>::new($($arg),*)),
+                    _ => unreachable!(),
+                }
+            };
+        }
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) if integers || (lint && rint) => {
-                crate::window::windowed!(select CompareIntRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
-                    compare_exit::<OP, i32>(a, lhs.as_int(), rhs.as_int())
-                });
-                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRR, [], (a, &[b, c])));
+                arg = yield YieldOp::Emit(dispatch_compare!(CompareIntRR, (a, &[b, c])));
             },
             (ResumeArg::Matched, ResumeArg::Matched) => {
                 arg = yield YieldOp::ExecWindow(compare_rr(opcode, lint, rint, a, &[b, c]));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) if integers => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rb)) else { unreachable!() };
-                crate::window::windowed!(select CompareIntKR, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (rhs) {
-                    compare_exit::<OP, i32>(a, k, rhs.as_int())
-                });
-                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntKR, [], (a, k, &[c])));
+                arg = yield YieldOp::Emit(dispatch_compare!(CompareIntKR, (a, k, &[c])));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(rb)) else { unreachable!() };
@@ -1560,10 +1688,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) if integers => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rc)) else { unreachable!() };
-                crate::window::windowed!(select CompareIntRK, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (lhs) {
-                    compare_exit::<OP, i32>(a, lhs.as_int(), k)
-                });
-                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRK, [], (a, k, &[b])));
+                arg = yield YieldOp::Emit(dispatch_compare!(CompareIntRK, (a, k, &[b])));
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(rc)) else { unreachable!() };

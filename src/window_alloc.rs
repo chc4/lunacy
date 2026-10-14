@@ -679,12 +679,12 @@ impl<'a> Op<'a> {
         }
     }
 
-    /// Whether it may leave the trace to code reading any slot from the stack: a window op that
-    /// selects, takes its exit 1, or has a cold path.
+    /// Whether it may leave the trace to code reading any slot from the stack: an op that selects,
+    /// takes its exit 1, or has a cold path.
     fn blind(self) -> bool {
         match self {
             Op::Window(w) => w.selects() || w.exit1().is_some() || (0..WINDOW).any(|skip| w.cold(skip).is_some()),
-            Op::Emitted(_) => false,
+            Op::Emitted(e) => e.selects(),
         }
     }
 }
@@ -1169,15 +1169,17 @@ fn place_free(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> (
         want[reg] = Some(slot);
     }
     let inputs: SmallVec<[usize; WINDOW]> = (0..width).filter(|&reg| want[reg].is_some()).collect();
-    let (out, _) = slots.iter().zip(accesses).enumerate().find(|(_, (_, a))| **a == Access::Write).expect("an emitted op's output");
-    let out_slot = slots[out];
     let dead = |slot: usize| !now.dirty.contains(&slot) || ahead.dead(slot, step);
-    let out = inputs.iter().copied().find(|&reg| want[reg] == Some(out_slot))
-        .or_else(|| now.position(out_slot).filter(|&reg| want[reg].is_none()))
-        .or_else(|| inputs.iter().copied().find(|&reg| want[reg].is_some_and(|slot| worth(slot).is_none() && dead(slot))))
-        .unwrap_or_else(|| free(&want, &[]));
     let mut taken: SmallVec<[usize; WINDOW]> = inputs.clone();
-    if !taken.contains(&out) {
+    // An op with no output, as a compare, takes no register for one.
+    let output = slots.iter().zip(accesses).find(|(_, a)| **a == Access::Write).map(|(&slot, _)| slot);
+    let out = output.map_or(0, |out_slot| {
+        inputs.iter().copied().find(|&reg| want[reg] == Some(out_slot))
+            .or_else(|| now.position(out_slot).filter(|&reg| want[reg].is_none()))
+            .or_else(|| inputs.iter().copied().find(|&reg| want[reg].is_some_and(|slot| worth(slot).is_none() && dead(slot))))
+            .unwrap_or_else(|| free(&want, &[]))
+    });
+    if output.is_some() && !taken.contains(&out) {
         taken.push(out);
     }
     // The values worth most of the others, each in its register if the op doesn't take it, else
@@ -1320,8 +1322,10 @@ mod tests {
         fn operands(&self) -> &[usize] { self.0.operands() }
         fn accesses(&self) -> &'static [Access] { self.0.accesses() }
         fn doubles(&self) -> u8 { self.1 }
-        fn constants(&self) -> SmallVec<[u64; 2]> { SmallVec::new() }
-        fn emit(&self, _: &mut crate::emitted::Assembler, _: &[u8]) {}
+        fn captures(&self) -> SmallVec<[u64; 2]> { SmallVec::new() }
+        fn selects(&self) -> bool { false }
+        fn emit(&self, _: &mut crate::emitted::Assembler, _: &[u8], _: &crate::emitted::Exits) {}
+        fn cold(&self) -> Option<crate::emitted::Cold> { None }
         fn with_operands(&self, _: &[usize]) -> std::rc::Rc<dyn Emitted> { unreachable!() }
     }
 
@@ -1441,7 +1445,7 @@ mod tests {
             .zip(ops)
             .enumerate()
             .map(|(i, (w, op))| match op {
-                TestOp::Bin(..) | TestOp::BinFirst(..) | TestOp::Get(..) if emitted => {
+                TestOp::Bin(..) | TestOp::BinFirst(..) | TestOp::Get(..) | TestOp::Set(..) if emitted => {
                     // An emitted op takes each of its operands in one form.
                     let mask = if doubles(i) & ((1 << w.arity()) - 1) != 0 { (1 << w.arity()) - 1 } else { 0 };
                     Built::Emitted(Box::new(TestEmitted(w, mask)))

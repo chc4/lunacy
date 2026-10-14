@@ -309,6 +309,8 @@ pub enum YieldOp {
     OptimisticExec(Rc<dyn Window>), // An op with a cold path, which selects 0 on its hot path and
                                     // 1 on its cold. Resumed with Matched on the hot path, and
                                     // Failed on the cold. See Note [Optimistic ops]
+    OptimisticEmit(Rc<dyn crate::emitted::Emitted>), // `OptimisticExec` of an emitted op. See Note
+                                                    // [Emitted ops]
     Decided(bool), // A guard whose outcome is known, emitting nothing: steps the SubPc as a guard
                    // with that outcome does, for a way meeting ones that take it. Resumed with
                    // Matched or Failed. See Note [Subblocks]
@@ -6513,15 +6515,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let called = ctx.inline.last().filter(|frame| frame.made != Made::Yes).and_then(|frame| frame.closure);
                     arg = called.map_or(ResumeArg::Failed, ResumeArg::Boxed);
                 },
-                CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
+                CoroutineState::Yielded(yielded @ (YieldOp::OptimisticExec(_) | YieldOp::OptimisticEmit(_))) => {
+                    let (operands, accesses, residual): (SmallVec<[usize; 4]>, _, _) = match yielded {
+                        YieldOp::OptimisticExec(op) => (op.operands().into(), op.accesses(), Residual::ExecWindow(op)),
+                        YieldOp::OptimisticEmit(op) => (op.operands().into(), op.accesses(), Residual::Emit(op)),
+                        _ => unreachable!(),
+                    };
                     // Its outputs are written whichever path it takes. See Note [Optimistic ops].
-                    for (&slot, access) in op.operands().iter().zip(op.accesses()) {
+                    for (&slot, access) in operands.iter().zip(accesses) {
                         if access.writes() {
                             Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
                         }
                     }
                     self.end_block(block_id);
-                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op));
+                    self.blocks[block_id.0].instructions.push(residual);
                     let hot = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
                     let cold = self.new_block(pc.0);
                     // Its overflow rebuilds it from where its encoding was asked. See Note
