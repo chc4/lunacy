@@ -2398,10 +2398,14 @@ pub struct Context {
 // carrying one invalidation per backwards edge may drop a single fact from the set at a different
 // position each time, and cause `2^n` combination repeatedly compiling the same loop.
 //
-// Instead the versions of a pc that differ only in their facts are kept ordered by inclusion,
-// domain by domain (each key of `Known`, and the equalities), each one's knowledge in a domain
-// within the next's, and a context reaching the pc forgets whatever it knows that would break that
-// order. Forgetting is always sound, since a version relying on less accepts any context knowing
+// Instead the versions of a pc compatible but for their facts (one's types, hash keys and top
+// accepting the other's: LBBV's nearest compatible versions, not only those identical but for
+// their facts) are kept ordered by inclusion, domain by domain (each key of `Known`, and the
+// equalities), each one's knowledge in a domain within the next's, and a context reaching the pc
+// forgets whatever it knows that would break that order: the least it can. So a loop whose first
+// iteration learns a type and a transient fact at once, as a peeled version knowing more of a
+// slot's type and a value class that holds only for the next iteration, forgets the fact against
+// the version before it, and the steady state reuses the peeled version. Forgetting is always sound, since a version relying on less accepts any context knowing
 // more, and n facts of a domain then give at most n + 1 versions for it. Domains are kept apart
 // so that facts of one, established and lost on their own schedule, never cost another's: a fact
 // is forgotten in one domain alone, and a class split keeps every fact it had. A join of versions
@@ -3181,12 +3185,23 @@ impl Context {
     /// Whether a block specialized to `self` is correct in `other`. See Note
     /// [Version compatibility].
     fn accepts(&self, other: &Context) -> bool {
+        self.accepts_layout(other) && self.values.accepts(&other.values)
+    }
+
+    /// Whether `self` accepts `other` but for their fragile information: its types, hash keys
+    /// and top.
+    fn accepts_layout(&self, other: &Context) -> bool {
         self.same_point(other) && self.hkeys.iter().enumerate().all(|(i, hkey)| {
             hkey.orphan() || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
         })
             && (self.top.is_none() || self.top == other.top)
-            && self.values.accepts(&other.values)
             && (0..self.types.len().max(other.types.len())).all(|idx| self.slot(idx).accepts(&other.slot(idx)))
+    }
+
+    /// Whether, but for their fragile information, one of `self` and `other` accepts the other.
+    /// See Note [Fragile information].
+    fn compatible(&self, other: &Context) -> bool {
+        self.accepts_layout(other) || other.accepts_layout(self)
     }
 
     /// The lattice height `self` loses from `other`, which it accepts.
@@ -3758,11 +3773,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .filter(|((epc, ectx), _)| *epc == subpc && ectx.same_point(&ctx))
             .map(|((_, ectx), block)| (ectx.clone(), *block))
             .collect();
-        // Versions differing only in fragile information are, kind by kind of
+        // Versions compatible but for their fragile information are, kind by kind of
         // fact, a chain of subsets, each version's facts of the kind in the
         // next's: `ctx` keeps the most facts of each kind that keep it one. See
         // Note [Fragile information].
-        let alike: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
+        let compatible: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.compatible(&ctx)).collect();
         let mut lowered = (*ctx).clone();
         // The equalities, then each domain of facts.
         for domain in std::iter::once(None).chain(KEYS.into_iter().map(Some)) {
@@ -3780,7 +3795,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 None => values.equalities(),
                 Some(key) => values.count(key),
             };
-            let mut chain: Vec<&Values> = alike.iter().map(|(ectx, _)| &ectx.values).collect();
+            let mut chain: Vec<&Values> = compatible.iter().map(|(ectx, _)| &ectx.values).collect();
             chain.sort_by_key(|values| size(values));
             chain.dedup_by(|a, b| within(a, b) && within(b, a));
             let below = chain.iter().rposition(|values| within(values, &ctx.values));
@@ -3793,7 +3808,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let ctx = if lowered.values == ctx.values {
             ctx
         } else {
-            if let Some((ectx, block)) = alike.iter().find(|(ectx, _)| ectx.values == lowered.values) {
+            // The nearest version knowing the same, if one accepts it.
+            if let Some((ectx, block)) = compatible.iter().filter(|(ectx, _)| ectx.values == lowered.values && ectx.accepts(&lowered)).min_by_key(|(ectx, block)| (ectx.distance(&lowered), block.0)) {
                 ectx.adopt(owner, &lowered);
                 self.unreachable.remove(block);
                 return (*block, "fragile", None);

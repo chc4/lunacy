@@ -24,6 +24,7 @@ def main():
     ap.add_argument('counts')
     ap.add_argument('--rare', type=int, default=100, help='executions under which code ran rarely')
     ap.add_argument('--by-point', action='store_true', help='compiled blocks per function and PC: the points with the most')
+    ap.add_argument('--by-copy', action='store_true', help="each compiled copy of a function (its inline chain): bytes, PCs, and blocks per PC")
     ap.add_argument('--top', type=int, default=15)
     args = ap.parse_args()
 
@@ -72,6 +73,28 @@ def main():
         for (f, p), blocks in sorted(points.items(), key=lambda item: -len(item[1]))[:args.top]:
             print(f'  {f} pc {p}: {len(blocks)} blocks, {sum(size[b] for b in blocks)} bytes, '
                   f'{sum(jit[b] for b in blocks)} executions')
+
+    if args.by_copy:
+        # Each copy of a function's code (the chain of calls it is inlined through, its own last):
+        # how much code, over how many of its PCs, and how many blocks each PC has.
+        copies = defaultdict(list)
+        for b in size:
+            copies[function[b]].append(b)
+        print(f'\ncopies of functions with the most code (chain: bytes, blocks, PCs, blocks per PC (most), PCs with 3+ blocks, executions):')
+        for chain, blocks in sorted(copies.items(), key=lambda item: -sum(size[b] for b in item[1]))[:args.top]:
+            per_pc = Counter(pc[b] for b in blocks)
+            many = sum(1 for n in per_pc.values() if n >= 3)
+            print(f'  {chain}: {sum(size[b] for b in blocks)} bytes, {len(blocks)} blocks, {len(per_pc)} PCs, '
+                  f'{len(blocks) / len(per_pc):.1f} ({max(per_pc.values())}), {many} PCs, {sum(jit[b] for b in blocks)} executions')
+        # Each function's code over all its copies.
+        functions = defaultdict(lambda: [0, set()])
+        for chain, blocks in copies.items():
+            callee = chain.split('-')[-1]
+            functions[callee][0] += sum(size[b] for b in blocks)
+            functions[callee][1].add(chain)
+        print(f'\nfunctions with the most code over their copies (function: bytes, copies):')
+        for f, (n, chains) in sorted(functions.items(), key=lambda item: -item[1][0])[:args.top]:
+            print(f'  {f}: {n} bytes, {len(chains)} copies')
 
 
 if __name__ == '__main__':
