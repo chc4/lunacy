@@ -39,9 +39,17 @@ const INITIAL_HOTNESS: usize = 64;
 // relative to the rest of the program, and code that went cold stops looking hot.
 //
 // A block without code is compiled when it is entered by an edge that has run `HOT_EDGE` times
-// recently, or when it is forced to compile (its hotness 0). A block with code is always entered.
-// An entry right after JIT code exits counts `EXIT_COUNT` times over: the code exited because it
-// was compiled without what it went on to, which should be compiled sooner.
+// recently and starts a region where one should start: a loop's back edge (to its function at a PC
+// no later than the edge's own), an edge into a function or back into one, or the entry right after
+// JIT code exits. A forward edge within a function is counted but compiles nothing: the region from
+// the loop header or function entry before it takes it in, so a region doesn't start inside a loop.
+// A block forced to compile (its hotness 0) is compiled when entered, and a block with code is
+// always entered. An entry right after JIT code exits counts `EXIT_COUNT` times over: the code exited
+// because it was compiled without what it went on to, which should be compiled sooner.
+//
+// Compiling a region reads the counts of its edges as they are then: which blocks it takes in (Note
+// [Region selection]), which way its traces go (Note [Most frequent edge]), and which way out of a
+// block its code falls through to.
 
 // Note [Region selection]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -68,7 +76,7 @@ const EDGES: usize = 1 << 16;
 const EDGE_DECAY: u32 = 1 << 16;
 /// The recent count of an edge entering a block without code that compiles it. See Note [Edge
 /// counts].
-pub const HOT_EDGE: u16 = 64;
+pub const HOT_EDGE: u16 = 128;
 /// How many times an entry right after JIT code exits counts. See Note [Edge counts].
 pub const EXIT_COUNT: u16 = 4;
 
@@ -1326,8 +1334,31 @@ struct CallSite {
 /// The window dump ends with how often each counted piece of allocator code
 /// ran, and the code is disassembled.
 #[cfg(any(feature = "window_dump", feature = "jit_disasm"))]
+/// How many blocks `BLOCK_COUNTS` counts, by id.
+#[cfg(feature = "block_counts")]
+const COUNTED_BLOCKS: usize = 1 << 20;
+
+/// Each block's executions by its id (feature `block_counts`): in JIT code, which counts as each
+/// block's code is entered, and in the interpreter, which counts a block it runs from its start.
+/// Written to block_counts.txt as the JIT context is dropped.
+#[cfg(feature = "block_counts")]
+pub static BLOCK_COUNTS: [[std::sync::atomic::AtomicU64; COUNTED_BLOCKS]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; COUNTED_BLOCKS] }; 2];
+
 impl Drop for JitContext {
     fn drop(&mut self) {
+        #[cfg(feature = "block_counts")]
+        {
+            use std::io::Write;
+            let mut out = std::io::BufWriter::new(std::fs::File::create("block_counts.txt").expect("block_counts.txt"));
+            writeln!(out, "# block jit interpreter").unwrap();
+            for id in 0..COUNTED_BLOCKS {
+                let [jit, interpreter] = [0, 1].map(|tier| BLOCK_COUNTS[tier][id].load(std::sync::atomic::Ordering::Relaxed));
+                if jit + interpreter > 0 {
+                    writeln!(out, "{id} {jit} {interpreter}").unwrap();
+                }
+            }
+        }
         #[cfg(feature = "window_dump")]
         for (id, count) in self.window_counts.borrow().iter().enumerate() {
             window_dump!(self, "count #{id} {}", count.load(std::sync::atomic::Ordering::Relaxed));
@@ -2346,12 +2377,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
         }
         #[cfg(feature = "tracing")]
-        crate::tracing::instant("jit", "region", &[
-            ("root", root.0.into()),
-            ("reached", reached.len().into()),
-            ("selected", region.len().into()),
-            ("root_weight", (root_weight as u64).into()),
-        ]);
+        {
+            // How many of the blocks reached weigh under each share of the root's weight.
+            let under = |percent: u32| reached.iter().filter(|block| weights.get(block).copied().unwrap_or(0) * 100 < root_weight * percent).count();
+            crate::tracing::instant("jit", "region", &[
+                ("root", root.0.into()),
+                ("reached", reached.len().into()),
+                ("selected", region.len().into()),
+                ("root_weight", (root_weight as u64).into()),
+                ("under_1", under(1).into()),
+                ("under_10", under(10).into()),
+                ("under_25", under(25).into()),
+                ("under_50", under(50).into()),
+                ("under_100", under(100).into()),
+            ]);
+        }
         region
     }
 
@@ -2435,6 +2475,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             placement.iter().flatten().for_each(|&slot| slots.insert(slot));
             slots
         };
+        // Each edge's weight between the region's blocks, how often it ran recently, and each
+        // block's, the edges into it; the entry's at least what compiled it. See Note [Edge counts].
+        let mut edge_weights: Vec<SmallVec<[(usize, u64); 2]>> = vec![SmallVec::new(); ids.len()];
+        let mut weights = vec![0u64; ids.len()];
+        for (from, &block) in ids.iter().enumerate() {
+            let residuals = &self.blocks[block.0].instructions;
+            for target in residuals[..runs_to(residuals)].iter().flat_map(jump_targets) {
+                if let Some(&to) = index.get(&target) && !edge_weights[from].iter().any(|&(t, _)| t == to) {
+                    let weight = self.jctx.edges.recent(block, target) as u64;
+                    edge_weights[from].push((to, weight));
+                    weights[to] += weight;
+                }
+            }
+        }
+        weights[0] = weights[0].max(HOT_EDGE as u64);
+        window_dump!(self.jctx, "weights {}", ids.iter().enumerate().map(|(b, id)| format!("{}={} [{}]", id.0, weights[b],
+            edge_weights[b].iter().map(|&(to, weight)| format!("->{}:{weight}", ids[to].0)).collect::<Vec<_>>().join(" "))).collect::<Vec<_>>().join(", "));
         let region = Region::new(
             ids.iter()
                 .zip(&skips)
@@ -2490,7 +2547,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     TraceBlock {
                         events,
-                        hotness: self.blocks[block.0].jit_info.hotness.get(),
+                        weight: weights[index[block]],
+                        weights: edge_weights[index[block]].clone(),
                         id: block.0,
                         pc: self.blocks[block.0].pc,
                         // A block whose countdown hasn't moved never ran. Every
@@ -2510,12 +2568,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         // The window each trace's head starts from, and the block it comes
         // from: the region's entry, the window of the thunk linked into it,
-        // from outside the region; another head, the window the hottest edge
+        // from outside the region; another head, the window the heaviest edge
         // into it from a trace planned earlier leaves. See Note [Trace
         // allocation].
-        let mut hints: HashMap<BlockId, (usize, Cache, Option<usize>), FxBuildHasher> = HashMap::default();
+        let mut hints: HashMap<BlockId, (u64, Cache, Option<usize>), FxBuildHasher> = HashMap::default();
         if let Some(window) = entered {
-            hints.insert(entry, (0, window.clone(), None));
+            hints.insert(entry, (u64::MAX, window.clone(), None));
         }
         let mut plans = Plans::default();
         for trace in &traces {
@@ -2524,9 +2582,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             window_dump!(self.jctx, "trace from block {} starts from {}", head.0, hint);
             let (planned, exits) = self.plan_trace(trace, &ids, &offsets, &windows, &skips, &index, &live_in, &loops, &plans, &hint, from);
             for (from, target, window) in exits {
-                let hotness = self.blocks[from.0].jit_info.hotness.get();
-                if hints.get(&target).is_none_or(|&(hottest, ..)| hotness < hottest) {
-                    hints.insert(target, (hotness, window, Some(index[&from])));
+                let weight = self.jctx.edges.recent(from, target) as u64;
+                if hints.get(&target).is_none_or(|&(heaviest, ..)| weight > heaviest) {
+                    hints.insert(target, (weight, window, Some(index[&from])));
                 }
             }
             plans.extend(planned);
@@ -2561,9 +2619,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         };
         // What a block the trace leaves into reads first: its entry window's
         // slots, or those live into it; none for a side exit that never ran.
-        let reads = |target: BlockId, hot: bool| match self.jctx.blocks.get(&target) {
+        let reads = |from: BlockId, target: BlockId, hot: bool| match self.jctx.blocks.get(&target) {
             Some(done) => slots_of(done.window.regs()),
-            None if !hot && !cfg!(feature = "immediate_jit") && self.blocks[target.0].jit_info.hotness.get() >= INITIAL_HOTNESS => Slots::default(),
+            None if !hot && !cfg!(feature = "immediate_jit") && self.jctx.edges.recent(from, target) == 0 => Slots::default(),
             // A cold edge's exit stores the window. See Note [Region selection].
             None => match index.get(&target) {
                 Some(&at) => plans.get(&target).map_or(live_in[at], |plan| slots_of(&plan.entry.unpack())),
@@ -2584,7 +2642,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let targets = || ran.iter().flat_map(jump_targets);
             let back = targets().any(|target| position(target).is_some_and(|at| at <= pos));
             let continues = if next.is_none() && !back {
-                targets().min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0))
+                targets().min_by_key(|target| (std::cmp::Reverse(self.jctx.edges.recent(ids[b], *target)), target.0))
             } else {
                 None
             };
@@ -2633,7 +2691,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 None => {
                                     let hot = Some(target) == continues;
                                     leaving.push((steps.len(), ids[b], target));
-                                    steps.push(Step::Exit { hot, reads: reads(target, hot) });
+                                    steps.push(Step::Exit { hot, reads: reads(ids[b], target, hot) });
                                 }
                             }
                         }
@@ -2714,6 +2772,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if block.promoted.is_empty() { String::new() } else {
                 format!(", promoted {}", block.promoted.iter().map(|(pc, value)| format!("pc {pc} = {value}")).collect::<Vec<_>>().join(", "))
             }, alloc.cache());
+        // See `BLOCK_COUNTS`.
+        #[cfg(feature = "block_counts")]
+        {
+            let counter = &BLOCK_COUNTS[0][id.0] as *const _ as i64;
+            dynasm!(ops
+                ; .arch x64
+                ; push rax
+                ; mov rax, QWORD counter
+                ; add QWORD [rax], 1
+                ; pop rax
+            );
+        }
 
         // Jump to `target`, or fall through to it if `skip`, transferring the
         // window to the one it is entered with: its planned entry window, dirty where the
@@ -3726,10 +3796,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     //
                     // `select` is always one of the targets: debug builds test
                     // each and trap on anything else, which release builds
-                    // trust, testing only the targets after the first and
-                    // falling through to it.
-                    let tested = if cfg!(debug_assertions) { 0 } else { 1 };
-                    for (i, target) in targets.iter().enumerate().skip(tested) {
+                    // trust, testing every target but the one the heaviest edge
+                    // goes to (Note [Edge counts]) and falling through to it.
+                    let heaviest = (0..targets.len()).min_by_key(|&i| (std::cmp::Reverse(self.jctx.edges.recent(id, targets[i].1)), i)).expect("a Select's targets");
+                    for (i, target) in targets.iter().enumerate().filter(|&(i, _)| cfg!(debug_assertions) || i != heaviest) {
                         #[cfg(feature = "align_selects")]
                         if (self.jctx.region_base + ops.offset().0) % CACHE_LINE + SELECT_TEST > CACHE_LINE {
                             pad(ops, self.jctx.region_base, CACHE_LINE);
@@ -3750,12 +3820,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; ud2
                         );
                     } else {
-                        // The first target is laid out next if it isn't compiled
+                        // The heaviest edge's target is laid out next if it isn't compiled
                         // yet, as a `Jump`'s is: falling through, it needs no jump.
                         debug_assert_eq!(off, block.instructions.len() - 1, "a Select ends its block");
-                        let first = targets[0].1;
-                        emit_jump(ops, &alloc, &first, self.jctx.blocks.get(&first).is_none(), false);
-                        successor = Some(first);
+                        let next = targets[heaviest].1;
+                        emit_jump(ops, &alloc, &next, self.jctx.blocks.get(&next).is_none(), false);
+                        successor = Some(next);
                     }
                 },
                 Residual::GC => {

@@ -141,7 +141,7 @@ VIEWS = {
     'frames_made': ['line', 'pc', 'block', 'by'],
     'jit_bailout': ['reason', 'block_id', 'off', 'source', 'line'],
     'jit_compile': ['block_id', 'source', 'line'],
-    'jit_region': ['root', 'reached', 'selected', 'root_weight'],
+    'jit_region': ['root', 'reached', 'selected', 'root_weight', 'under_1', 'under_10', 'under_25', 'under_50', 'under_100'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),

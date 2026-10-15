@@ -89,6 +89,7 @@ def main():
     ap.add_argument('--blocks-of', help='the samples of what this note names, by block')
     ap.add_argument('--classes', action='store_true', help="the JIT's samples by kind of code, and whether they load or store a stack slot")
     ap.add_argument('--footprint', action='store_true', help="the 64-byte lines holding the JIT's sampled code: how many hold each share of its samples, and the span they cover")
+    ap.add_argument('--coverage', action='store_true', help="the JIT's blocks and code bytes by their samples: how much has none, and how little holds most")
     ap.add_argument('--top', type=int, default=25)
     args = ap.parse_args()
 
@@ -137,6 +138,34 @@ def main():
                 run += lines[line]
                 taken.append(line)
             print(f'  {int(share * 100):3}% of samples: {len(taken):5} lines, spanning {(max(taken) - min(taken) + 1) * 64:7} bytes')
+
+    if args.coverage:
+        # Each block's code bytes and samples: how much of the code compiled ever runs.
+        size = {}
+        for i, (addr, r, _, _) in enumerate(insts):
+            base, length, _ = ranges[r]
+            following = insts[i + 1][0] if i + 1 < len(insts) and insts[i + 1][1] == r else base + length
+            size[i] = following - addr
+        block_bytes, block_samples = Counter(), Counter()
+        for i, (_, r, _, notes) in enumerate(insts):
+            block = next((note for note in notes if note.startswith('block ')), f'(no block, range {r})')
+            block_bytes[block] += size[i]
+            block_samples[block] += counts.get(i, 0)
+        code = sum(block_bytes.values())
+        cold = [b for b in block_bytes if block_samples[b] == 0]
+        print(f'\nJIT code coverage: {len(block_bytes)} blocks, {code} bytes')
+        print(f'  no samples: {len(cold)} blocks, {sum(block_bytes[b] for b in cold)} bytes '
+              f'({100 * sum(block_bytes[b] for b in cold) / code:.1f}%)')
+        hottest = sorted(block_bytes, key=lambda b: -block_samples[b])
+        for share in (0.5, 0.9, 0.99, 0.999):
+            run, taken = 0, []
+            for b in hottest:
+                if run >= share * jit:
+                    break
+                run += block_samples[b]
+                taken.append(b)
+            taken_bytes = sum(block_bytes[b] for b in taken)
+            print(f'  {100 * share:5.1f}% of samples: {len(taken):6} blocks, {taken_bytes:8} bytes ({100 * taken_bytes / code:.1f}%)')
 
     print(f'\nJIT samples by what emitted the code (summed over copies):')
     for k, n in by_kind.most_common(args.top):

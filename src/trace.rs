@@ -33,8 +33,8 @@ use smallvec::SmallVec;
 // Trace register allocation assumes a control-flow graph whose start block has
 // no predecessors, so every loop is entered from outside it at its header, the
 // target of its back edges, and a trace goes through a loop from its entry to
-// its end. A region is compiled from the block whose hotness ran out, which
-// may lie inside a loop: its entry can have predecessors in the region, and
+// its end. A region is compiled from the block an edge compiled (Note [Edge
+// counts]), which may lie inside a loop: its entry can have predecessors in the region, and
 // the loop's own entry, upstream of the entry, isn't in the region at all.
 // Walking the region from its entry would make the edge into the entry the
 // loop's back edge, cutting the loop wherever compilation was triggered.
@@ -65,14 +65,15 @@ pub enum Event {
     Exit(Slots),
 }
 
-/// A block of a region: its events, its hotness (the countdown to
-/// compilation, lower is hotter) and id, which order blocks by frequency, the
-/// bytecode PC it starts at (see Note [Region root]), and whether the
-/// interpreter has entered it (see Note [Most frequent edge]).
+/// A block of a region: its events, its weight (how often it ran recently, the edges into it)
+/// and id, which order blocks by frequency, the weight of each edge to another of the region's
+/// blocks, which orders edges (see Note [Most frequent edge]), the bytecode PC it starts at (see
+/// Note [Region root]), and whether the interpreter has entered it.
 #[derive(Debug, Clone)]
 pub struct Block {
     pub events: Vec<Event>,
-    pub hotness: usize,
+    pub weight: u64,
+    pub weights: SmallVec<[(usize, u64); 2]>,
     pub id: usize,
     pub pc: usize,
     pub ran: bool,
@@ -325,8 +326,7 @@ impl Region {
 
 /// A region's loops: per loop, whether each block is in it, and the slots its
 /// blocks read and write. Code in a loop runs more often than the code around
-/// it, the one measure of frequency that tells a hot region's blocks apart:
-/// their hotness counts down no further than the compile threshold.
+/// it.
 pub struct Loops(Vec<(Vec<bool>, Slots, Slots)>);
 
 impl Loops {
@@ -402,9 +402,10 @@ impl Policy {
 // drop the loop's edge, whose target is placed already, and carry the trace on
 // into the exit however cold, planning the loop end's window for the exit.
 // So every neighbour is compared, and the trace ends when the most frequent
-// one can't extend it: already in a trace, or across a retreating edge. Among
-// equally frequent neighbours, one that can extend the trace comes first, then
-// the lowest id.
+// one can't extend it: already in a trace, or across a retreating edge. Which is
+// most frequent is the edge's weight, how often it ran recently (Note [Edge
+// counts]). Among equally frequent neighbours, one that can extend the trace
+// comes first, then the lowest id.
 //
 // A block the interpreter never entered is a trace of its own. The region
 // compiles it only so that the code reaching it has somewhere to bail out: it
@@ -413,10 +414,15 @@ impl Policy {
 // hasn't run, and its thunk is a hot exit if it turns out to be the way on.
 
 impl Region {
+    /// The weight of the edge from block `from` to block `to`: none if it has none.
+    pub fn edge(&self, from: usize, to: usize) -> u64 {
+        self.blocks[from].weights.iter().find(|&&(target, _)| target == to).map_or(0, |&(_, weight)| weight)
+    }
+
     /// The region's traces, in the order they are allocated.
     pub fn traces(&self, policy: Policy) -> Vec<Vec<usize>> {
         let n = self.blocks.len();
-        let hotter = |b: usize| (self.blocks[b].hotness, self.blocks[b].id);
+        let hotter = |b: usize| (std::cmp::Reverse(self.blocks[b].weight), self.blocks[b].id);
         let mut placed = vec![false; n];
         let mut traces = Vec::new();
         if policy == Policy::SingleBlock {
@@ -440,7 +446,7 @@ impl Region {
                     .iter()
                     .copied()
                     .filter(|&p| !self.is_retreating(p, head))
-                    .min_by_key(|&p| (self.blocks[p].hotness, !prepends(&placed, head, p), self.blocks[p].id))
+                    .min_by_key(|&p| (std::cmp::Reverse(self.edge(p, head)), !prepends(&placed, head, p), self.blocks[p].id))
                     .filter(|&p| prepends(&placed, head, p))
                 {
                     placed[p] = true;
@@ -455,7 +461,7 @@ impl Region {
             while let Some(s) = self.succs[last]
                 .iter()
                 .copied()
-                .min_by_key(|&s| (self.blocks[s].hotness, !extends(&placed, last, s), self.blocks[s].id))
+                .min_by_key(|&s| (std::cmp::Reverse(self.edge(last, s)), !extends(&placed, last, s), self.blocks[s].id))
                 .filter(|&s| extends(&placed, last, s))
             {
                 placed[s] = true;
@@ -473,20 +479,26 @@ mod tests {
     use super::*;
 
     /// A block reading, writing and jumping as `events` say, with hotness 0
-    /// unless `hot` says otherwise, and its index as its id and PC.
+    /// unless `hot` says otherwise (lower is hotter), and its index as its id and PC.
     fn region(blocks: &[&[Event]], hot: &[(usize, usize)]) -> Region {
         region_at(blocks, hot, &(0..blocks.len()).collect::<Vec<_>>(), &(0..blocks.len()).collect::<Vec<_>>())
     }
 
-    /// As `region`, with each block's id and PC.
+    /// As `region`, with each block's id and PC. A block's weight is the higher the hotter it is,
+    /// and an edge's the sum of its blocks': the heaviest edge out of a block goes to its hottest
+    /// successor, and the heaviest into it comes from its hottest predecessor.
     fn region_at(blocks: &[&[Event]], hot: &[(usize, usize)], ids: &[usize], pcs: &[usize]) -> Region {
+        let weight = |b: usize| 1000 - hot.iter().find(|(x, _)| *x == b).map_or(0, |&(_, h)| h) as u64;
         Region::new(
             blocks
                 .iter()
                 .enumerate()
                 .map(|(b, events)| {
-                    let hotness = hot.iter().find(|(x, _)| *x == b).map_or(0, |&(_, h)| h);
-                    Block { events: events.to_vec(), hotness, id: ids[b], pc: pcs[b], ran: true }
+                    let weights = events.iter().filter_map(|event| match *event {
+                        Event::Edge(target) => Some((target, weight(b) + weight(target))),
+                        _ => None,
+                    }).collect();
+                    Block { events: events.to_vec(), weight: weight(b), weights, id: ids[b], pc: pcs[b], ran: true }
                 })
                 .collect(),
         )
@@ -548,15 +560,15 @@ mod tests {
                 assert_eq!(traces.iter().map(|trace| trace[0]).collect::<Vec<_>>(), region.postorder());
             }
             Policy::Unidirectional | Policy::Bidirectional => {
-                let hotness = |b: usize| region.blocks[b].hotness;
+                let edge = |from: usize, to: usize| region.edge(from, to);
                 let ran = |b: usize| region.blocks[b].ran;
                 for (t, trace) in traces.iter().enumerate() {
                     assert!(trace.len() == 1 || trace.iter().all(|&b| ran(b)), "{policy:?}: a block that never ran in a longer trace: {traces:?}");
                     for pair in trace.windows(2) {
                         let (a, b) = (pair[0], pair[1]);
-                        let hottest_succ = region.succs(a).iter().all(|&s| hotness(b) <= hotness(s));
+                        let hottest_succ = region.succs(a).iter().all(|&s| edge(a, b) >= edge(a, s));
                         let hottest_pred =
-                            region.preds[b].iter().all(|&p| region.is_retreating(p, b) || hotness(a) <= hotness(p));
+                            region.preds[b].iter().all(|&p| region.is_retreating(p, b) || edge(a, b) >= edge(p, b));
                         assert!(
                             hottest_succ || (policy == Policy::Bidirectional && hottest_pred),
                             "{policy:?}: {pair:?} doesn't follow the most frequent edge: {traces:?}"
@@ -569,7 +581,7 @@ mod tests {
                         region.succs(last).iter().partition(|&&s| !region.is_retreating(last, s) && trace_of[s] > t && ran(last) && ran(s));
                     for s in open {
                         assert!(
-                            closed.iter().any(|&c| hotness(c) < hotness(s)),
+                            closed.iter().any(|&c| edge(last, c) > edge(last, s)),
                             "{policy:?}: trace {t} could go on to {s}: {traces:?}"
                         );
                     }
@@ -579,7 +591,7 @@ mod tests {
                         let (open, closed): (Vec<usize>, Vec<usize>) = preds.partition(|&p| trace_of[p] > t && ran(p) && ran(head));
                         for p in open {
                             assert!(
-                                closed.iter().any(|&c| hotness(c) < hotness(p)),
+                                closed.iter().any(|&c| edge(c, head) > edge(p, head)),
                                 "{policy:?}: trace {t} could start at {p}: {traces:?}"
                             );
                         }
@@ -697,7 +709,7 @@ mod tests {
 
     #[test]
     fn region_entered_inside_its_loop() {
-        // The region's entry 0, the block whose hotness triggered compilation,
+        // The region's entry 0, the block an edge compiled,
         // is the end of the loop 1 -> 2 -> 0 -> 1, whose header 1 is at the
         // lowest PC and exits to 3. The loop is walked from its header.
         let r = region_at(&[&[R(3), E(1)], &[E(2), E(3)], &[W(3), E(0)], &[]], &[(3, 50)], &[0, 1, 2, 3], &[6, 2, 4, 8]);
@@ -839,7 +851,7 @@ mod tests {
     /// Random regions of up to 9 blocks and 6 slots: every block reachable
     /// through a spanning chain, plus random edges (back edges, self-loops,
     /// critical edges and irreducible cycles among them), random reads,
-    /// writes and flushes, and random hotness and PCs. Every policy's traces uphold
+    /// writes and flushes, and random weights and PCs. Every policy's traces uphold
     /// the invariants, and liveness covers the exact one.
     #[test]
     fn random_regions() {
@@ -861,7 +873,7 @@ mod tests {
                     for _ in 0..rng.below(3) {
                         events.push(Event::Edge(rng.below(n)));
                     }
-                    Block { events, hotness: rng.below(3) * 20, id: b, pc: rng.below(n), ran: rng.below(4) != 0 }
+                    Block { events, weight: rng.below(3) as u64 * 20, weights: SmallVec::new(), id: b, pc: rng.below(n), ran: rng.below(4) != 0 }
                 })
                 .collect();
             // The spanning tree: every block's parent jumps to it somewhere.
@@ -870,6 +882,15 @@ mod tests {
                 let parent = rng.below(b);
                 let at = rng.below(blocks[parent].events.len() + 1);
                 blocks[parent].events.insert(at, Event::Edge(b));
+            }
+            // Each edge's weight, at random.
+            for block in &mut blocks {
+                let targets: Vec<usize> = block.events.iter().filter_map(|event| match *event { Event::Edge(t) => Some(t), _ => None }).collect();
+                for target in targets {
+                    if !block.weights.iter().any(|&(t, _)| t == target) {
+                        block.weights.push((target, rng.below(3) as u64 * 20));
+                    }
+                }
             }
             let r = Region::new(blocks);
             if r.retreating.iter().any(|&(s, h)| !r.dominates(h, s)) {

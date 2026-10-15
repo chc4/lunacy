@@ -7412,14 +7412,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             #[cfg(feature = "jit")]
             if off == 0 && state.gas > 0 {
                 let recent = self.jctx.edges.count(from, id, count_by);
+                // Only an edge where a region should start compiles one: a loop's back edge, into
+                // a function or back into one, or after JIT code exits. See Note [Edge counts].
+                let starts = count_by > 1 || {
+                    let (source, target) = (&self.blocks[from.0], &self.blocks[id.0]);
+                    source.proto != target.proto || target.pc <= source.pc
+                };
                 (from, count_by) = (id, 1);
-                // Counted down as the block is entered, for building traces, to 1: 0 is a block
+                let block = &mut self.blocks[id.0];
+                // Counted down as the block is entered, to 1, for whether it ran: 0 is a block
                 // forced to compile.
                 let hot = block.jit_info.hotness.get();
                 if hot > 1 {
                     block.jit_info.hotness.set(hot - 1);
                 }
-                if block.jit_info.entry.is_some() || hot == 0 || recent >= crate::jit::HOT_EDGE {
+                if block.jit_info.entry.is_some() || hot == 0 || (starts && recent >= crate::jit::HOT_EDGE) {
                     count_by = crate::jit::EXIT_COUNT;
                     if block.jit_info.entry.is_none() {
                         debug!("jit compile {id:?}");
@@ -7489,6 +7496,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // thunk at offset=0, we don't want to jump back to the JIT again.
                     }
                 }
+            }
+            // See `BLOCK_COUNTS`.
+            #[cfg(feature = "block_counts")]
+            if off == 0 {
+                crate::jit::BLOCK_COUNTS[1][id.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             // An error JIT code exited for. See Note [Errors].
             if state.error.is_some() {
