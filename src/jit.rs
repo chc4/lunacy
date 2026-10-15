@@ -306,6 +306,20 @@ impl JitHelper {
     /// hadn't found: the version's code if it has some now, its frame pushed,
     /// else as `dynamic_call`. `ret` names the call, as the residual before it.
     /// See Note [Call sites].
+    /// The code of R(A)'s entry, if R(A) is a Lua function that isn't vararg and its entry has
+    /// some: a `Call` to it is then a `LuaCall` found as it runs. Else 0. See Note [Call sites].
+    pub unsafe extern "C" fn lua_code(spec: *mut (), state: *mut (), a: u16) -> usize {
+        unsafe {
+            let spec = &mut *(spec as *mut Specializer<'static, 'static>);
+            let state = &*(state as *const RunState<'static, 'static>);
+            let owner = crate::forge_owner();
+            match state.vals[state.base + a as usize].unbox() {
+                LValue::LClosure(lclos) if (*lclos.ro(owner).prototype).is_vararg == 0 => spec.lua_entry(owner, &lclos).map_or(0, |code| code as usize),
+                _ => 0,
+            }
+        }
+    }
+
     pub unsafe extern "C" fn lua_call(spec: *mut (), state: *mut (), ret: u64, a: u16, b: u16, c: u16) -> usize {
         unsafe {
             let specializer = &mut *(spec as *mut Specializer<'static, 'static>);
@@ -3070,10 +3084,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; .arch x64
                                 ; jmp >no_code
                                 ; no_code:
-                                // The interpreter runs the version's first residual, as a
-                                // bailout from a block's first one does.
-                                ; mov WORD r12 => RunState.current_off, 0
-                                ; mov rax, QWORD (((-1i32 as u64) << 32 | (version.0 as u64)) as i64)
+                                // The interpreter enters the version, as it enters any block:
+                                // counting its hotness, so a function only JIT code tail calls
+                                // tiers up too.
+                                ; mov rax, QWORD (Location(*version, 0).pack().bits() as i64)
                                 ; mov BYTE r12 => RunState.trap, 1
                                 ; ret
                             );
@@ -3203,7 +3217,74 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         );
                     }
                 },
-                Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize, true),
+                Residual::Call { a, b, c } => {
+                    // A Lua function whose entry has code is called as a `LuaCall` is, its frame
+                    // pushed without an entry (whatever its size: `PushFrame` reads it and nils the
+                    // frame), so inside frames JIT code called too; anything else as a dynamic call.
+                    // See Note [Frame ops].
+                    let packed_ret = Location(BlockId(id.0), off + 1).pack();
+                    let hold = crate::specialize::Count::hold;
+                    let push = frame_op!(PushFrame [true,] (hold(*a), hold(*b), 0u64); *a, *b);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, QWORD spec
+                        ; mov rsi, r12 // state
+                        ; mov edx, *a as i32
+                        ; call extern (JitHelper::lua_code as *const () as usize)
+                        ; test rax, rax
+                        ; jz >dynamic
+                        // The code, under the caller's frame kept as `LuaCall` keeps it.
+                        ; sub rsp, 8
+                        ; push rax
+                    );
+                    jit_note!(self.jctx, ops, "        keep the caller's frame");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; push QWORD r12 => RunState.clos
+                        ; push QWORD r12 => RunState.base
+                        ; push QWORD r12 => RunState.witness_base
+                        ; push QWORD r12 => RunState.witness_top
+                    );
+                    jit_note!(self.jctx, ops, "        PushFrame");
+                    emit_frame_op_owning(ops, &mut self.jctx.stencils, pool, &push, Some(2));
+                    self.jctx.frame_ops.push(push);
+                    jit_note!(self.jctx, ops, "        enter the callee");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; lea rcx, r12 => RunState.vals
+                        ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
+                        ; mov rcx, QWORD r12 => RunState.base
+                        ; lea r13, [rax + rcx * 8]
+                        ; call QWORD [rsp + 32]
+                    );
+                    jit_note!(self.jctx, ops, "        put back the caller's frame, or unwind");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; cmp BYTE r12 => RunState.trap, 0
+                        ; jz >call_returned
+                        ; mov rdi, r12
+                        ; mov rsi, rsp
+                        ; mov rdx, QWORD (packed_ret.bits() as i64)
+                        ; mov rcx, rax
+                        ; call extern (JitHelper::unwind_frame as *const () as usize)
+                        ; add rsp, 48
+                        ; jmp =>exits[depth.get()]
+                        ; call_returned:
+                        ; pop QWORD r12 => RunState.witness_top
+                        ; pop QWORD r12 => RunState.witness_base
+                        ; pop QWORD r12 => RunState.base
+                        ; pop QWORD r12 => RunState.clos
+                        ; add rsp, 16
+                        ; mov r13, QWORD [rsp - 0]
+                        ; jmp >lua_called
+                        ; dynamic:
+                    );
+                    emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize, true);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; lua_called:
+                    );
+                },
                 Residual::ReturnedFrom(from) => {
                     // The call's return value, still in rax, from the `Ret` expected: its
                     // continuation goes on to `off + 2`, else falls through to the thunk for the
