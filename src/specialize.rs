@@ -3765,6 +3765,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return (exists, "exact", None);
         }
         if self.versions_at(owner, subpc, &ctx) >= MAX_VERSIONS {
+            // At the cap, a dead version accepting the context comes before evicting a dead one to
+            // make room for a new one. A version is dead because a contraction left it behind,
+            // retyping what it dropped, so a dead version accepts only contexts that never learned
+            // the old type: reviving it gives up no specialization a new version would have, and
+            // costs a lookup rather than a compile. A live version accepting it may know less than
+            // a new one would, so it doesn't. See Note [Contraction].
+            let versions = self.versions.get(&self.proto).unwrap();
+            let nearest = versions.iter()
+                .filter(|((epc, ectx), block)| *epc == subpc && ectx.same_point(&ctx) && self.unreachable.contains(block) && ectx.accepts(&ctx))
+                .min_by_key(|((_, ectx), block)| (ectx.distance(&ctx), block.0))
+                .map(|((_, ectx), block)| (ectx.clone(), *block));
+            if let Some((ectx, block)) = nearest {
+                ectx.adopt(owner, &ctx);
+                self.unreachable.remove(&block);
+                return (block, "accepting", None);
+            }
             self.evict(owner, subpc, &ctx);
         }
         let versions = self.versions.get(&self.proto).unwrap();

@@ -143,7 +143,9 @@ version-summaries +runs:
         benchmark=${run%:*}; times=${run#*:}
         out=working/versions-$benchmark.txt
         if ! just trace $benchmark $times > $out 2>&1; then echo "$benchmark: its traced run failed"; continue; fi
-        { python3 tools/trace_sql.py "SELECT line, COUNT(*) AS points, SUM(created) AS created, SUM(live) AS live, SUM(unreachable) AS unreachable, MAX(live + unreachable) AS most FROM point_versions GROUP BY line ORDER BY live DESC LIMIT 10"
+        { python3 tools/trace_sql.py "SELECT outcome, COUNT(*) AS jumps FROM spec_version GROUP BY outcome ORDER BY jumps DESC"
+          python3 tools/trace_sql.py "SELECT COUNT(*) AS points, SUM(created) AS created, SUM(live) AS live, SUM(unreachable) AS unreachable FROM point_versions"
+          python3 tools/trace_sql.py "SELECT line, COUNT(*) AS points, SUM(created) AS created, SUM(live) AS live, SUM(unreachable) AS unreachable, MAX(live + unreachable) AS most FROM point_versions GROUP BY line ORDER BY live DESC LIMIT 10"
           python3 tools/trace_sql.py "SELECT line, pc, created, live, unreachable, evicted, forgotten FROM point_versions ORDER BY live + unreachable DESC LIMIT 10"
           python3 tools/trace_sql.py "SELECT inline, pc, created, live, unreachable, evicted, forgotten FROM site_versions ORDER BY live + unreachable DESC LIMIT 15"; } > $out 2>&1
     done
