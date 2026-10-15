@@ -586,7 +586,12 @@ pub enum ResumeArg {
 // witness; its cold path finds the key wherever it is (`href_init_slow`). Exit 0 if the table has
 // the key, where the field's type is guarded (`GuardWitness`), and 1 if not. See Notes [Hash
 // witnesses] and [Field types].
-windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
+//
+// With `MISS`, for a key the table was found without, as an object lacks a method its class
+// has: its hot path finds the table still lacks it, populating the witness with no value, for
+// the `__index` chain after it, and exit 0 is missing the key, 1 having it. See Note [Table
+// metatables].
+windowed!(writes HrefInit, [at: u64, key: u64], [MISS: bool], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -594,9 +599,15 @@ windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table)
     let hit = {
         let tab = tab.rw(owner);
         let epoch = tab.epoch;
-        match tab.hash.get_index_mut(index) {
-            Some((k, value)) if k.boxed().bits() == key => Some((epoch, value as *mut LBoxed<'_, '_>)),
-            _ => None,
+        if MISS {
+            // Safety: the key is a constant's, which outlives the code using it.
+            let lacks = !tab.hash.contains_key(&unsafe { LCanon::from_bits(key) });
+            lacks.then_some((epoch, core::ptr::null_mut()))
+        } else {
+            match tab.hash.get_index_mut(index) {
+                Some((k, value)) if k.boxed().bits() == key => Some((epoch, value as *mut LBoxed<'_, '_>)),
+                _ => None,
+            }
         }
     };
     match hit {
@@ -610,7 +621,8 @@ windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table)
 } cold {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    href_init_slow(owner, state, tab, href, index, key)
+    let found = href_init_slow(owner, state, tab, href, index, key);
+    if MISS { 1 - found } else { found }
 });
 
 // `HrefInit` for a hash key of a userdata, in its `__index` table: exit 0 if that has the key,
@@ -6258,8 +6270,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
             let at = (index as u64) << 8 | href.0 as u64;
+            // A table lacking the key it's chained for expects to: its init's hot path is the
+            // miss.
+            let miss = chained && entry.is_none() && place == Place::Register && receiver == LType::Table;
             let href_init = Residual::ExecWindow(match (place, receiver) {
-                (Place::Register, LType::Table) => Rc::new(HrefInit::new(at, kbits, &[idx])) as Rc<dyn Window>,
+                (Place::Register, LType::Table) if miss => Rc::new(HrefInit::<true>::new(at, kbits, &[idx])) as Rc<dyn Window>,
+                (Place::Register, LType::Table) => Rc::new(HrefInit::<false>::new(at, kbits, &[idx])),
                 (Place::Register, LType::Userdata) => Rc::new(HrefInitIndex::new(at, kbits, &[idx])),
                 (Place::Register, _) => unreachable!("a hash key of a {receiver}"),
                 (Place::Metatable(link), _) => Rc::new(HrefInitAt::<true>::new(at, kbits, link.0, &[])),
@@ -6277,8 +6293,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             let typed = vm.new_block(pc.0);
             let missing_key = vm.new_block(pc.0);
-            vm.blocks[block_id.0].instructions.push(Residual::Select(
-                vec![("has_key", typed), ("missing_key", missing_key)]));
+            // A `MISS` init's exit 0 is missing the key.
+            let targets = if miss { vec![("missing_key", missing_key), ("has_key", typed)] } else { vec![("has_key", typed), ("missing_key", missing_key)] };
+            vm.blocks[block_id.0].instructions.push(Residual::Select(targets));
             if chained {
                 // Its own field is none or nil, which a guard checks where it has the key,
                 // and the chain goes on at its metatable's `__index`, then the key in the

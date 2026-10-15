@@ -15,6 +15,9 @@ import argparse
 import re
 from collections import Counter
 
+# The instruction classes `jit_samples --classes` splits samples by.
+from jit_samples import SLOT, MOVE, TAG
+
 REGION = re.compile(r'^==== region entered at block \d+, function :(\d+) @ \S+, (\d+) bytes')
 # Other committed code (thunk stubs, the shared snapshot code), by its title.
 OTHER = re.compile(r'^==== (.*?)(?: into block \d+)? @ ')
@@ -31,18 +34,29 @@ def main():
     ap.add_argument('--function', help="only the function defined at this line")
     ap.add_argument('--by-pc', action='store_true', help='blocks and bytes per function and pc')
     ap.add_argument('--vs', help="another run's disassembly, to print the differences from")
+    ap.add_argument('--classes', action='store_true', help="bytes by what the instruction is, as jit_samples --classes splits samples: a stack slot's load or store, a move between registers, one with the pinned tag, or anything else; and the kinds of code with the most bytes of moves")
     args = ap.parse_args()
     if args.vs:
         vs(measure(args.vs, args.function), measure(args.disasm, args.function), args.top)
         return
-    by_function, by_block, by_kind, uses, blocks_of, region_total = measure(args.disasm, args.function)
+    by_function, by_block, by_kind, uses, blocks_of, region_total, by_class = measure(args.disasm, args.function)
     report(by_function, by_block, by_kind, uses, blocks_of, region_total, args)
+    if args.classes:
+        total = sum(by_kind.values())
+        print('\nby instruction class:')
+        for c in ['slot', 'move', 'tag', 'rest']:
+            n = sum(v for (k, what), v in by_class.items() if what == c)
+            print(f'  {n:>7} bytes {100 * n / total:5.1f}%  {c}')
+        print('\nmoves, by kind:')
+        moves = Counter({k: v for (k, what), v in by_class.items() if what == 'move'})
+        for k, n in moves.most_common(args.top):
+            print(f'  {n:>7} bytes {100 * n / total:5.1f}%  {k}')
 
 
 def measure(path, only):
     """Bytes by function, block, and kind; uses of each kind; each function's blocks; and the
     regions' bytes."""
-    by_function, by_block, by_kind, uses, blocks_of = Counter(), Counter(), Counter(), Counter(), {}
+    by_function, by_block, by_kind, uses, blocks_of, by_class = Counter(), Counter(), Counter(), Counter(), {}, Counter()
     region_total = 0
     function = block = kind = None
     for line in open(path):
@@ -73,10 +87,12 @@ def measure(path, only):
             size = len(m.group(1)) // 2
             by_function[function] += size
             by_kind[kind] += size
+            text = line[m.end():]
+            by_class[(kind, 'slot' if SLOT.search(text) else 'move' if MOVE.search(text) else 'tag' if TAG.search(text) else 'rest')] += size
             if block:
                 by_block[block] += size
                 blocks_of.setdefault(function, set()).add(block[1])
-    return by_function, by_block, by_kind, uses, blocks_of, region_total
+    return by_function, by_block, by_kind, uses, blocks_of, region_total, by_class
 
 
 def per_pc(by_block):
@@ -88,7 +104,7 @@ def per_pc(by_block):
 
 
 def vs(base, this, top):
-    (bf, bb, bk, bu, bbl, _), (tf, tb, tk, tu, tbl, _) = base, this
+    (bf, bb, bk, bu, bbl, _, _), (tf, tb, tk, tu, tbl, _, _) = base, this
     print(f'{sum(bk.values())} -> {sum(tk.values())} bytes of code, '
           f'{sum(len(b) for b in bbl.values())} -> {sum(len(b) for b in tbl.values())} blocks')
     print('\nby function (line):')
