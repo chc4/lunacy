@@ -33,38 +33,27 @@ const INITIAL_HOTNESS: usize = 64;
 
 // Note [Edge counts]
 // ~~~~~~~~~~~~~~~~~~
-// The interpreter counts how often it goes from one block to another. Each edge's count is a
-// counter found by hashing the two blocks (edges that collide share one), and every counter is
-// halved after a fixed number of counts in all, so a count says how often its edge ran recently,
-// relative to the rest of the program, and code that went cold stops looking hot.
+// The interpreter counts how often it goes from one block to another, in hashed counters that
+// are all halved now and then. A count says how often an edge ran recently, relative to the rest.
 //
-// A block without code is compiled when it is entered by an edge that has run `HOT_EDGE` times
-// recently and starts a region where one should start: a loop's back edge (to its function at a PC
-// no later than the edge's own), an edge into a function or back into one, or the entry right after
-// JIT code exits. A forward edge within a function is counted but compiles nothing: the region from
-// the loop header or function entry before it takes it in, so a region doesn't start inside a loop.
-// A block forced to compile (its hotness 0) is compiled when entered, and a block with code is
-// always entered. An entry right after JIT code exits counts `EXIT_COUNT` times over: the code exited
-// because it was compiled without what it went on to, which should be compiled sooner.
+// A block without code compiles once an edge into it has run `HOT_EDGE` times recently, if that
+// edge is where a region should start: a back edge, a call or return, or an entry after a JIT
+// exit. Forward edges inside a function only count, so regions start at loop headers and function
+// entries, never inside a loop. An entry after a JIT exit counts extra, since the code it left
+// was compiled without it.
 //
-// Compiling a region reads the counts of its edges as they are then: which blocks it takes in (Note
-// [Region selection]), which way its traces go (Note [Most frequent edge]), and which way out of a
-// block its code falls through to.
+// A region reads its edges' counts when it compiles, to choose its blocks, its traces and its
+// fall-through jumps.
 
 // Note [Region selection]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
-// A region compiles the blocks that ran recently enough, not all it reaches. A block's weight is
-// the recent count of the edges into it from the blocks the region reaches (Note [Edge counts]);
-// the region's root weighs at least what compiled it. A block is in the region if its weight is
-// at least `REGION_PERCENT` percent of the root's and the blocks in the region reach it. Every
-// jump between the region's blocks is compiled, back edges too: a loop whose body ran is whole,
-// as the body weighs at least what entering it did.
+// A region compiles the blocks it reaches that ran recently enough: those whose incoming edges
+// weigh at least `REGION_PERCENT` percent of its root. It keeps every jump between them, so a
+// loop that ran is compiled whole.
 //
-// A jump out of the region, to a block without code, is a cold edge: it exits to the interpreter
-// at the block, the window stored, which counts its entry as an exit's (so the block compiles
-// sooner, as the root of a region of its own) and, once the block has code, is linked to it as a
-// thunk is, its window moved to the block's (Note [Thunk patching]). A region compiled because
-// it was forced, or with `immediate_jit`, has every block it reaches.
+// A jump to a block outside the region is a cold edge. It exits to the interpreter, which counts
+// the block toward compiling it as a region of its own. Once the block has code the edge is linked
+// to it, as a thunk is. A forced region takes every block it reaches.
 
 /// The least weight of a block in a region, in percent of its root's. See Note [Region
 /// selection].
@@ -3794,10 +3783,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // A taken target's transfer may use rax (`SCRATCH`): the
                     // comparisons only continue on the paths not taken.
                     //
-                    // `select` is always one of the targets: debug builds test
-                    // each and trap on anything else, which release builds
-                    // trust, testing every target but the one the heaviest edge
-                    // goes to (Note [Edge counts]) and falling through to it.
+                    // `select` is always one of the targets. Debug builds test
+                    // each and trap on anything else. Release builds fall
+                    // through to the heaviest edge's target and test the rest.
                     let heaviest = (0..targets.len()).min_by_key(|&i| (std::cmp::Reverse(self.jctx.edges.recent(id, targets[i].1)), i)).expect("a Select's targets");
                     for (i, target) in targets.iter().enumerate().filter(|&(i, _)| cfg!(debug_assertions) || i != heaviest) {
                         #[cfg(feature = "align_selects")]

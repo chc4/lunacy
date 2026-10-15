@@ -2398,15 +2398,11 @@ pub struct Context {
 // carrying one invalidation per backwards edge may drop a single fact from the set at a different
 // position each time, and cause `2^n` combination repeatedly compiling the same loop.
 //
-// Instead the versions of a pc compatible but for their facts (one's types, hash keys and top
-// accepting the other's: LBBV's nearest compatible versions, not only those identical but for
-// their facts) are kept ordered by inclusion, domain by domain (each key of `Known`, and the
-// equalities), each one's knowledge in a domain within the next's, and a context reaching the pc
-// forgets whatever it knows that would break that order: the least it can. So a loop whose first
-// iteration learns a type and a transient fact at once, as a peeled version knowing more of a
-// slot's type and a value class that holds only for the next iteration, forgets the fact against
-// the version before it, and the steady state reuses the peeled version. Forgetting is always sound, since a version relying on less accepts any context knowing
-// more, and n facts of a domain then give at most n + 1 versions for it. Domains are kept apart
+// Instead the versions of a pc whose types and hash keys are compatible are kept ordered by
+// inclusion of their facts, domain by domain. A context reaching the pc forgets the least it must
+// to keep that order, against its nearest compatible versions, as LBBV picks a version. Forgetting
+// is always sound, since a version relying on less accepts any context knowing more, and n facts
+// of a domain then give at most n + 1 versions for it. Domains are kept apart
 // so that facts of one, established and lost on their own schedule, never cost another's: a fact
 // is forgotten in one domain alone, and a class split keeps every fact it had. A join of versions
 // keeps what a version knowing nothing in a domain doesn't know there.
@@ -3765,12 +3761,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             return (exists, "exact", None);
         }
         if self.versions_at(owner, subpc, &ctx) >= MAX_VERSIONS {
-            // At the cap, a dead version accepting the context comes before evicting a dead one to
-            // make room for a new one. A version is dead because a contraction left it behind,
-            // retyping what it dropped, so a dead version accepts only contexts that never learned
-            // the old type: reviving it gives up no specialization a new version would have, and
-            // costs a lookup rather than a compile. A live version accepting it may know less than
-            // a new one would, so it doesn't. See Note [Contraction].
+            // At the cap, revive a dead version that accepts the context before evicting one. A
+            // contraction left it dead by retyping what it knew, so it knows nothing a new version
+            // would. A live version may know less, so it isn't used here. See Note [Contraction].
             let versions = self.versions.get(&self.proto).unwrap();
             let nearest = versions.iter()
                 .filter(|((epc, ectx), block)| *epc == subpc && ectx.same_point(&ctx) && self.unreachable.contains(block) && ectx.accepts(&ctx))

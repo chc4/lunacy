@@ -65,10 +65,9 @@ pub enum Event {
     Exit(Slots),
 }
 
-/// A block of a region: its events, its weight (how often it ran recently, the edges into it)
-/// and id, which order blocks by frequency, the weight of each edge to another of the region's
-/// blocks, which orders edges (see Note [Most frequent edge]), the bytecode PC it starts at (see
-/// Note [Region root]), and whether the interpreter has entered it.
+/// A block of a region. Its weight is how often it ran recently, and each of its edges into the
+/// region has a weight of its own (Note [Most frequent edge]). Its PC finds the region's root
+/// (Note [Region root]).
 #[derive(Debug, Clone)]
 pub struct Block {
     pub events: Vec<Event>,
@@ -402,10 +401,10 @@ impl Policy {
 // drop the loop's edge, whose target is placed already, and carry the trace on
 // into the exit however cold, planning the loop end's window for the exit.
 // So every neighbour is compared, and the trace ends when the most frequent
-// one can't extend it: already in a trace, or across a retreating edge. Which is
-// most frequent is the edge's weight, how often it ran recently (Note [Edge
-// counts]). Among equally frequent neighbours, one that can extend the trace
-// comes first, then the lowest id.
+// one can't extend it: already in a trace, or across a retreating edge. An
+// edge's frequency is how often it ran recently (Note [Edge counts]). Among
+// equally frequent neighbours, one that can extend the trace comes first, then
+// the lowest id.
 //
 // A block the interpreter never entered is a trace of its own. The region
 // compiles it only so that the code reaching it has somewhere to bail out: it
