@@ -31,6 +31,63 @@ const INITIAL_HOTNESS: usize = 0;
 #[cfg(not(feature = "immediate_jit"))]
 const INITIAL_HOTNESS: usize = 64;
 
+// Note [Edge counts]
+// ~~~~~~~~~~~~~~~~~~
+// The interpreter counts how often it goes from one block to another. Each edge's count is a
+// counter found by hashing the two blocks (edges that collide share one), and every counter is
+// halved after a fixed number of counts in all, so a count says how often its edge ran recently,
+// relative to the rest of the program, and code that went cold stops looking hot.
+//
+// A block without code is compiled when it is entered by an edge that has run `HOT_EDGE` times
+// recently, or when it is forced to compile (its hotness 0). A block with code is always entered.
+// An entry right after JIT code exits counts `EXIT_COUNT` times over: the code exited because it
+// was compiled without what it went on to, which should be compiled sooner.
+
+/// The counters of `Edges`: a power of two.
+const EDGES: usize = 1 << 16;
+/// The counts in all after which every counter is halved. See Note [Edge counts].
+const EDGE_DECAY: u32 = 1 << 16;
+/// The recent count of an edge entering a block without code that compiles it. See Note [Edge
+/// counts].
+pub const HOT_EDGE: u16 = 64;
+/// How many times an entry right after JIT code exits counts. See Note [Edge counts].
+pub const EXIT_COUNT: u16 = 4;
+
+/// How often the interpreter went from one block to another, recently. See Note [Edge counts].
+pub struct Edges {
+    counts: Box<[u16]>,
+    /// Counts since the counters were last halved.
+    since: u32,
+}
+
+impl Edges {
+    fn new() -> Self {
+        Edges { counts: vec![0; EDGES].into_boxed_slice(), since: 0 }
+    }
+
+    /// The counter of the edge from `from` to `to`.
+    fn index(from: BlockId, to: BlockId) -> usize {
+        let mut hash = (from.0 as u64) << 32 | to.0 as u64;
+        hash ^= hash >> 23;
+        hash = hash.wrapping_mul(0x2127599bf4325c37);
+        hash ^= hash >> 47;
+        hash as usize & (EDGES - 1)
+    }
+
+    /// Count the edge from `from` to `to` `by` times, and its recent count.
+    pub fn count(&mut self, from: BlockId, to: BlockId, by: u16) -> u16 {
+        let counter = &mut self.counts[Self::index(from, to)];
+        *counter = counter.saturating_add(by);
+        let recent = *counter;
+        self.since += by as u32;
+        if self.since >= EDGE_DECAY {
+            self.since = 0;
+            self.counts.iter_mut().for_each(|count| *count >>= 1);
+        }
+        recent
+    }
+}
+
 #[derive(Debug)]
 pub struct JitInfo {
     pub buffer: Option<ExecutableBuffer>,
@@ -1175,6 +1232,8 @@ pub struct JitContext {
     /// The JIT entry of each prototype's all-unknown entry block, by the
     /// prototype's address, once it has one. See `JitHelper::dynamic_call`.
     lua_entries: HashMap<usize, JitExec, FxBuildHasher>,
+    /// How often the interpreter went from one block to another. See Note [Edge counts].
+    pub edges: Edges,
     /// The `LuaCall` sites of the region being compiled whose callee's version
     /// has no code yet: the version, and the site's and its call's offsets in
     /// the region. See Note [Call linking].
@@ -1537,6 +1596,7 @@ impl JitContext {
             emitted_colds: HashMap::default(),
             waiting: HashMap::default(),
             lua_entries: HashMap::default(),
+            edges: Edges::new(),
             region_calls: Vec::new(),
             call_waiting: HashMap::default(),
             region_tail_calls: Vec::new(),

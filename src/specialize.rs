@@ -7385,6 +7385,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut Owner, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, FVec<LBoxed<'src, 'intern>>) {
         let mut off: usize = 0;
+        // The block the loop last ran, and how many times over the edge from it to the next counts.
+        // See Note [Edge counts].
+        #[cfg(feature = "jit")]
+        let (mut from, mut count_by) = (id, 1);
         debug!("run");
         // Republish on entry: `state` was moved into this frame (the caller's pointer is now
         // stale) and a JIT block can call a native before the first safepoint. See Note
@@ -7407,10 +7411,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             #[cfg(feature = "jit")]
             if off == 0 && state.gas > 0 {
+                let recent = self.jctx.edges.count(from, id, count_by);
+                (from, count_by) = (id, 1);
+                // Counted down as the block is entered, for building traces, to 1: 0 is a block
+                // forced to compile.
                 let hot = block.jit_info.hotness.get();
-                if hot > 0 {
+                if hot > 1 {
                     block.jit_info.hotness.set(hot - 1);
-                } else {
+                }
+                if block.jit_info.entry.is_some() || hot == 0 || recent >= crate::jit::HOT_EDGE {
+                    count_by = crate::jit::EXIT_COUNT;
                     if block.jit_info.entry.is_none() {
                         debug!("jit compile {id:?}");
                         // As many inlined calls deep as the running frame's code is: the entries

@@ -40,6 +40,8 @@ import subprocess
 import sys
 from collections import defaultdict
 
+import hyperfine_json
+
 HISTORY = 'bench/history.jsonl'
 SIZES = 'bench/jit_sizes.jsonl'
 # A section of committed code in an annotated disassembly, and its bytes.
@@ -119,7 +121,7 @@ def load(path=HISTORY):
 def record(args):
     head, dirty = head_state()
     ref = commit_info(args.ref)[0] if args.ref else None
-    results = json.load(open(args.json))['results']
+    results = hyperfine_json.results(args.json)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
     lines = []
     # (commit, dirty, build) -> padding -> its times, of a run over paddings.
@@ -283,7 +285,7 @@ def attach_times(args):
     lines = load()
     attached = 0
     for path in args.json:
-        for r in json.load(open(path))['results']:
+        for r in hyperfine_json.results(path):
             build = r['command'][len('ref '):] if r['command'].startswith('ref ') else r['command']
             for line in lines:
                 if 'times' not in line and line['build'] == build and line['mean'] == r['mean'] \

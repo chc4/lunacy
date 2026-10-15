@@ -10,10 +10,12 @@ import argparse
 import json
 import statistics
 
+import hyperfine_json
+
 
 def medians(benchmark, times):
-    data = json.load(open(f'working/hyperfine-promote-{benchmark}-{times}.json'))
-    return {r['command']: (statistics.median(r['times']) * 1000, set(r.get('exit_codes', [0]))) for r in data['results']}
+    results = hyperfine_json.results(f'working/hyperfine-promote-{benchmark}-{times}.json')
+    return {r['command']: (statistics.median(r['times']) * 1000, set(r.get('exit_codes', [0]))) for r in results}
 
 
 def main():

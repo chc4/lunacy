@@ -10,6 +10,8 @@ import math
 import sys
 from pathlib import Path
 
+import hyperfine_json
+
 
 def main(paths):
     rows, ratios = [], []
@@ -18,7 +20,7 @@ def main(paths):
         text = Path(path).read_text()
         if not text.strip():
             continue
-        results = json.loads(text)['results']
+        results = hyperfine_json.results(text, text=True)
         if len(results) != 2:
             continue
         base, knob = (r['median'] for r in results)
