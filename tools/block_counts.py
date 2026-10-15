@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 sys.path.insert(0, __import__('os').path.dirname(__file__))
 from jit_samples import read_disasm
 
-BLOCK = re.compile(r'block (\d+) \(pc \d+, function ([^,]+),')
+BLOCK = re.compile(r'block (\d+) \(pc (\d+), function ([^,]+),')
 BUCKETS = [0, 1, 10, 100, 1000, 10000, 100000]
 
 
@@ -23,11 +23,12 @@ def main():
     ap.add_argument('disasm')
     ap.add_argument('counts')
     ap.add_argument('--rare', type=int, default=100, help='executions under which code ran rarely')
+    ap.add_argument('--by-point', action='store_true', help='compiled blocks per function and PC: the points with the most')
     ap.add_argument('--top', type=int, default=15)
     args = ap.parse_args()
 
     ranges, insts = read_disasm(args.disasm)
-    size, function = Counter(), {}
+    size, function, pc = Counter(), {}, {}
     for i, (addr, r, _, notes) in enumerate(insts):
         base, length, _ = ranges[r]
         following = insts[i + 1][0] if i + 1 < len(insts) and insts[i + 1][1] == r else base + length
@@ -35,7 +36,8 @@ def main():
             if m := BLOCK.match(note):
                 block = int(m.group(1))
                 size[block] += following - addr
-                function[block] = m.group(2)
+                pc[block] = int(m.group(2))
+                function[block] = m.group(3)
                 break
     jit, interpreted = Counter(), Counter()
     for line in open(args.counts):
@@ -60,6 +62,16 @@ def main():
     print(f'\nfunctions with the most code run under {args.rare} times in JIT code:')
     for f, n in sorted(rare.items(), key=lambda item: -item[1])[:args.top]:
         print(f'  {n:8} bytes  {f}')
+
+    if args.by_point:
+        # Compiled blocks at each point: versions of it, and subblocks inside them, compiled.
+        points = defaultdict(list)
+        for b in size:
+            points[(function[b], pc[b])].append(b)
+        print(f'\npoints with the most compiled blocks (function, pc: blocks, bytes, JIT executions):')
+        for (f, p), blocks in sorted(points.items(), key=lambda item: -len(item[1]))[:args.top]:
+            print(f'  {f} pc {p}: {len(blocks)} blocks, {sum(size[b] for b in blocks)} bytes, '
+                  f'{sum(jit[b] for b in blocks)} executions')
 
 
 if __name__ == '__main__':
