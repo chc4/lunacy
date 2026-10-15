@@ -6451,10 +6451,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut state = Pin::new(&mut *coro).resume(arg);
             arg = ResumeArg::Start;
             'machine: loop {
-            // What it needs of the frames of the inlined calls the code is in: made, if it may
-            // observe them, or, a frame passed what's up to the top, may lay out code; else their
-            // base moved to, if it may lay out code. A Lua call's thunk, which may yet inline its
-            // callee, makes them only as it lays out a call. See Note [Inlined frames].
+            // Make the inlined calls' frames only as far as this yield needs. Code that observes
+            // a frame needs it made. Code that only runs in it needs just the base moved, unless
+            // the call passed a variable number of arguments. A Lua call's thunk may still inline
+            // its callee, so it makes the frames only when it lays out a call. See Note [Inlined
+            // frames].
             if let CoroutineState::Yielded(yielded) = &state && ctx.inline.iter().any(|frame| frame.made != Made::Yes) {
                 let unpassed = ctx.inline.iter().any(|frame| frame.made == Made::No && frame.b == 0);
                 let deferred = matches!(yielded, YieldOp::Call(CallTarget::Dynamic(a, ..)) if !matches!(ctx.types[*a], CType::NativeFunction(_)));
