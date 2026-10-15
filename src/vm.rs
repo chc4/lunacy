@@ -2360,13 +2360,14 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     /// the top. The new frame starts where the running one's function was, and
     /// returns where it would have; from the outermost frame, which has no slot
     /// for its function, the callee's arguments start at its base. `vararg` is
-    /// whether the running function is vararg. The callee's `max_stack`. See
-    /// Note [Tail calls].
+    /// whether the running function is vararg, and `callee_vararg` whether the
+    /// callee is, if the caller knows. The callee's `max_stack`. See Note [Tail
+    /// calls].
     ///
-    /// Inlined into the window op replacing a frame in JIT code (`TailFrame`).
-    /// See Note [Frame ops].
+    /// Inlined into the window op replacing a frame in JIT code (`TailFrame`),
+    /// which knows its callee. See Note [Frame ops].
     #[inline(always)]
-    pub fn tail_call(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool) -> usize {
+    pub fn tail_call(&mut self, owner: &mut Owner, a: usize, b: usize, closes: bool, vararg: bool, callee_vararg: Option<bool>) -> usize {
         debug_assert_eq!(unsafe { (*self.clos.ro(owner).prototype).is_vararg } != 0, vararg, "a tail call's vararg isn't its function's");
         if closes {
             if !self.upvals.is_empty() {
@@ -2383,7 +2384,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         let count = if b == 0 { self.top - from } else { b };
         let LValue::LClosure(lclos) = self.vals[from].unbox() else { unreachable!("a tail call of what isn't a Lua function") };
         let proto = unsafe { &*lclos.ro(owner).prototype };
-        let (stack, callee_vararg, params, frame) = (proto.max_stack as usize, proto.is_vararg != 0, proto.param_count as usize, proto.frame_size.get());
+        debug_assert!(callee_vararg.is_none_or(|known| known == (proto.is_vararg != 0)), "a tail call's callee_vararg isn't its callee's");
+        let callee_vararg = callee_vararg.unwrap_or(proto.is_vararg != 0);
+        let (stack, params, frame) = (proto.max_stack as usize, proto.param_count as usize, proto.frame_size.get());
         let next_base = match self.callstack.last() {
             // A frame JIT code called is no vararg function's, and its entry isn't there to
             // record a vararg callee's function slot. See Note [Frame ops].

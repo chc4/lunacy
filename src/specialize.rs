@@ -1040,11 +1040,11 @@ windowed!(writes frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A:
 // `tail_call` for a tail call of R(A). `ab` is its `a | b << 16` (as `Count::hold` holds them);
 // `effects` and `callee` the addresses of the running function's effects and the callee's, which
 // the first is joined into (Note [Tail calls]). Closing upvalues if `CLOSES`, from a vararg
-// function if `VARARG`. See Note [Frame ops].
-windowed!(writes frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+// function if `VARARG`, to one if `CALLEE_VARARG`. See Note [Frame ops].
+windowed!(writes frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, VARARG: bool, CALLEE_VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
     unsafe { *(callee as *mut u16) |= *(effects as *const u16) };
-    state.tail_call(owner, a, b, CLOSES, VARARG);
+    state.tail_call(owner, a, b, CLOSES, VARARG, Some(CALLEE_VARARG));
 });
 
 // A `Ret` of R(A) and B (`a` and `b` as `Count::hold` holds them), returning `returns`, the id of
@@ -7629,7 +7629,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // What the tail caller did, the callee's return must tell. See Note
                     // [Tail calls].
                     unsafe { (*callee_effects).set((*callee_effects).get().join((*effects).get())) };
-                    state.tail_call(owner, a as usize, b as usize, closes, vararg);
+                    state.tail_call(owner, a as usize, b as usize, closes, vararg, None);
                     let callee = state.clos.clone();
                     self.set_current(callee.ro(owner).prototype);
                     let block = match entry {

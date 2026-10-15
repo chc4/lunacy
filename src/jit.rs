@@ -3049,11 +3049,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // this code. See Note [Tail calls].
                     let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     let (ab, effects, callee) = (hold(*a) | hold(*b) << 16, *effects as u64, *callee_effects as u64);
-                    let tail = match (*closes, *vararg) {
-                        (false, false) => frame_op!(TailFrame [false, false,] (ab, effects, callee); *a, *b),
-                        (false, true) => frame_op!(TailFrame [false, true,] (ab, effects, callee); *a, *b),
-                        (true, false) => frame_op!(TailFrame [true, false,] (ab, effects, callee); *a, *b),
-                        (true, true) => frame_op!(TailFrame [true, true,] (ab, effects, callee); *a, *b),
+                    // The callee's version is known, and so whether it is vararg.
+                    let callee_vararg = unsafe { (*(self.blocks[version.0].proto as crate::vm::LProto<'src, 'intern>)).is_vararg } != 0;
+                    let tail = match (*closes, *vararg, callee_vararg) {
+                        (false, false, false) => frame_op!(TailFrame [false, false, false,] (ab, effects, callee); *a, *b),
+                        (false, false, true) => frame_op!(TailFrame [false, false, true,] (ab, effects, callee); *a, *b),
+                        (false, true, false) => frame_op!(TailFrame [false, true, false,] (ab, effects, callee); *a, *b),
+                        (false, true, true) => frame_op!(TailFrame [false, true, true,] (ab, effects, callee); *a, *b),
+                        (true, false, false) => frame_op!(TailFrame [true, false, false,] (ab, effects, callee); *a, *b),
+                        (true, false, true) => frame_op!(TailFrame [true, false, true,] (ab, effects, callee); *a, *b),
+                        (true, true, false) => frame_op!(TailFrame [true, true, false,] (ab, effects, callee); *a, *b),
+                        (true, true, true) => frame_op!(TailFrame [true, true, true,] (ab, effects, callee); *a, *b),
                     };
                     jit_note!(self.jctx, ops, "        TailFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &tail);
