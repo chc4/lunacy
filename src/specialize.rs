@@ -51,12 +51,10 @@ impl<'src, 'intern> LValue<'src, 'intern> {
 
     /// Get the CType of an observed value: this may have more precise information, such as
     /// specialized call targets for functions.
-    pub fn ctypeof_(&self) -> CType {
+    pub fn ctypeof_(&self, owner: &Owner) -> CType {
         match self {
             LValue::NClosure(c) => CType::NativeFunction(c.clone()),
-            // Safety: Ok this one is kinda sketchy. We only use CTypes inside Specializer, which
-            // is parameterized over the same pre-transmute lifetimes and thus outlives them.
-            LValue::LClosure(c) => CType::LuaFunction(unsafe { core::mem::transmute(c.clone()) }),
+            LValue::LClosure(c) => CType::LuaFunction(c.ro(owner).prototype.cast()),
             x => CType::Type(x.typeof_()),
         }
 
@@ -1709,16 +1707,8 @@ pub enum CType {
     /// A table, or a userdata (Note [Userdata fields]), with these hash keys.
     Shape(LType, SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
-    LuaFunction(Tc<LClosure<'static, 'static>>),
-}
-
-impl Mark for CType {
-    fn mark(&self, owner: &Owner) {
-        match self {
-            CType::LuaFunction(c) => c.mark(owner),
-            _ => { },
-        }
-    }
+    /// A Lua function of this prototype: what its guards test, so not a GC reference.
+    LuaFunction(LProto<'static, 'static>),
 }
 
 impl CType {
@@ -1786,7 +1776,7 @@ impl std::fmt::Display for CType {
             CType::Number => write!(f, "number"),
             CType::Shape(of, shape) => write!(f, "{}shape({})", if *of == LType::Table { "" } else { "userdata " }, shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
             CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
-            CType::LuaFunction(lclos) => write!(f, "fn({:?})", lclos.as_ptr()),
+            CType::LuaFunction(proto) => write!(f, "fn({:?})", proto),
         }
     }
 }
@@ -2766,19 +2756,6 @@ impl Effects {
 // top. So that the top in memory is right wherever the context doesn't know it,
 // the window op's call stores it too (`SetTop`).
 
-impl Mark for Context {
-    fn mark(&self, owner: &Owner) {
-        for ctype in &self.types {
-            ctype.mark(owner);
-        }
-        for fact in self.values.all_facts() {
-            if let Known::Type(ctype) = fact {
-                ctype.mark(owner);
-            }
-        }
-    }
-}
-
 impl Context {
     /// A context knowing nothing of `slots` slots.
     pub fn new(slots: usize) -> Self {
@@ -3578,22 +3555,8 @@ pub struct Specializer<'src, 'intern> {
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
+    // Contexts hold no GC references: a Lua function's type is its prototype.
     fn mark(&self, owner: &Owner) {
-        for (proto, versions) in &self.versions {
-            for (key, blockid) in versions {
-                let (subpc, context) = key.deref();
-                (*context).mark(owner);
-            }
-        }
-        for types in &self.returns {
-            types.iter().for_each(|ty| ty.mark(owner));
-        }
-        for entries in self.inlined.values() {
-            entries.iter().for_each(|entry| entry.mark(owner));
-        }
-        for continuation in &self.continuations {
-            continuation.caller.mark(owner);
-        }
         for table in self.frozen.values() {
             table.mark(owner);
         }
@@ -5213,7 +5176,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             LValue::Integer(value) => i32::try_from(value).ok(),
             _ => None,
         };
-        Some(ResumeArg::Element(element.bits(), value.ctypeof_(), constant))
+        Some(ResumeArg::Element(element.bits(), value.ctypeof_(owner), constant))
     }
 
     fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
@@ -5372,7 +5335,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // also try to emit a guard to specialize the function value as well. This lets us
             // specialize code like `local print = print; print("xyz");`. Up to MAX_VERSIONS
             // of them: past that, the value is only a function. See Note [Call sites].
-            let idx_ctype = Some(state.vals[state.base + idx].unbox().ctypeof_())
+            let idx_ctype = Some(state.vals[state.base + idx].unbox().ctypeof_(owner))
                 .filter(|ctype| matches!(ctype, CType::NativeFunction(_) | CType::LuaFunction(_)))
                 .filter(|_| identities < MAX_VERSIONS);
             let identities = identities + idx_ctype.is_some() as usize;
@@ -5399,7 +5362,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // much.
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
-            } else if let Some(CType::LuaFunction(lclos)) = &idx_ctype {
+            } else if let Some(&CType::LuaFunction(proto)) = idx_ctype.as_ref() {
                 // Likewise we can do the same thing with statically known Lua functions
                 forced_mut.types[idx] = idx_ctype.clone().unwrap();
                 if let Some(upvalue) = holds {
@@ -5407,7 +5370,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
                 forced_mut.learn_held(idx, field, idx_ctype.clone().unwrap());
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
-                let proto = lclos.ro(owner).prototype.cast();
+                let proto = proto.cast();
                 vm.blocks[block_id.0].instructions.push(Residual::LuaGuard { idx, ptr: proto });
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
@@ -7081,12 +7044,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             });
                             self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckNative::new(nf.get_ptr() as usize, &[slot]))));
                         },
-                        Some(CType::LuaFunction(lclos)) => {
+                        Some(CType::LuaFunction(proto)) => {
                             windowed!(reads CheckLua, [proto: usize], [], |owner, state, base| (value) {
                                 let LValue::LClosure(clos) = value.unbox() else { panic!("fragile information: a Lua function was assumed, {:?} found", value) };
                                 assert_eq!(clos.ro(owner).prototype as usize, proto, "fragile information: another Lua function was assumed");
                             });
-                            let proto = lclos.ro(owner).prototype as usize;
+                            let proto = *proto as usize;
                             self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckLua::new(proto, &[slot]))));
                         },
                         Some(CType::Type(ty)) => {
