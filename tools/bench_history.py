@@ -77,6 +77,24 @@ def head_state():
     return head, dirty
 
 
+def merge(args):
+    """Take another checkout's history (or size history, with --sizes) into this one's: the
+    records of both, each once, in the order they were made."""
+    path = SIZES if args.sizes else HISTORY
+    records, seen = [], set()
+    for source in [path, *args.files]:
+        for record in load(source):
+            key = json.dumps(record, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                records.append(record)
+    records.sort(key=lambda record: record['date'])
+    with open(path, 'w') as f:
+        for record in records:
+            f.write(json.dumps(record, sort_keys=True) + '\n')
+    print(f'{path}: {len(records)} records')
+
+
 def print_state(args):
     head, dirty = head_state()
     print(head, 'dirty' if dirty else 'clean')
@@ -568,6 +586,10 @@ def main():
     r.set_defaults(func=record)
     st = sub.add_parser('state', help="print this checkout's HEAD and whether it's dirty, for $LUNACY_BENCH_STATE")
     st.set_defaults(func=print_state)
+    m = sub.add_parser('merge', help="take other checkouts' history files into this one's")
+    m.add_argument('files', nargs='+')
+    m.add_argument('--sizes', action='store_true', help='the size history, not the times')
+    m.set_defaults(func=merge)
     p = sub.add_parser('report', help='print each benchmark and build, flagging regressions')
     p.add_argument('--strict', action='store_true', help='exit 1 on a regression')
     p.set_defaults(func=report)
