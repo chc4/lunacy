@@ -26,5 +26,6 @@ def v1(r):
         'min': wall['min'], 'max': wall['max'],
     }
     if 'parameters' in r:
-        out['parameters'] = r['parameters']
+        # hyperfine 2 gives each as `{"value": ...}`.
+        out['parameters'] = {k: v['value'] if isinstance(v, dict) else v for k, v in r['parameters'].items()}
     return out

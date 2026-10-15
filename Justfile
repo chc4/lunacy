@@ -1082,7 +1082,7 @@ hyperfine-traces benchmark times='10' policies='streaming,single,unidirectional,
     just _luac {{benchmark}}
     {{SHARED}} cargo build --release --bin bench
     {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
-        "LUNACY_TRACES={policy} ./target/release/bench working/{{benchmark}}.bin {{times}}"
+        "env LUNACY_TRACES={policy} ./target/release/bench working/{{benchmark}}.bin {{times}}"
 # `hyperfine-traces` over the benchmarks lunacy runs, each run enough times for
 # a stable mean. life runs twice: the difference between its 1000 and 5000 runs
 # is the steady-state cost of the code, the rest the upfront cost (compiling).
@@ -1415,7 +1415,7 @@ hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='' feature=''
     fi
     {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown $out.md --export-json $out.json \
         --parameter-list padding {{paddings}} --parameter-list build $builds \
-        "LUNACY_JIT_PADDING={padding} {build} working/{{benchmark}}.bin {{times}}"
+        "env LUNACY_JIT_PADDING={padding} {build} working/{{benchmark}}.bin {{times}}"
     if [ -z "{{feature}}" ]; then
         python3 tools/bench_history.py record $out.json --benchmark {{benchmark}} --arg {{times}} ${ref:+--ref $ref}
     fi
