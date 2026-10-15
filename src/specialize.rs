@@ -1345,6 +1345,9 @@ pub enum CallEntry {
 // residuals that do work, less a credit for each guard the caller's facts can stand for once the
 // callee runs in the caller's context: a guard of a value loaded from an upvalue (Note [Upvalue
 // paths]), and a hash key's guard. A call inlines if what is left is within `MAX_INLINE_COST`.
+// The credit is at most `MAX_INLINE_COST` itself: a method's guards of the receiver its caller
+// already guarded grow with its code, so the credit doesn't bound what inlines, and a large
+// method copied into every call site costs more to compile than it saves.
 
 // Note [Inlined frames]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -1631,7 +1634,7 @@ struct InlineCost {
 
 impl InlineCost {
     fn inlines(self) -> bool {
-        self.cost <= MAX_INLINE_COST + REUSED_GUARD_CREDIT * self.reused
+        self.cost <= MAX_INLINE_COST + (REUSED_GUARD_CREDIT * self.reused).min(MAX_INLINE_COST)
     }
 }
 
