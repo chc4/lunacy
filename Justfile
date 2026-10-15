@@ -41,6 +41,9 @@ test:
     {{SHARED}} cargo test --features "gc_stress gc_sanitize"
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     {{SHARED}} cargo test --test gc_reset_frees
+    # The golden tests with random gas, a new seed each time, which a failure prints to
+    # rerun it with (`just golden-gas <seed>`)
+    just golden-gas
 
 # Copy&patch window stencils (src/window.rs) as the JIT will use them: built
 # in release, so the stencils checked are the ones the JIT copies (a build

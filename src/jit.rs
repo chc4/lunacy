@@ -1093,8 +1093,9 @@ fn splat_owning(ops: &mut Assembler, body: &Body, name: &'static str, captures: 
 }
 
 /// The JIT code buffer's size. `immediate_jit` compiles every block that runs,
-/// each as its own region, so it gets twice as much.
-const JIT_SIZE: usize = 0x1000 * 16 * if cfg!(feature = "immediate_jit") { 2 } else { 1 };
+/// each as its own region, so it gets twice as much; `gas` checks its gas before
+/// every residual, which takes about as much code as the residuals, so 4 times.
+const JIT_SIZE: usize = 0x1000 * 16 * if cfg!(feature = "immediate_jit") { 2 } else { 1 } * if cfg!(feature = "gas") { 4 } else { 1 };
 
 /// The JIT code buffer's size for this run: `LUNACY_JIT_SIZE` bytes, to measure
 /// how much code a program needs past the limit, else `JIT_SIZE`.
@@ -2722,8 +2723,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         emit_window_move(ops, emit, offset.get());
                     }
                 }
+                // Not between an op and the `Branch` or `Select` taking its exit, which JIT code
+                // takes by where it goes, not by `select`, which the interpreter would read.
                 #[cfg(feature = "gas")]
-                emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1), &alloc.stores());
+                if !matches!(res, Residual::Branch { .. } | Residual::Select(_)) {
+                    emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1), &alloc.stores());
+                }
             }
             let call = res;
             if shifted.is_some() {
