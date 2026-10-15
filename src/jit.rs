@@ -1095,7 +1095,7 @@ fn splat_owning(ops: &mut Assembler, body: &Body, name: &'static str, captures: 
 /// The JIT code buffer's size. `immediate_jit` compiles every block that runs,
 /// each as its own region, so it gets twice as much; `gas` checks its gas before
 /// every residual, which takes about as much code as the residuals, so 4 times.
-const JIT_SIZE: usize = 0x1000 * 16 * if cfg!(feature = "immediate_jit") { 2 } else { 1 } * if cfg!(feature = "gas") { 4 } else { 1 };
+const JIT_SIZE: usize = 0x1000 * 256 * if cfg!(feature = "immediate_jit") { 2 } else { 1 } * if cfg!(feature = "gas") { 4 } else { 1 };
 
 /// The JIT code buffer's size for this run: `LUNACY_JIT_SIZE` bytes, to measure
 /// how much code a program needs past the limit, else `JIT_SIZE`.

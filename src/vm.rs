@@ -2458,7 +2458,9 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         for k in 0..depth {
             let entry = &self.callstack[len - depth + k];
             let Return::Inlined(continuation) = entry.ret else { unreachable!("JIT code entered in an inlined call's frame with no entry for it") };
-            let callee = self.callstack.get(len - depth + k + 1).map_or(self.base, |inner| inner.frame);
+            // The callee's base as its frame was made: the innermost's is below the base the
+            // inlined calls whose frames aren't made moved it past. See Note [Inlined frames].
+            let callee = self.callstack.get(len - depth + k + 1).map_or(self.base - self.shifted, |inner| inner.frame);
             let at = INLINE_KEPT * (depth - 1 - k);
             kept[at..at + INLINE_KEPT].copy_from_slice(&[stack + callee as u64 * 8, continuation, entry.witness_top as u64, entry.witness_frame as u64, entry.frame as u64, entry.clos.0.to_addr() as u64]);
         }
