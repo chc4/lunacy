@@ -1499,6 +1499,12 @@ pub enum Made {
 }
 
 impl InlineFrame {
+    /// Its call's location, which names the inlined call in traces.
+    #[cfg(feature = "tracing")]
+    fn site(&self) -> String {
+        format!("b{}@{}", self.call.0.0, self.call.1)
+    }
+
     /// The residual making the frame from its caller's: nilling it past its arguments, unless code
     /// in it ran already, which nilled its parameters past them (`Enter`).
     fn push(&self) -> Residual {
@@ -4426,6 +4432,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for frame in made.inline.iter_mut().filter(|frame| frame.made != Made::Yes) {
             self.blocks[block.0].instructions.push(frame.push());
             frame.made = Made::Yes;
+            #[cfg(feature = "tracing")]
+            crate::tracing::instant("spec", "frame_made", &[("site", frame.site().as_str().into())]);
         }
         let inside = self.new_block(pc);
         self.blocks[inside.0].cells = made.filled_cells();
@@ -4440,6 +4448,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn enter(&mut self, ctx: &mut Rc<Context>, block: BlockId) {
         for frame in Rc::make_mut(ctx).inline.iter_mut().filter(|frame| frame.made == Made::No) {
             frame.made = Made::Base;
+            #[cfg(feature = "tracing")]
+            crate::tracing::instant("spec", "frame_entered", &[("site", frame.site().as_str().into())]);
             self.blocks[block.0].instructions.push(Residual::Enter(frame.by() as u16));
             for slot in frame.b as usize - 1..frame.stack as usize {
                 self.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::LoadNil::new(&[slot]))));
@@ -5980,7 +5990,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.jctx.frame_grew(outermost as usize, unsafe { (*outermost).frame_size.get() });
         }
         #[cfg(feature = "tracing")]
-        let (_line, _entry, _after) = (self.traced_line(owner), entry.tostring(owner), continuation.rest.pc());
+        let (_line, _entry, _after, _site) = (self.traced_line(owner), entry.tostring(owner), continuation.rest.pc(), entry.inline.last().expect("an inlined call's frame").site());
         let continuation = Rc::new(continuation);
         let pointer = Rc::as_ptr(&continuation);
         self.continuations.push(continuation);
@@ -6002,6 +6012,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.set_current(caller);
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline", &[
+            ("site", _site.as_str().into()),
             ("line", _line.into()),
             ("callee", (unsafe { (*callee).line_defined } as u64).into()),
             ("after", _after.into()),

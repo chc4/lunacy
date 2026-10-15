@@ -134,11 +134,13 @@ VIEWS = {
     'encoding': ['line', 'pc', 'block', 'encoding'],
     'widen': ['line', 'slot', 'block', 'origins', 'queued'],
     'evicted': ['line', 'pc', 'blocks'],
-    'inline': ['line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
+    'inline': ['site', 'line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
     'inline_return': ['line', 'callee', 'after', 'block', 'context'],
     'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'inlines', 'why'],
     'inline_refused': ['line', 'callee', 'call_block', 'reason'],
     'frames_made': ['line', 'pc', 'block', 'by'],
+    'frame_entered': ['site'],
+    'frame_made': ['site'],
     'jit_bailout': ['reason', 'block_id', 'off', 'source', 'line'],
     'jit_compile': ['block_id', 'source', 'line'],
     'jit_region': ['root', 'reached', 'selected', 'root_weight', 'under_1', 'under_10', 'under_25', 'under_50', 'under_100'],
@@ -152,6 +154,7 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return'),
           'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused'),
           'frames_made': ('spec', 'frames_made'),
+          'frame_entered': ('spec', 'frame_entered'), 'frame_made': ('spec', 'frame_made'),
           'jit_bailout': ('jit', 'bailout'), 'jit_compile': ('jit', 'compile'),
           'jit_region': ('jit', 'region')}
 
@@ -165,6 +168,11 @@ def connect(trace):
         tp.query(f"CREATE PERFETTO VIEW {view} AS SELECT ts, {extracted} FROM slice "
                  f"WHERE category = '{category}' AND name = '{name}'")
     fates(tp)
+    # Each inlined call (its site): whether its frame was entered (the base moved) or made.
+    tp.query("CREATE PERFETTO VIEW inline_frames AS SELECT i.site, i.callee, "
+             "EXISTS (SELECT 1 FROM frame_entered e WHERE e.site = i.site) AS entered, "
+             "EXISTS (SELECT 1 FROM frame_made m WHERE m.site = i.site) AS made "
+             "FROM (SELECT DISTINCT site, callee FROM inline) i")
     return tp
 
 
