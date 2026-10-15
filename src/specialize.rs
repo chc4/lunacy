@@ -584,12 +584,7 @@ pub enum ResumeArg {
 // witness; its cold path finds the key wherever it is (`href_init_slow`). Exit 0 if the table has
 // the key, where the field's type is guarded (`GuardWitness`), and 1 if not. See Notes [Hash
 // witnesses] and [Field types].
-//
-// With `MISS`, for a key the table was found without, as an object lacks a method its class
-// has: its hot path finds the table still lacks it, populating the witness with no value, for
-// the `__index` chain after it, and exit 0 is missing the key, 1 having it. See Note [Table
-// metatables].
-windowed!(writes HrefInit, [at: u64, key: u64], [MISS: bool], |owner, state, base| (table) {
+windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -597,15 +592,9 @@ windowed!(writes HrefInit, [at: u64, key: u64], [MISS: bool], |owner, state, bas
     let hit = {
         let tab = tab.rw(owner);
         let epoch = tab.epoch;
-        if MISS {
-            // Safety: the key is a constant's, which outlives the code using it.
-            let lacks = !tab.hash.contains_key(&unsafe { LCanon::from_bits(key) });
-            lacks.then_some((epoch, core::ptr::null_mut()))
-        } else {
-            match tab.hash.get_index_mut(index) {
-                Some((k, value)) if k.boxed().bits() == key => Some((epoch, value as *mut LBoxed<'_, '_>)),
-                _ => None,
-            }
+        match tab.hash.get_index_mut(index) {
+            Some((k, value)) if k.boxed().bits() == key => Some((epoch, value as *mut LBoxed<'_, '_>)),
+            _ => None,
         }
     };
     match hit {
@@ -619,8 +608,7 @@ windowed!(writes HrefInit, [at: u64, key: u64], [MISS: bool], |owner, state, bas
 } cold {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    let found = href_init_slow(owner, state, tab, href, index, key);
-    if MISS { 1 - found } else { found }
+    href_init_slow(owner, state, tab, href, index, key)
 });
 
 // `HrefInit` for a hash key of a userdata, in its `__index` table: exit 0 if that has the key,
@@ -683,6 +671,35 @@ windowed!(writes HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |owner
         None => 1,
     }
 });
+
+/// `HrefInit` for a key the table in R(`idx`) was found without, as an object lacks a method its
+/// class has: an exec, called from JIT code rather than copied into it, as a copy would be a whole
+/// probe of the table. It looks the key up by `hash`, the table's hash of it, worked out as the
+/// residual is made, and finding the table still lacks it, populates the witness with no value,
+/// for the `__index` chain after it. Exit 0 is missing the key, 1 having it. See Notes [Table
+/// metatables] and [Hash witnesses].
+fn href_init_miss(idx: usize, at: u64, key: u64, hash: u64) -> ResidualExec {
+    ResidualExec::new("href_init_miss", Rc::new(move |owner, state| {
+        use indexmap::map::RawEntryApiV1;
+        let (href, index) = (at as u8, (at >> 8) as usize);
+        let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
+        let address = tab.0.to_addr();
+        let lacks = {
+            let tab = tab.ro(owner);
+            tab.hash.raw_entry_v1().index_from_hash(hash, |k| k.boxed().bits() == key).is_none().then_some(tab.epoch)
+        };
+        state.select = match lacks {
+            Some(epoch) => {
+                let hidx = state.witness_base + href as usize;
+                debug_assert!(hidx < state.witness_top, "a witness past its frame's range");
+                state.hash_witnesses[hidx] = HashWitness { epoch, index, value: core::ptr::null_mut(), table: address };
+                0
+            },
+            // It has the key after all: its witness, wherever the key is.
+            None => 1 - href_init_slow(owner, state, tab, href, index, key),
+        };
+    }))
+}
 
 /// `HrefInit`'s cold path: the key isn't at `index`, or the witness's place isn't there yet,
 /// which it makes. Exit 0 if `tab` has the key, populating the witness, and 1 if not.
@@ -6244,14 +6261,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A table lacking the key it's chained for expects to: its init's hot path is the
             // miss.
             let miss = chained && entry.is_none() && place == Place::Register && receiver == LType::Table;
-            let href_init = Residual::ExecWindow(match (place, receiver) {
-                (Place::Register, LType::Table) if miss => Rc::new(HrefInit::<true>::new(at, kbits, &[idx])) as Rc<dyn Window>,
-                (Place::Register, LType::Table) => Rc::new(HrefInit::<false>::new(at, kbits, &[idx])),
+            let href_init = if miss {
+                // Safety: the key is a constant's, which outlives the code using it.
+                let hash = std::hash::BuildHasher::hash_one(&crate::vm::InternedHasher::default(), unsafe { LCanon::from_bits(kbits) });
+                Residual::Exec(href_init_miss(idx, at, kbits, hash))
+            } else { Residual::ExecWindow(match (place, receiver) {
+                (Place::Register, LType::Table) => Rc::new(HrefInit::new(at, kbits, &[idx])) as Rc<dyn Window>,
                 (Place::Register, LType::Userdata) => Rc::new(HrefInitIndex::new(at, kbits, &[idx])),
                 (Place::Register, _) => unreachable!("a hash key of a {receiver}"),
                 (Place::Metatable(link), _) => Rc::new(HrefInitAt::<true>::new(at, kbits, link.0, &[])),
                 (Place::Index(link), _) => Rc::new(HrefInitAt::<false>::new(at, kbits, link.0, &[])),
-            });
+            }) };
             // In place, unless the thunk's JIT code can only be patched to a
             // jump. See Note [Thunk patching].
             if !appends || vm.compiled(block_id) {
