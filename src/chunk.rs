@@ -220,33 +220,6 @@ impl core::hash::Hash for FrameSize {
     fn hash<H: core::hash::Hasher>(&self, _: &mut H) {}
 }
 
-/// The hash witnesses a function's frame takes: one past the highest hash key index its code, and
-/// the code of the calls inlined into it, initializes, growing as that code is specialized. See
-/// Note [Hash witnesses].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct WitnessCount(core::cell::Cell<u16>);
-
-impl WitnessCount {
-    pub fn get(&self) -> usize {
-        self.0.get() as usize
-    }
-
-    /// Grow to at least `count`, whether it grew.
-    pub fn grow(&self, count: usize) -> bool {
-        let count = u16::try_from(count).expect("a witness count in a u16");
-        let grows = count > self.0.get();
-        if grows {
-            self.0.set(count);
-        }
-        grows
-    }
-}
-
-// What a function is, not how many witnesses its frames have grown to.
-impl core::hash::Hash for WitnessCount {
-    fn hash<H: core::hash::Hasher>(&self, _: &mut H) {}
-}
-
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct FunctionBlock<'a, C> {
     pub source: PackedString<'a>,
@@ -256,7 +229,6 @@ pub struct FunctionBlock<'a, C> {
     pub is_vararg: u8,
     pub max_stack: u8,
     pub frame_size: FrameSize,
-    pub witnesses: WitnessCount,
     pub instructions: PackedList<Instruction>,
     pub constants: PackedList<C>,
     pub line_info: PackedList<u32>, // Empty list if stripped
@@ -303,7 +275,6 @@ pub fn function_block(input: &[u8]) -> IResult<&[u8], FunctionBlock<Constant<Pac
         is_vararg,
         max_stack,
         frame_size: FrameSize::new(max_stack),
-        witnesses: WitnessCount::default(),
         instructions,
         constants,
         prototypes,
@@ -361,7 +332,6 @@ impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
             is_vararg,
             max_stack,
             frame_size,
-            witnesses,
             instructions,
             constants,
             prototypes,
@@ -387,7 +357,6 @@ impl<'src> FunctionBlock<'src, Constant<PackedString<'src>>> {
             is_vararg,
             max_stack,
             frame_size,
-            witnesses,
             instructions,
             constants: PackedList { count: const_count, items: const_items },
             prototypes: PackedList { count: proto_count, items: proto_items },

@@ -1726,25 +1726,17 @@ impl Default for HashWitness {
 // Note [Hash witnesses]
 // ~~~~~~~~~~~~~~~~~~~~~
 // A frame's hash witnesses are the region of `hash_witnesses` from its
-// `witness_base` to its `witness_top`, as many as its function's witness count:
-// one past the highest hash key index its code, and the code inlined into it,
-// initializes. Pushing a frame makes its region, past its caller's, so a hash key's
-// `href_init` writes within its region with no check. A call's region starts at the
-// caller's `witness_top`, and a return puts the caller's back.
-//
-// A function's count grows as code using a new hash key is specialized, which only
-// happens in the interpreter, the callstack whole, before that code runs: every live
-// frame whose witnesses are that function's has its region raised to the count then,
-// the running one's and each caller's in its entry. A caller only runs again once the
-// frames above it have returned, so its region may reach theirs.
-//
-// The vector itself never shrinks, so a call never refills it: entries in a region
-// are stale until written, but no frame reads one it hasn't written, as a
+// `witness_base` up; a call's region starts at the caller's `witness_top`,
+// which `href_init` raises past each witness it writes, and a return resets it.
+// The vector itself never shrinks, so a call never refills it: entries above
+// `witness_top` are stale, but no frame reads one it hasn't written, as a
 // function's entry context has no hash keys and a hash key's `href_init` runs
 // before any use of it. An inlined call's frame has its caller's region, and its
 // entry context its caller's hash keys: its code reads and writes the caller's
-// witnesses as the caller's own code would (Note [Inlined calls]), so its hash
-// keys count toward the caller's function's count.
+// witnesses as the caller's own code would (Note [Inlined calls]),
+// and its return leaves `witness_top` where the callee raised it, as the hash keys
+// the callee leaves the caller are past where the caller's top was: a call after
+// it starts past them.
 //
 // A witness holds its entry's index and its value's address while its table is
 // the one it saw, at the epoch it saw: a table's hash part only reallocates or moves an
@@ -1782,17 +1774,9 @@ impl Witnesses {
     /// Make room for `len` witnesses.
     pub fn grow(&mut self, len: usize) {
         if self.vec.len() < len {
-            self.resize(len);
+            self.vec.resize_with(len, HashWitness::default);
+            self.data = self.vec.as_mut_ptr();
         }
-    }
-
-    // Out of line: the frame ops copied into JIT code at every call grow the vector, and it
-    // rarely needs to.
-    #[cold]
-    #[inline(never)]
-    fn resize(&mut self, len: usize) {
-        self.vec.resize_with(len, HashWitness::default);
-        self.data = self.vec.as_mut_ptr();
     }
 }
 
@@ -2042,36 +2026,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         self.lengthen_nilled(end);
     }
 
-    /// Raise the witness range of every live frame whose witnesses are `root`'s, the running one's
-    /// and each caller's in the callstack, to `root`'s witness count: it grew as code using a new
-    /// hash key was specialized. A caller's frame is only run again once the frames above it have
-    /// returned, so its range may reach theirs. See Note [Hash witnesses].
-    pub fn fit_witnesses(&mut self, owner: &Owner, root: *const ()) {
-        debug_assert_eq!(self.jit_depth, 0, "frames JIT code called have no entries to fit");
-        let count = unsafe { (*(root as LProto<'src, 'intern>)).witnesses.get() };
-        // A frame's witnesses are its function's, or for an inlined call's frame (the entry below
-        // it, its caller's, returning to inlining code), its caller's.
-        let mut frame_root: *const () = core::ptr::null();
-        let mut below_inlines = false;
-        for call in self.callstack.iter_mut() {
-            if !below_inlines {
-                frame_root = call.clos.ro(owner).prototype.cast();
-            }
-            if frame_root == root {
-                call.witness_top = call.witness_top.max(call.witness_frame + count);
-            }
-            below_inlines = matches!(call.ret, Return::Inlined(_));
-        }
-        if !below_inlines {
-            frame_root = self.clos.ro(owner).prototype.cast();
-        }
-        if frame_root == root {
-            self.witness_top = self.witness_top.max(self.witness_base + count);
-        }
-        let end = self.callstack.iter().map(|call| call.witness_top).chain([self.witness_top]).fold(0, usize::max);
-        self.hash_witnesses.grow(end);
-    }
-
     /// The most of each live frame's end, the running one's and each caller's in the callstack: its
     /// base plus its function's frame size, or for an inlined call's frame, its `max_stack`, as the
     /// frame of the function inlining it holds whatever it inlines in turn. See Note [Stack frames].
@@ -2154,8 +2108,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         // Start `top` at the end of the callee's register file.
         self.top = next_base + next_stack;
         self.witness_base = self.witness_top;
-        self.witness_top = self.witness_base + proto.witnesses.get();
-        self.hash_witnesses.grow(self.witness_top);
         self.clos = lclos.clone();
         match entry {
             Some(entry) => self.callstack.push(entry),
@@ -2422,8 +2374,7 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         self.base = next_base;
         self.top = end;
         // The running frame's hash witnesses are the callee's to reuse.
-        self.witness_top = self.witness_base + unsafe { (*lclos.ro(owner).prototype).witnesses.get() };
-        self.hash_witnesses.grow(self.witness_top);
+        self.witness_top = self.witness_base;
         self.clos = lclos.clone();
         // The frame's entry records its function's slot if it is vararg. See Note
         // [Vararg frames].
