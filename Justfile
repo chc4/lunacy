@@ -274,6 +274,12 @@ jit-disasm benchmark times='10' features='unsafe':
 jit-code-size benchmark times='10': (jit-disasm benchmark times)
     python3 tools/jit_code_size.py working/jit_disasm.txt
 
+# How often a benchmark's compiled code runs (tools/block_counts.py): its compiled blocks' bytes by
+# how many times each block's code ran, counted exactly (feature `block_counts`), and the functions
+# with the most code that ran rarely. working/block_counts.txt has each block's counts.
+block-counts benchmark times='10': (jit-disasm benchmark times "unsafe block_counts")
+    python3 tools/block_counts.py working/jit_disasm.txt working/block_counts.txt
+
 # `jit-code-size` of each of `runs` (`benchmark:times`, as HYPERFINES has them):
 # each one's in working/jit-code-size-<benchmark>.txt.
 jit-code-sizes +runs:
