@@ -43,6 +43,25 @@ const INITIAL_HOTNESS: usize = 64;
 // An entry right after JIT code exits counts `EXIT_COUNT` times over: the code exited because it
 // was compiled without what it went on to, which should be compiled sooner.
 
+// Note [Region selection]
+// ~~~~~~~~~~~~~~~~~~~~~~~~
+// A region compiles the blocks that ran recently enough, not all it reaches. A block's weight is
+// the recent count of the edges into it from the blocks the region reaches (Note [Edge counts]);
+// the region's root weighs at least what compiled it. A block is in the region if its weight is
+// at least `REGION_PERCENT` percent of the root's and the blocks in the region reach it. Every
+// jump between the region's blocks is compiled, back edges too: a loop whose body ran is whole,
+// as the body weighs at least what entering it did.
+//
+// A jump out of the region, to a block without code, is a cold edge: it exits to the interpreter
+// at the block, the window stored, which counts its entry as an exit's (so the block compiles
+// sooner, as the root of a region of its own) and, once the block has code, is linked to it as a
+// thunk is, its window moved to the block's (Note [Thunk patching]). A region compiled because
+// it was forced, or with `immediate_jit`, has every block it reaches.
+
+/// The least weight of a block in a region, in percent of its root's. See Note [Region
+/// selection].
+const REGION_PERCENT: u32 = 1;
+
 /// The counters of `Edges`: a power of two.
 const EDGES: usize = 1 << 16;
 /// The counts in all after which every counter is halved. See Note [Edge counts].
@@ -72,6 +91,11 @@ impl Edges {
         hash = hash.wrapping_mul(0x2127599bf4325c37);
         hash ^= hash >> 47;
         hash as usize & (EDGES - 1)
+    }
+
+    /// The recent count of the edge from `from` to `to`.
+    fn recent(&self, from: BlockId, to: BlockId) -> u16 {
+        self.counts[Self::index(from, to)]
     }
 
     /// Count the edge from `from` to `to` `by` times, and its recent count.
@@ -1234,6 +1258,12 @@ pub struct JitContext {
     lua_entries: HashMap<usize, JitExec, FxBuildHasher>,
     /// How often the interpreter went from one block to another. See Note [Edge counts].
     pub edges: Edges,
+    /// The blocks of the region being compiled, if it has only some of those it reaches. See
+    /// Note [Region selection].
+    region_set: Option<std::collections::HashSet<BlockId, FxBuildHasher>>,
+    /// The cold edges of the region being compiled: the block each goes to, and its site's
+    /// offset in the region and window, linked as a thunk's. See Note [Region selection].
+    region_edges: Vec<(BlockId, usize, Cache)>,
     /// The `LuaCall` sites of the region being compiled whose callee's version
     /// has no code yet: the version, and the site's and its call's offsets in
     /// the region. See Note [Call linking].
@@ -1336,6 +1366,8 @@ pub struct JitBlock {
 pub struct Pending {
     label: DynamicLabel,
     window: Cache,
+    /// A cold edge's exit, not the block's code. See Note [Region selection].
+    cold: bool,
     /// How many inlined calls deep the jumps to it are, and their frame's offset.
     depth: usize,
     offset: usize,
@@ -1597,6 +1629,8 @@ impl JitContext {
             waiting: HashMap::default(),
             lua_entries: HashMap::default(),
             edges: Edges::new(),
+            region_set: None,
+            region_edges: Vec::new(),
             region_calls: Vec::new(),
             call_waiting: HashMap::default(),
             region_tail_calls: Vec::new(),
@@ -1790,9 +1824,11 @@ impl JitContext {
 impl<'src, 'intern> Specializer<'src, 'intern> {
     /// JIT compile the region entered at `id`, whose code is `depth` inlined calls deep, its frame
     /// `offset` slots past the window's (`offset_past`).
-    pub fn jit_compile(&mut self, id: BlockId, owner: &mut Owner, depth: usize, offset: usize) {
+    pub fn jit_compile(&mut self, id: BlockId, owner: &mut Owner, depth: usize, offset: usize, selects: bool) {
         #[cfg(feature = "tracing")]
         crate::tracing::begin("jit", "compile", &[("block_id", id.0.into())]);
+        // See Note [Region selection].
+        self.jctx.region_set = selects.then(|| self.select_region(id));
         debug!("JIT compiling block {:?}", id);
         window_dump!(self.jctx, "== region entered at block {}", id.0);
         let base = self.jctx.end();
@@ -1917,6 +1953,34 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let successor_pair = successor.and_then(|succ| self.jctx.pending.remove(&succ).map(|pending| (succ, pending)));
             let Some((pending_block, pending)) = successor_pair.or_else(|| self.jctx.pending.pop_first()) else { break };
             debug!("pending block {:?} {:?}", pending_block.0, pending.label);
+            if pending.cold {
+                // A cold edge: room for a jump to the block once it has code, else the window
+                // stored and an exit to it. See Note [Region selection].
+                let start = ops.offset();
+                dynasm!(ops
+                    ; =>pending.label
+                );
+                jit_note!(self.jctx, ops, "cold edge into block {}, entered with {}", pending_block.0, pending.window);
+                self.jctx.region_edges.push((pending_block, ops.offset().0, pending.window.clone()));
+                ops.extend(&NOP5);
+                // An exit to the block as any other, not a thunk's: the interpreter enters it,
+                // counting the edge, so it compiles once hot.
+                let stores = WindowAlloc::entering(pending.window.clone()).stores();
+                let counted = window_count!(self.jctx, &mut ops, stores);
+                window_dump!(self.jctx, "cold edge into block {}: exit after {}{counted}", pending_block.0, emits_line(&stores));
+                for emit in stores {
+                    emit_window_move(&mut ops, emit, pending.offset);
+                }
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov rax, QWORD (Location(pending_block, 0).pack().bits() as i64)
+                    ; mov BYTE r12 => RunState.trap, 1
+                    ; jmp =>pool.exits[pending.depth]
+                );
+                self.jctx.reserve(ops.offset().0 - start.0);
+                successor = None;
+                continue;
+            }
             // A loop header starts aligned: its padding reserved first, so the
             // block's pointer is past it.
             #[cfg(feature = "align_loops")]
@@ -2080,6 +2144,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for (block, off, at, window) in std::mem::take(&mut self.jctx.region_sites) {
             self.jctx.thunk_sites.insert((block, off), ThunkSite { at: slab as usize + at, window });
         }
+        for (target, at, window) in std::mem::take(&mut self.jctx.region_edges) {
+            self.jctx.waiting.entry(target).or_default().push(ThunkSite { at: slab as usize + at, window });
+        }
+        self.jctx.region_set = None;
         for (block, off, at, exit, window) in patchables {
             self.jctx.patchable_sites.insert((block, off), (ThunkSite { at: slab as usize + at, window }, slab as usize + exit));
         }
@@ -2239,6 +2307,54 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// The compensation code a patched thunk site jumps to: the transfer from
     /// the thunk's `window` to `target`'s entry window, then a jump into it.
+    /// The blocks of the region compiled from `root`: those reached from it, without code, that ran
+    /// recently enough. See Note [Region selection].
+    fn select_region(&self, root: BlockId) -> std::collections::HashSet<BlockId, FxBuildHasher> {
+        let targets = |block: BlockId| {
+            let residuals = &self.blocks[block.0].instructions;
+            residuals[..runs_to(residuals)].iter().flat_map(jump_targets).collect::<SmallVec<[BlockId; 4]>>()
+        };
+        // Every block the region reaches.
+        let mut reached: std::collections::HashSet<BlockId, FxBuildHasher> = Default::default();
+        reached.insert(root);
+        let mut work = vec![root];
+        while let Some(block) = work.pop() {
+            for target in targets(block) {
+                if !self.jctx.blocks.contains_key(&target) && reached.insert(target) {
+                    work.push(target);
+                }
+            }
+        }
+        let mut weights: HashMap<BlockId, u32, FxBuildHasher> = HashMap::default();
+        for &block in &reached {
+            for target in targets(block) {
+                if reached.contains(&target) {
+                    *weights.entry(target).or_default() += self.jctx.edges.recent(block, target) as u32;
+                }
+            }
+        }
+        let root_weight = weights.get(&root).copied().unwrap_or(0).max(HOT_EDGE as u32);
+        let heavy = |block: &BlockId| weights.get(block).copied().unwrap_or(0) * 100 >= root_weight * REGION_PERCENT;
+        let mut region: std::collections::HashSet<BlockId, FxBuildHasher> = Default::default();
+        region.insert(root);
+        let mut work = vec![root];
+        while let Some(block) = work.pop() {
+            for target in targets(block) {
+                if reached.contains(&target) && heavy(&target) && region.insert(target) {
+                    work.push(target);
+                }
+            }
+        }
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("jit", "region", &[
+            ("root", root.0.into()),
+            ("reached", reached.len().into()),
+            ("selected", region.len().into()),
+            ("root_weight", (root_weight as u64).into()),
+        ]);
+        region
+    }
+
     fn thunk_stub(&mut self, window: &Cache, target: BlockId) -> usize {
         #[cfg(feature = "jit_disasm")]
         let notes = self.jctx.disasm.begin();
@@ -2285,7 +2401,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             for res in &residuals[..runs_to(residuals)] {
                 offset = offset_past(res, offset);
                 for target in jump_targets(res) {
-                    if !self.jctx.blocks.contains_key(&target) && !index.contains_key(&target) {
+                    let selected = self.jctx.region_set.as_ref().is_none_or(|set| set.contains(&target));
+                    if selected && !self.jctx.blocks.contains_key(&target) && !index.contains_key(&target) {
                         index.insert(target, ids.len());
                         ids.push(target);
                         offsets.push(offset);
@@ -2359,7 +2476,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 for target in jump_targets(res) {
                                     events.push(match index.get(&target) {
                                         Some(&i) => Event::Edge(i),
-                                        None => Event::Exit(slots_of(self.jctx.blocks[&target].window.regs())),
+                                        // A block with code, entered with its window, or a cold
+                                        // edge's exit, which stores the window. See Note [Region
+                                        // selection].
+                                        None => Event::Exit(self.jctx.blocks.get(&target).map_or_else(Slots::default, |block| slots_of(block.window.regs()))),
                                     });
                                 }
                             }
@@ -2444,7 +2564,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let reads = |target: BlockId, hot: bool| match self.jctx.blocks.get(&target) {
             Some(done) => slots_of(done.window.regs()),
             None if !hot && !cfg!(feature = "immediate_jit") && self.blocks[target.0].jit_info.hotness.get() >= INITIAL_HOTNESS => Slots::default(),
-            None => plans.get(&target).map_or(live_in[index[&target]], |plan| slots_of(&plan.entry.unpack())),
+            // A cold edge's exit stores the window. See Note [Region selection].
+            None => match index.get(&target) {
+                Some(&at) => plans.get(&target).map_or(live_in[at], |plan| slots_of(&plan.entry.unpack())),
+                None => Slots::default(),
+            },
         };
         let position = |target: BlockId| trace.iter().position(|&t| ids[t] == target);
         let mut steps = Vec::new();
@@ -2618,7 +2742,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // The block could already be pending from another block in this assembler
                 // set. Use it if it already exists, otherwise create a new label for our
                 // relocation.
+                let cold = self.jctx.region_set.as_ref().is_some_and(|set| !set.contains(target));
                 let pending = self.jctx.pending.entry(*target).or_insert_with(|| Pending {
+                    cold,
                     depth: depth.get(),
                     offset: offset.get(),
                     label: ops.new_dynamic_label(),

@@ -141,6 +141,7 @@ VIEWS = {
     'frames_made': ['line', 'pc', 'block', 'by'],
     'jit_bailout': ['reason', 'block_id', 'off', 'source', 'line'],
     'jit_compile': ['block_id', 'source', 'line'],
+    'jit_region': ['root', 'reached', 'selected', 'root_weight'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
@@ -151,7 +152,8 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return'),
           'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused'),
           'frames_made': ('spec', 'frames_made'),
-          'jit_bailout': ('jit', 'bailout'), 'jit_compile': ('jit', 'compile')}
+          'jit_bailout': ('jit', 'bailout'), 'jit_compile': ('jit', 'compile'),
+          'jit_region': ('jit', 'region')}
 
 
 def connect(trace):

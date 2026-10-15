@@ -7428,7 +7428,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // calls].
                         let depth = state.callstack.iter().rev().take_while(|entry| entry.returns_to().is_none()).count();
                         let offset = state.callstack.len().checked_sub(depth).filter(|_| depth > 0).map_or(state.shifted, |outer| state.base - state.callstack[outer].frame);
-                        self.jit_compile(id, owner, depth, offset);
+                        // A forced region, or every block's with `immediate_jit`, has every block it
+                        // reaches. See Note [Region selection].
+                        self.jit_compile(id, owner, depth, offset, hot != 0 && !cfg!(feature = "immediate_jit"));
                     }
 
                     let mut jit_entry = self.blocks[id.0].jit_info.entry.unwrap();
