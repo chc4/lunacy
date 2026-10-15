@@ -739,17 +739,22 @@ gdb-unsafe benchmark: unsafe-compile
 # lunacy's release and unsafe builds against LuaJIT, its interpreter alone
 # (-joff) and with its JIT, into the benchmark history (tools/bench_history.py).
 hyperfine benchmark times='10': unsafe-compile
+    {{SHARED}} cargo build --release --bin bench
+    just _hyperfine {{benchmark}} {{times}} target
+
+# `hyperfine` of the release and unsafe benches in `bins` (its `release/bench` and
+# `unsafe/bench`), built already.
+_hyperfine benchmark times bins:
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
-    {{SHARED}} cargo build --release --bin bench
     # A build whose run fails (e.g. past the JIT buffer's end) is still timed,
     # and left out of the history for its exit code.
     {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
         -n "luajit -joff" "luajit -joff bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
         -n luajit "luajit bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
-        -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
-        -n unsafe "./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
+        -n release "./{{bins}}/release/bench working/{{benchmark}}.bin {{times}}" \
+        -n unsafe "./{{bins}}/unsafe/bench working/{{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
 
 # `hyperfine`, with lunacy's interpreter (no JIT), Lua 5.1, Lua 5.5, and Luau
@@ -1243,10 +1248,26 @@ hyperfines-interpreter:
     for run in {{HYPERFINES}}; do just hyperfine-interpreter ${run%:*} ${run#*:}; done
 
 # `hyperfine` over HYPERFINES.
-hyperfines:
+# The benches `hyperfines` and `jit-sizes` time and measure: built once, up front, and copied,
+# with the state of the checkout they were built from (`bench_history.py state`), so the
+# source can be edited while they run.
+BENCH_BINS := "target/bench-snapshot"
+
+_bench-snapshot: unsafe-compile
+    mkdir -p {{BENCH_BINS}}/release {{BENCH_BINS}}/unsafe {{BENCH_BINS}}/jit_disasm
+    python3 tools/bench_history.py state > {{BENCH_BINS}}/state
+    {{SHARED}} cargo build --release --bin bench
+    {{SHARED}} cargo build --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
+        --target-dir target/jit_disasm -Z build-std="core,std,panic_abort"
+    cp target/release/bench {{BENCH_BINS}}/release/bench
+    cp target/unsafe/bench {{BENCH_BINS}}/unsafe/bench
+    cp target/jit_disasm/unsafe/bench {{BENCH_BINS}}/jit_disasm/bench
+
+hyperfines: _bench-snapshot
     #!/usr/bin/env bash
     set -euo pipefail
-    for run in {{HYPERFINES}}; do just hyperfine ${run%:*} ${run#*:}; done
+    export LUNACY_BENCH_STATE={{BENCH_BINS}}/state
+    for run in {{HYPERFINES}}; do just _hyperfine ${run%:*} ${run#*:} {{BENCH_BINS}}; done
     python3 tools/bench_history.py report
 
 # The JIT code size of each benchmark of HYPERFINES run by checkout `dir`
@@ -1255,7 +1276,7 @@ hyperfines:
 # disassembly (as `jit-disasm` makes it), into the size history
 # (tools/bench_history.py record-size). A benchmark whose run fails is left
 # out, its output in working/jit-size-<benchmark>.log.
-_jit-sizes dir ref='':
+_jit-sizes dir ref='' bin='':
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p {{dir}}/working
@@ -1268,9 +1289,13 @@ _jit-sizes dir ref='':
         (cd {{dir}} && just _luac $benchmark > /dev/null)
         [ -f {{dir}}/working/$benchmark.bin ] || mv {{dir}}/$benchmark.bin {{dir}}/working/
         rm -f {{dir}}/working/jit_disasm.txt
-        if (cd {{dir}}/working && {{SHARED}} cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
-                --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- $benchmark.bin $times) \
-                > working/jit-size-$benchmark.log 2>&1; then
+        if [ -n "{{bin}}" ]; then
+            run=({{SHARED}} $PWD/{{bin}})
+        else
+            run=({{SHARED}} cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench
+                --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" --)
+        fi
+        if (cd {{dir}}/working && "${run[@]}" $benchmark.bin $times) > working/jit-size-$benchmark.log 2>&1; then
             python3 tools/bench_history.py record-size {{dir}}/working/jit_disasm.txt --benchmark $benchmark --arg $times {{ if ref == "" { "" } else { "--ref " + ref } }} \
                 || echo "skipped $benchmark $times: no size recorded"
         else
@@ -1280,7 +1305,8 @@ _jit-sizes dir ref='':
 
 # The JIT code size of each benchmark of HYPERFINES, into the size history
 # (see `_jit-sizes`).
-jit-sizes: (_jit-sizes ".")
+jit-sizes: _bench-snapshot
+    LUNACY_BENCH_STATE={{BENCH_BINS}}/state just _jit-sizes . "" {{BENCH_BINS}}/jit_disasm/bench
 
 # Revision `ref`'s JIT code size on each benchmark of HYPERFINES, into the size
 # history (see `_jit-sizes`), from its compare worktree: to fill in commits

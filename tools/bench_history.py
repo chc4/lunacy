@@ -64,11 +64,22 @@ def git(*args):
 
 
 def head_state():
-    """This checkout's HEAD, and whether what builds it differs from it."""
+    """This checkout's HEAD, and whether what builds it differs from it: as of the benches
+    built up front, when $LUNACY_BENCH_STATE names the file `state` wrote then, as the source
+    can change while they run."""
+    if os.environ.get('LUNACY_BENCH_STATE'):
+        with open(os.environ['LUNACY_BENCH_STATE']) as f:
+            head, dirty = f.read().split()
+        return head, dirty == 'dirty'
     head = git('rev-parse', 'HEAD')
     paths = [p for p in BUILD_PATHS if os.path.exists(p)]
     dirty = subprocess.run(['git', 'diff', '--quiet', 'HEAD', '--', *paths]).returncode != 0
     return head, dirty
+
+
+def print_state(args):
+    head, dirty = head_state()
+    print(head, 'dirty' if dirty else 'clean')
 
 
 def commit_info(rev):
@@ -555,6 +566,8 @@ def main():
     r.add_argument('--arg', required=True, help="the benchmark's argument (`times`)")
     r.add_argument('--ref', help="the revision `ref `-prefixed commands were built from")
     r.set_defaults(func=record)
+    st = sub.add_parser('state', help="print this checkout's HEAD and whether it's dirty, for $LUNACY_BENCH_STATE")
+    st.set_defaults(func=print_state)
     p = sub.add_parser('report', help='print each benchmark and build, flagging regressions')
     p.add_argument('--strict', action='store_true', help='exit 1 on a regression')
     p.set_defaults(func=report)
