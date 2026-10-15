@@ -139,6 +139,8 @@ VIEWS = {
     'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'inlines', 'why'],
     'inline_refused': ['line', 'callee', 'call_block', 'reason'],
     'frames_made': ['line', 'pc', 'block', 'by'],
+    'jit_bailout': ['reason', 'block_id', 'off', 'source', 'line'],
+    'jit_compile': ['block_id', 'source', 'line'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
@@ -148,7 +150,8 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'widen': ('spec', 'widen'), 'evicted': ('spec', 'evicted'),
           'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return'),
           'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused'),
-          'frames_made': ('spec', 'frames_made')}
+          'frames_made': ('spec', 'frames_made'),
+          'jit_bailout': ('jit', 'bailout'), 'jit_compile': ('jit', 'compile')}
 
 
 def connect(trace):
