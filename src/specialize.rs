@@ -609,12 +609,12 @@ windowed!(writes HrefInit, [at: u64, key: u64], [MISS: bool], |owner, state, bas
         }
     };
     match hit {
-        Some((epoch, value)) if hidx < state.hash_witnesses.len() => {
-            state.witness_top = state.witness_top.max(hidx + 1);
+        Some((epoch, value)) => {
+            debug_assert!(hidx < state.witness_top, "a witness past its frame's range");
             state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast(), table: address };
             false
         },
-        _ => true,
+        None => true,
     }
 } cold {
     let (href, index) = (at as u8, (at >> 8) as usize);
@@ -669,12 +669,12 @@ windowed!(writes HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |owner
         }
     });
     match hit {
-        Some((epoch, value, address)) if hidx < state.hash_witnesses.len() => {
-            state.witness_top = state.witness_top.max(hidx + 1);
+        Some((epoch, value, address)) => {
+            debug_assert!(hidx < state.witness_top, "a witness past its frame's range");
             state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast(), table: address };
             false
         },
-        _ => true,
+        None => true,
     }
 } cold {
     let (href, index) = (at as u8, (at >> 8) as usize);
@@ -690,8 +690,7 @@ windowed!(writes HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |owner
 /// needn't save the window around the call.
 extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: Tc<Table<'src, 'intern>>, href: u8, index: usize, key: u64) -> usize {
     let hidx = state.witness_base + href as usize;
-    state.hash_witnesses.grow(hidx + 1);
-    state.witness_top = state.witness_top.max(hidx + 1);
+    debug_assert!(hidx < state.witness_top, "a witness past its frame's range");
     // Safety: the key is a constant's, which outlives the code using it.
     let key: LCanon<'src, 'intern> = unsafe { LCanon::from_bits(key) };
     let address = tab.0.to_addr();
@@ -6236,6 +6235,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
             let at = (index as u64) << 8 | href.0 as u64;
+            // The frames whose witnesses the key's are have room for it before its init runs. See
+            // Note [Hash witnesses].
+            let root = ctx_mut.inline.first().map_or(vm.proto, |frame| frame.proto as LProto<'src, 'intern>);
+            if unsafe { (*root).witnesses.grow(href.0 as usize + 1) } {
+                state.fit_witnesses(owner, root.cast());
+            }
             // A table lacking the key it's chained for expects to: its init's hot path is the
             // miss.
             let miss = chained && entry.is_none() && place == Place::Register && receiver == LType::Table;
