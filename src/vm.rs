@@ -1809,6 +1809,8 @@ pub struct RunState<'src, 'intern> {
     /// The run's outermost frame's closure, which has no function's slot to keep it while it calls
     /// from JIT code. See Note [Frame ops].
     pub entry: Tc<LClosure<'src, 'intern>>,
+    /// The open upvalues, one per captured slot, in the order of their slots: a frame's return
+    /// closes those at the end, past its base.
     pub upvals: FVec<(Upvalue<'src, 'intern>, FVec<Tc<Upvalue<'src, 'intern>>>)>,
     pub callstack: FVec<CallstackEntry<'src, 'intern>>,
     pub counters: PerfCounters,
@@ -1915,17 +1917,14 @@ impl<'src, 'intern> RunState<'src, 'intern> {
     pub fn close_upvalues_from(&mut self, owner: &mut Owner, from: usize)
     {
         let vals = &self.vals;
-        self.upvals.retain(|(upval, uses)| {
+        let past = self.upvals.partition_point(|(upval, _)| matches!(upval, Upvalue::Open(idx) if *idx < from));
+        for (upval, uses) in self.upvals.drain(past..) {
             let Upvalue::Open(idx) = upval else { unreachable!("a closed upvalue in the open list") };
-            if *idx < from {
-                return true;
-            }
-            let closed = Tc::new(vals[*idx]);
+            let closed = Tc::new(vals[idx]);
             for up_use in uses.iter() {
                 up_use.replace(owner, Upvalue::Closed(closed.clone()));
             }
-            false
-        });
+        }
     }
 
     #[inline(always)]

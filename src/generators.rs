@@ -2212,12 +2212,15 @@ pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: u
             for &(from, b) in upvalues.iter() {
                 let cell = if from == Opcode::MOVE {
                     let slot = state.base + b;
-                    let open = state.upvals.iter().find(|(upval, _)| matches!(upval, Upvalue::Open(o) if *o == slot));
+                    let open = state.upvals.binary_search_by_key(&slot, |(upval, _)| match upval {
+                        Upvalue::Open(o) => *o,
+                        Upvalue::Closed(_) => unreachable!("a closed upvalue in the open list"),
+                    });
                     match open {
-                        Some((_, uses)) => uses[0].clone(),
-                        None => {
+                        Ok(at) => state.upvals[at].1[0].clone(),
+                        Err(at) => {
                             let cell = Tc::new(Upvalue::Open(slot));
-                            state.upvals.push((Upvalue::Open(slot), vec![cell.clone()].into()));
+                            state.upvals.insert(at, (Upvalue::Open(slot), vec![cell.clone()].into()));
                             cell
                         }
                     }
