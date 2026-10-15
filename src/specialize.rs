@@ -7503,8 +7503,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if state.gas == 0 {
                 let res = &self.blocks[id.0].instructions[off];
                 println!("out of gas at {id:?} {off} {res:?}");
-                println!("out of gas run state: base={:?}", state.base);
+                let base_ptr = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() } as u64;
+                println!("out of gas run state: base={:?}, JIT code's base {:+} slots from it", state.base, (state.gas_base_ptr as i64 - base_ptr as i64) / 8);
                 println!("out of gas return stack: {:?}", state.callstack);
+                state.gas -= 1;
+            } else if state.gas < 0 && state.gas > -200 {
+                // What runs after, to where a run that goes wrong does.
+                let res = &self.blocks[id.0].instructions[off];
+                let end = (state.base + 12).min(state.vals.len());
+                println!("after gas at {id:?} {off} {res:?}");
+                println!("after gas frame at {}: {:?}", state.base, &state.vals[state.base..end]);
                 state.gas -= 1;
             }
             // See `Block::proto`.

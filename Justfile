@@ -422,17 +422,43 @@ gdb-test name gdb_args='' features='': (_luac-test name)
 # `lunacy` with TEST_FEATURES and `gas` of it: a gas-bisect's run just short of
 # going wrong.
 graph-gas source gas:
-    {{SHARED}} cargo build --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy
+    {{SHARED}} cargo build --release --features "gas graph" --bin lunacy
     luac5.1 -o working/gas-bisect.bin {{source}}
     cd working && LUNACY_GAS={{gas}} {{SAMPLED}} ../target/release/lunacy gas-bisect.bin > graph-gas.log 2>&1
 
-# The least gas with which `source`'s run goes wrong, against Lua 5.1's
-# (tools/gas_bisect.py): where JIT code miscompiles, run by the release `lunacy`
-# with TEST_FEATURES (`gas`).
-gas-bisect source signature='':
-    {{SHARED}} cargo build --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy
+# `source`'s JIT code, disassembled and annotated as `jit-disasm` makes it, run by
+# the release `lunacy` with `gas` of it, as `gas-bisect` runs it: the code a run
+# just short of going wrong ran, in working/jit_disasm.txt.
+gas-disasm source gas:
+    {{SHARED}} cargo build --release --features "gas jit_disasm" --bin lunacy --target-dir target/gas_disasm
     luac5.1 -o working/gas-bisect.bin {{source}}
-    {{SAMPLED}} python3 tools/gas_bisect.py working/gas-bisect.bin {{source}} target/release/lunacy --signature "{{signature}}"
+    -cd working && LUNACY_GAS={{gas}} {{SAMPLED}} ../target/gas_disasm/release/lunacy gas-bisect.bin > gas-disasm.log 2>&1
+
+# The last `lines` of `source`'s debug log (RUST_LOG=debug), run by the release
+# `lunacy` with `gas` of it, as `gas-bisect` runs it: the residuals the interpreter
+# ran after the JIT code's gas ran out, to where the run goes wrong. In
+# working/gas-log.txt.
+gas-log source gas lines='400':
+    {{SHARED}} cargo build --release --features gas --bin lunacy
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    -cd working && RUST_LOG=debug LUNACY_GAS={{gas}} {{SAMPLED}} ../target/release/lunacy gas-bisect.bin 2>&1 | tail -n {{lines}} > gas-log.txt
+
+# The least gas with which `source`'s run goes wrong, against `reference`'s
+# (Lua 5.1, or luajit for a program needing `bit`; tools/gas_bisect.py): where
+# JIT code miscompiles, run by the release `lunacy` with `gas`, and none of the
+# test features' checks, which slow a long run past the bisection's limit.
+gas-bisect source signature='' reference='lua5.1':
+    {{SHARED}} cargo build --release --features gas --bin lunacy
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    {{SAMPLED}} python3 tools/gas_bisect.py working/gas-bisect.bin {{source}} target/release/lunacy --signature "{{signature}}" --reference {{reference}}
+
+# Where JIT code stops for each gas in `range` (`from:to[:step]`), as `gas-bisect`
+# runs `source`: the residual, and the frame base the code held against the
+# interpreter's (tools/gas_bisect.py --scan).
+gas-scan source range:
+    {{SHARED}} cargo build --release --features gas --bin lunacy
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    {{SAMPLED}} python3 tools/gas_bisect.py working/gas-bisect.bin {{source}} target/release/lunacy --scan {{range}}
 
 _luac-test name:
     mkdir -p working
@@ -479,9 +505,9 @@ _luauc benchmark:
     mkdir -p working
     { python3 tools/bundle_bench.py {{benchmark}}; printf '\nrun_iter(tonumber((...)))\n'; } > working/{{benchmark}}.luau
 
-run benchmark:
+run benchmark *args:
     just _luac {{benchmark}}
-    time {{SHARED}} cargo run --release --bin bench -- working/{{benchmark}}.bin
+    time {{SHARED}} cargo run --release --bin bench -- working/{{benchmark}}.bin {{args}}
 
 [env("RUST_LOG", "debug")]
 run-debug benchmark:

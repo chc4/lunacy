@@ -4,7 +4,7 @@ Lua 5.1's, or it crashes. Gas (feature `gas`) counts the residuals JIT code runs
 to the interpreter once it is spent (`LUNACY_GAS`), so a run with less gas runs less of the
 JIT's code; the least gas that goes wrong ends just past the JIT code that miscompiles.
 
-    tools/gas_bisect.py BYTECODE SOURCE LUNACY [--max N] [--signature TEXT]
+    tools/gas_bisect.py BYTECODE SOURCE LUNACY [--max N] [--signature TEXT] [--reference LUA]
 
 BYTECODE is SOURCE compiled by luac5.1, LUNACY a `lunacy` binary built with `gas`. A run
 stopped by gas at a point it can't stop at cleanly can fail otherwise: `--signature` counts
@@ -20,7 +20,7 @@ import subprocess
 def output(cmd, env=None):
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
     # lunacy's reports of its run, and of where gas ran out, aren't the program's output.
-    report = ('counters after run', 'out of gas', 'low gas')
+    report = ('counters after run', 'out of gas', 'low gas', 'after gas')
     lines = [l for l in r.stdout.splitlines() if not l.startswith(report)]
     low = [l for l in r.stdout.splitlines() if l.startswith(('out of gas', 'low gas'))]
     return r.returncode, lines, r.stderr, low
@@ -32,9 +32,18 @@ def main():
     ap.add_argument('source')
     ap.add_argument('lunacy')
     ap.add_argument('--max', type=int, default=1 << 40)
+    ap.add_argument('--reference', default='lua5.1', help="the Lua whose output is right: luajit for a program needing `bit`")
+    ap.add_argument('--scan', help="FROM:TO[:STEP]: instead of bisecting, where each gas in the range stops the JIT's code, and its report there (the frame base it held, against the interpreter's)")
     ap.add_argument('--signature', default='', help='only a run whose stderr has this goes wrong: one failure of several')
     args = ap.parse_args()
-    _, expected, _, _ = output(['lua5.1', args.source])
+    if args.scan:
+        lo, hi, *step = (int(x) for x in args.scan.split(':'))
+        for gas in range(lo, hi, step[0] if step else 1):
+            code, _, _, low = output([args.lunacy, args.bytecode], dict(os.environ, LUNACY_GAS=str(gas)))
+            stop = [l for l in low if l.startswith(('out of gas at', 'out of gas run state'))]
+            print(f'gas {gas} (exit {code}): ' + ' | '.join(l[len('out of gas '):][:150] for l in stop))
+        return
+    _, expected, _, _ = output([args.reference, args.source])
 
     def wrong(gas):
         code, lines, err, low = output([args.lunacy, args.bytecode], dict(os.environ, LUNACY_GAS=str(gas), RUST_BACKTRACE='1'))

@@ -1740,8 +1740,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; push rbx
             // The upvalue cells. See Note [Upvalue cells].
             ; sub rsp, (crate::specialize::CELLS * 8) as i32
-            // The initial base_ptr, where the code after an inlined call takes it back from.
-            ; push r13
+            // The initial base_ptr, where the code after an inlined call takes it back from: the
+            // base of the innermost frame made, `offset` slots below the base it's entered with
+            // in inlined calls whose frames aren't made. See Note [Inlined frames].
+            ; lea rax, [r13 - (offset * 8) as i32]
+            ; push rax
         );
         emit_pin(&mut ops);
         // Entered inside inlined calls, the interpreter's entries for them kept as their code
@@ -2604,6 +2607,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 emit_window_move(ops, emit, offset.get());
             }
             dynasm!(ops
+                ; mov QWORD r12 => RunState.gas_base_ptr, r13
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                 ; mov BYTE r12 => RunState.trap, 1
                 ; jmp =>exits[depth.get()]

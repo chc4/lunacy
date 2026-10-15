@@ -1852,6 +1852,9 @@ pub struct RunState<'src, 'intern> {
     /// JIT code called has written, as their calls unwind. See Note [Frame ops].
     pub unwound: usize,
     pub gas: i64,
+    /// The frame base pointer JIT code held where its gas ran out, against the base it left
+    /// for the interpreter (feature `gas`), which the two should agree on.
+    pub gas_base_ptr: u64,
     /// Prototypes whose entry blocks `closure.__jit = ...` asked to compile, for
     /// `Specializer::run` to force (feature `magic`). See `emit_settable`.
     #[cfg(feature = "magic")]
@@ -2804,6 +2807,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 current_off: 0,
                 exit: 0,
                 gas: std::env::var("LUNACY_GAS").ok().and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
+                gas_base_ptr: 0,
                 intern,
                 index_key: LCanon::new(LBoxed::box_lvalue(InternString::intern(intern, "__index")), intern),
                 strings,
