@@ -2116,6 +2116,23 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
+    /// Make the running frame, an inlined call's, the frame of a call returning to `ret`. See Note
+    /// [Sealed inlined calls].
+    pub fn uninline(&mut self, owner: &Owner, ret: PackedLocation) {
+        let entry = self.callstack.last_mut().expect("an inlined call's entry");
+        debug_assert!(matches!(entry.ret, Return::Inlined(_)), "a call's frame made a call's again");
+        entry.ret = Return::To(Location::unpack(ret));
+        self.own_frame(owner);
+    }
+
+    /// Give the running frame what a call's frame has that an inlined call's doesn't: the stack its
+    /// function's frame size long, and hash witnesses of its own. See Note [Sealed inlined calls].
+    pub fn own_frame(&mut self, owner: &Owner) {
+        let frame = unsafe { (*self.clos.ro(owner).prototype).frame_size.get() };
+        self.lengthen_nilled(self.base + frame);
+        self.witness_base = self.witness_top;
+    }
+
     /// The frame of an inlined call of R(A), `callee`, with CALL's B, of a callee whose `max_stack`
     /// is `stack`, made as `push_frame` makes a frame, nilled past its arguments if `fills`, or else
     /// by the JIT code. The stack is already long enough: the frame is within the frame size of the

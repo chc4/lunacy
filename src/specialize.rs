@@ -170,6 +170,7 @@ impl std::fmt::Display for Residual {
             Residual::Ret(..) => write!(f, "ret"),
             Residual::Inline { a, b, .. } => write!(f, "inline({}, {})", a, b),
             Residual::InlineReturn { a, b, .. } => write!(f, "inline_ret({}, {})", a, b),
+            Residual::Uninline { entry, .. } => write!(f, "uninline({})", entry.0),
             Residual::Enter(by) => write!(f, "enter({by})"),
             Residual::Leave(by) => write!(f, "leave({by})"),
             Residual::GC => write!(f, "gc"),
@@ -1258,6 +1259,9 @@ pub enum Residual {
     /// callee's upvalue cells its entry knows hold their values (Note [Upvalue cells]), and whose
     /// returns continue compiling `continuation`. See Note [Inlined calls].
     Inline { a: u16, b: u16, stack: u8, cells: u32, continuation: *const Continuation },
+    /// A sealed inlined call of R(A)'s frame, made, made the frame of a call of its callee's
+    /// version `entry`, which returns to the residual after it. See Note [Sealed inlined calls].
+    Uninline { entry: BlockId, a: u16 },
     /// An inlined callee's RETURN A B, which closes its frame's open upvalues if `closes`: its
     /// results to the call's R(A), `call`, if `moves`, and the caller's frame back. See Note
     /// [Inlined calls].
@@ -1397,6 +1401,25 @@ pub enum CallEntry {
 // block's function runs in, whatever closure is running: an upvalue of a callee whose frame isn't
 // made is loaded through its closure, in its caller's slot below the frame (`CalledUpval`). An upvalue's value
 // a slot also holds is that slot's, so code naming the slot observes nothing.
+
+// Note [Sealed inlined calls]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// An inlined call is sealed once a run of it reaches a return: the thunk laying out its return is
+// forced. Its callee's inlined code is then the blocks that run reached. Sealing assumes later runs
+// follow them closely, and bounds the inlined code to them. A return compiled into the caller's
+// code has no thunk, so a call returning only that way is never sealed.
+//
+// Under a sealed call, an existing inlined version that accepts a context is reused, but no new
+// one is made. A thunk that runs finishes its instruction inline, since its generator is part way
+// through it. At the next pc the code calls its callee's own version there instead, specialized
+// as any version is. The frame is laid out already, so the call keeps it: a frame only entered is
+// called as any Lua call passing it whole, and one made is changed in place into a call's. The
+// callee's context there is what its own code can name, as an entry or a return maps it, with a
+// witness region of its own.
+//
+// The call returns into the code after the call, specialized as after any call. Code that knows
+// its top stays inline, since a call's frame resets it. `LUNACY_NO_SEAL` turns sealing off, to
+// compare.
 
 /// A field's or a global's name, hashed: what a store with a key of that name may change. See
 /// Note [Field facts].
@@ -1552,6 +1575,9 @@ pub struct Continuation {
     /// The places below the call holding each argument's value, by the argument.
     args: Vec<(u8, Root)>,
     rest: Rest,
+    after: After,
+    /// Whether the call is sealed, shared by its copies. See Note [Sealed inlined calls].
+    sealed: Rc<Cell<bool>>,
 }
 
 /// How the code after a call is compiled, from the context its return gives: the next pc's
@@ -1612,6 +1638,19 @@ const _: () = assert!(CELLS <= u32::BITS as usize);
 fn inlining() -> bool {
     static INLINES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUNACY_NO_INLINE").is_none());
     *INLINES
+}
+
+/// Whether `ctx` is the code of a sealed inlined call, which leaves for its callee's own version
+/// at its next pc: unless `LUNACY_NO_SEAL` is set, to compare. See Note [Sealed inlined calls].
+fn sealed(ctx: &Context) -> bool {
+    static SEALS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUNACY_NO_SEAL").is_none());
+    *SEALS && ctx.inline.last().is_some_and(|frame| {
+        // SAFETY: an inlined call's continuation lives as long as the code.
+        !frame.continuation.is_null() && ctx.top.is_none() && {
+            let continuation = unsafe { &*frame.continuation };
+            continuation.sealed.get() && matches!(continuation.after, After::Version(..))
+        }
+    })
 }
 
 /// How many slots past the base of the outermost frame inlining it the frame of code of `ctx` is.
@@ -3832,6 +3871,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.unreachable.remove(&exists);
             return (exists, "exact", None);
         }
+        // A sealed call's code makes no new inlined version. See Note [Sealed inlined calls].
+        if sealed(&ctx) {
+            let accepting = versions.iter()
+                .filter(|((epc, ectx), _)| *epc == subpc && ectx.same_point(&ctx) && ectx.accepts(&ctx))
+                .min_by_key(|((_, ectx), block)| (ectx.distance(&ctx), block.0))
+                .map(|((_, ectx), block)| (ectx.clone(), *block));
+            if let Some((ectx, block)) = accepting {
+                ectx.adopt(owner, &ctx);
+                self.unreachable.remove(&block);
+                return (block, "accepting", None);
+            }
+            let block = self.uninline(owner, pc, &ctx);
+            self.versions.get_mut(&self.proto).unwrap().insert((subpc, ctx), block);
+            return (block, "sealed", None);
+        }
         if self.versions_at(owner, subpc, &ctx) >= MAX_VERSIONS {
             // At the cap, revive a dead version that accepts the context before evicting one. A
             // contraction left it dead by retyping what it knew, so it knows nothing a new version
@@ -4261,6 +4315,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
                 Residual::Select(targets) => targets.iter().map(|(_, target)| *target).collect(),
                 Residual::LuaCall { entry: CallEntry::Block(target), .. } | Residual::TailCall { entry: CallEntry::Block(target), .. } => smallvec::smallvec![*target],
+                Residual::Uninline { entry, .. } => smallvec::smallvec![*entry],
                 _ => SmallVec::new(),
             }
         })
@@ -4629,6 +4684,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 (None, op) => unreachable!("{op:?}"),
             };
             let Some((next, nctx, _, block)) = compiled else { return ctx };
+            // A sealed call's code leaves at its next pc. See Note [Sealed inlined calls].
+            if sealed(&nctx) {
+                let nctx = self.jumping(owner, nctx, next);
+                self.end_block(block);
+                let version = self.version(owner, next, nctx.clone());
+                self.blocks[block.0].instructions.push(Residual::Jump(version));
+                return nctx;
+            }
             (pc, ctx, block_id) = (next, nctx, block);
         }
     }
@@ -5545,6 +5608,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// less what the callee's code may have done to it, with the results' types. See Note [Inlined
     /// calls].
     fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, continuation: &Continuation, a: usize, b: usize) -> BlockId {
+        continuation.sealed.set(true);
         let (known, effects) = self.returned_context(owner, ctx, continuation, a, b);
         let callee = self.proto;
         #[cfg(feature = "tracing")]
@@ -5784,7 +5848,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let decided = vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known)));
                         if decided || makes_iterator(unsafe { &*vm.proto }, pc.0, a) {
                             vm.blocks[block.0].instructions.extend(layout);
-                            let continuation = vm.continuation(&calling, ctx, captured, rest, a, c);
+                            let continuation = vm.continuation(&calling, ctx, captured, rest, &after, a, c);
                             let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation);
                             vm.blocks[block.0].instructions.push(Residual::Jump(shift));
                             return;
@@ -6026,7 +6090,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The code after the inlined call of R(A) with C in `calling`, by the running function: the
     /// context before the call `caller`, less the callee's frame (`captured` its slots below the call
     /// its closures captured), continuing as `rest`. See Note [Inlined calls].
-    fn continuation(&self, calling: &Context, caller: &Context, captured: &Rc<[usize]>, rest: &Rest, a: usize, c: usize) -> Continuation {
+    fn continuation(&self, calling: &Context, caller: &Context, captured: &Rc<[usize]>, rest: &Rest, after: &After, a: usize, c: usize) -> Continuation {
         Continuation {
             proto: self.proto as LProto<'static, 'static>,
             caller: caller.clone(),
@@ -6042,7 +6106,76 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     .map(move |root| ((arg - a - 1) as u8, root))
             }).collect(),
             rest: rest.clone(),
+            after: after.clone(),
+            sealed: Rc::new(Cell::new(false)),
         }
+    }
+
+    /// The block a sealed inlined call's code in `ctx` goes on in at `pc`: its frame made a call's
+    /// of its callee's own version at `pc`, which returns to the code after the call. See Note
+    /// [Sealed inlined calls].
+    fn uninline(&mut self, owner: &mut Owner, pc: Pc, ctx: &Rc<Context>) -> BlockId {
+        let frame = ctx.inline.last().expect("a sealed inlined call's frame").clone();
+        // SAFETY: an inlined call's continuation lives as long as the code.
+        let continuation = unsafe { &*frame.continuation };
+        let entry = self.version(owner, pc, Rc::new(self.standalone(ctx)));
+        // The block is the caller's. Only its first residual runs in the callee's frame, and that
+        // one doesn't use the running function.
+        let Rest::Next(next) = continuation.rest else { unreachable!("a sealed call continuing in its instruction") };
+        let block = self.new_block(next - 1);
+        self.blocks[block.0].proto = continuation.proto as usize;
+        if frame.made == Made::Yes {
+            self.blocks[block.0].instructions.push(Residual::Uninline { entry, a: frame.a });
+        } else {
+            // A frame only entered is called whole, once the frames it is in are made.
+            let entered: usize = ctx.inline.iter().filter(|frame| frame.made != Made::Yes).map(InlineFrame::by).sum();
+            self.blocks[block.0].instructions.push(Residual::Leave(entered as u16));
+            for outer in ctx.inline[..ctx.inline.len() - 1].iter().filter(|frame| frame.made != Made::Yes) {
+                self.blocks[block.0].instructions.push(outer.push());
+            }
+            let callee = self.proto as LProto<'static, 'static>;
+            self.blocks[block.0].instructions.push(Residual::LuaCall {
+                entry: CallEntry::Block(entry), a: frame.a, b: frame.stack as u16 + 1, c: continuation.c, stack: frame.stack, vararg: false, callee,
+            });
+        }
+        // The code after the call, as after any call. The frames it is in are made by then.
+        let made = |ctx: &Context| {
+            let mut ctx = ctx.clone();
+            ctx.inline.iter_mut().for_each(|frame| frame.made = Made::Yes);
+            Rc::new(ctx)
+        };
+        let caller = made(&continuation.caller);
+        let after = match &continuation.after {
+            After::Version(next, ctx) => After::Version(*next, made(ctx)),
+            After::Block(_) => unreachable!("a sealed call continuing at a block"),
+        };
+        let (captured, rest, a, c) = (continuation.captured.clone(), continuation.rest.clone(), continuation.a as usize, continuation.c as usize);
+        let off = self.blocks[block.0].instructions.len();
+        let thunk = self.make_continuation_thunk(block, caller.clone(), captured.clone(), rest.clone(), a, c, after.clone(), None, 0, true);
+        self.blocks[block.0].instructions.push(Residual::Thunk(thunk));
+        self.continuation_sites.insert(Location(block, off), ContinuationSite { ctx: caller, captured, rest, a, c, after });
+        block
+    }
+
+    /// What the code of `ctx`, an inlined call's, knows as its own function's: of what its own code
+    /// names, its frame, its upvalues and the globals. Its hash witnesses start afresh, so it knows
+    /// no hash keys. See Note [Sealed inlined calls].
+    fn standalone(&self, ctx: &Context) -> Context {
+        let slots = ctx.types.len();
+        let mut own = Context::new(slots);
+        own.types = ctx.types.iter().map(|ctype| match ctype {
+            CType::Shape(of, _) => CType::Type(*of),
+            ctype => ctype.clone(),
+        }).collect();
+        own.promoted = ctx.promoted.clone();
+        let upvalues = unsafe { (*self.proto).upval_count };
+        let map: Vec<(Root, Loc)> = (0..slots).map(|slot| Root::Slot(slot as u16))
+            .chain((0..upvalues).map(Root::Upvalue))
+            .chain(ctx.values.roots().filter(|root| matches!(root, Root::Global(_))))
+            .map(|root| (root, Loc::root(root)))
+            .collect();
+        own.values = ctx.closing(0).view(&map);
+        own
     }
 
     /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
@@ -6149,7 +6282,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let mut decided = entry.clone();
                 decided.inline = Vec::new();
                 vm.inlined.entry((vm.proto, call.pc, call.callee as LProto<'_, '_>)).or_default().push(decided);
-                let continuation = vm.continuation(&call.calling, &ctx, &captured, &rest, a, c);
+                let continuation = vm.continuation(&call.calling, &ctx, &captured, &rest, &after, a, c);
                 let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry, continuation);
                 vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
             }
@@ -7808,6 +7941,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 &Residual::Jump(target) | &Residual::PatchableJump(target) => {
                     id = target;
                     off = 0;
+                },
+                &Residual::Uninline { entry, .. } => {
+                    off += 1;
+                    state.uninline(owner, Location(id, off).pack());
+                    id = entry;
+                    off = 0;
+                    continue;
                 },
                 &Residual::Inline { a, b, stack, continuation, .. } => {
                     off += 1;

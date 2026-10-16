@@ -297,6 +297,15 @@ impl JitHelper {
         }
     }
 
+    /// `RunState::own_frame`, of the frame an inlined call's code made a call's. See Note [Sealed
+    /// inlined calls].
+    pub unsafe extern "C" fn own_frame(state: *mut ()) {
+        unsafe {
+            let state = &mut *(state as *mut RunState<'static, 'static>);
+            state.own_frame(crate::forge_owner());
+        }
+    }
+
     /// The entry of the frame of the innermost inlined call JIT code is in, written as it unwinds
     /// a bailout, from what its code keeps on the native stack at `kept` (as `adopt_inlined` lays
     /// it out). See Note [Inlined calls].
@@ -604,6 +613,7 @@ fn offset_past(res: &Residual, offset: usize) -> usize {
     match res {
         Residual::Inline { a, .. } => offset + *a as usize + 1,
         Residual::InlineReturn { call, .. } => offset - (*call as usize + 1),
+        Residual::Uninline { a, .. } => offset - (*a as usize + 1),
         Residual::Enter(by) => offset + *by as usize,
         Residual::Leave(by) => offset - *by as usize,
         _ => offset,
@@ -3750,6 +3760,83 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov r13, QWORD [rsp - 0]
                     );
                     depth.set(depth.get() - 1);
+                    offset.set(offset_past(res, offset.get()));
+                },
+                Residual::Uninline { entry, .. } => {
+                    // `Inline` kept what a call keeps, and the continuation. Without the continuation
+                    // the record is a call's, so the callee's version is called on the frame as it
+                    // is. A version with no code yet is linked once it has some. Until then the
+                    // interpreter changes the frame. See Note [Sealed inlined calls].
+                    let version = *entry;
+                    let code = self.blocks[version.0].jit_info.entry;
+                    let packed_ret = Location(BlockId(id.0), off + 1).pack();
+                    let site = ops.offset().0;
+                    if code.is_none() {
+                        dynasm!(ops
+                            ; .arch x64
+                            ; jmp >uninline_exit
+                        );
+                    }
+                    jit_note!(self.jctx, ops, "        make the frame a call's");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; add rsp, 16
+                        ; mov rdi, r12
+                        ; call extern (JitHelper::own_frame as *const () as usize)
+                        // The stack may have moved.
+                        ; lea rcx, r12 => RunState.vals
+                        ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
+                        ; mov rcx, QWORD r12 => RunState.base
+                        ; lea r13, [rax + rcx * 8]
+                    );
+                    let inlined = depth.get();
+                    depth.set(inlined - 1);
+                    match code {
+                        Some(code) => dynasm!(ops
+                            ; .arch x64
+                            ; call extern (code as usize)
+                        ),
+                        None => {
+                            self.jctx.region_calls.push((version, site, ops.offset().0));
+                            dynasm!(ops
+                                ; .arch x64
+                                ; call >uninline_exit
+                            );
+                        },
+                    }
+                    jit_note!(self.jctx, ops, "        put back the caller's frame, or unwind");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; cmp BYTE r12 => RunState.trap, 0
+                        ; jz >uninline_returned
+                        ; mov rdi, r12
+                        ; mov rsi, rsp
+                        ; mov rdx, QWORD (packed_ret.bits() as i64)
+                        ; mov rcx, rax
+                        ; call extern (JitHelper::unwind_frame as *const () as usize)
+                        ; add rsp, 32
+                        ; jmp =>exits[depth.get()]
+                        ; uninline_returned:
+                        ; pop QWORD r12 => RunState.witness_top
+                        ; pop QWORD r12 => RunState.witness_base
+                        ; pop QWORD r12 => RunState.base
+                        ; pop QWORD r12 => RunState.clos
+                        ; mov r13, QWORD [rsp - 0]
+                    );
+                    if code.is_none() {
+                        dynasm!(ops
+                            ; .arch x64
+                            ; jmp >uninline_done
+                            ; uninline_exit:
+                        );
+                        depth.set(inlined);
+                        emit_bailout(ops, off);
+                        depth.set(inlined - 1);
+                        dynasm!(ops
+                            ; .arch x64
+                            ; uninline_done:
+                        );
+                    }
                     offset.set(offset_past(res, offset.get()));
                 },
                 Residual::Branch { hot, cold } => {
