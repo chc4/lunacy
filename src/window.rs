@@ -369,7 +369,7 @@ impl dyn Window {
         let operands = self.operands().iter().zip(self.accesses()).enumerate();
         let mut w = [LBoxed::NIL; WINDOW];
         for (i, (slot, _)) in operands.clone().filter(|(_, (_, a))| a.reads()) {
-            w[i] = state.vals[state.base + slot];
+            w[i] = state.vals[state.base.wrapping_add(*slot)];
         }
         let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() };
         let before = w;
@@ -379,7 +379,7 @@ impl dyn Window {
             check::check(&*twin, owner, state, base, before, &w);
         }
         for (i, (slot, _)) in operands.filter(|(_, (_, a))| a.writes()) {
-            state.vals[state.base + slot] = w[i];
+            state.vals[state.base.wrapping_add(*slot)] = w[i];
         }
     }
 }
@@ -883,16 +883,16 @@ macro_rules! windowed {
             ) {
                 let at = state.base;
                 let base = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(at).as_ptr() };
-                $( let $in = $crate::window::windowed!(@from_stack $if, state.vals[at + self.operands[$ii]]); )*
-                $( let mut $out = $crate::window::windowed!(@out_from_stack $of, state.vals[at + self.operands[$oi]]); )*
+                $( let $in = $crate::window::windowed!(@from_stack $if, state.vals[at.wrapping_add(self.operands[$ii])]); )*
+                $( let mut $out = $crate::window::windowed!(@out_from_stack $of, state.vals[at.wrapping_add(self.operands[$oi])]); )*
                 let exit = unsafe { Self::__run($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, $($in,)* $(&mut $out,)*) };
-                $( state.vals[at + self.operands[$oi]] = $crate::window::windowed!(@to_stack $of, $out); )*
+                $( state.vals[at.wrapping_add(self.operands[$oi])] = $crate::window::windowed!(@to_stack $of, $out); )*
                 // The cold path's exit, if it takes it.
                 let exit = if exit == $crate::window::TO_COLD {
-                    $( let $in = $crate::window::windowed!(@from_stack $if, state.vals[at + self.operands[$ii]]); )*
-                    $( let mut $out = $crate::window::windowed!(@out_from_stack $of, state.vals[at + self.operands[$oi]]); )*
+                    $( let $in = $crate::window::windowed!(@from_stack $if, state.vals[at.wrapping_add(self.operands[$ii])]); )*
+                    $( let mut $out = $crate::window::windowed!(@out_from_stack $of, state.vals[at.wrapping_add(self.operands[$oi])]); )*
                     let exit = unsafe { Self::__run_cold($(self.$cap,)* owner, state, base, $crate::lboxed::LBoxed::NUMBER_TAG, $($in,)* $(&mut $out,)*) };
-                    $( state.vals[at + self.operands[$oi]] = $crate::window::windowed!(@to_stack $of, $out); )*
+                    $( state.vals[at.wrapping_add(self.operands[$oi])] = $crate::window::windowed!(@to_stack $of, $out); )*
                     exit
                 } else {
                     exit

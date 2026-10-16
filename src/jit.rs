@@ -2500,12 +2500,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         match res {
                             Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[off].is_empty() => {
                                 let operands = w.operands().iter().zip(w.accesses());
-                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot + at)));
+                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot.wrapping_add(at))));
                                 events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot + at)));
                             }
                             Residual::Emit(e) => {
                                 let operands = e.operands().iter().zip(e.accesses());
-                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot + at)));
+                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot.wrapping_add(at))));
                                 events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot + at)));
                             }
                             res if inline_guard(res) => events.push(Event::Read(guarded_slot(res) + at)),

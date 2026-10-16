@@ -180,9 +180,9 @@ impl std::fmt::Display for Residual {
 /// A window op and its operands, as the dumps label it.
 fn window_label(w: &dyn Window) -> String {
     let operands = w.operands().iter().zip(w.accesses()).map(|(slot, access)| match access {
-        Access::Read => format!(", {slot}"),
-        Access::Write => format!(", out {slot}"),
-        Access::Update => format!(", inout {slot}"),
+        Access::Read => format!(", {}", *slot as isize),
+        Access::Write => format!(", out {}", *slot as isize),
+        Access::Update => format!(", inout {}", *slot as isize),
     });
     format!("{}{}", w.name(), operands.collect::<String>())
 }
@@ -1271,6 +1271,11 @@ pub enum CallEntry {
 // passed, as a table's array kind, the caller's places holding it know on the return: the value
 // of each argument is a place of the callee's code (`Root::Arg`) that none of it writes.
 //
+// A caller's slot that one of the callee's upvalues holds is a place of the callee's code too
+// (`Root::Outer`), named by how far below the callee's frame it is. Reading the upvalue is then a
+// move from that slot. A cell may be open onto any such slot, so a set of an upvalue writes them
+// all.
+//
 // The call making a generic for's iterator (`for k, v in f(t) do`) inlines from its first layout,
 // before it has run: the loop is compiled from what the code after it knows, and a function whose
 // loop runs once (its only call making the iterator) has no later call to learn from. Inlined, the
@@ -1644,6 +1649,18 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
     }
     let params = 0..(proto.param_count as usize).min(entry.types.len());
     let fields: Vec<[Label; 1]> = (0..proto.upval_count).map(|n| [Label::Upvalue(n)]).collect();
+    let closed = caller.closing(0);
+    // The caller's slots its upvalues hold, and its own callers'. See Note [Inlined calls].
+    let mut outer: Vec<(u16, Root)> = fields.iter()
+        .flat_map(|path| closed.members(Loc { root: Root::Slot(a as u16), path }))
+        .filter_map(|root| match root {
+            Root::Slot(slot) if slot as usize <= a => Some((a as u16 + 1 - slot, root)),
+            Root::Outer(below) => Some((below + a as u16 + 1, root)),
+            _ => None,
+        })
+        .collect();
+    outer.sort();
+    outer.dedup();
     let map: Vec<(Root, Loc)> = params
         .filter(|&param| entry.types[param] != CType::Type(LType::Nil))
         .map(|param| (Root::Slot(param as u16), Loc::root(Root::Slot((a + 1 + param) as u16))))
@@ -1653,8 +1670,9 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
         // What it learns of the values it was passed, its return gives its caller. See Note [Inlined
         // calls].
         .chain(args.clone().map(|arg| (Root::Arg((arg - a - 1) as u8), Loc::root(Root::Slot(arg as u16)))))
+        .chain(outer.iter().map(|&(below, root)| (Root::Outer(below), Loc::root(root))))
         .collect();
-    entry.values = caller.closing(0).view(&map);
+    entry.values = closed.view(&map);
     entry.inline = caller.inline.iter().cloned().chain([frame]).collect();
     entry
 }
@@ -2803,6 +2821,10 @@ impl Context {
 
     /// Drop what `effect` may falsify. See Notes [Fragile information] and [Upvalue paths].
     fn effect(&mut self, effect: Effect) {
+        // A set of an upvalue may be of a caller's slot. See Note [Inlined calls].
+        if matches!(effect, Effect::SetUpvalue(_) | Effect::AnyUpvalue) {
+            self.values.retain_roots(|root| !matches!(root, Root::Outer(_)));
+        }
         // A set of a sealed cell is of that cell alone. See Note [Upvalue paths].
         if let Effect::SetUpvalue(j) = effect && self.values.sealed(Root::Upvalue(j as u8)) {
             self.values.write(Root::Upvalue(j as u8));
@@ -2892,7 +2914,7 @@ impl Context {
     fn holds(&self, slot: usize) -> Option<u8> {
         self.values.members(Loc::root(Root::Slot(slot as u16))).into_iter().find_map(|root| match root {
             Root::Upvalue(j) => Some(j),
-            Root::Slot(_) | Root::Global(_) | Root::Arg(_) => None,
+            Root::Slot(_) | Root::Global(_) | Root::Arg(_) | Root::Outer(_) => None,
         })
     }
 
@@ -3031,12 +3053,18 @@ impl Context {
         }
     }
 
-    /// A slot holding the running function's upvalue `upvalue`'s value, if known.
-    fn held(&self, upvalue: usize) -> Option<usize> {
-        self.values.members(Loc::root(Root::Upvalue(upvalue as u8))).into_iter().find_map(|root| match root {
-            Root::Slot(slot) => Some(slot as usize),
-            Root::Upvalue(_) | Root::Global(_) | Root::Arg(_) => None,
-        })
+    /// A slot holding the running function's upvalue `upvalue`'s value, if known: one of its own
+    /// frame, else a caller's, below its base. See Note [Inlined calls].
+    fn held(&self, upvalue: usize) -> Option<isize> {
+        let members = self.values.members(Loc::root(Root::Upvalue(upvalue as u8)));
+        let own = members.iter().find_map(|root| match root {
+            Root::Slot(slot) => Some(*slot as isize),
+            _ => None,
+        });
+        own.or_else(|| members.iter().find_map(|root| match root {
+            Root::Outer(below) => Some(-(*below as isize)),
+            _ => None,
+        }))
     }
 
     /// How many inlined calls deep the code this is the context of is.
@@ -5280,7 +5308,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let value = match table {
                     Root::Slot(slot) => state.vals[state.base + slot as usize],
                     Root::Upvalue(j) => state.upvalue(owner, j as usize),
-                    Root::Global(_) | Root::Arg(_) => unreachable!("an array read through a global or an argument"),
+                    Root::Global(_) | Root::Arg(_) | Root::Outer(_) => unreachable!("an array read through a global, an argument or a caller's slot"),
                 };
                 let LValue::Table(tab) = value.unbox() else { unreachable!("an element of an array part not of a table") };
                 (table, tab.ro(owner).kind)
@@ -5291,7 +5319,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::GuardDynamic(match table {
                     Root::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot as usize])),
                     Root::Upvalue(j) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
-                    Root::Global(_) | Root::Arg(_) => unreachable!("an array read through a global or an argument"),
+                    Root::Global(_) | Root::Arg(_) | Root::Outer(_) => unreachable!("an array read through a global, an argument or a caller's slot"),
                 })
             } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
@@ -5526,11 +5554,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let returned = (b != 0).then(|| b - 1);
         let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
         let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
+        // A field open onto a slot stays open: what it holds is the slot's.
         let map: Vec<(Loc, Loc)> = continuation.closure.into_iter()
             .flat_map(|closure| fields.iter().enumerate().map(move |(n, path)| (Loc { root: closure, path }, Loc::root(Root::Upvalue(n as u8)))))
+            .filter(|&(field, _)| !known.values.open_field(field))
             .chain((0..count.min(returned.unwrap_or(0))).map(|i| (Loc::root(Root::Slot((call + i) as u16)), Loc::root(Root::Slot((a + i) as u16)))))
             // A callee's globals are its caller's. See Note [Field facts].
             .chain(ctx.values.roots().filter(|root| matches!(root, Root::Global(_))).map(|root| (Loc::root(root), Loc::root(root))))
+            // So are the slots below it it named, but the call's own, which its results overwrite.
+            // See Note [Inlined calls].
+            .chain(ctx.values.roots().filter_map(|root| {
+                let Root::Outer(below) = root else { return None };
+                let caller = match (below as usize).checked_sub(call + 1) {
+                    Some(further) => Root::Outer(further as u16),
+                    None if (below as usize) < 2 => return None,
+                    None => Root::Slot((call + 1 - below as usize) as u16),
+                };
+                Some((Loc::root(caller), Loc::root(root)))
+            }))
             .collect();
         known.values.overlay(&ctx.closing(0), &map);
         // What it learned of the values it was passed, the caller's places holding them learn:

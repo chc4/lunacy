@@ -60,6 +60,8 @@ pub enum Root {
     /// The value an inlined call passed its callee as argument n, which no code of the callee
     /// writes.
     Arg(u8),
+    /// A slot of a frame the frame is inlined into, by how many slots below its base it is.
+    Outer(u16),
 }
 
 /// The field a class's value has, which another class's value is.
@@ -473,6 +475,12 @@ impl<F: ClassFact> Classes<F> {
     /// Whether field `label` of the value `loc` holds is known.
     pub fn has_field(&self, loc: Loc, label: Label) -> bool {
         self.find(loc).is_some_and(|class| self.field(class, label).is_some())
+    }
+
+    /// Whether the last field `loc` is reached by is open onto a slot.
+    pub fn open_field(&self, loc: Loc) -> bool {
+        let Some((&label, parent)) = loc.path.split_last() else { return false };
+        self.find(Loc { root: loc.root, path: parent }).is_some_and(|class| matches!(self.field(class, label), Some(Target::Open(_))))
     }
 
     /// Every fact known, of every class.
@@ -917,7 +925,7 @@ mod tests {
         }
     }
 
-    const ROOTS: [Root; 8] = [Root::Slot(0), Root::Slot(1), Root::Slot(2), Root::Slot(3), Root::Upvalue(0), Root::Upvalue(1), Root::Global(7), Root::Arg(0)];
+    const ROOTS: [Root; 9] = [Root::Slot(0), Root::Slot(1), Root::Slot(2), Root::Slot(3), Root::Upvalue(0), Root::Upvalue(1), Root::Global(7), Root::Arg(0), Root::Outer(1)];
     const LABELS: [Label; 4] = [Label::Upvalue(0), Label::Upvalue(1), Label::ElementOf, Label::Field(9)];
     const FACTS: [Fact; 5] = [Fact::Type(Ty::Int), Fact::Type(Ty::Float), Fact::Type(Ty::Number), Fact::Constant(1), Fact::Constant(2)];
 

@@ -700,11 +700,11 @@ pub struct Framed<'a> {
 
 impl<'a> Framed<'a> {
     pub fn new(op: &'a dyn Window, offset: usize) -> Self {
-        Framed { op: Op::Window(op), slots: op.operands().iter().map(|&slot| slot + offset).collect() }
+        Framed { op: Op::Window(op), slots: op.operands().iter().map(|&slot| slot.wrapping_add(offset)).collect() }
     }
 
     pub fn emitted(op: &'a dyn Emitted, offset: usize) -> Self {
-        Framed { op: Op::Emitted(op), slots: op.operands().iter().map(|&slot| slot + offset).collect() }
+        Framed { op: Op::Emitted(op), slots: op.operands().iter().map(|&slot| slot.wrapping_add(offset)).collect() }
     }
 
     /// The operands' slots, as the window names them.

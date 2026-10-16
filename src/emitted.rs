@@ -331,7 +331,7 @@ pub fn interp(op: &dyn Emitted, state: &mut RunState<'_, '_>) {
     let mut inputs: SmallVec<[u64; 8]> = SmallVec::new();
     for (i, (&slot, access)) in op.operands().iter().zip(op.accesses()).enumerate() {
         if access.reads() {
-            let bits = state.vals[state.base + slot].bits();
+            let bits = state.vals[state.base.wrapping_add(slot)].bits();
             inputs.push(if op.doubles() >> i & 1 == 1 { bits.wrapping_sub(LBoxed::DOUBLE_ENCODE_OFFSET) } else { bits });
         }
     }
@@ -365,7 +365,7 @@ pub fn interp(op: &dyn Emitted, state: &mut RunState<'_, '_>) {
             let bits = outputs[output];
             // SAFETY: an unboxed output is a double the op computed from boxed numbers. See Note
             // [Arithmetic NaNs].
-            state.vals[state.base + slot] = if op.doubles() >> i & 1 == 1 {
+            state.vals[state.base.wrapping_add(slot)] = if op.doubles() >> i & 1 == 1 {
                 unsafe { LBoxed::from_arith(f64::from_bits(bits)) }
             } else {
                 unsafe { LBoxed::from_bits(bits) }

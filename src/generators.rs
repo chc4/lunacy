@@ -2170,6 +2170,10 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
                 yield YieldOp::ExecWindow(Rc::new(NativeUpval::new(bits, b, &[a])));
             },
             ResumeArg::Integer(slot) if slot as usize == a => {},
+            // A caller's slot below the frame. See Note [Inlined calls].
+            ResumeArg::Integer(slot) if slot < 0 => {
+                yield YieldOp::ExecWindow(Rc::new(Move::new(&[slot as isize as usize, a])));
+            },
             ResumeArg::Integer(slot) => {
                 yield YieldOp::ExecWindow(Rc::new(HeldUpval::new(b, &[slot as usize, a])));
             },
