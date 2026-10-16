@@ -4909,6 +4909,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         BlockId(self.blocks.len() - 1)
     }
 
+    /// The block a thunk forced at `thunk_pc` in `block` lays its code out in: its own, from the
+    /// thunk on, unless its JIT code can only be patched to a jump or the layout after it stays
+    /// (not `appends`). Then it is a new block at `pc` the thunk becomes a jump to. See Note [Thunk
+    /// patching].
+    fn reopen(&mut self, block: BlockId, thunk_pc: usize, pc: Pc, appends: bool) -> BlockId {
+        if !appends || self.compiled(block) {
+            let at = self.new_block(pc);
+            self.jump_thunk(block, thunk_pc, at);
+            at
+        } else {
+            self.blocks[block.0].instructions.truncate(thunk_pc);
+            block
+        }
+    }
+
     /// Replace the thunk at `off` in `block` with a jump to `target`, and its
     /// JIT code too, if any, once `target` has some. See Note [Thunk patching].
     pub fn jump_thunk(&mut self, block: BlockId, off: usize, target: BlockId) {
@@ -4931,17 +4946,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             test.interp(owner, state);
             let passed = state.select == 1;
-            // In place, unless the thunk's JIT code can only be patched to a jump.
-            // See Note [Thunk patching].
-            let block = if vm.compiled(block_id) {
-                let guard_block = vm.new_block(pc.0);
-                vm.jump_thunk(block_id, thunk_pc, guard_block);
-                vm.blocks[guard_block.0].instructions.push(Residual::GuardDynamic(test.clone()));
-                guard_block
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test.clone());
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, pc.0, true);
+            vm.blocks[block.0].instructions.push(Residual::GuardDynamic(test.clone()));
             let (fail, pass) = if passed {
                 let pass = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Matched);
                 let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
@@ -4975,17 +4981,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 return;
             }
             let test: Rc<dyn Window> = Rc::new(crate::generators::EqualsK::new(value, &[slot]));
-            // In place, unless the thunk's JIT code can only be patched to a jump.
-            // See Note [Thunk patching].
-            let block = if vm.compiled(block_id) {
-                let guard_block = vm.new_block(pc.0);
-                vm.jump_thunk(block_id, thunk_pc, guard_block);
-                vm.blocks[guard_block.0].instructions.push(Residual::GuardDynamic(test));
-                guard_block
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test);
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, pc.0, true);
+            vm.blocks[block.0].instructions.push(Residual::GuardDynamic(test));
             // Past the guard, the slot holds the value too.
             let mut promoted = thunk_ctx.clone();
             Rc::make_mut(&mut promoted).promote(pc.0, value);
@@ -5074,21 +5071,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // The origin becomes a thunk laying out the rebuilt code. See Note [Contraction].
         let rebuild = move |vm: &mut Specializer, owner: &mut Owner, how: ResumeArg| {
             let thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-                // In place, unless the thunk's JIT code can only be patched to a jump (Note [Thunk
-                // patching]). Nothing returns into the residuals after it, which it
-                // truncates: the rebuild waited until nothing ran past it.
+                // Nothing returns into the residuals after it, which it truncates: the rebuild
+                // waited until nothing ran past it.
                 assert!(!state.callstack.iter().filter_map(|entry| entry.returns_to()).any(|ret| ret.0 == block && ret.1 > thunk_pc), "a frame returns past a rebuilt origin");
-                let at = if vm.compiled(block) {
-                    let at = vm.new_block(pc.0);
-                    vm.jump_thunk(block, thunk_pc, at);
-                    at
-                } else {
-                    vm.blocks[block.0].instructions.truncate(thunk_pc);
-                    if vm.cuts.get(&block).is_some_and(|&cut| cut > thunk_pc) {
-                        vm.cuts.remove(&block);
-                    }
-                    block
-                };
+                let at = vm.reopen(block, thunk_pc, pc.0, true);
+                if at == block && vm.cuts.get(&block).is_some_and(|&cut| cut > thunk_pc) {
+                    vm.cuts.remove(&block);
+                }
                 vm.rebuilding.remove(&(block, offset));
                 let running = vm.proto;
                 vm.set_current(proto as LProto<'_, '_>);
@@ -5117,16 +5106,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// fits for its operands' values, and else as the double one. See Note [Optimistic ops].
     fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            // In place, unless the thunk's JIT code can only be patched to a jump. See Note
-            // [Thunk patching].
-            let at = if vm.compiled(block_id) {
-                let at = vm.new_block(pc.0);
-                vm.jump_thunk(block_id, thunk_pc, at);
-                at
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
-            };
+            let at = vm.reopen(block_id, thunk_pc, pc.0, true);
             let fit = (fits.0)(state);
             #[cfg(feature = "tracing")]
             crate::tracing::instant("spec", "encoding", &[
@@ -5196,17 +5176,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 return;
             };
             let test: Rc<dyn Window> = Rc::new(KindIs::new(of, &[slot]));
-            // In place, unless the thunk's JIT code can only be patched to a jump. See Note
-            // [Thunk patching].
-            let block = if vm.compiled(block_id) {
-                let guard_block = vm.new_block(pc.0);
-                vm.jump_thunk(block_id, thunk_pc, guard_block);
-                vm.blocks[guard_block.0].instructions.push(Residual::GuardDynamic(test));
-                guard_block
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test);
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, pc.0, true);
+            vm.blocks[block.0].instructions.push(Residual::GuardDynamic(test));
             let mut known = (*thunk_ctx).clone();
             known.learn_kind(Root::Slot(slot as u16), Kind::Of(of));
             let pass = vm.subblock(owner, pc.next_true(), Rc::new(known), thunk_coro.clone(), ResumeArg::Matched);
@@ -5495,16 +5466,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // finding out and knowing share the subblock.
             let (next, arg) = navigate(pc, &expected, &found);
             // TODO: search for if we already have a compatible block
-            // In place, unless the thunk's JIT code can only be patched to a
-            // jump. See Note [Thunk patching].
-            if !appends || vm.compiled(block_id) {
-                let old_block = block_id;
-                block_id = vm.new_block(pc.0);
-                vm.jump_thunk(old_block, thunk_pc, block_id);
-                vm.blocks[block_id.0].instructions.push(guard);
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = guard;
-            }
+            block_id = vm.reopen(block_id, thunk_pc, pc.0, appends);
+            vm.blocks[block_id.0].instructions.push(guard);
             // If we're in the success block and the guarded value is a function, we can
             // also try to emit a guard to specialize the function value as well. This lets us
             // specialize code like `local print = print; print("xyz");`. Up to MAX_VERSIONS
@@ -5567,15 +5530,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
             // SAFETY: a continuation lives as long as the specializer does.
             let continuation = unsafe { &*(continuation as *const Continuation) };
-            // In place, as for a call thunk. See Note [Thunk patching].
-            let block = if vm.compiled(block_id) {
-                let block = vm.new_block(vm.blocks[block_id.0].pc);
-                vm.jump_thunk(block_id, thunk_pc, block);
-                block
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, vm.blocks[block_id.0].pc, true);
             let after = vm.inline_return(owner, &ctx, continuation, a, b as usize);
             // A count of results known statically moves them as window ops in the caller's frame,
             // missing ones nil: values the JIT's window only renames. Every result up to the top
@@ -5805,17 +5760,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            // In place, unless the thunk's JIT code can only be patched to a jump, or it
-            // is a guard's failure, with the rest of the layout after it. See Note
-            // [Thunk patching].
-            let block = if !appends || vm.compiled(block_id) {
-                let block = vm.new_block(vm.blocks[block_id.0].pc);
-                vm.jump_thunk(block_id, thunk_pc, block);
-                block
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, vm.blocks[block_id.0].pc, appends);
             // Any call but one inlined observes the frames of the inlined calls it is in, made
             // here. See Note [Inlined frames].
             let inlined = vm.inlines_first(owner, &calling, state.vals[state.base + a], pc, a, b, continuation.is_some(), identities);
@@ -6286,15 +6231,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry, continuation);
                 vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
             }
-            // In place, as for a call thunk. See Note [Thunk patching].
-            let block = if !appends || vm.compiled(block_id) {
-                let block = vm.new_block(vm.blocks[block_id.0].pc);
-                vm.jump_thunk(block_id, thunk_pc, block);
-                block
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, vm.blocks[block_id.0].pc, appends);
             let (a16, c16) = (a as u16, c as u16);
             let returned = state.returned;
             let results = (returned & !0xffff_ffff == crate::vm::RETURNED && identities < MAX_VERSIONS)
@@ -6376,15 +6313,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     fn make_tail_call_thunk(&self, block_id: BlockId, site: Rc<TailSite>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            // In place, as for a call thunk. See Note [Thunk patching].
-            let block = if !appends || vm.compiled(block_id) {
-                let block = vm.new_block(vm.blocks[block_id.0].pc);
-                vm.jump_thunk(block_id, thunk_pc, block);
-                block
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, vm.blocks[block_id.0].pc, appends);
             let TailSite { ref calling, pc, a, b, closes, vararg, effects } = *site;
             let (a16, b16) = (a as u16, b as u16);
             let next = |vm: &Specializer| Residual::Thunk(vm.make_tail_call_thunk(block, site.clone(), identities + 1, false));
@@ -6516,16 +6445,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 (Place::Metatable(link), _) => Rc::new(HrefInitAt::<true>::new(at, kbits, link.0, &[])),
                 (Place::Index(link), _) => Rc::new(HrefInitAt::<false>::new(at, kbits, link.0, &[])),
             }) };
-            // In place, unless the thunk's JIT code can only be patched to a
-            // jump. See Note [Thunk patching].
-            if !appends || vm.compiled(block_id) {
-                let old_block = block_id;
-                block_id = vm.new_block(pc.0);
-                vm.jump_thunk(old_block, thunk_pc, block_id);
-                vm.blocks[block_id.0].instructions.push(href_init);
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = href_init;
-            }
+            block_id = vm.reopen(block_id, thunk_pc, pc.0, appends);
+            vm.blocks[block_id.0].instructions.push(href_init);
             let typed = vm.new_block(pc.0);
             let missing_key = vm.new_block(pc.0);
             // A `MISS` init's exit 0 is missing the key.
