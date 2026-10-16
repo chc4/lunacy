@@ -486,6 +486,13 @@ impl WindowAlloc {
         emits
     }
 
+    /// Store the dirty values of `slots`, which their registers keep, clean.
+    pub fn clean(&mut self, slots: &Slots) -> SmallVec<[Emit; WINDOW]> {
+        let stores = self.cache.dirty.iter().filter(|&&slot| slots.contains(slot)).map(|&slot| self.cache.store(slot)).collect();
+        self.cache.dirty.retain(|slot| !slots.contains(*slot));
+        stores
+    }
+
     /// Drop `slots` from the window without storing them: their values are dead.
     pub fn forget(&mut self, slots: &Slots) {
         for reg in 0..WINDOW {
@@ -739,6 +746,9 @@ pub enum Step<'a> {
     Read(usize),
     /// A residual that flushes the window.
     Flush,
+    /// Slots whose dirty values are stored, kept in their registers: an op's memory may be their
+    /// stack homes. See Note [Window memory].
+    Store(Slots),
     /// Slots whose values die, which the window drops without storing them: an inlined callee's
     /// frame past its arguments, its caller's dead temporaries, which it nils. See Note [Inlined
     /// calls].
@@ -826,6 +836,7 @@ impl Ahead {
                 }
                 Step::Leave => ahead.blind.push(step),
                 Step::Flush => ahead.flushes.push(step),
+                Step::Store(slots) => slots.iter().for_each(|slot| ahead.events[slot].push((step, true))),
                 Step::Kill(slots) => slots.iter().for_each(|slot| ahead.events[slot].push((step, false))),
                 Step::Back(start) => ahead.backs.push((step, *start)),
                 Step::Start(_) => {}
@@ -1057,6 +1068,9 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("alloc", "flush", &[("trace", trace.into()), ("step", step.into()), ("window", format!("{}", alloc.cache()).as_str().into())]);
                 alloc.flush();
+            }
+            Step::Store(slots) => {
+                alloc.clean(slots);
             }
             Step::Kill(slots) => alloc.forget(slots),
             Step::Exit { hot, .. } => {
@@ -1828,6 +1842,7 @@ mod tests {
                         }
                         Step::Read(_) => {}
                         Step::Kill(_) => unreachable!("a test trace kills no slot"),
+                        Step::Store(_) => unreachable!("a test trace stores no slot"),
                     }
                 }
                 finish(alloc, machine, &ops);

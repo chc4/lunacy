@@ -322,6 +322,10 @@ pub trait Window: std::fmt::Debug {
     fn closure(&self) -> bool {
         false
     }
+    /// Whether it reads, or writes, upvalues' cells. See Note [Window memory].
+    fn cells(&self) -> Option<Access> {
+        None
+    }
     /// The operands its stencils take and give as unboxed doubles, in their
     /// window registers' paired XMM registers: bit `i` for operand `i`. See
     /// Note [Unboxed doubles].
@@ -424,7 +428,12 @@ pub(crate) use bind_record;
 // running closure. Whether it may is part of its declaration, as `reads` or `writes` before it,
 // and only an op declaring it is given the owner, shared to read or not to write: without it, its
 // body can't reach the heap. One reaching memory through the running closure, its upvalues,
-// declares `upvalues` or `sets_upvalues` instead.
+// declares `upvalues` or `sets_upvalues` instead. One reading upvalues through a closure it is
+// given declares `cells`.
+//
+// An upvalue's cell may be open onto a slot of a frame below the op's own, which JIT code inlining
+// that frame may hold in a register. So the window stores those slots before an op touching
+// upvalues, and forgets them after one setting an upvalue.
 
 /// The owner of an op that touches no memory: nothing to reach the heap through. See Note
 /// [Window memory].
@@ -489,6 +498,10 @@ macro_rules! windowed {
     };
     (sets_upvalues $($rest:tt)*) => {
         $crate::window::windowed!(@mem sets_upvalues $($rest)*);
+    };
+    // Upvalues through a closure it is given. See Note [Window memory].
+    (cells $($rest:tt)*) => {
+        $crate::window::windowed!(@mem cells $($rest)*);
     };
     (
         @mem $mem:ident
@@ -615,9 +628,14 @@ macro_rules! windowed {
     (@owner writes, $owner:ident) => { $owner };
     (@owner upvalues, $owner:ident) => { &*$owner };
     (@owner sets_upvalues, $owner:ident) => { $owner };
+    (@owner cells, $owner:ident) => { &*$owner };
     (@closure upvalues) => { true };
     (@closure sets_upvalues) => { true };
     (@closure $other:ident) => { false };
+    (@cells upvalues) => { Some($crate::window::Access::Read) };
+    (@cells cells) => { Some($crate::window::Access::Read) };
+    (@cells sets_upvalues) => { Some($crate::window::Access::Write) };
+    (@cells $other:ident) => { None };
     (@cold_body []) => {
         { 0 }
     };
@@ -823,6 +841,7 @@ macro_rules! windowed {
             fn operands(&self) -> &[usize] { &self.operands }
             fn accesses(&self) -> &'static [$crate::window::Access] { Self::ACCESSES }
             fn closure(&self) -> bool { $crate::window::windowed!(@closure $mem) }
+            fn cells(&self) -> Option<$crate::window::Access> { $crate::window::windowed!(@cells $mem) }
             fn with_operands(&self, operands: &[usize]) -> std::rc::Rc<dyn $crate::window::Window> {
                 $crate::window::check_operands(stringify!($name), operands, Self::ACCESSES);
                 std::rc::Rc::new(Self { operands: operands.into(), ..self.clone() })

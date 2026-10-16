@@ -1010,6 +1010,13 @@ fn results_end(residuals: &[Residual], off: usize) -> Option<(usize, usize)> {
     Some((at, end))
 }
 
+/// The slots of the frames below the one the window names at `offset`.
+fn slots_below(offset: usize) -> Slots {
+    let mut slots = Slots::default();
+    (0..offset).for_each(|slot| slots.insert(slot));
+    slots
+}
+
 /// The slots, as the window names them at `offset`, from `end` on.
 fn slots_from(end: usize, offset: usize) -> Slots {
     let mut slots = Slots::default();
@@ -2499,6 +2506,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         offset = offset_past(res, offset);
                         match res {
                             Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[off].is_empty() => {
+                                // Upvalues' cells may be open onto them. See Note [Window memory].
+                                if w.cells().is_some() {
+                                    events.extend(slots_below(at).iter().map(Event::Read));
+                                }
                                 let operands = w.operands().iter().zip(w.accesses());
                                 events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot.wrapping_add(at))));
                                 events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot + at)));
@@ -2654,8 +2665,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 offset = offset_past(res, offset);
                 match res {
                     Residual::ExecWindow(_) | Residual::GuardDynamic(_) if !skips[b][off].is_empty() => {
+                        let w = windows[b][off].as_ref().expect("a window op");
+                        // See Note [Window memory].
+                        if w.cells().is_some() {
+                            steps.push(Step::Store(slots_below(at)));
+                        }
                         of[off] = Some(steps.len());
-                        steps.push(Step::Op(Framed::new(&**windows[b][off].as_ref().expect("a window op"), at), skips[b][off].clone()));
+                        steps.push(Step::Op(Framed::new(&**w, at), skips[b][off].clone()));
+                        if w.cells() == Some(Access::Write) {
+                            steps.push(Step::Kill(slots_below(at)));
+                        }
                     }
                     Residual::Emit(e) => {
                         of[off] = Some(steps.len());
@@ -3898,6 +3917,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let w = self.jctx.stencils.effective(w);
                     let w = &w;
                     let stencils = &mut self.jctx.stencils;
+                    // See Note [Window memory].
+                    if w.cells().is_some() {
+                        let stores = alloc.clean(&slots_below(offset.get()));
+                        window_dump!(self.jctx, "      cells: store {}", emits_line(&stores));
+                        for emit in stores {
+                            emit_window_move(ops, emit, offset.get());
+                        }
+                    }
                     let emits = match plans.get(&id) {
                         // A `Move` planned as a rename. See `WindowAlloc::rename`.
                         Some(plan) if plan.placed[off].is_some_and(|(skip, _)| skip as usize >= RENAME) => {
@@ -3996,6 +4023,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 );
                             }
                         }
+                    }
+                    // Its sets of upvalues may have been of their stack homes.
+                    if w.cells() == Some(Access::Write) {
+                        alloc.forget(&slots_below(offset.get()));
                     }
                     match (res, other, copied) {
                         // Its body ran on the stack, and selected: as an inline guard, a

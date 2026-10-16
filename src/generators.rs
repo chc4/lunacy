@@ -2159,7 +2159,7 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
         });
         // One of an inlined call's frame not made, through its closure, below the frame. See Note
         // [Inlined frames].
-        windowed!(reads CalledUpval, [index: usize], [], |owner, state, base| (closure, out dest) {
+        windowed!(cells CalledUpval, [index: usize], [], |owner, state, base| (closure, out dest) {
             let LValue::LClosure(clos) = closure.unbox() else { unreachable!("an inlined call's closure") };
             *dest = state.upvalue_of(owner, &clos, index);
         });
