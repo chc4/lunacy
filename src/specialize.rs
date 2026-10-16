@@ -1331,7 +1331,8 @@ pub enum CallEntry {
 // An inlined call's frame is made in two halves. The base is moved to it as the call is inlined
 // (`Enter`), nilling it past the arguments. The rest, its callstack entry and running closure
 // (`Inline`), is made only before code observing them: an upvalue's access through the closure, a
-// call not inlined, a safepoint, or an exit to the interpreter. A native's call that runs as a
+// call not inlined, or an exit to the interpreter. A safepoint observes nothing: every value is on
+// the stack, the callee's closure in its caller's frame. A native's call that runs as a
 // window op is no call. A frame passed a variable number of arguments is made whole at once. A Lua
 // call's thunk, which doesn't know until it runs whether it inlines its callee, makes the frames
 // only if it calls. A callee whose code observes nothing returns with only its base moved back
@@ -7080,8 +7081,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ctx.values.assign(Root::Slot(slot as u16), Loc::root(Root::Upvalue(upvalue as u8)));
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
-                    // The safepoint its block ends in observes the frames.
-                    self.observe(owner, &mut block_id, &mut ctx, pc.0, "CollectGarbage");
                     self.blocks[block_id.0].allocates = true;
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {
