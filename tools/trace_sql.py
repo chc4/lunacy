@@ -49,6 +49,14 @@ The specializer's are also views, one column per argument:
       each place code makes the frames of the inlined calls it is in, in
       `block` of the function at `line`: `by` the yield observing them, or
       the return opcode returning from one.
+  inline_calls(line, pc, callee, copies, entered, made)
+      each call inlined, the function at `line`'s call at `pc` of the
+      function defined at `callee`: how many copies of it were laid out, one
+      in each version of the caller's block holding the call, and in how many
+      of them its frame was entered and made.
+  inline_copies(site, line, pc, callee, entered, made)
+      each copy of an inlined call, at `site` (its call's block and offset):
+      whether its frame was entered (the base moved) and made.
   alloc_step(trace, step, line, block, pc, off)
       each step of each trace the window planner planned: the block it is in
       and, for a residual, its offset (a block's start's is 2^64-1).
@@ -168,11 +176,12 @@ def connect(trace):
         tp.query(f"CREATE PERFETTO VIEW {view} AS SELECT ts, {extracted} FROM slice "
                  f"WHERE category = '{category}' AND name = '{name}'")
     fates(tp)
-    # Each inlined call (its site): whether its frame was entered (the base moved) or made.
-    tp.query("CREATE PERFETTO VIEW inline_frames AS SELECT i.site, i.callee, "
+    tp.query("CREATE PERFETTO VIEW inline_copies AS SELECT i.site, i.line, i.pc, i.callee, "
              "EXISTS (SELECT 1 FROM frame_entered e WHERE e.site = i.site) AS entered, "
              "EXISTS (SELECT 1 FROM frame_made m WHERE m.site = i.site) AS made "
-             "FROM (SELECT DISTINCT site, callee FROM inline) i")
+             "FROM (SELECT DISTINCT site, line, after - 1 AS pc, callee FROM inline) i")
+    tp.query("CREATE PERFETTO VIEW inline_calls AS SELECT line, pc, callee, COUNT(*) AS copies, "
+             "SUM(entered) AS entered, SUM(made) AS made FROM inline_copies GROUP BY line, pc, callee")
     return tp
 
 
