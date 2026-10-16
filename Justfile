@@ -758,6 +758,7 @@ hyperfine benchmark times='10': unsafe-compile
 _hyperfine benchmark times bins:
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
+    python3 tools/clock_check.py
     # A build whose run fails (e.g. past the JIT buffer's end) is still timed,
     # and left out of the history for its exit code.
     {{TIMED}} hyperfine -i --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
@@ -1164,7 +1165,8 @@ bench-rev ref:
 # latest, dirty, best and first times, regressions flagged, and the charts, in
 # working/history.html.
 # Whether the clock is fine enough to time with: a coarse one rounds every timing to whole
-# milliseconds (tools/clock_check.py). `hyperfines` won't start without it.
+# milliseconds (tools/clock_check.py). `hyperfines` won't start without it, and each benchmark it
+# times checks it again, since the clock can turn coarse at any time.
 clock-check:
     python3 tools/clock_check.py
 
