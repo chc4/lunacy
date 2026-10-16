@@ -2157,41 +2157,35 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             let _ = index;
             *to = from;
         });
-        // One of an inlined call's frame not made, through its closure, below the frame. See Note
-        // [Inlined frames].
+        // One of a closure a slot holds. See Note [Reaching values].
         windowed!(cells CalledUpval, [index: usize], [], |owner, state, base| (closure, out dest) {
             let LValue::LClosure(clos) = closure.unbox() else { unreachable!("an inlined call's closure") };
             *dest = state.upvalue_of(owner, &clos, index);
         });
-        let unmade = matches!(yield YieldOp::FrameUnmade, ResumeArg::Matched);
-        match yield YieldOp::UpvalueKnown(b) {
-            ResumeArg::Boxed(bits) => {
-                yield YieldOp::ExecWindow(Rc::new(NativeUpval::new(bits, b, &[a])));
-            },
-            ResumeArg::Integer(slot) if slot as usize == a => {},
-            // A caller's slot below the frame. See Note [Inlined calls].
-            ResumeArg::Integer(slot) if slot < 0 => {
-                yield YieldOp::ExecWindow(Rc::new(Move::new(&[slot as isize as usize, a])));
-            },
-            ResumeArg::Integer(slot) => {
+        let ResumeArg::Reach(reach) = (yield YieldOp::Reach(crate::classes::Root::Upvalue(b as u8))) else { unreachable!("a reach") };
+        match reach {
+            Reach::Slot(slot) if slot == a as isize => {},
+            Reach::Slot(slot) if slot >= 0 => {
                 yield YieldOp::ExecWindow(Rc::new(HeldUpval::new(b, &[slot as usize, a])));
             },
-            _ if unmade => {
-                yield YieldOp::ExecWindow(Rc::new(CalledUpval::new(b, &[usize::MAX, a])));
+            // A slot of a frame below. See Note [Inlined calls].
+            Reach::Slot(slot) => {
+                yield YieldOp::ExecWindow(Rc::new(Move::new(&[slot as usize, a])));
             },
-            // A load from its cell where that holds its value, else a load storing into it.
+            Reach::Native(bits) => {
+                yield YieldOp::ExecWindow(Rc::new(NativeUpval::new(bits, b, &[a])));
+            },
+            Reach::Closure { slot, index } => {
+                yield YieldOp::ExecWindow(Rc::new(CalledUpval::new(index, &[slot as usize, a])));
+            },
             // See Note [Upvalue cells].
-            _ => match yield YieldOp::UpvalueCell(b) {
-                ResumeArg::Cell(cell, true) => {
-                    yield YieldOp::ExecWindow(Rc::new(UpvalCell::new(b, cell, &[a])));
-                },
-                ResumeArg::Cell(cell, false) => {
-                    yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, cell, &[a])));
-                },
-                _ => {
-                    yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, NO_CELL, &[a])));
-                },
+            Reach::Cell { cell, .. } => {
+                yield YieldOp::ExecWindow(Rc::new(UpvalCell::new(b, cell, &[a])));
             },
+            Reach::Upvalue { cell, .. } => {
+                yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, cell.unwrap_or(NO_CELL), &[a])));
+            },
+            Reach::Unknown => unreachable!("an upvalue the code can't read"),
         }
         arg = yield YieldOp::LoadUpvalue(a, b);
         return arg;

@@ -318,9 +318,8 @@ pub enum YieldOp {
     LoadGlobal(usize, usize), // STACK[idx] was just loaded with global CONSTANT[k]. See Note [Field facts]
     LoadUpvalue(usize, usize), // Infrom the executor that STACK[idx]'s type is the same as an UPVALUE[b].
                                // See Note [Fragile information]
-    UpvalueKnown(usize), // Resumed with what the context knows of UPVALUE[idx]'s value: Boxed, the
-                         // native it holds; else Integer, a stack slot holding it; else Failed.
-                         // See Note [Fragile information]
+    Reach(Root), // Resumed with Reach, the most direct way to read what ROOT holds. See Note
+                 // [Reaching values]
     UpvalueCell(usize), // Resumed with UPVALUE[idx]'s cell, and whether it holds the value, as
                         // Cell; else Failed, if it has none. See Note [Upvalue cells]
     Captures(usize, Vec<(Opcode, usize)>), // Inform the executor that the closure in STACK[a]
@@ -337,8 +336,6 @@ pub enum YieldOp {
 
     HashKey(usize, usize, bool), // Looks up or allocates an HREF for STACK[idx][key]; down its `__index` chain if true (a load). See Note [Table metatables]
     HashKeyNamed(usize, LConstant<'static, 'static>, bool), // `HashKey` of a key known by its value
-    FrameUnmade, // Resumed with Matched if the code is an inlined call's whose frame isn't made, else
-                 // Failed. See Note [Inlined frames]
     HoldsValue(usize, usize), // Resumed with Matched if STACK[dest] holds STACK[src]'s value
                               // already, a move between them nothing
     Quotient(usize, usize, i32), // STACK[idx] was just computed as STACK[of] / by, of an integer by a
@@ -538,6 +535,52 @@ pub enum ResumeArg {
     /// The slot holding the integer a value is the quotient of, and the constant. See Note
     /// [Quotients].
     Quotient(usize, i32),
+    /// See Note [Reaching values].
+    Reach(Reach),
+}
+
+// Note [Reaching values]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// A value the context knows of may have many names: the places of its eclass, and the fields of
+// other values that hold it. Code reads it by the most direct name the context knows. A slot is
+// best, of the frame or of one it is inlined into, since the window keeps slots in registers. A
+// native the value is known to be comes next, as a constant. Then comes the code's own upvalue,
+// from its cell where that holds it, else through the running closure. An inlined call's frame not
+// made has no running closure, so there it is read through the callee's closure in the slot below
+// the frame. Last is a field of another closure a slot holds.
+
+/// The most direct way code reads a value. See Note [Reaching values].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reach {
+    /// A slot holding it: of the frame, or, below its base, of a frame it is inlined into.
+    Slot(isize),
+    /// The native it is, boxed.
+    Native(u64),
+    /// The code's own upvalue `index`, from its cell. See Note [Upvalue cells].
+    Cell { index: usize, cell: usize },
+    /// Upvalue `index` of the closure slot `slot` holds.
+    Closure { slot: isize, index: usize },
+    /// The code's own upvalue `index`, through the running closure, stored into its cell if it
+    /// has one.
+    Upvalue { index: usize, cell: Option<usize> },
+    /// Nothing the context knows reaches it.
+    Unknown,
+}
+
+impl Reach {
+    /// What it reaches, in the frame `state` runs, if it is a slot or an upvalue.
+    fn value<'src, 'intern>(&self, owner: &Owner, state: &RunState<'src, 'intern>) -> Option<LBoxed<'src, 'intern>> {
+        let slot = |slot: isize| state.vals[state.base.wrapping_add(slot as usize)];
+        match *self {
+            Reach::Slot(at) => Some(slot(at)),
+            Reach::Cell { index, .. } | Reach::Upvalue { index, .. } => Some(state.upvalue(owner, index)),
+            Reach::Closure { slot: at, index } => {
+                let LValue::LClosure(clos) = slot(at).unbox() else { unreachable!("an upvalue of a closure not in its slot") };
+                Some(state.upvalue_of(owner, &clos, index))
+            }
+            Reach::Native(_) | Reach::Unknown => None,
+        }
+    }
 }
 
 // Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
@@ -1076,6 +1119,13 @@ windowed!(reads guard KindIs, [kind: LType], [], |owner, state, base| (table) {
 // The same of the table in the running closure's upvalue `index`.
 windowed!(upvalues guard UpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| () {
     let LValue::Table(tab) = state.upvalue(owner, index).unbox() else { unreachable!() };
+    tab.ro(owner).kind == kind.bit()
+});
+// The same of the table in upvalue `index` of the closure in its operand. See Note [Reaching
+// values].
+windowed!(cells guard CalledUpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| (closure) {
+    let LValue::LClosure(clos) = closure.unbox() else { unreachable!("a closure") };
+    let LValue::Table(tab) = state.upvalue_of(owner, &clos, index).unbox() else { unreachable!() };
     tab.ro(owner).kind == kind.bit()
 });
 
@@ -3060,18 +3110,42 @@ impl Context {
         }
     }
 
-    /// A slot holding the running function's upvalue `upvalue`'s value, if known: one of its own
-    /// frame, else a caller's, below its base. See Note [Inlined calls].
-    fn held(&self, upvalue: usize) -> Option<isize> {
-        let members = self.values.members(Loc::root(Root::Upvalue(upvalue as u8)));
+    /// The most direct way its code reads what `loc` holds. See Note [Reaching values].
+    fn reach(&self, loc: Loc) -> Reach {
+        let members = self.values.members(loc);
         let own = members.iter().find_map(|root| match root {
             Root::Slot(slot) => Some(*slot as isize),
             _ => None,
         });
-        own.or_else(|| members.iter().find_map(|root| match root {
+        let outer = || members.iter().find_map(|root| match root {
             Root::Outer(below) => Some(-(*below as isize)),
             _ => None,
-        }))
+        });
+        if let Some(slot) = own.or_else(outer) {
+            return Reach::Slot(slot);
+        }
+        // A native's fact is of its code, and its value is the one cell it was made with. A Lua
+        // function's is only of its prototype, which closure isn't known.
+        if let Some(Known::Type(CType::NativeFunction(nf))) = self.values.fact(loc, TYPE) {
+            return Reach::Native(LBoxed::box_lvalue(LValue::NClosure(*nf)).bits());
+        }
+        let upvalue = members.iter().find_map(|root| match root {
+            Root::Upvalue(j) => Some(*j as usize),
+            _ => None,
+        });
+        let unmade = self.inline.last().is_some_and(|frame| frame.made != Made::Yes);
+        match upvalue {
+            Some(index) if unmade => Reach::Closure { slot: -1, index },
+            Some(index) => match self.upvalue_cell(index) {
+                Some(cell) if self.cell_filled(index) => Reach::Cell { index, cell },
+                cell => Reach::Upvalue { index, cell },
+            },
+            None => self.values.parents(loc).into_iter().find_map(|(root, label)| match (root, label) {
+                (Root::Slot(slot), Label::Upvalue(n)) => Some(Reach::Closure { slot: slot as isize, index: n as usize }),
+                (Root::Outer(below), Label::Upvalue(n)) => Some(Reach::Closure { slot: -(below as isize), index: n as usize }),
+                _ => None,
+            }).unwrap_or(Reach::Unknown),
+        }
     }
 
     /// How many inlined calls deep the code this is the context of is.
@@ -5308,28 +5382,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // An element of an array part whose kind is the element's
             // representation: the array's kind is tested in place of the
             // element's, and is known after. See Note [Array kinds].
-            // The runtime kind of the array the element was loaded from.
-            // An upvalue's table is read from the running closure's own upvalue; one
-            // through another closure isn't, and its element is tested as any value.
-            // An inlined call's frame not made has no running closure to read the upvalue through.
-            // See Note [Inlined frames].
-            let unmade = thunk_ctx.inline.last().is_some_and(|frame| frame.made != Made::Yes);
-            let array = thunk_ctx.element_of(idx).filter(|table| !(unmade && matches!(table, Root::Upvalue(_)))).map(|table| {
-                let value = match table {
-                    Root::Slot(slot) => state.vals[state.base + slot as usize],
-                    Root::Upvalue(j) => state.upvalue(owner, j as usize),
-                    Root::Global(_) | Root::Arg(_) | Root::Outer(_) => unreachable!("an array read through a global, an argument or a caller's slot"),
-                };
+            // The runtime kind of the array the element was loaded from, its table read the most
+            // direct way. See Note [Reaching values].
+            let element_of = [Label::ElementOf];
+            let table = Loc { root: Root::Slot(idx as u16), path: &element_of };
+            let reach = thunk_ctx.reach(table);
+            let array = reach.value(owner, state).map(|value| {
                 let LValue::Table(tab) = value.unbox() else { unreachable!("an element of an array part not of a table") };
-                (table, tab.ro(owner).kind)
+                tab.ro(owner).kind
             });
-            let kind_of = array.as_ref().filter(|(_, kind)| *kind == found_field.bit()).map(|(table, _)| table.clone());
+            let kind_of = array.filter(|kind| *kind == found_field.bit()).is_some();
             // A value the context knows is a number only has its encoding tested.
-            let guard = if let Some(table) = &kind_of {
-                Residual::GuardDynamic(match table {
-                    Root::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot as usize])),
-                    Root::Upvalue(j) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
-                    Root::Global(_) | Root::Arg(_) | Root::Outer(_) => unreachable!("an array read through a global, an argument or a caller's slot"),
+            let guard = if kind_of {
+                Residual::GuardDynamic(match reach {
+                    Reach::Slot(slot) => Rc::new(KindIs::new(found_field, &[slot as usize])),
+                    Reach::Cell { index, .. } | Reach::Upvalue { index, .. } => Rc::new(UpvalKindIs::new(index, found_field, &[])),
+                    Reach::Closure { slot, index } => Rc::new(CalledUpvalKindIs::new(index, found_field, &[slot as usize])),
+                    Reach::Native(_) | Reach::Unknown => unreachable!("an array read through no slot or upvalue"),
                 })
             } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
@@ -5339,12 +5408,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut forced_ctx = thunk_ctx.clone();;
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
             forced_mut.types[idx] = found.clone();
-            if let Some(table) = kind_of {
-                forced_mut.learn_kind(table, Kind::Of(found_field));
+            if kind_of {
+                forced_mut.values.learn(table, Known::Kind(Kind::Of(found_field)));
             }
             // An array of two representations or more stays mixed.
-            if let Some((table, _)) = array.filter(|(_, kind)| kind.count_ones() > 1) {
-                forced_mut.learn_kind(table, Kind::Mixed);
+            if array.is_some_and(|kind| kind.count_ones() > 1) {
+                forced_mut.values.learn(table, Known::Kind(Kind::Mixed));
             }
             // A slot holding an upvalue's value tells of the upvalue: the type the
             // guard found, and past a function's identity guard below, which
@@ -6734,8 +6803,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 // The closure an inlined call whose frame isn't made calls, if known. See Note
                 // [Inlined frames].
-                CoroutineState::Yielded(YieldOp::FrameUnmade) => {
-                    arg = if ctx.inline.last().is_some_and(|frame| frame.made != Made::Yes) { ResumeArg::Matched } else { ResumeArg::Failed };
+                CoroutineState::Yielded(YieldOp::Reach(root)) => {
+                    arg = ResumeArg::Reach(ctx.reach(Loc::root(root)));
                 },
                 CoroutineState::Yielded(yielded @ (YieldOp::OptimisticExec(_) | YieldOp::OptimisticEmit(_))) => {
                     if let YieldOp::OptimisticExec(op) = &yielded && op.closure() {
@@ -7072,17 +7141,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         self.blocks[block_id.0].instructions.push(thunk);
                         return None;
                     }
-                },
-                CoroutineState::Yielded(YieldOp::UpvalueKnown(upvalue)) => {
-                    // A native's fact is of its code, and its value is the one cell it was
-                    // made with. A Lua function's is only of its prototype (what its
-                    // identity guard compares), which closure isn't known: that, like any
-                    // other value, is only known as what a slot still holds.
-                    arg = match (ctx.upvalue(upvalue), ctx.held(upvalue)) {
-                        (Some(CType::NativeFunction(nf)), _) => ResumeArg::Boxed(LBoxed::box_lvalue(LValue::NClosure(*nf)).bits()),
-                        (_, Some(slot)) => ResumeArg::Integer(slot as i32),
-                        _ => ResumeArg::Failed,
-                    };
                 },
                 CoroutineState::Yielded(YieldOp::UpvalueCell(upvalue)) => {
                     arg = match ctx.upvalue_cell(upvalue) {

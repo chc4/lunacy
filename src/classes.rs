@@ -477,6 +477,15 @@ impl<F: ClassFact> Classes<F> {
         self.find(loc).is_some_and(|class| self.field(class, label).is_some())
     }
 
+    /// Each root holding a value whose field `label` holds what `loc` does, with the label.
+    pub fn parents(&self, loc: Loc) -> Vec<(Root, Label)> {
+        let Some(class) = self.find(loc) else { return Vec::new() };
+        self.fields.iter()
+            .filter(|&&(_, _, target)| self.target_class(target) == Some(class))
+            .flat_map(|&(parent, label, _)| self.roots.iter().filter(move |&&(_, c)| c == parent).map(move |&(root, _)| (root, label)))
+            .collect()
+    }
+
     /// Whether the last field `loc` is reached by is open onto a slot.
     pub fn open_field(&self, loc: Loc) -> bool {
         let Some((&label, parent)) = loc.path.split_last() else { return false };
