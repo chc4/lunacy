@@ -234,45 +234,6 @@ impl Clone for Box<dyn NativeGen> {
     }
 }
 
-/// Whether `yielded` may lay out code reading the frame it runs in past the slots it names: its
-/// closure, the callstack, or the top, or the table of an upvalue a guard on its element finds. See
-/// Note [Inlined frames].
-fn observes(ctx: &Context, yielded: &YieldOp) -> bool {
-    let upvalue = |slot: usize| matches!(ctx.element_of(slot), Some(Root::Upvalue(_)));
-    match yielded {
-        YieldOp::Exec(func) => func.frame,
-        YieldOp::ExecWindow(w) | YieldOp::OptimisticExec(w) | YieldOp::GuardDynamic(w) => w.closure(),
-        YieldOp::Call(CallTarget::Dynamic(a, b, c)) => windowed_call(ctx, *a, *b, *c).is_none(),
-        YieldOp::Call(_) | YieldOp::CallResume(_) | YieldOp::NativeCall { .. } | YieldOp::CollectGarbage => true,
-        YieldOp::Guard(idx, _) => upvalue(*idx),
-        YieldOp::GuardRk(rk, _) | YieldOp::GuardCType(rk, _) => rk & 0x100 == 0 && upvalue(*rk),
-        _ => false,
-    }
-}
-
-/// Whether `yielded` may lay out code, or only asks of or tells the context. See Note [Inlined
-/// frames].
-fn lays_out(ctx: &Context, yielded: &YieldOp) -> bool {
-    let known = |slot: usize, expected: &CType| {
-        let found = &ctx.types[slot];
-        expected.accepts(found) || !found.accepts(expected)
-    };
-    !match yielded {
-        YieldOp::Typeof(_) | YieldOp::TypeofRk(_) | YieldOp::TypeofK(_) | YieldOp::IntegerK(_) | YieldOp::IntegralK(_)
-            | YieldOp::NumberK(_) | YieldOp::BoxedK(_) | YieldOp::SetTypes(_) | YieldOp::SetCTypes(_) | YieldOp::Decided(_)
-            | YieldOp::Effect(_) | YieldOp::EncodeK(..) | YieldOp::HoldsK(..) | YieldOp::IsKey(..)
-            | YieldOp::Subject(_) | YieldOp::ArrayKind(_) | YieldOp::IsElementOf(..) | YieldOp::ArrayType(..)
-            | YieldOp::FrozenElement(..) | YieldOp::Discovered(..) | YieldOp::ValueOf(_) | YieldOp::KnownInteger(_) | YieldOp::NativeWindowArgs(..)
-            | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Created(_) | YieldOp::HoldsValue(..) | YieldOp::FrameUnmade
-            | YieldOp::Quotient(..) | YieldOp::QuotientOf(_) => true,
-        YieldOp::Narrow(slot) => ctx.types[*slot] != CType::Type(LType::Double),
-        YieldOp::Guard(idx, expected) => known(*idx, &CType::Type(*expected)),
-        YieldOp::GuardRk(rk, expected) => rk & 0x100 != 0 || known(*rk, &CType::Type(*expected)),
-        YieldOp::GuardCType(rk, expected) => rk & 0x100 != 0 || known(*rk, expected),
-        _ => false,
-    }
-}
-
 /// A native's generator for its call CALL A B C, given the native itself, for a call of it the
 /// generator lays out as any native's (`YieldOp::NativeCall`).
 pub type NativeGenerator = fn(crate::vm::NativeFunc, usize, usize, usize) -> Box<dyn NativeGen>;
@@ -1367,20 +1328,18 @@ pub enum CallEntry {
 
 // Note [Inlined frames]
 // ~~~~~~~~~~~~~~~~~~~~~~
-// An inlined call's frame is made in two halves, each only once code needs it: the base moved to
-// it (`Enter`), nilling it past the arguments, before code naming its slots, and the rest, its
-// callstack entry and running closure (`Inline`), before code observing them, as an upvalue's
-// access through the closure, a call not inlined, a safepoint, or an exit to the interpreter does;
-// a native's call that runs as a window op is no call. A Lua call's thunk, which doesn't know until
-// it runs whether it inlines its callee, makes them only if it calls, its continuations knowing
-// them made: inlined calls in one another make none of their frames that nothing observes.
-// A callee whose code lays out nothing returns into its caller's having made none of its frame,
-// and one naming only slots, none but the base, which its return moves back (`Leave`). How much of
-// each frame is made is known to the context, so versions differ by it, and is what the code of a
+// An inlined call's frame is made in two halves. The base is moved to it as the call is inlined
+// (`Enter`), nilling it past the arguments. The rest, its callstack entry and running closure
+// (`Inline`), is made only before code observing them: an upvalue's access through the closure, a
+// call not inlined, a safepoint, or an exit to the interpreter. A native's call that runs as a
+// window op is no call. A frame passed a variable number of arguments is made whole at once. A Lua
+// call's thunk, which doesn't know until it runs whether it inlines its callee, makes the frames
+// only if it calls. A callee whose code observes nothing returns with only its base moved back
+// (`Leave`). How much of each frame is made is known to the context, so versions differ by it, and
+// is what the code of a
 // block's function runs in, whatever closure is running: an upvalue of a callee whose frame isn't
 // made is loaded through the closure the call is known to call (`CalledUpval`). An upvalue's value
-// a slot also holds is that slot's, so code naming the slot observes nothing: only a guard whose
-// failure finds an array's kind through an upvalue, holding the table no slot holds, needs it.
+// a slot also holds is that slot's, so code naming the slot observes nothing.
 
 /// A field's or a global's name, hashed: what a store with a key of that name may change. See
 /// Note [Field facts].
@@ -1489,11 +1448,10 @@ pub struct InlineFrame {
     pub continuation: *const Continuation,
 }
 
-/// How much of an inlined call's frame is made: none, the base moved to it (`Enter`), or all of it,
-/// its callstack entry and closure too (`Inline`). See Note [Inlined frames].
+/// How much of an inlined call's frame is made: the base moved to it (`Enter`), or all of it, its
+/// callstack entry and closure too (`Inline`). See Note [Inlined frames].
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Made {
-    No,
     Base,
     Yes,
 }
@@ -1505,11 +1463,9 @@ impl InlineFrame {
         format!("b{}@{}", self.call.0.0, self.call.1)
     }
 
-    /// The residual making the frame from its caller's: nilling it past its arguments, unless code
-    /// in it ran already, which nilled its parameters past them (`Enter`).
+    /// The residual making the rest of the frame, its base moved to it already.
     fn push(&self) -> Residual {
-        let b = if self.made == Made::Base { self.stack as u16 + 1 } else { self.b };
-        Residual::Inline { a: self.a, b, stack: self.stack, cells: self.cells, continuation: self.continuation }
+        Residual::Inline { a: self.a, b: self.stack as u16 + 1, stack: self.stack, cells: self.cells, continuation: self.continuation }
     }
 
     /// The slots `Enter` moves the base on by to it.
@@ -4422,6 +4378,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Make the frames of the inlined calls code in `ctx` is in that aren't, ending `block`: the
     /// block the code goes on in, from `pc`, inside them, and its context. See Note [Inlined
     /// frames].
+    /// Make the frames of the inlined calls `ctx` is in, before a residual observing them, `by`.
+    /// See Note [Inlined frames].
+    fn observe(&mut self, owner: &Owner, block: &mut BlockId, ctx: &mut Rc<Context>, pc: Pc, by: &str) {
+        if ctx.inline.iter().all(|frame| frame.made == Made::Yes) {
+            return;
+        }
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("spec", "frames_made", &[
+            ("line", self.traced_line(owner).into()),
+            ("pc", pc.into()),
+            ("block", block.0.into()),
+            ("by", by.into()),
+        ]);
+        let _ = (owner, by);
+        (*block, *ctx) = self.make_frames(*block, pc, ctx);
+    }
+
     fn make_frames(&mut self, block: BlockId, pc: Pc, ctx: &Context) -> (BlockId, Rc<Context>) {
         let mut made = ctx.clone();
         self.end_block(block);
@@ -4442,21 +4415,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         (inside, Rc::new(made))
     }
 
-    /// Move the base to the frames of the inlined calls code in `ctx` is in that it isn't in, in
-    /// `block`, nilling each past its arguments, as making it would: its code reads a local its
-    /// first instruction declares as nil. See Note [Inlined frames].
-    fn enter(&mut self, ctx: &mut Rc<Context>, block: BlockId) {
-        for frame in Rc::make_mut(ctx).inline.iter_mut().filter(|frame| frame.made == Made::No) {
-            frame.made = Made::Base;
-            #[cfg(feature = "tracing")]
-            crate::tracing::instant("spec", "frame_entered", &[("site", frame.site().as_str().into())]);
-            self.blocks[block.0].instructions.push(Residual::Enter(frame.by() as u16));
-            for slot in frame.b as usize - 1..frame.stack as usize {
-                self.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::LoadNil::new(&[slot]))));
-            }
-        }
-    }
-
     /// Compile on from where compiling an instruction went on to, if it went on.
     fn go_on(&mut self, owner: &mut Owner, compiled: Compiled) {
         if let Some((next, ctx, _, block)) = compiled {
@@ -4475,29 +4433,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
             // An inlined call's return whose frame isn't made: the caller's code after the call goes
-            // on here, the base moved back if it was moved, the results moved to the call's slots.
-            // See Note [Inlined frames].
+            // on here, the base moved back and the results moved to the call's slots. See Note
+            // [Inlined frames].
             if let Some(frame) = ctx.inline.last() && inst.0.Opcode() == Opcode::RETURN && frame.made != Made::Yes {
                 let (a, b) = crate::vm::AB::unpack(inst.0);
                 let (a, b) = (a as usize, b as usize);
                 // SAFETY: an inlined call's continuation lives as long as the code.
                 let continuation = unsafe { &*frame.continuation };
                 let (call, c) = (continuation.a as usize, continuation.c as usize);
-                if let Rest::Next(next) = continuation.rest && b != 0 && c != 0 && c <= b && frame.b != 0 {
-                    let moved = frame.made == Made::Base;
+                if let Rest::Next(next) = continuation.rest && b != 0 && c != 0 && c <= b {
                     let by = frame.by();
                     let (known, effects) = self.returned_context(owner, &ctx, continuation, a, b);
                     self.end_block(block_id);
-                    if moved {
-                        self.blocks[block_id.0].instructions.push(Residual::Leave(by as u16));
-                    }
-                    // A result past the arguments of a frame never entered is nil.
-                    let unset = (frame.made == Made::No).then(|| frame.b as usize - 1);
+                    self.blocks[block_id.0].instructions.push(Residual::Leave(by as u16));
                     for slot in a..a + c - 1 {
-                        let result: Rc<dyn Window> = match unset {
-                            Some(past) if slot >= past => Rc::new(crate::generators::LoadNil::new(&[call + slot - a])),
-                            _ => Rc::new(crate::generators::Move::new(&[call + 1 + slot, call + slot - a])),
-                        };
+                        let result = Rc::new(crate::generators::Move::new(&[call + 1 + slot, call + slot - a]));
                         self.blocks[block_id.0].instructions.push(Residual::ExecWindow(result));
                     }
                     let callee = self.proto;
@@ -5946,7 +5896,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             _ => None,
         }).collect();
         let frame = InlineFrame {
-            call, proto, a: a as u16, effects: Effects::NONE, passed, made: Made::No,
+            call, proto, a: a as u16, effects: Effects::NONE, passed, made: Made::Base,
             b: b as u16, params: unsafe { (*callee).param_count }, stack: unsafe { (*callee).max_stack }, cells: 0, continuation: std::ptr::null(),
             closure: match calling.values.fact(Loc::root(Root::Slot(a as u16)), VALUE) {
                 Some(&Known::Value(bits)) => Some(bits),
@@ -6001,13 +5951,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // entered. See Note [Upvalue cells].
         let own = (1u32 << UPVALUE_CELLS) - 1;
         let cells = entry.filled_cells() & own << (entry.depth() * UPVALUE_CELLS);
-        // Its code from the call's block, its frame unmade until code observes it, so code naming
-        // only its slots runs in its caller's, and code laying out nothing folds into it. See Note
-        // [Inlined frames].
+        // Its code from the call's block, its frame entered, and made already if it was passed a
+        // variable number of arguments. See Note [Inlined frames].
         let shift = self.new_block(self.blocks[block.0].pc);
         let mut entry = entry;
         let frame = entry.inline.last_mut().expect("an inlined call's frame");
         (frame.cells, frame.continuation) = (cells, pointer);
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("spec", "frame_entered", &[("site", frame.site().as_str().into())]);
+        if frame.b == 0 {
+            frame.made = Made::Yes;
+            #[cfg(feature = "tracing")]
+            crate::tracing::instant("spec", "frame_made", &[("site", frame.site().as_str().into())]);
+            self.blocks[shift.0].instructions.push(Residual::Inline { a: frame.a, b: 0, stack: frame.stack, cells: frame.cells, continuation: frame.continuation });
+        } else {
+            self.blocks[shift.0].instructions.push(Residual::Enter(frame.by() as u16));
+            for slot in frame.b as usize - 1..frame.stack as usize {
+                self.blocks[shift.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::LoadNil::new(&[slot]))));
+            }
+        }
         self.compile(owner, 0, Rc::new(entry), shift);
         self.set_current(caller);
         #[cfg(feature = "tracing")]
@@ -6462,27 +6424,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut state = Pin::new(&mut *coro).resume(arg);
             arg = ResumeArg::Start;
             'machine: loop {
-            // Make the inlined calls' frames only as far as this yield needs. Code that observes
-            // a frame needs it made. Code that only runs in it needs just the base moved, unless
-            // the call passed a variable number of arguments. A Lua call's thunk may still inline
-            // its callee, so it makes the frames only when it lays out a call. See Note [Inlined
-            // frames].
-            if let CoroutineState::Yielded(yielded) = &state && ctx.inline.iter().any(|frame| frame.made != Made::Yes) {
-                let unpassed = ctx.inline.iter().any(|frame| frame.made == Made::No && frame.b == 0);
-                let deferred = matches!(yielded, YieldOp::Call(CallTarget::Dynamic(a, ..)) if !matches!(ctx.types[*a], CType::NativeFunction(_)));
-                if (observes(&ctx, yielded) && !deferred) || (unpassed && lays_out(&ctx, yielded)) {
-                    #[cfg(feature = "tracing")]
-                    crate::tracing::instant("spec", "frames_made", &[
-                        ("line", self.traced_line(owner).into()),
-                        ("pc", pc.0.into()),
-                        ("block", block_id.0.into()),
-                        ("by", format!("{yielded:?}").as_str().into()),
-                    ]);
-                    (block_id, ctx) = self.make_frames(block_id, pc.0, &ctx);
-                } else if lays_out(&ctx, yielded) {
-                    self.enter(&mut ctx, block_id);
-                }
-            }
             match state {
                 CoroutineState::Yielded(YieldOp::TypeofK(k)) => {
                     let proto = self.proto;
@@ -6750,6 +6691,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = called.map_or(ResumeArg::Failed, ResumeArg::Boxed);
                 },
                 CoroutineState::Yielded(yielded @ (YieldOp::OptimisticExec(_) | YieldOp::OptimisticEmit(_))) => {
+                    if let YieldOp::OptimisticExec(op) = &yielded && op.closure() {
+                        self.observe(owner, &mut block_id, &mut ctx, pc.0, "OptimisticExec");
+                    }
                     let (operands, accesses, residual): (SmallVec<[usize; 4]>, _, _) = match yielded {
                         YieldOp::OptimisticExec(op) => (op.operands().into(), op.accesses(), Residual::ExecWindow(op)),
                         YieldOp::OptimisticEmit(op) => (op.operands().into(), op.accesses(), Residual::Emit(op)),
@@ -6810,6 +6754,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     } else {
+                        // Its thunk lays out the guard.
+                        if test.closure() {
+                            self.observe(owner, &mut block_id, &mut ctx, pc.0, "GuardDynamic");
+                        }
                         let thunk = Residual::Thunk(self.make_dynamic_thunk(block_id, coro.clone(), test, pc, ctx.clone()));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
@@ -6937,9 +6885,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         },
                         None => Rc::make_mut(&mut ctx).effect(Effect::WriteAny),
                     }
+                    if func.frame {
+                        self.observe(owner, &mut block_id, &mut ctx, pc.0, func.name);
+                    }
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
+                    if w.closure() {
+                        self.observe(owner, &mut block_id, &mut ctx, pc.0, w.name());
+                    }
                     for (&slot, access) in w.operands().iter().zip(w.accesses()) {
                         if access.writes() {
                             Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
@@ -6956,6 +6910,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(Residual::Emit(op));
                 },
                 CoroutineState::Yielded(YieldOp::NativeCall { nf, a, b, c }) => {
+                    self.observe(owner, &mut block_id, &mut ctx, pc.0, "NativeCall");
                     self.blocks[block_id.0].instructions.push(Residual::NativeCall { nf, a: a as u16, b: b as u16, c: c as u16 });
                     // A native may allocate (a table, a string).
                     self.blocks[block_id.0].allocates = true;
@@ -7125,6 +7080,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ctx.values.assign(Root::Slot(slot as u16), Loc::root(Root::Upvalue(upvalue as u8)));
                 },
                 CoroutineState::Yielded(YieldOp::CollectGarbage) => {
+                    // The safepoint its block ends in observes the frames.
+                    self.observe(owner, &mut block_id, &mut ctx, pc.0, "CollectGarbage");
                     self.blocks[block_id.0].allocates = true;
                 },
                 CoroutineState::Yielded(YieldOp::Select(targets)) => {
@@ -7182,12 +7139,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     result = Some(op.result);
                                     pure = true;
                                 } else {
+                                    let (call, is_pure) = (nf.native(), nf.is_pure());
+                                    self.observe(owner, &mut block_id, &mut ctx, pc.0, "NativeCall");
                                     self.blocks[block_id.0].instructions.push(Residual::NativeCall {
-                                        nf: nf.native(), a: a as u16, b: b as u16, c: c as u16
+                                        nf: call, a: a as u16, b: b as u16, c: c as u16
                                     });
                                     // A native may allocate (a table, a string).
                                     self.blocks[block_id.0].allocates = true;
-                                    pure = nf.is_pure();
+                                    pure = is_pure;
                                     // See Note [Call effects].
                                     if !pure {
                                         self.join_effects(owner, Effects::OPAQUE);
