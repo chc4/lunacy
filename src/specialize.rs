@@ -337,8 +337,8 @@ pub enum YieldOp {
 
     HashKey(usize, usize, bool), // Looks up or allocates an HREF for STACK[idx][key]; down its `__index` chain if true (a load). See Note [Table metatables]
     HashKeyNamed(usize, LConstant<'static, 'static>, bool), // `HashKey` of a key known by its value
-    FrameUnmade, // Resumed with the closure the code's inlined call calls, Boxed, if its frame isn't
-                 // made and the closure is known, else Failed. See Note [Inlined frames]
+    FrameUnmade, // Resumed with Matched if the code is an inlined call's whose frame isn't made, else
+                 // Failed. See Note [Inlined frames]
     HoldsValue(usize, usize), // Resumed with Matched if STACK[dest] holds STACK[src]'s value
                               // already, a move between them nothing
     Quotient(usize, usize, i32), // STACK[idx] was just computed as STACK[of] / by, of an integer by a
@@ -1272,7 +1272,8 @@ pub enum CallEntry {
 // of each argument is a place of the callee's code (`Root::Arg`) that none of it writes.
 //
 // A caller's slot that one of the callee's upvalues holds is a place of the callee's code too
-// (`Root::Outer`), named by how far below the callee's frame it is. Reading the upvalue is then a
+// (`Root::Outer`), named by how far below the callee's frame it is. So is the slot just below the
+// frame, which holds the callee's closure while it runs. Reading the upvalue is then a
 // move from that slot. A cell may be open onto any such slot, so a set of an upvalue writes them
 // all.
 //
@@ -1344,7 +1345,7 @@ pub enum CallEntry {
 // (`Leave`). How much of each frame is made is known to the context, so versions differ by it, and
 // is what the code of a
 // block's function runs in, whatever closure is running: an upvalue of a callee whose frame isn't
-// made is loaded through the closure the call is known to call (`CalledUpval`). An upvalue's value
+// made is loaded through its closure, in its caller's slot below the frame (`CalledUpval`). An upvalue's value
 // a slot also holds is that slot's, so code naming the slot observes nothing.
 
 /// A field's or a global's name, hashed: what a store with a key of that name may change. See
@@ -1448,8 +1449,6 @@ pub struct InlineFrame {
     pub b: u16,
     pub params: u8,
     pub stack: u8,
-    /// The closure it calls, boxed, if the caller knows which.
-    pub closure: Option<u64>,
     pub cells: u32,
     pub continuation: *const Continuation,
 }
@@ -1658,6 +1657,7 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
             Root::Outer(below) => Some((below + a as u16 + 1, root)),
             _ => None,
         })
+        .chain([(1, Root::Slot(a as u16))])
         .collect();
     outer.sort();
     outer.dedup();
@@ -1673,6 +1673,13 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
         .chain(outer.iter().map(|&(below, root)| (Root::Outer(below), Loc::root(root))))
         .collect();
     entry.values = closed.view(&map);
+    // Its upvalues are its closure's.
+    for (n, path) in fields.iter().enumerate() {
+        let field = Loc { root: Root::Outer(1), path };
+        if !entry.values.same(field, Loc::root(Root::Upvalue(n as u8))) {
+            entry.values.link(Loc::root(Root::Outer(1)), path[0], Loc::root(Root::Upvalue(n as u8)));
+        }
+    }
     entry.inline = caller.inline.iter().cloned().chain([frame]).collect();
     entry
 }
@@ -5304,7 +5311,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // The runtime kind of the array the element was loaded from.
             // An upvalue's table is read from the running closure's own upvalue; one
             // through another closure isn't, and its element is tested as any value.
-            let array = thunk_ctx.element_of(idx).map(|table| {
+            // An inlined call's frame not made has no running closure to read the upvalue through.
+            // See Note [Inlined frames].
+            let unmade = thunk_ctx.inline.last().is_some_and(|frame| frame.made != Made::Yes);
+            let array = thunk_ctx.element_of(idx).filter(|table| !(unmade && matches!(table, Root::Upvalue(_)))).map(|table| {
                 let value = match table {
                     Root::Slot(slot) => state.vals[state.base + slot as usize],
                     Root::Upvalue(j) => state.upvalue(owner, j as usize),
@@ -5940,10 +5950,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let frame = InlineFrame {
             call, proto, a: a as u16, effects: Effects::NONE, passed, made: Made::Base,
             b: b as u16, params: unsafe { (*callee).param_count }, stack: unsafe { (*callee).max_stack }, cells: 0, continuation: std::ptr::null(),
-            closure: match calling.values.fact(Loc::root(Root::Slot(a as u16)), VALUE) {
-                Some(&Known::Value(bits)) => Some(bits),
-                _ => None,
-            },
         };
         inline_entry(calling, unsafe { &*callee }, a, b, frame)
     }
@@ -6729,8 +6735,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // The closure an inlined call whose frame isn't made calls, if known. See Note
                 // [Inlined frames].
                 CoroutineState::Yielded(YieldOp::FrameUnmade) => {
-                    let called = ctx.inline.last().filter(|frame| frame.made != Made::Yes).and_then(|frame| frame.closure);
-                    arg = called.map_or(ResumeArg::Failed, ResumeArg::Boxed);
+                    arg = if ctx.inline.last().is_some_and(|frame| frame.made != Made::Yes) { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
                 CoroutineState::Yielded(yielded @ (YieldOp::OptimisticExec(_) | YieldOp::OptimisticEmit(_))) => {
                     if let YieldOp::OptimisticExec(op) = &yielded && op.closure() {

@@ -2088,10 +2088,6 @@ windowed!(upvalues GetUpval, [index: usize, cell: usize], [], |owner, state, bas
 });
 // An upvalue of `closure`, the closure an inlined call whose frame isn't made calls, known: the
 // running closure is its caller's until it is. See Note [Inlined frames].
-windowed!(reads CalledUpval, [closure: u64, index: usize], [], |owner, state, base| (out dest) {
-    let LValue::LClosure(clos) = LBoxed::from_bits(closure).unbox() else { unreachable!("an inlined call's closure") };
-    *dest = state.upvalue_of(owner, &clos, index);
-});
 // An upvalue's value, which JIT code loads from its `cell`, holding it. See Note [Upvalue cells].
 windowed!(upvalues UpvalCell, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
     let _ = cell;
@@ -2161,10 +2157,13 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             let _ = index;
             *to = from;
         });
-        let called = match (yield YieldOp::FrameUnmade) {
-            ResumeArg::Boxed(closure) => Some(closure),
-            _ => None,
-        };
+        // One of an inlined call's frame not made, through its closure, below the frame. See Note
+        // [Inlined frames].
+        windowed!(reads CalledUpval, [index: usize], [], |owner, state, base| (closure, out dest) {
+            let LValue::LClosure(clos) = closure.unbox() else { unreachable!("an inlined call's closure") };
+            *dest = state.upvalue_of(owner, &clos, index);
+        });
+        let unmade = matches!(yield YieldOp::FrameUnmade, ResumeArg::Matched);
         match yield YieldOp::UpvalueKnown(b) {
             ResumeArg::Boxed(bits) => {
                 yield YieldOp::ExecWindow(Rc::new(NativeUpval::new(bits, b, &[a])));
@@ -2177,10 +2176,8 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             ResumeArg::Integer(slot) => {
                 yield YieldOp::ExecWindow(Rc::new(HeldUpval::new(b, &[slot as usize, a])));
             },
-            // In an inlined call's frame not made, through its closure, below it. See Note
-            // [Inlined frames].
-            _ if let Some(closure) = called => {
-                yield YieldOp::ExecWindow(Rc::new(CalledUpval::new(closure, b, &[a])));
+            _ if unmade => {
+                yield YieldOp::ExecWindow(Rc::new(CalledUpval::new(b, &[usize::MAX, a])));
             },
             // A load from its cell where that holds its value, else a load storing into it.
             // See Note [Upvalue cells].
