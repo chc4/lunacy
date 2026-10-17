@@ -34,10 +34,18 @@ def main():
     ap.add_argument('--function', help="only the function defined at this line")
     ap.add_argument('--by-pc', action='store_true', help='blocks and bytes per function and pc')
     ap.add_argument('--vs', help="another run's disassembly, to print the differences from")
+    ap.add_argument('--duplicates', action='store_true', help="blocks compiled into more than one region, and the bytes of their copies past the first")
+    ap.add_argument('--where', metavar='KIND', help="each function and pc holding a kind of residual, as `by kind` names it: its uses and bytes there")
     ap.add_argument('--classes', action='store_true', help="bytes by what the instruction is, as jit_samples --classes splits samples: a stack slot's load or store, a move between registers, one with the pinned tag, or anything else; and the kinds of code with the most bytes of moves")
     args = ap.parse_args()
     if args.vs:
         vs(measure(args.vs, args.function), measure(args.disasm, args.function), args.top)
+        return
+    if args.duplicates:
+        duplicates(args.disasm, args.top)
+        return
+    if args.where:
+        where(args.disasm, args.where, args.top)
         return
     by_function, by_block, by_kind, uses, blocks_of, region_total, by_class = measure(args.disasm, args.function)
     report(by_function, by_block, by_kind, uses, blocks_of, region_total, args)
@@ -51,6 +59,55 @@ def main():
         moves = Counter({k: v for (k, what), v in by_class.items() if what == 'move'})
         for k, n in moves.most_common(args.top):
             print(f'  {n:>7} bytes {100 * n / total:5.1f}%  {k}')
+
+
+def where(path, wanted, top):
+    """Each function and pc whose blocks hold residuals of kind `wanted`, by the inline chain of the
+    code (`837-1035` is 1035 inlined into 837's code; the pc is the last function's): their uses and
+    bytes."""
+    uses, sizes = Counter(), Counter()
+    at = kind = None
+    for line in open(path):
+        if REGION.match(line) or OTHER.match(line):
+            at = kind = None
+        elif m := re.match(r'^\s*; block \d+ \(pc (\d+), function ([^,)]+)', line):
+            at, kind = (m.group(2), int(m.group(1))), None
+        elif m := RESIDUAL.match(line):
+            kind = f'{m.group(1)}({m.group(2)})' if m.group(2) else m.group(1)
+            if kind == wanted and at:
+                uses[at] += 1
+        elif (m := INSN.match(line)) and kind == wanted and at:
+            sizes[at] += len(m.group(1)) // 2
+    print(f'{sum(uses.values())} uses, {sum(sizes.values())} bytes of {wanted}')
+    for (chain, pc), n in uses.most_common(top):
+        print(f'  {chain:<24} pc {pc:<4} {n:>4} uses {sizes[(chain, pc)]:>7} bytes')
+
+
+def duplicates(path, top):
+    """Each block's copies, one per region compiling it: the blocks with more than one, and what
+    the copies past the first cost."""
+    copies, sizes, function_of = Counter(), Counter(), {}
+    block = None
+    for line in open(path):
+        if REGION.match(line) or OTHER.match(line):
+            block = None
+        elif m := BLOCK.match(line):
+            block = int(m.group(1))
+            copies[block] += 1
+        elif block is not None and (m := INSN.match(line)):
+            sizes[block] += len(m.group(1)) // 2
+        if m := re.search(r'; block (\d+) \(pc \d+, function (\d+)', line):
+            function_of[int(m.group(1))] = m.group(2)
+    repeated = {b: n for b, n in copies.items() if n > 1}
+    # A block's bytes are summed over its copies, so a copy's are the average.
+    extra = sum(sizes[b] * (n - 1) // n for b, n in repeated.items())
+    print(f'{sum(copies.values())} blocks compiled, {len(copies)} distinct; {len(repeated)} in more than one region, '
+          f'their copies past the first {extra} bytes')
+    by_function = Counter()
+    for b, n in repeated.items():
+        by_function[function_of.get(b, '?')] += sizes[b] * (n - 1) // n
+    for function, extra in by_function.most_common(top):
+        print(f'  :{function:<6} {extra:>8} bytes of copies')
 
 
 def measure(path, only):

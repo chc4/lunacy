@@ -1361,6 +1361,24 @@ hyperfines-knob knob: unsafe-compile
     for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-json working/knob/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{knob}}" "env {{knob}} ./target/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
     python3 tools/knob_table.py working/knob/*.json
 
+# Every HYPERFINES run in the unsafe build with each of `knobs`, environment
+# assignments joined by commas (`LUNACY_SEAL_BUDGET=0,LUNACY_NO_GIVE_UP=1`), and
+# each one's median against the first's (tools/knob_table.py); a run that fails
+# is skipped. Its json in working/knobs/.
+hyperfines-knobs +knobs: unsafe-compile
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf working/knobs && mkdir -p working/knobs
+    for run in {{HYPERFINES}}; do
+        b=${run%:*}; t=${run#*:}
+        just _luac $b
+        python3 tools/clock_check.py
+        commands=()
+        for knob in {{knobs}}; do commands+=(-n "$knob" "env ${knob//,/ } ./target/unsafe/bench working/$b.bin $t"); done
+        {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-json working/knobs/$b-$t.json "${commands[@]}" || echo "skipped $b $t"
+    done
+    python3 tools/knob_table.py working/knobs/*.json
+
 # Every HYPERFINES run in the unsafe build without and with cargo feature
 # `feature` (built into target/feature-<feature>), and the change in each's
 # median (tools/knob_table.py); a run that fails is skipped. Its json in
