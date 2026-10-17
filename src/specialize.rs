@@ -5829,10 +5829,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let returned = (b != 0).then(|| b - 1);
         let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
         let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
-        // A field open onto a slot stays open: what it holds is the slot's.
+        // Only a field known closed holds what the callee's upvalue does: one open onto a slot holds
+        // the slot's, and one not known may be open, as an opaque call forgets every field.
         let map: Vec<(Loc, Loc)> = continuation.closure.into_iter()
             .flat_map(|closure| fields.iter().enumerate().map(move |(n, path)| (Loc { root: closure, path }, Loc::root(Root::Upvalue(n as u8)))))
-            .filter(|&(field, _)| !known.values.open_field(field))
+            .filter(|&(field, _)| known.values.closed_field(field))
             .chain((0..count.min(returned.unwrap_or(0))).map(|i| (Loc::root(Root::Slot((call + i) as u16)), Loc::root(Root::Slot((a + i) as u16)))))
             // A callee's globals are its caller's. See Note [Field facts].
             .chain(ctx.values.roots().filter(|root| matches!(root, Root::Global(_))).map(|root| (Loc::root(root), Loc::root(root))))

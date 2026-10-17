@@ -486,10 +486,11 @@ impl<F: ClassFact> Classes<F> {
             .collect()
     }
 
-    /// Whether the last field `loc` is reached by is open onto a slot.
-    pub fn open_field(&self, loc: Loc) -> bool {
+    /// Whether the last field `loc` is reached by is known to be a closed cell's: one not known
+    /// may be open onto a slot, as what is known of fields is only what wasn't forgotten.
+    pub fn closed_field(&self, loc: Loc) -> bool {
         let Some((&label, parent)) = loc.path.split_last() else { return false };
-        self.find(Loc { root: loc.root, path: parent }).is_some_and(|class| matches!(self.field(class, label), Some(Target::Open(_))))
+        self.find(Loc { root: loc.root, path: parent }).is_some_and(|class| matches!(self.field(class, label), Some(Target::Class(_) | Target::Sealed(_))))
     }
 
     /// Every fact known, of every class.
