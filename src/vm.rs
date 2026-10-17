@@ -1914,9 +1914,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         match clos.ro(owner).upvalues[index].deref().ro(owner) {
             // The running closure's upvalues were captured by an enclosing function,
             // so an open one is a slot of an enclosing frame, not one of this frame's
-            // (which the window may cache).
+            // (which the window may cache). Another closure's may be one of this
+            // frame's, read where the window is stored.
             Upvalue::Open(o) => {
-                debug_assert!(*o < self.base, "open upvalue in the running frame");
+                debug_assert!(*o < self.base || !std::ptr::eq(clos.ro(owner), self.clos.ro(owner)), "open upvalue in the running frame");
                 self.vals[*o as usize]
             },
             Upvalue::Closed(c) => *c.ro(owner),

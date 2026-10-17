@@ -1751,7 +1751,7 @@ fn standalone(ctx: &Context, upvalues: u8) -> Context {
         .chain(ctx.values.roots().filter(|root| matches!(root, Root::Global(_))))
         .map(|root| (root, Loc::root(root)))
         .collect();
-    own.values = ctx.closing(0).view(&map);
+    own.values = ctx.seen().view(&map);
     own
 }
 
@@ -1877,10 +1877,10 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
     }
     let params = 0..(proto.param_count as usize).min(entry.types.len());
     let fields: Vec<[Label; 1]> = (0..proto.upval_count).map(|n| [Label::Upvalue(n)]).collect();
-    let closed = caller.closing(0);
+    let seen = caller.seen();
     // The caller's slots its upvalues hold, and its own callers'. See Note [Inlined calls].
     let mut outer: Vec<(u16, Root)> = fields.iter()
-        .flat_map(|path| closed.members(Loc { root: Root::Slot(a as u16), path }))
+        .flat_map(|path| seen.members(Loc { root: Root::Slot(a as u16), path }))
         .filter_map(|root| match root {
             Root::Slot(slot) if slot as usize <= a => Some((a as u16 + 1 - slot, root)),
             Root::Outer(below) => Some((below + a as u16 + 1, root)),
@@ -1901,7 +1901,9 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
         .chain(args.clone().map(|arg| (Root::Arg((arg - a - 1) as u8), Loc::root(Root::Slot(arg as u16)))))
         .chain(outer.iter().map(|&(below, root)| (Root::Outer(below), Loc::root(root))))
         .collect();
-    entry.values = closed.view(&map);
+    entry.values = seen.view(&map);
+    // Its frame is new: no closure has captured its slots.
+    entry.values.uncaptured(entry.types.len());
     // Its upvalues are its closure's.
     for (n, path) in fields.iter().enumerate() {
         let field = Loc { root: Root::Outer(1), path };
@@ -1917,6 +1919,8 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
 fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize) -> Context {
     let slots = proto.max_stack as usize;
     let mut entry = Context::new(slots);
+    // Its frame is new: no closure has captured its slots. See Note [Value classes].
+    entry.values.uncaptured(slots);
     let passed = if b != 0 { Some(b - 1) } else { caller.top.map(|top| top.saturating_sub(a + 1)) };
     let Some(passed) = passed.filter(|_| proto.is_vararg == 0) else { return entry };
     for param in 0..(proto.param_count as usize).min(slots) {
@@ -2701,10 +2705,11 @@ impl std::fmt::Display for Kind {
 // A closure made here knows its cells. One it captured from a slot is that slot while it is open
 // (an open field), so a write to the slot is one to the upvalue, until a CLOSE or the frame's end
 // closes it: from then on it holds the value the slot had, with the slot's type. One it captured
-// from the running function's upvalue holds that upvalue's value. A slot only the one closure
-// captured is closed into a sealed cell, which only that closure's code reaches: inlined, its sets
-// of the cell are of that cell alone, and falsify nothing else; a set of some unknown upvalue may
-// be the closure's, and forgets it.
+// from the running function's upvalue holds that upvalue's value. A slot only one closure captured
+// is closed into a sealed cell, which only that closure's code reaches: inlined, its sets of the
+// cell are of that cell alone, and falsify nothing else; a set of some unknown upvalue may be the
+// closure's, and forgets it. How many closures captured a slot is held of the slot, not counted
+// from the fields known, which are forgotten (Note [Value classes]).
 //
 // Fields carry facts across inlined calls (Note [Inlined calls]). The callee enters with its own
 // upvalue n holding what the closure's field n does, and its return gives the closure's fields
@@ -2934,6 +2939,9 @@ pub enum Effect {
     Trip,
     /// A table is watched: no table is known not to be. See Note [Watched tables].
     Watch,
+    /// A closure is made of one of the running function's upvalues: its cell may be one open onto
+    /// a caller's slot, which the closure then shares. See Note [Value classes].
+    CaptureUpvalue,
 }
 
 // Note [Call effects]
@@ -2971,8 +2979,10 @@ impl Effects {
     pub const HASH: Effects = Effects(1 << 9);
     /// Some table is watched.
     pub const WATCH: Effects = Effects(1 << 11);
+    /// A closure was made of an upvalue. See Note [Value classes].
+    pub const CAPTURE: Effects = Effects(1 << 12);
     /// Code the specializer never saw ran: every other effect too.
-    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::WATCH.0 | Self::OPAQUE_BIT);
+    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::WATCH.0 | Self::CAPTURE.0 | Self::OPAQUE_BIT);
     /// The representations stored into some table's array part, as `LType::bit`s.
     const ARRAYS: u16 = {
         let mut bits = 0;
@@ -3002,6 +3012,7 @@ impl Effects {
             Effect::ArrayStore(Some(stored)) => Effects(stored.bit() as u16),
             // Its callers' code is replaced as it trips. See Note [Watched tables].
             Effect::Trip => Effects::NONE,
+            Effect::CaptureUpvalue => Effects::CAPTURE,
             Effect::Watch => Effects::WATCH,
         }
     }
@@ -3010,6 +3021,10 @@ impl Effects {
     /// effects may have falsified. `captured` are the caller's slots below the
     /// call's its closures captured, which a set upvalue may be.
     fn apply(self, owner: &mut Owner, ctx: &mut Context, captured: &[usize]) {
+        // A closure the call made of a cell open onto a slot shares it. See Note [Value classes].
+        if self.0 & Self::CAPTURE.0 != 0 {
+            ctx.values.called();
+        }
         if self.0 & Self::OPAQUE_BIT != 0 {
             ctx.effect(Effect::Opaque);
         }
@@ -3143,7 +3158,7 @@ impl Context {
         }
         match effect {
             Effect::Write(slot) => self.values.write(Root::Slot(slot as u16)),
-            Effect::WriteAny => self.values.retain_roots(|root| !matches!(root, Root::Slot(_))),
+            Effect::WriteAny => self.values.write_any(),
             Effect::SetUpvalue(j) => {
                 self.values.write(Root::Upvalue(j as u8));
                 self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_) | Target::Sealed(_)));
@@ -3155,6 +3170,7 @@ impl Context {
             // Code it doesn't see writes any table, upvalue or global, but no slot of the frame:
             // what slots the call does write are written apart. See Note [Fragile information].
             Effect::Opaque => {
+                self.values.called();
                 self.values.retain_fields(|_, _| false);
                 self.values.retain_roots(|root| matches!(root, Root::Slot(_)));
                 self.values.retain_facts(|fact| matches!(fact, Known::Constant { .. }));
@@ -3167,6 +3183,8 @@ impl Context {
             }),
             Effect::Trip => self.values.retain_facts(Known::survives_trip),
             Effect::Watch => self.values.retain_facts(|fact| !matches!(fact, Known::Unwatched)),
+            // Of a caller's cell, not this frame's: only its caller forgets.
+            Effect::CaptureUpvalue => {},
         }
         self.inlined(Effects::of(effect));
     }
@@ -3448,6 +3466,20 @@ impl Context {
     /// value its slot had, with the slot's type, but not that it is a constant, which only a
     /// slot's load is rebuilt for (Note [Widening]). See Note [Upvalue paths].
     fn closing(&self, from: usize) -> Values {
+        let mut values = self.open_typed(from);
+        values.close(from as u16);
+        values
+    }
+
+    /// What another frame's view sees (`Values::view`): each slot an upvalue is open into has
+    /// its type, as `closing`, but stays open, as its cell does.
+    fn seen(&self) -> Values {
+        self.open_typed(0)
+    }
+
+    /// The values, each slot from `from` on an upvalue is open into knowing its type and not that
+    /// it is a constant.
+    fn open_typed(&self, from: usize) -> Values {
         let mut values = self.values.clone();
         for slot in values.open_slots().into_iter().filter(|&slot| slot as usize >= from) {
             let at = Loc::root(Root::Slot(slot));
@@ -3456,7 +3488,6 @@ impl Context {
             }
             values.forget(at, CONSTANT);
         }
-        values.close(from as u16);
         values
     }
 
@@ -5911,11 +5942,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let returned = (b != 0).then(|| b - 1);
         let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
         let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
-        // Only a field known closed holds what the callee's upvalue does: one open onto a slot holds
-        // the slot's, and one not known may be open, as an opaque call forgets every field.
+        // A field open onto a slot stays open: what it holds is the slot's. Any other holds what the
+        // callee's upvalue does, until a write to a slot a cell may be open onto. See Note [Value
+        // classes].
         let map: Vec<(Loc, Loc)> = continuation.closure.into_iter()
             .flat_map(|closure| fields.iter().enumerate().map(move |(n, path)| (Loc { root: closure, path }, Loc::root(Root::Upvalue(n as u8)))))
-            .filter(|&(field, _)| known.values.closed_field(field))
+            .filter(|&(field, _)| !known.values.open_field(field))
             .chain((0..count.min(returned.unwrap_or(0))).map(|i| (Loc::root(Root::Slot((call + i) as u16)), Loc::root(Root::Slot((a + i) as u16)))))
             // A callee's globals are its caller's. See Note [Field facts].
             .chain(ctx.values.roots().filter(|root| matches!(root, Root::Global(_))).map(|root| (Loc::root(root), Loc::root(root))))
@@ -7526,13 +7558,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Captures(closure, upvalues)) => {
                     // See Note [Upvalue paths].
                     let ctx = Rc::make_mut(&mut ctx);
+                    let mut shares = false;
                     for (n, (from, index)) in upvalues.into_iter().enumerate() {
                         let at = Loc::root(Root::Slot(closure as u16));
                         if from == Opcode::MOVE {
                             ctx.values.alias(at, Label::Upvalue(n as u8), index as u16);
                         } else {
                             ctx.values.link(at, Label::Upvalue(n as u8), Loc::root(Root::Upvalue(index as u8)));
+                            shares = true;
                         }
+                    }
+                    // See Note [Value classes].
+                    if shares {
+                        ctx.effect(Effect::CaptureUpvalue);
+                        self.join_effects(owner, Effects::CAPTURE);
                     }
                 },
                 CoroutineState::Yielded(YieldOp::Close(from)) => {
