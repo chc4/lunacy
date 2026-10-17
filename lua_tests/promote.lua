@@ -66,7 +66,7 @@ print(total)
 
 -- A whole double, a string, a constant, and all of a call's results; and a
 -- promote in a function of its own, so each call's version of it starts with no
--- green and tests the values in turn: more of them than a version tests.
+-- promoted value and tests the values in turn: more of them than a version tests.
 local function pick(v) return promote(v) + 0 end
 local function others(n)
   local sum = 0

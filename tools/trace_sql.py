@@ -11,9 +11,12 @@ The specializer's are also views, one column per argument:
       block, the versions at the pc after it, the context requested, the join
       (if one was made), how many of the context's shapes it lost, and where
       each of its fragile facts was introduced (`fact <- block@offset,...`).
-  spec_block(ts, block, line, pc, context)
+  spec_block(ts, block, line, pc, context, inline)
       each version created, whatever became of it since: counting its rows
       counts versions ever made, not versions in the graph (`point_versions`).
+      `inline` is the inlined calls it is in, as `jit_disasm` names
+      functions: each caller's line at the block its call is in, then its own
+      line (`101@b5-71`).
   version_fate(ts, block, line, pc, fate, at)
       each version created (as `spec_block`), and what became of it: `live`,
       in the graph at the end; `forgotten` by a contraction, or `evicted` from
@@ -24,17 +27,36 @@ The specializer's are also views, one column per argument:
       fate is that of its id until the id's next version.
   point_versions(line, pc, created, live, unreachable, evicted, forgotten)
       per point, its versions by fate: `live` and `unreachable` are what the
-      graph has there at the end. How often a version ran isn't in a trace:
+      graph has there at the end. Every inlined copy of a function's point
+      is pooled; `site_versions(inline, pc, ...)` counts each copy's apart. How often a version ran isn't in a trace:
       `just jit-profile` samples the JIT's, the interpreter tier's graph dump
       (`just window-runs`) counts every entry.
-  block_summary(block, line, pc, residuals, code, context, hotness, jitted, returns, returned_from, unreachable)
+  block_summary(block, line, pc, residuals, code, context, hotness, jit_entry, compiled, returns, returned_from, unreachable)
       every block at the end of the run (line 0 for one no version names),
+      whether JIT code is entered at it from the interpreter (`jit_entry`), and
+      whether it has JIT code at all, in any region (`compiled`),
       with the return ids its returns return with, those its call
       continuations guard on (comma separated), and whether the trimming
       found it unreachable (forgotten once its point needs the room).
       `hotness` counts down from 64, one for each time the interpreter
       entered the block, to 0 when it tiers up: 64 is never entered there, 0
       is compiled, and JIT code's entries don't count.
+  inline_refused(line, callee, call_block, reason)
+      each call's continuation that didn't inline its callee: `compiled` (its
+      call's block had JIT code by its first return), `relaid` (the call was
+      laid out again), or `policy` (`inlines` says no: size, depth, loops).
+  frames_made(line, pc, block, by)
+      each place code makes the frames of the inlined calls it is in, in
+      `block` of the function at `line`: `by` the yield observing them, or
+      the return opcode returning from one.
+  inline_calls(line, pc, callee, copies, entered, made)
+      each call inlined, the function at `line`'s call at `pc` of the
+      function defined at `callee`: how many copies of it were laid out, one
+      in each version of the caller's block holding the call, and in how many
+      of them its frame was entered and made.
+  inline_copies(site, line, pc, callee, entered, made)
+      each copy of an inlined call, at `site` (its call's block and offset):
+      whether its frame was entered (the base moved) and made.
   alloc_step(trace, step, line, block, pc, off)
       each step of each trace the window planner planned: the block it is in
       and, for a residual, its offset (a block's start's is 2^64-1).
@@ -107,8 +129,8 @@ from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 VIEWS = {
     'spec_version': ['line', 'pc', 'outcome', 'block', 'versions', 'context', 'joined', 'shapes_dropped', 'origins'],
-    'spec_block': ['block', 'line', 'pc', 'context'],
-    'block_summary': ['block', 'line', 'pc', 'residuals', 'code', 'context', 'hotness', 'jitted', 'returns', 'returned_from', 'unreachable'],
+    'spec_block': ['block', 'line', 'pc', 'context', 'inline'],
+    'block_summary': ['block', 'line', 'pc', 'residuals', 'code', 'context', 'hotness', 'jit_entry', 'compiled', 'returns', 'returned_from', 'unreachable'],
     'alloc_step': ['trace', 'step', 'line', 'block', 'pc', 'off'],
     'alloc_start': ['trace', 'step', 'rise', 'arrives', 'worth', 'entry'],
     'alloc_op': ['trace', 'step', 'name', 'before', 'worth', 'skip', 'emits', 'after'],
@@ -120,9 +142,16 @@ VIEWS = {
     'encoding': ['line', 'pc', 'block', 'encoding'],
     'widen': ['line', 'slot', 'block', 'origins', 'queued'],
     'evicted': ['line', 'pc', 'blocks'],
-    'inline': ['line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
+    'inline': ['site', 'line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
     'inline_return': ['line', 'callee', 'after', 'block', 'context'],
     'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'inlines', 'why'],
+    'inline_refused': ['line', 'callee', 'call_block', 'reason'],
+    'frames_made': ['line', 'pc', 'block', 'by'],
+    'frame_entered': ['site'],
+    'frame_made': ['site'],
+    'jit_bailout': ['reason', 'block_id', 'off', 'source', 'line'],
+    'jit_compile': ['block_id', 'source', 'line'],
+    'jit_region': ['root', 'reached', 'selected', 'root_weight', 'under_1', 'under_10', 'under_25', 'under_50', 'under_100'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
           'alloc_step': ('alloc', 'step'), 'alloc_start': ('alloc', 'start'), 'alloc_op': ('alloc', 'op'),
@@ -131,7 +160,11 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'unreachable': ('spec', 'unreachable'), 'encoding': ('spec', 'encoding'),
           'widen': ('spec', 'widen'), 'evicted': ('spec', 'evicted'),
           'inline': ('spec', 'inline'), 'inline_return': ('spec', 'inline_return'),
-          'inline_cost': ('spec', 'inline_cost')}
+          'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused'),
+          'frames_made': ('spec', 'frames_made'),
+          'frame_entered': ('spec', 'frame_entered'), 'frame_made': ('spec', 'frame_made'),
+          'jit_bailout': ('jit', 'bailout'), 'jit_compile': ('jit', 'compile'),
+          'jit_region': ('jit', 'region')}
 
 
 def connect(trace):
@@ -143,6 +176,12 @@ def connect(trace):
         tp.query(f"CREATE PERFETTO VIEW {view} AS SELECT ts, {extracted} FROM slice "
                  f"WHERE category = '{category}' AND name = '{name}'")
     fates(tp)
+    tp.query("CREATE PERFETTO VIEW inline_copies AS SELECT i.site, i.line, i.pc, i.callee, "
+             "EXISTS (SELECT 1 FROM frame_entered e WHERE e.site = i.site) AS entered, "
+             "EXISTS (SELECT 1 FROM frame_made m WHERE m.site = i.site) AS made "
+             "FROM (SELECT DISTINCT site, line, after - 1 AS pc, callee FROM inline) i")
+    tp.query("CREATE PERFETTO VIEW inline_calls AS SELECT line, pc, callee, COUNT(*) AS copies, "
+             "SUM(entered) AS entered, SUM(made) AS made FROM inline_copies GROUP BY line, pc, callee")
     return tp
 
 
@@ -154,7 +193,7 @@ def ids(text):
 def fates(tp):
     """The `version_fate` table and its `point_versions` summary: each version's
     fate, found from the events forgetting versions, within its block id's life."""
-    created = [(r.ts, r.block, r.line, r.pc) for r in tp.query("SELECT ts, block, line, pc FROM spec_block ORDER BY ts")]
+    created = [(r.ts, r.block, r.line, r.pc, r.inline) for r in tp.query("SELECT ts, block, line, pc, inline FROM spec_block ORDER BY ts")]
     if not created:
         return
     # Each block id's events forgetting its version, in time order.
@@ -169,12 +208,12 @@ def fates(tp):
     # When each block id's next version is created.
     following = {}
     last = {}
-    for i, (ts, block, _, _) in enumerate(created):
+    for i, (ts, block, _, _, _) in enumerate(created):
         if block in last:
             following[last[block]] = ts
         last[block] = i
     rows = []
-    for i, (ts, block, line, pc) in enumerate(created):
+    for i, (ts, block, line, pc, inline) in enumerate(created):
         until = following.get(i)
         end = next(((at, fate) for at, fate in sorted(ends.get(block, [])) if at >= ts and (until is None or at < until)), None)
         if end:
@@ -183,9 +222,14 @@ def fates(tp):
             fate, at = 'forgotten', until
         else:
             fate, at = ('unreachable' if block in unreachable else 'live'), None
-        rows.append(f"({ts}, {block}, {line}, {pc}, '{fate}', {'NULL' if at is None else at})")
-    tp.query("CREATE PERFETTO TABLE version_fate AS WITH fates(ts, block, line, pc, fate, at) AS "
+        sql = lambda v: 'NULL' if v is None else v
+        rows.append(f"({ts}, {sql(block)}, {sql(line)}, {sql(pc)}, '{fate}', {sql(at)}, {'NULL' if inline is None else repr(str(inline))})")
+    tp.query("CREATE PERFETTO TABLE version_fate AS WITH fates(ts, block, line, pc, fate, at, inline) AS "
              f"(VALUES {', '.join(rows)}) SELECT * FROM fates")
+    tp.query("CREATE PERFETTO VIEW site_versions AS SELECT inline, pc, COUNT(*) AS created, "
+             "SUM(fate = 'live') AS live, SUM(fate = 'unreachable') AS unreachable, "
+             "SUM(fate = 'evicted') AS evicted, SUM(fate = 'forgotten') AS forgotten "
+             "FROM version_fate GROUP BY inline, pc")
     tp.query("CREATE PERFETTO VIEW point_versions AS SELECT line, pc, COUNT(*) AS created, "
              "SUM(fate = 'live') AS live, SUM(fate = 'unreachable') AS unreachable, "
              "SUM(fate = 'evicted') AS evicted, SUM(fate = 'forgotten') AS forgotten "

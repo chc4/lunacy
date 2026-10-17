@@ -1,6 +1,6 @@
 -- The library functions written in Lua: those a native can't be, as they keep
 -- state between calls or call a function. Run before every program, in its
--- global environment. See Note [Library natives] in `library`.
+-- global environment. See Note [Library natives].
 
 local find, sub, len = string.find, string.sub, string.len
 local native_gsub = string.gsub
@@ -142,4 +142,24 @@ end
 
 function table.sort(t, lt)
   auxsort(t, 1, #t, lt or less)
+end
+
+-- Lua's `ipairs(t)`: t[1], t[2], ... up to the first nil, each with its index.
+local function ipairs_next(t, i)
+  i = i + 1
+  local v = t[i]
+  if v ~= nil then
+    return i, v
+  end
+end
+
+function ipairs(t)
+  return ipairs_next, t, 0
+end
+
+-- Lua's `pairs(t)`: every entry of `t`, as `next` walks them.
+local next = next
+
+function pairs(t)
+  return next, t, nil
 end

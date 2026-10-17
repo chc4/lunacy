@@ -4,7 +4,7 @@ a run's `window_dump.txt` (`just window-dump`): per op (by its residual's
 name), the executions of copies whose output the window then holds unboxed in
 an XMM register (`x`) and boxed in a general register (`w`), most run first.
 An op runs as often as the counted code it emits (its line's `#N`); its output
-is the slot after `out`. See Note [Unboxed doubles] in `window_alloc`.
+is the slot after `out`. See Note [Unboxed doubles].
 
     window_forms.py [working/window_dump.txt] [--op PREFIX]
 """

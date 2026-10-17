@@ -31,6 +31,84 @@ const INITIAL_HOTNESS: usize = 0;
 #[cfg(not(feature = "immediate_jit"))]
 const INITIAL_HOTNESS: usize = 64;
 
+// Note [Edge counts]
+// ~~~~~~~~~~~~~~~~~~
+// The interpreter counts how often it goes from one block to another, in hashed counters that
+// are all halved now and then. A count says how often an edge ran recently, relative to the rest.
+//
+// A block without code compiles once an edge into it has run `HOT_EDGE` times recently, if that
+// edge is where a region should start: a back edge, a call or return, or an entry after a JIT
+// exit. Forward edges inside a function only count, so regions start at loop headers and function
+// entries, never inside a loop. An entry after a JIT exit counts extra, since the code it left
+// was compiled without it.
+//
+// A region reads its edges' counts when it compiles, to choose its blocks, its traces and its
+// fall-through jumps.
+
+// Note [Region selection]
+// ~~~~~~~~~~~~~~~~~~~~~~~~
+// A region compiles the blocks it reaches that ran recently enough: those whose incoming edges
+// weigh at least `REGION_PERCENT` percent of its root. It keeps every jump between them, so a
+// loop that ran is compiled whole.
+//
+// A jump to a block outside the region is a cold edge. It exits to the interpreter, which counts
+// the block toward compiling it as a region of its own. Once the block has code the edge is linked
+// to it, as a thunk is. A forced region takes every block it reaches.
+
+/// The least weight of a block in a region, in percent of its root's. See Note [Region
+/// selection].
+const REGION_PERCENT: u32 = 1;
+
+/// The counters of `Edges`: a power of two.
+const EDGES: usize = 1 << 16;
+/// The counts in all after which every counter is halved. See Note [Edge counts].
+const EDGE_DECAY: u32 = 1 << 16;
+/// The recent count of an edge entering a block without code that compiles it. See Note [Edge
+/// counts].
+pub const HOT_EDGE: u16 = 128;
+/// How many times an entry right after JIT code exits counts. See Note [Edge counts].
+pub const EXIT_COUNT: u16 = 4;
+
+/// How often the interpreter went from one block to another, recently. See Note [Edge counts].
+pub struct Edges {
+    counts: Box<[u16]>,
+    /// Counts since the counters were last halved.
+    since: u32,
+}
+
+impl Edges {
+    fn new() -> Self {
+        Edges { counts: vec![0; EDGES].into_boxed_slice(), since: 0 }
+    }
+
+    /// The counter of the edge from `from` to `to`.
+    fn index(from: BlockId, to: BlockId) -> usize {
+        let mut hash = (from.0 as u64) << 32 | to.0 as u64;
+        hash ^= hash >> 23;
+        hash = hash.wrapping_mul(0x2127599bf4325c37);
+        hash ^= hash >> 47;
+        hash as usize & (EDGES - 1)
+    }
+
+    /// The recent count of the edge from `from` to `to`.
+    fn recent(&self, from: BlockId, to: BlockId) -> u16 {
+        self.counts[Self::index(from, to)]
+    }
+
+    /// Count the edge from `from` to `to` `by` times, and its recent count.
+    pub fn count(&mut self, from: BlockId, to: BlockId, by: u16) -> u16 {
+        let counter = &mut self.counts[Self::index(from, to)];
+        *counter = counter.saturating_add(by);
+        let recent = *counter;
+        self.since += by as u32;
+        if self.since >= EDGE_DECAY {
+            self.since = 0;
+            self.counts.iter_mut().for_each(|count| *count >>= 1);
+        }
+        recent
+    }
+}
+
 #[derive(Debug)]
 pub struct JitInfo {
     pub buffer: Option<ExecutableBuffer>,
@@ -84,8 +162,7 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
 //
 // A target compiled with a thunk waiting to be linked into it, the thunk whose
 // path got it hot, plans its region from that thunk's window: it is the hint
-// its entry window starts from (see Note [Trace allocation] in
-// `window_alloc`).
+// its entry window starts from (see Note [Trace allocation]).
 
 // Note [Snapshots]
 // ~~~~~~~~~~~~~~~~
@@ -108,7 +185,7 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
 //
 // A store of an unboxed register names its XMM half, which `flush_snapshot`
 // saves next to the general registers and boxes as it stores it. See Note
-// [Unboxed doubles] in `window_alloc`.
+// [Unboxed doubles].
 
 /// A five-byte nop: the room a thunk site leaves for a `jmp rel32`.
 const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
@@ -184,10 +261,16 @@ impl JitHelper {
             match state.vals[state.base + a as usize].unbox() {
                 LValue::NClosure(ncall) => {
                     state.call_native(ncall.native(), a, b, c, owner);
+                    // A tripped watchpoint exits, past the call's `Arrive`. See Note [Watched
+                    // tables].
+                    if crate::vm::TRIPPED.load(std::sync::atomic::Ordering::Relaxed) {
+                        state.trap = true;
+                        state.current_off = (Location::unpack(PackedLocation::from_bits(ret as usize)).1 + 1) as _;
+                    }
                     1
                 }
                 // Inside frames JIT code called, the interpreter makes the call, once the callstack
-                // is whole. See Note [Frame ops] in `specialize`.
+                // is whole. See Note [Frame ops].
                 LValue::LClosure(_) if state.jit_depth > 0 => 0,
                 LValue::LClosure(lclos) => {
                     let Some(entry) = spec.lua_entry(owner, &lclos) else { return 0 };
@@ -203,7 +286,7 @@ impl JitHelper {
     /// The entry of the frame a call from JIT code made, which a bailout is unwinding, from what
     /// the call kept on the native stack at `kept` (the frame's caller's hash witnesses' top and
     /// base, base, and closure, in that order up the stack) and its return location `ret`. Gives
-    /// back the bailout's `exit`, for the call to leave with. See Note [Frame ops] in `specialize`.
+    /// back the bailout's `exit`, for the call to leave with. See Note [Frame ops].
     pub unsafe extern "C" fn unwind_frame(state: *mut (), kept: *const u64, ret: u64, exit: u64) -> u64 {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
@@ -214,9 +297,57 @@ impl JitHelper {
         }
     }
 
+    /// `RunState::own_frame`, of the frame an inlined call's code made a call's. See Note [Sealed
+    /// inlined calls].
+    pub unsafe extern "C" fn own_frame(state: *mut ()) {
+        unsafe {
+            let state = &mut *(state as *mut RunState<'static, 'static>);
+            state.own_frame(crate::forge_owner());
+        }
+    }
+
     /// The entry of the frame of the innermost inlined call JIT code is in, written as it unwinds
     /// a bailout, from what its code keeps on the native stack at `kept` (as `adopt_inlined` lays
-    /// it out). See Note [Inlined calls] in `specialize`.
+    /// it out). See Note [Inlined calls].
+    /// Fill the upvalue cells `cells` names, of JIT code `depth` inlined calls deep: each frame's
+    /// upvalue of its closure, the running one for the innermost frame, else the one `kept`
+    /// keeps for it (as `RunState::adopt_inlined` lays them out). The cells are below `rbp`, the
+    /// activation's frame pointer. See Note [Upvalue cells].
+    pub unsafe extern "C" fn fill_cells(state: *mut (), kept: *const u64, rbp: *mut u64, cells: u32, depth: usize) {
+        unsafe {
+            let state = &*(state as *const RunState<'static, 'static>);
+            let owner = crate::forge_owner();
+            let mut cells = cells;
+            while cells != 0 {
+                let cell = cells.trailing_zeros() as usize;
+                cells &= cells - 1;
+                let (frame, upvalue) = (cell / crate::specialize::UPVALUE_CELLS, cell % crate::specialize::UPVALUE_CELLS);
+                if frame > depth {
+                    break;
+                }
+                let clos = match frame == depth {
+                    true => state.clos.clone(),
+                    false => Tc(crate::gc::Gc::from_addr(*kept.add(crate::vm::INLINE_KEPT * (depth - 1 - frame) + 5))),
+                };
+                if upvalue < clos.ro(owner).upvalues.len() {
+                    *rbp.sub(cell_slot(cell)) = state.upvalue_of(owner, &clos, upvalue).bits();
+                }
+            }
+        }
+    }
+
+    /// Debug builds: check that upvalue cell `cell`, which JIT code just read `value` from,
+    /// holds upvalue `index` of the running closure. See Note [Upvalue cells].
+    #[cfg(debug_assertions)]
+    pub unsafe extern "C" fn check_cell(state: *mut (), value: u64, index: usize, cell: usize) {
+        unsafe {
+            let state = &*(state as *const RunState<'static, 'static>);
+            let owner = crate::forge_owner();
+            let held = state.upvalue(owner, index);
+            assert_eq!(held.bits(), value, "upvalue cell {cell} (depth {}, upvalue {index}) holds {:?}, not the upvalue's {:?}", cell / crate::specialize::UPVALUE_CELLS, LBoxed::from_bits(value), held);
+        }
+    }
+
     pub unsafe extern "C" fn unwind_inlined(state: *mut (), kept: *const u64) {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
@@ -227,7 +358,7 @@ impl JitHelper {
     }
 
     /// `RunState::adopt_inlined`, of `depth` inlined calls' entries, into the native stack at
-    /// `kept`, entering JIT code in the innermost. See Note [Inlined calls] in `specialize`.
+    /// `kept`, entering JIT code in the innermost. See Note [Inlined calls].
     pub unsafe extern "C" fn adopt_inlined(state: *mut (), kept: *mut u64, depth: usize) {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
@@ -235,8 +366,7 @@ impl JitHelper {
         }
     }
 
-    /// Raise `error`, a native's, called from JIT code. See Note [Errors] in
-    /// `specialize`.
+    /// Raise `error`, a native's, called from JIT code. See Note [Errors].
     pub unsafe extern "C" fn raise(state: *mut (), error: u64) {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
@@ -251,6 +381,10 @@ impl JitHelper {
             let state = &mut *(state as *mut RunState<'static, 'static>);
             let nf: crate::vm::NativeFunc = core::mem::transmute(nf);
             state.call_native(nf, a, b, 0, crate::forge_owner());
+            // A tripped watchpoint exits, after the call. See Note [Watched tables].
+            if crate::vm::TRIPPED.load(std::sync::atomic::Ordering::Relaxed) {
+                state.trap = true;
+            }
         }
     }
 
@@ -259,6 +393,20 @@ impl JitHelper {
     /// hadn't found: the version's code if it has some now, its frame pushed,
     /// else as `dynamic_call`. `ret` names the call, as the residual before it.
     /// See Note [Call sites].
+    /// The code of R(A)'s entry, if R(A) is a Lua function that isn't vararg and its entry has
+    /// some: a `Call` to it is then a `LuaCall` found as it runs. Else 0. See Note [Call sites].
+    pub unsafe extern "C" fn lua_code(spec: *mut (), state: *mut (), a: u16) -> usize {
+        unsafe {
+            let spec = &mut *(spec as *mut Specializer<'static, 'static>);
+            let state = &*(state as *const RunState<'static, 'static>);
+            let owner = crate::forge_owner();
+            match state.vals[state.base + a as usize].unbox() {
+                LValue::LClosure(lclos) if (*lclos.ro(owner).prototype).is_vararg == 0 => spec.lua_entry(owner, &lclos).map_or(0, |code| code as usize),
+                _ => 0,
+            }
+        }
+    }
+
     pub unsafe extern "C" fn lua_call(spec: *mut (), state: *mut (), ret: u64, a: u16, b: u16, c: u16) -> usize {
         unsafe {
             let specializer = &mut *(spec as *mut Specializer<'static, 'static>);
@@ -267,7 +415,7 @@ impl JitHelper {
             if let Residual::LuaCall { entry: CallEntry::Block(entry), .. } = &specializer.blocks[block].instructions[call] {
                 if let Some(code) = specializer.blocks[entry.0].jit_info.entry {
                     let state = &mut *(state as *mut RunState<'static, 'static>);
-                    // As `dynamic_call`'s. See Note [Frame ops] in `specialize`.
+                    // As `dynamic_call`'s. See Note [Frame ops].
                     if state.jit_depth > 0 {
                         return 0;
                     }
@@ -385,7 +533,7 @@ enum PoolEntry {
     Snapshot(Snapshot),
     /// A site's record: the absolute address of where each of its exits goes,
     /// then the displacement from the record to each capture's value entry, as
-    /// an `i32`. See Note [Cold stencils] in `window`.
+    /// an `i32`. See Note [Cold stencils].
     /// With the op's name and captures, for disassembly.
     Record([DynamicLabel; EXITS], SmallVec<[DynamicLabel; 4]>, &'static str, Captures),
 }
@@ -394,7 +542,7 @@ enum PoolEntry {
 struct Snapshot {
     /// Where the flush is.
     location: PackedLocation,
-    /// How many inlined calls deep it is. See Note [Inlined calls] in `specialize`.
+    /// How many inlined calls deep it is. See Note [Inlined calls].
     depth: usize,
     /// The window register index, whether its value is unboxed, and slot of
     /// each store, past the running frame's base.
@@ -427,35 +575,47 @@ struct Pool {
     values: HashMap<u64, DynamicLabel, FxBuildHasher>,
     stubs: Vec<(DynamicLabel, Stub)>,
     /// The region's exit for code each number of inlined calls deep: writing those calls'
-    /// entries, then leaving. See Note [Inlined calls] in `specialize`.
+    /// entries, then leaving. See Note [Inlined calls].
     exits: Vec<DynamicLabel>,
     /// The most inlined calls deep the region's code is, past which it has no exits.
     deepest: usize,
+    /// The cold code of each emitted op on each assignment of registers this region lays out, as
+    /// `JitContext::emitted_colds` keys them.
+    colds: HashMap<(&'static str, SmallVec<[u8; WINDOW]>), DynamicLabel, FxBuildHasher>,
 }
 
 /// Code a region lays out after its blocks, off its hot paths.
 enum Stub {
-    /// The way from a copy into its cold stencil: the site's record's address
-    /// into `cold_site`, then the jump. See Note [Cold stencils] in `window`.
-    ColdEntry { record: DynamicLabel, cold: usize },
+    /// A `PatchableJump`'s exit to the interpreter, with `snapshot`, once unlinked.
+    Exit { snapshot: DynamicLabel },
+    /// The way from a copy into its cold stencil, or an emitted op's cold code: the site's
+    /// record's address into `cold_site`, then the jump. See Note [Cold stencils].
+    ColdEntry { record: DynamicLabel, cold: JumpTo },
+    /// An emitted op's cold code on `regs`, which every site of it on those registers shares,
+    /// `key` its key in `JitContext::emitted_colds`: the site's record's address into r10, then
+    /// the code. See Note [Emitted ops].
+    EmittedCold { cold: crate::emitted::Cold, regs: SmallVec<[u8; WINDOW]>, key: (&'static str, SmallVec<[u8; WINDOW]>) },
     /// The way an op's exit takes, off the hot path, to a target of the
     /// `Select` or `Branch` after it: out of its copy's alignment if `aligned`,
-    /// the window's moves, then the jump. See Note [Window exits] in `window`.
+    /// the window's moves, then the jump. See Note [Window exits].
     /// With `count`, the window dump's counter of its moves.
     Way { aligned: bool, moves: SmallVec<[Emit; 16]>, to: JumpTo, count: Option<i64>, offset: usize },
     /// An exit of an op that selects with no `Select` or `Branch` after it:
     /// out of its copy's alignment if `aligned`, the exit to `select`, then on
-    /// at `join`. See Note [Window exits] in `window`.
+    /// at `join`. See Note [Window exits].
     Select { aligned: bool, exit: usize, join: DynamicLabel },
 }
 
 /// How many slots past the base of the frame of the code a window is of the frame of the code
 /// past `res` is, `offset` before it: the window names slots from that base, so a value keeps its
-/// name across an inlined call. See Note [Inlined calls] in `specialize`.
+/// name across an inlined call. See Note [Inlined calls].
 fn offset_past(res: &Residual, offset: usize) -> usize {
     match res {
         Residual::Inline { a, .. } => offset + *a as usize + 1,
         Residual::InlineReturn { call, .. } => offset - (*call as usize + 1),
+        Residual::Uninline { a, .. } => offset - (*a as usize + 1),
+        Residual::Enter(by) => offset + *by as usize,
+        Residual::Leave(by) => offset - *by as usize,
         _ => offset,
     }
 }
@@ -491,7 +651,7 @@ impl Pool {
     }
 
     /// The label of a new entry holding the record of a site whose exits go
-    /// to `exits`, with `captures`. See Note [Cold stencils] in `window`.
+    /// to `exits`, with `captures`. See Note [Cold stencils].
     fn record(&mut self, ops: &mut Assembler, exits: [DynamicLabel; EXITS], name: &'static str, captures: &Captures) -> DynamicLabel {
         let values = captures.iter().map(|&value| self.value(ops, value)).collect();
         let label = ops.new_dynamic_label();
@@ -536,7 +696,7 @@ pub struct Stencils {
 impl Stencils {
     /// The op the JIT copies for `op`: its twin, which takes some operands
     /// unboxed, if it has one whose stencils copy, else `op` itself, the same
-    /// each time. See Note [Unboxed doubles] in `window_alloc`.
+    /// each time. See Note [Unboxed doubles].
     fn effective(&mut self, op: &Rc<dyn Window>) -> Rc<dyn Window> {
         let key = Rc::as_ptr(op) as *const () as usize;
         if let Some((_, w)) = self.twins.get(&key) {
@@ -551,7 +711,7 @@ impl Stencils {
     }
 
     /// The body of `op`'s stencil at `skip`, falling through to its exit
-    /// `fall_exit`. See Note [Exit stencils] in `window`.
+    /// `fall_exit`. See Note [Exit stencils].
     fn body(&mut self, op: &dyn Window, skip: usize, fall_exit: usize) -> Result<Rc<Body>, StencilError> {
         if !COPIES {
             return Err(StencilError::Disabled);
@@ -577,7 +737,134 @@ impl Stencils {
 }
 
 /// Load the pinned tag's register, r14: on entering a region, and after a
-/// frame op. See Note [Pinned tag] in `window`.
+/// frame op. See Note [Pinned tag].
+// Note [Upvalue cells]
+// ~~~~~~~~~~~~~~~~~~~~
+// Code reading an upvalue more than once would reload it each time through its closure and
+// upvalue. Each activation of JIT code keeps the values of upvalues in cells on its native stack
+// instead, below its frame pointer: one per upvalue of each of its frames, its own and each inlined
+// call's, by its inlined depth and index (the first `UPVALUE_CELLS` of each frame's).
+//
+// A cell holds its upvalue's value wherever the context has a fact about the upvalue (`Upvalue`,
+// `Holds`, or a kind of the array it holds): such a fact dies with whatever may change the
+// upvalue, and every path into a version carries its facts. So a cell is filled where such a fact
+// can come from: a load of the upvalue stores what it loads into its cell, a store into the
+// upvalue stores the value into its cell too, and where a fact comes from no load in the
+// activation, the JIT fills cells from the upvalues: where JIT code is entered, those of the facts
+// of the block it enters, and every cell of each frame it is inlined into (an inlined callee's facts
+// about its callers' upvalues, which its arguments held, become theirs as it returns, though the
+// loads that filled them ran before the code was entered); and where an inlined call's frame is
+// entered, those of its entry's facts, which a caller's facts about the callee's closure's upvalues
+// become. A load where the context has a fact about the upvalue reads its cell. Interpreted, every
+// load reads the upvalue. Debug builds check each cell a load reads.
+
+/// What a window op does with an upvalue's cell, besides its body. See Note [Upvalue cells].
+enum CellOp {
+    /// Loads the upvalue's value from its cell in place of its body.
+    Load(usize),
+    /// Stores its only operand, the upvalue's value, into the cell after its body.
+    Store(usize),
+}
+
+/// What `op` does with an upvalue's cell, if anything.
+fn cell_op(op: &dyn Window) -> Option<CellOp> {
+    let cell = |op: &dyn Window| op.captures().get(1).copied().filter(|&cell| cell != crate::generators::NO_CELL as u64).map(|cell| cell as usize);
+    match op.name() {
+        "UpvalCell" => cell(op).map(CellOp::Load),
+        "GetUpval" | "SetUpval" => cell(op).map(CellOp::Store),
+        _ => None,
+    }
+}
+
+/// The words below the frame pointer of an activation's upvalue cell `cell`: past the saved
+/// `rbx`, and above the saved `r13`, which the code after an inlined call finds at the stack's top.
+fn cell_slot(cell: usize) -> usize {
+    2 + cell
+}
+
+/// The displacement from the frame pointer of upvalue cell `cell`.
+fn cell_disp(cell: usize) -> i32 {
+    -((cell_slot(cell) * 8) as i32)
+}
+
+/// Fill the upvalue cells `cells` of JIT code `depth` inlined calls deep, the window's registers
+/// kept, from the frame entries kept at `rsp`. See Note [Upvalue cells].
+fn emit_fill_cells(ops: &mut Assembler, cells: u32, depth: usize) {
+    if cells == 0 {
+        return;
+    }
+    emit_keeping_window(ops, |ops| dynasm!(ops
+        ; .arch x64
+        ; mov rdi, r12
+        ; lea rsi, [rsp + 0x80]
+        ; mov rdx, rbp
+        ; mov ecx, cells as i32
+        ; mov r8d, depth as i32
+        ; call extern (JitHelper::fill_cells as *const () as usize)
+    ));
+}
+
+/// Debug builds: check that the upvalue cell `cell` the window register `reg` was just loaded
+/// from holds upvalue `index` of the running closure. See Note [Upvalue cells].
+fn emit_check_cell(ops: &mut Assembler, reg: u8, index: usize, cell: usize) {
+    #[cfg(debug_assertions)]
+    emit_keeping_window(ops, |ops| dynasm!(ops
+        ; .arch x64
+        ; mov rsi, Rq(reg)
+        ; mov rdi, r12
+        ; mov rdx, QWORD index as i64
+        ; mov rcx, QWORD cell as i64
+        ; call extern (JitHelper::check_cell as *const () as usize)
+    ));
+    let _ = (ops, reg, index, cell);
+}
+
+/// `call` emitted keeping the window's registers, general and XMM, as a native call doesn't.
+/// `rsp` is 0x80 past what it was before `call` runs.
+fn emit_keeping_window(ops: &mut Assembler, call: impl FnOnce(&mut Assembler)) {
+    dynasm!(ops
+        ; .arch x64
+        ; sub rsp, 0x40
+        ; vmovq QWORD [rsp], xmm0
+        ; vmovq QWORD [rsp + 0x8], xmm1
+        ; vmovq QWORD [rsp + 0x10], xmm2
+        ; vmovq QWORD [rsp + 0x18], xmm3
+        ; vmovq QWORD [rsp + 0x20], xmm4
+        ; vmovq QWORD [rsp + 0x28], xmm5
+        ; vmovq QWORD [rsp + 0x30], xmm6
+        ; vmovq QWORD [rsp + 0x38], xmm7
+        ; push r15
+        ; push rdi
+        ; push rsi
+        ; push rdx
+        ; push rcx
+        ; push r8
+        ; push r9
+        ; push r11
+    );
+    call(ops);
+    dynasm!(ops
+        ; .arch x64
+        ; pop r11
+        ; pop r9
+        ; pop r8
+        ; pop rcx
+        ; pop rdx
+        ; pop rsi
+        ; pop rdi
+        ; pop r15
+        ; vmovq xmm0, QWORD [rsp]
+        ; vmovq xmm1, QWORD [rsp + 0x8]
+        ; vmovq xmm2, QWORD [rsp + 0x10]
+        ; vmovq xmm3, QWORD [rsp + 0x18]
+        ; vmovq xmm4, QWORD [rsp + 0x20]
+        ; vmovq xmm5, QWORD [rsp + 0x28]
+        ; vmovq xmm6, QWORD [rsp + 0x30]
+        ; vmovq xmm7, QWORD [rsp + 0x38]
+        ; add rsp, 0x40
+    );
+}
+
 fn emit_pin(ops: &mut Assembler) {
     dynasm!(ops
         ; .arch x64
@@ -587,14 +874,13 @@ fn emit_pin(ops: &mut Assembler) {
 
 /// The XMM register paired with window register `r`, as `WINDOW_REGS` names
 /// its general register: xmm`r`, the stencil ABI's `x{r}`, and for `SCRATCH`
-/// xmm15, which no stencil takes. See Note [Unboxed doubles] in `window_alloc`.
+/// xmm15, which no stencil takes. See Note [Unboxed doubles].
 fn xmm(r: usize) -> u8 {
     if r == SCRATCH { 15 } else { r as u8 }
 }
 
 /// Emit an allocator instruction other than `Emit::Op`. Boxing subtracts the
-/// pinned tag and unboxing adds it, as `LBoxed` does (see Note [Pinned tag] in
-/// `window`), through r10, never a window register.
+/// pinned tag and unboxing adds it, as `LBoxed` does (see Note [Pinned tag]), through r10, never a window register.
 fn emit_window_move(ops: &mut Assembler, emit: Emit, offset: usize) {
     let reg = |r: usize| WINDOW_REGS[r];
     // A slot's home, past the running frame's base: the window names it from its own frame's.
@@ -640,8 +926,8 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit, offset: usize) {
                 ; sub Rq(reg(dst.reg)), r14
             ),
         },
-        // An op is splatted by the caller.
-        Emit::Op { .. } => unreachable!(),
+        // An op is splatted, or emitted, by the caller.
+        Emit::Op { .. } | Emit::Emitted => unreachable!(),
     }
 }
 
@@ -650,14 +936,13 @@ fn emit_window_move(ops: &mut Assembler, emit: Emit, offset: usize) {
 /// every other RIP-relative reference at its original target. The body is entered
 /// with the stack aligned as just after a call, as it was compiled to expect.
 /// Copy `op`, a window op with no operands, into the code at `SKIP` 0, the
-/// window empty: its stencil, or else a call of its body. See Note [Frame ops]
-/// in `specialize`.
+/// window empty: its stencil, or else a call of its body. See Note [Frame ops].
 /// The most slots of a callee's frame a call's JIT code nils itself, a store a
 /// slot, rather than `PushFrame` with a loop.
 const INLINE_NILS: usize = 16;
 
 /// The frame op `$op`, its const params `$pre` then a `Count` of each of
-/// `$counts` (see Note [Frame ops] in `specialize`), made from `$args`.
+/// `$counts` (see Note [Frame ops]), made from `$args`.
 /// `frame_op!`, of a window op with `operands`.
 macro_rules! window_op {
     ($op:ident [$($pre:tt)*] ($($args:expr),*) [$operands:expr];) => {
@@ -689,7 +974,7 @@ macro_rules! frame_op {
 
 /// The window op an `Inline` moves to the callee's frame by, keeping the window, if its call has a
 /// fixed count of arguments, past which its code nils the frame itself; else the frame op does,
-/// flushing the window. See Note [Inlined calls] in `specialize`.
+/// flushing the window. See Note [Inlined calls].
 fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
     let &Residual::Inline { a, b, stack, .. } = res else { return None };
     let passed = (b as usize).checked_sub(1)?;
@@ -702,8 +987,7 @@ fn inline_shift(res: &Residual) -> Option<Rc<dyn Window>> {
 }
 
 /// The slots, as the window names them at `offset`, that an `Inline`'s window op kills: the
-/// callee's frame past its arguments, which its code nils. See Note [Inlined calls] in
-/// `specialize`.
+/// callee's frame past its arguments, which its code nils. See Note [Inlined calls].
 fn inline_kills(res: &Residual, offset: usize) -> Slots {
     let mut kills = Slots::default();
     if let &Residual::Inline { a, b, stack, .. } = res {
@@ -716,7 +1000,7 @@ fn inline_kills(res: &Residual, offset: usize) -> Slots {
 /// For an `InlineReturn` keeping the window at `off`, the residual after the window ops moving its
 /// results, where the callee's frame's values die, and the slot of the caller's frame past its
 /// results, from which they all do: the caller's temporaries past a call's results are dead. See
-/// Note [Inlined calls] in `specialize`.
+/// Note [Inlined calls].
 fn results_end(residuals: &[Residual], off: usize) -> Option<(usize, usize)> {
     let res = &residuals[off];
     let Residual::InlineReturn { call, .. } = res else { return None };
@@ -736,6 +1020,13 @@ fn results_end(residuals: &[Residual], off: usize) -> Option<(usize, usize)> {
     Some((at, end))
 }
 
+/// The slots of the frames below the one the window names at `offset`.
+fn slots_below(offset: usize) -> Slots {
+    let mut slots = Slots::default();
+    (0..offset).for_each(|slot| slots.insert(slot));
+    slots
+}
+
 /// The slots, as the window names them at `offset`, from `end` on.
 fn slots_from(end: usize, offset: usize) -> Slots {
     let mut slots = Slots::default();
@@ -744,14 +1035,13 @@ fn slots_from(end: usize, offset: usize) -> Slots {
 }
 
 /// Whether an `InlineReturn` keeps the window: its results moved by the window ops after it, and
-/// no upvalue to close, it only puts the caller's frame back. See Note [Inlined calls] in
-/// `specialize`.
+/// no upvalue to close, it only puts the caller's frame back. See Note [Inlined calls].
 fn keeps_frame(res: &Residual) -> bool {
     matches!(res, Residual::InlineReturn { moves: false, closes: false, .. })
 }
 
 /// A frame op's stencil, copied at `SKIP` 0, or, in a build that copies none, a
-/// call running its body. See Note [Frame ops] in `specialize`.
+/// call running its body. See Note [Frame ops].
 fn emit_frame_op(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut Pool, op: &Rc<dyn Window>) {
     emit_frame_op_owning(ops, stencils, pool, op, None);
 }
@@ -785,7 +1075,7 @@ fn emit_frame_op_owning(ops: &mut Assembler, stencils: &mut Stencils, pool: &mut
 }
 
 /// How a copy between `sub rsp, 8` and `add rsp, 8` leaves from its middle by
-/// the exit it doesn't fall through to. See Note [Stencil alignment] in `window`.
+/// the exit it doesn't fall through to. See Note [Stencil alignment].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Unalign {
     /// Through an `add rsp, 8` after the copy, which its fall-through jumps
@@ -796,7 +1086,7 @@ enum Unalign {
 }
 
 /// Copy `body`, its other exit, the one it doesn't fall through to, going to
-/// `other`, its cold path's exits too. See Note [Window exits] in `window`.
+/// `other`, its cold path's exits too. See Note [Window exits].
 fn splat(ops: &mut Assembler, body: &Body, name: &'static str, captures: &Captures, pool: &mut Pool, other: Option<DynamicLabel>, unalign: Unalign) {
     splat_owning(ops, body, name, captures, pool, other, unalign, None);
 }
@@ -815,7 +1105,7 @@ fn splat_owning(ops: &mut Assembler, body: &Body, name: &'static str, captures: 
         /// The address of where exit 0 goes, in the pool.
         Exit0Address,
         /// The site's record, which its site hole's `lea` gives. See Note
-        /// [Cold stencils] in `window`.
+        /// [Cold stencils].
         Record,
         /// Where exit 1 goes.
         Exit1,
@@ -833,12 +1123,12 @@ fn splat_owning(ops: &mut Assembler, body: &Body, name: &'static str, captures: 
         false => way,
     });
     // The site's record, if the op has a cold path, and the way into its cold
-    // stencil. See Note [Cold stencils] in `window`.
+    // stencil. See Note [Cold stencils].
     let has_record = body.cold.is_some() || body.holes.iter().any(|&(_, i)| i == crate::window::SITE_HOLE);
     let record = has_record.then(|| pool.record(ops, exits.map(|exit| exit.unwrap_or(fall)), name, captures));
     let cold_entry = body.cold.map(|stencil| {
         let label = ops.new_dynamic_label();
-        pool.stubs.push((label, Stub::ColdEntry { record: record.expect("a record for a cold path"), cold: stencil }));
+        pool.stubs.push((label, Stub::ColdEntry { record: record.expect("a record for a cold path"), cold: JumpTo::Code(stencil) }));
         label
     });
     let mut sites: SmallVec<[(usize, usize, Site); 8]> = SmallVec::new();
@@ -912,8 +1202,9 @@ fn splat_owning(ops: &mut Assembler, body: &Body, name: &'static str, captures: 
 }
 
 /// The JIT code buffer's size. `immediate_jit` compiles every block that runs,
-/// each as its own region, so it gets twice as much.
-const JIT_SIZE: usize = 0x1000 * 16 * if cfg!(feature = "immediate_jit") { 2 } else { 1 };
+/// each as its own region, so it gets twice as much; `gas` checks its gas before
+/// every residual, which takes about as much code as the residuals, so 4 times.
+const JIT_SIZE: usize = 0x1000 * 256 * if cfg!(feature = "immediate_jit") { 2 } else { 1 } * if cfg!(feature = "gas") { 4 } else { 1 };
 
 /// The JIT code buffer's size for this run: `LUNACY_JIT_SIZE` bytes, to measure
 /// how much code a program needs past the limit, else `JIT_SIZE`.
@@ -945,11 +1236,18 @@ pub struct JitContext {
     /// Each thunk compiled into JIT code, by block and offset. See Note
     /// [Thunk patching].
     thunk_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
+    /// Each thunk site linked, by what `thunk_sites` had it as, to unlink. See Note [Watched
+    /// tables].
+    linked_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
     /// The thunk sites of the region being compiled, by offset in it.
     region_sites: Vec<(BlockId, usize, usize, Cache)>,
+    /// Each `PatchableJump` compiled: its jump, or the NOP5 it relaxed to, as a thunk site entered
+    /// with its target's window, and its exit's address.
+    patchable_sites: HashMap<(BlockId, usize), (ThunkSite, usize), FxBuildHasher>,
+    /// The `PatchableJump`s of the region being compiled: by offset in it, and their exits.
+    region_patchables: Vec<(BlockId, usize, usize, DynamicLabel, Cache)>,
     /// Where each call JIT code makes of a function holds the function's frame size, by the
-    /// function's prototype's address: patched as it grows. See Note [Inlined calls] in
-    /// `specialize`.
+    /// function's prototype's address: patched as it grows. See Note [Inlined calls].
     frame_sites: HashMap<usize, Vec<usize>, FxBuildHasher>,
     /// The frame size entries of the region being compiled: the prototype and the entry.
     region_frames: Vec<(usize, DynamicLabel)>,
@@ -963,11 +1261,23 @@ pub struct JitContext {
     /// The address the region being compiled starts at, which alignment is
     /// relative to.
     region_base: usize,
+    /// The cold code of each emitted op on each assignment of registers, by the op's name and
+    /// those registers: one copy every site shares, each through its record. See Note [Emitted
+    /// ops].
+    emitted_colds: HashMap<(&'static str, SmallVec<[u8; WINDOW]>), usize, FxBuildHasher>,
     /// Thunk sites to patch once their target block has JIT code.
     waiting: HashMap<BlockId, Vec<ThunkSite>, FxBuildHasher>,
     /// The JIT entry of each prototype's all-unknown entry block, by the
     /// prototype's address, once it has one. See `JitHelper::dynamic_call`.
     lua_entries: HashMap<usize, JitExec, FxBuildHasher>,
+    /// How often the interpreter went from one block to another. See Note [Edge counts].
+    pub edges: Edges,
+    /// The blocks of the region being compiled, if it has only some of those it reaches. See
+    /// Note [Region selection].
+    region_set: Option<std::collections::HashSet<BlockId, FxBuildHasher>>,
+    /// The cold edges of the region being compiled: the block each goes to, and its site's
+    /// offset in the region and window, linked as a thunk's. See Note [Region selection].
+    region_edges: Vec<(BlockId, usize, Cache)>,
     /// The `LuaCall` sites of the region being compiled whose callee's version
     /// has no code yet: the version, and the site's and its call's offsets in
     /// the region. See Note [Call linking].
@@ -983,7 +1293,7 @@ pub struct JitContext {
     /// code, by the version. See Note [Call linking].
     tail_waiting: HashMap<BlockId, Vec<usize>, FxBuildHasher>,
     /// The frame ops the JIT's code has, which a call of an op's body refers to.
-    /// See Note [Frame ops] in `specialize`.
+    /// See Note [Frame ops].
     frame_ops: Vec<Rc<dyn Window>>,
     /// How regions are partitioned into traces (`LUNACY_TRACES`), or `None` to
     /// allocate streaming instead: no plan, each op placing itself in the window
@@ -996,6 +1306,7 @@ pub struct JitContext {
 struct JitPtr(*const u8);
 
 /// A thunk in JIT code: where its nops are, and the window it leaves.
+#[derive(Clone)]
 struct ThunkSite {
     at: usize,
     window: Cache,
@@ -1029,8 +1340,31 @@ struct CallSite {
 /// The window dump ends with how often each counted piece of allocator code
 /// ran, and the code is disassembled.
 #[cfg(any(feature = "window_dump", feature = "jit_disasm"))]
+/// How many blocks `BLOCK_COUNTS` counts, by id.
+#[cfg(feature = "block_counts")]
+const COUNTED_BLOCKS: usize = 1 << 20;
+
+/// Each block's executions by its id (feature `block_counts`): in JIT code, which counts as each
+/// block's code is entered, and in the interpreter, which counts a block it runs from its start.
+/// Written to block_counts.txt as the JIT context is dropped.
+#[cfg(feature = "block_counts")]
+pub static BLOCK_COUNTS: [[std::sync::atomic::AtomicU64; COUNTED_BLOCKS]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; COUNTED_BLOCKS] }; 2];
+
 impl Drop for JitContext {
     fn drop(&mut self) {
+        #[cfg(feature = "block_counts")]
+        {
+            use std::io::Write;
+            let mut out = std::io::BufWriter::new(std::fs::File::create("block_counts.txt").expect("block_counts.txt"));
+            writeln!(out, "# block jit interpreter").unwrap();
+            for id in 0..COUNTED_BLOCKS {
+                let [jit, interpreter] = [0, 1].map(|tier| BLOCK_COUNTS[tier][id].load(std::sync::atomic::Ordering::Relaxed));
+                if jit + interpreter > 0 {
+                    writeln!(out, "{id} {jit} {interpreter}").unwrap();
+                }
+            }
+        }
         #[cfg(feature = "window_dump")]
         for (id, count) in self.window_counts.borrow().iter().enumerate() {
             window_dump!(self, "count #{id} {}", count.load(std::sync::atomic::Ordering::Relaxed));
@@ -1059,7 +1393,7 @@ pub struct JitBlock {
     ptr: JitPtr,
     window: Cache,
     /// How many inlined calls deep its code is entered, and its frame's offset (`offset_past`).
-    /// See Note [Inlined calls] in `specialize`.
+    /// See Note [Inlined calls].
     depth: usize,
     offset: usize,
 }
@@ -1069,6 +1403,8 @@ pub struct JitBlock {
 pub struct Pending {
     label: DynamicLabel,
     window: Cache,
+    /// A cold edge's exit, not the block's code. See Note [Region selection].
+    cold: bool,
     /// How many inlined calls deep the jumps to it are, and their frame's offset.
     depth: usize,
     offset: usize,
@@ -1106,12 +1442,11 @@ impl BlockPlan {
 /// The tag test of a guard of `expected` on the value in register `v`: a
 /// match jumps to `pass`, a mismatch falls through. `numeric` if the value is
 /// known to be a number. rax, never a window register, is scratch. A number's
-/// test is against the pinned tag, r14 (see Note [Pinned tag] in `window`).
+/// test is against the pinned tag, r14 (see Note [Pinned tag]).
 ///
 ///   * Integer  : it has all `NUMBER_TAG` bits: at least `NUMBER_TAG`, unsigned.
 ///   * Double   : some but not all: below `NUMBER_TAG`, and, unless the guard
-///     is numeric (the value a number), any set. See Note [Integers] in
-///     `specialize`.
+///     is numeric (the value a number), any set. See Note [Integers].
 ///   * Nil/Bool : exact immediate compare (nil = 2, false/true = 6/7).
 ///   * cell types (Table/Closure/String): the value is a raw pointer (no
 ///     `NOT_CELL_MASK` bits) whose offset-0 header byte is the kind. We must
@@ -1263,12 +1598,12 @@ fn pad(ops: &mut Assembler, base: usize, align: usize) -> usize {
 }
 
 /// How many of a block's residuals its code runs: up to its first jump or thunk no guard before
-/// it can skip. See Note [Contraction] in `specialize`.
+/// it can skip. See Note [Contraction].
 fn runs_to(residuals: &[Residual]) -> usize {
     // Whether the residual before can skip this one: a guard's side exit.
     let mut guarded = false;
     for (off, res) in residuals.iter().enumerate() {
-        if matches!(res, Residual::Jump(_) | Residual::Thunk(_)) && !guarded {
+        if matches!(res, Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Thunk(_) | Residual::Tripped(_)) && !guarded {
             return off + 1;
         }
         guarded = matches!(res, Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::NativeGuard { .. }
@@ -1281,7 +1616,7 @@ fn runs_to(residuals: &[Residual]) -> usize {
 /// The blocks a residual jumps to.
 fn jump_targets(res: &Residual) -> SmallVec<[BlockId; 2]> {
     match res {
-        Residual::Jump(target) => smallvec::smallvec![*target],
+        Residual::Jump(target) | Residual::PatchableJump(target) => smallvec::smallvec![*target],
         Residual::Select(targets) => targets.iter().map(|target| target.1).collect(),
         Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
         _ => SmallVec::new(),
@@ -1317,15 +1652,22 @@ impl JitContext {
             blocks: HashMap::default(),
             pending: BTreeMap::new(),
             thunk_sites: HashMap::default(),
+            linked_sites: HashMap::default(),
             region_sites: Vec::new(),
+            patchable_sites: HashMap::default(),
+            region_patchables: Vec::new(),
             frame_sites: HashMap::default(),
             region_frames: Vec::new(),
             region_headers: Default::default(),
             #[cfg(feature = "tracing")]
             traced_line: 0,
             region_base: 0,
+            emitted_colds: HashMap::default(),
             waiting: HashMap::default(),
             lua_entries: HashMap::default(),
+            edges: Edges::new(),
+            region_set: None,
+            region_edges: Vec::new(),
             region_calls: Vec::new(),
             call_waiting: HashMap::default(),
             region_tail_calls: Vec::new(),
@@ -1403,7 +1745,7 @@ impl JitContext {
         // A trap at the snapshot's block and `current_off`, what a region
         // returns for one: see `Specializer::run`.
         // The inlined calls the snapshot is inside write their entries first. See Note [Inlined
-        // calls] in `specialize`.
+        // calls].
         dynasm!(ops
             ; .arch x64
             ; call extern base.0 as usize + flush.0
@@ -1424,6 +1766,7 @@ impl JitContext {
             ; mov rcx, QWORD ((-4i32 as u64) << 32) as i64
             ; or rax, rcx
             ; pop r13
+            ; add rsp, (crate::specialize::CELLS * 8) as i32
             ; pop rbx
             ; pop rbp
             ; ret
@@ -1498,7 +1841,7 @@ impl JitContext {
     }
 
     /// The function of the prototype at `proto`'s frame size is now `size`: JIT code's calls of it
-    /// hold that. See Note [Inlined calls] in `specialize`.
+    /// hold that. See Note [Inlined calls].
     pub fn frame_grew(&mut self, proto: usize, size: usize) {
         for at in self.frame_sites.get(&proto).cloned().unwrap_or_default() {
             self.patch(at, &(size as u64).to_le_bytes());
@@ -1518,9 +1861,11 @@ impl JitContext {
 impl<'src, 'intern> Specializer<'src, 'intern> {
     /// JIT compile the region entered at `id`, whose code is `depth` inlined calls deep, its frame
     /// `offset` slots past the window's (`offset_past`).
-    pub fn jit_compile(&mut self, id: BlockId, owner: &mut Owner, depth: usize, offset: usize) {
+    pub fn jit_compile(&mut self, id: BlockId, owner: &mut Owner, depth: usize, offset: usize, selects: bool) {
         #[cfg(feature = "tracing")]
         crate::tracing::begin("jit", "compile", &[("block_id", id.0.into())]);
+        // See Note [Region selection].
+        self.jctx.region_set = selects.then(|| self.select_region(id));
         debug!("JIT compiling block {:?}", id);
         window_dump!(self.jctx, "== region entered at block {}", id.0);
         let base = self.jctx.end();
@@ -1541,11 +1886,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; push rbp
             ; mov rbp, rsp
             ; push rbx
-            ; push r13 // save initial base_ptr
+            // The upvalue cells. See Note [Upvalue cells].
+            ; sub rsp, (crate::specialize::CELLS * 8) as i32
+            // The initial base_ptr, where the code after an inlined call takes it back from: the
+            // base of the innermost frame made, `offset` slots below the base it's entered with
+            // in inlined calls whose frames aren't made. See Note [Inlined frames].
+            ; lea rax, [r13 - (offset * 8) as i32]
+            ; push rax
         );
         emit_pin(&mut ops);
         // Entered inside inlined calls, the interpreter's entries for them kept as their code
-        // keeps them. See Note [Inlined calls] in `specialize`.
+        // keeps them. See Note [Inlined calls].
         if depth > 0 {
             jit_note!(self.jctx, ops, "adopt {depth} inlined calls' entries");
             dynasm!(ops
@@ -1557,6 +1908,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; call extern (JitHelper::adopt_inlined as *const () as usize)
             );
         }
+        // The cells the entered block's facts are about. See Note [Upvalue cells].
+        jit_note!(self.jctx, ops, "fill the upvalue cells the entry's facts are about");
+        emit_fill_cells(&mut ops, self.blocks[id.0].cells, depth);
         // TODO: Pin state.vals.as_ptr() to a register, which will let us remove a lot of the
         // JitHelper function calls.
 
@@ -1636,6 +1990,34 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let successor_pair = successor.and_then(|succ| self.jctx.pending.remove(&succ).map(|pending| (succ, pending)));
             let Some((pending_block, pending)) = successor_pair.or_else(|| self.jctx.pending.pop_first()) else { break };
             debug!("pending block {:?} {:?}", pending_block.0, pending.label);
+            if pending.cold {
+                // A cold edge: room for a jump to the block once it has code, else the window
+                // stored and an exit to it. See Note [Region selection].
+                let start = ops.offset();
+                dynasm!(ops
+                    ; =>pending.label
+                );
+                jit_note!(self.jctx, ops, "cold edge into block {}, entered with {}", pending_block.0, pending.window);
+                self.jctx.region_edges.push((pending_block, ops.offset().0, pending.window.clone()));
+                ops.extend(&NOP5);
+                // An exit to the block as any other, not a thunk's: the interpreter enters it,
+                // counting the edge, so it compiles once hot.
+                let stores = WindowAlloc::entering(pending.window.clone()).stores();
+                let counted = window_count!(self.jctx, &mut ops, stores);
+                window_dump!(self.jctx, "cold edge into block {}: exit after {}{counted}", pending_block.0, emits_line(&stores));
+                for emit in stores {
+                    emit_window_move(&mut ops, emit, pending.offset);
+                }
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov rax, QWORD (Location(pending_block, 0).pack().bits() as i64)
+                    ; mov BYTE r12 => RunState.trap, 1
+                    ; jmp =>pool.exits[pending.depth]
+                );
+                self.jctx.reserve(ops.offset().0 - start.0);
+                successor = None;
+                continue;
+            }
             // A loop header starts aligned: its padding reserved first, so the
             // block's pointer is past it.
             #[cfg(feature = "align_loops")]
@@ -1660,14 +2042,31 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for (label, stub) in std::mem::take(&mut pool.stubs) {
             dynasm!(ops ; .arch x64 ; =>label);
             match stub {
+                Stub::Exit { snapshot } => {
+                    jit_note!(self.jctx, ops, "an unlinked patchable jump's exit");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; lea rax, [=>snapshot]
+                        ; jmp extern self.jctx.exit_snapshot
+                    );
+                }
                 Stub::ColdEntry { record, cold } => {
                     jit_note!(self.jctx, ops, "into a cold stencil");
                     dynasm!(ops
                         ; .arch x64
                         ; lea rax, [=>record]
                         ; mov QWORD r12 => RunState.cold_site, rax
-                        ; jmp extern cold
                     );
+                    match cold {
+                        JumpTo::Code(code) => dynasm!(ops ; .arch x64 ; jmp extern code),
+                        JumpTo::Label(label) => dynasm!(ops ; .arch x64 ; jmp =>label),
+                    }
+                }
+                Stub::EmittedCold { cold, regs, key } => {
+                    jit_note!(self.jctx, ops, "an emitted op's cold code");
+                    self.jctx.emitted_colds.insert(key, base.0 as usize + ops.offset().0);
+                    dynasm!(ops ; .arch x64 ; mov r10, QWORD r12 => RunState.cold_site);
+                    cold(&mut ops, &regs, &crate::emitted::Record);
                 }
                 Stub::Select { aligned, exit, join } => {
                     jit_note!(self.jctx, ops, "exit {exit}, selected");
@@ -1721,6 +2120,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ; =>pool.exits[0]
             ; ->exit_jit:
             ; pop r13
+            ; add rsp, (crate::specialize::CELLS * 8) as i32
             ; pop rbx
             ; pop rbp
             ; ret
@@ -1728,7 +2128,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.reserve(ops.offset().0 - epilogue.0);
 
         let pool_start = ops.offset();
-        ops.align(8, 0xcc);
+        // Its address aligned, not just its offset in the region: a region starts wherever the
+        // buffer's last code ended, and a misaligned 8 byte entry splits cache lines.
+        pad(&mut ops, base.0 as usize, 8);
         jit_note!(self.jctx, ops, "{}", crate::disasm::POOL);
         // Records last: their displacements are to value entries, which are
         // then placed.
@@ -1764,6 +2166,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.reserve(ops.offset().0 - pool_start.0);
 
         debug!("drained pending");
+        let patchables: Vec<(BlockId, usize, usize, usize, Cache)> = std::mem::take(&mut self.jctx.region_patchables).into_iter()
+            .map(|(block, off, at, exit, window)| (block, off, at, ops.labels().resolve_dynamic(exit).expect("a patchable jump's exit placed").0, window))
+            .collect();
         let frames: Vec<(usize, usize)> = std::mem::take(&mut self.jctx.region_frames).into_iter()
             .map(|(proto, entry)| (proto, ops.labels().resolve_dynamic(entry).expect("a frame size's entry placed").0))
             .collect();
@@ -1775,6 +2180,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let entrypoint: JitExec = unsafe { core::mem::transmute(slab.add(entry.0)) };
         for (block, off, at, window) in std::mem::take(&mut self.jctx.region_sites) {
             self.jctx.thunk_sites.insert((block, off), ThunkSite { at: slab as usize + at, window });
+        }
+        for (target, at, window) in std::mem::take(&mut self.jctx.region_edges) {
+            self.jctx.waiting.entry(target).or_default().push(ThunkSite { at: slab as usize + at, window });
+        }
+        self.jctx.region_set = None;
+        for (block, off, at, exit, window) in patchables {
+            self.jctx.patchable_sites.insert((block, off), (ThunkSite { at: slab as usize + at, window }, slab as usize + exit));
         }
         // Thunk sites waiting for a block compiled here jump to it now.
         let ready: Vec<BlockId> = self.jctx.waiting.keys().filter(|target| self.jctx.blocks.contains_key(target)).copied().collect();
@@ -1848,7 +2260,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// Where a region is entered at `id` from the interpreter, and `id` starts
     /// with a continuation guard, the call's return value it compares, from
-    /// `RunState::returned`. See Note [Call continuations] in `specialize`.
+    /// `RunState::returned`. See Note [Call continuations].
     fn load_returned(&self, ops: &mut Assembler, id: BlockId) {
         if let Some(Residual::ReturnedFrom(_)) = self.blocks[id.0].instructions.first() {
             jit_note!(self.jctx, ops, "the return the entry's continuation guard compares");
@@ -1893,11 +2305,31 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // ran is linked when it first runs and is forced, to a target compiled
         // by then or not.
         let Some(site) = self.jctx.thunk_sites.remove(&(block, off)) else { return };
+        self.jctx.linked_sites.insert((block, off), site.clone());
         if self.jctx.blocks.contains_key(&target) {
             self.patch_thunk(site, target);
         } else {
             self.jctx.waiting.entry(target).or_default().push(site);
         }
+    }
+
+    /// The thunk at `off` in `block` is a thunk again: its JIT code, if linked, exits again. See
+    /// Note [Watched tables].
+    pub fn unlink_thunk(&mut self, block: BlockId, off: usize) {
+        if let Some((site, exit)) = self.jctx.patchable_sites.remove(&(block, off)) {
+            let rel = i32::try_from(exit as isize - (site.at as isize + NOP5.len() as isize)).expect("a patchable jump's exit within rel32 of it");
+            let mut jmp = [0xe9, 0, 0, 0, 0];
+            jmp[1..].copy_from_slice(&rel.to_le_bytes());
+            self.jctx.patch(site.at, &jmp);
+            self.jctx.thunk_sites.insert((block, off), site);
+            return;
+        }
+        let Some(site) = self.jctx.linked_sites.remove(&(block, off)) else { return };
+        for waiting in self.jctx.waiting.values_mut() {
+            waiting.retain(|other| other.at != site.at);
+        }
+        self.jctx.patch(site.at, &NOP5);
+        self.jctx.thunk_sites.insert((block, off), site);
     }
 
     /// Make the thunk site `site` jump into `target`'s JIT code, through its
@@ -1912,6 +2344,63 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// The compensation code a patched thunk site jumps to: the transfer from
     /// the thunk's `window` to `target`'s entry window, then a jump into it.
+    /// The blocks of the region compiled from `root`: those reached from it, without code, that ran
+    /// recently enough. See Note [Region selection].
+    fn select_region(&self, root: BlockId) -> std::collections::HashSet<BlockId, FxBuildHasher> {
+        let targets = |block: BlockId| {
+            let residuals = &self.blocks[block.0].instructions;
+            residuals[..runs_to(residuals)].iter().flat_map(jump_targets).collect::<SmallVec<[BlockId; 4]>>()
+        };
+        // Every block the region reaches.
+        let mut reached: std::collections::HashSet<BlockId, FxBuildHasher> = Default::default();
+        reached.insert(root);
+        let mut work = vec![root];
+        while let Some(block) = work.pop() {
+            for target in targets(block) {
+                if !self.jctx.blocks.contains_key(&target) && reached.insert(target) {
+                    work.push(target);
+                }
+            }
+        }
+        let mut weights: HashMap<BlockId, u32, FxBuildHasher> = HashMap::default();
+        for &block in &reached {
+            for target in targets(block) {
+                if reached.contains(&target) {
+                    *weights.entry(target).or_default() += self.jctx.edges.recent(block, target) as u32;
+                }
+            }
+        }
+        let root_weight = weights.get(&root).copied().unwrap_or(0).max(HOT_EDGE as u32);
+        let heavy = |block: &BlockId| weights.get(block).copied().unwrap_or(0) * 100 >= root_weight * REGION_PERCENT;
+        let mut region: std::collections::HashSet<BlockId, FxBuildHasher> = Default::default();
+        region.insert(root);
+        let mut work = vec![root];
+        while let Some(block) = work.pop() {
+            for target in targets(block) {
+                if reached.contains(&target) && heavy(&target) && region.insert(target) {
+                    work.push(target);
+                }
+            }
+        }
+        #[cfg(feature = "tracing")]
+        {
+            // How many of the blocks reached weigh under each share of the root's weight.
+            let under = |percent: u32| reached.iter().filter(|block| weights.get(block).copied().unwrap_or(0) * 100 < root_weight * percent).count();
+            crate::tracing::instant("jit", "region", &[
+                ("root", root.0.into()),
+                ("reached", reached.len().into()),
+                ("selected", region.len().into()),
+                ("root_weight", (root_weight as u64).into()),
+                ("under_1", under(1).into()),
+                ("under_10", under(10).into()),
+                ("under_25", under(25).into()),
+                ("under_50", under(50).into()),
+                ("under_100", under(100).into()),
+            ]);
+        }
+        region
+    }
+
     fn thunk_stub(&mut self, window: &Cache, target: BlockId) -> usize {
         #[cfg(feature = "jit_disasm")]
         let notes = self.jctx.disasm.begin();
@@ -1958,7 +2447,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             for res in &residuals[..runs_to(residuals)] {
                 offset = offset_past(res, offset);
                 for target in jump_targets(res) {
-                    if !self.jctx.blocks.contains_key(&target) && !index.contains_key(&target) {
+                    let selected = self.jctx.region_set.as_ref().is_none_or(|set| set.contains(&target));
+                    if selected && !self.jctx.blocks.contains_key(&target) && !index.contains_key(&target) {
                         index.insert(target, ids.len());
                         ids.push(target);
                         offsets.push(offset);
@@ -1991,6 +2481,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             placement.iter().flatten().for_each(|&slot| slots.insert(slot));
             slots
         };
+        // Each edge's weight between the region's blocks, how often it ran recently, and each
+        // block's, the edges into it; the entry's at least what compiled it. See Note [Edge counts].
+        let mut edge_weights: Vec<SmallVec<[(usize, u64); 2]>> = vec![SmallVec::new(); ids.len()];
+        let mut weights = vec![0u64; ids.len()];
+        for (from, &block) in ids.iter().enumerate() {
+            let residuals = &self.blocks[block.0].instructions;
+            for target in residuals[..runs_to(residuals)].iter().flat_map(jump_targets) {
+                if let Some(&to) = index.get(&target) && !edge_weights[from].iter().any(|&(t, _)| t == to) {
+                    let weight = self.jctx.edges.recent(block, target) as u64;
+                    edge_weights[from].push((to, weight));
+                    weights[to] += weight;
+                }
+            }
+        }
+        weights[0] = weights[0].max(HOT_EDGE as u64);
+        window_dump!(self.jctx, "weights {}", ids.iter().enumerate().map(|(b, id)| format!("{}={} [{}]", id.0, weights[b],
+            edge_weights[b].iter().map(|&(to, weight)| format!("->{}:{weight}", ids[to].0)).collect::<Vec<_>>().join(" "))).collect::<Vec<_>>().join(", "));
         let region = Region::new(
             ids.iter()
                 .zip(&skips)
@@ -2009,8 +2516,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         offset = offset_past(res, offset);
                         match res {
                             Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[off].is_empty() => {
+                                // Upvalues' cells may be open onto them. See Note [Window memory].
+                                if w.cells().is_some() {
+                                    events.extend(slots_below(at).iter().map(Event::Read));
+                                }
                                 let operands = w.operands().iter().zip(w.accesses());
-                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot + at)));
+                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot.wrapping_add(at))));
+                                events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot + at)));
+                            }
+                            Residual::Emit(e) => {
+                                let operands = e.operands().iter().zip(e.accesses());
+                                events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot.wrapping_add(at))));
                                 events.extend(operands.filter(|(_, a)| a.writes()).map(|(&slot, _)| Event::Write(slot + at)));
                             }
                             res if inline_guard(res) => events.push(Event::Read(guarded_slot(res) + at)),
@@ -2019,24 +2535,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 events.extend(inline_kills(res, at).iter().map(Event::Write));
                             }
                             res if keeps_frame(res) => {}
+                            // The base moved, the window kept. See Note [Inlined frames].
+                            Residual::Enter(_) | Residual::Leave(_) => {}
                             // Reads its field through the witness, no slot.
                             Residual::GuardWitness { .. } => {}
-                            Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. } => {
+                            Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Select(_) | Residual::Branch { .. } => {
                                 for target in jump_targets(res) {
                                     events.push(match index.get(&target) {
                                         Some(&i) => Event::Edge(i),
-                                        None => Event::Exit(slots_of(self.jctx.blocks[&target].window.regs())),
+                                        // A block with code, entered with its window, or a cold
+                                        // edge's exit, which stores the window. See Note [Region
+                                        // selection].
+                                        None => Event::Exit(self.jctx.blocks.get(&target).map_or_else(Slots::default, |block| slots_of(block.window.regs()))),
                                     });
                                 }
                             }
                             // An exit to the interpreter, which reads the stack.
-                            Residual::Thunk(_) => {}
+                            Residual::Thunk(_) | Residual::Tripped(_) => {}
                             _ => events.push(Event::Flush),
                         }
                     }
                     TraceBlock {
                         events,
-                        hotness: self.blocks[block.0].jit_info.hotness.get(),
+                        weight: weights[index[block]],
+                        weights: edge_weights[index[block]].clone(),
                         id: block.0,
                         pc: self.blocks[block.0].pc,
                         // A block whose countdown hasn't moved never ran. Every
@@ -2056,12 +2578,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         // The window each trace's head starts from, and the block it comes
         // from: the region's entry, the window of the thunk linked into it,
-        // from outside the region; another head, the window the hottest edge
+        // from outside the region; another head, the window the heaviest edge
         // into it from a trace planned earlier leaves. See Note [Trace
         // allocation].
-        let mut hints: HashMap<BlockId, (usize, Cache, Option<usize>), FxBuildHasher> = HashMap::default();
+        let mut hints: HashMap<BlockId, (u64, Cache, Option<usize>), FxBuildHasher> = HashMap::default();
         if let Some(window) = entered {
-            hints.insert(entry, (0, window.clone(), None));
+            hints.insert(entry, (u64::MAX, window.clone(), None));
         }
         let mut plans = Plans::default();
         for trace in &traces {
@@ -2070,9 +2592,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             window_dump!(self.jctx, "trace from block {} starts from {}", head.0, hint);
             let (planned, exits) = self.plan_trace(trace, &ids, &offsets, &windows, &skips, &index, &live_in, &loops, &plans, &hint, from);
             for (from, target, window) in exits {
-                let hotness = self.blocks[from.0].jit_info.hotness.get();
-                if hints.get(&target).is_none_or(|&(hottest, ..)| hotness < hottest) {
-                    hints.insert(target, (hotness, window, Some(index[&from])));
+                let weight = self.jctx.edges.recent(from, target) as u64;
+                if hints.get(&target).is_none_or(|&(heaviest, ..)| weight > heaviest) {
+                    hints.insert(target, (weight, window, Some(index[&from])));
                 }
             }
             plans.extend(planned);
@@ -2107,10 +2629,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         };
         // What a block the trace leaves into reads first: its entry window's
         // slots, or those live into it; none for a side exit that never ran.
-        let reads = |target: BlockId, hot: bool| match self.jctx.blocks.get(&target) {
+        let reads = |from: BlockId, target: BlockId, hot: bool| match self.jctx.blocks.get(&target) {
             Some(done) => slots_of(done.window.regs()),
-            None if !hot && !cfg!(feature = "immediate_jit") && self.blocks[target.0].jit_info.hotness.get() >= INITIAL_HOTNESS => Slots::default(),
-            None => plans.get(&target).map_or(live_in[index[&target]], |plan| slots_of(&plan.entry.unpack())),
+            None if !hot && !cfg!(feature = "immediate_jit") && self.jctx.edges.recent(from, target) == 0 => Slots::default(),
+            // A cold edge's exit stores the window. See Note [Region selection].
+            None => match index.get(&target) {
+                Some(&at) => plans.get(&target).map_or(live_in[at], |plan| slots_of(&plan.entry.unpack())),
+                None => Slots::default(),
+            },
         };
         let position = |target: BlockId| trace.iter().position(|&t| ids[t] == target);
         let mut steps = Vec::new();
@@ -2126,7 +2652,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let targets = || ran.iter().flat_map(jump_targets);
             let back = targets().any(|target| position(target).is_some_and(|at| at <= pos));
             let continues = if next.is_none() && !back {
-                targets().min_by_key(|target| (self.blocks[target.0].jit_info.hotness.get(), target.0))
+                targets().min_by_key(|target| (std::cmp::Reverse(self.jctx.edges.recent(ids[b], *target)), target.0))
             } else {
                 None
             };
@@ -2149,8 +2675,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 offset = offset_past(res, offset);
                 match res {
                     Residual::ExecWindow(_) | Residual::GuardDynamic(_) if !skips[b][off].is_empty() => {
+                        let w = windows[b][off].as_ref().expect("a window op");
+                        // See Note [Window memory].
+                        if w.cells().is_some() {
+                            steps.push(Step::Store(slots_below(at)));
+                        }
                         of[off] = Some(steps.len());
-                        steps.push(Step::Op(Framed::new(&**windows[b][off].as_ref().expect("a window op"), at), skips[b][off].clone()));
+                        steps.push(Step::Op(Framed::new(&**w, at), skips[b][off].clone()));
+                        if w.cells() == Some(Access::Write) {
+                            steps.push(Step::Kill(slots_below(at)));
+                        }
+                    }
+                    Residual::Emit(e) => {
+                        of[off] = Some(steps.len());
+                        steps.push(Step::Op(Framed::emitted(&**e, at), SmallVec::new()));
                     }
                     res if inline_guard(res) => steps.push(Step::Read(guarded_slot(res) + at)),
                     Residual::Inline { .. } if !skips[b][off].is_empty() => {
@@ -2159,8 +2697,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         steps.push(Step::Kill(inline_kills(res, at)));
                     }
                     res if keeps_frame(res) => {}
+                    Residual::Enter(_) | Residual::Leave(_) => {}
                     Residual::GuardWitness { .. } => {}
-                    Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. } => {
+                    Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Select(_) | Residual::Branch { .. } => {
                         for target in jump_targets(res) {
                             if Some(off) == flow && Some(target) == next {
                                 continue;
@@ -2170,12 +2709,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 None => {
                                     let hot = Some(target) == continues;
                                     leaving.push((steps.len(), ids[b], target));
-                                    steps.push(Step::Exit { hot, reads: reads(target, hot) });
+                                    steps.push(Step::Exit { hot, reads: reads(ids[b], target, hot) });
                                 }
                             }
                         }
                     }
-                    Residual::Thunk(_) => steps.push(Step::Leave),
+                    Residual::Thunk(_) | Residual::Tripped(_) => steps.push(Step::Leave),
                     _ => steps.push(Step::Flush),
                 }
             }
@@ -2224,7 +2763,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// compile.
     pub fn jit_block(&mut self, id: BlockId, depth: usize, offset: usize, ops: &mut Assembler, pool: &mut Pool, owner: &mut Owner, plans: &Plans) -> (AssemblyOffset, Option<BlockId>) {
         // How many inlined calls deep the code being emitted is, its frame's offset
-        // (`offset_past`), and each depth's exit. See Note [Inlined calls] in `specialize`.
+        // (`offset_past`), and each depth's exit. See Note [Inlined calls].
         let depth = core::cell::Cell::new(depth);
         let offset = core::cell::Cell::new(offset);
         let exits = pool.exits.clone();
@@ -2239,7 +2778,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // Where the op just copied has the exit it doesn't fall through to go,
         // whether its copy is aligned, and which it falls through to, for the
         // `Select` or `Branch` after it to lay its ways: that residual then tests
-        // no `select`. See Note [Window exits] in `window`.
+        // no `select`. See Note [Window exits].
         let mut fused: Option<(DynamicLabel, bool, usize)> = None;
         let entry = ops.offset();
         let x = self.jctx.memory.get_mut().as_ptr();
@@ -2247,14 +2786,29 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let insts: Vec<_> = block.instructions.iter().map(|_| ops.new_dynamic_label()).collect();
         let mut alloc = WindowAlloc::entering(self.jctx.blocks[&id].window.clone());
         window_dump!(self.jctx, "block {} hotness {} pc {} entered with {}", id.0, block.jit_info.hotness.get(), block.pc, alloc.cache());
-        jit_note!(self.jctx, ops, "block {} (pc {}, function {}, hotness {}) entered with {}", id.0, block.pc, self.jctx.functions.get(&id).map_or("?", String::as_str), block.jit_info.hotness.get(), alloc.cache());
+        jit_note!(self.jctx, ops, "block {} (pc {}, function {}, hotness {}{}) entered with {}", id.0, block.pc, self.jctx.functions.get(&id).map_or("?", String::as_str), block.jit_info.hotness.get(),
+            if block.promoted.is_empty() { String::new() } else {
+                format!(", promoted {}", block.promoted.iter().map(|(pc, value)| format!("pc {pc} = {value}")).collect::<Vec<_>>().join(", "))
+            }, alloc.cache());
+        // See `BLOCK_COUNTS`.
+        #[cfg(feature = "block_counts")]
+        {
+            let counter = &BLOCK_COUNTS[0][id.0] as *const _ as i64;
+            dynasm!(ops
+                ; .arch x64
+                ; push rax
+                ; mov rax, QWORD counter
+                ; add QWORD [rax], 1
+                ; pop rax
+            );
+        }
 
         // Jump to `target`, or fall through to it if `skip`, transferring the
         // window to the one it is entered with: its planned entry window, dirty where the
         // first jump to it compiled delivers it dirty.
         // With `defer`, its moves and target, for code laid out elsewhere, in
         // place of emitting it.
-        let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool, defer: bool| -> Option<(SmallVec<[Emit; 16]>, JumpTo, Option<i64>)> {
+        let mut emit_jump = |ops: &mut Assembler, alloc: &WindowAlloc, target: &BlockId, skip: bool, defer: bool| -> Option<(SmallVec<[Emit; 16]>, JumpTo, Option<i64>, Cache)> {
             if let Some(target_block) = self.jctx.blocks.get(target) {
                 debug_assert_eq!((target_block.depth, target_block.offset), (depth.get(), offset.get()), "a jump to a block at another depth");
                 // We already JIT compiled the block, and can jump to it directly.
@@ -2262,7 +2816,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let (counted, count) = if defer { window_deferred!(self.jctx, transfer) } else { (window_count!(self.jctx, ops, transfer), None) };
                 window_dump!(self.jctx, "      to block {} (compiled, entered with {}): {}{counted}", target.0, target_block.window, emits_line(&transfer));
                 if defer {
-                    return Some((transfer, JumpTo::Code(target_block.ptr.0 as usize), count));
+                    return Some((transfer, JumpTo::Code(target_block.ptr.0 as usize), count, target_block.window.clone()));
                 }
                 for emit in transfer {
                     emit_window_move(ops, emit, offset.get());
@@ -2276,7 +2830,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // The block could already be pending from another block in this assembler
                 // set. Use it if it already exists, otherwise create a new label for our
                 // relocation.
+                let cold = self.jctx.region_set.as_ref().is_some_and(|set| !set.contains(target));
                 let pending = self.jctx.pending.entry(*target).or_insert_with(|| Pending {
+                    cold,
                     depth: depth.get(),
                     offset: offset.get(),
                     label: ops.new_dynamic_label(),
@@ -2290,7 +2846,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let (counted, count) = if defer { window_deferred!(self.jctx, transfer) } else { (window_count!(self.jctx, ops, transfer), None) };
                 window_dump!(self.jctx, "      to block {} (entered with {}): {}{counted}", target.0, pending.window, emits_line(&transfer));
                 if defer {
-                    return Some((transfer, JumpTo::Label(pending.label), count));
+                    return Some((transfer, JumpTo::Label(pending.label), count, pending.window.clone()));
                 }
                 for emit in transfer {
                     emit_window_move(ops, emit, offset.get());
@@ -2340,6 +2896,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 emit_window_move(ops, emit, offset.get());
             }
             dynasm!(ops
+                ; mov QWORD r12 => RunState.gas_base_ptr, r13
                 ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                 ; mov BYTE r12 => RunState.trap, 1
                 ; jmp =>exits[depth.get()]
@@ -2383,8 +2940,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let past_arrive = insts[off + 2];
                 dynasm!(ops
                     ; .arch x64
-                    // A native's error exits as an exec's trap does. See Note [Errors] in
-                    // `specialize`.
+                    // A native's error exits as an exec's trap does. See Note [Errors].
                     ; cmp BYTE r12 => RunState.trap, 0
                     ; jz >no_trap
                     ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
@@ -2422,8 +2978,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 ; done:
             );
         };
-        let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_));
-        let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::Select(_) | Residual::Branch { .. });
+        let window = |r: &Residual| matches!(r, Residual::ExecWindow(_) | Residual::GuardDynamic(_) | Residual::Emit(_));
+        let jump = |r: &Residual| matches!(r, Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Select(_) | Residual::Branch { .. });
         let end = runs_to(&block.instructions);
         let mut dies = None;
         for (off, res) in block.instructions[..end].iter().enumerate() {
@@ -2436,10 +2992,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             jit_note!(self.jctx, ops, "  {off:3} {res}");
             let prev = off.checked_sub(1).map(|p| &block.instructions[p]);
             // An inlined call shifting to its callee's frame by a window op is laid out as the op,
-            // the caller's frame kept before it. See Note [Inlined calls] in `specialize`.
+            // the caller's frame kept before it. See Note [Inlined calls].
             let shifted = inline_shift(res).map(Residual::ExecWindow);
-            let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_) | Residual::GuardWitness { .. })
-                || shifted.is_some() || keeps_frame(res);
+            let keeps_window = window(res) || inline_guard(res) || jump(res) || matches!(res, Residual::Thunk(_) | Residual::Tripped(_) | Residual::GuardWitness { .. })
+                || shifted.is_some() || keeps_frame(res) || matches!(res, Residual::Enter(_) | Residual::Leave(_));
             if window(res) && prev.is_some_and(|p| window(p)) {
                 // Inside a run of window residuals, charged for with its first.
             } else {
@@ -2455,8 +3011,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         emit_window_move(ops, emit, offset.get());
                     }
                 }
+                // Not between an op and the `Branch` or `Select` taking its exit, which JIT code
+                // takes by where it goes, not by `select`, which the interpreter would read.
                 #[cfg(feature = "gas")]
-                emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1), &alloc.stores());
+                if !matches!(res, Residual::Branch { .. } | Residual::Select(_)) {
+                    emit_gas_check(ops, off, block.instructions[off..].iter().take_while(|r| window(r)).count().max(1), &alloc.stores());
+                }
             }
             let call = res;
             if shifted.is_some() {
@@ -2539,7 +3099,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::GuardWitness { href, expected } => {
                     // A `Guard` of hash key `href`'s field: its value, through the
-                    // frame's witness of it (Note [Hash witnesses] in `vm`), into r10,
+                    // frame's witness of it (Note [Hash witnesses]), into r10,
                     // then the same test, with the window live.
                     window_dump!(self.jctx, "      tests r10 <- witness {}", href.0);
                     let witnesses = (core::mem::offset_of!(RunState<'static, 'static>, hash_witnesses) + Witnesses::DATA) as i32;
@@ -2629,7 +3189,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // function the JIT doesn't know. See Note [Call sites].
                     // `PushFrame` pushes the frame of a function that isn't vararg
                     // only: a call of a vararg one goes as one to a function the JIT
-                    // doesn't know. See Note [Vararg frames] in `vm`.
+                    // doesn't know. See Note [Vararg frames].
                     let version = match entry {
                         CallEntry::Block(block) if !*vararg => Some(*block),
                         _ => None,
@@ -2648,7 +3208,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // The frame, pushed by `PushFrame` returning here, with what its
                             // entry would hold kept on the native stack: put back when it
                             // returns, or written as its entry if it bails out. See Note
-                            // [Frame ops] in `specialize`.
+                            // [Frame ops].
                             // The callee's frame past a fixed count of arguments is
                             // nilled here, a store a slot, but for a big one, which
                             // `PushFrame` nils, as it does past a count up to the top.
@@ -2658,7 +3218,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             let nils = (*b != 0).then(|| (*b as usize - 1)..*stack as usize).filter(|nils| nils.len() <= INLINE_NILS);
                             // The callee's frame size, which the copy holds in an entry of its own
                             // that the JIT patches as the size grows; with no copy, the op reads it.
-                            // See Note [Inlined calls] in `specialize`.
+                            // See Note [Inlined calls].
                             let push = |frame: u64| match nils {
                                 Some(_) => frame_op!(PushFrame [false,] (held_a, held_b, frame); *a, *b),
                                 None => frame_op!(PushFrame [true,] (held_a, held_b, frame); *a, *b),
@@ -2760,14 +3320,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // The frame, replaced by `TailFrame`; then this code's own native
                     // frame is left, as the region's epilogue leaves it, and the callee's
                     // version's code entered with a jump, so its return is to what called
-                    // this code. See Note [Tail calls] in `specialize`.
+                    // this code. See Note [Tail calls].
                     let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     let (ab, effects, callee) = (hold(*a) | hold(*b) << 16, *effects as u64, *callee_effects as u64);
-                    let tail = match (*closes, *vararg) {
-                        (false, false) => frame_op!(TailFrame [false, false,] (ab, effects, callee); *a, *b),
-                        (false, true) => frame_op!(TailFrame [false, true,] (ab, effects, callee); *a, *b),
-                        (true, false) => frame_op!(TailFrame [true, false,] (ab, effects, callee); *a, *b),
-                        (true, true) => frame_op!(TailFrame [true, true,] (ab, effects, callee); *a, *b),
+                    // The callee's version is known, and so whether it is vararg.
+                    let callee_vararg = unsafe { (*(self.blocks[version.0].proto as crate::vm::LProto<'src, 'intern>)).is_vararg } != 0;
+                    let tail = match (*closes, *vararg, callee_vararg) {
+                        (false, false, false) => frame_op!(TailFrame [false, false, false,] (ab, effects, callee); *a, *b),
+                        (false, false, true) => frame_op!(TailFrame [false, false, true,] (ab, effects, callee); *a, *b),
+                        (false, true, false) => frame_op!(TailFrame [false, true, false,] (ab, effects, callee); *a, *b),
+                        (false, true, true) => frame_op!(TailFrame [false, true, true,] (ab, effects, callee); *a, *b),
+                        (true, false, false) => frame_op!(TailFrame [true, false, false,] (ab, effects, callee); *a, *b),
+                        (true, false, true) => frame_op!(TailFrame [true, false, true,] (ab, effects, callee); *a, *b),
+                        (true, true, false) => frame_op!(TailFrame [true, true, false,] (ab, effects, callee); *a, *b),
+                        (true, true, true) => frame_op!(TailFrame [true, true, true,] (ab, effects, callee); *a, *b),
                     };
                     jit_note!(self.jctx, ops, "        TailFrame");
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &tail);
@@ -2776,6 +3342,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     dynasm!(ops
                         ; .arch x64
                         ; pop r13
+                        ; add rsp, (crate::specialize::CELLS * 8) as i32
                         ; pop rbx
                         ; pop rbp
                         // The callee's base: vals.stack_ptr + base * sizeof(LBoxed)
@@ -2797,10 +3364,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; .arch x64
                                 ; jmp >no_code
                                 ; no_code:
-                                // The interpreter runs the version's first residual, as a
-                                // bailout from a block's first one does.
-                                ; mov WORD r12 => RunState.current_off, 0
-                                ; mov rax, QWORD (((-1i32 as u64) << 32 | (version.0 as u64)) as i64)
+                                // The interpreter enters the version, as it enters any block:
+                                // counting its hotness, so a function only JIT code tail calls
+                                // tiers up too.
+                                ; mov rax, QWORD (Location(*version, 0).pack().bits() as i64)
                                 ; mov BYTE r12 => RunState.trap, 1
                                 ; ret
                             );
@@ -2810,8 +3377,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::NativeCall { nf, a, b, c } if *c == 0 => {
                     // Taking every result, which may be more than the call's slots
                     // (`unpack`): `call_native` makes room for them.
-                    // An error it raises exits as an exec's trap does. See Note [Errors]
-                    // in `specialize`.
+                    // An error it raises exits as an exec's trap does. See Note [Errors].
                     dynasm!(ops
                         ; .arch x64
                         ; mov rdi, r12 // state
@@ -2871,7 +3437,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     );
                     // It returns a `Result<usize, LBoxed>`: in al bit 0 whether it's an
                     // error, and in rdx the count or the error. An error exits as an
-                    // exec's trap does. See Note [Errors] in `specialize`.
+                    // exec's trap does. See Note [Errors].
                     dynasm!(ops
                         ; .arch x64
                         ; test al, 1
@@ -2883,6 +3449,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
                         ; jmp =>exits[depth.get()]
                         ; native_ok:
+                    );
+                    // A tripped watchpoint exits, after the call. See Note [Watched tables].
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov r10, QWORD (&crate::vm::TRIPPED as *const _ as i64)
+                        ; cmp BYTE [r10], 0
+                        ; jz >untripped
+                        ; mov WORD r12 => RunState.current_off, ((off + 1) as i16)
+                        ; mov BYTE r12 => RunState.trap, 1
+                        ; mov rax, QWORD (((-1i32 as u64) << 32 | (id.0 as u64)) as i64)
+                        ; jmp =>exits[depth.get()]
+                        ; untripped:
                         ; mov rax, rdx
                     );
                     // Taking every result, the caller reads up to the top: the
@@ -2919,11 +3497,78 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         );
                     }
                 },
-                Residual::Call { a, b, c } => emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize, true),
+                Residual::Call { a, b, c } => {
+                    // A Lua function whose entry has code is called as a `LuaCall` is, its frame
+                    // pushed without an entry (whatever its size: `PushFrame` reads it and nils the
+                    // frame), so inside frames JIT code called too; anything else as a dynamic call.
+                    // See Note [Frame ops].
+                    let packed_ret = Location(BlockId(id.0), off + 1).pack();
+                    let hold = crate::specialize::Count::hold;
+                    let push = frame_op!(PushFrame [true,] (hold(*a), hold(*b), 0u64); *a, *b);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov rdi, QWORD spec
+                        ; mov rsi, r12 // state
+                        ; mov edx, *a as i32
+                        ; call extern (JitHelper::lua_code as *const () as usize)
+                        ; test rax, rax
+                        ; jz >dynamic
+                        // The code, under the caller's frame kept as `LuaCall` keeps it.
+                        ; sub rsp, 8
+                        ; push rax
+                    );
+                    jit_note!(self.jctx, ops, "        keep the caller's frame");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; push QWORD r12 => RunState.clos
+                        ; push QWORD r12 => RunState.base
+                        ; push QWORD r12 => RunState.witness_base
+                        ; push QWORD r12 => RunState.witness_top
+                    );
+                    jit_note!(self.jctx, ops, "        PushFrame");
+                    emit_frame_op_owning(ops, &mut self.jctx.stencils, pool, &push, Some(2));
+                    self.jctx.frame_ops.push(push);
+                    jit_note!(self.jctx, ops, "        enter the callee");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; lea rcx, r12 => RunState.vals
+                        ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
+                        ; mov rcx, QWORD r12 => RunState.base
+                        ; lea r13, [rax + rcx * 8]
+                        ; call QWORD [rsp + 32]
+                    );
+                    jit_note!(self.jctx, ops, "        put back the caller's frame, or unwind");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; cmp BYTE r12 => RunState.trap, 0
+                        ; jz >call_returned
+                        ; mov rdi, r12
+                        ; mov rsi, rsp
+                        ; mov rdx, QWORD (packed_ret.bits() as i64)
+                        ; mov rcx, rax
+                        ; call extern (JitHelper::unwind_frame as *const () as usize)
+                        ; add rsp, 48
+                        ; jmp =>exits[depth.get()]
+                        ; call_returned:
+                        ; pop QWORD r12 => RunState.witness_top
+                        ; pop QWORD r12 => RunState.witness_base
+                        ; pop QWORD r12 => RunState.base
+                        ; pop QWORD r12 => RunState.clos
+                        ; add rsp, 16
+                        ; mov r13, QWORD [rsp - 0]
+                        ; jmp >lua_called
+                        ; dynamic:
+                    );
+                    emit_dynamic_call(ops, off, *a, *b, *c, JitHelper::dynamic_call as *const () as usize, true);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; lua_called:
+                    );
+                },
                 Residual::ReturnedFrom(from) => {
                     // The call's return value, still in rax, from the `Ret` expected: its
                     // continuation goes on to `off + 2`, else falls through to the thunk for the
-                    // next return. See Note [Call continuations] in `specialize`.
+                    // next return. See Note [Call continuations].
                     let from = pool.value(ops, *from);
                     dynasm!(ops
                         ; .arch x64
@@ -2933,7 +3578,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Arrived { a, c, returned } => {
                     // The results, as `Arrive` takes them, of a return of `returned`: the
-                    // missing ones nil. See Note [Call continuations] in `specialize`.
+                    // missing ones nil. See Note [Call continuations].
                     if *c != 0 {
                         let (at, end) = (*a as usize, *a as usize + *c as usize - 1);
                         let nil = i32::try_from(LBoxed::NIL.bits()).expect("nil is a sign-extended imm32");
@@ -2954,7 +3599,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Arrive { a, c } => {
                     // The call's results, taken by `Arrive`, which keeps no register
                     // but `state`'s: the base pointer is loaded again. See Note
-                    // [Returns] in `specialize`.
+                    // [Returns].
                     let hold = |count: u16| crate::specialize::Count::hold(count) as u64;
                     let arrive = frame_op!(Arrive [] (hold(*a) | hold(*c) << 16); *a, *c);
                     emit_frame_op(ops, &mut self.jctx.stencils, pool, &arrive);
@@ -2963,6 +3608,30 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; .arch x64
                         ; mov r13, QWORD [rsp - 0]
                     );
+                },
+                Residual::PatchableJump(target) => {
+                    // A jump, or relaxed to a fall-through a NOP5, the 5 bytes unlinking it patches
+                    // to a jump to its exit.
+                    let skip = off == end - 1 && self.jctx.blocks.get(target).is_none();
+                    let (moves, to, count, window) = emit_jump(ops, &alloc, target, skip, true).expect("a deferred jump's moves");
+                    if let Some(at) = count {
+                        emit_count(ops, at);
+                    }
+                    for emit in moves {
+                        emit_window_move(ops, emit, offset.get());
+                    }
+                    let snapshot = pool.snapshot(ops, Location(id, off), depth.get(), offset.get(), WindowAlloc::entering(window.clone()).stores());
+                    let exit = ops.new_dynamic_label();
+                    pool.stubs.push((exit, Stub::Exit { snapshot }));
+                    let at = ops.offset().0;
+                    self.jctx.region_patchables.push((id, off, at, exit, window));
+                    match to {
+                        _ if skip => ops.extend(&NOP5),
+                        JumpTo::Code(code) => dynasm!(ops ; .arch x64 ; jmp extern code),
+                        JumpTo::Label(label) => dynasm!(ops ; .arch x64 ; jmp =>label),
+                    }
+                    assert_eq!(ops.offset().0 - at, NOP5.len(), "a patchable jump of 5 bytes");
+                    successor = Some(*target);
                 },
                 Residual::Jump(target) => {
                     // If the block ends in a jump, and the block hasn't already been emitted, then
@@ -2977,9 +3646,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // The frame, popped by `PopFrame`, and the JIT code left with the
                     // return (`RETURNED | effects << EFFECTS_SHIFT | id`), or for the
                     // outermost frame's, the exit. See Notes [Frame ops], [Call
-                    // continuations] and [Call effects] in `specialize`.
+                    // continuations] and [Call effects].
                     let hold = crate::specialize::Count::hold;
-                    // With the id of what it returns. See Note [Call continuations] in `specialize`.
+                    // With the id of what it returns. See Note [Call continuations].
                     let (held_a, held_b, returns) = (hold(*a as u16), hold(*b), *returns);
                     let (effects, at) = (*effects as u64, Location(BlockId(id.0), off).pack().bits() as u64);
                     let pop = match (*closes, *vararg) {
@@ -2998,12 +3667,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; jmp =>exits[depth.get()]
                     );
                 },
-                Residual::Inline { a, b, stack, continuation } => {
+                Residual::Inline { a, b, stack, cells, continuation } => {
                     // The callee's frame, moved to by `ShiftFrameFilled`, which keeps no register
                     // but `state`'s and nils the frame; what the frame's entry would hold kept as
                     // `RunState::adopt_inlined` lays it out, the code after the call above the
                     // callee's base pointer, which is last, where the code after a call takes it
-                    // back from. See Note [Inlined calls] in `specialize`.
+                    // back from. See Note [Inlined calls].
                     let hold = crate::specialize::Count::hold;
                     let (held_a, held_b) = (hold(*a), hold(*b));
                     let shift = frame_op!(ShiftFrameFilled [] (held_a, held_b, *stack); *a, *b);
@@ -3027,20 +3696,35 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; add r13, (*a as i32 + 1) * 8
                         ; mov QWORD [rsp], r13
                     );
+                    emit_fill_cells(ops, *cells, depth.get() + 1);
                     depth.set(depth.get() + 1);
                     offset.set(offset_past(res, offset.get()));
                     pool.deepest = pool.deepest.max(depth.get());
                 },
+                // The base moved to an inlined call's frame, or back, none of it made: the window
+                // names slots from the outermost frame's base, so it keeps. See Note [Inlined
+                // frames].
+                Residual::Enter(by) | Residual::Leave(by) => {
+                    let by = if matches!(res, Residual::Enter(_)) { *by as i32 } else { -(*by as i32) };
+                    jit_note!(self.jctx, ops, "        move the base");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; add QWORD r12 => RunState.base, by
+                        ; add QWORD r12 => RunState.shifted, by
+                        ; add r13, by * 8
+                    );
+                    offset.set(offset_past(res, offset.get()));
+                },
                 Residual::InlineReturn { .. } if keeps_frame(res) => {
                     // Its results moved by the window ops after it, the caller's frame put back
-                    // from what `Inline` kept, keeping the window. See Note [Inlined calls] in
-                    // `specialize`.
+                    // from what `Inline` kept, keeping the window. See Note [Inlined calls].
                     jit_note!(self.jctx, ops, "        put back the caller's frame");
                     dynasm!(ops
                         ; .arch x64
                         ; dec QWORD r12 => RunState.jit_depth
-                        ; add rsp, 16
-                        ; pop QWORD r12 => RunState.witness_top
+                        // The witnesses it wrote are its caller's: the top stays. See Note
+                        // [Hash witnesses].
+                        ; add rsp, 24
                         ; pop QWORD r12 => RunState.witness_base
                         ; pop QWORD r12 => RunState.base
                         ; pop QWORD r12 => RunState.clos
@@ -3051,8 +3735,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::InlineReturn { a, b, closes, call, moves } => {
                     // The results moved by `UnshiftFrame`, then the caller's frame put back from
-                    // what `Inline` kept, and the base pointer with it. See Note [Inlined calls]
-                    // in `specialize`.
+                    // what `Inline` kept, and the base pointer with it. See Note [Inlined calls].
                     let _ = call;
                     let hold = crate::specialize::Count::hold;
                     let (held_a, held_b) = (hold(*a), hold(*b));
@@ -3068,8 +3751,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     jit_note!(self.jctx, ops, "        put back the caller's frame");
                     dynasm!(ops
                         ; .arch x64
-                        ; add rsp, 16
-                        ; pop QWORD r12 => RunState.witness_top
+                        // The witnesses it wrote are its caller's: the top stays. See Note
+                        // [Hash witnesses].
+                        ; add rsp, 24
                         ; pop QWORD r12 => RunState.witness_base
                         ; pop QWORD r12 => RunState.base
                         ; pop QWORD r12 => RunState.clos
@@ -3078,13 +3762,89 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     depth.set(depth.get() - 1);
                     offset.set(offset_past(res, offset.get()));
                 },
+                Residual::Uninline { entry, .. } => {
+                    // `Inline` kept what a call keeps, and the continuation. Without the continuation
+                    // the record is a call's, so the callee's version is called on the frame as it
+                    // is. A version with no code yet is linked once it has some. Until then the
+                    // interpreter changes the frame. See Note [Sealed inlined calls].
+                    let version = *entry;
+                    let code = self.blocks[version.0].jit_info.entry;
+                    let packed_ret = Location(BlockId(id.0), off + 1).pack();
+                    let site = ops.offset().0;
+                    if code.is_none() {
+                        dynasm!(ops
+                            ; .arch x64
+                            ; jmp >uninline_exit
+                        );
+                    }
+                    jit_note!(self.jctx, ops, "        make the frame a call's");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; add rsp, 16
+                        ; mov rdi, r12
+                        ; call extern (JitHelper::own_frame as *const () as usize)
+                        // The stack may have moved.
+                        ; lea rcx, r12 => RunState.vals
+                        ; mov rax, QWORD rcx => ValueStack<'src, 'intern>.stack_ptr
+                        ; mov rcx, QWORD r12 => RunState.base
+                        ; lea r13, [rax + rcx * 8]
+                    );
+                    let inlined = depth.get();
+                    depth.set(inlined - 1);
+                    match code {
+                        Some(code) => dynasm!(ops
+                            ; .arch x64
+                            ; call extern (code as usize)
+                        ),
+                        None => {
+                            self.jctx.region_calls.push((version, site, ops.offset().0));
+                            dynasm!(ops
+                                ; .arch x64
+                                ; call >uninline_exit
+                            );
+                        },
+                    }
+                    jit_note!(self.jctx, ops, "        put back the caller's frame, or unwind");
+                    dynasm!(ops
+                        ; .arch x64
+                        ; cmp BYTE r12 => RunState.trap, 0
+                        ; jz >uninline_returned
+                        ; mov rdi, r12
+                        ; mov rsi, rsp
+                        ; mov rdx, QWORD (packed_ret.bits() as i64)
+                        ; mov rcx, rax
+                        ; call extern (JitHelper::unwind_frame as *const () as usize)
+                        ; add rsp, 32
+                        ; jmp =>exits[depth.get()]
+                        ; uninline_returned:
+                        ; pop QWORD r12 => RunState.witness_top
+                        ; pop QWORD r12 => RunState.witness_base
+                        ; pop QWORD r12 => RunState.base
+                        ; pop QWORD r12 => RunState.clos
+                        ; mov r13, QWORD [rsp - 0]
+                    );
+                    if code.is_none() {
+                        dynasm!(ops
+                            ; .arch x64
+                            ; jmp >uninline_done
+                            ; uninline_exit:
+                        );
+                        depth.set(inlined);
+                        emit_bailout(ops, off);
+                        depth.set(inlined - 1);
+                        dynasm!(ops
+                            ; .arch x64
+                            ; uninline_done:
+                        );
+                    }
+                    offset.set(offset_past(res, offset.get()));
+                },
                 Residual::Branch { hot, cold } => {
                     match fused.take() {
                         // The op falls through to exit 0, the hot way; exit 1, its cold
-                        // path's, goes off the hot path. See Notes [Window exits] in
-                        // `window` and [Optimistic ops] in `specialize`.
+                        // path's, goes off the hot path. See Notes [Window exits] and [Optimistic ops].
                         Some((label, aligned, _)) => {
-                            let (moves, to, count) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
+                            let (moves, to, count, _) = emit_jump(ops, &alloc, cold, false, true).expect("a deferred jump's moves");
                             pool.stubs.push((label, Stub::Way { aligned, moves, to, count, offset: offset.get() }));
                             emit_jump(ops, &alloc, hot, self.jctx.blocks.get(hot).is_none(), false);
                         },
@@ -3102,7 +3862,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     successor = Some(*hot);
                 },
                 // The op before it took exit 0, falling through, or exit 1 to its
-                // way. See Note [Window exits] in `window`.
+                // way. See Note [Window exits].
                 Residual::Select(targets) if fused.is_some() => {
                     let (label, aligned, fall_exit) = fused.take().expect("a fused exit");
                     let first = targets[0].1;
@@ -3116,7 +3876,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     } else {
                         // Exit 1 comes only from its cold path: its way off the hot path.
-                        let (moves, to, count) = emit_jump(ops, &alloc, &targets[1].1, false, true).expect("a deferred jump's moves");
+                        let (moves, to, count, _) = emit_jump(ops, &alloc, &targets[1].1, false, true).expect("a deferred jump's moves");
                         pool.stubs.push((label, Stub::Way { aligned, moves, to, count, offset: offset.get() }));
                     }
                     emit_jump(ops, &alloc, &first, self.jctx.blocks.get(&first).is_none(), false);
@@ -3129,12 +3889,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // A taken target's transfer may use rax (`SCRATCH`): the
                     // comparisons only continue on the paths not taken.
                     //
-                    // `select` is always one of the targets: debug builds test
-                    // each and trap on anything else, which release builds
-                    // trust, testing only the targets after the first and
-                    // falling through to it.
-                    let tested = if cfg!(debug_assertions) { 0 } else { 1 };
-                    for (i, target) in targets.iter().enumerate().skip(tested) {
+                    // `select` is always one of the targets. Debug builds test
+                    // each and trap on anything else. Release builds fall
+                    // through to the heaviest edge's target and test the rest.
+                    let heaviest = (0..targets.len()).min_by_key(|&i| (std::cmp::Reverse(self.jctx.edges.recent(id, targets[i].1)), i)).expect("a Select's targets");
+                    for (i, target) in targets.iter().enumerate().filter(|&(i, _)| cfg!(debug_assertions) || i != heaviest) {
                         #[cfg(feature = "align_selects")]
                         if (self.jctx.region_base + ops.offset().0) % CACHE_LINE + SELECT_TEST > CACHE_LINE {
                             pad(ops, self.jctx.region_base, CACHE_LINE);
@@ -3155,12 +3914,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             ; ud2
                         );
                     } else {
-                        // The first target is laid out next if it isn't compiled
+                        // The heaviest edge's target is laid out next if it isn't compiled
                         // yet, as a `Jump`'s is: falling through, it needs no jump.
                         debug_assert_eq!(off, block.instructions.len() - 1, "a Select ends its block");
-                        let first = targets[0].1;
-                        emit_jump(ops, &alloc, &first, self.jctx.blocks.get(&first).is_none(), false);
-                        successor = Some(first);
+                        let next = targets[heaviest].1;
+                        emit_jump(ops, &alloc, &next, self.jctx.blocks.get(&next).is_none(), false);
+                        successor = Some(next);
                     }
                 },
                 Residual::GC => {
@@ -3169,12 +3928,90 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; call extern (JitHelper::gc_safepoint as *const () as usize)
                     );
                 },
+                // Its code on the registers planned for its operands, or streaming, those the
+                // window has. See Note [Emitted ops].
+                Residual::Emit(e) => {
+                    let framed = Framed::emitted(&**e, offset.get());
+                    let (regs, emits) = match plans.get(&id).and_then(|plan| plan.placed[off]) {
+                        Some((out, want)) => {
+                            let want = want.unpack();
+                            let regs = framed.placed(&want, out as usize);
+                            let mut emits = alloc.reconcile(&want, &framed, &regs);
+                            emits.extend(alloc.emitted(&framed, &regs));
+                            (regs, emits)
+                        }
+                        None => {
+                            let regs = alloc.free_regs(&framed);
+                            let emits = alloc.emitted(&framed, &regs);
+                            (regs, emits)
+                        }
+                    };
+                    let counted = window_count!(self.jctx, ops, emits);
+                    window_dump!(self.jctx, "      {}{counted}", emits_line(&emits));
+                    let machine: SmallVec<[u8; WINDOW]> = regs.iter().enumerate()
+                        .map(|(i, &reg)| if e.doubles() >> i & 1 == 1 { xmm(reg) } else { WINDOW_REGS[reg] })
+                        .collect();
+                    // Its exits as a copied op's: before a `Branch` or `Select`, that residual's
+                    // ways, else stored to `select`; its cold path through the site's record into
+                    // the cold code every site on its registers shares. See Notes [Window exits],
+                    // [Cold stencils] and [Emitted ops].
+                    let fuses = match block.instructions.get(off + 1) {
+                        Some(Residual::Branch { .. }) => true,
+                        Some(Residual::Select(targets)) => targets.len() == EXITS,
+                        _ => false,
+                    };
+                    let fall = ops.new_dynamic_label();
+                    let other = e.selects().then(|| ops.new_dynamic_label());
+                    let exits = crate::emitted::Exits { exit1: other.unwrap_or(fall), cold: ops.new_dynamic_label() };
+                    if let Some(cold) = e.cold() {
+                        let record = pool.record(ops, [fall, other.unwrap_or(fall)], e.name(), &e.captures().into_iter().collect());
+                        let key = (e.name(), machine.clone());
+                        let to = match self.jctx.emitted_colds.get(&key) {
+                            Some(&code) => JumpTo::Code(code),
+                            None => JumpTo::Label(*pool.colds.entry(key.clone()).or_insert_with(|| {
+                                let label = ops.new_dynamic_label();
+                                pool.stubs.push((label, Stub::EmittedCold { cold, regs: machine.clone(), key }));
+                                label
+                            })),
+                        };
+                        pool.stubs.push((exits.cold, Stub::ColdEntry { record, cold: to }));
+                    }
+                    for emit in emits {
+                        match emit {
+                            Emit::Emitted => e.emit(ops, &machine, &exits),
+                            emit => emit_window_move(ops, emit, offset.get()),
+                        }
+                    }
+                    dynasm!(ops ; .arch x64 ; =>fall);
+                    match other {
+                        Some(label) if fuses => fused = Some((label, false, 0)),
+                        // Selected, for whatever reads `select` after it.
+                        Some(label) => {
+                            let join = ops.new_dynamic_label();
+                            pool.stubs.push((label, Stub::Select { aligned: false, exit: 1, join }));
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov QWORD r12 => RunState.select, 0
+                                ; =>join
+                            );
+                        }
+                        None => {}
+                    }
+                },
                 Residual::ExecWindow(w) | Residual::GuardDynamic(w) => {
                     // The op copied for it, as planning placed. See Note [Unboxed
-                    // doubles] in `window_alloc`.
+                    // doubles].
                     let w = self.jctx.stencils.effective(w);
                     let w = &w;
                     let stencils = &mut self.jctx.stencils;
+                    // See Note [Window memory].
+                    if w.cells().is_some() {
+                        let stores = alloc.clean(&slots_below(offset.get()));
+                        window_dump!(self.jctx, "      cells: store {}", emits_line(&stores));
+                        for emit in stores {
+                            emit_window_move(ops, emit, offset.get());
+                        }
+                    }
                     let emits = match plans.get(&id) {
                         // A `Move` planned as a rename. See `WindowAlloc::rename`.
                         Some(plan) if plan.placed[off].is_some_and(|(skip, _)| skip as usize >= RENAME) => {
@@ -3183,7 +4020,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             Some(alloc.rename(framed.slots()[0], framed.slots()[1], store))
                         }
                         Some(plan) => plan.placed[off].map(|(skip, want)| {
-                            let mut emits = alloc.reconcile(&want.unpack(), &Framed::new(&**w, offset.get()), skip as usize);
+                            let framed = Framed::new(&**w, offset.get());
+                            let mut emits = alloc.reconcile(&want.unpack(), &framed, &framed.run(skip as usize));
                             emits.extend(alloc.op(&Framed::new(&**w, offset.get()), [skip as usize]).expect("a placed op runs at its SKIP"));
                             emits
                         }),
@@ -3196,8 +4034,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // edge, exit 1 jumping to its pass edge; before a `Select` it falls
                     // through to exit 1's way, as the test of `select` would, when its
                     // stencil can (exit 1 only from its cold path otherwise); before a
-                    // `Branch`, to exit 0, the hot way. See Note [Window exits] in
-                    // `window`.
+                    // `Branch`, to exit 0, the hot way. See Note [Window exits].
                     let next = block.instructions.get(off + 1);
                     let fuses = match next {
                         Some(Residual::Branch { .. }) => true,
@@ -3220,10 +4057,27 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             window_dump!(self.jctx, "      {}{counted}", emits_line(&emits));
                             for emit in emits {
                                 match emit {
+                                    // A load from an upvalue's cell, into the op's register. See
+                                    // Note [Upvalue cells].
+                                    Emit::Op { skip } if let Some(CellOp::Load(cell)) = cell_op(&**w) => {
+                                        dynasm!(ops
+                                            ; .arch x64
+                                            ; mov Rq(WINDOW_REGS[skip]), QWORD [rbp + cell_disp(cell)]
+                                        );
+                                        emit_check_cell(ops, WINDOW_REGS[skip], w.captures()[0] as usize, cell);
+                                    }
                                     Emit::Op { skip } => {
                                         let body = stencils.body(&**w, skip, fall_exit).expect("a usable skip");
                                         splat(ops, &body, w.name(), &w.captures(), pool, other, unalign);
                                         copied = Some(body.aligned);
+                                        // The value loaded from or stored into an upvalue, into
+                                        // its cell too.
+                                        if let Some(CellOp::Store(cell)) = cell_op(&**w) {
+                                            dynasm!(ops
+                                                ; .arch x64
+                                                ; mov QWORD [rbp + cell_disp(cell)], Rq(WINDOW_REGS[skip])
+                                            );
+                                        }
                                     }
                                     emit => emit_window_move(ops, emit, offset.get()),
                                 }
@@ -3246,7 +4100,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 ; mov rdx, QWORD (vtable as i64)
                                 ; call extern (JitHelper::window_interp as *const () as usize)
                             );
+                            // Its value, from the stack, into the upvalue's cell. See Note
+                            // [Upvalue cells].
+                            if let Some(CellOp::Store(cell)) = cell_op(&**w) {
+                                dynasm!(ops
+                                    ; .arch x64
+                                    ; mov rax, QWORD [r13 + (w.operands()[0] * 8) as i32]
+                                    ; mov QWORD [rbp + cell_disp(cell)], rax
+                                );
+                            }
                         }
+                    }
+                    // Its sets of upvalues may have been of their stack homes.
+                    if w.cells() == Some(Access::Write) {
+                        alloc.forget(&slots_below(offset.get()));
                     }
                     match (res, other, copied) {
                         // Its body ran on the stack, and selected: as an inline guard, a
@@ -3280,11 +4147,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         _ => {}
                     }
                 },
-                Residual::Thunk(_) => {
+                Residual::Thunk(_) | Residual::Tripped(_) => {
                     // Room for a `jmp rel32` past the exit, once the thunk is a
-                    // jump. See Note [Thunk patching].
-                    self.jctx.region_sites.push((id, off, ops.offset().0, alloc.cache().clone()));
-                    ops.extend(&NOP5);
+                    // jump. See Note [Thunk patching]. A trip always exits. See Note
+                    // [Watched tables].
+                    if matches!(res, Residual::Thunk(_)) {
+                        self.jctx.region_sites.push((id, off, ops.offset().0, alloc.cache().clone()));
+                        ops.extend(&NOP5);
+                    }
                     let stores = alloc.stores();
                     let counted = window_count!(self.jctx, ops, stores);
                     window_dump!(self.jctx, "      exit after {}{counted}", emits_line(&stores));
@@ -3301,7 +4171,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }; break; }
             if shifted.is_some() {
-                let &Residual::Inline { a, b, stack, .. } = call else { unreachable!() };
+                let &Residual::Inline { a, b, stack, cells, .. } = call else { unreachable!() };
                 // The window op keeps r13, the caller's base pointer, and the stack, which the
                 // callee's frame is within, stays where it is.
                 jit_note!(self.jctx, ops, "        enter the callee's frame");
@@ -3310,6 +4180,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ; add r13, (a as i32 + 1) * 8
                     ; mov QWORD [rsp], r13
                 );
+                emit_fill_cells(ops, cells, depth.get() + 1);
                 // Past its arguments, its frame's slots hold nil, the caller's dead temporaries
                 // before.
                 alloc.forget(&inline_kills(call, offset.get()));

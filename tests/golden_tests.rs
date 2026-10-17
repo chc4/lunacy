@@ -13,6 +13,9 @@ thread_local! {
     // The metatable of `make_userdata`'s userdata, as its bits: a native captures nothing. The
     // global `userdata_metatable` holds it too, which keeps it alive.
     static USERDATA_METATABLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // The metatable of `make_counter`'s userdata, as `USERDATA_METATABLE`; the global
+    // `counter_metatable` holds it.
+    static COUNTER_METATABLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // The owner is per-thread (a second `Owner::new()` on a thread panics), so a shared
     // `static` cell — which would have to be `Sync` — can't hold it; each test thread gets
     // its own capture buffer instead.
@@ -35,7 +38,7 @@ fn test_golden() {
     for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("lua") {
-            run_test_file(&path, false);
+            run_timed(&path, false);
         }
     }
 }
@@ -52,8 +55,39 @@ fn test_lua_baseline() {
     for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("lua") {
-            run_test_file(&path, true);
+            run_timed(&path, true);
         }
+    }
+}
+
+/// `run_test_file` on a thread of its own, failing if it runs past `LUNACY_GOLDEN_TIMEOUT`
+/// seconds (120 by default): a golden test is small, and one running that long is stuck. The
+/// thread is left running, and ends with the test process.
+fn run_timed(path: &Path, lua_baseline: bool) {
+    let limit = std::env::var("LUNACY_GOLDEN_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+    // `LUNACY_GOLDEN_GAS_SEED`: each test run with gas (feature `gas`) the seed and its name
+    // choose, from 1 to about a million, as likely small as large: JIT code stopping anywhere
+    // must leave the run as it would have been.
+    if let Some(seed) = std::env::var("LUNACY_GOLDEN_GAS_SEED").ok().filter(|_| !lua_baseline) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        (seed, path).hash(&mut hasher);
+        let bits = hasher.finish();
+        let gas = (1u64 << (bits % 21)) + (bits >> 32) % (1u64 << (bits % 21));
+        println!("{} with gas {gas}", path.display());
+        // Read when the run starts, on the test's thread; nothing else runs meanwhile.
+        unsafe { std::env::set_var("LUNACY_GAS", gas.to_string()) };
+    }
+    let owned = path.to_path_buf();
+    let (done, finished) = std::sync::mpsc::channel();
+    let test = std::thread::spawn(move || {
+        run_test_file(&owned, lua_baseline);
+        let _ = done.send(());
+    });
+    // A panic drops the sender: the test's own failure, from its thread.
+    match finished.recv_timeout(std::time::Duration::from_secs(limit)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{} ran past {limit}s", path.display()),
+        _ => if let Err(panic) = test.join() { std::panic::resume_unwind(panic) },
     }
 }
 
@@ -121,6 +155,18 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
             })));
             _g.set(owner, print_key, custom_print, s.intern());
 
+            // `blackbox(...)`: its arguments, from a native that isn't pure, so a call of it is
+            // opaque to the specializer. A test runs under Lua 5.1 with an identity in its place.
+            let blackbox = vm::LBoxed::box_lvalue(vm::LValue::NClosure(vm::NClosure::new(|mut seq, args, returns, _owner| {
+                let args: Vec<vm::LBoxed> = args.ro(&seq).to_vec();
+                let returns = returns.rw(&mut seq);
+                for (i, slot) in returns.iter_mut().enumerate() {
+                    *slot = args.get(i).copied().unwrap_or(vm::LBoxed::NIL);
+                }
+                Ok(args.len().min(returns.len()))
+            })));
+            _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "blackbox")), blackbox, s.intern());
+
             // `make_userdata()`: a userdata whose metatable's `__index` table has `answer`, a
             // native returning 42, as a library's objects have methods.
             let mut index = vm::Table::new(0, 1);
@@ -141,6 +187,31 @@ fn run_test_file(path: &Path, lua_baseline: bool) {
                 Ok(1)
             })));
             _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "make_userdata")), make_userdata, s.intern());
+
+            // `make_counter()`: a userdata whose data is a count, from 0, which its
+            // method `bump` adds one to and returns, as a library's objects keep
+            // native state.
+            let mut index = vm::Table::new(0, 1);
+            index.insert_lvalue(vm::InternString::intern(s.intern(), "bump"), vm::LValue::NClosure(vm::NClosure::new(|mut seq, args, returns, owner| {
+                let vm::LValue::Userdata(counter) = args.ro(&seq)[0].unbox() else { return Err(vm::LBoxed::NIL) };
+                let count = counter.ro(owner).data::<std::cell::Cell<i32>>().expect("a counter's count");
+                count.set(count.get() + 1);
+                returns.rw(&mut seq).iter_mut().next().map(|r| *r = vm::LBoxed::from_int(count.get()));
+                Ok(1)
+            })));
+            let mut metatable = vm::Table::new(0, 1);
+            metatable.insert_lvalue(vm::InternString::intern(s.intern(), "__index"), vm::LValue::Table(vm::Tc::new(index)));
+            let metatable = vm::LBoxed::box_lvalue(vm::LValue::Table(vm::Tc::new(metatable)));
+            COUNTER_METATABLE.with(|bits| bits.set(metatable.bits()));
+            _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "counter_metatable")), metatable, s.intern());
+            let make_counter = vm::LBoxed::box_lvalue(vm::LValue::NClosure(vm::NClosure::pure(|mut seq, _args, returns, _owner| {
+                // Safety: the global `counter_metatable` keeps it alive.
+                let metatable = unsafe { vm::LBoxed::from_bits(COUNTER_METATABLE.with(|bits| bits.get())) }.as_table();
+                let counter = vm::LValue::Userdata(vm::Tc::new(vm::Userdata::with_data(metatable, std::cell::Cell::new(0i32))));
+                returns.rw(&mut seq).iter_mut().next().map(|r| *r = vm::LBoxed::box_lvalue(counter));
+                Ok(1)
+            })));
+            _g.set(owner, vm::LBoxed::box_lvalue(vm::InternString::intern(s.intern(), "make_counter")), make_counter, s.intern());
 
             let clos = vm::Tc::new(vm::LClosure::new(s.vm().top_level));
             let args = vec![].into();

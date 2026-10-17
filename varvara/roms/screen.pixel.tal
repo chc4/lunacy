@@ -1,0 +1,96 @@
+( Screen.pixel: test rom for screen pixel drawing )
+
+|00 @System &vector $2 &wst $1 &rst $1 &pad $4 &r $2 &g $2 &b $2 &debug $1 &halt $1
+|20 @Screen &vector $2 &width $2 &height $2 &auto $1 &pad $1 &x $2 &y $2 &addr $2 &pixel $1 &sprite $1
+
+|0000
+
+	@center &x $2 &y $2
+
+|0100
+
+@on-reset ( -> )
+	( | theme )
+	#f07f .System/r DEO2
+	#f0d6 .System/g DEO2
+	#f0b2 .System/b DEO2
+	( | resize )
+	#00c8 DUP2 .Screen/width DEO2
+	.Screen/height DEO2
+	( | find screen center )
+	.Screen/width DEI2 #01 SFT2 .center/x STZ2
+	.Screen/height DEI2 #01 SFT2 .center/y STZ2
+	( | draw )
+	<draw-bg-fill>
+	<draw-bg-corners>
+	<draw-fg-corners>
+	<draw-pixels>
+	BRK
+
+@<draw-bg-fill> ( -- )
+	.center/x LDZ2 .Screen/x DEO2
+	.center/x LDZ2 .Screen/y DEO2
+	( | 4-way backgrounds )
+	#0400
+	&l ( -- )
+		DUP DUP #40 SFT #80 ADD ORA .Screen/pixel DEO
+		INC GTHk ?&l
+	POP2 JMP2r
+
+@<draw-bg-corners> ( -- )
+	.center/x LDZ2 #01 SFT2 .Screen/x DEO2
+	.center/y LDZ2 #01 SFT2 .Screen/y DEO2
+	#b0 .Screen/pixel DEO
+	.center/x LDZ2 #01 SFT2 #0003 MUL2 .Screen/x DEO2
+	.center/y LDZ2 #01 SFT2 .Screen/y DEO2
+	#a1 .Screen/pixel DEO
+	.center/x LDZ2 #01 SFT2 #0003 MUL2 .Screen/x DEO2
+	.center/y LDZ2 #01 SFT2 #0003 MUL2 .Screen/y DEO2
+	#83 .Screen/pixel DEO
+	.center/x LDZ2 #01 SFT2 .Screen/x DEO2
+	.center/y LDZ2 #01 SFT2 #0003 MUL2 .Screen/y DEO2
+	#92 .Screen/pixel DEO
+	JMP2r
+
+@<draw-fg-corners> ( -- )
+	.center/x LDZ2 #02 SFT2 .Screen/x DEO2
+	.center/y LDZ2 #02 SFT2 .Screen/y DEO2
+	#f1 .Screen/pixel DEO
+	.center/x LDZ2 #02 SFT2 #0007 MUL2 .Screen/x DEO2
+	.center/y LDZ2 #02 SFT2 .Screen/y DEO2
+	#e3 .Screen/pixel DEO
+	( clear ) #e0 .Screen/pixel DEO
+	.center/x LDZ2 #02 SFT2 #0007 MUL2 .Screen/x DEO2
+	.center/y LDZ2 #02 SFT2 #0007 MUL2 .Screen/y DEO2
+	#c2 .Screen/pixel DEO
+	.center/x LDZ2 #02 SFT2 .Screen/x DEO2
+	.center/y LDZ2 #02 SFT2 #0007 MUL2 .Screen/y DEO2
+	#d0 .Screen/pixel DEO
+	JMP2r
+
+@<draw-pixels> ( -- )
+	( | bottom-left, background )
+	.center/x LDZ2 #0010 SUB2 .Screen/x DEO2
+	.center/y LDZ2 .Screen/y DEO2
+	( auto-x ) #01 .Screen/auto DEO
+	#00
+	&bl ( -- )
+		#00 OVR EQU OVR #0f AND ORA ?{
+			.center/x LDZ2 #0010 SUB2 .Screen/x DEO2
+			.Screen/y DEI2k INC2 ROT DEO2 }
+		DUP #04 SFT OVR #0f AND LTH INC .Screen/pixel DEO
+		INC DUP ?&bl
+	POP
+	( | bottom-right, foreground )
+	.center/x LDZ2 .Screen/x DEO2
+	.center/y LDZ2 #0010 SUB2 .Screen/y DEO2
+	( auto-y ) #02 .Screen/auto DEO
+	#00
+	&br ( -- )
+		#00 OVR EQU OVR #0f AND ORA ?{
+			.center/y LDZ2 #0010 SUB2 .Screen/y DEO2
+			.Screen/x DEI2k INC2 ROT DEO2 }
+		DUP #04 SFT OVR #0f AND GTH INC #40 ORA .Screen/pixel DEO
+		INC DUP ?&br
+	POP JMP2r
+

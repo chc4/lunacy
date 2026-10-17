@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """A benchmark as one Lua file, for a Lua to compile or run: benchmarks/prelude.lua,
 then each module the benchmark requires that is a file (its own directory's, then
-lua_benchmarking/lualibs'), then the benchmark.
+varvara/'s, then lua_benchmarking/lualibs'), then the benchmark. With `--entry`,
+any Lua program, in place of a benchmark.
+
+A module `roms.<name>` is a Uxn ROM, a string: varvara/roms/<name>.tal, assembled
+by `uxnasm` into working/roms/<name>.rom. With `--rom <name>`, the module `rom`
+is that ROM.
 
 A bundled module is loaded by a `require` the bundle defines, as Lua's own loads a
 file: once, its result cached. Any other name goes to the Lua's `require`, but for
@@ -9,9 +14,11 @@ LuaJIT's `table.new` and `table.clear`, which a Lua other than LuaJIT gets as it
 own `table` functions of those names if it has them, else plain Lua versions.
 
     bundle_bench.py <benchmark> > out.lua
+    bundle_bench.py --entry varvara/snapshot.lua --rom screen > out.lua
 """
 import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -44,6 +51,19 @@ def bench_dir(name):
     sys.exit(f"bundle_bench: no benchmark {name}")
 
 
+def rom_module(name):
+    """`return` of ROM `name`'s bytes, each a decimal escape, which every Lua reads."""
+    tal = ROOT / "varvara" / "roms" / f"{name}.tal"
+    if not tal.is_file():
+        sys.exit(f"bundle_bench: no ROM {name}")
+    rom = ROOT / "working" / "roms" / f"{name}.rom"
+    rom.parent.mkdir(parents=True, exist_ok=True)
+    assembled = subprocess.run(["uxnasm", str(tal), str(rom)], capture_output=True, text=True)
+    if assembled.returncode != 0:
+        sys.exit(f"bundle_bench: uxnasm failed on {tal}:\n{assembled.stdout}{assembled.stderr}")
+    return 'return "' + "".join(f"\\{b:03d}" for b in rom.read_bytes()) + '"'
+
+
 def module_file(name, dirs):
     rel = name.replace(".", "/") + ".lua"
     for d in dirs:
@@ -54,19 +74,32 @@ def module_file(name, dirs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("benchmark")
+    parser.add_argument("benchmark", nargs="?")
+    parser.add_argument("--entry", type=Path, help="a Lua program to bundle, in place of a benchmark")
+    parser.add_argument("--rom", help="the ROM the module `rom` is")
     args = parser.parse_args()
+    if (args.benchmark is None) == (args.entry is None):
+        parser.error("give a benchmark or --entry, not both")
 
-    here = bench_dir(args.benchmark)
-    dirs = [here, ROOT / "lua_benchmarking" / "lualibs"]
-    main_src = (here / "bench.lua").read_text(encoding="latin-1")
+    if args.entry is not None:
+        here, main_path = args.entry.resolve().parent, args.entry
+    else:
+        here = bench_dir(args.benchmark)
+        main_path = here / "bench.lua"
+    dirs = [here, ROOT / "varvara", ROOT / "lua_benchmarking" / "lualibs"]
+    main_src = main_path.read_text(encoding="latin-1")
 
     # Every module the benchmark reaches, depth first, each once.
     modules = dict(TABLE_MODULES)
+    if args.rom is not None:
+        modules["rom"] = rom_module(args.rom)
     pending = REQUIRE.findall(main_src)
     while pending:
         name = pending.pop()
         if name in modules:
+            continue
+        if name.startswith("roms."):
+            modules[name] = rom_module(name.removeprefix("roms."))
             continue
         path = module_file(name, dirs)
         if path is None:

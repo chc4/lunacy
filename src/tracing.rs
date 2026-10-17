@@ -90,23 +90,24 @@ impl Tracer {
         for (arg_name, arg_val) in args.iter().take(15) {
             let name_ref = self.intern_string(arg_name) as u64;
             match arg_val {
+                // Past the string table's last index, a string goes inline.
+                TraceValue::String(s) if self.next_string_index >= 0x8000 && !self.string_table.contains_key(*s) => {
+                    let len = s.len().min(INLINE_STRING_MAX);
+                    frame_refs.push((name_ref, Some(0x8000 | len as u64), Some(s.as_bytes()[..len].to_vec())));
+                }
                 TraceValue::String(s) => {
                     let val_ref = self.intern_string(s) as u64;
                     frame_refs.push((name_ref, Some(val_ref), None));
                 }
                 TraceValue::Uint64(n) => {
-                    frame_refs.push((name_ref, None, Some(*n)));
+                    frame_refs.push((name_ref, None, Some(n.to_le_bytes().to_vec())));
                 }
             }
         }
 
         let mut arg_words = 0;
-        for (_, val_ref, u64_val) in &frame_refs {
-            if val_ref.is_some() {
-                arg_words += 1;
-            } else if u64_val.is_some() {
-                arg_words += 2;
-            }
+        for (_, _, bytes) in &frame_refs {
+            arg_words += 1 + bytes.as_ref().map_or(0, |bytes| (bytes.len() as u64 + 7) / 8);
         }
         let size = 2 + arg_words;
 
@@ -118,20 +119,23 @@ impl Tracer {
         self.write_word(header);
         self.write_word(ts);
 
-        for (name_ref, val_ref, u64_val) in frame_refs {
-            if let Some(vr) = val_ref {
-                // Argument Type 6: String, Size 1
-                let arg_header = 6u64 | (1 << 4) | (name_ref << 16) | (vr << 32);
-                self.write_word(arg_header);
-            } else if let Some(uv) = u64_val {
+        for (name_ref, val_ref, bytes) in frame_refs {
+            let words = bytes.as_ref().map_or(0, |bytes| (bytes.len() as u64 + 7) / 8);
+            match val_ref {
+                // Argument Type 6: String, its bytes after the header if inline
+                Some(vr) => self.write_word(6u64 | ((1 + words) << 4) | (name_ref << 16) | (vr << 32)),
                 // Argument Type 3: Uint64, Size 2
-                let arg_header = 3u64 | (2 << 4) | (name_ref << 16);
-                self.write_word(arg_header);
-                self.write_word(uv);
+                None => self.write_word(3u64 | (2 << 4) | (name_ref << 16)),
+            }
+            if let Some(bytes) = bytes {
+                self.write_padded_bytes(&bytes);
             }
         }
     }
 }
+
+/// The longest string an argument holds inline, once the string table is full.
+const INLINE_STRING_MAX: usize = 1024;
 
 pub enum TraceValue<'a> {
     String(&'a str),

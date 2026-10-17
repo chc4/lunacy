@@ -3,6 +3,9 @@ TEST_FEATURES := "counters graph jit gas gc_sanitize"
 # Runs hyperfine makes of each command before timing it, so the CPU has ramped
 # up and caches are warm.
 WARMUP := "3"
+# The most runs hyperfine makes of a command: with no limit, it may never stop timing one that
+# runs for a few milliseconds.
+MAX_RUNS := "300"
 # The core hyperfine and the commands it times are pinned to (`taskset`), so a
 # run never migrates onto a core that has not ramped up.
 CPU := "2"
@@ -41,6 +44,9 @@ test:
     {{SHARED}} cargo test --features "gc_stress gc_sanitize"
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     {{SHARED}} cargo test --test gc_reset_frees
+    # The golden tests with random gas, a new seed each time, which a failure prints to
+    # rerun it with (`just golden-gas <seed>`)
+    just golden-gas
 
 # Copy&patch window stencils (src/window.rs) as the JIT will use them: built
 # in release, so the stencils checked are the ones the JIT copies (a build
@@ -66,8 +72,35 @@ trace benchmark times='10' features='unsafe':
     just _luac {{benchmark}}
     {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} tracing" --bin bench \
         --target-dir target/tracing -Z build-std="core,std,panic_abort"
-    cd working && ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
+    cd working && {{SHARED}} ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
     python3 tools/perfetto_summary.py working/lunacy.fxt
+
+# `trace` of revision `ref` (as for `hyperfine-vs`), from its compare worktree,
+# its trace in working/lunacy-<ref>.fxt.
+trace-rev ref benchmark times='10' features='unsafe':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _compare-worktree {{ref}}
+    dir=target/compare/{{ref}}
+    (cd $dir && just _luac {{benchmark}} > /dev/null)
+    (cd $dir && {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} tracing" --bin bench \
+        --target-dir target/tracing -Z build-std="core,std,panic_abort")
+    (cd $dir/working && {{SHARED}} ../target/tracing/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null)
+    mv $dir/working/lunacy.fxt working/lunacy-{{ref}}.fxt
+
+# Each benchmark of HYPERFINES traced at revision `ref` and in this checkout,
+# their hash keys and versions compared (tools/hash_key_stats.py).
+hash-keys-vs ref features='unsafe':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{HYPERFINES}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        just trace-rev {{ref}} $benchmark $times "{{features}}" > /dev/null 2>&1 || { echo "skipped $benchmark: its traced run at {{ref}} failed"; continue; }
+        mv working/lunacy-{{ref}}.fxt working/hash-keys-$benchmark-{{ref}}.fxt
+        just trace $benchmark $times "{{features}}" > /dev/null 2>&1 || { echo "skipped $benchmark: its traced run failed"; continue; }
+        mv working/lunacy.fxt working/hash-keys-$benchmark.fxt
+        python3 tools/hash_key_stats.py $benchmark working/hash-keys-$benchmark-{{ref}}.fxt working/hash-keys-$benchmark.fxt
+    done
 
 # A golden test's run traced (feature `tracing`), as `trace` traces a
 # benchmark's: lua_tests/<name>.lua in the golden harness, built in release with
@@ -77,6 +110,21 @@ trace-golden name features='check_windows':
     -LUNACY_GOLDEN={{name}} {{SHARED}} cargo test --release --features "{{features}} tracing" --test golden_tests test_golden
     mv lunacy.fxt working/lunacy.fxt
     python3 tools/perfetto_summary.py working/lunacy.fxt
+
+# `trace-golden` of this checkout's lua_tests/<name>.lua at revision `ref`, from
+# its compare worktree (as for `hyperfine-vs`): its trace in
+# working/lunacy-golden-<name>-<ref>.fxt, its test output in
+# working/golden-<name>-<ref>.log. For when a test's versions grew, and which
+# revision made them.
+trace-golden-rev ref name features='check_windows':
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just _compare-worktree {{ref}}
+    dir=target/compare/{{ref}}
+    cp lua_tests/{{name}}.lua $dir/lua_tests/{{name}}.lua
+    (cd $dir && LUNACY_GOLDEN={{name}} {{SHARED}} cargo test --release --features "{{features}} tracing" --test golden_tests test_golden) > working/golden-{{name}}-{{ref}}.log 2>&1
+    grep -aE "test result|panicked at|Output mismatch" working/golden-{{name}}-{{ref}}.log | head -2
+    mv $dir/lunacy.fxt working/lunacy-golden-{{name}}-{{ref}}.fxt
 
 # `trace`'s summary of working/lunacy.fxt again.
 show-trace:
@@ -88,11 +136,63 @@ show-trace:
 trace-sql query:
     python3 tools/trace_sql.py "{{query}}"
 
+# Each of `runs` (`benchmark:times`) traced, and its versions (`point_versions`):
+# by function, its points with the most, and the inlined copies of points with the
+# most (`site_versions`), in working/versions-<benchmark>.txt.
+version-summaries +runs:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for run in {{runs}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        out=working/versions-$benchmark.txt
+        if ! just trace $benchmark $times > $out 2>&1; then echo "$benchmark: its traced run failed"; continue; fi
+        { python3 tools/trace_sql.py "SELECT outcome, COUNT(*) AS jumps FROM spec_version GROUP BY outcome ORDER BY jumps DESC"
+          python3 tools/trace_sql.py "SELECT COUNT(*) AS points, SUM(created) AS created, SUM(live) AS live, SUM(unreachable) AS unreachable FROM point_versions"
+          python3 tools/trace_sql.py "SELECT line, COUNT(*) AS points, SUM(created) AS created, SUM(live) AS live, SUM(unreachable) AS unreachable, MAX(live + unreachable) AS most FROM point_versions GROUP BY line ORDER BY live DESC LIMIT 10"
+          python3 tools/trace_sql.py "SELECT line, pc, created, live, unreachable, evicted, forgotten FROM point_versions ORDER BY live + unreachable DESC LIMIT 10"
+          python3 tools/trace_sql.py "SELECT inline, pc, created, live, unreachable, evicted, forgotten FROM site_versions ORDER BY live + unreachable DESC LIMIT 15"; } > $out 2>&1
+    done
+
+# Each golden test's versions, as `trace-golden` traces it: live at the end, the most live at one
+# point, and made in all (tools/trace_sql.py's point_versions).
+golden-versions +names:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for name in {{names}}; do
+        just trace-golden "$name" > /dev/null 2>&1
+        echo "$name: $(python3 tools/trace_sql.py 'SELECT sum(live) AS live, max(live) AS most, sum(created) AS created FROM point_versions' | tail -1)"
+    done
+
+# `golden-versions` at revision `ref`, each test traced as `trace-golden-rev`
+# traces it.
+golden-versions-rev ref +names:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for name in {{names}}; do
+        just trace-golden-rev {{ref}} "$name" > /dev/null 2>&1
+        echo "$name: $(python3 tools/trace_sql.py --trace working/lunacy-golden-$name-{{ref}}.fxt 'SELECT sum(live) AS live, max(live) AS most, sum(created) AS created FROM point_versions' | tail -1)"
+    done
+
 # The named golden tests (lua_tests/<name>.lua), each against its expected
 # output, in one debug build with `test`'s golden suite's features: quicker than
 # the whole suite while iterating.
 golden +names:
     LUNACY_GOLDEN={{replace(names, " ", ",")}} {{SHARED}} cargo test --features gc_sanitize --test golden_tests test_golden
+
+# The golden tests, each with random gas (`LUNACY_GOLDEN_GAS_SEED`, from `seed`, else
+# a random one, printed): JIT code stopped anywhere must leave a test's output as it
+# was, so a run failing is a JIT miscompile or an exit that loses state. Rerun with its
+# seed, and bisect the test with `gas-bisect`. Its whole output in working/golden-gas.log.
+golden-gas seed='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seed="{{seed}}"
+    [ -n "$seed" ] || seed=$RANDOM$RANDOM
+    echo "seed $seed"
+    status=0
+    LUNACY_GOLDEN_GAS_SEED=$seed {{SHARED}} cargo test --features "gc_sanitize gas" --test golden_tests test_golden -- --nocapture > working/golden-gas.log 2>&1 || status=$?
+    grep -E "panicked|ran past|test result|mismatch" -B1 working/golden-gas.log | grep -v "^--" | tail -n 20
+    exit $status
 
 # Golden tests, each against its expected output, under the default build,
 # immediate_jit, no_dynamic_guards and both (tools/golden_builds.py).
@@ -179,6 +279,42 @@ jit-disasm benchmark times='10' features='unsafe':
 jit-code-size benchmark times='10': (jit-disasm benchmark times)
     python3 tools/jit_code_size.py working/jit_disasm.txt
 
+# How often a benchmark's compiled code runs (tools/block_counts.py): its compiled blocks' bytes by
+# how many times each block's code ran, counted exactly (feature `block_counts`), and the functions
+# with the most code that ran rarely. working/block_counts.txt has each block's counts.
+block-counts benchmark times='10': (jit-disasm benchmark times "unsafe block_counts")
+    python3 tools/block_counts.py working/jit_disasm.txt working/block_counts.txt
+
+# `jit-code-size` of each of `runs` (`benchmark:times`, as HYPERFINES has them):
+# each one's in working/jit-code-size-<benchmark>.txt.
+jit-code-sizes +runs:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for run in {{runs}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        just jit-code-size $benchmark $times > working/jit-code-size-$benchmark.txt 2>&1 || echo "$benchmark: its run failed"
+    done
+
+# `jit-disasm` of revision `ref`, from its compare worktree (as for
+# `hyperfine-vs`), on this checkout's compiled benchmark: in
+# working/jit_disasm-<ref>.txt.
+jit-disasm-rev ref benchmark times='10' features='unsafe':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _luac {{benchmark}}
+    just _compare-worktree {{ref}}
+    bin=$(realpath working/{{benchmark}}.bin)
+    dir=target/compare/{{ref}}
+    mkdir -p $dir/working
+    (cd $dir/working && {{SHARED}} cargo run --profile unsafe --no-default-features --features "{{features}} jit_disasm" --bin bench \
+        --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- $bin {{times}} > /dev/null)
+    mv $dir/working/jit_disasm.txt working/jit_disasm-{{ref}}.txt
+
+# How a benchmark's JIT code differs from revision `ref`'s, in bytes
+# (tools/jit_code_size.py --vs): by function, by kind of residual, and by pc.
+jit-code-size-vs ref benchmark times='10': (jit-disasm-rev ref benchmark times) (jit-disasm benchmark times)
+    python3 tools/jit_code_size.py working/jit_disasm.txt --vs working/jit_disasm-{{ref}}.txt --top 30
+
 # A golden test's JIT code, in bytes, as `jit-code-size` measures a benchmark's:
 # lua_tests/<name>.lua run by the unsafe build, as `jit-disasm` builds it (with
 # `magic`, for the tests that force JIT compiling).
@@ -199,17 +335,51 @@ luajit-mcode benchmark times='10':
 # Profile a benchmark with IBS (AMD's precise sampling: a sample is the
 # instruction that ran, with no skid), every `period` cycles, built as
 # `jit-disasm` builds with the perf map too, and join the samples on the JIT's
-# code to its disassembly (tools/jit_samples.py): by what emitted the code, and,
+# code to its disassembly (tools/jit_samples.py): by what emitted the code, by kind
+# of code and stack slot traffic, and,
 # with `op` (a disassembly note, like `PushFrame`), that code's instructions
 # summed over its copies. working/jit-profile.data, and the sampled
-# disassembly with counts in working/jit_samples.txt.
-jit-profile benchmark times='10' op='' period='20000' features='unsafe':
+# disassembly with counts in working/jit_samples.txt. `event` samples another event
+# every `period` of it in place of IBS, as a raw counter (`r47`, misaligned
+# accesses on Zen 2): a counter's sample is taken at its overflow interrupt, so it
+# lands some instructions after the one that counted. `only` keeps the IBS samples of
+# ops with that flag of IBS's op data set (`DcMisAcc`, a misaligned access), from
+# its raw data (tools/ibs_samples.py).
+jit-profile benchmark times='10' op='' period='20000' features='unsafe' event='ibs_op//' only='':
     just _luac {{benchmark}}
     {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} perf jit_disasm" --bin bench \
         --target-dir target/jit_disasm -Z build-std="core,std,panic_abort"
-    cd working && {{SAMPLED}} perf record -e ibs_op// -c {{period}} -o jit-profile.data ../target/jit_disasm/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
-    cd working && perf script -i jit-profile.data -F ip,sym > jit-profile.samples
-    python3 tools/jit_samples.py working/jit_disasm.txt working/jit-profile.samples --out working/jit_samples.txt {{ if op != "" { "--op '" + op + "'" } else { "" } }}
+    cd working && {{SAMPLED}} perf record -e {{event}} -c {{period}} {{ if only != "" { "-R" } else { "" } }} -o jit-profile.data ../target/jit_disasm/unsafe/bench {{benchmark}}.bin {{times}} > /dev/null
+    {{ if only != "" { "cd working && perf report -D -i jit-profile.data | python3 ../tools/ibs_samples.py " + only + " jit-profile.data > jit-profile.samples" } else { "cd working && perf script -i jit-profile.data -F ip,sym > jit-profile.samples" } }}
+    python3 tools/jit_samples.py working/jit_disasm.txt working/jit-profile.samples --out working/jit_samples.txt --classes {{ if op != "" { "--op '" + op + "'" } else { "" } }}
+
+# `jit-profile` of revision `ref`, from its compare worktree (as for `hyperfine-vs`), on this
+# checkout's compiled benchmark: its sampled disassembly in working/jit_samples-<ref>.txt.
+jit-profile-rev ref benchmark times='10' period='20000' features='unsafe' event='ibs_op//':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _luac {{benchmark}}
+    just _compare-worktree {{ref}}
+    bin=$(realpath working/{{benchmark}}.bin)
+    dir=target/compare/{{ref}}
+    mkdir -p $dir/working
+    (cd $dir && {{SHARED}} cargo build --profile unsafe --no-default-features --features "{{features}} perf jit_disasm" --bin bench \
+        --target-dir target/jit_disasm -Z build-std="core,std,panic_abort")
+    (cd $dir/working && {{SAMPLED}} perf record -e {{event}} -c {{period}} -o jit-profile.data ../target/jit_disasm/unsafe/bench $bin {{times}} > /dev/null)
+    (cd $dir/working && perf script -i jit-profile.data -F ip,sym > jit-profile.samples)
+    python3 tools/jit_samples.py $dir/working/jit_disasm.txt $dir/working/jit-profile.samples --out working/jit_samples-{{ref}}.txt --classes
+
+# `jit-profile` of each of `runs` (`benchmark:times`, as HYPERFINES has them): each one's
+# summary in working/jit-profile-<benchmark>.txt and its sampled disassembly in
+# working/jit_samples-<benchmark>.txt.
+jit-profiles +runs:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for run in {{runs}}; do
+        benchmark=${run%:*}; times=${run#*:}
+        just jit-profile $benchmark $times > working/jit-profile-$benchmark.txt 2>&1 || echo "$benchmark: its profiled run failed"
+        cp working/jit_samples.txt working/jit_samples-$benchmark.txt
+    done
 
 # Save a benchmark's window dump as bench/window_dumps/<benchmark>.<name>.txt, a
 # reference to compare window allocators against with `just window-dump-stats`.
@@ -254,11 +424,56 @@ debug-jit name: (_luac-test name)
 release name: (_luac-test name)
     cd working && time {{SHARED}} cargo run --release --no-default-features --features "{{TEST_FEATURES}}" --bin lunacy -- {{name}}.bin
 
-gdb-test name: (_luac-test name)
-    {{SHARED}} cargo build --release --bin lunacy
-    gdb --args ./target/release/lunacy working/{{name}}.bin
+# lua_tests/<name>.lua under gdb, with `gdb_args` (say "-batch -ex run -ex bt" for the
+# backtrace where it crashes), built with `features` too (`alloc_debug` to find a write past or
+# after an allocation).
+gdb-test name gdb_args='' features='': (_luac-test name)
+    {{SHARED}} cargo build --release --bin lunacy --features "{{features}}"
+    gdb {{gdb_args}} --args ./target/release/lunacy working/{{name}}.bin
 
 # Compile lua_tests/<name>.lua to working/<name>.bin.
+# `source`'s residual graphs (working/func_<line>.dot), run by the release
+# `lunacy` with TEST_FEATURES and `gas` of it: a gas-bisect's run just short of
+# going wrong.
+graph-gas source gas:
+    {{SHARED}} cargo build --release --features "gas graph" --bin lunacy
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    cd working && LUNACY_GAS={{gas}} {{SAMPLED}} ../target/release/lunacy gas-bisect.bin > graph-gas.log 2>&1
+
+# `source`'s JIT code, disassembled and annotated as `jit-disasm` makes it, run by
+# the release `lunacy` with `gas` of it, as `gas-bisect` runs it: the code a run
+# just short of going wrong ran, in working/jit_disasm.txt.
+gas-disasm source gas:
+    {{SHARED}} cargo build --release --features "gas jit_disasm" --bin lunacy --target-dir target/gas_disasm
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    -cd working && LUNACY_GAS={{gas}} {{SAMPLED}} ../target/gas_disasm/release/lunacy gas-bisect.bin > gas-disasm.log 2>&1
+
+# The last `lines` of `source`'s debug log (RUST_LOG=debug), run by the release
+# `lunacy` with `gas` of it, as `gas-bisect` runs it: the residuals the interpreter
+# ran after the JIT code's gas ran out, to where the run goes wrong. In
+# working/gas-log.txt.
+gas-log source gas lines='400':
+    {{SHARED}} cargo build --release --features gas --bin lunacy
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    -cd working && RUST_LOG=debug LUNACY_GAS={{gas}} {{SAMPLED}} ../target/release/lunacy gas-bisect.bin 2>&1 | tail -n {{lines}} > gas-log.txt
+
+# The least gas with which `source`'s run goes wrong, against `reference`'s
+# (Lua 5.1, or luajit for a program needing `bit`; tools/gas_bisect.py): where
+# JIT code miscompiles, run by the release `lunacy` with `gas`, and none of the
+# test features' checks, which slow a long run past the bisection's limit.
+gas-bisect source signature='' reference='lua5.1':
+    {{SHARED}} cargo build --release --features gas --bin lunacy
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    {{SAMPLED}} python3 tools/gas_bisect.py working/gas-bisect.bin {{source}} target/release/lunacy --signature "{{signature}}" --reference {{reference}}
+
+# Where JIT code stops for each gas in `range` (`from:to[:step]`), as `gas-bisect`
+# runs `source`: the residual, and the frame base the code held against the
+# interpreter's (tools/gas_bisect.py --scan).
+gas-scan source range:
+    {{SHARED}} cargo build --release --features gas --bin lunacy
+    luac5.1 -o working/gas-bisect.bin {{source}}
+    {{SAMPLED}} python3 tools/gas_bisect.py working/gas-bisect.bin {{source}} target/release/lunacy --scan {{range}}
+
 _luac-test name:
     mkdir -p working
     luac5.1 -o working/{{name}}.bin lua_tests/{{name}}.lua
@@ -304,9 +519,9 @@ _luauc benchmark:
     mkdir -p working
     { python3 tools/bundle_bench.py {{benchmark}}; printf '\nrun_iter(tonumber((...)))\n'; } > working/{{benchmark}}.luau
 
-run benchmark:
+run benchmark *args:
     just _luac {{benchmark}}
-    time {{SHARED}} cargo run --release --bin bench -- working/{{benchmark}}.bin
+    time {{SHARED}} cargo run --release --bin bench -- working/{{benchmark}}.bin {{args}}
 
 [env("RUST_LOG", "debug")]
 run-debug benchmark:
@@ -323,6 +538,20 @@ graph name:
 graph-golden name:
     mkdir -p working/graphs/{{name}}
     LUNACY_GOLDEN={{name}} LUNACY_GRAPH_DIR=$PWD/working/graphs/{{name}} {{SHARED}} cargo test --features graph --test golden_tests test_golden
+# `graph-golden`'s graphs of lua_tests/<name>.lua with `env` (an assignment, such as
+# `LUNACY_NO_FUSION=1`) and without, side by side in working/graphs/<name>-vs/index.html
+# (tools/graph_compare.py): searchable, over the residuals whose counts differ.
+graph-golden-vs name env:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf working/graphs/{{name}} working/graphs/{{name}}-with working/graphs/{{name}}-without
+    env {{env}} just graph-golden {{name}}
+    mv working/graphs/{{name}} working/graphs/{{name}}-with
+    just graph-golden {{name}}
+    mv working/graphs/{{name}} working/graphs/{{name}}-without
+    python3 tools/graph_compare.py --before working/graphs/{{name}}-with --after working/graphs/{{name}}-without \
+        --out working/graphs/{{name}}-vs --before-label "{{env}}" --after-label "default" \
+        --title "{{name}}" --about "Residual graphs of lua_tests/{{name}}.lua from the golden runner, with {{env}} and without."
 graph-release name:
     mkdir -p working
     luac5.1 -o working/{{name}}.bin {{name}}.lua
@@ -443,19 +672,20 @@ flamegraph-vs ref benchmark times='10' freq='997' top='25':
         perf report -i $data --no-children -g none --sort sym --stdio 2>/dev/null | grep '%' | head -n {{top}}
     done
 
-# `flamegraph` over HYPERFINES, sampling at `freq` Hz: for each run,
+# `flamegraph` over HYPERFINES, or `runs` (`benchmark:times`) if named, sampling at `freq` Hz: for each run,
 # working/perf-<benchmark>-<times>.data and flamegraph-<benchmark>-<times>.svg,
 # then each profile's share of time by tier, and its time in each
 # (tools/tiers.py): JIT code, the interpreter, specializing, contracting,
 # compiling to machine code, and GC. perf runs the benchmark itself: under
 # `cargo flamegraph`, samples from the run's start are the pre-exec process's,
 # which perf can't resolve.
-flamegraphs freq='19997':
+flamegraphs freq='19997' *runs:
     #!/usr/bin/env bash
     set -euo pipefail
     {{SHARED}} cargo build --profile flamegraph --no-default-features --features "unsafe perf" --bin bench -Z build-std="core,std,panic_abort"
     profiles=()
-    for run in {{HYPERFINES}}; do
+    runs="{{runs}}"
+    for run in ${runs:-{{HYPERFINES}}}; do
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark
         # A run that fails is left out, and said so.
@@ -520,17 +750,23 @@ gdb-unsafe benchmark: unsafe-compile
 # lunacy's release and unsafe builds against LuaJIT, its interpreter alone
 # (-joff) and with its JIT, into the benchmark history (tools/bench_history.py).
 hyperfine benchmark times='10': unsafe-compile
+    {{SHARED}} cargo build --release --bin bench
+    just _hyperfine {{benchmark}} {{times}} target
+
+# `hyperfine` of the release and unsafe benches in `bins` (its `release/bench` and
+# `unsafe/bench`), built already.
+_hyperfine benchmark times bins:
     just _luac {{benchmark}}
     just _luajitc {{benchmark}}
-    {{SHARED}} cargo build --release --bin bench
+    python3 tools/clock_check.py
     # A build whose run fails (e.g. past the JIT buffer's end) is still timed,
     # and left out of the history for its exit code.
-    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
+    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
         -n "luajit -joff" "luajit -joff bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
         -n luajit "luajit bench.lua -- working/{{benchmark}}.luajit.bin {{times}}" \
-        -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
-        -n unsafe "./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
+        -n release "./{{bins}}/release/bench working/{{benchmark}}.bin {{times}}" \
+        -n unsafe "./{{bins}}/unsafe/bench working/{{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
 
 # `hyperfine`, with lunacy's interpreter (no JIT), Lua 5.1, Lua 5.5, and Luau
@@ -546,7 +782,7 @@ hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
     {{SHARED}} cargo build --release --bin bench
     # A command failing (lua5.1, lua5.5, Luau and tcvm lack the bit library) is
     # timed, and left out of the history for its exit code.
-    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
+    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}.json \
         -n lua5.1 "lua5.1 bench.lua -- working/{{benchmark}}.bin {{times}}" \
         -n lua5.5 "lua5.5 bench.lua -- working/{{benchmark}}.lua55.bin {{times}}" \
@@ -559,14 +795,306 @@ hyperfine-full benchmark times='10': unsafe-compile interpreter-compile
         -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
         -n unsafe "./target/unsafe/bench working/{{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}.json --benchmark {{benchmark}} --arg {{times}}
+# Raven (https://github.com/mkeeter/raven), Matt Keeter's Uxn and Varvara
+# emulator, at RAVEN_REV in target/raven: its CLI, with each of its backends,
+# `--backend interpreter` (safe Rust), `tailcall` (safe Rust, tail calls) and
+# `native` (x86-64 assembly).
+RAVEN_REV := "14dbcbeb38cf15fa941f35095f6acf944252f4b3"
+_raven:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -d target/raven || git clone -q https://github.com/mkeeter/raven target/raven
+    git -C target/raven checkout -q --detach {{RAVEN_REV}}
+    cd target/raven && {{SHARED}} cargo build -q --release -p raven-cli --features native,tailcall
+
+# The uxn_* benchmarks run a Uxn ROM (varvara/roms) on the Lua Varvara emulator
+# (varvara/), the uxn_bit_* ones on its bitwise machine, which needs the bit
+# library (Lua 5.1 and 5.5 have none, so their runs fail). The emulator needs
+# more JIT code than lunacy's default buffer holds: their lunacy builds get
+# LUNACY_JIT_SIZE bytes.
+UXN_JIT_SIZE := "16777216"
+
+# `hyperfine-full` of a uxn_* benchmark, lunacy's builds with UXN_JIT_SIZE, and
+# with `times` 1, Raven's backends running its ROM's reset vector (raven-cli
+# --quit), where the ROM needs nothing past it (not bunnymark, which runs on
+# frames): the same work as the benchmark's, past building the Lua machine.
+hyperfine-uxn benchmark times='1': unsafe-compile interpreter-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    b={{benchmark}}
+    just _luac $b
+    just _luajitc $b
+    just _lua55c $b
+    just _luauc $b
+    {{SHARED}} cargo build --release --bin bench
+    jit="LUNACY_JIT_SIZE={{UXN_JIT_SIZE}}"
+    raven=()
+    # uxn_<rom> or uxn_bit_<rom>.
+    name=${b#uxn_}; name=${name#bit_}
+    rom=working/roms/$name.rom
+    if [ {{times}} = 1 ] && [ $name != bunnymark ]; then
+        for backend in interpreter tailcall native; do
+            raven+=(-n "raven $backend" "target/raven/target/release/raven-cli --backend $backend --quit $rom")
+        done
+    fi
+    # As `hyperfine-full`: a command failing is timed, and left out of the history.
+    {{TIMED}} hyperfine -i -N --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-$b-{{times}}.md \
+        --export-json working/hyperfine-$b-{{times}}.json \
+        -n lua5.1 "lua5.1 bench.lua -- working/$b.bin {{times}}" \
+        -n lua5.5 "lua5.5 bench.lua -- working/$b.lua55.bin {{times}}" \
+        -n luau "luau -O2 working/$b.luau -a {{times}}" \
+        -n "luau --codegen" "luau -O2 --codegen working/$b.luau -a {{times}}" \
+        -n "luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin {{times}}" \
+        -n luajit "luajit bench.lua -- working/$b.luajit.bin {{times}}" \
+        -n interpreter "./target/interpreter/release/bench working/$b.bin {{times}}" \
+        -n release "env $jit ./target/release/bench working/$b.bin {{times}}" \
+        -n unsafe "env $jit ./target/unsafe/bench working/$b.bin {{times}}" \
+        "${raven[@]}"
+    python3 tools/bench_history.py record working/hyperfine-$b-{{times}}.json --benchmark $b --arg {{times}}
+
+# A ROM's uxn_* and uxn_bit_* benchmarks side by side (`rom` as varvara/roms
+# names it): what computing with the bit library does on each Lua that has it,
+# LuaJIT, Luau and lunacy's release and unsafe builds (with UXN_JIT_SIZE), in
+# working/hyperfine-uxn-bit-<rom>.md.
+hyperfine-uxn-bit rom: unsafe-compile
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{SHARED}} cargo build --release --bin bench
+    commands=()
+    for b in uxn_{{rom}} uxn_bit_{{rom}}; do
+        just _luac $b
+        just _luajitc $b
+        just _luauc $b
+        commands+=(-n "$b luau" "luau -O2 working/$b.luau -a 1"
+            -n "$b luau --codegen" "luau -O2 --codegen working/$b.luau -a 1"
+            -n "$b luajit -joff" "luajit -joff bench.lua -- working/$b.luajit.bin 1"
+            -n "$b luajit" "luajit bench.lua -- working/$b.luajit.bin 1"
+            -n "$b release" "env LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} ./target/release/bench working/$b.bin 1"
+            -n "$b unsafe" "env LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} ./target/unsafe/bench working/$b.bin 1")
+    done
+    {{TIMED}} hyperfine -N --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-uxn-bit-{{rom}}.md \
+        --export-json working/hyperfine-uxn-bit-{{rom}}.json "${commands[@]}"
+
+# The unsafe build with `magic`, whose `jit` table's `promote` lets the Lua
+# Varvara emulator specialize its loop to the virtual program counter, in
+# target/magic (`unsafe-compile`'s has none: the emulator runs without).
+unsafe-magic-compile:
+    {{SHARED}} cargo build --profile unsafe --no-default-features --features unsafe,magic --bin bench \
+        --target-dir target/magic -Z build-std="core,std,panic_abort"
+
+# A uxn_* benchmark (`times` 1) on Raven's backends, where the ROM needs nothing
+# past its reset vector (as `hyperfine-uxn`), and lunacy's unsafe build and its
+# unsafe build with `magic` (`unsafe-magic-compile`).
+hyperfine-uxn-promote benchmark times='1': (_hyperfine-uxn-promote benchmark times "")
+
+# `hyperfine-uxn-promote`, and LuaJIT with and without its JIT.
+hyperfine-uxn-promote-full benchmark times='1': (_hyperfine-uxn-promote benchmark times "full")
+
+_hyperfine-uxn-promote benchmark times full: unsafe-compile unsafe-magic-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    commands=()
+    while IFS=$'\t' read -r name command; do commands+=(-n "$name" "$command"); done \
+        < <(just _uxn-promote-commands {{benchmark}} {{times}} "{{full}}")
+    # As `hyperfine-full`: a command failing is timed, and left out of the history.
+    {{TIMED}} hyperfine -i -N --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-promote-{{benchmark}}-{{times}}.md \
+        --export-json working/hyperfine-promote-{{benchmark}}-{{times}}.json "${commands[@]}"
+
+# The implementations `hyperfine-uxn-promote` runs a uxn_* benchmark on, one
+# `name<TAB>command` line each: Raven's backends, where the ROM needs nothing past
+# its reset vector, LuaJIT with and without its JIT with `full`, and lunacy's
+# unsafe build and its unsafe build with `magic`. Each command runs without a shell.
+_uxn-promote-commands benchmark times full:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    b={{benchmark}}
+    just _luac $b >&2
+    name=${b#uxn_}; name=${name#bit_}
+    # uxn_loop runs loop_long.tal.
+    if [ $name = loop ]; then name=loop_long; fi
+    rom=working/roms/$name.rom
+    if [ {{times}} = 1 ] && [ $name != bunnymark ]; then
+        for backend in interpreter tailcall native; do
+            printf 'raven %s\t%s\n' $backend "target/raven/target/release/raven-cli --backend $backend --quit $rom"
+        done
+    fi
+    if [ -n "{{full}}" ]; then
+        just _luajitc $b >&2
+        printf 'luajit -joff\t%s\n' "luajit -joff bench.lua -- working/$b.luajit.bin {{times}}"
+        printf 'luajit\t%s\n' "luajit bench.lua -- working/$b.luajit.bin {{times}}"
+    fi
+    jit="LUNACY_JIT_SIZE={{UXN_JIT_SIZE}}"
+    printf 'lunacy unsafe\t%s\n' "env $jit ./target/unsafe/bench working/$b.bin {{times}}"
+    printf 'lunacy unsafe magic\t%s\n' "env $jit ./target/magic/unsafe/bench working/$b.bin {{times}}"
+
+# What lunacy's unsafe builds, with and without `magic`, print running a uxn_*
+# benchmark as `hyperfine-uxn-promote` runs them, and their exit statuses.
+run-uxn-promote benchmark times='1': unsafe-compile unsafe-magic-compile
+    #!/usr/bin/env bash
+    set -uo pipefail
+    while IFS=$'\t' read -r name command; do
+        echo "== $name"
+        {{SHARED}} $command; echo "== exit $?"
+    done < <(just _uxn-promote-commands {{benchmark}} {{times}} "" | grep '^lunacy')
+
+# Cycles (`perf stat`, the mean of `runs`) of each implementation
+# `hyperfine-uxn-promote-full` times on a uxn_* benchmark, pinned as it pins
+# them, and those cycles over `iterations`, the iterations of the ROM's loop: a
+# whole run's, starting the process and compiling included. uxn_loop's loop
+# runs 16 * 65535 = 1048560 times.
+perf-stat-uxn-promote benchmark iterations times='1' runs='5': unsafe-compile unsafe-magic-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf '%-22s %16s %12s\n' implementation cycles cycles/iter
+    while IFS=$'\t' read -r name command; do
+        read -ra words <<< "$command"
+        cycles=$({{TIMED}} perf stat -x, -r {{runs}} -e cycles -- "${words[@]}" 2>&1 < /dev/null > /dev/null \
+            | awk -F, '$3 ~ /cycles/ { print $1 }' | tail -1)
+        awk -v name="$name" -v cycles="$cycles" 'BEGIN { printf "%-22s %16s %12.2f\n", name, cycles, cycles / {{iterations}} }'
+    done < <(just _uxn-promote-commands {{benchmark}} {{times}} full)
+
+# `perf-stat-uxn-promote`'s cycles on uxn_* benchmarks `long` and `short`, whose
+# ROMs differ only in running their loop `iterations` more times in `long`, and
+# the difference over `iterations`: one iteration's cycles, apart from starting
+# the process, building the machine and compiling, which both runs do alike.
+# uxn_loop runs uxn_loop_short's loop 15 * 65535 = 983025 times more.
+perf-stat-uxn-slope long='uxn_loop' short='uxn_loop_short' iterations='983025' runs='5': unsafe-compile unsafe-magic-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cycles() {
+        read -ra words <<< "$1"
+        {{TIMED}} perf stat -x, -r {{runs}} -e cycles -- "${words[@]}" 2>&1 < /dev/null > /dev/null \
+            | awk -F, '$3 ~ /cycles/ { print $1 }' | tail -1
+    }
+    printf '%-22s %16s %16s %12s\n' implementation {{long}} {{short}} cycles/iter
+    while IFS=$'\t' read -r name long short; do
+        l=$(cycles "$long"); s=$(cycles "$short")
+        awk -v name="$name" -v l="$l" -v s="$s" 'BEGIN { printf "%-22s %16s %16s %12.2f\n", name, l, s, (l - s) / {{iterations}} }'
+    done < <(paste <(just _uxn-promote-commands {{long}} 1 full) \
+        <(just _uxn-promote-commands {{short}} 1 full | cut -f2))
+
+# `perf-stat-uxn-slope` for hardware counters `events` (`perf stat`, the mean of `runs`), of the
+# implementations whose names match `only` (a regex): each one's counts on `long` and `short` in
+# `out`/<implementation>.{long,short}.csv, and per iteration of the loop (tools/uxn_slope.py).
+# Compare runs, say with a knob set and without, with tools/uxn_slope.py over their `out`s.
+perf-stat-uxn-slope-events out='working/uxn-slope' only='lunacy' long='uxn_loop' short='uxn_loop_short' iterations='983025' runs='5' events='cycles,instructions,branches,branch-misses,stalled-cycles-frontend,L1-dcache-loads,L1-dcache-load-misses,L1-icache-load-misses,iTLB-load-misses': unsafe-compile unsafe-magic-compile _raven
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf {{out}} && mkdir -p {{out}}
+    while IFS=$'\t' read -r name long short; do
+        [[ "$name" =~ {{only}} ]] || continue
+        for rom in long short; do
+            read -ra words <<< "${!rom}"
+            {{TIMED}} perf stat -x, -r {{runs}} -e {{events}} -o "{{out}}/${name// /_}.$rom.csv" -- "${words[@]}" < /dev/null > /dev/null
+        done
+    done < <(paste <(just _uxn-promote-commands {{long}} 1 full) \
+        <(just _uxn-promote-commands {{short}} 1 full | cut -f2))
+    python3 tools/uxn_slope.py --iterations {{iterations}} {{out}}
+
+# `hyperfine-uxn-promote` over the uxn_* ROMs.
+hyperfines-uxn-promote: (_hyperfines-uxn-promote "hyperfine-uxn-promote")
+
+# `hyperfine-uxn-promote-full` over the uxn_* ROMs.
+hyperfines-uxn-promote-full: (_hyperfines-uxn-promote "hyperfine-uxn-promote-full")
+
+_hyperfines-uxn-promote recipe:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop; do just {{recipe}} $b; done
+    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop; do echo $b; tail -n +3 working/hyperfine-promote-$b-1.md; done
+
+# Each uxn_* benchmark (which checks its own output) run once on the unsafe
+# build and the unsafe build with `magic`, holding the benchmark lock shared:
+# its exit status per build, for a correctness sweep.
+uxn-check: unsafe-compile unsafe-magic-compile
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for b in uxn_fib uxn_tak uxn_mandelbrot uxn_bunnymark uxn_loop uxn_bit_fib uxn_bit_tak uxn_bit_mandelbrot uxn_bit_bunnymark; do
+        just _luac $b > /dev/null
+        printf "%-20s" $b
+        for bin in target/unsafe/bench target/magic/unsafe/bench; do
+            LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} {{SHARED}} $bin working/$b.bin 1 > /dev/null 2>&1
+            printf " %-28s %s" $bin $?
+        done
+        echo
+    done
+
+# `hyperfine-uxn` over UXN_HYPERFINES.
+UXN_HYPERFINES := "uxn_fib:1 uxn_tak:1 uxn_mandelbrot:1 uxn_bunnymark:1 uxn_bit_fib:1 uxn_bit_tak:1 uxn_bit_mandelbrot:1 uxn_bit_bunnymark:1"
+hyperfines-uxn:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for run in {{UXN_HYPERFINES}}; do just hyperfine-uxn ${run%:*} ${run#*:}; done
+    for run in {{UXN_HYPERFINES}}; do echo "${run%:*} ${run#*:}"; tail -n +3 working/hyperfine-${run%:*}-${run#*:}.md; done
+
+# The Lua Varvara emulator's screen against Raven's snapshot tests' images:
+# each ROM given input as Raven's tests give it (varvara/snapshot.lua) by
+# `lua`, a Lua (`lua5.1`, `luajit`) or lunacy's release build (`lunacy`), in
+# working/snapshot-<rom>.ppm, compared pixel by pixel with Raven's
+# (tools/compare_snapshot.py), any differences drawn in working/snapshot-<rom>-diff.png.
+SNAPSHOT_ROMS := "screen screen.auto screen.blending screen.bounds screen.pixel controller mandelbrot"
+varvara-snapshots lua='lunacy': _raven
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if [ {{lua}} = lunacy ]; then {{SHARED}} cargo build --release --bin lunacy || exit 1; fi
+    failed=0
+    for rom in {{SNAPSHOT_ROMS}}; do
+        python3 tools/bundle_bench.py --entry varvara/snapshot.lua --rom $rom > working/snapshot-$rom.lua || exit 1
+        if [ {{lua}} = lunacy ]; then
+            luac5.1 -o working/snapshot-$rom.bin working/snapshot-$rom.lua
+            LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} ./target/release/lunacy working/snapshot-$rom.bin > working/snapshot-$rom.ppm
+        else
+            {{lua}} working/snapshot-$rom.lua > working/snapshot-$rom.ppm
+        fi
+        python3 tools/compare_snapshot.py working/snapshot-$rom.ppm target/raven/raven-varvara/tests/${rom//./_}.png \
+            --diff working/snapshot-$rom-diff.png || failed=1
+    done
+    exit $failed
+
+# ROM `rom` (varvara/roms/<rom>.tal) run headless on the Lua Varvara emulator
+# (varvara/run.lua), bundled into one chunk: working/run-<rom>.lua, compiled to
+# working/run-<rom>.bin, for `lunacy` or `trace` runs of a small ROM.
+uxn-bundle rom:
+    python3 tools/bundle_bench.py --entry varvara/run.lua --rom {{rom}} > working/run-{{rom}}.lua
+    luac5.1 -o working/run-{{rom}}.bin working/run-{{rom}}.lua
+
+# The Lua Varvara emulator in a window (the `varvara` bin, feature
+# `varvara_ui`): lunacy's release build running varvara/app.lua on ROM `rom`, a
+# name in varvara/roms or a path to a .rom file. `env` is more of the bin's
+# environment (`VARVARA_FRAMES`, `VARVARA_SCREENSHOT`).
+varvara rom env='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{SHARED}} cargo build --release --features varvara_ui --bin varvara
+    python3 tools/bundle_bench.py --entry varvara/app.lua > working/varvara-app.lua
+    luac5.1 -o working/varvara-app.bin working/varvara-app.lua
+    rom={{rom}}
+    if [ -f varvara/roms/$rom.tal ]; then
+        mkdir -p working/roms
+        uxnasm varvara/roms/$rom.tal working/roms/$rom.rom > /dev/null
+        rom=working/roms/$rom.rom
+    fi
+    # GL is Mesa's, through libglvnd (see VARVARA_LIBRARY_PATH in flake.nix), by
+    # EGL: a virtual display may have no GLX.
+    env LD_LIBRARY_PATH=$VARVARA_LIBRARY_PATH SDL_VIDEO_FORCE_EGL=1 \
+        __EGL_VENDOR_LIBRARY_DIRS=$VARVARA_MESA/share/glvnd/egl_vendor.d LIBGL_DRIVERS_PATH=$VARVARA_MESA/lib/dri \
+        LUNACY_JIT_SIZE={{UXN_JIT_SIZE}} {{env}} ./target/release/varvara working/varvara-app.bin $rom
+
+# `varvara` on a virtual display, its window after `frames` frames in
+# working/varvara-<rom>.png.
+varvara-screenshot rom frames='120':
+    xvfb-run -a -s "-screen 0 1440x900x24" just varvara {{rom}} "VARVARA_FRAMES={{frames}} VARVARA_SCREENSHOT=working/varvara-{{rom}}.ppm"
+    python3 -c 'import sys; from PIL import Image; Image.open(sys.argv[1]).save(sys.argv[2])' working/varvara-{{rom}}.ppm working/varvara-{{rom}}.png
+    @echo working/varvara-{{rom}}.png
+
 # Compare the trace-building policies of the window allocator, and streaming
 # allocation, on a benchmark
 # (LUNACY_TRACES; see docs/trace-register-allocation.md).
 hyperfine-traces benchmark times='10' policies='streaming,single,unidirectional,bidirectional':
     just _luac {{benchmark}}
     {{SHARED}} cargo build --release --bin bench
-    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
-        "LUNACY_TRACES={policy} ./target/release/bench working/{{benchmark}}.bin {{times}}"
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-traces.md -L policy {{policies}} \
+        "env LUNACY_TRACES={policy} ./target/release/bench working/{{benchmark}}.bin {{times}}"
 # `hyperfine-traces` over the benchmarks lunacy runs, each run enough times for
 # a stable mean. life runs twice: the difference between its 1000 and 5000 runs
 # is the steady-state cost of the code, the rest the upfront cost (compiling).
@@ -607,7 +1135,7 @@ _build-vs ref:
 hyperfine-vs ref benchmark times='10': (_build-vs ref)
     just _luac {{benchmark}}
     # As `hyperfine`: a build whose run fails is left out of the history.
-    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
+    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.md \
         --export-json working/hyperfine-{{benchmark}}-{{times}}-vs-{{ref}}.json \
         -n "ref release" "target/compare/{{ref}}/target/release/bench working/{{benchmark}}.bin {{times}}" \
         -n release "./target/release/bench working/{{benchmark}}.bin {{times}}" \
@@ -627,7 +1155,7 @@ bench-rev ref:
         benchmark=${run%:*}; times=${run#*:}
         just _luac $benchmark
         # As `hyperfine`: a build whose run fails is left out of the history.
-        {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-json working/hyperfine-$benchmark-$times-{{ref}}.json \
+        {{TIMED}} hyperfine -i --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-json working/hyperfine-$benchmark-$times-{{ref}}.json \
             -n "ref release" "target/compare/{{ref}}/target/release/bench working/$benchmark.bin $times" \
             -n "ref unsafe" "target/compare/{{ref}}/target/unsafe/bench working/$benchmark.bin $times"
         python3 tools/bench_history.py record working/hyperfine-$benchmark-$times-{{ref}}.json --benchmark $benchmark --arg $times --ref {{ref}}
@@ -636,6 +1164,12 @@ bench-rev ref:
 # The benchmark history (tools/bench_history.py): each benchmark's and build's
 # latest, dirty, best and first times, regressions flagged, and the charts, in
 # working/history.html.
+# Whether the clock is fine enough to time with: a coarse one rounds every timing to whole
+# milliseconds (tools/clock_check.py). `hyperfines` won't start without it, and each benchmark it
+# times checks it again, since the clock can turn coarse at any time.
+clock-check:
+    python3 tools/clock_check.py
+
 bench-history:
     python3 tools/bench_history.py report
     python3 tools/bench_history.py plot
@@ -643,10 +1177,10 @@ bench-history:
 # What stops each benchmark of lua_benchmarking that HYPERFINES doesn't run:
 # each run once at its scaling under LuaJIT and lunacy's release build (the
 # unsafe build's panics have no message), with how each ended and its error
-# (tools/bench_blockers.py).
-bench-blockers:
+# (tools/bench_blockers.py); or only `benchmarks`, if named.
+bench-blockers *benchmarks:
     {{SHARED}} cargo build --release --bin bench
-    python3 tools/bench_blockers.py --exclude "{{HYPERFINES}}"
+    {{SAMPLED}} python3 tools/bench_blockers.py --exclude "{{HYPERFINES}}" {{benchmarks}}
 
 # The latest commit's times from the benchmark history as a grouped bar chart,
 # a group per benchmark, in rows of `per_row` each on its own scale, in
@@ -677,29 +1211,31 @@ hyperfine-feature feature benchmark times='10':
     just _luac {{benchmark}}
     {{SHARED}} cargo build --release --bin bench
     {{SHARED}} cargo build --release --features {{feature}} --bin bench --target-dir target/features/{{feature}}
-    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-{{feature}}.md \
         -n default "./target/release/bench working/{{benchmark}}.bin {{times}}" \
         -n {{feature}} "target/features/{{feature}}/release/bench working/{{benchmark}}.bin {{times}}"
 hyperfine-jit benchmark:
     just _luac {{benchmark}}
     {{SHARED}} cargo build --release --bin bench
-    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-jit.md \
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-jit.md \
         "./target/release/bench working/{{benchmark}}.bin"
 hyperfine-unsafe benchmark: unsafe-compile
     just _luac {{benchmark}}
-    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-unsafe.md \
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-unsafe.md \
         "./target/unsafe/bench working/{{benchmark}}.bin"
 
 
 # The benchmarks lunacy runs, as `benchmark:times`, each run enough times for a
 # stable mean; life twice, as for `hyperfines-traces`. euler14's count is the
 # bound of its search.
-HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10 nsieve:9 binarytrees:2 partialsums:2000000 series:2 mandelbrot:1000 mandelbrot_bit:1000 array3d:120 quicksort:300000 table_cmpsort:100000 recursive_fib:35 recursive_ack:10 spectralnorm:2 bounce:30000 md5:140"
+HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10 nsieve:9 binarytrees:2 partialsums:2000000 series:2 mandelbrot:1000 mandelbrot_bit:1000 array3d:120 quicksort:300000 table_cmpsort:100000 recursive_fib:35 recursive_ack:10 spectralnorm:2 bounce:30000 md5:140 heapsort:100000 jsonlua_encode:10 deltablue:4000 havlak:1 ray:50 richards:10 collisiondetector:35"
 
 # Which benchmarks lunacy runs (tools/bench_runs.py): each of lua_benchmarking's,
-# or those named, at `fraction` of its benchinfo.json scaling, against LuaJIT.
-bench-runs fraction='0.1' *benchmarks:
-    python3 tools/bench_runs.py --fraction {{fraction}} {{benchmarks}}
+# or those named, at `fraction` of its benchinfo.json scaling, against LuaJIT, in
+# lunacy's `build` (`unsafe`, or `release` for panics' messages), built first.
+bench-runs fraction='0.1' build='unsafe' *benchmarks:
+    {{ if build == "unsafe" { "just unsafe-compile" } else { SHARED + " cargo build --release --bin bench" } }}
+    {{SAMPLED}} python3 tools/bench_runs.py --fraction {{fraction}} --build {{build}} {{benchmarks}}
 
 # The array part stores and hash field stores each run of HYPERFINES does, by
 # what the specializer knew of each stored value's type: nothing, that it's a
@@ -719,7 +1255,7 @@ store-types:
 # every other implementation again.
 hyperfine-interpreter benchmark times='10': interpreter-compile
     just _luac {{benchmark}}
-    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --export-json working/hyperfine-{{benchmark}}-{{times}}-interpreter.json \
+    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-json working/hyperfine-{{benchmark}}-{{times}}-interpreter.json \
         -n interpreter "./target/interpreter/release/bench working/{{benchmark}}.bin {{times}}"
     python3 tools/bench_history.py record working/hyperfine-{{benchmark}}-{{times}}-interpreter.json --benchmark {{benchmark}} --arg {{times}}
 
@@ -730,10 +1266,26 @@ hyperfines-interpreter:
     for run in {{HYPERFINES}}; do just hyperfine-interpreter ${run%:*} ${run#*:}; done
 
 # `hyperfine` over HYPERFINES.
-hyperfines:
+# The benches `hyperfines` and `jit-sizes` time and measure: built once, up front, and copied,
+# with the state of the checkout they were built from (`bench_history.py state`), so the
+# source can be edited while they run.
+BENCH_BINS := "target/bench-snapshot"
+
+_bench-snapshot: unsafe-compile
+    mkdir -p {{BENCH_BINS}}/release {{BENCH_BINS}}/unsafe {{BENCH_BINS}}/jit_disasm
+    python3 tools/bench_history.py state > {{BENCH_BINS}}/state
+    {{SHARED}} cargo build --release --bin bench
+    {{SHARED}} cargo build --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
+        --target-dir target/jit_disasm -Z build-std="core,std,panic_abort"
+    cp target/release/bench {{BENCH_BINS}}/release/bench
+    cp target/unsafe/bench {{BENCH_BINS}}/unsafe/bench
+    cp target/jit_disasm/unsafe/bench {{BENCH_BINS}}/jit_disasm/bench
+
+hyperfines: clock-check _bench-snapshot
     #!/usr/bin/env bash
     set -euo pipefail
-    for run in {{HYPERFINES}}; do just hyperfine ${run%:*} ${run#*:}; done
+    export LUNACY_BENCH_STATE={{BENCH_BINS}}/state
+    for run in {{HYPERFINES}}; do just _hyperfine ${run%:*} ${run#*:} {{BENCH_BINS}}; done
     python3 tools/bench_history.py report
 
 # The JIT code size of each benchmark of HYPERFINES run by checkout `dir`
@@ -742,7 +1294,7 @@ hyperfines:
 # disassembly (as `jit-disasm` makes it), into the size history
 # (tools/bench_history.py record-size). A benchmark whose run fails is left
 # out, its output in working/jit-size-<benchmark>.log.
-_jit-sizes dir ref='':
+_jit-sizes dir ref='' bin='':
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p {{dir}}/working
@@ -755,9 +1307,13 @@ _jit-sizes dir ref='':
         (cd {{dir}} && just _luac $benchmark > /dev/null)
         [ -f {{dir}}/working/$benchmark.bin ] || mv {{dir}}/$benchmark.bin {{dir}}/working/
         rm -f {{dir}}/working/jit_disasm.txt
-        if (cd {{dir}}/working && {{SHARED}} cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench \
-                --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" -- $benchmark.bin $times) \
-                > working/jit-size-$benchmark.log 2>&1; then
+        if [ -n "{{bin}}" ]; then
+            run=({{SHARED}} $PWD/{{bin}})
+        else
+            run=({{SHARED}} cargo run --profile unsafe --no-default-features --features "unsafe jit_disasm" --bin bench
+                --target-dir ../target/jit_disasm -Z build-std="core,std,panic_abort" --)
+        fi
+        if (cd {{dir}}/working && "${run[@]}" $benchmark.bin $times) > working/jit-size-$benchmark.log 2>&1; then
             python3 tools/bench_history.py record-size {{dir}}/working/jit_disasm.txt --benchmark $benchmark --arg $times {{ if ref == "" { "" } else { "--ref " + ref } }} \
                 || echo "skipped $benchmark $times: no size recorded"
         else
@@ -767,7 +1323,8 @@ _jit-sizes dir ref='':
 
 # The JIT code size of each benchmark of HYPERFINES, into the size history
 # (see `_jit-sizes`).
-jit-sizes: (_jit-sizes ".")
+jit-sizes: _bench-snapshot
+    LUNACY_BENCH_STATE={{BENCH_BINS}}/state just _jit-sizes . "" {{BENCH_BINS}}/jit_disasm/bench
 
 # Revision `ref`'s JIT code size on each benchmark of HYPERFINES, into the size
 # history (see `_jit-sizes`), from its compare worktree: to fill in commits
@@ -801,8 +1358,21 @@ hyperfines-knob knob: unsafe-compile
     #!/usr/bin/env bash
     set -euo pipefail
     rm -rf working/knob && mkdir -p working/knob
-    for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; {{TIMED}} hyperfine --warmup {{WARMUP}} --export-json working/knob/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{knob}}" "env {{knob}} ./target/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
+    for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-json working/knob/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{knob}}" "env {{knob}} ./target/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
     python3 tools/knob_table.py working/knob/*.json
+
+# Every HYPERFINES run in the unsafe build without and with cargo feature
+# `feature` (built into target/feature-<feature>), and the change in each's
+# median (tools/knob_table.py); a run that fails is skipped. Its json in
+# working/feature/.
+hyperfines-feature feature: unsafe-compile
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{SHARED}} cargo build --profile unsafe --no-default-features --features "unsafe {{feature}}" --bin bench \
+        --target-dir target/feature-{{feature}} -Z build-std="core,std,panic_abort"
+    rm -rf working/feature && mkdir -p working/feature
+    for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-json working/feature/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{feature}}" "./target/feature-{{feature}}/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
+    python3 tools/knob_table.py working/feature/*.json
 
 hyperfines-full:
     #!/usr/bin/env bash
@@ -824,7 +1394,7 @@ hyperfine-features benchmark times +sets:
         mkdir -p target/features/$set && cp target/release/bench target/features/$set/bench
         commands+=(-n $set "target/features/$set/bench working/{{benchmark}}.bin {{times}}")
     done
-    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-features.md "${commands[@]}"
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-features.md "${commands[@]}"
 
 # `hyperfine-features` over HYPERFINES, then every comparison's table.
 hyperfines-features +sets:
@@ -839,8 +1409,9 @@ hyperfines-features +sets:
 # `ref`, revision `ref`'s unsafe build too (it must read the variable), each at
 # every padding in the one run. Into the benchmark history as the build
 # `unsafe padded`: every padding's runs pooled, and each padding's kept
-# (tools/bench_history.py).
-hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
+# (tools/bench_history.py). With `feature`, this checkout's unsafe build with
+# that cargo feature too (built into target/feature-<feature>), not recorded.
+hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='' feature='':
     #!/usr/bin/env bash
     set -euo pipefail
     just unsafe-compile
@@ -854,10 +1425,18 @@ hyperfine-padding benchmark times='10' paddings='0,1,2,4,8,16' ref='':
         builds=target/compare/{{ref}}/target/unsafe/bench,$builds
         out=$out-vs-{{ref}}
     fi
-    {{TIMED}} hyperfine --warmup {{WARMUP}} --export-markdown $out.md --export-json $out.json \
+    if [ -n "{{feature}}" ]; then
+        {{SHARED}} cargo build --profile unsafe --no-default-features --features "unsafe {{feature}}" --bin bench \
+            --target-dir target/feature-{{feature}} -Z build-std="core,std,panic_abort"
+        builds=$builds,./target/feature-{{feature}}/unsafe/bench
+        out=$out-{{feature}}
+    fi
+    {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown $out.md --export-json $out.json \
         --parameter-list padding {{paddings}} --parameter-list build $builds \
-        "LUNACY_JIT_PADDING={padding} {build} working/{{benchmark}}.bin {{times}}"
-    python3 tools/bench_history.py record $out.json --benchmark {{benchmark}} --arg {{times}} ${ref:+--ref $ref}
+        "env LUNACY_JIT_PADDING={padding} {build} working/{{benchmark}}.bin {{times}}"
+    if [ -z "{{feature}}" ]; then
+        python3 tools/bench_history.py record $out.json --benchmark {{benchmark}} --arg {{times}} ${ref:+--ref $ref}
+    fi
 
 # Revision `head`'s times against revision `base`'s in the benchmark history, as
 # `build`, every run of each pooled: per benchmark their medians, at how many
@@ -885,3 +1464,93 @@ hyperfines-vs ref:
     python3 tools/bench_history.py report
 
 all: test benchmarks (hyperfine "binarytrees")
+
+# Experiment: stencil holes as LLVM patchpoints instead of RIP-relative loads.
+# experiments/patchpoint/hole.ll wraps `llvm.experimental.patchpoint.i64` (and
+# a stackmap) in plain functions, made ThinLTO bitcode (with a summary: plain
+# bitcode is a separate full-LTO partition, which ThinLTO never inlines from)
+# by the LLVM release rustc is built on; experiments/patchpoint/main.rs calls
+# them and is built with `-C linker-plugin-lto` and linked by rustc's own lld,
+# so LTO inlines the wrappers into the Rust callers. `.llvm_stackmaps` needs
+# keeping from section GC, and its absolute relocations in a read-only section
+# need `-z notext` under PIE. Built with rustc directly, not as a cargo bin, so
+# the crate's build never needs the bitcode. Writes the binary, LTO's
+# intermediate files, each `ex_*` function's disassembly and the stackmap to
+# target/patchpoint/.
+patchpoint-experiment:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=target/patchpoint
+    mkdir -p $out
+    llvm=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#llvmPackages_23.llvm)/bin
+    $llvm/llvm-as --version | grep version
+    rustc --version --verbose | grep LLVM
+    $llvm/opt --thinlto-bc experiments/patchpoint/hole.ll -o $out/hole.bc
+    {{SHARED}} rustc --edition 2024 -C opt-level=3 -C codegen-units=1 -C panic=abort -C target-cpu=native \
+        -C linker-plugin-lto -C linker-flavor=gnu-lld-cc -Z unstable-options -C link-self-contained=+linker \
+        -C link-arg=$out/hole.bc -C link-arg=-Wl,--save-temps -C link-arg=-Wl,--no-gc-sections -C link-arg=-Wl,-z,notext -o $out/patchpoint_experiment experiments/patchpoint/main.rs
+    {{SHARED}} $out/patchpoint_experiment
+    syms=$($llvm/llvm-nm $out/patchpoint_experiment | awk '$3 ~ /^(ex_|pp_|sm_)/ {print $3}' | sort)
+    echo "symbols: $syms"
+    for s in $(echo "$syms" | grep '^ex_'); do
+        $llvm/llvm-objdump -d -M intel --disassemble-symbols=$s $out/patchpoint_experiment | sed -n '/^[0-9a-f]* </,$p'
+    done | tee $out/disasm.txt
+    $llvm/llvm-readobj --stackmap $out/patchpoint_experiment | tee $out/stackmap.txt
+    $llvm/llvm-objdump -s -j .lunacy_imm_holes $out/patchpoint_experiment || true
+
+# A hole declared as the stencils declare theirs (experiments/weak_hole), built
+# as a PIE (as lunacy is), non-PIE with relocation-model=static, and that with
+# --emit-relocs: each one's code for `x - hole` and `x & hole`, and the
+# relocations, dynamic and static, at or into those functions.
+weak-hole-experiment:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=target/weak_hole
+    mkdir -p $out
+    build() {
+        name=$1; shift
+        {{SHARED}} rustc --edition 2024 -C opt-level=3 -C panic=abort -C codegen-units=1 "$@" \
+            -o $out/$name experiments/weak_hole/main.rs
+        echo "=== $name: $* ; runs: $($out/$name)"
+        objdump -d -M intel --no-show-raw-insn $out/$name | awk '/<ex_(sub|and)_hole>:/{p=1} p&&/^$/{p=0} p'
+        lo=$(nm $out/$name | awk '$3=="ex_sub_hole"{print $1}')
+        echo "--- relocations naming the hole, or within ex_*:"
+        readelf -rW $out/$name | grep -E "__lunacy_hole1|^$lo" || echo "(none)"
+    }
+    build pie
+    build static -C relocation-model=static
+    build static-emit-relocs -C relocation-model=static -C link-arg=-Wl,--emit-relocs
+
+# Holes as `!absolute_symbol` globals (experiments/absolute_hole): an IR module
+# declaring them, with accessors cross-language ThinLTO inlines into the Rust
+# using them, linked as a PIE (as `patchpoint-experiment` links): each
+# function's code, and the relocations at or into them and naming the holes.
+# `link` is extra linker arguments, comma separated, e.g. `-z,notext`.
+absolute-hole-experiment link='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=target/absolute_hole
+    mkdir -p $out
+    llvm=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#llvmPackages_23.llvm)/bin
+    $llvm/opt --thinlto-bc experiments/absolute_hole/hole.ll -o $out/hole.bc
+    extra=()
+    if [ -n "{{link}}" ]; then extra=(-C "link-arg=-Wl,{{link}}"); fi
+    {{SHARED}} rustc --edition 2024 -C opt-level=3 -C codegen-units=1 -C panic=abort -C target-cpu=native \
+        -C linker-plugin-lto -C linker-flavor=gnu-lld-cc -Z unstable-options -C link-self-contained=+linker \
+        -C link-arg=$out/hole.bc -C link-arg=-Wl,--save-temps "${extra[@]}" \
+        -o $out/absolute_hole experiments/absolute_hole/main.rs
+    echo "runs: $({{SHARED}} $out/absolute_hole)"
+    for s in ex_sub_hole ex_and_hole ex_add_small_hole ex_cmp_hole; do
+        $llvm/llvm-objdump -d -M intel --disassemble-symbols=$s $out/absolute_hole | sed -n '/^[0-9a-f]* </,$p'
+    done | tee $out/disasm.txt
+    echo "--- relocations naming the holes:"
+    readelf -rW $out/absolute_hole | grep -E "__lunacy_abs_hole" || echo "(none)"
+
+# `llc` alone on experiments/absolute_hole/isel.ll, as PIC: which operations
+# take an `!absolute_symbol` hole as their immediate operand.
+absolute-hole-isel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    llvm=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#llvmPackages_23.llvm)/bin
+    $llvm/llc -O3 -relocation-model=pic -x86-asm-syntax=intel experiments/absolute_hole/isel.ll -o - \
+        | grep -vE '^\s*(\.|#)' | grep -vE '^\s*$'

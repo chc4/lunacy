@@ -40,8 +40,13 @@ def main():
     for run in args.runs_:
         benchmark, times = run.split(':')
         subprocess.run(['just', '_luac', benchmark], check=True, capture_output=True)
-        a = counts(args.a, benchmark, times, args.cpu, args.runs)
-        b = counts(args.b, benchmark, times, args.cpu, args.runs)
+        try:
+            a = counts(args.a, benchmark, times, args.cpu, args.runs)
+            b = counts(args.b, benchmark, times, args.cpu, args.runs)
+        except subprocess.CalledProcessError as failed:
+            # A build failing on a benchmark leaves it out, as `hyperfine-full` does.
+            print(f'| {run} | failed: {failed.cmd[8]} exited {failed.returncode} |', flush=True)
+            continue
         cells = [f'{a[e] / 1e6:.0f}M | {b[e] / 1e6:.0f}M | {100 * (b[e] / a[e] - 1):+.1f}%' for e in EVENTS]
         print(f'| {run} | ' + ' | '.join(cells) + ' |', flush=True)
 

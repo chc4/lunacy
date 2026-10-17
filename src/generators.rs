@@ -154,15 +154,16 @@ macro_rules! integer_operands {
     }};
 }
 
+// The constant's boxed value is the op's hole: a whole number is an integer, any other a double.
+// See Note [Integers].
+windowed!(LoadK, [bits: u64], [], |owner, state, base| (out dest) {
+    // A constant's value lives as long as its prototype.
+    *dest = LBoxed::from_bits(bits);
+});
+
 pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // The constant's boxed value is the op's hole: a whole number is an integer,
-        // any other a double. See Note [Integers] in `specialize`.
-        windowed!(LoadK, [bits: u64], [], |owner, state, base| (out dest) {
-            // A constant's value lives as long as its prototype.
-            *dest = LBoxed::from_bits(bits);
-        });
         match c {
             LType::Integer | LType::Double => {
                 let whole = (yield YieldOp::IntegralK(bx as usize)) == ResumeArg::Matched;
@@ -176,8 +177,7 @@ pub fn emit_loadk(bx: u32, c: LType, dest: usize) -> impl Coroutine<ResumeArg, Y
                             yield YieldOp::HoldsK(dest, bx as usize);
                         }
                     },
-                    // Not whole, or rebuilt to load it as a double. See Note [Contraction] in
-                    // `specialize`.
+                    // Not whole, or rebuilt to load it as a double. See Note [Contraction].
                     _ => {
                         let ResumeArg::Type(t) = (yield YieldOp::TypeofK(bx as usize)) else { unreachable!() };
                         let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(bx as usize)) else { unreachable!() };
@@ -241,8 +241,7 @@ pub fn emit_loadnil(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yie
 /// `receiver[key]` as Lua reads it, through `__index`: the cold paths of the
 /// loads that found nil. `rust-cold` (LLVM's `preserve_most`), so a cold
 /// stencil calling it with its window live needn't save the window around the
-/// call. See Notes [Table metatables] in `specialize` and [Cold stencils] in
-/// `window`.
+/// call. See Notes [Table metatables] and [Cold stencils].
 extern "rust-cold" fn index_value<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, receiver: LBoxed<'src, 'intern>, key: LBoxed<'src, 'intern>) -> LBoxed<'src, 'intern> {
     LBoxed::box_lvalue(receiver.unbox().gettable(owner, Cow::Owned(key.unbox()), state.intern))
 }
@@ -264,7 +263,7 @@ windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
 // GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
 // [Global caches].
 // A cache that misses is refilled out of line.
-windowed!(GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
+windowed!(writes GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         Some(entry) => {
@@ -280,8 +279,7 @@ windowed!(GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
     }
 } rejoin {
     let cache = &*(cache as *const GlobalCache);
-    // A global the environment lacks is its `__index`'s. See Note [Table metatables]
-    // in `specialize`.
+    // A global the environment lacks is its `__index`'s. See Note [Table metatables].
     *dest = match cache.refill(owner, &state._G) {
         Some(entry) => *entry.cast(),
         None => {
@@ -292,8 +290,8 @@ windowed!(GetGlobal, [cache: usize], [], |owner, state, base| (out dest) {
     };
 });
 // A string's field, from the strings' table through the cache of its constant
-// key. See Note [String methods] in `specialize`.
-windowed!(GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
+// key. See Note [String methods].
+windowed!(writes GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         Some(entry) => {
@@ -308,7 +306,7 @@ windowed!(GetStringMethod, [cache: usize], [], |owner, state, base| (out dest) {
 });
 // A store that hits the cache and keeps the field's type stores in place; any
 // other, or one needing the write barrier, goes out of line.
-windowed!(SetGlobal, [cache: usize], [], |owner, state, base| (value) {
+windowed!(writes SetGlobal, [cache: usize], [], |owner, state, base| (value) {
     let cache = &*(cache as *const GlobalCache);
     match cache.hit() {
         // Hash keys of registers holding the environment know a field's type
@@ -350,6 +348,8 @@ pub fn emit_getglobal(dest: usize, k: usize) -> impl Coroutine<ResumeArg, Yield 
         let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
         arg = yield YieldOp::ExecWindow(Rc::new(GetGlobal::new(cache as usize, &[dest])));
         yield YieldOp::SetCTypes(vec![(dest, CType::Unknown)]);
+        // What's known of the global's value. See Note [Field facts].
+        yield YieldOp::LoadGlobal(dest, k);
         arg
     }
 }
@@ -358,9 +358,11 @@ pub fn emit_getglobal(dest: usize, k: usize) -> impl Coroutine<ResumeArg, Yield 
 pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
     #[coroutine]
     move |mut arg: ResumeArg| {
+        // A watched environment trips first. See Note [Watched tables].
+        yield YieldOp::Trip(None);
         let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
         // A store to `__index` moves the environment to a new epoch, as only the
-        // generic store does. See Note [Table metatables] in `specialize`.
+        // generic store does. See Note [Table metatables].
         arg = if (yield YieldOp::IsKey(k, b"__index")) == ResumeArg::Matched {
             let cache = cache as usize;
             yield YieldOp::Exec(ResidualExec::new("setglobal_index", Rc::new(move |owner, state| {
@@ -379,35 +381,43 @@ pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield =
 
 // `GuardDynamic` tests: whether a `CType::Type(LType::Integer)` key, in a register or the
 // constant `k`, is in a table's array part. See Note [Dynamic guards].
-crate::window::windowed!(guard InArray, [], [], |owner, state, base| (table, key) {
+crate::window::windowed!(reads guard InArray, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(key.as_int()) < tab.ro(owner).array.len()
 });
-crate::window::windowed!(guard InArrayK, [k: i32], [], |owner, state, base| (table) {
+crate::window::windowed!(reads guard InArrayK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     integer_slot(k) < tab.ro(owner).array.len()
 });
-// Whether an integer is `k`: a promote's guard. See Note [Green values] in `specialize`.
+// Whether a value is the boxed `bits`: a watch site's. See Note [Watched tables].
+crate::window::windowed!(guard IsValue, [bits: u64], [], |owner, state, base| (value) {
+    value.bits() == bits
+});
+// A frozen table's element, as it was when the load was compiled. The table still holds it while
+// the load runs: a store into it trips first, which unpublishes the load. See Note [Frozen tables].
+windowed!(LoadFrozen, [bits: u64], [], |owner, state, base| (out dest) {
+    *dest = LBoxed::from_bits(bits);
+});
+// Whether an integer is `k`: a promote's guard. See Note [Promoted values].
 crate::window::windowed!(guard EqualsK, [k: i32], [], |owner, state, base| (value) {
     value.as_int() == k
 });
 // And whether the element there isn't nil.
-crate::window::windowed!(guard InArrayHeld, [], [], |owner, state, base| (table, key) {
+crate::window::windowed!(reads guard InArrayHeld, [], [], |owner, state, base| (table, key) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).array.get(integer_slot(key.as_int())).is_some_and(|v| !v.is_nil())
 });
-crate::window::windowed!(guard InArrayHeldK, [k: i32], [], |owner, state, base| (table) {
+crate::window::windowed!(reads guard InArrayHeldK, [k: i32], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).array.get(integer_slot(k)).is_some_and(|v| !v.is_nil())
 });
 
 
 /// R(A) := R(B)[RK(C)] for any table, userdata or string and key, through
-/// `gettable`; a string's from the strings' table. See Note [String methods] in
-/// `specialize`. It writes only R(A): it follows `__index` through tables, running
+/// `gettable`; a string's from the strings' table. See Note [String methods]. It writes only R(A): it follows `__index` through tables, running
 /// no Lua code.
 fn gettable(a: usize, b: usize, c: usize) -> ResidualExec {
-    ResidualExec::new("gettable", Rc::new(move |owner, state| {
+    ResidualExec::framed("gettable", Rc::new(move |owner, state| {
         let kc: Cow<'_, LValue<'_, '_>> = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
             Ok(c) => Cow::Owned(LValue::from(c)),
             Err(lv) => Cow::Owned(lv.unbox()),
@@ -429,11 +439,10 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
     #[coroutine]
     move |mut arg: ResumeArg| {
         let table = (yield YieldOp::Guard(b, LType::Table)) == ResumeArg::Matched;
-        // A userdata's fields are its `__index` table's. See Note [Userdata fields] in
-        // `specialize`.
+        // A userdata's fields are its `__index` table's. See Note [Userdata fields].
         if !table && (yield YieldOp::Guard(b, LType::Userdata)) != ResumeArg::Matched {
             // A string's fields are the strings' table's: a constant string key's
-            // through a cache. See Note [String methods] in `specialize`.
+            // through a cache. See Note [String methods].
             if (yield YieldOp::Guard(b, LType::String)) == ResumeArg::Matched {
                 let constant = c & 0x100 != 0 && (yield YieldOp::TypeofK(c & 0xff)) == ResumeArg::Type(CType::Type(LType::String));
                 arg = if constant {
@@ -452,6 +461,11 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
             return arg;
         }
+        if table && let ResumeArg::Element(bits, ctype, constant) = (yield YieldOp::FrozenElement(b, c)) {
+            arg = yield YieldOp::ExecWindow(Rc::new(LoadFrozen::new(bits, &[a])));
+            yield YieldOp::Discovered(a, bits, ctype, constant);
+            return arg;
+        }
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c, true);
         if let ResumeArg::HashRef(hc, _) = arg {
@@ -463,8 +477,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
         } else {
             // An integer key in the array part, potentially from a constant `k`. See Note [Dynamic guards].
-            // A double key an i32 holds exactly, narrowed. See Note [Narrowing] in
-            // `specialize`.
+            // A double key an i32 holds exactly, narrowed. See Note [Narrowing].
             if c & 0x100 == 0 {
                 yield YieldOp::Narrow(c);
             }
@@ -479,8 +492,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             // Where the table is, asked before a load into its register overwrites it.
             let ResumeArg::Subject(table_subject) = (yield YieldOp::Subject(b)) else { unreachable!() };
             // A nil element of a table with a metatable is its `__index`'s: an array
-            // of a kind that isn't nil holds none. See Note [Table metatables] in
-            // `specialize`.
+            // of a kind that isn't nil holds none. See Note [Table metatables].
             let holds = matches!(yield YieldOp::ArrayKind(b), ResumeArg::Type(CType::Type(t)) if t != LType::Nil);
             // A nil element looks the key up again, in the table and key the load read;
             // a load into either's register has overwritten it by then. So that load,
@@ -496,41 +508,50 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 None => yield YieldOp::Decided(false),
             };
             let chains = !(in_array == ResumeArg::Matched && (holds || held));
-            windowed!(GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
+            windowed!(reads GetTableArray, [k: i32], [], |owner, state, base| (table, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(k)];
             });
-            windowed!(GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
+            windowed!(reads GetTableInteger, [], [], |owner, state, base| (table, key, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(key.as_int())];
             });
             // A load that may find nil takes its cold path on nil, the way on from
             // which looks the key up down the chain. See Note [Optimistic ops].
-            windowed!(GetTableArrayChain, [k: i32], [], |owner, state, base| (table, out dest) {
+            windowed!(reads GetTableArrayChain, [k: i32], [], |owner, state, base| (table, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(k)];
                 dest.is_nil()
             } cold {
                 1
             });
-            windowed!(GetTableIntegerChain, [], [], |owner, state, base| (table, key, out dest) {
+            windowed!(reads GetTableIntegerChain, [], [], |owner, state, base| (table, key, out dest) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 *dest = tab.ro(owner).array[integer_slot(key.as_int())];
                 dest.is_nil()
             } cold {
                 1
             });
-            let load: Option<(Rc<dyn Window>, Rc<dyn Window>)> = match (integer, &in_array) {
-                (Some(Some(k)), ResumeArg::Matched) => Some((Rc::new(GetTableArray::new(k, &[b, a])), Rc::new(GetTableArrayChain::new(k, &[b, a])))),
-                (Some(None), ResumeArg::Matched) => Some((Rc::new(GetTableInteger::new(&[b, c, a])), Rc::new(GetTableIntegerChain::new(&[b, c, a])))),
+            // The key of a load in the array part: a constant, or none for the key's register. Its
+            // ops are made as they are yielded, never kept across a yield: a clone of this
+            // coroutine clones what it kept there even moved out of, which may be an op nothing
+            // else holds by then.
+            let key = match (integer, &in_array) {
+                (Some(key), ResumeArg::Matched) => Some(key),
                 _ => None,
             };
-            if let Some((plain, chain)) = load {
+            if let Some(key) = key {
                 // As one step each way, as the nil test is. See Note [Subblocks].
                 if !chains {
                     yield YieldOp::Decided(true);
-                    arg = yield YieldOp::ExecWindow(plain);
-                } else if (yield YieldOp::OptimisticExec(chain)) != ResumeArg::Matched {
+                    arg = yield YieldOp::ExecWindow(match key {
+                        Some(k) => Rc::new(GetTableArray::new(k, &[b, a])),
+                        None => Rc::new(GetTableInteger::new(&[b, c, a])),
+                    });
+                } else if (yield YieldOp::OptimisticExec(match key {
+                    Some(k) => Rc::new(GetTableArrayChain::new(k, &[b, a])),
+                    None => Rc::new(GetTableIntegerChain::new(&[b, c, a])),
+                })) != ResumeArg::Matched {
                     arg = yield YieldOp::Exec(gettable(a, b, c));
                     yield YieldOp::SetCTypes(vec![(a, CType::Unknown)]);
                     return arg;
@@ -571,7 +592,7 @@ fn store_kind<'src, 'intern, const W: Widen>(owner: &mut Owner, tab: &Tc<Table<'
 /// Store `value` into `tab`'s array part at `slot`, widening its kind as `W`
 /// says. A value that `MAY_BE_NIL` and is nil drops the nils ending the array,
 /// and past its end stores nothing (so the store repeats safely, as
-/// `check_windows` repeats it). See Note [Array length] in `vm`.
+/// `check_windows` repeats it). See Note [Array length].
 #[inline(always)]
 fn store_array<'src, 'intern, const W: Widen, const MAY_BE_NIL: bool>(owner: &mut Owner, tab: &Tc<Table<'src, 'intern>>, slot: usize, value: LBoxed<'src, 'intern>) {
     if MAY_BE_NIL && value.is_nil() {
@@ -609,18 +630,27 @@ macro_rules! with_widen {
 /// How storing a value of type `new_type` changes a field known as `htype`. A
 /// field whose type isn't known yet is never `Same`: its value may have any
 /// type. See Note [Field types].
-fn retype(new_type: Option<LType>, htype: Kind) -> Retype {
+fn retype(new_type: Option<LType>, htype: &CType) -> Retype {
     match new_type {
-        Some(new_type) if htype == Kind::Of(new_type) => Retype::Same,
+        Some(new_type) if *htype == CType::Type(new_type) => Retype::Same,
         None => Retype::Unknown,
         Some(_) => Retype::Known,
     }
 }
 
+/// The representations a field of type `htype` may hold, as `LType::bit`s.
+fn holds_bits(htype: &CType) -> u8 {
+    match htype {
+        CType::Type(t) => t.bit(),
+        CType::Number => LType::Integer.bit() | LType::Double.bit(),
+        _ => u8::MAX,
+    }
+}
+
 /// Store through `href`'s witness into `tab`, bumping the table's epoch if the
 /// field's type changes (see `Retype`), and leaving its write barrier to the
-/// caller, after it.
-fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: Kind, retype: Retype) {
+/// caller, after it. `expected` is the representations the field holds, as `holds_bits`.
+fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: u8, retype: Retype) {
     let hidx = state.witness_base + href as usize;
     let witness = state.hash_witnesses[hidx];
     debug!("settable_href with {:?} {:?}", &witness, expected);
@@ -628,7 +658,7 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
     let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
     debug!("settable_href {:?} {:?}", &val1, expected);
     #[cfg(debug_assertions)]
-    assert!(expected.holds(val1.unbox().typeof_()));
+    assert!(expected & val1.unbox().typeof_().bit() != 0);
     *val1 = value;
     match retype {
         Retype::Same => {}
@@ -641,8 +671,11 @@ fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'int
 }
 
 // Store through a hash key's witness into a register's table.
-windowed!(SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, state, base| (table, value) {
+// With `DOUBLE`, an integer value is stored as a double: into a field that has held both,
+// which then holds doubles. See Note [Widening].
+windowed!(writes SetTableHref, [href: u8, expected: u8], [RETYPE: Retype, DOUBLE: bool], |owner, state, base| (table, value) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    let value = if DOUBLE && value.is_int() { LBoxed::from_double(value.as_int() as f64) } else { value };
     store_field(owner, state, &tab, value, href, expected, RETYPE);
     // Last. See Note [Write barriers].
     tab.barrier_pending()
@@ -650,7 +683,7 @@ windowed!(SetTableHref, [href: u8, expected: Kind], [RETYPE: Retype], |owner, st
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.barrier_slow();
 });
-windowed!(SetTableHrefK, [href: u8, expected: Kind, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
+windowed!(writes SetTableHrefK, [href: u8, expected: u8, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     // A constant's value lives as long as its prototype.
     let value = LBoxed::from_bits(value);
@@ -666,8 +699,12 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
     #[coroutine]
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::Guard(a, LType::Table);
+        // A watched table trips first. See Note [Watched tables].
+        if arg == ResumeArg::Matched {
+            yield YieldOp::Trip(Some(a));
+        }
         if arg != ResumeArg::Matched {
-            arg = yield YieldOp::Exec(ResidualExec::new("settable_meta", Rc::new(move |owner, state| {
+            arg = yield YieldOp::Exec(ResidualExec::framed("settable_meta", Rc::new(move |owner, state| {
                 let key: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                     Ok(b) => LValue::from(b),
                     Err(lv) => lv.unbox(),
@@ -688,8 +725,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         }
         // An integer key in the array part. Potentially from a constant (`k`).
         // See Note [Dynamic guards].
-        // A double key an i32 holds exactly, narrowed. See Note [Narrowing] in
-        // `specialize`.
+        // A double key an i32 holds exactly, narrowed. See Note [Narrowing].
         if b & 0x100 == 0 {
             yield YieldOp::Narrow(b);
         }
@@ -704,7 +740,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // A whole constant stored at an integer key, into the array part or appended to it, is
         // stored in the integer encoding, as it is loaded, unless the array is known to hold
         // doubles: then a constant is stored in the double encoding, and a slot a fact says holds
-        // one is widened first. See Note [Widening] in `specialize`.
+        // one is widened first. See Note [Widening].
         let doubles = integer.is_some() && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(LType::Double));
         let narrowed = if integer.is_some() && !doubles && c & 0x100 != 0 && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
             let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
@@ -714,6 +750,13 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         };
         if doubles && c & 0x100 == 0 {
             yield YieldOp::WidenConstant(c);
+        }
+        // Into an array part known to hold integers, any double an i32 holds exactly is
+        // narrowed, so it keeps its kind. See Note [Narrowing].
+        // Its type found out first: a value of unknown type isn't narrowed.
+        if integer.is_some() && c & 0x100 == 0 && (yield YieldOp::ArrayKind(a)) == ResumeArg::Type(CType::Type(LType::Integer)) {
+            yield YieldOp::GuardCType(c, CType::Number);
+            yield YieldOp::Narrow(c);
         }
         let in_array = match integer {
             Some(Some(k)) => yield YieldOp::GuardDynamic(Rc::new(InArrayK::new(k, &[a]))),
@@ -764,7 +807,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             || known == ResumeArg::Type(CType::Unknown)
             || stored.is_some_and(|stored| known == ResumeArg::Type(CType::Type(stored))));
         // Whether the value may be nil, which may shorten the array part. See
-        // Note [Array length] in `vm`.
+        // Note [Array length].
         let nil = matches!(stored, Some(LType::Nil) | None);
         // How the store widens the array's kind: not at all, by the value's
         // representation, known here, or by the value's found out.
@@ -774,7 +817,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             (true, Some(stored)) => Widen::Bit(stored),
         };
         if let (Some(Some(k)), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableArray, [k: i32], [W: Widen, N: bool], |owner, state, base| (table, value) {
+            windowed!(writes SetTableArray, [k: i32], [W: Widen, N: bool], |owner, state, base| (table, value) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 store_array::<W, N>(owner, &tab, integer_slot(k), value);
                 // Last. See Note [Write barriers].
@@ -783,7 +826,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 tab.barrier_slow();
             });
-            windowed!(SetTableArrayK, [k: i32, value: u64], [W: Widen, N: bool], |owner, state, base| (table) {
+            windowed!(writes SetTableArrayK, [k: i32, value: u64], [W: Widen, N: bool], |owner, state, base| (table) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 // A constant's value lives as long as its prototype.
                 let value = LBoxed::from_bits(value);
@@ -805,13 +848,12 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 }
             });
             // A store that widens no kind falsifies no table's: its own keeps its kind, and a
-            // table of another known kind isn't the one stored into. See Note [Array kinds] in
-            // `specialize`.
+            // table of another known kind isn't the one stored into. See Note [Array kinds].
             if widen {
                 yield YieldOp::Effect(Effect::ArrayStore(stored));
             }
         } else if let (Some(None), ResumeArg::Matched) = (integer, &in_array) {
-            windowed!(SetTableInteger, [], [W: Widen, N: bool], |owner, state, base| (table, key, value) {
+            windowed!(writes SetTableInteger, [], [W: Widen, N: bool], |owner, state, base| (table, key, value) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 store_array::<W, N>(owner, &tab, integer_slot(key.as_int()), value);
                 // Last. See Note [Write barriers].
@@ -820,7 +862,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 tab.barrier_slow();
             });
-            windowed!(SetTableIntegerK, [value: u64], [W: Widen, N: bool], |owner, state, base| (table, key) {
+            windowed!(writes SetTableIntegerK, [value: u64], [W: Widen, N: bool], |owner, state, base| (table, key) {
                 let LValue::Table(tab) = table.unbox() else { unreachable!() };
                 // A constant's value lives as long as its prototype.
                 let value = LBoxed::from_bits(value);
@@ -842,8 +884,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 }
             });
             // A store that widens no kind falsifies no table's: its own keeps its kind, and a
-            // table of another known kind isn't the one stored into. See Note [Array kinds] in
-            // `specialize`.
+            // table of another known kind isn't the one stored into. See Note [Array kinds].
             if widen {
                 yield YieldOp::Effect(Effect::ArrayStore(stored));
             }
@@ -853,7 +894,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             // A closure for each way of widening, which it knows as a constant.
             macro_rules! make {
                 ($W:tt) => {
-                    ResidualExec::new("settable_array", Rc::new(move |owner, state| {
+                    ResidualExec::framed("settable_array", Rc::new(move |owner, state| {
                         let kb: LValue = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                             Ok(b) => LValue::from(b),
                             Err(lv) => lv.unbox(),
@@ -870,7 +911,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 };
             }
             arg = yield YieldOp::Exec(with_widen!(how, make));
-            // See Note [Call effects] in `specialize`.
+            // See Note [Call effects].
             yield YieldOp::Effect(Effect::ArrayStore(stored));
         } else {
             // Hash part set
@@ -878,28 +919,33 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
             if let ResumeArg::HashRef(hb, htype) = arg {
                 count_store!(field_stores);
                 // A whole constant stored into a field known to hold integers is stored as one, so
-                // the field keeps its type. See Note [Widening] in `specialize`.
-                let whole = if c & 0x100 != 0 && htype == Kind::Of(LType::Integer) && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
+                // the field keeps its type. See Note [Widening].
+                // A field that has held doubles holds doubles. See Note [Widening].
+                let doubles = matches!(htype, CType::Type(LType::Double) | CType::Number);
+                let whole = if c & 0x100 != 0 && !doubles && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
                     let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
                     Some(k)
                 } else {
                     None
                 };
                 let ResumeArg::Type(value_type) = (yield YieldOp::TypeofRk(c)) else { unreachable!() };
-                let new_type = if whole.is_some() { Some(LType::Integer) } else { value_type.as_ltype() };
+                // A number stored into a field that has held both encodings goes in as a double.
+                let to_double = c & 0x100 == 0 && htype == CType::Number && matches!(value_type, CType::Number | CType::Type(LType::Integer));
+                let new_type = if whole.is_some() { Some(LType::Integer) } else if to_double { Some(LType::Double) } else { value_type.as_ltype() };
                 // A store to `__index` moves the table to a new epoch, whatever it
-                // stores. See Note [Table metatables] in `specialize`.
+                // stores. See Note [Table metatables].
                 let index = b & 0x100 != 0 && (yield YieldOp::IsKey(b & 0xff, b"__index")) == ResumeArg::Matched;
-                let retype = match retype(new_type, htype) {
+                let retype = match retype(new_type, &htype) {
                     Retype::Same if index => Retype::Known,
                     retype => retype,
                 };
-                let expected = htype;
+                let expected = holds_bits(&htype);
                 if c & 0x100 == 0 {
                     arg = yield YieldOp::ExecWindow(match retype {
-                        Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
-                        Retype::Known => Rc::new(SetTableHref::<{ Retype::Known }>::new(hb.0, expected, &[a, c])),
-                        Retype::Unknown => Rc::new(SetTableHref::<{ Retype::Unknown }>::new(hb.0, expected, &[a, c])),
+                        Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }, false>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
+                        Retype::Known if to_double => Rc::new(SetTableHref::<{ Retype::Known }, true>::new(hb.0, expected, &[a, c])),
+                        Retype::Known => Rc::new(SetTableHref::<{ Retype::Known }, false>::new(hb.0, expected, &[a, c])),
+                        Retype::Unknown => Rc::new(SetTableHref::<{ Retype::Unknown }, false>::new(hb.0, expected, &[a, c])),
                     });
                 } else {
                     let value = match whole {
@@ -922,15 +968,24 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Retype::Known | Retype::Unknown => yield YieldOp::UpdateHashRef(hb, new_type),
                 };
             } else {
-                arg = yield YieldOp::Exec(ResidualExec::new("settable_hash", Rc::new(move |owner, state| {
+                // A whole constant into a field not known to hold doubles is an integer. See Note
+                // [Widening].
+                let whole = if c & 0x100 != 0 && (yield YieldOp::IntegralK(c & 0xff)) == ResumeArg::Matched {
+                    let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(c & 0xff)) else { unreachable!() };
+                    Some(k)
+                } else {
+                    None
+                };
+                arg = yield YieldOp::Exec(ResidualExec::framed("settable_hash", Rc::new(move |owner, state| {
                     let kb: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, b as u16) {
                         Ok(b) => LBoxed::from(b),
                         Err(lv) => *lv,
                     };
                     let kb = LCanon::new(kb, state.intern);
-                    let kc: LBoxed = match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16) {
-                        Ok(c) => LBoxed::from(c),
-                        Err(lv) => *lv,
+                    let kc: LBoxed = match (whole, Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, c as u16)) {
+                        (Some(k), _) => LBoxed::from_int(k),
+                        (None, Ok(c)) => LBoxed::from(c),
+                        (None, Err(lv)) => *lv,
                     };
                     let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
                     // A field's type is a number's encoding. See Note [Field types].
@@ -961,8 +1016,9 @@ pub fn emit_newtable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         arg = yield YieldOp::Exec(ResidualExec::new("newtable", Rc::new(move |owner, state| {
             // TODO: properly decode the "floating point byte" size hints instead
             state.vals[state.base + a as usize] = LBoxed::box_lvalue(LValue::Table(Tc::new(Table::new(b as usize, c as usize))));
-        })));
+        })).writing(&[a]));
         yield YieldOp::SetTypes(vec![(a, LType::Table)]);
+        yield YieldOp::Created(a);
         yield YieldOp::CollectGarbage;
         arg
     }
@@ -974,7 +1030,7 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
         // We don't need to guard on LType::Table, because this instruction is only ever used for
         // table initialization, which means it is definitely a table and doesn't e.g. have a
         // metatable we have to chain to.
-        arg = yield YieldOp::Exec(ResidualExec::new("setlist", Rc::new(move |owner, state| {
+        arg = yield YieldOp::Exec(ResidualExec::framed("setlist", Rc::new(move |owner, state| {
             match state.vals[state.base + a as usize].unbox() {
                 LValue::Table(tab) => {
                     assert_ne!(c, 0);
@@ -1087,7 +1143,7 @@ crate::window::windowed!(NumericRK, [k: f64], [OP: Opcode, LI: bool], |owner, st
 });
 
 // Twins of the double ops on doubles, taking and giving them unboxed. See Note
-// [Unboxed doubles] in `window_alloc`.
+// [Unboxed doubles].
 crate::window::windowed!(NumericRRX, [], [OP: Opcode], |owner, state, base| (f64 lhs, f64 rhs, out f64 dest) {
     *dest = arith_value::<OP>(lhs, rhs);
 });
@@ -1152,10 +1208,93 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             // Notes [Integers] and [Optimistic ops].
             let integers = integer_operands!(lhs, rhs);
             let (lk, rk) = ((lhs & 0x100) != 0, (rhs & 0x100) != 0);
-            // The op, and whether its result can fail to fit. A constant operand is its
-            // value, as `k`. luac folds two.
+            // `+`, `-` and `*` are emitted ops: the instruction on whichever registers their
+            // operands are in, overflowing into a cold path computing the double op's result,
+            // which takes exit 1. See Notes [Emitted ops] and [Optimistic ops].
+            use crate::emitted::{Assembler, Emitted};
+            use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+            // xmm15 `OP` xmm14, boxed into `dest`.
+            fn double_result(ops: &mut Assembler, op: Opcode, dest: u8) {
+                match op {
+                    Opcode::ADD => dynasm!(ops ; .arch x64 ; vaddsd xmm15, xmm15, xmm14),
+                    Opcode::SUB => dynasm!(ops ; .arch x64 ; vsubsd xmm15, xmm15, xmm14),
+                    _ => dynasm!(ops ; .arch x64 ; vmulsd xmm15, xmm15, xmm14),
+                }
+                dynasm!(ops ; .arch x64 ; vmovq rax, xmm15 ; sub rax, r14 ; mov Rq(dest), rax);
+            }
+            // Zero times a negative number is -0: a product of zero, in eax, takes the cold path if
+            // either factor is negative, their or in r10d.
+            fn negative_zero(ops: &mut Assembler, cold: dynasmrt::DynamicLabel) {
+                dynasm!(ops
+                    ; .arch x64
+                    ; test eax, eax
+                    ; jnz >product
+                    ; test r10d, r10d
+                    ; js =>cold
+                    ; product:
+                );
+            }
+            crate::emitted::emitted!(ArithRR, [], [OP: Opcode], |ops, exits| (lhs, rhs, out dest) {
+                dynasm!(ops ; .arch x64 ; mov eax, Rd(lhs));
+                match OP {
+                    Opcode::ADD => dynasm!(ops ; .arch x64 ; add eax, Rd(rhs) ; jo =>exits.cold),
+                    Opcode::SUB => dynasm!(ops ; .arch x64 ; sub eax, Rd(rhs) ; jo =>exits.cold),
+                    _ => {
+                        dynasm!(ops ; .arch x64 ; imul eax, Rd(rhs) ; jo =>exits.cold ; mov r10d, Rd(lhs) ; or r10d, Rd(rhs));
+                        negative_zero(ops, exits.cold);
+                    },
+                }
+                dynasm!(ops ; .arch x64 ; or rax, r14 ; mov Rq(dest), rax);
+            } cold |record| {
+                dynasm!(ops ; .arch x64 ; vcvtsi2sd xmm15, xmm15, Rd(lhs) ; vcvtsi2sd xmm14, xmm14, Rd(rhs));
+                double_result(ops, OP, dest);
+                record.exit(ops, 1);
+            });
+            crate::emitted::emitted!(ArithRK, [k: i32], [OP: Opcode], |ops, exits| (lhs, out dest) {
+                match OP {
+                    Opcode::ADD => dynasm!(ops ; .arch x64 ; mov eax, Rd(lhs) ; add eax, k ; jo =>exits.cold),
+                    Opcode::SUB => dynasm!(ops ; .arch x64 ; mov eax, Rd(lhs) ; sub eax, k ; jo =>exits.cold),
+                    _ => {
+                        dynasm!(ops ; .arch x64 ; imul eax, Rd(lhs), k ; jo =>exits.cold ; mov r10d, Rd(lhs) ; or r10d, k);
+                        negative_zero(ops, exits.cold);
+                    },
+                }
+                dynasm!(ops ; .arch x64 ; or rax, r14 ; mov Rq(dest), rax);
+            } cold |record| {
+                record.capture(ops, k, 0);
+                dynasm!(ops ; .arch x64 ; vcvtsi2sd xmm15, xmm15, Rd(lhs) ; vcvtsi2sd xmm14, xmm14, eax);
+                double_result(ops, OP, dest);
+                record.exit(ops, 1);
+            });
+            crate::emitted::emitted!(ArithKR, [k: i32], [OP: Opcode], |ops, exits| (rhs, out dest) {
+                match OP {
+                    Opcode::ADD => dynasm!(ops ; .arch x64 ; mov eax, Rd(rhs) ; add eax, k ; jo =>exits.cold),
+                    Opcode::SUB => dynasm!(ops ; .arch x64 ; mov eax, k ; sub eax, Rd(rhs) ; jo =>exits.cold),
+                    _ => {
+                        dynasm!(ops ; .arch x64 ; imul eax, Rd(rhs), k ; jo =>exits.cold ; mov r10d, Rd(rhs) ; or r10d, k);
+                        negative_zero(ops, exits.cold);
+                    },
+                }
+                dynasm!(ops ; .arch x64 ; or rax, r14 ; mov Rq(dest), rax);
+            } cold |record| {
+                record.capture(ops, k, 0);
+                dynasm!(ops ; .arch x64 ; vcvtsi2sd xmm15, xmm15, eax ; vcvtsi2sd xmm14, xmm14, Rd(rhs));
+                double_result(ops, OP, dest);
+                record.exit(ops, 1);
+            });
+            macro_rules! dispatch_arith {
+                ($name:ident, ($($arg:expr),*)) => {
+                    match opcode {
+                        Opcode::ADD => Some(Rc::new($name::<{Opcode::ADD}>::new($($arg),*)) as Rc<dyn Emitted>),
+                        Opcode::SUB => Some(Rc::new($name::<{Opcode::SUB}>::new($($arg),*))),
+                        Opcode::MUL => Some(Rc::new($name::<{Opcode::MUL}>::new($($arg),*))),
+                        _ => None,
+                    }
+                };
+            }
+            let mut emitted: Option<Rc<dyn Emitted>> = None;
             // The op, whether its result can fail to fit, and whether it fits for the values its
-            // operands have. A constant operand is its value, as `k`.
+            // operands have. A constant operand is its value, as `k`; luac folds two.
             let op: Option<(Rc<dyn Window>, bool, Option<crate::specialize::Fits>)> = if !integers || (lk && rk) {
                 None
             } else if lk {
@@ -1170,6 +1309,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     1
                 });
                 let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| integer_fits(opcode, k, unsafe { state.vals[state.base + rhs].as_int() })));
+                emitted = dispatch_arith!(ArithKR, (k, &[rhs, dest]));
                 Some((dispatch_integer_window!(opcode, IntegerKR, (k, &[rhs, dest])), true, Some(fits)))
             } else if rk {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rhs & 0xff)) else { unreachable!() };
@@ -1196,6 +1336,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                     true => (Rc::new(ModRK::new(k, &[lhs, dest])) as Rc<dyn Window>, false, None),
                     false => {
                         let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| integer_fits(opcode, unsafe { state.vals[state.base + lhs].as_int() }, k)));
+                        emitted = dispatch_arith!(ArithRK, (k, &[lhs, dest]));
                         (dispatch_integer_window!(opcode, IntegerRK, (k, &[lhs, dest])), true, Some(fits))
                     },
                 })
@@ -1212,6 +1353,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 let fits = crate::specialize::Fits(Rc::new(move |state: &RunState| unsafe {
                     integer_fits(opcode, state.vals[state.base + lhs].as_int(), state.vals[state.base + rhs].as_int())
                 }));
+                emitted = dispatch_arith!(ArithRR, (&[lhs, rhs, dest]));
                 Some((dispatch_integer_window!(opcode, IntegerRR, (&[lhs, rhs, dest])), true, Some(fits)))
             };
             // As one step each way, as a guard of whether the result fits is
@@ -1222,10 +1364,13 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 Some((true, true)) => {
                     // In the integer encoding if it fits when it first runs, until it
                     // overflows, which rebuilds it to compute in the double one. See Note
-                    // [Optimistic ops] in `specialize`.
+                    // [Optimistic ops].
                     let fits = op.as_ref().and_then(|(_, _, fits)| fits.clone()).unwrap();
                     if (yield YieldOp::Encoding(fits)) != ResumeArg::Type(CType::Type(LType::Double)) {
-                        let fits = yield YieldOp::OptimisticExec(window(&op));
+                        let fits = match &emitted {
+                            Some(op) => yield YieldOp::OptimisticEmit(op.clone()),
+                            None => yield YieldOp::OptimisticExec(window(&op)),
+                        };
                         let ty = if fits == ResumeArg::Matched { LType::Integer } else { LType::Double };
                         yield YieldOp::SetCTypes(vec![(dest, CType::Type(ty))]);
                         return arg;
@@ -1261,7 +1406,39 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
         let numbers = matches!(larg, ResumeArg::Matched | ResumeArg::MatchedConst(_))
             && matches!(rarg, ResumeArg::Matched | ResumeArg::MatchedConst(_));
         let (lint, rint) = if numbers { (integer_encoded!(lhs), integer_encoded!(rhs)) } else { (false, false) };
+        let mut quotient = None;
+        // Of doubles, `+`, `-`, `*` and `/` are emitted ops: an instruction on whichever registers
+        // their operands are in. See Note [Emitted ops].
+        use crate::emitted::{Assembler, Emitted};
+        use dynasmrt::{dynasm, DynasmApi};
+        fn double_op(ops: &mut Assembler, op: Opcode, dst: u8, lhs: u8, rhs: u8) {
+            match op {
+                Opcode::ADD => dynasm!(ops ; .arch x64 ; vaddsd Rx(dst), Rx(lhs), Rx(rhs)),
+                Opcode::SUB => dynasm!(ops ; .arch x64 ; vsubsd Rx(dst), Rx(lhs), Rx(rhs)),
+                Opcode::MUL => dynasm!(ops ; .arch x64 ; vmulsd Rx(dst), Rx(lhs), Rx(rhs)),
+                Opcode::DIV => dynasm!(ops ; .arch x64 ; vdivsd Rx(dst), Rx(lhs), Rx(rhs)),
+                _ => unreachable!("a double op emitted: {op:?}"),
+            }
+        }
+        crate::emitted::emitted!(DoubleRR, [op: Opcode], [], |ops, exits| (f64 lhs, f64 rhs, out f64 dest) {
+            double_op(ops, op, dest, lhs, rhs);
+        });
+        // `k` into xmm15, an emitted op's scratch.
+        crate::emitted::emitted!(DoubleRK, [op: Opcode, k: f64], [], |ops, exits| (f64 lhs, out f64 dest) {
+            dynasm!(ops ; .arch x64 ; mov rax, QWORD k.to_bits() as i64 ; vmovq xmm15, rax);
+            double_op(ops, op, dest, lhs, 15);
+        });
+        crate::emitted::emitted!(DoubleKR, [op: Opcode, k: f64], [], |ops, exits| (f64 rhs, out f64 dest) {
+            dynasm!(ops ; .arch x64 ; mov rax, QWORD k.to_bits() as i64 ; vmovq xmm15, rax);
+            double_op(ops, op, dest, 15, rhs);
+        });
+        let emitted = matches!(opcode, Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV);
+        let mut emit: Option<Rc<dyn Emitted>> = None;
         let window = match (larg, rarg) {
+            (ResumeArg::Matched, ResumeArg::Matched) if emitted && !lint && !rint => {
+                emit = Some(Rc::new(DoubleRR::new(opcode, &[lhs, rhs, dest])));
+                None
+            },
             (ResumeArg::Matched, ResumeArg::Matched) => Some(numeric_rr(opcode, lint, rint, &[lhs, rhs, dest])),
             (ResumeArg::MatchedConst(lhsc), ResumeArg::MatchedConst(rhsc)) => {
                 let ResumeArg::Number(l) = (yield YieldOp::NumberK(lhsc)) else { unreachable!() };
@@ -1275,17 +1452,40 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             },
             (ResumeArg::MatchedConst(lhsc), ResumeArg::Matched) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(lhsc)) else { unreachable!() };
-                Some(numeric_kr(opcode, rint, k, &[rhs, dest]))
+                if emitted && !rint {
+                    emit = Some(Rc::new(DoubleKR::new(opcode, k, &[rhs, dest])));
+                    None
+                } else {
+                    Some(numeric_kr(opcode, rint, k, &[rhs, dest]))
+                }
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rhsc)) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(rhsc)) else { unreachable!() };
-                Some(numeric_rk(opcode, lint, k, &[lhs, dest]))
+                // An integer's quotient by a positive whole constant, as `math.floor` can compute
+                // it again from the integer. See Note [Quotients].
+                if opcode == Opcode::DIV && lint && dest != lhs && k >= 1.0 && k <= i32::MAX as f64 && k.fract() == 0.0 {
+                    quotient = Some(k as i32);
+                }
+                if emitted && !lint {
+                    emit = Some(Rc::new(DoubleRK::new(opcode, k, &[lhs, dest])));
+                    None
+                } else {
+                    Some(numeric_rk(opcode, lint, k, &[lhs, dest]))
+                }
             },
             _ => None,
         };
+        if let Some(op) = emit {
+            yield YieldOp::Emit(op);
+            yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Double))]);
+            return arg;
+        }
         if let Some(window) = window {
             yield YieldOp::ExecWindow(window);
             yield YieldOp::SetCTypes(vec![(dest, CType::Type(LType::Double))]);
+            if let Some(by) = quotient {
+                yield YieldOp::Quotient(dest, lhs, by);
+            }
             return arg;
         }
 
@@ -1321,7 +1521,7 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
 
 /// A compare's exit: 0 to take the jump, when the condition isn't `a`. `OP` is
 /// a const param, so each stencil compares one way. Unchecked, so that no panic
-/// path follows the stencil's `become`. See Note [Window exits] in `window`.
+/// path follows the stencil's `become`. See Note [Window exits].
 #[inline(always)]
 unsafe fn compare_exit<const OP: Opcode, T: PartialOrd>(a: u8, l: T, r: T) -> usize {
     let cond = match OP {
@@ -1346,7 +1546,7 @@ crate::window::windowed!(select CompareRK, [a: u8, k: f64], [OP: Opcode, LI: boo
 });
 
 // Twins of the compares of doubles, taking them unboxed. See Note [Unboxed
-// doubles] in `window_alloc`.
+// doubles].
 crate::window::windowed!(select CompareRRX, [a: u8], [OP: Opcode], |owner, state, base| (f64 lhs, f64 rhs) {
     compare_exit::<OP, f64>(a, lhs, rhs)
 });
@@ -1431,32 +1631,6 @@ fn unboxed_equal<'s, 'i>(l: LBoxed<'s, 'i>, r: LBoxed<'s, 'i>) -> bool {
     l.unbox() == r.unbox()
 }
 
-/// The order of two strings, by their bytes, as the C locale's `strcoll`
-/// orders them. Out of line, as `unboxed_equal` is.
-#[inline(never)]
-fn string_order<'s, 'i>(l: LBoxed<'s, 'i>, r: LBoxed<'s, 'i>) -> std::cmp::Ordering {
-    fn bytes<'a>(v: &'a LValue<'_, '_>) -> &'a [u8] {
-        match v {
-            LValue::InternedString(s) => s.as_bytes(),
-            LValue::OwnedString(s) => s.as_slice(),
-            _ => unreachable!("a string"),
-        }
-    }
-    let (l, r) = (l.unbox(), r.unbox());
-    bytes(&l).cmp(bytes(&r))
-}
-
-// Orderings of strings: registers, and a constant, `k` its boxed value, on the
-// left if `KL`.
-crate::window::windowed!(select CompareStringRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
-    compare_exit::<OP, std::cmp::Ordering>(a, string_order(lhs, rhs), std::cmp::Ordering::Equal)
-});
-crate::window::windowed!(select CompareStringRK, [a: u8, k: u64], [OP: Opcode, KL: bool], |owner, state, base| (operand) {
-    let k = LBoxed::from_bits(k);
-    let order = if KL { string_order(k, operand) } else { string_order(operand, k) };
-    compare_exit::<OP, std::cmp::Ordering>(a, order, std::cmp::Ordering::Equal)
-});
-
 pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
@@ -1480,22 +1654,59 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
         // Compares of integers, a constant one its value `k`: known to be before, or
         // both registers found in the integer encoding by the guards above. See Note
         // [Integers].
+        // Of integers, emitted ops: a `cmp` of the operands' registers, and a jump to exit 1 if
+        // the condition is `a`. See Notes [Emitted ops] and [Window exits].
+        use crate::emitted::{Assembler, Emitted};
+        use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+        // To `exit1` if `OP` of the operands the flags compared, the other way round if
+        // `swapped`, is `a`.
+        fn compare_jump(ops: &mut Assembler, op: Opcode, a: u8, swapped: bool, exit1: dynasmrt::DynamicLabel) {
+            match (op, swapped, a != 0) {
+                (Opcode::EQ, _, true) => dynasm!(ops ; .arch x64 ; je =>exit1),
+                (Opcode::EQ, _, false) => dynasm!(ops ; .arch x64 ; jne =>exit1),
+                (Opcode::LT, false, true) => dynasm!(ops ; .arch x64 ; jl =>exit1),
+                (Opcode::LT, false, false) => dynasm!(ops ; .arch x64 ; jge =>exit1),
+                (Opcode::LT, true, true) => dynasm!(ops ; .arch x64 ; jg =>exit1),
+                (Opcode::LT, true, false) => dynasm!(ops ; .arch x64 ; jle =>exit1),
+                (Opcode::LE, false, true) => dynasm!(ops ; .arch x64 ; jle =>exit1),
+                (Opcode::LE, false, false) => dynasm!(ops ; .arch x64 ; jg =>exit1),
+                (Opcode::LE, true, true) => dynasm!(ops ; .arch x64 ; jge =>exit1),
+                (Opcode::LE, true, false) => dynasm!(ops ; .arch x64 ; jl =>exit1),
+                _ => unreachable!("an integer compare of {op:?}"),
+            }
+        }
+        crate::emitted::emitted!(select CompareIntRR, [a: u8], [OP: Opcode], |ops, exits| (lhs, rhs) {
+            dynasm!(ops ; .arch x64 ; cmp Rd(lhs), Rd(rhs));
+            compare_jump(ops, OP, a, false, exits.exit1);
+        });
+        crate::emitted::emitted!(select CompareIntKR, [a: u8, k: i32], [OP: Opcode], |ops, exits| (rhs) {
+            dynasm!(ops ; .arch x64 ; cmp Rd(rhs), k);
+            compare_jump(ops, OP, a, true, exits.exit1);
+        });
+        crate::emitted::emitted!(select CompareIntRK, [a: u8, k: i32], [OP: Opcode], |ops, exits| (lhs) {
+            dynasm!(ops ; .arch x64 ; cmp Rd(lhs), k);
+            compare_jump(ops, OP, a, false, exits.exit1);
+        });
+        macro_rules! dispatch_compare {
+            ($name:ident, ($($arg:expr),*)) => {
+                match opcode {
+                    Opcode::EQ => Rc::new($name::<{Opcode::EQ}>::new($($arg),*)) as Rc<dyn Emitted>,
+                    Opcode::LT => Rc::new($name::<{Opcode::LT}>::new($($arg),*)),
+                    Opcode::LE => Rc::new($name::<{Opcode::LE}>::new($($arg),*)),
+                    _ => unreachable!(),
+                }
+            };
+        }
         match (larg, rarg) {
             (ResumeArg::Matched, ResumeArg::Matched) if integers || (lint && rint) => {
-                crate::window::windowed!(select CompareIntRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
-                    compare_exit::<OP, i32>(a, lhs.as_int(), rhs.as_int())
-                });
-                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRR, [], (a, &[b, c])));
+                arg = yield YieldOp::Emit(dispatch_compare!(CompareIntRR, (a, &[b, c])));
             },
             (ResumeArg::Matched, ResumeArg::Matched) => {
                 arg = yield YieldOp::ExecWindow(compare_rr(opcode, lint, rint, a, &[b, c]));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) if integers => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rb)) else { unreachable!() };
-                crate::window::windowed!(select CompareIntKR, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (rhs) {
-                    compare_exit::<OP, i32>(a, k, rhs.as_int())
-                });
-                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntKR, [], (a, k, &[c])));
+                arg = yield YieldOp::Emit(dispatch_compare!(CompareIntKR, (a, k, &[c])));
             },
             (ResumeArg::MatchedConst(rb), ResumeArg::Matched) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(rb)) else { unreachable!() };
@@ -1503,10 +1714,7 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) if integers => {
                 let ResumeArg::Integer(k) = (yield YieldOp::IntegerK(rc)) else { unreachable!() };
-                crate::window::windowed!(select CompareIntRK, [a: u8, k: i32], [OP: Opcode], |owner, state, base| (lhs) {
-                    compare_exit::<OP, i32>(a, lhs.as_int(), k)
-                });
-                arg = yield YieldOp::ExecWindow(dispatch_compare_window!(opcode, CompareIntRK, [], (a, k, &[b])));
+                arg = yield YieldOp::Emit(dispatch_compare!(CompareIntRK, (a, k, &[b])));
             },
             (ResumeArg::Matched, ResumeArg::MatchedConst(rc)) => {
                 let ResumeArg::Number(k) = (yield YieldOp::NumberK(rc)) else { unreachable!() };
@@ -1552,6 +1760,31 @@ pub fn emit_compare(opcode: Opcode, a: u8, b: usize, c: usize, pc: usize) -> imp
                 const RK: usize = 256;
                 let lstr = yield YieldOp::GuardRk(b, LType::String);
                 let rstr = yield YieldOp::GuardRk(c, LType::String);
+                /// The order of two strings, by their bytes, as the C locale's `strcoll`
+                /// orders them. Out of line, as `unboxed_equal` is.
+                #[inline(never)]
+                fn string_order<'s, 'i>(l: LBoxed<'s, 'i>, r: LBoxed<'s, 'i>) -> std::cmp::Ordering {
+                    fn bytes<'a>(v: &'a LValue<'_, '_>) -> &'a [u8] {
+                        match v {
+                            LValue::InternedString(s) => s.as_bytes(),
+                            LValue::OwnedString(s) => s.as_slice(),
+                            _ => unreachable!("a string"),
+                        }
+                    }
+                    let (l, r) = (l.unbox(), r.unbox());
+                    bytes(&l).cmp(bytes(&r))
+                }
+
+                // Orderings of strings: registers, and a constant, `k` its boxed value, on the
+                // left if `KL`.
+                crate::window::windowed!(select CompareStringRR, [a: u8], [OP: Opcode], |owner, state, base| (lhs, rhs) {
+                    compare_exit::<OP, std::cmp::Ordering>(a, string_order(lhs, rhs), std::cmp::Ordering::Equal)
+                });
+                crate::window::windowed!(select CompareStringRK, [a: u8, k: u64], [OP: Opcode, KL: bool], |owner, state, base| (operand) {
+                    let k = LBoxed::from_bits(k);
+                    let order = if KL { string_order(k, operand) } else { string_order(operand, k) };
+                    compare_exit::<OP, std::cmp::Ordering>(a, order, std::cmp::Ordering::Equal)
+                });
                 let window = match (lstr, rstr) {
                     (ResumeArg::Matched, ResumeArg::Matched) => dispatch_compare_window!(opcode, CompareStringRR, [], (a, &[b, c])),
                     (ResumeArg::MatchedConst(_), ResumeArg::Matched) => {
@@ -1590,6 +1823,12 @@ pub fn emit_test(a: usize, c: u16, pc: usize) -> impl Coroutine<ResumeArg, Yield
         // The targets are found after the guards, so they're versioned for what
         // the guards found out.
         let (fallthrough, taken) = (pc, pc + 1);
+        // A value known decides it.
+        if let ResumeArg::Boxed(bits) = (yield YieldOp::ValueOf(a)) {
+            let truthy = bits != LBoxed::VALUE_NIL && bits != LBoxed::VALUE_FALSE;
+            let ResumeArg::BlockId(target) = (yield YieldOp::GetBlock(if truthy == (c != 0) { fallthrough } else { taken })) else { unreachable!() };
+            return yield YieldOp::Jump(target);
+        }
         arg = yield YieldOp::Guard(a, LType::Bool);
         if let ResumeArg::Matched = arg {
             // Exit 1, the fallthrough, when the guarded bool is `C`.
@@ -1788,12 +2027,11 @@ pub fn emit_testset(a: usize, b: usize, c: u16, pc: usize) -> impl Coroutine<Res
 
 /// `R(A), ..., R(A+B-2) := the running vararg function's extra arguments`, or
 /// with B = 0 all of them, the top just past them. `params` is how many fixed
-/// parameters it has. See Note [Vararg frames] in
-/// `vm`.
+/// parameters it has. See Note [Vararg frames].
 pub fn emit_vararg(a: usize, b: usize, params: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        arg = yield YieldOp::Exec(ResidualExec::new("vararg", Rc::new(move |owner, state| {
+        arg = yield YieldOp::Exec(ResidualExec::framed("vararg", Rc::new(move |owner, state| {
             state.vararg(owner, a, b, params);
         })));
         if b == 0 {
@@ -1821,6 +2059,10 @@ pub fn emit_close(a: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return
 pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
+        // Into a slot holding its value already, nothing.
+        if (yield YieldOp::HoldsValue(dest, src)) == ResumeArg::Matched {
+            return ResumeArg::Start;
+        }
         arg = yield YieldOp::Typeof(src);
         if let ResumeArg::Type(t) = arg.clone() {
             yield YieldOp::ExecWindow(Rc::new(Move::new(&[src, dest])));
@@ -1834,20 +2076,58 @@ pub fn emit_move(dest: usize, src: usize) -> impl Coroutine<ResumeArg, Yield = Y
     }
 }
 
+/// No upvalue cell. See Note [Upvalue cells].
+pub const NO_CELL: usize = usize::MAX;
+
+// An upvalue's value, which JIT code also stores into its `cell`, if it has one.
+windowed!(upvalues GetUpval, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
+    let _ = cell;
+    let upval = state.upvalue(owner, index);
+    debug!("upval {:?}", &upval);
+    *dest = upval;
+});
+// An upvalue of `closure`, the closure an inlined call whose frame isn't made calls, known: the
+// running closure is its caller's until it is. See Note [Inlined frames].
+// An upvalue's value, which JIT code loads from its `cell`, holding it. See Note [Upvalue cells].
+windowed!(upvalues UpvalCell, [index: usize, cell: usize], [], |owner, state, base| (out dest) {
+    let _ = cell;
+    *dest = state.upvalue(owner, index);
+});
+// A store into an upvalue, which JIT code also stores into its `cell`, if it has one. A closed
+// upvalue is stored out of line.
+windowed!(sets_upvalues SetUpval, [index: usize, cell: usize], [], |owner, state, base| (value) {
+    let _ = cell;
+    let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
+    match upval {
+        Upvalue::Open(o) => {
+            debug_assert!(o < state.base, "open upvalue in the running frame");
+            state.vals[o] = value;
+            false
+        },
+        Upvalue::Closed(_) => true,
+    }
+} rejoin {
+    let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
+    let Upvalue::Closed(c) = upval else { unreachable!("an upvalue closed by its store") };
+    set_closed(owner, c, value);
+});
+
 pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        windowed!(GetUpval, [index: usize], [], |owner, state, base| (out dest) {
-            let upval = state.upvalue(owner, index);
-            debug!("upval {:?}", &upval);
-            *dest = upval;
-        });
         // An upvalue the context knows holds a native is that constant, not a
         // read. See Note [Fragile information].
-        windowed!(NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
+        windowed!(reads NativeUpval, [bits: u64, index: usize], [], |owner, state, base| (out dest) {
             #[cfg(debug_assertions)]
             {
-                let held = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {
+                // The code's closure, below its frame, which needn't be the running one: an
+                // inlined call's frame isn't made until something observes it. See Note
+                // [Inlined frames].
+                let clos = match state.vals[state.base - 1].unbox() {
+                    LValue::LClosure(clos) => clos,
+                    _ => state.clos.clone(),
+                };
+                let held = match clos.ro(owner).upvalues[index].deref().ro(owner) {
                     Upvalue::Open(o) => state.vals[*o as usize],
                     Upvalue::Closed(c) => *c.ro(owner),
                 };
@@ -1858,10 +2138,17 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
         });
         // One a slot is known to still hold is a move from that slot, or
         // nothing if it is the destination.
-        windowed!(HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
+        windowed!(reads HeldUpval, [index: usize], [], |owner, state, base| (from, out to) {
             #[cfg(debug_assertions)]
             {
-                let held = match state.clos.ro(owner).upvalues[index].deref().ro(owner) {
+                // The code's closure, below its frame, which needn't be the running one: an
+                // inlined call's frame isn't made until something observes it. See Note
+                // [Inlined frames].
+                let clos = match state.vals[state.base - 1].unbox() {
+                    LValue::LClosure(clos) => clos,
+                    _ => state.clos.clone(),
+                };
+                let held = match clos.ro(owner).upvalues[index].deref().ro(owner) {
                     Upvalue::Open(o) => state.vals[*o as usize],
                     Upvalue::Closed(c) => *c.ro(owner),
                 };
@@ -1870,17 +2157,35 @@ pub fn emit_getupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = Yi
             let _ = index;
             *to = from;
         });
-        match yield YieldOp::UpvalueKnown(b) {
-            ResumeArg::Boxed(bits) => {
-                yield YieldOp::ExecWindow(Rc::new(NativeUpval::new(bits, b, &[a])));
-            },
-            ResumeArg::Integer(slot) if slot as usize == a => {},
-            ResumeArg::Integer(slot) => {
+        // One of a closure a slot holds. See Note [Reaching values].
+        windowed!(cells CalledUpval, [index: usize], [], |owner, state, base| (closure, out dest) {
+            let LValue::LClosure(clos) = closure.unbox() else { unreachable!("an inlined call's closure") };
+            *dest = state.upvalue_of(owner, &clos, index);
+        });
+        let ResumeArg::Reach(reach) = (yield YieldOp::Reach(crate::classes::Root::Upvalue(b as u8))) else { unreachable!("a reach") };
+        match reach {
+            Reach::Slot(slot) if slot == a as isize => {},
+            Reach::Slot(slot) if slot >= 0 => {
                 yield YieldOp::ExecWindow(Rc::new(HeldUpval::new(b, &[slot as usize, a])));
             },
-            _ => {
-                yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, &[a])));
+            // A slot of a frame below. See Note [Inlined calls].
+            Reach::Slot(slot) => {
+                yield YieldOp::ExecWindow(Rc::new(Move::new(&[slot as usize, a])));
             },
+            Reach::Native(bits) => {
+                yield YieldOp::ExecWindow(Rc::new(NativeUpval::new(bits, b, &[a])));
+            },
+            Reach::Closure { slot, index } => {
+                yield YieldOp::ExecWindow(Rc::new(CalledUpval::new(index, &[slot as usize, a])));
+            },
+            // See Note [Upvalue cells].
+            Reach::Cell { cell, .. } => {
+                yield YieldOp::ExecWindow(Rc::new(UpvalCell::new(b, cell, &[a])));
+            },
+            Reach::Upvalue { cell, .. } => {
+                yield YieldOp::ExecWindow(Rc::new(GetUpval::new(b, cell.unwrap_or(NO_CELL), &[a])));
+            },
+            Reach::Unknown => unreachable!("an upvalue the code can't read"),
         }
         arg = yield YieldOp::LoadUpvalue(a, b);
         return arg;
@@ -1896,18 +2201,21 @@ pub fn emit_closure(a: usize, bx: usize, upvalues: Vec<(Opcode, usize)>, next: u
         let skip = !upvalues.is_empty();
         let captured = upvalues.clone();
         let upvalues = upvalues.clone();
-        arg = yield YieldOp::Exec(ResidualExec::new("closure", Rc::new(move |owner, state| {
+        arg = yield YieldOp::Exec(ResidualExec::framed("closure", Rc::new(move |owner, state| {
             let proto = unsafe { &(&(*state.clos.ro(owner).prototype).prototypes.items)[bx] };
             let mut fresh = LClosure::new(proto as *const _);
             for &(from, b) in upvalues.iter() {
                 let cell = if from == Opcode::MOVE {
                     let slot = state.base + b;
-                    let open = state.upvals.iter().find(|(upval, _)| matches!(upval, Upvalue::Open(o) if *o == slot));
+                    let open = state.upvals.binary_search_by_key(&slot, |(upval, _)| match upval {
+                        Upvalue::Open(o) => *o,
+                        Upvalue::Closed(_) => unreachable!("a closed upvalue in the open list"),
+                    });
                     match open {
-                        Some((_, uses)) => uses[0].clone(),
-                        None => {
+                        Ok(at) => state.upvals[at].1[0].clone(),
+                        Err(at) => {
                             let cell = Tc::new(Upvalue::Open(slot));
-                            state.upvals.push((Upvalue::Open(slot), vec![cell.clone()].into()));
+                            state.upvals.insert(at, (Upvalue::Open(slot), vec![cell.clone()].into()));
                             cell
                         }
                     }
@@ -1941,23 +2249,11 @@ fn set_closed<'src, 'intern>(owner: &mut Owner, cell: Tc<LBoxed<'src, 'intern>>,
 pub fn emit_setupval(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        // A closed upvalue is stored out of line.
-        windowed!(SetUpval, [index: usize], [], |owner, state, base| (value) {
-            let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
-            match upval {
-                Upvalue::Open(o) => {
-                    debug_assert!(o < state.base, "open upvalue in the running frame");
-                    state.vals[o] = value;
-                    false
-                },
-                Upvalue::Closed(_) => true,
-            }
-        } rejoin {
-            let upval = state.clos.ro(owner).upvalues[index].deref().ro(owner).clone();
-            let Upvalue::Closed(c) = upval else { unreachable!("an upvalue closed by its store") };
-            set_closed(owner, c, value);
-        });
-        arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, &[a])));
+        let cell = match yield YieldOp::UpvalueCell(b) {
+            ResumeArg::Cell(cell, _) => cell,
+            _ => NO_CELL,
+        };
+        arg = yield YieldOp::ExecWindow(Rc::new(SetUpval::new(b, cell, &[a])));
         yield YieldOp::Effect(Effect::SetUpvalue(b));
         yield YieldOp::UpvalueHolds(b, a);
         arg
@@ -1985,7 +2281,7 @@ pub fn emit_self(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yiel
 
 // The narrowing of a double an i32 holds exactly to the integer encoding, in
 // place, on its hot path; on its cold path the double stays. See Note
-// [Narrowing] in `specialize`.
+// [Narrowing].
 windowed!(ToInteger, [], [], |owner, state, base, tag| (inout v) {
     let d = v.as_double();
     if crate::lboxed::is_integer(d) {
@@ -1999,8 +2295,7 @@ windowed!(ToInteger, [], [], |owner, state, base, tag| (inout v) {
     1
 });
 
-// A known constant stored again in the double encoding. See Note [Widening]
-// in `specialize`.
+// A known constant stored again in the double encoding. See Note [Widening].
 windowed!(WidenK, [value: i32], [], |owner, state, base| (out dest) {
     *dest = LBoxed::from_double(value as f64);
 });
@@ -2011,7 +2306,7 @@ pub fn emit_forprep(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         debug!("forprep {a} {sbx} {pc}");
         // An integer loop's index, limit and step are integers: find out which
         // are, and narrow a double an i32 holds exactly to one. See Note
-        // [Narrowing] in `specialize`.
+        // [Narrowing].
         for slot in a..a + 3 {
             if (yield YieldOp::GuardCType(slot, CType::Type(LType::Integer))) != ResumeArg::Matched {
                 yield YieldOp::Narrow(slot);
@@ -2077,7 +2372,25 @@ pub fn emit_forloop(a: usize, sbx: i32, pc: usize) -> impl Coroutine<ResumeArg, 
         match (idx_number, limit_number, step_number) {
             (ResumeArg::Matched, ResumeArg::Matched, ResumeArg::Matched) => {
                 let (ii, li, si) = (integer_encoded!(a), integer_encoded!(a + 1), integer_encoded!(a + 2));
-                yield YieldOp::ExecWindow(for_loop(ii, li, si, &[a, a + 1, a + 2, a + 3]));
+                use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+                // All three integers, the step a known constant: the compare its sign picks, the
+                // loop variable set between it and its jump, after every input is read. Exit 1
+                // leaves the loop.
+                crate::emitted::emitted!(select ForLoopInt, [], [UP: bool], |ops, exits| (idx, limit, out var) {
+                    dynasm!(ops ; .arch x64 ; cmp Rd(idx), Rd(limit) ; mov Rq(var), Rq(idx));
+                    if UP {
+                        dynasm!(ops ; .arch x64 ; jg =>exits.exit1);
+                    } else {
+                        dynasm!(ops ; .arch x64 ; jl =>exits.exit1);
+                    }
+                });
+                let step = if ii && li && si { yield YieldOp::KnownInteger(a + 2) } else { ResumeArg::Failed };
+                if let ResumeArg::Integer(step) = step {
+                    let operands = &[a, a + 1, a + 3];
+                    yield YieldOp::Emit(if step < 0 { Rc::new(ForLoopInt::<false>::new(operands)) } else { Rc::new(ForLoopInt::<true>::new(operands)) });
+                } else {
+                    yield YieldOp::ExecWindow(for_loop(ii, li, si, &[a, a + 1, a + 2, a + 3]));
+                }
                 let ResumeArg::Type(t) = (yield YieldOp::Typeof(a)) else { unreachable!() };
                 yield YieldOp::SetCTypes(vec![(a + 3, t)]);
             },
@@ -2169,7 +2482,7 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
             return arg;
         }
         // The loop's variables, as a numeric loop's, are narrowed where an integer
-        // can be. See Note [Narrowing] in `specialize`.
+        // can be. See Note [Narrowing].
         for slot in f..f + c {
             yield YieldOp::Narrow(slot);
         }
@@ -2184,6 +2497,6 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
 /// The array part slot of a `CType::Type(LType::Integer)` key. Keys below 1 wrap past any
 /// array part.
 #[inline(always)]
-fn integer_slot(i: i32) -> usize {
+pub(crate) fn integer_slot(i: i32) -> usize {
     (i as i64 - 1) as usize
 }

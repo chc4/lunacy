@@ -1,7 +1,7 @@
 #![allow(unused_variables, unused_assignments, unused)]
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::{Coroutine, CoroutineState, Deref};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -51,12 +51,10 @@ impl<'src, 'intern> LValue<'src, 'intern> {
 
     /// Get the CType of an observed value: this may have more precise information, such as
     /// specialized call targets for functions.
-    pub fn ctypeof_(&self) -> CType {
+    pub fn ctypeof_(&self, owner: &Owner) -> CType {
         match self {
             LValue::NClosure(c) => CType::NativeFunction(c.clone()),
-            // Safety: Ok this one is kinda sketchy. We only use CTypes inside Specializer, which
-            // is parameterized over the same pre-transmute lifetimes and thus outlives them.
-            LValue::LClosure(c) => CType::LuaFunction(unsafe { core::mem::transmute(c.clone()) }),
+            LValue::LClosure(c) => CType::LuaFunction(c.ro(owner).prototype.cast()),
             x => CType::Type(x.typeof_()),
         }
 
@@ -75,6 +73,14 @@ pub struct Block {
     /// A version of a pc's context, which jumps to it enter. See Note [Version
     /// compatibility].
     context: Option<Rc<Context>>,
+    /// The upvalue cells holding their upvalue's value whenever the block is entered, by
+    /// `cell` index: every cell where its context isn't known. See Note [Upvalue cells].
+    pub cells: u32,
+    /// The promoted values its context has, which the JIT's notes show. See Note [Promoted values].
+    pub promoted: SmallVec<[(Pc, i32); 2]>,
+    /// The function whose code it is, which needn't be the running frame's: an inlined call's
+    /// frame isn't made until something observes it. See Note [Inlined frames].
+    pub proto: usize,
     #[cfg(feature = "jit")]
     pub jit_info: JitInfo,
     /// Times the interpreter entered the block, shown by `dump`.
@@ -101,6 +107,9 @@ impl Block {
             pc,
             allocates: false,
             context: None,
+            cells: u32::MAX,
+            promoted: SmallVec::new(),
+            proto: 0,
             #[cfg(feature = "jit")]
             jit_info: JitInfo::new(),
             #[cfg(feature = "graph")]
@@ -116,11 +125,6 @@ macro_rules! unreachable {
     ($($message:tt)*) => { unsafe { core::hint::unreachable_unchecked() } }
 }
 
-#[derive(Debug)]
-pub enum ExecEffect {
-    Jump(BlockId),
-    Call(usize, usize, u16),
-}
 #[derive(Clone)]
 pub struct ResidualExec {
     pub name: &'static str,
@@ -128,6 +132,9 @@ pub struct ResidualExec {
     pub template: Option<Rc<dyn Fn()->()>>,
     /// The slots it writes, if it says: else any. See Note [Fragile information].
     pub writes: Option<Vec<usize>>,
+    /// Whether it reads the frame it runs in past its slots: its closure, the callstack, or the
+    /// top. See Note [Inlined frames].
+    pub frame: bool,
 }
 
 /// A residual as the graph and window dumps label it.
@@ -140,8 +147,10 @@ impl std::fmt::Display for Residual {
             Residual::LuaGuard { idx, ptr } => write!(f, "lua_guard({}, {:p})", idx, *ptr),
             Residual::Exec(ResidualExec { name, .. }) => write!(f, "exec({})", name),
             Residual::ExecWindow(w) => write!(f, "window({})", window_label(&**w)),
+            Residual::Emit(op) => write!(f, "emit({})", &**op),
             Residual::GuardDynamic(w) => write!(f, "guard_dynamic({})", window_label(&**w)),
             Residual::Jump(target) => write!(f, "jump({})", target.0),
+            Residual::PatchableJump(target) => write!(f, "patchable_jump({})", target.0),
             Residual::Call { a, b, c } => write!(f, "call({}, {}, {})", a, b, c),
             Residual::Arrive { a, c } => write!(f, "arrive({}, {})", a, c),
             Residual::ReturnedFrom(from) => write!(f, "returned({}, {:#x})", from & UNKNOWN_RETURN as u64, (from & 0xffff_ffff) >> crate::vm::EFFECTS_SHIFT),
@@ -155,11 +164,15 @@ impl std::fmt::Display for Residual {
             Residual::GuardWitness { href, expected } => write!(f, "guard_witness({:?}, {})", href, expected),
             Residual::EpochCheck { tab, href, place } => write!(f, "epoch({}, {:?}, {:?})", tab, href, place),
             Residual::Thunk(_) => write!(f, "thunk"),
+            Residual::Tripped(of) => write!(f, "tripped({of:?})"),
             Residual::Select(targets) => write!(f, "select"),
             Residual::Branch { .. } => write!(f, "branch"),
             Residual::Ret(..) => write!(f, "ret"),
             Residual::Inline { a, b, .. } => write!(f, "inline({}, {})", a, b),
             Residual::InlineReturn { a, b, .. } => write!(f, "inline_ret({}, {})", a, b),
+            Residual::Uninline { entry, .. } => write!(f, "uninline({})", entry.0),
+            Residual::Enter(by) => write!(f, "enter({by})"),
+            Residual::Leave(by) => write!(f, "leave({by})"),
             Residual::GC => write!(f, "gc"),
         }
     }
@@ -168,16 +181,21 @@ impl std::fmt::Display for Residual {
 /// A window op and its operands, as the dumps label it.
 fn window_label(w: &dyn Window) -> String {
     let operands = w.operands().iter().zip(w.accesses()).map(|(slot, access)| match access {
-        Access::Read => format!(", {slot}"),
-        Access::Write => format!(", out {slot}"),
-        Access::Update => format!(", inout {slot}"),
+        Access::Read => format!(", {}", *slot as isize),
+        Access::Write => format!(", out {}", *slot as isize),
+        Access::Update => format!(", inout {}", *slot as isize),
     });
     format!("{}{}", w.name(), operands.collect::<String>())
 }
 
 impl ResidualExec {
     pub fn new(name: &'static str, body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)>) -> Self {
-        Self { name, body, template: None, writes: None }
+        Self { name, body, template: None, writes: None, frame: false }
+    }
+
+    /// One reading the frame it runs in past its slots. See `frame`.
+    pub fn framed(name: &'static str, body: Rc<dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &'b mut RunState<'src, 'intern>)>) -> Self {
+        Self { frame: true, ..Self::new(name, body) }
     }
 
     /// It, saying it writes only the slots `slots`.
@@ -200,7 +218,7 @@ pub enum CallTarget {
 }
 
 /// A native's generator, of an opcode's generator's type, boxed: a native's call is compiled by
-/// it as an opcode is by its own. See Note [Native generators] in `library`.
+/// it as an opcode is by its own. See Note [Native generators].
 pub trait NativeGen: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Unpin {
     fn clone_box(&self) -> Box<dyn NativeGen>;
 }
@@ -247,16 +265,20 @@ pub enum YieldOp {
     GuardDynamic(Rc<dyn Window>), // Resumed with Matched or Failed as the test op passes or fails.
                                   // See Note [Dynamic guards]
     Promote(usize), // Resumed with Integer(v) where STACK[idx], an integer, is guarded equal to v,
-                    // the path then green with v, or Failed where it isn't. See Note [Green values]
+                    // the path then promoting v, or Failed where it isn't. See Note [Promoted values]
     OptimisticExec(Rc<dyn Window>), // An op with a cold path, which selects 0 on its hot path and
                                     // 1 on its cold. Resumed with Matched on the hot path, and
                                     // Failed on the cold. See Note [Optimistic ops]
+    OptimisticEmit(Rc<dyn crate::emitted::Emitted>), // `OptimisticExec` of an emitted op. See Note
+                                                    // [Emitted ops]
     Decided(bool), // A guard whose outcome is known, emitting nothing: steps the SubPc as a guard
                    // with that outcome does, for a way meeting ones that take it. Resumed with
                    // Matched or Failed. See Note [Subblocks]
 
     Exec(ResidualExec), // Emit a residual operation that will be executed
     ExecWindow(Rc<dyn Window>), // Emit a copy&patch window op. See Note [Register window].
+    Emit(Rc<dyn crate::emitted::Emitted>), // An op on the window whose code the JIT emits itself.
+                                           // See Note [Emitted ops]
     Jump(BlockId), // Emit a jump to the given BlockId
     Call(CallTarget), // Call a block target.
     CallResume(CallTarget), // Call, and then resumed with Start, once the call's results arrive.
@@ -282,7 +304,7 @@ pub enum YieldOp {
                     // with the double type to compute it in the double encoding instead, else with
                     // the integer one. See Note [Optimistic ops]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
-    NativeCall { nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize }, // Emit a call of a pure native, its results from STACK[a] on of unknown type. See Note [Native generators] in `library`.
+    NativeCall { nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize }, // Emit a call of a pure native, its results from STACK[a] on of unknown type. See Note [Native generators].
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
                       // knows it, else Failed. See Note [Array kinds]
     IsElementOf(usize, usize), // Resumed with Matched if STACK[a] was loaded from STACK[b]'s array
@@ -294,11 +316,13 @@ pub enum YieldOp {
                     // context knows, else the slot. See Note [Upvalue paths]
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
                                // See Note [Field types]
+    LoadGlobal(usize, usize), // STACK[idx] was just loaded with global CONSTANT[k]. See Note [Field facts]
     LoadUpvalue(usize, usize), // Infrom the executor that STACK[idx]'s type is the same as an UPVALUE[b].
                                // See Note [Fragile information]
-    UpvalueKnown(usize), // Resumed with what the context knows of UPVALUE[idx]'s value: Boxed, the
-                         // native it holds; else Integer, a stack slot holding it; else Failed.
-                         // See Note [Fragile information]
+    Reach(Root), // Resumed with Reach, the most direct way to read what ROOT holds. See Note
+                 // [Reaching values]
+    UpvalueCell(usize), // Resumed with UPVALUE[idx]'s cell, and whether it holds the value, as
+                        // Cell; else Failed, if it has none. See Note [Upvalue cells]
     Captures(usize, Vec<(Opcode, usize)>), // Inform the executor that the closure in STACK[a]
                                            // captured these upvalues, as CLOSURE's pseudo-
                                            // instructions name them. See Note [Upvalue paths]
@@ -307,11 +331,35 @@ pub enum YieldOp {
     UpvalueHolds(usize, usize), // Inform the executor that UpValue[a] holds STACK[b]'s value. See
                                 // Note [Upvalue paths]
     Copy(usize, usize), // Inform the executor that STACK[a] holds STACK[b]'s value. See Note
-                        // [Value classes] in `classes`
+                        // [Value classes]
     Effect(Effect), // An effect on fragile information the residuals yielded don't show. See
                     // Note [Fragile information]
 
     HashKey(usize, usize, bool), // Looks up or allocates an HREF for STACK[idx][key]; down its `__index` chain if true (a load). See Note [Table metatables]
+    HashKeyNamed(usize, LConstant<'static, 'static>, bool), // `HashKey` of a key known by its value
+    HoldsValue(usize, usize), // Resumed with Matched if STACK[dest] holds STACK[src]'s value
+                              // already, a move between them nothing
+    Quotient(usize, usize, i32), // STACK[idx] was just computed as STACK[of] / by, of an integer by a
+                                 // positive constant. See Note [Quotients]
+    QuotientOf(usize), // Resumed with Quotient if STACK[idx] holds such a quotient of what a slot
+                       // holds, else Failed. See Note [Quotients]
+    Created(usize), // STACK[idx] holds a table just made, which nothing watches. See Note [Watched tables]
+    Watching(usize, bool), // A watch site of STACK[idx]'s table, frozen first if the bool says so:
+                           // resumed with Matched, the code after knowing which table it is,
+                           // while it is watched, else Failed. See Note [Watched tables]
+    FrozenElement(usize, usize), // The element of STACK[table] at RK(key), if the table is frozen and the
+                                 // key known: resumed with Element, else Failed. See Note [Frozen tables]
+    Discovered(usize, u64, CType, Option<i32>), // STACK[idx] holds the element `Element` resumed with.
+                                                // See Note [Frozen tables]
+    ValueOf(usize), // STACK[idx]'s value, if known: resumed with Boxed, else Failed
+    KnownInteger(usize), // Resumed with Integer(v) if a fact says STACK[idx] holds the integer
+                         // constant v, relying on it, else Failed. See Note [Widening]
+    Trip(Option<usize>), // A store into STACK[idx]'s table, or with none the environment, is about
+                         // to be laid out: resumed with Matched. See Note [Watched tables]
+    Learn(usize), // Resumed with Keys: the string keys of STACK[idx]'s table, once the code runs. See
+                  // `jit.learn` in `library`
+    LearnKind(usize), // Resumed with Matched once the context knows STACK[idx]'s table's array
+                      // part's kind, found out at runtime, if it is of one; else Failed
     IsKey(usize, &'static [u8]), // Whether CONSTANT[k] is the string of these bytes: Matched, else Failed
     UpdateHashRef(HashRef, Option<LType>), // Update the type of HREF to a new type, if known
     GlobalCache(usize), // Resumed with a Cache for global CONSTANT[k]. See
@@ -324,15 +372,15 @@ pub enum YieldOp {
     CollectGarbage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct HashKey<'src, 'intern> {
     /// The slot of the table the key is in.
     pub idx: usize,
     pub key: LConstant<'src, 'intern>,
-    /// Its field's type, `Mixed` if it isn't stable; `None` if the index is
-    /// free. A shape or a function's identity describes a register, not a
-    /// field, so a field's type is a representation. See Note [Field types].
-    pub known_type: Option<Kind>,
+    /// Its field's type: a representation, `Number`, or `Unknown` if it isn't
+    /// stable; `None` if the index is free. A shape or a function's identity
+    /// describes a register, not a field. See Note [Field types].
+    pub known_type: Option<CType>,
     /// Per slot: whether access through that slot is already checked for
     /// aliasing, so it needs no epoch check.
     pub hazards: SmallVec<[bool; 8]>,
@@ -342,7 +390,40 @@ pub struct HashKey<'src, 'intern> {
     /// For a key its table lacks, or has nil, found down the table's `__index`
     /// chain: the hash key it's found at. See Note [Table metatables].
     pub chain: Option<HashRef>,
+    /// Where an integer field type was found, which a store making the field a double
+    /// contracts. See Note [Field types].
+    pub origins: FieldOrigins,
 }
+
+/// A hash key's integer type's origins, if any: where it came from, not what it says, so not
+/// part of the hash key's equality. See Note [Contraction].
+#[derive(Clone, Default)]
+pub struct FieldOrigins(pub Option<Origins>);
+
+impl std::fmt::Debug for FieldOrigins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", if self.0.is_some() { "origins" } else { "-" })
+    }
+}
+
+impl PartialEq for HashKey<'_, '_> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.idx, &self.key, &self.known_type, &self.hazards, self.place, self.chain)
+            == (other.idx, &other.key, &other.known_type, &other.hazards, other.place, other.chain)
+    }
+}
+
+impl Eq for HashKey<'_, '_> {}
+
+impl std::hash::Hash for HashKey<'_, '_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.idx, &self.key, &self.known_type, &self.hazards, self.place, self.chain).hash(state)
+    }
+}
+
+/// The slot a hash key of a frame an inlined callee is inlined into is in, as the callee sees it:
+/// past any of its own. See Note [Inlined calls].
+const OUTER: usize = usize::MAX;
 
 /// How many `__index` hops down a table's chain a hash key's field can be.
 /// See Note [Table metatables].
@@ -350,18 +431,21 @@ const MAX_CHAIN: usize = 3;
 
 impl<'src, 'intern> HashKey<'src, 'intern> {
     fn tostring(&self, owner: &Owner) -> String {
+        if self.orphan() {
+            return "free".to_string();
+        }
         let lv: LValue = (&self.key).into();
         // The slots accesses through which are checked, if any.
         let checked: Vec<String> = self.hazards.iter().enumerate().filter(|(_, checked)| **checked).map(|(slot, _)| slot.to_string()).collect();
         format!("hkey({}, {}{})",
             String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
-            self.known_type.map_or("free".to_string(), |t| t.to_string()),
+            self.known_type.as_ref().map_or("free".to_string(), |t| t.to_string()),
             if checked.is_empty() { String::new() } else { format!(", checked {}", checked.join(" ")) })
     }
 
     /// A new hash key, its index reserved until its href thunk finds its type.
     fn new(idx: usize, key: LConstant<'src, 'intern>) -> Self {
-        HashKey { idx, key, known_type: None, hazards: Default::default(), place: Place::Register, chain: None }
+        HashKey { idx, key, known_type: None, hazards: Default::default(), place: Place::Register, chain: None, origins: FieldOrigins::default() }
     }
 
     /// Whether access through slot `at` needs no epoch check.
@@ -387,6 +471,12 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
         self.known_type.is_none()
     }
 
+    /// A free index, as every free index is: what the hash key there was tells nothing. See
+    /// Note [Version compatibility].
+    fn free() -> Self {
+        HashKey { idx: OUTER, key: crate::chunk::Constant::Nil, known_type: None, hazards: SmallVec::new(), place: Place::Register, chain: None, origins: FieldOrigins::default() }
+    }
+
     /// Whether blocks compiled knowing `self` are correct for a context with
     /// `other` at the same index. See Note [Version compatibility].
     fn accepts(&self, other: &Self) -> bool {
@@ -394,13 +484,18 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
             && self.key == other.key
             && self.place == other.place
             && self.chain == other.chain
-            && match (self.known_type, other.known_type) {
-                (Some(mine), Some(theirs)) => mine == theirs || mine == Kind::Mixed,
+            && match (&self.known_type, &other.known_type) {
+                (Some(mine), Some(theirs)) => mine.accepts(theirs),
                 (mine, theirs) => mine == theirs,
             }
             && self.hazards.iter().enumerate().all(|(slot, &checked)| !checked || other.hazards.get(slot) == Some(&true))
     }
 }
+
+
+/// Where compiling an instruction went on to, if it went on: the next instruction, in what context,
+/// what its generator returned, and the block it goes on in.
+pub type Compiled = Option<(Pc, Rc<Context>, ResumeArg, BlockId)>;
 
 /// Whether an integer op's result fits the integer encoding for the values its operands have.
 /// See Note [Optimistic ops].
@@ -422,15 +517,71 @@ pub enum ResumeArg {
     Failed,
     Type(CType),
     BlockId(BlockId),
-    HashRef(HashRef, Kind),
+    HashRef(HashRef, CType),
     Integer(i32),
     Number(f64),
     Boxed(u64),
+    /// A frozen table's element: boxed, its type, and its value if an integer. See Note [Frozen
+    /// tables].
+    Element(u64, CType, Option<i32>),
     /// See Note [Global caches].
     Cache(*const GlobalCache),
     /// The end of a call's arguments, and the type its native's window op
     /// assumes they have.
     WindowArgs(usize, CType),
+    /// An upvalue's cell, and whether it holds the upvalue's value. See Note [Upvalue cells].
+    Cell(usize, bool),
+    /// A table's string keys. See `jit.learn` in `library`.
+    Keys(Rc<[LConstant<'static, 'static>]>),
+    /// The slot holding the integer a value is the quotient of, and the constant. See Note
+    /// [Quotients].
+    Quotient(usize, i32),
+    /// See Note [Reaching values].
+    Reach(Reach),
+}
+
+// Note [Reaching values]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// A value the context knows of may have many names: the places of its eclass, and the fields of
+// other values that hold it. Code reads it by the most direct name the context knows. A slot is
+// best, of the frame or of one it is inlined into, since the window keeps slots in registers. A
+// native the value is known to be comes next, as a constant. Then comes the code's own upvalue,
+// from its cell where that holds it, else through the running closure. An inlined call's frame not
+// made has no running closure, so there it is read through the callee's closure in the slot below
+// the frame. Last is a field of another closure a slot holds.
+
+/// The most direct way code reads a value. See Note [Reaching values].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reach {
+    /// A slot holding it: of the frame, or, below its base, of a frame it is inlined into.
+    Slot(isize),
+    /// The native it is, boxed.
+    Native(u64),
+    /// The code's own upvalue `index`, from its cell. See Note [Upvalue cells].
+    Cell { index: usize, cell: usize },
+    /// Upvalue `index` of the closure slot `slot` holds.
+    Closure { slot: isize, index: usize },
+    /// The code's own upvalue `index`, through the running closure, stored into its cell if it
+    /// has one.
+    Upvalue { index: usize, cell: Option<usize> },
+    /// Nothing the context knows reaches it.
+    Unknown,
+}
+
+impl Reach {
+    /// What it reaches, in the frame `state` runs, if it is a slot or an upvalue.
+    fn value<'src, 'intern>(&self, owner: &Owner, state: &RunState<'src, 'intern>) -> Option<LBoxed<'src, 'intern>> {
+        let slot = |slot: isize| state.vals[state.base.wrapping_add(slot as usize)];
+        match *self {
+            Reach::Slot(at) => Some(slot(at)),
+            Reach::Cell { index, .. } | Reach::Upvalue { index, .. } => Some(state.upvalue(owner, index)),
+            Reach::Closure { slot: at, index } => {
+                let LValue::LClosure(clos) = slot(at).unbox() else { unreachable!("an upvalue of a closure not in its slot") };
+                Some(state.upvalue_of(owner, &clos, index))
+            }
+            Reach::Native(_) | Reach::Unknown => None,
+        }
+    }
 }
 
 // Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
@@ -438,7 +589,7 @@ pub enum ResumeArg {
 // witness; its cold path finds the key wherever it is (`href_init_slow`). Exit 0 if the table has
 // the key, where the field's type is guarded (`GuardWitness`), and 1 if not. See Notes [Hash
 // witnesses] and [Field types].
-windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
+windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let hidx = state.witness_base + href as usize;
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
@@ -468,7 +619,7 @@ windowed!(HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
 // `HrefInit` for a hash key of a userdata, in its `__index` table: exit 0 if that has the key,
 // populating the witness, and 1 if not, or if it has no `__index` table. See Note [Userdata
 // fields].
-windowed!(select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (userdata) {
+windowed!(writes select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (userdata) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let LValue::Userdata(u) = userdata.unbox() else { unreachable!() };
     match u.ro(owner).index_table(owner, &state.index_key) {
@@ -477,16 +628,84 @@ windowed!(select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (u
     }
 });
 
-// `HrefInit` for a hash key at a place down its register's `__index` chain (`place`, as
-// `Place::bits`): exit 0 if the table there has the key, populating the witness, and 1 if not,
-// or if there's no table there. See Note [Table metatables].
-windowed!(select HrefInitAt, [at: u64, key: u64, place: u16], [], |owner, state, base| () {
+/// The table at a place down an `__index` chain, from the witness of the hash key `link` before
+/// it: with `META`, the metatable of the table it witnesses (`Place::Metatable`), else the table
+/// it witnesses as its value (`Place::Index`). See Note [Table metatables].
+#[inline(always)]
+fn table_at<'src, 'intern, const META: bool>(owner: &Owner, state: &RunState<'src, 'intern>, link: u8) -> Option<Tc<Table<'src, 'intern>>> {
+    let witness = state.hash_witnesses[state.witness_base + link as usize];
+    if META {
+        // Its witness holds, so its table is alive.
+        let tab: Tc<Table<'src, 'intern>> = Tc(unsafe { crate::gc::Gc::from_addr(witness.table) });
+        tab.ro(owner).metatable.clone()
+    } else {
+        unsafe { *witness.value.cast::<LBoxed<'src, 'intern>>() }.as_table()
+    }
+}
+
+// `HrefInit` for a hash key at a place down its register's `__index` chain, the table found
+// from the hash key `link`'s witness as `table_at` says: its hot path, `HrefInit`'s, on that
+// table, and its cold path finding the key wherever it is. Exit 0 if the table has the key,
+// populating the witness, and 1 if not, or if there's no table there. See Note [Table
+// metatables].
+windowed!(writes HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |owner, state, base| () {
     let (href, index) = (at as u8, (at >> 8) as usize);
-    match state.place_table(owner, 0, Place::from_bits(place)) {
+    let hidx = state.witness_base + href as usize;
+    // No table there is a miss, which the cold path finds again.
+    let hit = table_at::<META>(owner, state, link).and_then(|tab| {
+        let address = tab.0.to_addr();
+        let tab = tab.rw(owner);
+        let epoch = tab.epoch;
+        match tab.hash.get_index_mut(index) {
+            Some((k, value)) if k.boxed().bits() == key => Some((epoch, value as *mut LBoxed<'_, '_>, address)),
+            _ => None,
+        }
+    });
+    match hit {
+        Some((epoch, value, address)) if hidx < state.hash_witnesses.len() => {
+            state.witness_top = state.witness_top.max(hidx + 1);
+            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: value.cast(), table: address };
+            false
+        },
+        _ => true,
+    }
+} cold {
+    let (href, index) = (at as u8, (at >> 8) as usize);
+    match table_at::<META>(owner, state, link) {
         Some(tab) => href_init_slow(owner, state, tab, href, index, key),
         None => 1,
     }
 });
+
+/// `HrefInit` for a key the table in R(`idx`) was found without, as an object lacks a method its
+/// class has: an exec, called from JIT code rather than copied into it, as a copy would be a whole
+/// probe of the table. It looks the key up by `hash`, the table's hash of it, worked out as the
+/// residual is made, and finding the table still lacks it, populates the witness with no value,
+/// for the `__index` chain after it. Exit 0 is missing the key, 1 having it. See Notes [Table
+/// metatables] and [Hash witnesses].
+fn href_init_miss(idx: usize, at: u64, key: u64, hash: u64) -> ResidualExec {
+    ResidualExec::new("href_init_miss", Rc::new(move |owner, state| {
+        use indexmap::map::RawEntryApiV1;
+        let (href, index) = (at as u8, (at >> 8) as usize);
+        let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
+        let address = tab.0.to_addr();
+        let lacks = {
+            let tab = tab.ro(owner);
+            tab.hash.raw_entry_v1().index_from_hash(hash, |k| k.boxed().bits() == key).is_none().then_some(tab.epoch)
+        };
+        state.select = match lacks {
+            Some(epoch) => {
+                let hidx = state.witness_base + href as usize;
+                state.hash_witnesses.grow(hidx + 1);
+                state.witness_top = state.witness_top.max(hidx + 1);
+                state.hash_witnesses[hidx] = HashWitness { epoch, index, value: core::ptr::null_mut(), table: address };
+                0
+            },
+            // It has the key after all: its witness, wherever the key is.
+            None => 1 - href_init_slow(owner, state, tab, href, index, key),
+        };
+    }))
+}
 
 /// `HrefInit`'s cold path: the key isn't at `index`, or the witness's place isn't there yet,
 /// which it makes. Exit 0 if `tab` has the key, populating the witness, and 1 if not.
@@ -573,7 +792,7 @@ pub(crate) use drain;
 //
 // A closure may read or write a slot it captured whenever it runs, which is during a call. For
 // that reason, the type of a slot any CLOSURE of a function captures (`captured_slots`) is
-// forgotten after each call that isn't a pure native's (Note [Library natives] in `library`), and
+// forgotten after each call that isn't a pure native's (Note [Library natives]), and
 // no context types a captured slot with what a call may have changed.
 //
 // GETUPVAL and SETUPVAL read and write an open cell's slot in memory, never the
@@ -607,6 +826,13 @@ fn native_window(ctx: &Context, a: usize, b: usize, c: usize) -> Option<(usize, 
     let CType::NativeFunction(nf) = &ctx.types[a] else { return None };
     native_op(ctx, nf, a, b, c)
 }
+
+/// The window op `CALL A B C` in `ctx` runs as, its arguments known to be of the types it assumes.
+/// See Note [Native windows].
+fn windowed_call(ctx: &Context, a: usize, b: usize, c: usize) -> Option<crate::vm::NativeOp> {
+    native_window(ctx, a, b, c).filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(&ctx.types[slot]))).map(|(_, op)| op)
+}
+
 
 /// `native_window`, for the native `nf` in R(A) however it is known.
 fn native_op(ctx: &Context, nf: &NClosure, a: usize, b: usize, c: usize) -> Option<(usize, crate::vm::NativeOp)> {
@@ -746,11 +972,11 @@ impl After {
 // leaves, the run loop takes them into the callstack (`finish_unwinding`), in order.
 //
 // Only a frame JIT code didn't call can be a vararg function's: its entry records its function's
-// slot (Note [Vararg frames] in `vm`). A call from JIT code that would make one, or reach the
+// slot (Note [Vararg frames]). A call from JIT code that would make one, or reach the
 // interpreter's call path, while frames JIT code called are running, goes to the interpreter
 // instead, which makes the callstack whole first. The frames JIT code called stay rooted for the
 // collector without entries: each one's closure is in its function's slot, in its caller's frame,
-// and while any runs, the collector marks the whole stack (Note [Stack frames] in `vm`). So is the
+// and while any runs, the collector marks the whole stack (Note [Stack frames]). So is the
 // closure of each frame that called one, which its call keeps on the native stack, but for the
 // run's outermost frame, which has no function's slot: the run's state keeps that one
 // (`RunState::entry`).
@@ -813,7 +1039,7 @@ impl Count {
 // callee: the JIT code's copy's own, which the JIT patches as it grows. Requires nilling the
 // callee's frame if `FILLS`, or else the JIT code does. The callee isn't vararg. See Notes [Frame
 // ops] and [Inlined calls].
-windowed!(frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(writes frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A: Count, B: Count], |owner, state, base| () {
     state.push_frame::<false>(owner, crate::vm::PackedLocation::from_bits(0), A.lift(a), B.lift(b), frame as usize, FILLS);
     debug_assert!(unsafe { (*state.clos.ro(owner).prototype).is_vararg } == 0, "PushFrame of a vararg function's frame");
 });
@@ -821,11 +1047,11 @@ windowed!(frame PushFrame, [a: u16, b: u16, frame: u64], [FILLS: bool, A: Count,
 // `tail_call` for a tail call of R(A). `ab` is its `a | b << 16` (as `Count::hold` holds them);
 // `effects` and `callee` the addresses of the running function's effects and the callee's, which
 // the first is joined into (Note [Tail calls]). Closing upvalues if `CLOSES`, from a vararg
-// function if `VARARG`. See Note [Frame ops].
-windowed!(frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+// function if `VARARG`, to one if `CALLEE_VARARG`. See Note [Frame ops].
+windowed!(writes frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, VARARG: bool, CALLEE_VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     let (a, b) = (A.lift(ab as u16), B.lift((ab >> 16) as u16));
     unsafe { *(callee as *mut u16) |= *(effects as *const u16) };
-    state.tail_call(owner, a, b, CLOSES, VARARG);
+    state.tail_call(owner, a, b, CLOSES, VARARG, Some(CALLEE_VARARG));
 });
 
 // A `Ret` of R(A) and B (`a` and `b` as `Count::hold` holds them), returning `returns`, the id of
@@ -833,7 +1059,7 @@ windowed!(frame TailFrame, [ab: u64, effects: u64, callee: u64], [CLOSES: bool, 
 // `effects` (Note [Call effects]); `at` (a `PackedLocation`) is where it is. Closing upvalues if
 // `CLOSES`, returning from a vararg function if `VARARG`. A return from a frame JIT code called
 // is the op; one from a frame with an entry, or the outermost, its cold path. See Note [Frame ops].
-windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(writes frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64], [CLOSES: bool, VARARG: bool, A: Count, B: Count], |owner, state, base| () {
     state.returned_at = at;
     if state.jit_depth > 0 {
         let _ = state.leave::<false>(owner, A.lift(a), B.lift(b), CLOSES, VARARG);
@@ -867,13 +1093,13 @@ windowed!(frame PopFrame, [a: u16, b: u16, returns: u32, effects: u64, at: u64],
 // (`a` and `b` as `Count::hold` holds them), of a callee whose `max_stack` is `stack`, keeping the
 // window: the JIT code nils the callee's frame. See Notes [Inlined calls] and [Count case
 // analysis].
-windowed!(ShiftFrame, [a: u64, b: u64, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
+windowed!(writes ShiftFrame, [a: u64, b: u64, stack: u8], [A: Count, B: Count], |owner, state, base| (callee) {
     state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, false, 0);
 });
 
 // `ShiftFrame` as a frame op, nilling the callee's frame past its arguments, as many as there are
 // or up to the top. See Notes [Inlined calls] and [Count case analysis].
-windowed!(frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| () {
+windowed!(writes frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Count], |owner, state, base| () {
     let callee = state.vals[state.base + A.lift(a)];
     state.shift_frame::<false>(owner, callee, A.lift(a), B.lift(b), stack, true, 0);
 });
@@ -881,19 +1107,26 @@ windowed!(frame ShiftFrameFilled, [a: u16, b: u16, stack: u8], [A: Count, B: Cou
 // `unshift_frame` without the callstack's entry, for an inlined callee's RETURN A B (`a` and `b`
 // as `Count::hold` holds them), closing its frame's open upvalues if `CLOSES`, moving its results
 // if `MOVES`. See Notes [Inlined calls] and [Count case analysis].
-windowed!(frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, MOVES: bool, A: Count, B: Count], |owner, state, base| () {
+windowed!(writes frame UnshiftFrame, [a: u16, b: u16], [CLOSES: bool, MOVES: bool, A: Count, B: Count], |owner, state, base| () {
     state.unshift_frame::<false>(owner, MOVES.then(|| (A.lift(a), B.lift(b))), CLOSES);
 });
 
 // Whether a table's array part has kind `kind`, testing an element loaded from it in place of
 // the element's own tag. See Note [Array kinds].
-windowed!(guard KindIs, [kind: LType], [], |owner, state, base| (table) {
+windowed!(reads guard KindIs, [kind: LType], [], |owner, state, base| (table) {
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     tab.ro(owner).kind == kind.bit()
 });
 // The same of the table in the running closure's upvalue `index`.
-windowed!(guard UpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| () {
+windowed!(upvalues guard UpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| () {
     let LValue::Table(tab) = state.upvalue(owner, index).unbox() else { unreachable!() };
+    tab.ro(owner).kind == kind.bit()
+});
+// The same of the table in upvalue `index` of the closure in its operand. See Note [Reaching
+// values].
+windowed!(cells guard CalledUpvalKindIs, [index: usize, kind: LType], [], |owner, state, base| (closure) {
+    let LValue::LClosure(clos) = closure.unbox() else { unreachable!("a closure") };
+    let LValue::Table(tab) = state.upvalue_of(owner, &clos, index).unbox() else { unreachable!() };
     tab.ro(owner).kind == kind.bit()
 });
 
@@ -931,21 +1164,18 @@ windowed!(frame Arrive, [ac: u64], [A: Count, C: Count], |owner, state, base| ()
 pub type Pc = usize;
 /// Where in an instruction a generator is: see Note [Subblocks].
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
-pub struct SubPc(usize, usize);
+pub struct SubPc(usize, u128);
 
 impl SubPc {
     pub fn new(pc: Pc) -> Self {
         SubPc(pc, 1)
     }
-    fn next_pc(&self) -> Self {
-        Self::new(self.0 + 1)
-    }
     fn next_true(&self) -> Self {
-        assert!(self.1 < (1<<32));
+        assert!(self.1 < (1 << 126));
         Self(self.0, (self.1 << 1) | 1)
     }
     fn next_false(&self) -> Self {
-        assert!(self.1 < (1<<32));
+        assert!(self.1 < (1 << 126));
         Self(self.0, self.1 << 1)
     }
 }
@@ -969,6 +1199,8 @@ pub enum Residual {
     Exec(ResidualExec),
     /// A copy&patch window op (see `crate::window`) to execute.
     ExecWindow(Rc<dyn Window>),
+    /// An op on the window whose code the JIT emits itself. See Note [Emitted ops].
+    Emit(Rc<dyn crate::emitted::Emitted>),
     /// A guard whose test is a window op: it selects 1 if passed, or 0 if failed. See Note
     /// [Dynamic guards].
     GuardDynamic(Rc<dyn Window>),
@@ -979,7 +1211,13 @@ pub enum Residual {
     /// [Optimistic ops].
     Branch { hot: BlockId, cold: BlockId },
     Jump(BlockId),
+    /// A jump whose JIT code can be unlinked again, to exit to the interpreter here: a forced
+    /// watch site, which a trip unpublishes. See Note [Watched tables].
+    PatchableJump(BlockId),
     Thunk(ThunkRef),
+    /// A store into STACK[idx]'s table, or with none the environment's, which is watched, trips its
+    /// watchpoint: the run loop handles it, then goes on after it. See Note [Watched tables].
+    Tripped(Option<usize>),
     /// A RETURN of `b - 1` values from R(A), or up to the top. Closes the frame's open upvalues.
     /// Functions which statically know they have no open upvalues may set `close = false` as an
     /// optimization. Then, whether the function is vararg (Note [Vararg frames]), the id of what
@@ -1017,13 +1255,22 @@ pub enum Residual {
     /// continuations].
     Arrived { a: u16, c: u16, returned: u16 },
     LuaGuard { idx: usize, ptr: *const () },
-    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`, whose
+    /// The frame of an inlined call of R(A) with B, of a callee whose `max_stack` is `stack`: the
+    /// callee's upvalue cells its entry knows hold their values (Note [Upvalue cells]), and whose
     /// returns continue compiling `continuation`. See Note [Inlined calls].
-    Inline { a: u16, b: u16, stack: u8, continuation: *const Continuation },
+    Inline { a: u16, b: u16, stack: u8, cells: u32, continuation: *const Continuation },
+    /// A sealed inlined call of R(A)'s frame, made, made the frame of a call of its callee's
+    /// version `entry`, which returns to the residual after it. See Note [Sealed inlined calls].
+    Uninline { entry: BlockId, a: u16 },
     /// An inlined callee's RETURN A B, which closes its frame's open upvalues if `closes`: its
     /// results to the call's R(A), `call`, if `moves`, and the caller's frame back. See Note
     /// [Inlined calls].
     InlineReturn { a: u16, b: u16, closes: bool, call: u16, moves: bool },
+    /// The base moved on `by` slots to an inlined call's frame, which isn't made: its code naming
+    /// only slots runs there. See Note [Inlined frames].
+    Enter(u16),
+    /// The base moved back `by` slots from the frame `Enter` moved it to.
+    Leave(u16),
     GC,
 }
 
@@ -1072,7 +1319,17 @@ pub enum CallEntry {
 // run, continues compiling the caller's code after the call from that context, with the results'
 // types, less what the callee's code may have falsified (its effects, applied as a continuation
 // applies a callee's; Note [Call effects]), with no guard on the return between, and becomes the
-// return and a jump to that code.
+// return and a jump to that code; but where the callee's frame isn't made, none of its code
+// observing it, the caller's code is compiled on from the return itself, the base moved back if
+// it was and the results moved (Note [Inlined frames]). What the callee learns of a value it was
+// passed, as a table's array kind, the caller's places holding it know on the return: the value
+// of each argument is a place of the callee's code (`Root::Arg`) that none of it writes.
+//
+// A caller's slot that one of the callee's upvalues holds is a place of the callee's code too
+// (`Root::Outer`), named by how far below the callee's frame it is. So is the slot just below the
+// frame, which holds the callee's closure while it runs. Reading the upvalue is then a
+// move from that slot. A cell may be open onto any such slot, so a set of an upvalue writes them
+// all.
 //
 // The call making a generic for's iterator (`for k, v in f(t) do`) inlines from its first layout,
 // before it has run: the loop is compiled from what the code after it knows, and a function whose
@@ -1104,6 +1361,14 @@ pub enum CallEntry {
 // Entered from the interpreter inside inlined calls, JIT code takes their entries onto the native
 // stack first (`RunState::adopt_inlined`).
 //
+// The callee's hash keys are the caller's (Note [Hash witnesses]): its frame has its
+// caller's witnesses, and its entry context the caller's hash keys at their indexes, an argument's
+// its parameter's, with its shape, and every other's the caller's own, which the callee's code
+// keeps, naming no slot of it (`OUTER`). So the callee's code finds a field of a table it was
+// passed as its caller's code would, and does to the caller's hash keys what its caller's code
+// would. Each of its returns gives the caller the hash keys it leaves: the caller's own it kept,
+// and the rest free.
+//
 // The callee's code is its versions for the inlined call, which their contexts carry
 // (`InlineFrame`), apart from its versions for its calls and for other inlined calls. Calls in
 // inlined code inline in turn, to `MAX_INLINE_DEPTH` deep. A callee with a tail call or VARARG
@@ -1117,16 +1382,181 @@ pub enum CallEntry {
 // residuals that do work, less a credit for each guard the caller's facts can stand for once the
 // callee runs in the caller's context: a guard of a value loaded from an upvalue (Note [Upvalue
 // paths]), and a hash key's guard. A call inlines if what is left is within `MAX_INLINE_COST`.
+// The credit is at most `MAX_INLINE_COST` itself: a method's guards of the receiver its caller
+// already guarded grow with its code, so the credit doesn't bound what inlines, and a large
+// method copied into every call site costs more to compile than it saves.
+
+// Note [Inlined frames]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// An inlined call's frame is made in two halves. The base is moved to it as the call is inlined
+// (`Enter`), nilling it past the arguments. The rest, its callstack entry and running closure
+// (`Inline`), is made only before code observing them: an upvalue's access through the closure, a
+// call not inlined, or an exit to the interpreter. A safepoint observes nothing: every value is on
+// the stack, the callee's closure in its caller's frame. A native's call that runs as a
+// window op is no call. A frame passed a variable number of arguments is made whole at once. A Lua
+// call's thunk, which doesn't know until it runs whether it inlines its callee, makes the frames
+// only if it calls. A callee whose code observes nothing returns with only its base moved back
+// (`Leave`). How much of each frame is made is known to the context, so versions differ by it, and
+// is what the code of a
+// block's function runs in, whatever closure is running: an upvalue of a callee whose frame isn't
+// made is loaded through its closure, in its caller's slot below the frame (`CalledUpval`). An upvalue's value
+// a slot also holds is that slot's, so code naming the slot observes nothing.
+
+// Note [Sealed inlined calls]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// An inlined call is sealed once a run of it reaches a return: the thunk laying out its return is
+// forced. Its callee's inlined code is then the blocks that run reached. Sealing assumes later runs
+// follow them closely, and bounds the inlined code to them. A return compiled into the caller's
+// code has no thunk, so a call returning only that way is never sealed.
+//
+// Under a sealed call, an existing inlined version that accepts a context is reused, but no new
+// one is made. A thunk that runs finishes its instruction inline, since its generator is part way
+// through it. At the next pc the code calls its callee's own version there instead, specialized
+// as any version is. The frame is laid out already, so the call keeps it: a frame only entered is
+// called as any Lua call passing it whole, and one made is changed in place into a call's. The
+// callee's context there is what its own code can name, as an entry or a return maps it, with a
+// witness region of its own.
+//
+// The call returns into the code after the call, specialized as after any call. Code that knows
+// its top stays inline, since a call's frame resets it. `LUNACY_NO_SEAL` turns sealing off, to
+// compare.
+
+/// A field's or a global's name, hashed: what a store with a key of that name may change. See
+/// Note [Field facts].
+fn name_hash(name: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+// Note [Watched tables]
+// ~~~~~~~~~~~~~~~~~~~~~~
+// Code can know a table is watched, and its contents, as a constant element: every store
+// into a table first checks whether it is (`Trip`), and one that is trips its watchpoint before it
+// stores, so nothing runs past the store relying on what it changes. The knowledge enters the code
+// only past a watch site, a thunk whose jump leads to the code knowing it, and is lost across code
+// the specializer doesn't see (`Effect::Opaque`), as a native's store trips no frame's; a trip unpublishes each
+// of the table's sites, the jump undone back into its thunk, which, forced again, compiles the code
+// after it knowing nothing of the table. The store goes on knowing nothing through a watch, and so
+// does each frame paused at a call: a trip leaves JIT code, which writes every frame's callstack
+// entry, and each entry whose code after the call knows something through one is redirected to a fresh
+// continuation compiled without it, which, for a context that knew none, is the code it had.
+// Values already loaded from the table are what they were: facts follow values, so only what is
+// known of the table's contents goes. A trip is an effect, and what was learned through a watch is
+// whatever doesn't survive it: a domain learned that way says so, as any domain does of the
+// effects it survives (Note [Fragile information]).
+//
+// A store's check passed, or the table just made, the code after it knows the table unwatched, and
+// checks it no more until a watch may have made it watched. A watch is an effect too, which no table's being unwatched
+// survives, so a callee's reaches its caller as its other effects do (Note [Call effects]).
+
+// Note [Frozen tables]
+// ~~~~~~~~~~~~~~~~~~~~~
+// A table can be frozen (`jit.frozen`): watched, and code past its watch site knows which table it
+// is. A load from it at a key the context knows reads the element as it compiles, and goes on with
+// the value in its register, known: its type, constant, and boxed value. What the load knows of its
+// register stays true after a trip, as facts follow values; that the table still holds it is known
+// only through the watch, so code relying on it is unpublished by a trip as the watch's is. The
+// table is kept alive until it trips, and a load reads it only until then; nothing reads a value
+// back from what is known of it.
+
+/// Where a Lua call's returns go on, and how the code after it is compiled: as
+/// `make_continuation_thunk` takes it. See Note [Watched tables].
+#[derive(Clone)]
+struct ContinuationSite {
+    ctx: Rc<Context>,
+    captured: Rc<[usize]>,
+    rest: Rest,
+    a: usize,
+    c: usize,
+    after: After,
+}
+
+/// A watch site of a table: the thunk at `at`, whose jump leads to code knowing its contents,
+/// and the thunk to put back there, which compiles it knowing none. See Note [Watched tables].
+struct WatchSite {
+    at: Location,
+    unwatched: ThunkRef,
+}
+
+// Whether a table, or the environment, is watched: its cold path trips its watchpoint. See Note
+// [Watched tables].
+windowed!(reads TripCheck, [], [], |owner, state, base| (table) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!() };
+    if tab.ro(owner).watched {
+        core::intrinsics::cold_path();
+        true
+    } else {
+        false
+    }
+} cold {
+    1
+});
+windowed!(reads TripCheckGlobal, [], [], |owner, state, base| () {
+    if state._G.ro(owner).watched {
+        core::intrinsics::cold_path();
+        true
+    } else {
+        false
+    }
+} cold {
+    1
+});
 
 /// An inlined call, for its callee's code: where its call is in its caller's code, the caller's
-/// prototype, the call's A, and what the callee's code may have done to the caller so far. See
-/// Note [Inlined calls].
+/// prototype, the call's A, what the callee's code may have done to the caller so far, and for
+/// each parameter passed a table the caller holds below the call, the caller's slot holding it.
+/// See Note [Inlined calls].
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct InlineFrame {
     pub call: Location,
     pub proto: LProto<'static, 'static>,
     pub a: u16,
     pub effects: Effects,
+    pub passed: SmallVec<[(u16, u16); 2]>,
+    /// How much of the frame code past here has made. See Note [Inlined frames].
+    pub made: Made,
+    /// The call's B, the callee's parameters and frame size, its cells, and its returns'
+    /// continuation: what makes the frame.
+    pub b: u16,
+    pub params: u8,
+    pub stack: u8,
+    pub cells: u32,
+    pub continuation: *const Continuation,
+}
+
+/// How much of an inlined call's frame is made: the base moved to it (`Enter`), or all of it, its
+/// callstack entry and closure too (`Inline`). See Note [Inlined frames].
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum Made {
+    Base,
+    Yes,
+}
+
+impl InlineFrame {
+    /// Its call's location, which names the inlined call in traces.
+    #[cfg(feature = "tracing")]
+    fn site(&self) -> String {
+        format!("b{}@{}", self.call.0.0, self.call.1)
+    }
+
+    /// The residual making the rest of the frame, its base moved to it already.
+    fn push(&self) -> Residual {
+        Residual::Inline { a: self.a, b: self.stack as u16 + 1, stack: self.stack, cells: self.cells, continuation: self.continuation }
+    }
+
+    /// The slots `Enter` moves the base on by to it.
+    fn by(&self) -> usize {
+        self.a as usize + 1
+    }
+
+    /// The caller's slot holding the table parameter `param` was passed, if it still holds it in
+    /// `ctx`: a write to it forgets the shape it entered with.
+    fn owner(&self, ctx: &Context, param: usize) -> Option<usize> {
+        let (_, owner) = self.passed.iter().find(|&&(p, _)| p as usize == param)?;
+        matches!(ctx.slot(param), CType::Shape(..)).then_some(*owner as usize)
+    }
 }
 
 /// The code after an inlined call, which its callee's returns continue compiling: the caller's
@@ -1134,6 +1564,7 @@ pub struct InlineFrame {
 /// a root of the caller's still holding the callee's closure (Note [Upvalue paths]), and how the
 /// code after the call is compiled. Kept for as long as the specializer is, in the inlined call's entry in the
 /// callstack by its address. See Note [Inlined calls].
+#[derive(Clone)]
 pub struct Continuation {
     proto: LProto<'static, 'static>,
     caller: Context,
@@ -1141,7 +1572,12 @@ pub struct Continuation {
     a: u16,
     c: u16,
     closure: Option<Root>,
+    /// The places below the call holding each argument's value, by the argument.
+    args: Vec<(u8, Root)>,
     rest: Rest,
+    after: After,
+    /// Whether the call is sealed, shared by its copies. See Note [Sealed inlined calls].
+    sealed: Rc<Cell<bool>>,
 }
 
 /// How the code after a call is compiled, from the context its return gives: the next pc's
@@ -1172,7 +1608,8 @@ impl Rest {
 }
 
 /// A Lua call laid out, which its continuation may inline: the block and offset of its `LuaCall`,
-/// its point, the callee's prototype, the context at the call and its B. See Note [Inlined calls].
+/// its point, the callee's prototype, and the context at the call and its B. See Note [Inlined
+/// calls].
 struct InlineCall {
     block: BlockId,
     off: usize,
@@ -1191,11 +1628,29 @@ const MAX_INLINE_COST: usize = 48;
 /// The credit for each guard of an inlined callee's code the caller's facts can stand for. See Note
 /// [Inlined calls].
 const REUSED_GUARD_CREDIT: usize = 4;
+/// The upvalues of each frame, from the first, that have a cell. See Note [Upvalue cells].
+pub const UPVALUE_CELLS: usize = 8;
+/// The upvalue cells of a JIT code's activation: its own frame's and each inlined call's.
+pub const CELLS: usize = UPVALUE_CELLS * (MAX_INLINE_DEPTH as usize + 1);
+const _: () = assert!(CELLS <= u32::BITS as usize);
 
 /// Whether calls inline: unless `LUNACY_NO_INLINE` is set, to compare. See Note [Inlined calls].
 fn inlining() -> bool {
     static INLINES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUNACY_NO_INLINE").is_none());
     *INLINES
+}
+
+/// Whether `ctx` is the code of a sealed inlined call, which leaves for its callee's own version
+/// at its next pc: unless `LUNACY_NO_SEAL` is set, to compare. See Note [Sealed inlined calls].
+fn sealed(ctx: &Context) -> bool {
+    static SEALS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUNACY_NO_SEAL").is_none());
+    *SEALS && ctx.inline.last().is_some_and(|frame| {
+        // SAFETY: an inlined call's continuation lives as long as the code.
+        !frame.continuation.is_null() && ctx.top.is_none() && {
+            let continuation = unsafe { &*frame.continuation };
+            continuation.sealed.get() && matches!(continuation.after, After::Version(..))
+        }
+    })
 }
 
 /// How many slots past the base of the outermost frame inlining it the frame of code of `ctx` is.
@@ -1215,6 +1670,20 @@ fn makes_iterator<C>(proto: &crate::chunk::FunctionBlock<'_, C>, pc: Pc, a: usiz
     let Some(jmp) = instructions.get(pc + 1).filter(|inst| inst.0.Opcode() == Opcode::JMP) else { return false };
     let target = ((pc + 2) as isize + crate::vm::sBx::unpack(jmp.0) as isize) as usize;
     instructions.get(target).is_some_and(|inst| inst.0.Opcode() == Opcode::TFORLOOP && crate::vm::ABC::unpack(inst.0).0 as usize == a)
+}
+
+/// For a Lua callee's continuation, which applies only what the callee's effects falsify: the
+/// context `ctx` before the call of R(A), but for the callee's frame, from `a` on, and the slots
+/// below it closures capture of `captured`. See Note [Call effects].
+fn before_call(owner: &mut Owner, ctx: &Context, captured: &[usize], a: usize) -> (Rc<Context>, Rc<[usize]>) {
+    let mut before = ctx.clone();
+    for idx in a..before.types.len() {
+        before.effect(Effect::Write(idx));
+    }
+    let frame = (a..before.types.len()).map(|idx| (idx, CType::Unknown)).collect();
+    before.set_types(owner, frame);
+    let captured: Rc<[usize]> = captured.iter().copied().filter(|&slot| slot < a).collect();
+    (Rc::new(before), captured)
 }
 
 /// Whether a call of R(A) in `caller`, of the context `calling`, can inline `callee`, whatever its
@@ -1237,7 +1706,7 @@ struct InlineCost {
 
 impl InlineCost {
     fn inlines(self) -> bool {
-        self.cost <= MAX_INLINE_COST + REUSED_GUARD_CREDIT * self.reused
+        self.cost <= MAX_INLINE_COST + (REUSED_GUARD_CREDIT * self.reused).min(MAX_INLINE_COST)
     }
 }
 
@@ -1247,14 +1716,59 @@ impl InlineCost {
 /// call `frame`. See Notes [Inlined calls] and [Upvalue paths].
 fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>, a: usize, b: usize, frame: InlineFrame) -> Context {
     let mut entry = entry_context(caller, proto, a, b);
+    let args = a + 1..a + 1 + (proto.param_count as usize).min(entry.types.len());
+    let shifted = |slot: usize| args.contains(&slot).then(|| slot - a - 1);
+    // The caller's hash keys, at their indexes, in the caller's witnesses: a parameter's are its
+    // argument's, with its shape, and any other's are the caller's own, which no slot of the
+    // callee names. See Note [Inlined calls].
+    let slots = entry.types.len();
+    entry.hkeys = caller.hkeys.iter().map(|hkey| {
+        let mut hkey = hkey.clone();
+        hkey.hazards = (0..slots).map(|slot| args.contains(&(a + 1 + slot)) && hkey.checked(a + 1 + slot)).collect();
+        if !hkey.orphan() {
+            hkey.idx = shifted(hkey.idx).unwrap_or(OUTER);
+        }
+        hkey
+    }).collect();
+    for slot in args.clone() {
+        if let CType::Shape(of, hrefs) = caller.slot(slot) && entry.types[slot - a - 1] == CType::Type(of) {
+            entry.types[slot - a - 1] = CType::Shape(of, hrefs);
+        }
+    }
     let params = 0..(proto.param_count as usize).min(entry.types.len());
     let fields: Vec<[Label; 1]> = (0..proto.upval_count).map(|n| [Label::Upvalue(n)]).collect();
+    let closed = caller.closing(0);
+    // The caller's slots its upvalues hold, and its own callers'. See Note [Inlined calls].
+    let mut outer: Vec<(u16, Root)> = fields.iter()
+        .flat_map(|path| closed.members(Loc { root: Root::Slot(a as u16), path }))
+        .filter_map(|root| match root {
+            Root::Slot(slot) if slot as usize <= a => Some((a as u16 + 1 - slot, root)),
+            Root::Outer(below) => Some((below + a as u16 + 1, root)),
+            _ => None,
+        })
+        .chain([(1, Root::Slot(a as u16))])
+        .collect();
+    outer.sort();
+    outer.dedup();
     let map: Vec<(Root, Loc)> = params
         .filter(|&param| entry.types[param] != CType::Type(LType::Nil))
         .map(|param| (Root::Slot(param as u16), Loc::root(Root::Slot((a + 1 + param) as u16))))
         .chain(fields.iter().enumerate().map(|(n, path)| (Root::Upvalue(n as u8), Loc { root: Root::Slot(a as u16), path })))
+        // A callee's globals are its caller's. See Note [Field facts].
+        .chain(caller.values.roots().filter(|root| matches!(root, Root::Global(_))).map(|root| (root, Loc::root(root))))
+        // What it learns of the values it was passed, its return gives its caller. See Note [Inlined
+        // calls].
+        .chain(args.clone().map(|arg| (Root::Arg((arg - a - 1) as u8), Loc::root(Root::Slot(arg as u16)))))
+        .chain(outer.iter().map(|&(below, root)| (Root::Outer(below), Loc::root(root))))
         .collect();
-    entry.values = caller.closing(0).view(&map);
+    entry.values = closed.view(&map);
+    // Its upvalues are its closure's.
+    for (n, path) in fields.iter().enumerate() {
+        let field = Loc { root: Root::Outer(1), path };
+        if !entry.values.same(field, Loc::root(Root::Upvalue(n as u8))) {
+            entry.values.link(Loc::root(Root::Outer(1)), path[0], Loc::root(Root::Upvalue(n as u8)));
+        }
+    }
     entry.inline = caller.inline.iter().cloned().chain([frame]).collect();
     entry
 }
@@ -1288,16 +1802,8 @@ pub enum CType {
     /// A table, or a userdata (Note [Userdata fields]), with these hash keys.
     Shape(LType, SmallVec<[HashRef; 4]>),
     NativeFunction(NClosure),
-    LuaFunction(Tc<LClosure<'static, 'static>>),
-}
-
-impl Mark for CType {
-    fn mark(&self, owner: &Owner) {
-        match self {
-            CType::LuaFunction(c) => c.mark(owner),
-            _ => { },
-        }
-    }
+    /// A Lua function of this prototype: what its guards test, so not a GC reference.
+    LuaFunction(LProto<'static, 'static>),
 }
 
 impl CType {
@@ -1309,6 +1815,9 @@ impl CType {
             (a, b) if a == b => true,
             (CType::Unknown, _) => true,
             (CType::Number, CType::Type(LType::Integer | LType::Double)) => true,
+            // A shape is above one with more hash keys: code knowing fewer of a table's keys is
+            // correct where more are known, the context's hash keys accepting index by index.
+            (CType::Shape(a, mine), CType::Shape(b, theirs)) => a == b && mine.iter().all(|href| theirs.contains(href)),
             // A shape or a function's identity is below its table or closure.
             (CType::Type(a), b) => b.as_ltype() == Some(*a),
             _ => false,
@@ -1362,7 +1871,7 @@ impl std::fmt::Display for CType {
             CType::Number => write!(f, "number"),
             CType::Shape(of, shape) => write!(f, "{}shape({})", if *of == LType::Table { "" } else { "userdata " }, shape.iter().map(|hr| hr.0.to_string()).intersperse(",".to_string()).collect::<String>()),
             CType::NativeFunction(func) => write!(f, "native_fn({:?})", func),
-            CType::LuaFunction(lclos) => write!(f, "fn({:?})", lclos.as_ptr()),
+            CType::LuaFunction(proto) => write!(f, "fn({:?})", proto),
         }
     }
 }
@@ -1411,7 +1920,7 @@ impl std::fmt::Display for CType {
 /// `found`. Each step down the lattice translates into one SubPc step, so that continuing the
 /// generator at different `found` but to the same `expected` reach the same state and so can be
 /// potentially deduplicated. See Note [Subblock].
-fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
+pub(crate) fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
     match expected {
         // `Integer` is two levels, a `Number`, then the encoding; every `CType::Type` one. See Note [Integers].
         CType::Type(LType::Integer) if !CType::Number.accepts(found) => (pc.next_false(), ResumeArg::Failed),
@@ -1426,8 +1935,9 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 // ~~~~~~~~~~~~~~~~~~~~
 // Each GETGLOBAL and SETGLOBAL has a cache (`GlobalCache`) of where its global's
 // value is in the global environment, so an access is a compare and a load, not
-// a hash lookup. Nothing about globals goes in the context: which globals a path
-// happens to touch would otherwise split versions at every merge.
+// a hash lookup. Where a global's value is goes in no context; what a guard found
+// of its value does, as a fact about the global (Note [Field facts]), which a
+// join keeps only where both paths have it.
 //
 // A cache holds the entry's address and `env_moves()` when it found it. The
 // entry stays at that address until the environment's entries move, which only
@@ -1469,14 +1979,35 @@ fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, ResumeArg) {
 // type again; if that fails it falls back to a fresh href, which guards the type
 // again and can rejoin the blocks already compiled for it.
 //
-// Joining contexts that know different types of a field (an integer on one way
-// in, a double on another) keeps its hash key, of no stable type (`Mixed`): a
-// load through it guards the loaded slot instead (`FieldType`), and the type
-// found becomes the hash key's again. A hash key's type is `None` only while its
+// Joining contexts that know different types of a field keeps its hash key, of
+// their join: an integer on one way in and a double on another make it a
+// `Number`, whose load gives its slot that type and leaves its encoding to the
+// uses that test it; any other two make it `Unknown`, of no stable type, and a
+// load through it guards the loaded slot instead (`FieldType`), the type found
+// becoming the hash key's again. A hash key's type is `None` only while its
 // index is free.
 //
-// A field's type is only ever a representation: a shape or a function's identity
-// describes a register, not a field.
+// A field's type is a representation, `Number` or `Unknown`, never a shape or a
+// function's identity: those describe a register, not a field.
+//
+// A guard finding a field an integer is an origin of the integer type (Note
+// [Contraction]), which the hash key carries, through joins of contexts agreeing on
+// it and an inlined callee's return. A store making the field a double contracts the
+// origins: the versions knowing the field an integer are forgotten, and each guard is
+// rebuilt as one finding the field's type again. A table holding an integer only
+// until its first store, as a loop's first pass over tables built from whole
+// constants, so leaves the loop's versions to doubles, not joined with integer ones
+// into `Number` where its points run out of versions. A guard is rebuilt once: one
+// finding an integer again makes no origin, as a field genuinely of both stays so.
+//
+// A field's hash key on a slot has the same index on every path through the
+// function's code whose witnesses it uses, and an inlined callee's on a table it
+// was passed its caller's slot's: the index the first hash key for that field and
+// slot was given. So paths learning the same fields in another order, as code
+// runs before and after its calls are inlined, reach the same contexts, and a
+// context knowing some of them reaches the versions compiled knowing fewer (Note
+// [Version compatibility]). A path finding something else at that index gives the
+// field a free one instead.
 
 // Note [Table metatables]
 // ~~~~~~~~~~~~~~~~~~~~~~~
@@ -1560,7 +2091,7 @@ fn forgets(ctx: &Context, live: usize) -> bool {
 // type, and what the target does with it (return it, pass it) needs it; a CLOSURE's jump past its
 // pseudo-instructions leaves its closure in a temporary until it is returned or stored. Such a
 // jump keeps what it knows of the register its instruction wrote: its type, and its value's class
-// (Note [Value classes] in `classes`), so both ways in agree.
+// (Note [Value classes]), so both ways in agree.
 
 /// Forget, for a jump to a target where the registers from `live` on hold no
 /// local, those registers' types and the fragile facts about them, but `kept`'s.
@@ -1575,7 +2106,7 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // Note [Dynamic guards]
 // ~~~~~~~~~~~~~~~~~~~~~~
 // A `GuardDynamic` residual's test is a window op that reads its operands and selects its exit, 1
-// to pass and 0 to fail (Note [Window exits] in `window`), and is otherwise pure. Its two edges continue the generator at
+// to pass and 0 to fail (Note [Window exits]), and is otherwise pure. Its two edges continue the generator at
 // different `SubPc`s, resumed with `Matched` or `Failed`, so their versions are told apart by the
 // outcome and needn't differ in context: a test can speculate on what no ctype names, like whether
 // a key is in a table's array part (`InArray`), for the instruction's next op alone. Nothing
@@ -1600,7 +2131,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // block for nothing. A slot typed `Integer` is one already, at the same `SubPc` as the narrowed hot
 // way, so the code after both is one version: in a loop, the first iteration narrows its counter,
 // and the rest compute on an integer. A whole constant is loaded as an integer already (Note
-// [Widening]): narrowing a slot holding one uses its fact, and nothing more.
+// [Widening]): narrowing a slot holding one uses its fact, and nothing more. A slot stored into an
+// array part the context knows holds integers is narrowed as a loop's counter is, by its value at
+// runtime: a whole double computed elsewhere keeps the array of the integer kind.
 
 // Note [Widening]
 // ~~~~~~~~~~~~~~~
@@ -1622,12 +2155,19 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // key) relies on the fact and consumes it: the slot's type then says what the fact would, and a
 // rebuild to a double, which would undo what the use relies on, is refused. A guard finding out
 // the slot's type at runtime consumes it too, deciding how the slot is used instead (one the
-// context answers decides nothing). Where the fact is never used, the code it was carried through
+// context answers decides nothing). A constant no load made, as a promote's guarded value, has no
+// load to rebuild, and isn't consumed. Where the fact is never used, the code it was carried through
 // is contracted. A whole constant passed to a function, stored into a table or an upvalue, or
 // passed to a native is the integer it was loaded as: a callee's versions, and a table's other
 // values, are out of the load's rebuild's reach. One a field store takes as its operand is stored
-// as an integer where the field is known to hold integers, so the field keeps its type, and as
-// a double anywhere else, where it may be a double the program writes as a whole number.
+// as an integer too, but where the field is known to hold doubles, or both encodings (`Number`):
+// there as a double.
+//
+// A field holding integers in some tables and doubles in others is a `Number` where both reach
+// the same code, and a number stored into it there goes in as a double, the field then known to
+// hold doubles: so a loop over such tables holds integers in them only on its way in, and goes
+// round on doubles, in the versions every table of doubles reaches. A field only ever written
+// whole stays an integer. See Note [Field types].
 
 // Note [Contraction]
 // ~~~~~~~~~~~~~~~~~~
@@ -1645,9 +2185,12 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 //
 // When a version is about to be compiled for a context, and a version at the same point differs
 // from it only in having more facts, all with origins and none used, the duplicate need not
-// exist: those origins are queued for contraction. So too if the context's own facts the version
-// lacks each say otherwise about something one of those facts is about, as a slot holding one
-// constant on one path and another on the other: neither is worth keeping where they meet, and
+// exist: those origins are queued for contraction. So too the other way, whichever path comes
+// first: where the context differs from a version only in having more facts, all with origins
+// and none used, the context drops them, reaching the version, and their origins are queued. So
+// too if the context's own facts the version lacks each say otherwise about something one of
+// those facts is about, as a slot holding one constant on one path and another on the other:
+// neither is worth keeping where they meet, and
 // the context drops its own there. So too when the versions at a point are joined: the facts of
 // theirs the join drops, all with origins and none used, are worth nothing past it. And when a
 // version's slot holding an unused constant holds another type in the context: the version is
@@ -1660,8 +2203,9 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // is dropped if an origin has JIT code, or a fact was used since. The residual where the origin
 // introduced the fact then becomes a thunk: code entering the block from its start ends there, as
 // the JIT and the trimming below read it, and the residuals after it are dead. Forced, the thunk
-// compiles the code from the origin again, as any thunk lays out its code (Note [Thunk patching]
-// in `jit`): in place, truncating the dead residuals.
+// compiles the code from the origin again, as any thunk lays out its code (Note [Thunk patching]):
+// in place, truncating the dead residuals. Origins sharing a residual share its thunk too: the
+// earliest's, whose code loads the rest again as each one's contraction decided.
 //
 // A fact can be rebuilt from the same origin another way: a constant that meets a double (Note
 // [Widening]) is loaded as a double instead, so every path from its load computes on the double.
@@ -1694,10 +2238,21 @@ fn overflow_rebuilds() -> bool {
     *REBUILDS
 }
 
+// Note [Quotients]
+// ~~~~~~~~~~~~~~~~
+// Lua's `/` is a double's division, so `math.floor(n / k)` divides in doubles and rounds back,
+// though for an integer `n` and a positive whole `k` it is the floored integer division of `n` by
+// `k`, a shift where `k` is a power of two. A division of an integer slot by such a constant gives
+// its result's value a field, the integer it is the quotient of (`Label::Quotient`); `math.floor`
+// of a value with that field computes the floored division from a slot holding the integer
+// instead. The division itself is still computed, for any other reader. The field is dropped at
+// jumps, as an element's table is (Note [Array kinds]), so it never tells versions apart: a
+// division and its floor are one block's.
+
 // Note [Optimistic ops]
 // ~~~~~~~~~~~~~~~~~~~~~
 // An op can do its common case on its hot path and the rest on its cold path (Note [Cold
-// stencils] in `window`), and select which it took, 0 or 1. Yielded as `OptimisticExec`, the op
+// stencils]), and select which it took, 0 or 1. Yielded as `OptimisticExec`, the op
 // is followed by a `Branch` to two ways on: its generator continues on the hot one, resumed with
 // `Matched`, and on the cold one, behind a thunk, only once it is taken, resumed with `Failed`. So
 // the code after the op can know what its common case gives, as an integer op's result in the
@@ -1716,9 +2271,9 @@ fn overflow_rebuilds() -> bool {
 // JIT code by its first overflow keeps both ways.
 //
 // In JIT code the `Branch` tests no `select`, as a guard's copy tests none (Note [Guard
-// stencils] in `window`): the op's hot path falls through to the hot way, as the next block if
+// stencils]): the op's hot path falls through to the hot way, as the next block if
 // it is laid out next, and its cold stencil, which ends in a jump to its site record's
-// continuation (Note [Cold stencils] in `window`), continues at the cold way, laid out after the
+// continuation (Note [Cold stencils]), continues at the cold way, laid out after the
 // region's blocks, as such an op's record's continuation.
 
 /// The type of a constant, as a value: a number is a double. See Note
@@ -1762,9 +2317,12 @@ fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected
 //   Unknown  >  Number  >  Integer or Double
 //   Unknown  >  each other LType,  Table > a shape,  Closure > a known function
 //
-// (a shape accepts only itself). A version for a table in a slot is correct for
-// a shape there: the jump's hash keys on it are extra keys the version doesn't
-// know, as below. The join relies on this, widening shapes to tables.
+// (and a shape is above one with more hash keys). A version for a table in a slot
+// is correct for a shape there, and one for a shape for a shape with more hash
+// keys: the jump's hash keys on it past the version's are extra keys the version
+// doesn't know, as below. The join relies on this, widening shapes to tables. So
+// a caller learning a new field of a table, as an inlined callee's hash keys come
+// back to it, reaches the versions compiled knowing fewer of its fields.
 //
 // Hash keys are compared index by index, since the version's blocks read
 // witnesses at those indexes. At each index the version's hash key must be the
@@ -1788,12 +2346,13 @@ fn constant_ctype_for<S: PartialEq + Eq>(k: &crate::chunk::Constant<S>, expected
 
 /// The versions of a pc before jumps to it reuse one. See Note [Version compatibility].
 const MAX_VERSIONS: usize = 3;
+
 /// The values one version of a promote tests before it returns its argument
-/// unspecialized. See Note [Green values].
+/// unspecialized. See Note [Promoted values].
 pub const PROMOTE_VALUES: usize = 8;
 /// The values a promote has versions for, past which it promotes no other.
-/// See Note [Green values].
-const PROMOTE_GREENS: usize = 512;
+/// See Note [Promoted values].
+const PROMOTE_SITE_VALUES: usize = 512;
 /// The versions of a pc, or of a point in its instruction, past which
 /// specialization panics. See Note [Version compatibility].
 const HARD_MAX_VERSIONS: usize = 16;
@@ -1811,37 +2370,37 @@ pub struct Context {
     /// The inlined call whose callee's frame this is, if it is one. See Note [Inlined calls].
     pub inline: Vec<InlineFrame>,
     /// The value each promote this path last passed through promoted, by the
-    /// promote's pc, in pc order. See Note [Green values].
-    pub greens: SmallVec<[(Pc, i32); 2]>,
+    /// promote's pc, in pc order. See Note [Promoted values].
+    pub promoted: SmallVec<[(Pc, i32); 2]>,
 }
 
-// Note [Green values]
-// ~~~~~~~~~~~~~~~~~~~~
-// `jit.promote(v)` returns `v`, and specializes the code after it to `v`'s value, as a meta-tracer's
-// green variables do: an interpreter written in Lua promotes its program counter and the
-// instruction there, and its dispatch loop's code is compiled once per guest instruction, the
-// guest's control flow its edges.
+// Note [Promoted values]
+// ~~~~~~~~~~~~~~~~~~~~~~~
+// `jit.promote(v)` returns `v`, and specializes the code after it to `v`'s value, as a meta-tracer
+// does with the values it is told to treat as constants: an interpreter written in Lua promotes
+// its program counter and the instruction there, and its dispatch loop's code is compiled once per
+// guest instruction, the guest's control flow its edges.
 //
 // A promote ends its block in a thunk. Forced, it guards its argument equal to the integer it holds
 // then (`EqualsK`), and the code past the guard is a version for that value: the context records
-// it in `greens`, by the promote's pc. The guard's other way promotes again, so a site seeing
+// it in `promoted`, by the promote's pc, and that the argument's slot holds it, as a constant. The guard's other way promotes again, so a site seeing
 // several values tests them in turn, up to `PROMOTE_VALUES`, past which it returns its argument
 // unspecialized. A promote whose argument the context knows is a constant needs no guard.
 //
-// A site's values are bounded too: it has versions for the first `PROMOTE_GREENS` values it sees,
-// and returns any other unspecialized. Code past a promote is compiled once per value, so
+// A site's values are bounded too: it has versions for the first `PROMOTE_SITE_VALUES` values it
+// sees, and returns any other unspecialized. Code past a promote is compiled once per value, so
 // promoting what takes many values, as a loop's counter, costs a version per value up to there;
 // an interpreter's program counter takes one per guest instruction.
 //
-// A green isn't a fact about a slot: it says which value the path's last pass through a promote
-// had, and holds until the path passes through it again, whatever is written since. So it is
-// part of a version's identity, as an inlined frame is (`same_point`): versions with different
-// greens are never compared, joined or counted together, and `MAX_VERSIONS` bounds each green's
-// versions apart. That is what makes a loop over an interpreter's instructions one per guest
-// instruction: the loop's back edge, though it overwrote the promoted program counter, still
-// carries the green of the instruction just run, so the loop's head has a version per guest
+// A promoted value isn't a fact about a slot: it says which value the path's last pass through a
+// promote had, and holds until the path passes through it again, whatever is written since. So it
+// is part of a version's identity, as an inlined frame is (`same_point`): versions with different
+// promoted values are never compared, joined or counted together, and `MAX_VERSIONS` bounds each
+// value's versions apart. That is what makes a loop over an interpreter's instructions one per
+// guest instruction: the loop's back edge, though it overwrote the promoted program counter, still
+// carries the value of the instruction just run, so the loop's head has a version per guest
 // instruction, and the promote there tests only the values seen after that instruction, most
-// often one. Greens are per activation: a function's entry has none.
+// often one. Promoted values are per activation: a function's entry has none.
 
 // Note [Array kinds]
 // ~~~~~~~~~~~~~~~~~~
@@ -1879,10 +2438,10 @@ pub struct Context {
 // guard to check it: once established, a fact holds until an effect the specializer sees could
 // falsify it, where it is dropped without repair. Every effect that could falsify a fact must be
 // visible; where the closed world can't be shown to hold, such as across code the specializer
-// doesn't see all of it is dropped. The known top (Note [Known top]) is information of this kind.
+// doesn't see, all that code could falsify is dropped. The known top (Note [Known top]) is information of this kind.
 //
 // It is in the context, as what is known of the values its places hold (`Context::values`; Note
-// [Value classes] in `classes`), so it is part of every block's key. A block compiled
+// [Value classes]), so it is part of every block's key. A block compiled
 // relying on a fact is only entered by paths that established it and kept it since, as any path
 // reaching a block with an equal context shares it. It is per activation: a function's entry block
 // has none, and a call's continuation only what the callee's effects keep (Note [Call effects]).
@@ -1890,10 +2449,13 @@ pub struct Context {
 // Effects come from the residuals as they are yielded (`Context::effect`). A window op writes the
 // slots its accesses say it writes (`Effect::Write`), an exec those it says it writes, else any
 // slot (`Effect::WriteAny`; it runs no Lua code), a call that isn't a window op or a pure native's
-// (Note [Library natives] in `library`) is `Effect::Opaque`, and what a residual can't show a
-// yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A store into a table is always yielded as one, `Effect::ArrayStore` or
-// the hash hazards it sets: an exec's writes are of its own frame, and a caller sees only the
-// store (Note [Call effects]).
+// (Note [Library natives]) is `Effect::Opaque`: code it doesn't see may write any table,
+// upvalue or global, but no slot of the frame but those the call writes, its own and its
+// callee's from its function's on, and those closures captured, which are written apart. So a
+// fact that a slot holds a constant survives it, and every other fact goes. What a residual can't show a
+// yield says (`YieldOp::Effect`: SETUPVAL's `Effect::SetUpvalue`). A store into a table is always
+// yielded as one, `Effect::ArrayStore` or the hash hazards it sets: an exec's writes are of its own
+// frame, and a caller sees only the store (Note [Call effects]).
 //
 // An effect falsifies what it writes (`Context::effect`): a written place moves to a class of its
 // own, and a domain of facts says which other effects its facts survive. A new domain is a variant
@@ -1913,11 +2475,11 @@ pub struct Context {
 // carrying one invalidation per backwards edge may drop a single fact from the set at a different
 // position each time, and cause `2^n` combination repeatedly compiling the same loop.
 //
-// Instead the versions of a pc that differ only in their facts are kept ordered by inclusion,
-// domain by domain (each key of `Known`, and the equalities), each one's knowledge in a domain
-// within the next's, and a context reaching the pc forgets whatever it knows that would break that
-// order. Forgetting is always sound, since a version relying on less accepts any context knowing
-// more, and n facts of a domain then give at most n + 1 versions for it. Domains are kept apart
+// Instead the versions of a pc whose types and hash keys are compatible are kept ordered by
+// inclusion of their facts, domain by domain. A context reaching the pc forgets the least it must
+// to keep that order, against its nearest compatible versions, as LBBV picks a version. Forgetting
+// is always sound, since a version relying on less accepts any context knowing more, and n facts
+// of a domain then give at most n + 1 versions for it. Domains are kept apart
 // so that facts of one, established and lost on their own schedule, never cost another's: a fact
 // is forgotten in one domain alone, and a class split keeps every fact it had. A join of versions
 // keeps what a version knowing nothing in a domain doesn't know there.
@@ -1960,9 +2522,21 @@ impl std::fmt::Display for Kind {
     }
 }
 
+// Note [Field facts]
+// ~~~~~~~~~~~~~~~~~~
+// A table's hash field and a global are places as an upvalue is (Note [Value classes]): a global a root, and a field an edge from the table's class, each by its name. A
+// slot loaded from one is in its class, so what a guard finds of either is known of both, and a
+// load needs no guard one before it passed: a global library's functions, or a machine's stacks
+// kept in its fields, are known after their first guards. Only a table or a function is kept so: a
+// load of anything else has only its type to guard, and its class would only tell versions apart.
+// An inlined callee's globals are its caller's, and its parameters' fields its arguments'.
+//
+// A store with a key of a name may be into any table, the environment included, so it forgets
+// every field and the global of that name, and one with an unknown key all of them.
+
 // Note [Upvalue paths]
 // ~~~~~~~~~~~~~~~~~~~~
-// A fact about an upvalue is one about the value it holds (Note [Value classes] in `classes`): the
+// A fact about an upvalue is one about the value it holds (Note [Value classes]): the
 // running function's own upvalue j is a root, and upvalue n of a closure is a field of the
 // closure's class. Only a closure's prototype is known (what its identity guard compares), not
 // the closure, so what is known of its upvalues is known of their values, not of its cells.
@@ -1995,19 +2569,28 @@ impl std::fmt::Display for Kind {
 /// What is known of a value, besides the type the slots holding it have: an upvalue's value's type
 /// (`Type`, Note [Upvalue paths]), a table's array part's kind (`Kind`, Note [Array kinds]), and a
 /// number constant an i32 holds exactly, with where it was loaded (`Constant`, Note [Widening]).
-/// Each is a domain of its own. See Notes [Fragile information] and [Value classes] in `classes`.
+/// Each is a domain of its own. See Notes [Fragile information] and [Value classes].
 #[derive(Clone)]
 pub enum Known {
     Type(CType),
     Kind(Kind),
     Constant { value: i32, origins: Option<Origins> },
+    /// The value is the table, boxed, and it is watched. See Note [Watched tables].
+    Watched(u64),
+    /// The value, boxed. See Note [Frozen tables].
+    Value(u64),
+    /// The value is a table that isn't watched. See Note [Watched tables].
+    Unwatched,
 }
 
 /// The keys of `Known`'s domains.
 pub const TYPE: u8 = 0;
 pub const KIND: u8 = 1;
 pub const CONSTANT: u8 = 2;
-const KEYS: [u8; 3] = [TYPE, KIND, CONSTANT];
+pub const WATCHED: u8 = 3;
+pub const VALUE: u8 = 4;
+pub const UNWATCHED: u8 = 5;
+const KEYS: [u8; 6] = [TYPE, KIND, CONSTANT, WATCHED, VALUE, UNWATCHED];
 
 /// What a context knows of values. See Note [Fragile information].
 pub type Values = crate::classes::Classes<Known>;
@@ -2031,6 +2614,8 @@ impl PartialEq for Known {
             (Known::Type(a), Known::Type(b)) => a == b,
             (Known::Kind(a), Known::Kind(b)) => a == b,
             (Known::Constant { value: a, .. }, Known::Constant { value: b, .. }) => a == b,
+            (Known::Watched(a), Known::Watched(b)) | (Known::Value(a), Known::Value(b)) => a == b,
+            (Known::Unwatched, Known::Unwatched) => true,
             _ => false,
         }
     }
@@ -2038,12 +2623,22 @@ impl PartialEq for Known {
 
 impl Eq for Known {}
 
+impl Known {
+    /// Whether it survives a trip: it wasn't learned through a watch. See Note [Watched tables].
+    fn survives_trip(&self) -> bool {
+        !matches!(self, Known::Watched(_))
+    }
+}
+
 impl std::hash::Hash for Known {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
             Known::Type(ctype) => (TYPE, ctype).hash(state),
             Known::Kind(kind) => (KIND, kind).hash(state),
             Known::Constant { value, .. } => (CONSTANT, value).hash(state),
+            Known::Watched(bits) => (WATCHED, bits).hash(state),
+            Known::Value(bits) => (VALUE, bits).hash(state),
+            Known::Unwatched => UNWATCHED.hash(state),
         }
     }
 }
@@ -2054,6 +2649,9 @@ impl std::fmt::Debug for Known {
             Known::Type(ctype) => write!(f, "{ctype}"),
             Known::Kind(kind) => write!(f, "kind {kind:?}"),
             Known::Constant { value, .. } => write!(f, "constant {value}"),
+            Known::Watched(bits) => write!(f, "watched {bits:#x}"),
+            Known::Value(bits) => write!(f, "value {bits:#x}"),
+            Known::Unwatched => write!(f, "unwatched"),
         }
     }
 }
@@ -2065,6 +2663,9 @@ impl crate::classes::ClassFact for Known {
             Known::Type(_) => TYPE,
             Known::Kind(_) => KIND,
             Known::Constant { .. } => CONSTANT,
+            Known::Watched(_) => WATCHED,
+            Known::Value(_) => VALUE,
+            Known::Unwatched => UNWATCHED,
         }
     }
     fn join(&self, other: &Self) -> Option<Self> {
@@ -2113,6 +2714,11 @@ pub enum Effect {
     /// A value of the representation (`None` if not known) is stored in some
     /// table's array part.
     ArrayStore(Option<LType>),
+    /// A watched table's watchpoint trips: what was learned through a watch is dropped. See Note
+    /// [Watched tables].
+    Trip,
+    /// A table is watched: no table is known not to be. See Note [Watched tables].
+    Watch,
 }
 
 // Note [Call effects]
@@ -2126,8 +2732,7 @@ pub enum Effect {
 // (`Specializer::effects`), which only grows. It is kept out of the context, so it never makes a
 // version of its own: whatever path code for the prototype is compiled on adds to the one join. A
 // call adds its callee's effects once its continuation knows them (Note [Call continuations]),
-// and opaque where nothing does: a call to a native that isn't pure (Note [Library natives] in
-// `library`), a call the call site doesn't specialize, and a continuation that doesn't know the
+// and opaque where nothing does: a call to a native that isn't pure (Note [Library natives]), a call the call site doesn't specialize, and a continuation that doesn't know the
 // return.
 //
 // A return reads its prototype's join when it runs, and returns it with the id of what it returns
@@ -2149,8 +2754,10 @@ impl Effects {
     pub const UPVALUE: Effects = Effects(1 << 8);
     /// Some table's hash part is stored into.
     pub const HASH: Effects = Effects(1 << 9);
+    /// Some table is watched.
+    pub const WATCH: Effects = Effects(1 << 11);
     /// Code the specializer never saw ran: every other effect too.
-    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::OPAQUE_BIT);
+    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::WATCH.0 | Self::OPAQUE_BIT);
     /// The representations stored into some table's array part, as `LType::bit`s.
     const ARRAYS: u16 = {
         let mut bits = 0;
@@ -2178,6 +2785,9 @@ impl Effects {
             Effect::Opaque => Effects::OPAQUE,
             Effect::ArrayStore(None) => Effects(Self::ARRAYS),
             Effect::ArrayStore(Some(stored)) => Effects(stored.bit() as u16),
+            // Its callers' code is replaced as it trips. See Note [Watched tables].
+            Effect::Trip => Effects::NONE,
+            Effect::Watch => Effects::WATCH,
         }
     }
 
@@ -2197,6 +2807,9 @@ impl Effects {
         }
         if self.0 & Self::HASH.0 != 0 {
             ctx.set_hazards(None, None);
+        }
+        if self.0 & Self::WATCH.0 != 0 {
+            ctx.effect(Effect::Watch);
         }
         for stored in Self::REPRESENTATIONS.into_iter().filter(|stored| self.0 & stored.bit() as u16 != 0) {
             ctx.effect(Effect::ArrayStore(Some(stored)));
@@ -2238,19 +2851,6 @@ impl Effects {
 // top. So that the top in memory is right wherever the context doesn't know it,
 // the window op's call stores it too (`SetTop`).
 
-impl Mark for Context {
-    fn mark(&self, owner: &Owner) {
-        for ctype in &self.types {
-            ctype.mark(owner);
-        }
-        for fact in self.values.all_facts() {
-            if let Known::Type(ctype) = fact {
-                ctype.mark(owner);
-            }
-        }
-    }
-}
-
 impl Context {
     /// A context knowing nothing of `slots` slots.
     pub fn new(slots: usize) -> Self {
@@ -2260,22 +2860,49 @@ impl Context {
             top: None,
             values: Values::default(),
             inline: Vec::new(),
-            greens: SmallVec::new(),
+            promoted: SmallVec::new(),
+        }
+    }
+
+    /// The context with its free hash key indexes all alike, and none past its last hash key:
+    /// contexts knowing the same hash keys are then equal, whatever was at their free indexes
+    /// before. See Note [Version compatibility].
+    fn canonical_free(ctx: Rc<Context>) -> Rc<Context> {
+        if ctx.free_canonical() {
+            return ctx;
+        }
+        let mut ctx = ctx;
+        Rc::make_mut(&mut ctx).canonicalize_free();
+        ctx
+    }
+
+    /// Whether its free hash key indexes are all alike, and none is past its last hash key.
+    fn free_canonical(&self) -> bool {
+        self.hkeys.iter().all(|hkey| !hkey.orphan() || *hkey == HashKey::free()) && self.hkeys.last().is_none_or(|hkey| !hkey.orphan())
+    }
+
+    /// Make its free hash key indexes all alike, and drop those past its last hash key.
+    fn canonicalize_free(&mut self) {
+        for hkey in self.hkeys.iter_mut().filter(|hkey| hkey.orphan()) {
+            *hkey = HashKey::free();
+        }
+        while self.hkeys.last().is_some_and(|hkey| hkey.orphan()) {
+            self.hkeys.pop();
         }
     }
 
     /// Whether `self` and `other` are at the same point of the code: in the same
     /// inlined call, past the same promoted values. Versions at different points
-    /// are never compared. See Note [Green values].
+    /// are never compared. See Note [Promoted values].
     fn same_point(&self, other: &Context) -> bool {
-        self.inline == other.inline && self.greens == other.greens
+        self.inline == other.inline && self.promoted == other.promoted
     }
 
-    /// The path's green for the promote at `site`, now `value`. See Note [Green values].
-    fn green(&mut self, site: Pc, value: i32) {
-        match self.greens.binary_search_by_key(&site, |&(at, _)| at) {
-            Ok(i) => self.greens[i].1 = value,
-            Err(i) => self.greens.insert(i, (site, value)),
+    /// The path's promoted value for the promote at `site`, now `value`. See Note [Promoted values].
+    fn promote(&mut self, site: Pc, value: i32) {
+        match self.promoted.binary_search_by_key(&site, |&(at, _)| at) {
+            Ok(i) => self.promoted[i].1 = value,
+            Err(i) => self.promoted.insert(i, (site, value)),
         }
     }
 
@@ -2284,12 +2911,16 @@ impl Context {
             self.types.iter().map(|t| format!("{}", t)).intersperse(",".to_string()).collect::<String>(),
             self.hkeys.iter().map(|hk| hk.tostring(owner)).intersperse(",".to_string()).collect::<String>(),
             self.values,
-            if self.greens.is_empty() { String::new() } else { format!(", greens: {:?}", self.greens) },
+            if self.promoted.is_empty() { String::new() } else { format!(", promoted: {:?}", self.promoted) },
         )
     }
 
     /// Drop what `effect` may falsify. See Notes [Fragile information] and [Upvalue paths].
     fn effect(&mut self, effect: Effect) {
+        // A set of an upvalue may be of a caller's slot. See Note [Inlined calls].
+        if matches!(effect, Effect::SetUpvalue(_) | Effect::AnyUpvalue) {
+            self.values.retain_roots(|root| !matches!(root, Root::Outer(_)));
+        }
         // A set of a sealed cell is of that cell alone. See Note [Upvalue paths].
         if let Effect::SetUpvalue(j) = effect && self.values.sealed(Root::Upvalue(j as u8)) {
             self.values.write(Root::Upvalue(j as u8));
@@ -2306,13 +2937,21 @@ impl Context {
                 self.values.retain_roots(|root| !matches!(root, Root::Upvalue(_)));
                 self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
             },
-            Effect::Opaque => self.values = Values::default(),
+            // Code it doesn't see writes any table, upvalue or global, but no slot of the frame:
+            // what slots the call does write are written apart. See Note [Fragile information].
+            Effect::Opaque => {
+                self.values.retain_fields(|_, _| false);
+                self.values.retain_roots(|root| matches!(root, Root::Slot(_)));
+                self.values.retain_facts(|fact| matches!(fact, Known::Constant { .. }));
+            },
             // Any table may be the one stored into: one of kind `kind` keeps it only for a value
             // of that kind, and a mixed one stays mixed.
             Effect::ArrayStore(stored) => self.values.retain_facts(|fact| match fact {
                 Known::Kind(kind) => *kind == Kind::Mixed || stored.is_some_and(|stored| *kind == Kind::Of(stored)),
                 _ => true,
             }),
+            Effect::Trip => self.values.retain_facts(Known::survives_trip),
+            Effect::Watch => self.values.retain_facts(|fact| !matches!(fact, Known::Unwatched)),
         }
         self.inlined(Effects::of(effect));
     }
@@ -2349,15 +2988,109 @@ impl Context {
     /// a slot, else an upvalue. See Note [Array kinds].
     fn element_of(&self, slot: usize) -> Option<Root> {
         let path = [Label::ElementOf];
-        self.values.members(Loc { root: Root::Slot(slot as u16), path: &path }).first().copied()
+        let members = self.values.members(Loc { root: Root::Slot(slot as u16), path: &path });
+        members.iter().find(|root| matches!(root, Root::Slot(_))).or_else(|| members.iter().find(|root| matches!(root, Root::Upvalue(_)))).copied()
+    }
+
+    /// A slot holding the integer slot `slot`'s value is the quotient of, and the constant. See
+    /// Note [Quotients].
+    fn quotient(&self, slot: usize) -> Option<(usize, i32)> {
+        let at = Loc::root(Root::Slot(slot as u16));
+        self.values.labels(at).into_iter().find_map(|label| {
+            let Label::Quotient(by) = label else { return None };
+            let path = [label];
+            self.values.members(Loc { root: at.root, path: &path }).into_iter().find_map(|root| match root {
+                Root::Slot(of) => Some((of as usize, by)),
+                _ => None,
+            })
+        })
     }
 
     /// The running function's upvalue whose value slot `slot` holds, if known.
     fn holds(&self, slot: usize) -> Option<u8> {
         self.values.members(Loc::root(Root::Slot(slot as u16))).into_iter().find_map(|root| match root {
             Root::Upvalue(j) => Some(j),
-            Root::Slot(_) => None,
+            Root::Slot(_) | Root::Global(_) | Root::Arg(_) | Root::Outer(_) => None,
         })
+    }
+
+    /// Whether a trip falsifies something it knows. See Note [Watched tables].
+    fn trips(&self) -> bool {
+        self.values.all_facts().any(|fact| !fact.survives_trip())
+    }
+
+    /// The slot of the table, and the name, of the field hash key `href` names: a string key of a
+    /// table's own hash part. In an inlined callee, a caller's table is the parameter it was passed
+    /// as, whose shape has its keys. See Note [Field facts].
+    fn field_of(&self, href: HashRef) -> Option<(u16, u64)> {
+        let hkey = self.hkeys.get(href.0 as usize).filter(|hkey| !hkey.orphan() && hkey.place == Place::Register)?;
+        let crate::chunk::Constant::String(name) = &hkey.key else { return None };
+        let table = if hkey.idx != OUTER {
+            hkey.idx
+        } else {
+            (0..self.types.len()).find(|&slot| matches!(&self.types[slot], CType::Shape(_, hrefs) if hrefs.contains(&href)))?
+        };
+        Some((table as u16, name_hash(name.as_bytes())))
+    }
+
+    /// Slot `slot` was just loaded from `root` along `path`, a global or a field: it holds its
+    /// value, of the type known of it. See Note [Field facts].
+    fn loaded(&mut self, slot: usize, root: Root, path: &[Label]) {
+        self.values.assign(Root::Slot(slot as u16), Loc { root, path });
+        if let Some(Known::Type(ctype)) = self.values.fact(Loc::root(Root::Slot(slot as u16)), TYPE).cloned() && self.types[slot].accepts(&ctype) {
+            self.types[slot] = ctype;
+        }
+    }
+
+    /// A guard found `ctype` in slot `slot`, loaded from field `field` if any: a global or a field
+    /// whose value the slot holds holds a value of it too, as does each slot holding its value,
+    /// unless its type already tells more. Only of a table or a function: of any other value, the
+    /// slot no longer holds the place's, as what it holds would only tell versions apart. See Note
+    /// [Field facts].
+    fn learn_held(&mut self, slot: usize, field: Option<HashRef>, ctype: CType) {
+        let at = Loc::root(Root::Slot(slot as u16));
+        let path;
+        let field = match field.and_then(|href| self.field_of(href)) {
+            Some((table, name)) => {
+                path = [Label::Field(name)];
+                Some(Loc { root: Root::Slot(table), path: &path })
+            },
+            None => None,
+        };
+        let held = self.values.members(at).iter().any(|root| matches!(root, Root::Global(_)))
+            || field.is_some_and(|field| self.values.same(at, field));
+        if !held {
+            return;
+        }
+        if !matches!(ctype, CType::Type(LType::Table | LType::Userdata) | CType::LuaFunction(_) | CType::NativeFunction(_) | CType::Shape(..)) {
+            self.values.write(Root::Slot(slot as u16));
+            return;
+        }
+        for root in self.values.members(at) {
+            if let Root::Slot(member) = root && self.types[member as usize].accepts(&ctype) {
+                self.types[member as usize] = ctype.clone();
+            }
+        }
+        self.values.learn(at, Known::Type(ctype));
+    }
+
+    /// Forget the fields and globals a store with a key named `stored` may change, or with none,
+    /// every field and global: any table may be the one stored into. See Note [Field facts].
+    fn forget_named(&mut self, stored: Option<u64>) {
+        self.values.retain_fields(|label, _| !matches!(label, Label::Field(name) if stored.is_none_or(|stored| name == stored)));
+        self.values.retain_roots(|root| !matches!(root, Root::Global(name) if stored.is_none_or(|stored| name == stored)));
+    }
+
+    /// Forget the fields a store through hash key `href` may change: those of its key's name, or
+    /// with none, every field and global. A key no field names, not a string, is none of them.
+    fn forget_fields(&mut self, stored: Option<HashRef>) {
+        match stored {
+            Some(href) => if let Some(crate::chunk::Constant::String(name)) = self.hkeys.get(href.0 as usize).map(|hkey| &hkey.key) {
+                let name = name_hash(name.as_bytes());
+                self.forget_named(Some(name));
+            },
+            None => self.forget_named(None),
+        }
     }
 
     /// Assume the running function's upvalue `upvalue` holds a value of `ctype`, as does each slot
@@ -2374,7 +3107,10 @@ impl Context {
     /// Slot `slot`'s type is found out at runtime: a fact that it holds a
     /// constant has had its use. See Note [Widening].
     fn used(&mut self, slot: usize) {
-        self.values.forget(Loc::root(Root::Slot(slot as u16)), CONSTANT);
+        let loc = Loc::root(Root::Slot(slot as u16));
+        if self.values.fact(loc, CONSTANT).is_some_and(|fact| fact.origins().is_some()) {
+            self.values.forget(loc, CONSTANT);
+        }
     }
 
     /// Mark that code relies on the constant slot `slot` holds, so that it isn't
@@ -2413,12 +3149,76 @@ impl Context {
         }
     }
 
-    /// A slot holding the running function's upvalue `upvalue`'s value, if known.
-    fn held(&self, upvalue: usize) -> Option<usize> {
-        self.values.members(Loc::root(Root::Upvalue(upvalue as u8))).into_iter().find_map(|root| match root {
-            Root::Slot(slot) => Some(slot as usize),
-            Root::Upvalue(_) => None,
-        })
+    /// The most direct way its code reads what `loc` holds. See Note [Reaching values].
+    fn reach(&self, loc: Loc) -> Reach {
+        let members = self.values.members(loc);
+        let own = members.iter().find_map(|root| match root {
+            Root::Slot(slot) => Some(*slot as isize),
+            _ => None,
+        });
+        let outer = || members.iter().find_map(|root| match root {
+            Root::Outer(below) => Some(-(*below as isize)),
+            _ => None,
+        });
+        if let Some(slot) = own.or_else(outer) {
+            return Reach::Slot(slot);
+        }
+        // A native's fact is of its code, and its value is the one cell it was made with. A Lua
+        // function's is only of its prototype, which closure isn't known.
+        if let Some(Known::Type(CType::NativeFunction(nf))) = self.values.fact(loc, TYPE) {
+            return Reach::Native(LBoxed::box_lvalue(LValue::NClosure(*nf)).bits());
+        }
+        let upvalue = members.iter().find_map(|root| match root {
+            Root::Upvalue(j) => Some(*j as usize),
+            _ => None,
+        });
+        let unmade = self.inline.last().is_some_and(|frame| frame.made != Made::Yes);
+        match upvalue {
+            Some(index) if unmade => Reach::Closure { slot: -1, index },
+            Some(index) => match self.upvalue_cell(index) {
+                Some(cell) if self.cell_filled(index) => Reach::Cell { index, cell },
+                cell => Reach::Upvalue { index, cell },
+            },
+            None => self.values.parents(loc).into_iter().find_map(|(root, label)| match (root, label) {
+                (Root::Slot(slot), Label::Upvalue(n)) => Some(Reach::Closure { slot: slot as isize, index: n as usize }),
+                (Root::Outer(below), Label::Upvalue(n)) => Some(Reach::Closure { slot: -(below as isize), index: n as usize }),
+                _ => None,
+            }).unwrap_or(Reach::Unknown),
+        }
+    }
+
+    /// How many inlined calls deep the code this is the context of is.
+    fn depth(&self) -> usize {
+        self.inline.len()
+    }
+
+    /// The cell of the running function's upvalue `upvalue`, if it has one. See Note [Upvalue
+    /// cells].
+    fn upvalue_cell(&self, upvalue: usize) -> Option<usize> {
+        (upvalue < UPVALUE_CELLS).then(|| self.depth() * UPVALUE_CELLS + upvalue)
+    }
+
+    /// Whether something is known of the running function's upvalue `upvalue`'s value, so that its
+    /// cell holds it. See Note [Upvalue cells].
+    fn cell_filled(&self, upvalue: usize) -> bool {
+        self.values.has(Root::Upvalue(upvalue as u8))
+    }
+
+    /// The cells holding their upvalue's value where this is the context: its own frame's its
+    /// facts are about, and every one of each caller's it is inlined into, whose facts the
+    /// callee's about its callers' upvalues become on its return. See Note [Upvalue cells].
+    fn filled_cells(&self) -> u32 {
+        let mut cells = 0;
+        for upvalue in 0..UPVALUE_CELLS {
+            if self.cell_filled(upvalue) {
+                cells |= 1 << self.upvalue_cell(upvalue).unwrap();
+            }
+        }
+        let frame = (1u32 << UPVALUE_CELLS) - 1;
+        for depth in 0..self.depth() {
+            cells |= frame << (depth * UPVALUE_CELLS);
+        }
+        cells
     }
 
     /// The type of the running function's upvalue `upvalue`'s value, if known.
@@ -2492,12 +3292,23 @@ impl Context {
     /// Whether a block specialized to `self` is correct in `other`. See Note
     /// [Version compatibility].
     fn accepts(&self, other: &Context) -> bool {
+        self.accepts_layout(other) && self.values.accepts(&other.values)
+    }
+
+    /// Whether `self` accepts `other` but for their fragile information: its types, hash keys
+    /// and top.
+    fn accepts_layout(&self, other: &Context) -> bool {
         self.same_point(other) && self.hkeys.iter().enumerate().all(|(i, hkey)| {
             hkey.orphan() || other.hkeys.get(i).is_some_and(|theirs| hkey.accepts(theirs))
         })
             && (self.top.is_none() || self.top == other.top)
-            && self.values.accepts(&other.values)
             && (0..self.types.len().max(other.types.len())).all(|idx| self.slot(idx).accepts(&other.slot(idx)))
+    }
+
+    /// Whether, but for their fragile information, one of `self` and `other` accepts the other.
+    /// See Note [Fragile information].
+    fn compatible(&self, other: &Context) -> bool {
+        self.accepts_layout(other) || other.accepts_layout(self)
     }
 
     /// The lattice height `self` loses from `other`, which it accepts.
@@ -2512,12 +3323,21 @@ impl Context {
     /// either has, the join has). Any other is dropped: left an orphan, which
     /// `accepts` ignores, and forgotten by every shape listing it.
     fn join(&mut self, owner: &mut Owner, other: &Context) {
-        let widened: Vec<(usize, CType)> = (0..self.types.len())
-            .filter_map(|idx| {
-                let joined = self.types[idx].join(&other.slot(idx));
-                (joined != self.types[idx]).then_some((idx, joined))
-            })
-            .collect();
+        let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
+        let mut widened: Vec<(usize, CType)> = Vec::new();
+        for idx in 0..self.types.len() {
+            let joined = self.types[idx].join(&other.slot(idx));
+            match (&self.types[idx], &joined) {
+                (a, b) if a == b => {},
+                // The same table, of which less is known: its hash keys the join's shape lacks go,
+                // and the rest stay its own. See Note [Version compatibility].
+                (CType::Shape(_, mine), CType::Shape(_, kept)) => {
+                    dropped.extend(mine.iter().filter(|href| !kept.contains(href)).cloned());
+                    self.types[idx] = joined;
+                },
+                _ => widened.push((idx, joined)),
+            }
+        }
         self.set_types(owner, widened);
         if self.top != other.top {
             self.top = None;
@@ -2542,12 +3362,22 @@ impl Context {
                 (mine, theirs) => mine.or_else(|| theirs.cloned()),
             };
         });
-        let mut dropped: SmallVec<[HashRef; 8]> = SmallVec::new();
         for (i, mine) in self.hkeys.iter_mut().enumerate() {
             match other.hkeys.get(i) {
+                _ if dropped.contains(&HashRef(i as u8)) => {
+                    mine.known_type = None;
+                    mine.clear_checks();
+                },
                 Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && theirs.place == mine.place && theirs.chain == mine.chain && mine.known_type.is_some() && theirs.known_type.is_some() => {
                     if mine.known_type != theirs.known_type {
-                        mine.known_type = Some(Kind::Mixed);
+                        mine.known_type = mine.known_type.as_ref().zip(theirs.known_type.as_ref()).map(|(mine, theirs)| mine.join(theirs));
+                        mine.origins = FieldOrigins::default();
+                    } else if let (Some(a), Some(b)) = (&mine.origins.0, &theirs.origins.0) && !Rc::ptr_eq(a, b) {
+                        let mut joined = owner.ro(a).clone();
+                        joined.extend(owner.ro(b).iter().filter(|origin| !owner.ro(a).iter().any(|known| Rc::ptr_eq(known, origin))).cloned());
+                        mine.origins = FieldOrigins(Some(Rc::new(TLCell::new(joined))));
+                    } else if mine.origins.0.is_none() {
+                        mine.origins = theirs.origins.clone();
                     }
                     for (slot, checked) in mine.hazards.iter_mut().enumerate() {
                         *checked &= theirs.hazards.get(slot) == Some(&true);
@@ -2593,9 +3423,15 @@ impl Context {
             // that has the issue of runtime hash_witness entries referring to the same
             // path-dependent index and having to emit shuffles if you take a
             // de-duplicated branch but with different indexes.
+            let mut dropped = SmallVec::new();
             if let CType::Shape(_, shape) = &self.types[idx] {
+                // A shape it still has keeps its hash keys.
+                let kept: SmallVec<[HashRef; 4]> = match &ty {
+                    CType::Shape(_, kept) => kept.clone(),
+                    _ => SmallVec::new(),
+                };
                 for (kidx, key) in self.hkeys.iter_mut().enumerate() {
-                    if key.idx != idx { continue; }
+                    if key.idx != idx || kept.contains(&HashRef(kidx as u8)) { continue; }
                     // Try to migrate
                     let mut migrated = false;
                     for (new_idx, other_type) in self.types.iter().enumerate() {
@@ -2619,11 +3455,35 @@ impl Context {
                 // to the array when we need a new HashKey in order to try and re-use
                 // the slot (and potentially end up with the same pre-SetTypes context
                 // entirely). See Note [Field types].
-                self.fix_chains();
-                while let Some(_) = self.hkeys.pop_if(|hkey| hkey.idx == idx) { }
+                dropped = self.fix_chains();
+                while self.hkeys.last().is_some_and(|hkey| hkey.idx == idx && !kept.contains(&HashRef((self.hkeys.len() - 1) as u8))) {
+                    self.hkeys.pop();
+                }
             }
             self.types[idx] = ty;
+            self.strip_shapes(&dropped);
             warn!("set types to {:?}", &self.types);
+        }
+    }
+
+    /// `fix_chains`, and the heads that go out of every shape holding them.
+    fn fix_shaped_chains(&mut self) {
+        let dropped = self.fix_chains();
+        self.strip_shapes(&dropped);
+    }
+
+    /// Hash keys `dropped` out of every shape holding them.
+    fn strip_shapes(&mut self, dropped: &[HashRef]) {
+        if dropped.is_empty() {
+            return;
+        }
+        for ty in &mut self.types {
+            if let CType::Shape(of, hrefs) = ty && hrefs.iter().any(|href| dropped.contains(href)) {
+                hrefs.retain(|href| !dropped.contains(href));
+                if hrefs.is_empty() {
+                    *ty = CType::Type(*of);
+                }
+            }
         }
     }
 
@@ -2744,6 +3604,8 @@ impl Context {
 
     pub fn set_hazards(&mut self, keep: Option<usize>, href: Option<HashRef>) {
         self.inlined(Effects::HASH);
+        // The store changed the field, wherever it is. See Note [Field facts].
+        self.forget_fields(href);
         let mut invalidate: Vec<usize> = (0..self.hkeys.len()).collect();
         if let Some(href) = href {
             // If we know we wrote to an href, then we can set hazards only on hkeys
@@ -2796,6 +3658,9 @@ pub struct Specializer<'src, 'intern> {
     encoding: Option<Origin>,
     /// Where each rebuilt block ends for code entering it from its start. See Note [Contraction].
     cuts: std::collections::HashMap<BlockId, usize, rustc_hash::FxBuildHasher>,
+    /// The instruction of the origin whose rebuild is yet to run at each place in a block. See
+    /// Note [Contraction].
+    rebuilding: std::collections::HashMap<(BlockId, usize), usize, rustc_hash::FxBuildHasher>,
     /// The targets of the code each rebuild replaced, whose blocks only it reaches are yet to be
     /// forgotten. See Note [Contraction].
     trimming: Vec<Vec<BlockId>>,
@@ -2810,28 +3675,30 @@ pub struct Specializer<'src, 'intern> {
     /// Each function's calls a continuation inlined, by the call's point and the callee: the
     /// entry contexts it decided on. See Note [Inlined calls].
     inlined: HashMap<(LProto<'src, 'intern>, SubPc, LProto<'src, 'intern>), Vec<Context>, rustc_hash::FxBuildHasher>,
-    /// Each promote's values that have versions, by its function and pc. See Note [Green values].
+    /// Each promote's values that have versions, by its function and pc. See Note [Promoted values].
     promoted: HashMap<(LProto<'src, 'intern>, Pc), std::collections::HashSet<i32, rustc_hash::FxBuildHasher>, rustc_hash::FxBuildHasher>,
+    /// The index of each field's hash key on each slot of the code of each function its
+    /// witnesses are of, and the indexes each function has given. See Note [Field types].
+    key_indexes: HashMap<(LProto<'src, 'intern>, usize, usize, Vec<u8>), u8, rustc_hash::FxBuildHasher>,
+    next_key_index: HashMap<LProto<'src, 'intern>, u8, rustc_hash::FxBuildHasher>,
     /// The code after each inlined call, its returns continue compiling. See Note [Inlined calls].
     continuations: Vec<Rc<Continuation>>,
+    /// Each Lua call's continuation, by where its returns go on. See Note [Watched tables].
+    continuation_sites: HashMap<Location, ContinuationSite>,
+    /// The watch sites of each watched table, by its address. See Note [Watched tables].
+    watches: HashMap<u64, Vec<WatchSite>>,
+    /// Each table watch sites know, by its boxed value, until it trips: what a load from it reads
+    /// as it compiles. See Note [Frozen tables].
+    frozen: HashMap<u64, Tc<Table<'static, 'static>>>,
+    /// How many tables each watch site has been compiled for, by prototype and pc.
+    watch_versions: HashMap<(usize, usize), usize>,
 }
 
 impl<'src, 'intern> Mark for Specializer<'src, 'intern> {
+    // Contexts hold no GC references: a Lua function's type is its prototype.
     fn mark(&self, owner: &Owner) {
-        for (proto, versions) in &self.versions {
-            for (key, blockid) in versions {
-                let (subpc, context) = key.deref();
-                (*context).mark(owner);
-            }
-        }
-        for types in &self.returns {
-            types.iter().for_each(|ty| ty.mark(owner));
-        }
-        for entries in self.inlined.values() {
-            entries.iter().for_each(|entry| entry.mark(owner));
-        }
-        for continuation in &self.continuations {
-            continuation.caller.mark(owner);
+        for table in self.frozen.values() {
+            table.mark(owner);
         }
     }
 }
@@ -2848,17 +3715,51 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             contractions: Vec::new(),
             encoding: None,
             cuts: Default::default(),
+            rebuilding: Default::default(),
             trimming: Vec::new(),
             rebuilt: Default::default(),
             decided: Default::default(),
             promoted: Default::default(),
+            key_indexes: Default::default(),
+            next_key_index: Default::default(),
             continuations: Vec::new(),
+            continuation_sites: HashMap::default(),
+            watches: HashMap::default(),
+            watch_versions: HashMap::default(),
+            frozen: HashMap::default(),
             inlined: Default::default(),
             unreachable: Default::default(),
             #[cfg(feature = "jit")]
             jctx: JitContext::new(),
             proto,
         }
+    }
+
+    /// The index of field `key`'s hash key on slot `place` where `ctx` is the context, the same
+    /// for every path through the code of the function whose witnesses it uses (the one inlined
+    /// calls are inlined into): given the first time, from the function's next. A parameter still
+    /// holding the table it was passed has its caller's slot's. See Note [Field types].
+    fn key_index(&mut self, ctx: &Context, place: usize, key: &LConstant<'_, '_>) -> Option<usize> {
+        let crate::chunk::Constant::String(name) = key else { return None };
+        let root = ctx.inline.first().map_or(self.proto, |frame| frame.proto as LProto<'src, 'intern>);
+        // The slot the key is named by is chosen so that hash keys are confluent: contexts
+        // reaching the same point have each field's key at the same index whether the code that
+        // learned it was inlined or not. A callee's key on a table it was passed is named by the
+        // caller's slot holding it, so it gets the index the caller's own code would give it, and
+        // is the caller's key at that index when it comes back on the return.
+        let (depth, slot) = match ctx.inline.last().and_then(|frame| frame.owner(ctx, place)) {
+            Some(owner) => (ctx.depth() - 1, owner),
+            None => (ctx.depth(), place),
+        };
+        let entry = (root, depth, slot, name.as_bytes().to_vec());
+        if let Some(&index) = self.key_indexes.get(&entry) {
+            return Some(index as usize);
+        }
+        let next = self.next_key_index.entry(root).or_insert(0);
+        let index = *next;
+        *next = next.checked_add(1)?;
+        self.key_indexes.insert(entry, index);
+        Some(index as usize)
     }
 
     /// The id of a return of `results`, the same for every return of them. See
@@ -2897,18 +3798,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         #[cfg(feature = "tracing")]
         {
             let context = ctx.tostring(owner);
+            let inline = self.traced_inline(&ctx);
             crate::tracing::instant("spec", "block", &[
                 ("block", block_id.0.into()),
                 ("line", self.traced_line(owner).into()),
                 ("pc", entry.into()),
                 ("context", context.as_str().into()),
+                ("inline", inline.as_str().into()),
             ]);
         }
+        self.blocks[block_id.0].cells = ctx.filled_cells();
+        self.blocks[block_id.0].promoted = ctx.promoted.clone();
         self.compile(owner, entry, ctx, block_id);
         return block_id;
     }
 
-    pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, mut coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, arg: ResumeArg) -> BlockId {
+    pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<dyn NativeGen>, arg: ResumeArg) -> BlockId {
+        let ctx = Context::canonical_free(ctx);
         if let Some(((_, ectx), &exists)) = self.versions.get(&self.proto).unwrap().get_key_value(&(pc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
             return exists;
@@ -2924,18 +3830,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         // Finish the remainder of the coroutine
         let new_block = self.new_block(pc.0);
+        self.blocks[new_block.0].cells = ctx.filled_cells();
+        self.blocks[new_block.0].promoted = ctx.promoted.clone();
         self.versions.get_mut(&self.proto).unwrap().insert((pc, ctx.clone()), new_block);
-        if let Some((succ_next, succ_ty, succ_ret)) = self.compile_one(owner, pc, ctx, coro, arg, new_block) {
-            // And continue compiling the block
-            self.compile(owner, succ_next, succ_ty, new_block);
-        }
-
-        return new_block;
+        let compiled = self.compile_one(owner, pc, ctx, coro, arg, new_block);
+        self.go_on(owner, compiled);
+        new_block
     }
 
     /// The block a jump to `pc` in `ctx` enters: a version for `ctx`, or one
     /// accepting it, compiled if need be. See Note [Version compatibility].
     pub fn version(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>) -> BlockId {
+        let ctx = Context::canonical_free(ctx);
         #[cfg(feature = "tracing")]
         let requested = ctx.clone();
         let (block, outcome, joined) = self.choose_version(owner, pc, ctx);
@@ -2965,7 +3871,35 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.unreachable.remove(&exists);
             return (exists, "exact", None);
         }
+        // A sealed call's code makes no new inlined version. See Note [Sealed inlined calls].
+        if sealed(&ctx) {
+            let accepting = versions.iter()
+                .filter(|((epc, ectx), _)| *epc == subpc && ectx.same_point(&ctx) && ectx.accepts(&ctx))
+                .min_by_key(|((_, ectx), block)| (ectx.distance(&ctx), block.0))
+                .map(|((_, ectx), block)| (ectx.clone(), *block));
+            if let Some((ectx, block)) = accepting {
+                ectx.adopt(owner, &ctx);
+                self.unreachable.remove(&block);
+                return (block, "accepting", None);
+            }
+            let block = self.uninline(owner, pc, &ctx);
+            self.versions.get_mut(&self.proto).unwrap().insert((subpc, ctx), block);
+            return (block, "sealed", None);
+        }
         if self.versions_at(owner, subpc, &ctx) >= MAX_VERSIONS {
+            // At the cap, revive a dead version that accepts the context before evicting one. A
+            // contraction left it dead by retyping what it knew, so it knows nothing a new version
+            // would. A live version may know less, so it isn't used here. See Note [Contraction].
+            let versions = self.versions.get(&self.proto).unwrap();
+            let nearest = versions.iter()
+                .filter(|((epc, ectx), block)| *epc == subpc && ectx.same_point(&ctx) && self.unreachable.contains(block) && ectx.accepts(&ctx))
+                .min_by_key(|((_, ectx), block)| (ectx.distance(&ctx), block.0))
+                .map(|((_, ectx), block)| (ectx.clone(), *block));
+            if let Some((ectx, block)) = nearest {
+                ectx.adopt(owner, &ctx);
+                self.unreachable.remove(&block);
+                return (block, "accepting", None);
+            }
             self.evict(owner, subpc, &ctx);
         }
         let versions = self.versions.get(&self.proto).unwrap();
@@ -2974,11 +3908,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .filter(|((epc, ectx), _)| *epc == subpc && ectx.same_point(&ctx))
             .map(|((_, ectx), block)| (ectx.clone(), *block))
             .collect();
-        // Versions differing only in fragile information are, kind by kind of
+        // Versions compatible but for their fragile information are, kind by kind of
         // fact, a chain of subsets, each version's facts of the kind in the
         // next's: `ctx` keeps the most facts of each kind that keep it one. See
         // Note [Fragile information].
-        let alike: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.alike(&ctx)).collect();
+        let compatible: Vec<&(Rc<Context>, BlockId)> = existing.iter().filter(|(ectx, _)| ectx.compatible(&ctx)).collect();
         let mut lowered = (*ctx).clone();
         // The equalities, then each domain of facts.
         for domain in std::iter::once(None).chain(KEYS.into_iter().map(Some)) {
@@ -2996,7 +3930,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 None => values.equalities(),
                 Some(key) => values.count(key),
             };
-            let mut chain: Vec<&Values> = alike.iter().map(|(ectx, _)| &ectx.values).collect();
+            let mut chain: Vec<&Values> = compatible.iter().map(|(ectx, _)| &ectx.values).collect();
             chain.sort_by_key(|values| size(values));
             chain.dedup_by(|a, b| within(a, b) && within(b, a));
             let below = chain.iter().rposition(|values| within(values, &ctx.values));
@@ -3009,7 +3943,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let ctx = if lowered.values == ctx.values {
             ctx
         } else {
-            if let Some((ectx, block)) = alike.iter().find(|(ectx, _)| ectx.values == lowered.values) {
+            // The nearest version knowing the same, if one accepts it.
+            if let Some((ectx, block)) = compatible.iter().filter(|(ectx, _)| ectx.values == lowered.values && ectx.accepts(&lowered)).min_by_key(|(ectx, block)| (ectx.distance(&lowered), block.0)) {
                 ectx.adopt(owner, &lowered);
                 self.unreachable.remove(block);
                 return (*block, "fragile", None);
@@ -3049,7 +3984,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// How many versions the running function has at `pc` at the same point as `ctx`: for its
-    /// inlined call, or for its calls, past its greens. See Notes [Inlined calls] and [Green
+    /// inlined call, or for its calls, past its promoted values. See Notes [Inlined calls] and [Promoted
     /// values].
     fn versions_at(&self, owner: &Owner, pc: SubPc, ctx: &Context) -> usize {
         self.versions.get(&self.proto).map_or(0, |versions| versions.keys().filter(|(at, ectx)| *at == pc && ectx.same_point(ctx)).count())
@@ -3172,6 +4107,29 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 for origin in found {
                     if !into.iter().any(|known| Rc::ptr_eq(known, &origin)) {
                         into.push(origin);
+                    }
+                }
+                continue;
+            }
+            // The version has every fact `ctx` has but some only `ctx` has, all from origins and
+            // none used: `ctx` drops those, reaching the version, and they are contracted.
+            if ectx.values.accepts(&ctx.values) && let Some(theirs) = ctx.past(ectx) {
+                let Some(sets) = theirs.iter().map(|(_, fact)| fact.origins()).collect::<Option<Vec<_>>>() else { continue };
+                let found: Vec<Origin> = sets.iter().flat_map(|set| owner.ro(set).iter().cloned()).collect();
+                if theirs.is_empty() || found.iter().any(|origin| owner.ro(origin).used) || found.iter().all(|origin| owner.ro(origin).rebuild.is_none()) {
+                    continue;
+                }
+                _duplicates.push(_block.0);
+                #[cfg(feature = "tracing")]
+                _their.push(format!("{} lacks: {}", _block.0, ectx.tostring(owner)));
+                for (root, fact) in &theirs {
+                    if !conflicting.contains(&(*root, fact.key())) {
+                        conflicting.push((*root, fact.key()));
+                    }
+                }
+                for origin in found {
+                    if !origins.iter().any(|known| Rc::ptr_eq(known, &origin)) {
+                        origins.push(origin);
                     }
                 }
                 continue;
@@ -3303,9 +4261,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 self.contractions.push((of, origins, how));
                 continue;
             }
-            let carries = |ctx: &Context| ctx.values.all_facts().any(|fact| {
-                fact.origins().is_some_and(|set| owner.ro(set).iter().any(|origin| origins.iter().any(|known| Rc::ptr_eq(known, origin))))
-            });
+            let ours = |set: &Origins| owner.ro(set).iter().any(|origin| origins.iter().any(|known| Rc::ptr_eq(known, origin)));
+            let carries = |ctx: &Context| ctx.values.all_facts().any(|fact| fact.origins().is_some_and(ours))
+                || ctx.hkeys.iter().any(|hkey| hkey.origins.0.as_ref().is_some_and(ours));
             let versions = self.versions.get_mut(&proto).unwrap();
             let mut _forgotten: Vec<usize> = Vec::new();
             versions.retain(|(_, ctx), block| {
@@ -3345,7 +4303,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             _ => residuals.len(),
         };
         let from = from.min(end);
-        let end = residuals[from..end].iter().position(|residual| matches!(residual, Residual::Jump(_))).map_or(end, |jump| from + jump + 1);
+        let end = residuals[from..end].iter().position(|residual| matches!(residual, Residual::Jump(_) | Residual::PatchableJump(_))).map_or(end, |jump| from + jump + 1);
         &residuals[from..end]
     }
 
@@ -3353,10 +4311,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     fn targets(residuals: &[Residual]) -> impl Iterator<Item = BlockId> + '_ {
         residuals.iter().flat_map(|residual| -> SmallVec<[BlockId; 2]> {
             match residual {
-                Residual::Jump(target) => smallvec::smallvec![*target],
+                Residual::Jump(target) | Residual::PatchableJump(target) => smallvec::smallvec![*target],
                 Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
                 Residual::Select(targets) => targets.iter().map(|(_, target)| *target).collect(),
                 Residual::LuaCall { entry: CallEntry::Block(target), .. } | Residual::TailCall { entry: CallEntry::Block(target), .. } => smallvec::smallvec![*target],
+                Residual::Uninline { entry, .. } => smallvec::smallvec![*entry],
                 _ => SmallVec::new(),
             }
         })
@@ -3497,6 +4456,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Vm::info(self.proto).1 as u64
     }
 
+    /// The inlined calls code in `ctx` is in, for the trace: each caller's line, at the block
+    /// its call is in, then the running function's line, as `jit_disasm` names functions
+    /// (`101@b5-71`).
+    #[cfg(feature = "tracing")]
+    fn traced_inline(&self, ctx: &Context) -> String {
+        let line = |proto: LProto<'_, '_>| unsafe { (*proto).line_defined };
+        let mut chain: Vec<String> = ctx.inline.iter().map(|frame| format!("{}@b{}", line(frame.proto.cast()), frame.call.0.0)).collect();
+        chain.push(line(self.proto).to_string());
+        chain.join("-")
+    }
+
     /// `version`'s choice, for the trace (`spec`/`version`, see
     /// `tools/trace_sql.py`): with how many versions `pc` has after it, and
     /// how many of the requested context's shapes the join lost.
@@ -3557,19 +4527,69 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             #[cfg(feature = "jit")]
             {
                 args.push(("hotness", block.jit_info.hotness.get().into()));
-                args.push(("jitted", (block.jit_info.entry.is_some() as u64).into()));
+                args.push(("jit_entry", (block.jit_info.entry.is_some() as u64).into()));
+                args.push(("compiled", (self.jctx.blocks.contains_key(&BlockId(id)) as u64).into()));
             }
             crate::tracing::instant("spec", "block_summary", &args);
         }
     }
 
-    /// Return a specialized block for a given PC and context, compiling a new one if necessary
+    /// The version of `pc` for exactly `ctx`, if there is one.
     pub fn find(&mut self, owner: &mut Owner, pc: SubPc, ctx: &Rc<Context>) -> Option<BlockId>
     {
         self.versions.get(&self.proto).unwrap().get(&(pc, ctx.clone())).cloned()
     }
 
-    pub fn compile(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, block_id: BlockId) -> Rc<Context> {
+    /// Make the frames of the inlined calls code in `ctx` is in that aren't, ending `block`: the
+    /// block the code goes on in, from `pc`, inside them, and its context. See Note [Inlined
+    /// frames].
+    /// Make the frames of the inlined calls `ctx` is in, before a residual observing them, `by`.
+    /// See Note [Inlined frames].
+    fn observe(&mut self, owner: &Owner, block: &mut BlockId, ctx: &mut Rc<Context>, pc: Pc, by: &str) {
+        if ctx.inline.iter().all(|frame| frame.made == Made::Yes) {
+            return;
+        }
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("spec", "frames_made", &[
+            ("line", self.traced_line(owner).into()),
+            ("pc", pc.into()),
+            ("block", block.0.into()),
+            ("by", by.into()),
+        ]);
+        let _ = (owner, by);
+        (*block, *ctx) = self.make_frames(*block, pc, ctx);
+    }
+
+    fn make_frames(&mut self, block: BlockId, pc: Pc, ctx: &Context) -> (BlockId, Rc<Context>) {
+        let mut made = ctx.clone();
+        self.end_block(block);
+        let moved: usize = made.inline.iter().filter(|frame| frame.made == Made::Base).map(InlineFrame::by).sum();
+        if moved > 0 {
+            self.blocks[block.0].instructions.push(Residual::Leave(moved as u16));
+        }
+        for frame in made.inline.iter_mut().filter(|frame| frame.made != Made::Yes) {
+            self.blocks[block.0].instructions.push(frame.push());
+            frame.made = Made::Yes;
+            #[cfg(feature = "tracing")]
+            crate::tracing::instant("spec", "frame_made", &[("site", frame.site().as_str().into())]);
+        }
+        let inside = self.new_block(pc);
+        self.blocks[inside.0].cells = made.filled_cells();
+        self.blocks[inside.0].promoted = made.promoted.clone();
+        self.blocks[block.0].instructions.push(Residual::Jump(inside));
+        (inside, Rc::new(made))
+    }
+
+    /// Compile on from where compiling an instruction went on to, if it went on.
+    fn go_on(&mut self, owner: &mut Owner, compiled: Compiled) {
+        if let Some((next, ctx, _, block)) = compiled {
+            self.compile(owner, next, ctx, block);
+        }
+    }
+
+    /// Compile the code from `pc`, in `ctx`, into `block_id` and the blocks it goes on in.
+    pub fn compile(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, mut block_id: BlockId) -> Rc<Context> {
+        debug_assert_eq!(ctx.types.len(), unsafe { (*self.proto).max_stack } as usize, "a context of another function's frame");
         loop {
             let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[pc].clone() };
             // Only a call uses the top the instruction before left. See Note [Known top].
@@ -3577,143 +4597,50 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Rc::make_mut(&mut ctx).top = None;
             }
             debug!("compile {pc} {:?} {:?}", inst.0.Opcode(), ctx);
-            if let Some((next, nctx, ret)) = match inst.0.Opcode() {
-                op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_numeric(op, a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                op @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("{a} {b} {c}");
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_compare(op, a, b as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::TEST => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_test(a as usize, c, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::TESTSET => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_testset(a as usize, b as usize, c, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::NOT => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_not(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::CLOSE => {
-                    let (a, _) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_close(a as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::TFORLOOP => {
-                    let (a, _, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_tforloop(a as usize, c as usize, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::VARARG => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    let params = unsafe { (*self.proto).param_count as usize };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_vararg(a as usize, b as usize, params)), ResumeArg::Start, block_id)
-                },
-                Opcode::JMP => {
-                    let sbx = crate::vm::sBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_jmp(sbx, pc + 1)), ResumeArg::Start, block_id)
-                    //self.blocks[block_id].push(Residual::Jump(((pc as isize) + sbx as isize) as usize)); return ctx;
-                },
-                Opcode::UNM => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_unm(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::LEN => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_len(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::CONCAT => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_concat(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::LOADK => {
-                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let c: LValue<'src, 'intern> = unsafe { (&(&(*self.proto).constants.items)[bx as usize]).into() };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadk(bx, c.typeof_(), a as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::LOADNIL => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadnil(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::LOADBOOL => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_loadbool(a as usize, b != 0, c != 0, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::MOVE => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    debug!("move {} {}", a, b);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_move(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::FORPREP => {
-                    let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_forprep(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::FORLOOP => {
-                    let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_forloop(a as usize, sbx, pc + 1)), ResumeArg::Start, block_id)
-                },
-                Opcode::GETUPVAL => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getupval(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::SETUPVAL => {
-                    let (a, b) = crate::vm::AB::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setupval(a as usize, b as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::CLOSURE => {
-                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let proto = unsafe { &*self.proto };
-                    let count = proto.prototypes.items[bx as usize].upval_count as usize;
-                    let upvalues = proto.instructions.items[pc + 1..pc + 1 + count].iter()
-                        .map(|pseudo| (pseudo.0.Opcode(), crate::vm::AB::unpack(pseudo.0).1 as usize))
-                        .collect();
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_closure(a as usize, bx as usize, upvalues, pc + 1 + count)), ResumeArg::Start, block_id)
-                },
-                Opcode::SELF => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_self(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::CALL => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("{} {} {}", a, b, c);
-                    // TODO: this should try to compile a new block and jump to it, and only
-                    // fallback to a trace exit if we need to run the fully generic code
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_call(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::GETGLOBAL => {
-                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
-                    debug!("getglobal {} {} {:?}", a, bx, &kst);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_getglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::SETGLOBAL => {
-                    let (a, bx) = crate::vm::ABx::unpack(inst.0);
-                    let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setglobal(a as usize, bx as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::GETTABLE => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("gettable {} {} {}", a, b, c);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_gettable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::SETTABLE => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    debug!("settable {} {} {}", a, b, c);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_settable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::NEWTABLE => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_newtable(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::SETLIST => {
-                    let (a, b, c) = crate::vm::ABC::unpack(inst.0);
-                    self.compile_one(owner, SubPc::new(pc), ctx.clone(), Box::new(emit_setlist(a as usize, b as usize, c as usize)), ResumeArg::Start, block_id)
-                },
-                Opcode::TAILCALL => {
+            // An inlined call's return whose frame isn't made: the caller's code after the call goes
+            // on here, the base moved back and the results moved to the call's slots. See Note
+            // [Inlined frames].
+            if let Some(frame) = ctx.inline.last() && inst.0.Opcode() == Opcode::RETURN && frame.made != Made::Yes {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                let (a, b) = (a as usize, b as usize);
+                // SAFETY: an inlined call's continuation lives as long as the code.
+                let continuation = unsafe { &*frame.continuation };
+                let (call, c) = (continuation.a as usize, continuation.c as usize);
+                if let Rest::Next(next) = continuation.rest && b != 0 && c != 0 && c <= b {
+                    let by = frame.by();
+                    let (known, effects) = self.returned_context(owner, &ctx, continuation, a, b);
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(Residual::Leave(by as u16));
+                    for slot in a..a + c - 1 {
+                        let result = Rc::new(crate::generators::Move::new(&[call + 1 + slot, call + slot - a]));
+                        self.blocks[block_id.0].instructions.push(Residual::ExecWindow(result));
+                    }
+                    let callee = self.proto;
+                    self.set_current(continuation.proto as LProto<'_, '_>);
+                    self.join_effects(owner, effects);
+                    let after = self.new_block(next);
+                    self.blocks[after.0].cells = known.filled_cells();
+                    self.blocks[after.0].promoted = known.promoted.clone();
+                    self.blocks[block_id.0].instructions.push(Residual::Jump(after));
+                    self.compile(owner, next, Rc::new(known), after);
+                    self.set_current(callee);
+                    return ctx;
+                }
+            }
+            // Any other return of an inlined call: from its frame, made. See Note [Inlined calls].
+            if matches!(inst.0.Opcode(), Opcode::TAILCALL | Opcode::RETURN) && ctx.inline.iter().any(|frame| frame.made != Made::Yes) {
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("spec", "frames_made", &[
+                    ("line", self.traced_line(owner).into()),
+                    ("pc", pc.into()),
+                    ("block", block_id.0.into()),
+                    ("by", format!("{:?}", inst.0.Opcode()).as_str().into()),
+                ]);
+                (block_id, ctx) = self.make_frames(block_id, pc, &ctx);
+            }
+            let compiled = match (self.decode(pc, &inst), inst.0.Opcode()) {
+                (Some(generator), _) => self.compile_one(owner, SubPc::new(pc), ctx.clone(), generator, ResumeArg::Start, block_id),
+                (None, Opcode::TAILCALL) => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.end_block(block_id);
                     let proto = self.proto;
@@ -3723,9 +4650,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // See Note [Tail calls].
                     let site = TailSite { calling: ctx.clone(), pc, a: a as usize, b: b as usize, closes, vararg, effects };
                     let thunk = self.make_tail_call_thunk(block_id, Rc::new(site), 0, true);
-                    self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk)); None
+                    self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                    None
                 },
-                Opcode::RETURN => {
+                (None, Opcode::RETURN) => {
                     let (a, b) = crate::vm::AB::unpack(inst.0);
                     self.end_block(block_id);
                     let proto = unsafe { &*self.proto };
@@ -3753,24 +4681,161 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     None
                 },
-                x => {
-                    #[cfg(debug_assertions)]
-                    {
-                        unreachable!("{:?}", x)
-                    }
-                    panic!("{:?}", x);
-                    let proto = self.proto;
-                    let vararg = unsafe { (*proto).is_vararg != 0 };
-                    let effects: *const Cell<Effects> = self.effects_of(proto);
-                    self.blocks[block_id.0].instructions.push(Residual::Ret(pc, 0, 0, true, vararg, UNKNOWN_RETURN, effects)); None
-                },
-            } {
-                pc = next;
-                ctx = nctx;
-                debug!("-> {}", next);
-            } else {
-                return ctx;
+                (None, op) => unreachable!("{op:?}"),
+            };
+            let Some((next, nctx, _, block)) = compiled else { return ctx };
+            // A sealed call's code leaves at its next pc. See Note [Sealed inlined calls].
+            if sealed(&nctx) {
+                let nctx = self.jumping(owner, nctx, next);
+                self.end_block(block);
+                let version = self.version(owner, next, nctx.clone());
+                self.blocks[block.0].instructions.push(Residual::Jump(version));
+                return nctx;
             }
+            (pc, ctx, block_id) = (next, nctx, block);
+        }
+    }
+
+    /// The generator of instruction `inst` at `pc`, if it is compiled by one: all but what the
+    /// specializer lays out itself.
+    fn decode(&self, pc: Pc, inst: &crate::chunk::Instruction) -> Option<Box<dyn NativeGen>> {
+        match inst.0.Opcode() {
+            op @ (Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::DIV | Opcode::MOD | Opcode::POW) => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("{a} {b} {c}");
+                Some(Box::new(emit_numeric(op, a as usize, b as usize, c as usize)))
+            },
+            op @ (Opcode::EQ | Opcode::LT | Opcode::LE) => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("{a} {b} {c}");
+                Some(Box::new(emit_compare(op, a, b as usize, c as usize, pc + 1)))
+            },
+            Opcode::TEST => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_test(a as usize, c, pc + 1)))
+            },
+            Opcode::TESTSET => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_testset(a as usize, b as usize, c, pc + 1)))
+            },
+            Opcode::NOT => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_not(a as usize, b as usize)))
+            },
+            Opcode::CLOSE => {
+                let (a, _) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_close(a as usize)))
+            },
+            Opcode::TFORLOOP => {
+                let (a, _, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_tforloop(a as usize, c as usize, pc + 1)))
+            },
+            Opcode::VARARG => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                let params = unsafe { (*self.proto).param_count as usize };
+                Some(Box::new(emit_vararg(a as usize, b as usize, params)))
+            },
+            Opcode::JMP => {
+                let sbx = crate::vm::sBx::unpack(inst.0);
+                Some(Box::new(emit_jmp(sbx, pc + 1)))
+                //self.blocks[block_id].push(Residual::Jump(((pc as isize) + sbx as isize) as usize)); return ctx;
+            },
+            Opcode::UNM => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_unm(a as usize, b as usize)))
+            },
+            Opcode::LEN => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_len(a as usize, b as usize)))
+            },
+            Opcode::CONCAT => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_concat(a as usize, b as usize, c as usize)))
+            },
+            Opcode::LOADK => {
+                let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                let c: LValue<'src, 'intern> = unsafe { (&(&(*self.proto).constants.items)[bx as usize]).into() };
+                Some(Box::new(emit_loadk(bx, c.typeof_(), a as usize)))
+            },
+            Opcode::LOADNIL => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_loadnil(a as usize, b as usize)))
+            },
+            Opcode::LOADBOOL => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_loadbool(a as usize, b != 0, c != 0, pc + 1)))
+            },
+            Opcode::MOVE => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                debug!("move {} {}", a, b);
+                Some(Box::new(emit_move(a as usize, b as usize)))
+            },
+            Opcode::FORPREP => {
+                let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
+                Some(Box::new(emit_forprep(a as usize, sbx, pc + 1)))
+            },
+            Opcode::FORLOOP => {
+                let (a, sbx) = crate::vm::AsBx::unpack(inst.0);
+                Some(Box::new(emit_forloop(a as usize, sbx, pc + 1)))
+            },
+            Opcode::GETUPVAL => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_getupval(a as usize, b as usize)))
+            },
+            Opcode::SETUPVAL => {
+                let (a, b) = crate::vm::AB::unpack(inst.0);
+                Some(Box::new(emit_setupval(a as usize, b as usize)))
+            },
+            Opcode::CLOSURE => {
+                let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                let proto = unsafe { &*self.proto };
+                let count = proto.prototypes.items[bx as usize].upval_count as usize;
+                let upvalues = proto.instructions.items[pc + 1..pc + 1 + count].iter()
+                    .map(|pseudo| (pseudo.0.Opcode(), crate::vm::AB::unpack(pseudo.0).1 as usize))
+                    .collect();
+                Some(Box::new(emit_closure(a as usize, bx as usize, upvalues, pc + 1 + count)))
+            },
+            Opcode::SELF => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_self(a as usize, b as usize, c as usize)))
+            },
+            Opcode::CALL => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("{} {} {}", a, b, c);
+                // TODO: this should try to compile a new block and jump to it, and only
+                // fallback to a trace exit if we need to run the fully generic code
+                Some(Box::new(emit_call(a as usize, b as usize, c as usize)))
+            },
+            Opcode::GETGLOBAL => {
+                let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
+                debug!("getglobal {} {} {:?}", a, bx, &kst);
+                Some(Box::new(emit_getglobal(a as usize, bx as usize)))
+            },
+            Opcode::SETGLOBAL => {
+                let (a, bx) = crate::vm::ABx::unpack(inst.0);
+                let kst = unsafe { &(&(*self.proto).constants.items)[bx as usize] };
+                Some(Box::new(emit_setglobal(a as usize, bx as usize)))
+            },
+            Opcode::GETTABLE => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("gettable {} {} {}", a, b, c);
+                Some(Box::new(emit_gettable(a as usize, b as usize, c as usize)))
+            },
+            Opcode::SETTABLE => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                debug!("settable {} {} {}", a, b, c);
+                Some(Box::new(emit_settable(a as usize, b as usize, c as usize)))
+            },
+            Opcode::NEWTABLE => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_newtable(a as usize, b as usize, c as usize)))
+            },
+            Opcode::SETLIST => {
+                let (a, b, c) = crate::vm::ABC::unpack(inst.0);
+                Some(Box::new(emit_setlist(a as usize, b as usize, c as usize)))
+            },
+            _ => None,
         }
     }
 
@@ -3825,24 +4890,37 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 known.values.unlink(Loc::root(Root::Slot(slot as u16)), Label::ElementOf);
             }
         }
+        // Nor what a quotient was divided from. See Note [Quotients].
+        let quotients: Vec<(usize, Label)> = (0..ctx.types.len())
+            .flat_map(|slot| ctx.values.labels(Loc::root(Root::Slot(slot as u16))).into_iter().filter(|label| matches!(label, Label::Quotient(_))).map(move |label| (slot, label)))
+            .collect();
+        if !quotients.is_empty() {
+            let known = Rc::make_mut(&mut ctx);
+            for (slot, label) in quotients {
+                known.values.unlink(Loc::root(Root::Slot(slot as u16)), label);
+            }
+        }
         ctx
     }
 
     /// A new, empty block starting at `pc` (see `Block::pc`).
     pub fn new_block(&mut self, pc: Pc) -> BlockId {
-        self.blocks.push(Block::new(pc));
+        self.blocks.push(Block { proto: self.proto as usize, ..Block::new(pc) });
         BlockId(self.blocks.len() - 1)
     }
 
-    // We have to be careful here, where rustc is very unhappy about generator -> thunk ->
-    // generator and will either think our types are recursive, require an infinite chain of
-    // implications to prove a Coroutine: Clone, or ICE (depending on the time of day) if we use
-    // slightly different structure.
-    fn yield_one(one: YieldOp) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static {
-        #[coroutine] |mut arg: ResumeArg| {
-            let arg = yield one;
-            debug!("yield one resulted in {arg:?}");
-            return arg;
+    /// The block a thunk forced at `thunk_pc` in `block` lays its code out in: its own, from the
+    /// thunk on, unless its JIT code can only be patched to a jump or the layout after it stays
+    /// (not `appends`). Then it is a new block at `pc` the thunk becomes a jump to. See Note [Thunk
+    /// patching].
+    fn reopen(&mut self, block: BlockId, thunk_pc: usize, pc: Pc, appends: bool) -> BlockId {
+        if !appends || self.compiled(block) {
+            let at = self.new_block(pc);
+            self.jump_thunk(block, thunk_pc, at);
+            at
+        } else {
+            self.blocks[block.0].instructions.truncate(thunk_pc);
+            block
         }
     }
 
@@ -3864,21 +4942,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// The thunk a `GuardDynamic` yield ends its block in. See Note [Dynamic guards].
-    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             test.interp(owner, state);
             let passed = state.select == 1;
-            // In place, unless the thunk's JIT code can only be patched to a jump.
-            // See Note [Thunk patching].
-            let block = if vm.compiled(block_id) {
-                let guard_block = vm.new_block(pc.0);
-                vm.jump_thunk(block_id, thunk_pc, guard_block);
-                vm.blocks[guard_block.0].instructions.push(Residual::GuardDynamic(test.clone()));
-                guard_block
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test.clone());
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, pc.0, true);
+            vm.blocks[block.0].instructions.push(Residual::GuardDynamic(test.clone()));
             let (fail, pass) = if passed {
                 let pass = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Matched);
                 let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
@@ -3894,16 +4963,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Whether the promote at `site` of the running function has, or may have, a version for
-    /// `value`: one of the first `PROMOTE_GREENS` values it sees. See Note [Green values].
+    /// `value`: one of the first `PROMOTE_SITE_VALUES` values it sees. See Note [Promoted values].
     fn promotes(&mut self, site: Pc, value: i32) -> bool {
         let values = self.promoted.entry((self.proto, site)).or_default();
-        values.contains(&value) || (values.len() < PROMOTE_GREENS && values.insert(value))
+        values.contains(&value) || (values.len() < PROMOTE_SITE_VALUES && values.insert(value))
     }
 
     /// The thunk a `Promote` of `slot` ends its block in: forced, it guards the
-    /// slot equal to the integer it holds, and continues past the guard green
-    /// with it, the guard's other way promoting again. See Note [Green values].
-    fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    /// slot equal to the integer it holds, and continues past the guard with
+    /// that value promoted, the guard's other way promoting again. See Note [Promoted values].
+    fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Integer(value) = state.vals[state.base + slot].unbox() else { unreachable!("a promote's argument is an integer") };
             if !vm.promotes(pc.0, value) {
@@ -3912,20 +4981,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 return;
             }
             let test: Rc<dyn Window> = Rc::new(crate::generators::EqualsK::new(value, &[slot]));
-            // In place, unless the thunk's JIT code can only be patched to a jump.
-            // See Note [Thunk patching].
-            let block = if vm.compiled(block_id) {
-                let guard_block = vm.new_block(pc.0);
-                vm.jump_thunk(block_id, thunk_pc, guard_block);
-                vm.blocks[guard_block.0].instructions.push(Residual::GuardDynamic(test));
-                guard_block
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = Residual::GuardDynamic(test);
-                block_id
-            };
-            let mut green = thunk_ctx.clone();
-            Rc::make_mut(&mut green).green(pc.0, value);
-            let pass = vm.subblock(owner, pc.next_true(), green, thunk_coro.clone(), ResumeArg::Integer(value));
+            let block = vm.reopen(block_id, thunk_pc, pc.0, true);
+            vm.blocks[block.0].instructions.push(Residual::GuardDynamic(test));
+            // Past the guard, the slot holds the value too.
+            let mut promoted = thunk_ctx.clone();
+            Rc::make_mut(&mut promoted).promote(pc.0, value);
+            Rc::make_mut(&mut promoted).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Constant { value, origins: None });
+            let pass = vm.subblock(owner, pc.next_true(), promoted, thunk_coro.clone(), ResumeArg::Integer(value));
             let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
             vm.blocks[block.0].instructions.push(Residual::Thunk(fail));
             vm.blocks[block.0].instructions.push(Residual::Jump(pass));
@@ -3936,7 +4998,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// place when first taken. See Note [Dynamic guards].
     /// The thunk a `Narrow` of `slot`, a double, ends its block in. See Note
     /// [Narrowing].
-    fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let value = state.vals[state.base + slot];
             let whole = value.representation() == LType::Double && value.as_number().is_some_and(crate::lboxed::is_integer);
@@ -4001,30 +5063,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Where the yield of `coro` at `pc` in `ctx` introduces a fact: rebuilding
     /// truncates `block` there and resumes `coro` in `ctx`, without the fact.
     /// See Note [Contraction].
-    fn origin(&self, block: BlockId, coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, ctx: Rc<Context>) -> Origin {
+    fn origin(&self, block: BlockId, coro: Box<dyn NativeGen>, pc: SubPc, ctx: Rc<Context>) -> Origin {
         let offset = self.blocks[block.0].instructions.len();
+        // Its function's, which needn't be the frame's it runs in: an inlined call's frame
+        // needn't be made. See Note [Inlined frames].
+        let proto = self.proto as LProto<'static, 'static>;
         // The origin becomes a thunk laying out the rebuilt code. See Note [Contraction].
         let rebuild = move |vm: &mut Specializer, owner: &mut Owner, how: ResumeArg| {
             let thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-                // In place, unless the thunk's JIT code can only be patched to a jump (Note [Thunk
-                // patching] in `jit`). Nothing returns into the residuals after it, which it
-                // truncates: the rebuild waited until nothing ran past it.
+                // Nothing returns into the residuals after it, which it truncates: the rebuild
+                // waited until nothing ran past it.
                 assert!(!state.callstack.iter().filter_map(|entry| entry.returns_to()).any(|ret| ret.0 == block && ret.1 > thunk_pc), "a frame returns past a rebuilt origin");
-                let at = if vm.compiled(block) {
-                    let at = vm.new_block(pc.0);
-                    vm.jump_thunk(block, thunk_pc, at);
-                    at
-                } else {
-                    vm.blocks[block.0].instructions.truncate(thunk_pc);
-                    if vm.cuts.get(&block).is_some_and(|&cut| cut > thunk_pc) {
-                        vm.cuts.remove(&block);
-                    }
-                    block
-                };
-                if let Some((next, ctx, _)) = vm.compile_one(owner, pc, ctx.clone(), coro.clone(), how.clone(), at) {
-                    vm.compile(owner, next, ctx, at);
+                let at = vm.reopen(block, thunk_pc, pc.0, true);
+                if at == block && vm.cuts.get(&block).is_some_and(|&cut| cut > thunk_pc) {
+                    vm.cuts.remove(&block);
                 }
+                vm.rebuilding.remove(&(block, offset));
+                let running = vm.proto;
+                vm.set_current(proto as LProto<'_, '_>);
+                let compiled = vm.compile_one(owner, pc, ctx.clone(), coro.clone(), how.clone(), at);
+                vm.go_on(owner, compiled);
+                vm.set_current(running);
             })));
+            // The earliest's of the origins sharing the residual. See Note [Contraction].
+            if vm.rebuilding.get(&(block, offset)).is_some_and(|&earlier| earlier < pc.0) {
+                return;
+            }
+            vm.rebuilding.insert((block, offset), pc.0);
             let residuals = &mut vm.blocks[block.0].instructions;
             if offset < residuals.len() {
                 residuals[offset] = Residual::Thunk(thunk);
@@ -4039,18 +5104,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk an optimistic integer op's `Encoding` ends its block in: forced, it lays out the
     /// op as the integer one, from an origin its first overflow rebuilds it from, if its result
     /// fits for its operands' values, and else as the double one. See Note [Optimistic ops].
-    fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
+    fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            // In place, unless the thunk's JIT code can only be patched to a jump. See Note
-            // [Thunk patching].
-            let at = if vm.compiled(block_id) {
-                let at = vm.new_block(pc.0);
-                vm.jump_thunk(block_id, thunk_pc, at);
-                at
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
-            };
+            let at = vm.reopen(block_id, thunk_pc, pc.0, true);
             let fit = (fits.0)(state);
             #[cfg(feature = "tracing")]
             crate::tracing::instant("spec", "encoding", &[
@@ -4065,9 +5121,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             } else {
                 ResumeArg::Type(CType::Type(LType::Double))
             };
-            if let Some((next, ctx, _)) = vm.compile_one(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), answer, at) {
-                vm.compile(owner, next, ctx, at);
-            }
+            let compiled = vm.compile_one(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), answer, at);
+            vm.go_on(owner, compiled);
             vm.encoding = None;
         })))
     }
@@ -4075,7 +5130,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// An optimistic op's cold way, as `make_side_thunk`'s, which the first time it's taken also
     /// queues where the op's encoding was asked, if anywhere, to be rebuilt computing it in the
     /// double encoding. See Note [Optimistic ops].
-    fn make_overflow_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, asked: Option<Origin>) -> ThunkRef {
+    fn make_overflow_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, asked: Option<Origin>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
             vm.jump_thunk(block_id, thunk_pc, side);
@@ -4090,7 +5145,188 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
+    fn make_learn_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table") };
+            let mut keys: Vec<LConstant<'static, 'static>> = tab.ro(owner).hash.keys().filter_map(|key| match key.boxed().unbox() {
+                // As the generator's constants, the intern arena outlives the code.
+                LValue::InternedString(name) => Some(unsafe { core::mem::transmute::<LConstant<'_, '_>, LConstant<'static, 'static>>(crate::chunk::Constant::String(name)) }),
+                _ => None,
+            }).collect();
+            keys.sort_by(|a, b| match (a, b) {
+                (crate::chunk::Constant::String(a), crate::chunk::Constant::String(b)) => a.as_bytes().cmp(b.as_bytes()),
+                _ => std::cmp::Ordering::Equal,
+            });
+            let rest = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Keys(keys.into()));
+            vm.jump_thunk(block_id, thunk_pc, rest);
+        })))
+    }
+
+    /// The thunk a `LearnKind` of `slot` ends its block in: forced on a table whose array part is of
+    /// one kind, a guard of it, past which the context knows it; else the code after it, knowing
+    /// nothing more. See `jit.learn` in `library`.
+    fn make_learn_kind_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table's field") };
+            let kind = tab.ro(owner).kind;
+            const TYPES: [LType; 8] = [LType::Nil, LType::Bool, LType::String, LType::Closure, LType::Table, LType::Integer, LType::Double, LType::Userdata];
+            let Some(of) = TYPES.into_iter().find(|t| t.bit() == kind).filter(|&t| t != LType::Nil) else {
+                let rest = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
+                vm.jump_thunk(block_id, thunk_pc, rest);
+                return;
+            };
+            let test: Rc<dyn Window> = Rc::new(KindIs::new(of, &[slot]));
+            let block = vm.reopen(block_id, thunk_pc, pc.0, true);
+            vm.blocks[block.0].instructions.push(Residual::GuardDynamic(test));
+            let mut known = (*thunk_ctx).clone();
+            known.learn_kind(Root::Slot(slot as u16), Kind::Of(of));
+            let pass = vm.subblock(owner, pc.next_true(), Rc::new(known), thunk_coro.clone(), ResumeArg::Matched);
+            let fail = vm.make_side_thunk(block, thunk_coro.clone(), pc.next_false(), thunk_ctx.clone(), ResumeArg::Failed);
+            vm.blocks[block.0].instructions.push(Residual::Thunk(fail));
+            vm.blocks[block.0].instructions.push(Residual::Jump(pass));
+        })))
+    }
+
+    /// Trip `tab`'s watchpoint: it is no longer watched, its watch sites are unpublished, and each
+    /// frame paused at a call goes on in code knowing no element. See Note [Watched tables].
+    fn trip(&mut self, owner: &mut Owner, state: &mut RunState, tab: Tc<Table>) {
+        tab.rw(owner).watched = false;
+        self.tripped(owner, state, tab.0.to_addr());
+    }
+
+    /// Handle the watchpoints natives' stores tripped, if any. See Note [Watched tables].
+    fn trip_pending(&mut self, owner: &mut Owner, state: &mut RunState) {
+        if !crate::vm::TRIPPED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        for table in crate::vm::PENDING_TRIPS.with(|pending| std::mem::take(&mut *pending.borrow_mut())) {
+            self.tripped(owner, state, table);
+        }
+    }
+
+    /// The table at `table` was tripped. See `trip`.
+    fn tripped(&mut self, owner: &mut Owner, state: &mut RunState, table: u64) {
+        self.frozen.retain(|_, frozen| frozen.0.to_addr() != table);
+        for site in self.watches.remove(&table).unwrap_or_default() {
+            let Location(block, off) = site.at;
+            self.blocks[block.0].instructions[off] = Residual::Thunk(site.unwatched);
+            #[cfg(feature = "jit")]
+            self.unlink_thunk(block, off);
+        }
+        for i in 0..state.callstack.len() {
+            let ret = match state.callstack[i].ret {
+                Return::To(at) => match self.continuation_sites.get(&at).cloned() {
+                    Some(site) if site.ctx.trips() => {
+                        // The code of the function the frame runs, which needn't be the tripping one.
+                        let block = self.new_block(self.blocks[at.0.0].pc);
+                        self.blocks[block.0].proto = self.blocks[at.0.0].proto;
+                        let mut ctx = (*site.ctx).clone();
+                        ctx.effect(Effect::Trip);
+                        let after = match site.after {
+                            After::Version(pc, ctx) => {
+                                let mut ctx = (*ctx).clone();
+                                ctx.effect(Effect::Trip);
+                                After::Version(pc, Rc::new(ctx))
+                            },
+                            after => after,
+                        };
+                        let thunk = self.make_continuation_thunk(block, Rc::new(ctx), site.captured, site.rest, site.a, site.c, after, None, 0, true);
+                        self.blocks[block.0].instructions.push(Residual::Thunk(thunk));
+                        Return::To(Location(block, 0))
+                    },
+                    _ => continue,
+                },
+                Return::Inlined(continuation) => {
+                    let continuation = unsafe { &*(continuation as *const Continuation) };
+                    if !continuation.caller.trips() {
+                        continue;
+                    }
+                    let mut caller = continuation.caller.clone();
+                    caller.effect(Effect::Trip);
+                    let unwatched = Rc::new(Continuation { caller, ..continuation.clone() });
+                    let at = Rc::as_ptr(&unwatched) as u64;
+                    self.continuations.push(unwatched);
+                    Return::Inlined(at)
+                },
+            };
+            state.callstack[i].ret = ret;
+        }
+    }
+
+    /// The thunk a watch site of the table in `slot` ends its block in: forced on a watched table,
+    /// if `watches`, it is one of the table's watch sites, the code after it knowing the table is
+    /// still watched; else, as the site a trip puts back, the code after it knowing nothing. See
+    /// Note [Watched tables].
+    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>, watches: bool, freezes: bool) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let boxed = state.vals[state.base + slot];
+            let LValue::Table(tab) = boxed.unbox() else { unreachable!("a watch site of a table") };
+            let site = (vm.proto as usize, pc.0);
+            let watched = watches && vm.watch_versions.get(&site).is_none_or(|&versions| versions < MAX_VERSIONS) && {
+                if freezes {
+                    tab.rw(owner).watched = true;
+                }
+                tab.ro(owner).watched
+            };
+            if !watched {
+                let rest = vm.subblock(owner, pc.next_false(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
+                vm.jump_thunk(block_id, thunk_pc, rest);
+                return;
+            }
+            *vm.watch_versions.entry(site).or_default() += 1;
+            let unwatched = vm.make_watch_thunk(block_id, thunk_coro.clone(), slot, pc, thunk_ctx.clone(), false, false);
+            vm.watches.entry(tab.0.to_addr()).or_default().push(WatchSite { at: Location(block_id, thunk_pc), unwatched });
+            // SAFETY: as `ctypeof_`'s: the specializer is parameterized over the VM's own lifetimes,
+            // which the thunk's signature doesn't say, and it outlives the table it roots.
+            vm.frozen.insert(boxed.bits(), unsafe { core::mem::transmute::<Tc<Table<'_, '_>>, Tc<Table<'static, 'static>>>(tab.clone()) });
+            // Which table it is, past a guard; another table fails it to a site of its own.
+            let guard = vm.new_block(pc.0);
+            vm.blocks[block_id.0].instructions[thunk_pc] = Residual::PatchableJump(guard);
+            #[cfg(feature = "jit")]
+            vm.link_thunk(block_id, thunk_pc, guard);
+            let mut ctx = thunk_ctx.clone();
+            Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Watched(boxed.bits()));
+            let pass = vm.subblock(owner, pc.next_true(), ctx, thunk_coro.clone(), ResumeArg::Matched);
+            let (coro, ctx) = (thunk_coro.clone(), thunk_ctx.clone());
+            let other = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, _: &mut Owner, _: &mut RunState, other_pc: usize| {
+                let site = vm.new_block(pc.0);
+                let thunk = vm.make_watch_thunk(site, coro.clone(), slot, pc, ctx.clone(), true, freezes);
+                vm.blocks[site.0].instructions.push(Residual::Thunk(thunk));
+                vm.jump_thunk(guard, other_pc, site);
+            })));
+            vm.blocks[guard.0].instructions.extend([
+                Residual::GuardDynamic(Rc::new(crate::generators::IsValue::new(boxed.bits(), &[slot]))),
+                Residual::Thunk(other),
+                Residual::Jump(pass),
+            ]);
+        })))
+    }
+
+    /// The element of the table in `table` at RK `key`, as `ResumeArg::Element`, if the context
+    /// knows which frozen table it is and the key, and the element is in its array part, not nil.
+    /// See Note [Frozen tables].
+    fn frozen_element(&self, owner: &Owner, ctx: &Context, table: usize, key: usize) -> Option<ResumeArg> {
+        let Some(&Known::Watched(bits)) = ctx.values.fact(Loc::root(Root::Slot(table as u16)), WATCHED) else { return None };
+        let tab = self.frozen.get(&bits)?;
+        let k = if key & 0x100 != 0 {
+            let crate::chunk::Constant::Number(n) = (unsafe { &(&(*self.proto).constants.items)[key & 0xff] }) else { return None };
+            is_integer(n.0).then_some(n.0 as i64)?
+        } else {
+            ctx.constant(key)? as i64
+        };
+        let element = *tab.ro(owner).array.get(usize::try_from(k - 1).ok()?)?;
+        if element.is_nil() {
+            return None;
+        }
+        let value = element.unbox();
+        let constant = match value {
+            LValue::Integer(value) => i32::try_from(value).ok(),
+            _ => None,
+        };
+        Some(ResumeArg::Element(element.bits(), value.ctypeof_(owner), constant))
+    }
+
+    fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
             vm.jump_thunk(block_id, thunk_pc, side);
@@ -4100,7 +5336,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `Versions` ends its block in: forced, it lays out the code after with the
     /// count, at a point of its own: at the call's, the version found would be the one the
     /// thunk is in. See `jit.versions` in `library`.
-    fn make_versions_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_versions_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let count = vm.versions_entering(owner, block_id);
             let rest = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Integer(count as i32));
@@ -4132,9 +5368,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 work.extend(from.get(&at).into_iter().flatten().copied());
             }
         }
-        let doomed = |ctx: &Context| ctx.values.all_facts().any(|fact| fact.origins().is_some_and(|set| owner.ro(set).iter().any(|origin| {
+        let queued = |set: &Origins| owner.ro(set).iter().any(|origin| {
             self.contractions.iter().any(|(of, queued, _)| *of == self.proto && queued.iter().any(|known| Rc::ptr_eq(known, origin)))
-        })));
+        });
+        let doomed = |ctx: &Context| ctx.values.all_facts().any(|fact| fact.origins().is_some_and(queued))
+            || ctx.hkeys.iter().any(|hkey| hkey.origins.0.as_ref().is_some_and(queued));
         let versions = self.versions.get(&self.proto).unwrap();
         entries.iter().filter_map(|entry| versions.iter().find(|(_, block)| **block == *entry).map(|(key, _)| key)).map(|(at, ctx)| {
             versions.iter().filter(|((there, theirs), block)| there == at && theirs.same_point(ctx) && !self.unreachable.contains(*block) && !doomed(theirs)).count()
@@ -4151,7 +5389,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// A function found gets its identity guarded too, unless the chain of
     /// thunks this one is in guards `identities` of them already, `MAX_VERSIONS`
     /// (Note [Call sites]).
-    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
+    fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // Each forcing patches the thunk where it was forced, in `block_id`: one
@@ -4178,23 +5416,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // An element of an array part whose kind is the element's
             // representation: the array's kind is tested in place of the
             // element's, and is known after. See Note [Array kinds].
-            // The runtime kind of the array the element was loaded from.
-            // An upvalue's table is read from the running closure's own upvalue; one
-            // through another closure isn't, and its element is tested as any value.
-            let array = thunk_ctx.element_of(idx).map(|table| {
-                let value = match table {
-                    Root::Slot(slot) => state.vals[state.base + slot as usize],
-                    Root::Upvalue(j) => state.upvalue(owner, j as usize),
-                };
+            // The runtime kind of the array the element was loaded from, its table read the most
+            // direct way. See Note [Reaching values].
+            let element_of = [Label::ElementOf];
+            let table = Loc { root: Root::Slot(idx as u16), path: &element_of };
+            let reach = thunk_ctx.reach(table);
+            let array = reach.value(owner, state).map(|value| {
                 let LValue::Table(tab) = value.unbox() else { unreachable!("an element of an array part not of a table") };
-                (table, tab.ro(owner).kind)
+                tab.ro(owner).kind
             });
-            let kind_of = array.as_ref().filter(|(_, kind)| *kind == found_field.bit()).map(|(table, _)| table.clone());
+            let kind_of = array.filter(|kind| *kind == found_field.bit()).is_some();
             // A value the context knows is a number only has its encoding tested.
-            let guard = if let Some(table) = &kind_of {
-                Residual::GuardDynamic(match table {
-                    Root::Slot(slot) => Rc::new(KindIs::new(found_field, &[*slot as usize])),
-                    Root::Upvalue(j) => Rc::new(UpvalKindIs::new(*j as usize, found_field, &[])),
+            let guard = if kind_of {
+                Residual::GuardDynamic(match reach {
+                    Reach::Slot(slot) => Rc::new(KindIs::new(found_field, &[slot as usize])),
+                    Reach::Cell { index, .. } | Reach::Upvalue { index, .. } => Rc::new(UpvalKindIs::new(index, found_field, &[])),
+                    Reach::Closure { slot, index } => Rc::new(CalledUpvalKindIs::new(index, found_field, &[slot as usize])),
+                    Reach::Native(_) | Reach::Unknown => unreachable!("an array read through no slot or upvalue"),
                 })
             } else if thunk_ctx.types[idx] == CType::Number {
                 Residual::NumericGuard { idx, expected: found_field }
@@ -4204,43 +5442,37 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut forced_ctx = thunk_ctx.clone();;
             let mut forced_mut = Rc::make_mut(&mut forced_ctx);
             forced_mut.types[idx] = found.clone();
-            if let Some(table) = kind_of {
-                forced_mut.learn_kind(table, Kind::Of(found_field));
+            if kind_of {
+                forced_mut.values.learn(table, Known::Kind(Kind::Of(found_field)));
             }
             // An array of two representations or more stays mixed.
-            if let Some((table, _)) = array.filter(|(_, kind)| kind.count_ones() > 1) {
-                forced_mut.learn_kind(table, Kind::Mixed);
+            if array.is_some_and(|kind| kind.count_ones() > 1) {
+                forced_mut.values.learn(table, Known::Kind(Kind::Mixed));
             }
             // A slot holding an upvalue's value tells of the upvalue: the type the
             // guard found, and past a function's identity guard below, which
             // function. See Note [Fragile information].
             if let Some(href) = field {
-                forced_mut.hkeys[href.0 as usize].known_type = Some(Kind::Of(found_field));
+                forced_mut.hkeys[href.0 as usize].known_type = Some(CType::Type(found_field));
             }
             let holds = forced_mut.holds(idx);
             if let Some(upvalue) = &holds {
                 forced_mut.learn_upvalue(upvalue.clone(), found.clone());
             }
+            // A slot holding a field's or a global's value tells of it too. See Note [Field facts].
+            forced_mut.learn_held(idx, field, found.clone());
             debug!("forcing thunk with {} == {}", found, expected);
             // Continued as a guard the context answers would be, so the ways
             // finding out and knowing share the subblock.
             let (next, arg) = navigate(pc, &expected, &found);
             // TODO: search for if we already have a compatible block
-            // In place, unless the thunk's JIT code can only be patched to a
-            // jump. See Note [Thunk patching].
-            if !appends || vm.compiled(block_id) {
-                let old_block = block_id;
-                block_id = vm.new_block(pc.0);
-                vm.jump_thunk(old_block, thunk_pc, block_id);
-                vm.blocks[block_id.0].instructions.push(guard);
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = guard;
-            }
+            block_id = vm.reopen(block_id, thunk_pc, pc.0, appends);
+            vm.blocks[block_id.0].instructions.push(guard);
             // If we're in the success block and the guarded value is a function, we can
             // also try to emit a guard to specialize the function value as well. This lets us
             // specialize code like `local print = print; print("xyz");`. Up to MAX_VERSIONS
             // of them: past that, the value is only a function. See Note [Call sites].
-            let idx_ctype = Some(state.vals[state.base + idx].unbox().ctypeof_())
+            let idx_ctype = Some(state.vals[state.base + idx].unbox().ctypeof_(owner))
                 .filter(|ctype| matches!(ctype, CType::NativeFunction(_) | CType::LuaFunction(_)))
                 .filter(|_| identities < MAX_VERSIONS);
             let identities = identities + idx_ctype.is_some() as usize;
@@ -4254,6 +5486,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 if let Some(upvalue) = holds {
                     forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
                 }
+                forced_mut.learn_held(idx, field, idx_ctype.clone().unwrap());
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
                 // However future executions may have change the native function out from under us.
                 // Emit a guard for the pointer identity: if it passes we're fine, but if it fails
@@ -4266,14 +5499,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // much.
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
-            } else if let Some(CType::LuaFunction(lclos)) = &idx_ctype {
+            } else if let Some(&CType::LuaFunction(proto)) = idx_ctype.as_ref() {
                 // Likewise we can do the same thing with statically known Lua functions
                 forced_mut.types[idx] = idx_ctype.clone().unwrap();
                 if let Some(upvalue) = holds {
                     forced_mut.learn_upvalue(upvalue, idx_ctype.clone().unwrap());
                 }
+                forced_mut.learn_held(idx, field, idx_ctype.clone().unwrap());
                 let guard_block = vm.subblock(owner, next, forced_ctx, thunk_coro, arg);
-                let proto = lclos.ro(owner).prototype.cast();
+                let proto = proto.cast();
                 vm.blocks[block_id.0].instructions.push(Residual::LuaGuard { idx, ptr: proto });
                 vm.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
                 vm.blocks[block_id.0].instructions.push(Residual::Jump(guard_block));
@@ -4296,15 +5530,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
             // SAFETY: a continuation lives as long as the specializer does.
             let continuation = unsafe { &*(continuation as *const Continuation) };
-            // In place, as for a call thunk. See Note [Thunk patching].
-            let block = if vm.compiled(block_id) {
-                let block = vm.new_block(vm.blocks[block_id.0].pc);
-                vm.jump_thunk(block_id, thunk_pc, block);
-                block
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, vm.blocks[block_id.0].pc, true);
             let after = vm.inline_return(owner, &ctx, continuation, a, b as usize);
             // A count of results known statically moves them as window ops in the caller's frame,
             // missing ones nil: values the JIT's window only renames. Every result up to the top
@@ -4337,31 +5563,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// less what the callee's code may have done to it, with the results' types. See Note [Inlined
     /// calls].
     fn inline_return(&mut self, owner: &mut Owner, ctx: &Context, continuation: &Continuation, a: usize, b: usize) -> BlockId {
-        let effects = ctx.inline.last().expect("an inlined call's frame").effects;
-        let mut known = continuation.caller.clone();
-        effects.apply(owner, &mut known, &continuation.captured);
-        // See Note [Upvalue paths].
-        let (call, c) = (continuation.a as usize, continuation.c as usize);
-        let returned = (b != 0).then(|| b - 1);
-        let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
-        let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
-        let map: Vec<(Loc, Loc)> = continuation.closure.into_iter()
-            .flat_map(|closure| fields.iter().enumerate().map(move |(n, path)| (Loc { root: closure, path }, Loc::root(Root::Upvalue(n as u8)))))
-            .chain((0..count.min(returned.unwrap_or(0))).map(|i| (Loc::root(Root::Slot((call + i) as u16)), Loc::root(Root::Slot((a + i) as u16)))))
-            .collect();
-        known.values.overlay(&ctx.closing(0), &map);
-        let slots = known.types.len();
-        for i in (0..count).filter(|i| call + i < slots) {
-            known.types[call + i] = match returned {
-                Some(returned) if i < returned => match ctx.slot(a + i) {
-                    CType::Shape(of, _) => CType::Type(of),
-                    ctype => ctype,
-                },
-                Some(_) => CType::Type(LType::Nil),
-                None => CType::Unknown,
-            };
-        }
-        known.top = if c == 0 { returned.map(|returned| call + returned) } else { None };
+        continuation.sealed.set(true);
+        let (known, effects) = self.returned_context(owner, ctx, continuation, a, b);
         let callee = self.proto;
         #[cfg(feature = "tracing")]
         let (_callee, _known) = (self.traced_line(owner), known.tostring(owner));
@@ -4380,6 +5583,129 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         after
     }
 
+    /// The caller's context after the inlined call `continuation`, for a return in the callee's
+    /// code, in `ctx`, of RETURN A B, and what the callee's code may have done to the caller's: the
+    /// caller's context before the call, less that, with the results' types. See Note [Inlined
+    /// calls].
+    fn returned_context(&mut self, owner: &mut Owner, ctx: &Context, continuation: &Continuation, a: usize, b: usize) -> (Context, Effects) {
+        let effects = ctx.inline.last().expect("an inlined call's frame").effects;
+        let caller = &continuation.caller;
+        let mut known = caller.clone();
+        // Its frames as the callee's code made them. See Note [Inlined frames].
+        for (frame, now) in known.inline.iter_mut().zip(&ctx.inline) {
+            frame.made = now.made;
+        }
+        // The hash keys the callee leaves, in the witnesses it shared: the caller's own it kept
+        // are the caller's again, and any other, of the callee's frame or put in place of one of
+        // the caller's, is free. See Note [Inlined calls].
+        // A parameter still holding the table it was passed has its hash keys the caller's slot's.
+        let frame = ctx.inline.last().expect("an inlined call's frame");
+        let passed = |slot: usize| frame.owner(ctx, slot);
+        let mut gained: Vec<(usize, HashRef)> = Vec::new();
+        known.hkeys = ctx.hkeys.iter().enumerate().map(|(i, hkey)| match caller.hkeys.get(i) {
+            // Its field's type as the callee left it: a store through another register holding
+            // the table may have changed it, moving the witness to the table's new epoch.
+            Some(mine) if !hkey.orphan() && hkey.idx == OUTER && !mine.orphan() => HashKey { known_type: hkey.known_type.clone(), origins: hkey.origins.clone(), ..mine.clone() },
+            _ if !hkey.orphan() && hkey.place == Place::Register && let Some(owner) = passed(hkey.idx) => {
+                let mut theirs = hkey.clone();
+                theirs.idx = owner;
+                theirs.clear_checks();
+                gained.push((owner, HashRef(i as u8)));
+                theirs
+            },
+            _ => {
+                let mut free = hkey.clone();
+                free.known_type = None;
+                free.clear_checks();
+                free
+            },
+        }).collect();
+        // A callee's version knowing fewer hash keys than the caller had (Note [Version
+        // compatibility]) leaves fewer: the caller's past them are free, as the callee may have
+        // put its own there.
+        for i in known.hkeys.len()..caller.hkeys.len() {
+            let mut free = caller.hkeys[i].clone();
+            free.known_type = None;
+            free.clear_checks();
+            known.hkeys.push(free);
+        }
+        // A shape keeps the caller's hash keys that came back as they were, and gains its slot's.
+        let unchanged = |href: &HashRef| {
+            let (mine, back) = (caller.hkeys.get(href.0 as usize), known.hkeys.get(href.0 as usize));
+            mine.zip(back).is_some_and(|(mine, back)| !back.orphan() && mine.idx == back.idx && mine.key == back.key && mine.place == back.place && mine.chain == back.chain)
+        };
+        for slot in 0..known.types.len() {
+            let CType::Shape(of, hrefs) = &known.types[slot] else { continue };
+            let mut kept: SmallVec<[HashRef; 4]> = hrefs.iter().filter(|href| unchanged(href)).cloned().collect();
+            for &(owner, href) in &gained {
+                if owner == slot && !kept.contains(&href) {
+                    kept.push(href);
+                }
+            }
+            known.types[slot] = if kept.is_empty() { CType::Type(*of) } else { CType::Shape(*of, kept) };
+        }
+        // A chain of the caller's whose hash keys didn't all come back goes.
+        known.fix_shaped_chains();
+        effects.apply(owner, &mut known, &continuation.captured);
+        // See Note [Upvalue paths].
+        let (call, c) = (continuation.a as usize, continuation.c as usize);
+        let returned = (b != 0).then(|| b - 1);
+        let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
+        let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
+        // A field open onto a slot stays open: what it holds is the slot's.
+        let map: Vec<(Loc, Loc)> = continuation.closure.into_iter()
+            .flat_map(|closure| fields.iter().enumerate().map(move |(n, path)| (Loc { root: closure, path }, Loc::root(Root::Upvalue(n as u8)))))
+            .filter(|&(field, _)| !known.values.open_field(field))
+            .chain((0..count.min(returned.unwrap_or(0))).map(|i| (Loc::root(Root::Slot((call + i) as u16)), Loc::root(Root::Slot((a + i) as u16)))))
+            // A callee's globals are its caller's. See Note [Field facts].
+            .chain(ctx.values.roots().filter(|root| matches!(root, Root::Global(_))).map(|root| (Loc::root(root), Loc::root(root))))
+            // So are the slots below it it named, but the call's own, which its results overwrite.
+            // See Note [Inlined calls].
+            .chain(ctx.values.roots().filter_map(|root| {
+                let Root::Outer(below) = root else { return None };
+                let caller = match (below as usize).checked_sub(call + 1) {
+                    Some(further) => Root::Outer(further as u16),
+                    None if (below as usize) < 2 => return None,
+                    None => Root::Slot((call + 1 - below as usize) as u16),
+                };
+                Some((Loc::root(caller), Loc::root(root)))
+            }))
+            .collect();
+        known.values.overlay(&ctx.closing(0), &map);
+        // What it learned of the values it was passed, the caller's places holding them learn:
+        // the same values, of which the caller knows the rest. See Note [Inlined calls].
+        for &(n, root) in &continuation.args {
+            for fact in ctx.values.facts(Loc::root(Root::Arg(n))) {
+                known.values.learn(Loc::root(root), fact.clone());
+            }
+        }
+        let slots = known.types.len();
+        for i in (0..count).filter(|i| call + i < slots) {
+            known.types[call + i] = match returned {
+                Some(returned) if i < returned => match ctx.slot(a + i) {
+                    CType::Shape(of, _) => CType::Type(of),
+                    ctype => ctype,
+                },
+                Some(_) => CType::Type(LType::Nil),
+                None => CType::Unknown,
+            };
+        }
+        known.top = if c == 0 { returned.map(|returned| call + returned) } else { None };
+        // A parameter the callee's code never wrote holds what it was passed still: its slot past
+        // the results holds the caller's value. See Note [Inlined calls].
+        for &(n, root) in &continuation.args {
+            let slot = call + 1 + n as usize;
+            if slot >= call + count && slot < slots && ctx.values.members(Loc::root(Root::Arg(n))).contains(&Root::Slot(n as u16)) {
+                known.values.assign(Root::Slot(slot as u16), Loc::root(root));
+                known.types[slot] = match ctx.slot(n as usize) {
+                    CType::Shape(of, _) => CType::Type(of),
+                    ctype => ctype,
+                };
+            }
+        }
+        (known, effects)
+    }
+
     /// The thunk a call to R(A) of the context `calling`, continuing at
     /// `after` (as `After::block`), ends its block in, or, not `appends`, a guard's failure is: run,
     /// it lays out a call for the function in R(A), guarding its identity and
@@ -4390,28 +5716,68 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// below it, and the pc after it, a Lua function's call continues at a thunk
     /// specializing it to the return. See Notes [Call sites], [Call
     /// continuations] and [Call effects].
+    /// Whether the call thunk of R(A) with B at `pc` in the context `calling`, of `value`, inlines
+    /// its callee from the first, as `make_call_thunk` decides: with a continuation, past fewer
+    /// than `MAX_VERSIONS` identity guards (`identities`). See Note [Inlined calls].
+    fn inlines_first(&self, owner: &Owner, calling: &Context, value: LBoxed<'_, '_>, pc: SubPc, a: usize, b: usize, continues: bool, identities: usize) -> bool {
+        let LValue::LClosure(lclos) = value.unbox() else { return false };
+        if !continues || !(matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS) {
+            return false;
+        }
+        let proto = lclos.ro(owner).prototype;
+        if !inlines(calling, unsafe { &*self.proto }, unsafe { &*proto }, a) {
+            return false;
+        }
+        let mut known = Self::inline_frame(calling, proto as LProto<'static, 'static>, Location(BlockId(0), 0), self.proto as LProto<'static, 'static>, a, b);
+        known.inline = Vec::new();
+        let decided = self.inlined.get(&(self.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known)));
+        decided || makes_iterator(unsafe { &*self.proto }, pc.0, a)
+    }
+
+    /// A call thunk's call, from code in `calling` at `pc`, laid out in `block`: the frames of the
+    /// inlined calls it is in made first, the block it goes on in, and the contexts at the call,
+    /// before it (`continuation`'s) and after it (`after`'s) knowing them made. See Note [Inlined
+    /// frames].
+    fn calls_from(&mut self, block: BlockId, pc: SubPc, calling: &Rc<Context>, continuation: &Option<(Rc<Context>, Rc<[usize]>, Rest)>, after: &After) -> (BlockId, Rc<Context>, Option<(Rc<Context>, Rc<[usize]>, Rest)>, After) {
+        if calling.inline.iter().all(|frame| frame.made == Made::Yes) {
+            return (block, calling.clone(), continuation.clone(), after.clone());
+        }
+        let (block, made) = self.make_frames(block, pc.0, calling);
+        let remade = |ctx: &Rc<Context>| {
+            let mut ctx = (**ctx).clone();
+            for (frame, made) in ctx.inline.iter_mut().zip(&made.inline) {
+                frame.made = made.made;
+            }
+            Rc::new(ctx)
+        };
+        let continuation = continuation.as_ref().map(|(before, captured, rest)| (remade(before), captured.clone(), rest.clone()));
+        let after = match after {
+            After::Version(next, ctx) => After::Version(*next, remade(ctx)),
+            After::Block(_) => unreachable!("a call whose frames weren't made continuing at a block"),
+        };
+        (block, made, continuation, after)
+    }
+
     fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            // In place, unless the thunk's JIT code can only be patched to a jump, or it
-            // is a guard's failure, with the rest of the layout after it. See Note
-            // [Thunk patching].
-            let block = if !appends || vm.compiled(block_id) {
-                let block = vm.new_block(vm.blocks[block_id.0].pc);
-                vm.jump_thunk(block_id, thunk_pc, block);
-                block
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
+            let block = vm.reopen(block_id, thunk_pc, vm.blocks[block_id.0].pc, appends);
+            // Any call but one inlined observes the frames of the inlined calls it is in, made
+            // here. See Note [Inlined frames].
+            let inlined = vm.inlines_first(owner, &calling, state.vals[state.base + a], pc, a, b, continuation.is_some(), identities);
+            let (block, calling, continuation, after) = match inlined {
+                true => (block, calling.clone(), continuation.clone(), after.clone()),
+                false => vm.calls_from(block, pc, &calling, &continuation, &after),
             };
+            let mut block = block;
             let (a16, b16, c16) = (a as u16, b as u16, c as u16);
-            let next = |vm: &Specializer| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), pc, a, b, c, after.clone(), continuation.clone(), identities + 1, false));
+            let next = |vm: &Specializer, block: BlockId| Residual::Thunk(vm.make_call_thunk(block, calling.clone(), pc, a, b, c, after.clone(), continuation.clone(), identities + 1, false));
             let mut layout = vec![];
             match state.vals[state.base + a].unbox() {
                 LValue::LClosure(lclos) if matches!(calling.types[a], CType::LuaFunction(_)) || identities < MAX_VERSIONS => {
                     let proto = lclos.ro(owner).prototype;
                     if !matches!(calling.types[a], CType::LuaFunction(_)) {
                         layout.push(Residual::LuaGuard { idx: a, ptr: proto.cast() });
-                        layout.push(next(vm));
+                        layout.push(next(vm, block));
                     }
                     // A call a continuation decided to inline in a context its callee's entry
                     // accepts this one's in inlines from the first, as does one making a generic
@@ -4427,7 +5793,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let decided = vm.inlined.get(&(vm.proto, pc, proto)).is_some_and(|decided| decided.iter().any(|decided| decided.accepts(&known)));
                         if decided || makes_iterator(unsafe { &*vm.proto }, pc.0, a) {
                             vm.blocks[block.0].instructions.extend(layout);
-                            let continuation = vm.continuation(&calling, ctx, captured, rest, a, c);
+                            let continuation = vm.continuation(&calling, ctx, captured, rest, &after, a, c);
                             let shift = vm.inline_call(owner, state, block, callee, a, b, entry, continuation);
                             vm.blocks[block.0].instructions.push(Residual::Jump(shift));
                             return;
@@ -4441,6 +5807,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // See Notes [Call continuations] and [Inlined calls].
                         let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
                         layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), rest.clone(), a, c, after.clone(), Some(Rc::new(call)), 0, true)));
+                        // Where its returns go on. See Note [Watched tables].
+                        vm.continuation_sites.insert(Location(block, off + 1), ContinuationSite { ctx: ctx.clone(), captured: captured.clone(), rest: rest.clone(), a, c, after: after.clone() });
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -4451,7 +5819,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // An error raised in it continues after it. See Note [Errors].
                 LValue::NClosure(nf) if nf.is_protected_call() && identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
-                    layout.push(next(vm));
+                    layout.push(next(vm, block));
                     let after = after.block(vm, owner);
                     layout.extend(Self::protected_call(a, b, c, after));
                     layout.push(Residual::Jump(after));
@@ -4461,14 +5829,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 LValue::NClosure(nf) if identities < MAX_VERSIONS => {
                     layout.push(Residual::NativeGuard { idx: a, ptr: nf.get_ptr() });
-                    layout.push(next(vm));
+                    layout.push(next(vm, block));
                     // Past the guard, a native with a generator is compiled by it, as an opcode is,
-                    // and the code after the call is a version. See Note [Native generators] in
-                    // `library`.
+                    // and the code after the call is a version. See Note [Native generators].
                     if let (Some(generator), After::Version(..)) = (nf.generator(), &after) {
                         vm.blocks[block.0].instructions.extend(layout);
-                        let coro = Box::new(generator(nf.native(), a, b, c));
-                        if let Some((next, ctx, _)) = vm.compile_one(owner, pc, calling.clone(), coro, ResumeArg::Start, block) {
+                        let compiled = vm.compile_one(owner, pc, calling.clone(), generator(nf.native(), a, b, c), ResumeArg::Start, block);
+                        if let Some((next, ctx, _, block)) = compiled {
                             let ctx = vm.jumping(owner, ctx, next);
                             let version = After::Version(next, ctx).block(vm, owner);
                             vm.blocks[block.0].instructions.push(Residual::Jump(version));
@@ -4505,7 +5872,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             known = None;
                         }
                     }
-                    // See Note [Library natives] in `library`.
+                    // See Note [Library natives].
                     if let Some((known, rest)) = known {
                         let after = match rest {
                             Rest::Next(pc) => {
@@ -4544,7 +5911,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let flow = |block: BlockId| -> SmallVec<[BlockId; 4]> {
             self.blocks[block.0].instructions.iter().flat_map(|res| -> SmallVec<[BlockId; 2]> {
                 match res {
-                    Residual::Jump(target) => smallvec::smallvec![*target],
+                    Residual::Jump(target) | Residual::PatchableJump(target) => smallvec::smallvec![*target],
                     Residual::Branch { hot, cold } => smallvec::smallvec![*hot, *cold],
                     Residual::Select(targets) => targets.iter().map(|(_, target)| *target).collect(),
                     _ => SmallVec::new(),
@@ -4552,20 +5919,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }).collect()
         };
         let mut reached = Blocks::default();
+        // Each reached block's predecessors among them.
+        let mut from: HashMap<BlockId, SmallVec<[BlockId; 2]>, rustc_hash::FxBuildHasher> = HashMap::default();
         let mut work = vec![entry];
         while let Some(block) = work.pop() {
             if reached.insert(block) {
-                work.extend(flow(block));
+                for target in flow(block) {
+                    from.entry(target).or_default().push(block);
+                    work.push(target);
+                }
             }
         }
         // Those that reach the exit the call took, back from it.
-        let mut path: Blocks = reached.iter().copied().filter(|&block| block == exit).collect();
-        loop {
-            let more: Vec<BlockId> = reached.iter().copied().filter(|block| !path.contains(block) && flow(*block).iter().any(|target| path.contains(target))).collect();
-            if more.is_empty() {
-                break;
+        let mut path = Blocks::default();
+        let mut work: Vec<BlockId> = reached.contains(&exit).then_some(exit).into_iter().collect();
+        while let Some(block) = work.pop() {
+            if path.insert(block) {
+                work.extend(from.get(&block).into_iter().flatten().copied());
             }
-            path.extend(more);
         }
         // A cycle among them is a loop.
         let mut done = Blocks::default();
@@ -4612,11 +5983,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut upvalued: SmallVec<[usize; 4]> = SmallVec::new();
             for res in &self.blocks[block.0].instructions {
                 measured.cost += match res {
-                    Residual::Jump(_) | Residual::Branch { .. } | Residual::Select(_) | Residual::Thunk(_) | Residual::Ret(..)
+                    Residual::Jump(_) | Residual::PatchableJump(_) | Residual::Branch { .. } | Residual::Select(_) | Residual::Thunk(_) | Residual::Ret(..)
                         | Residual::ReturnedFrom(_) | Residual::Arrive { .. } | Residual::Arrived { .. } | Residual::GC => 0,
                     _ => 1,
                 };
                 match res {
+                    Residual::Emit(op) => {
+                        for (&slot, _) in op.operands().iter().zip(op.accesses()).filter(|(_, access)| access.writes()) {
+                            upvalued.retain(|held| *held != slot);
+                        }
+                    }
                     Residual::ExecWindow(w) => {
                         let written = w.operands().iter().zip(w.accesses()).filter(|(_, access)| access.writes()).map(|(&slot, _)| slot);
                         let loads = matches!(w.name(), "GetUpval" | "HeldUpval" | "NativeUpval");
@@ -4642,14 +6018,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The entry context of the inlined call `call` of R(A) with B in `calling`, of `callee`, by
     /// the function `proto`. See Note [Inlined calls].
     fn inline_frame(calling: &Context, callee: LProto<'static, 'static>, call: Location, proto: LProto<'static, 'static>, a: usize, b: usize) -> Context {
-        let frame = InlineFrame { call, proto, a: a as u16, effects: Effects::NONE };
+        // A table parameter's hash keys are its caller's slot's. See Note [Inlined calls].
+        let params = unsafe { (*callee).param_count } as usize;
+        let passed = (0..params).filter_map(|param| match calling.slot(a + 1 + param) {
+            CType::Shape(_, hrefs) => hrefs.first().map(|href| calling.hkeys[href.0 as usize].idx).filter(|&owner| owner < a)
+                .map(|owner| (param as u16, owner as u16)),
+            _ => None,
+        }).collect();
+        let frame = InlineFrame {
+            call, proto, a: a as u16, effects: Effects::NONE, passed, made: Made::Base,
+            b: b as u16, params: unsafe { (*callee).param_count }, stack: unsafe { (*callee).max_stack }, cells: 0, continuation: std::ptr::null(),
+        };
         inline_entry(calling, unsafe { &*callee }, a, b, frame)
     }
 
     /// The code after the inlined call of R(A) with C in `calling`, by the running function: the
     /// context before the call `caller`, less the callee's frame (`captured` its slots below the call
     /// its closures captured), continuing as `rest`. See Note [Inlined calls].
-    fn continuation(&self, calling: &Context, caller: &Context, captured: &Rc<[usize]>, rest: &Rest, a: usize, c: usize) -> Continuation {
+    fn continuation(&self, calling: &Context, caller: &Context, captured: &Rc<[usize]>, rest: &Rest, after: &After, a: usize, c: usize) -> Continuation {
         Continuation {
             proto: self.proto as LProto<'static, 'static>,
             caller: caller.clone(),
@@ -4658,8 +6044,83 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             c: c as u16,
             // A place below the call holding the callee's closure. See Note [Upvalue paths].
             closure: calling.values.members(Loc::root(Root::Slot(a as u16))).into_iter().find(|root| !matches!(root, Root::Slot(slot) if *slot as usize >= a)),
+            // What the callee learns of its arguments' values. See Note [Inlined calls].
+            args: (a + 1..calling.types.len()).flat_map(|arg| {
+                calling.values.members(Loc::root(Root::Slot(arg as u16))).into_iter()
+                    .filter(|root| !matches!(root, Root::Slot(slot) if *slot as usize >= a))
+                    .map(move |root| ((arg - a - 1) as u8, root))
+            }).collect(),
             rest: rest.clone(),
+            after: after.clone(),
+            sealed: Rc::new(Cell::new(false)),
         }
+    }
+
+    /// The block a sealed inlined call's code in `ctx` goes on in at `pc`: its frame made a call's
+    /// of its callee's own version at `pc`, which returns to the code after the call. See Note
+    /// [Sealed inlined calls].
+    fn uninline(&mut self, owner: &mut Owner, pc: Pc, ctx: &Rc<Context>) -> BlockId {
+        let frame = ctx.inline.last().expect("a sealed inlined call's frame").clone();
+        // SAFETY: an inlined call's continuation lives as long as the code.
+        let continuation = unsafe { &*frame.continuation };
+        let entry = self.version(owner, pc, Rc::new(self.standalone(ctx)));
+        // The block is the caller's. Only its first residual runs in the callee's frame, and that
+        // one doesn't use the running function.
+        let Rest::Next(next) = continuation.rest else { unreachable!("a sealed call continuing in its instruction") };
+        let block = self.new_block(next - 1);
+        self.blocks[block.0].proto = continuation.proto as usize;
+        if frame.made == Made::Yes {
+            self.blocks[block.0].instructions.push(Residual::Uninline { entry, a: frame.a });
+        } else {
+            // A frame only entered is called whole, once the frames it is in are made.
+            let entered: usize = ctx.inline.iter().filter(|frame| frame.made != Made::Yes).map(InlineFrame::by).sum();
+            self.blocks[block.0].instructions.push(Residual::Leave(entered as u16));
+            for outer in ctx.inline[..ctx.inline.len() - 1].iter().filter(|frame| frame.made != Made::Yes) {
+                self.blocks[block.0].instructions.push(outer.push());
+            }
+            let callee = self.proto as LProto<'static, 'static>;
+            self.blocks[block.0].instructions.push(Residual::LuaCall {
+                entry: CallEntry::Block(entry), a: frame.a, b: frame.stack as u16 + 1, c: continuation.c, stack: frame.stack, vararg: false, callee,
+            });
+        }
+        // The code after the call, as after any call. The frames it is in are made by then.
+        let made = |ctx: &Context| {
+            let mut ctx = ctx.clone();
+            ctx.inline.iter_mut().for_each(|frame| frame.made = Made::Yes);
+            Rc::new(ctx)
+        };
+        let caller = made(&continuation.caller);
+        let after = match &continuation.after {
+            After::Version(next, ctx) => After::Version(*next, made(ctx)),
+            After::Block(_) => unreachable!("a sealed call continuing at a block"),
+        };
+        let (captured, rest, a, c) = (continuation.captured.clone(), continuation.rest.clone(), continuation.a as usize, continuation.c as usize);
+        let off = self.blocks[block.0].instructions.len();
+        let thunk = self.make_continuation_thunk(block, caller.clone(), captured.clone(), rest.clone(), a, c, after.clone(), None, 0, true);
+        self.blocks[block.0].instructions.push(Residual::Thunk(thunk));
+        self.continuation_sites.insert(Location(block, off), ContinuationSite { ctx: caller, captured, rest, a, c, after });
+        block
+    }
+
+    /// What the code of `ctx`, an inlined call's, knows as its own function's: of what its own code
+    /// names, its frame, its upvalues and the globals. Its hash witnesses start afresh, so it knows
+    /// no hash keys. See Note [Sealed inlined calls].
+    fn standalone(&self, ctx: &Context) -> Context {
+        let slots = ctx.types.len();
+        let mut own = Context::new(slots);
+        own.types = ctx.types.iter().map(|ctype| match ctype {
+            CType::Shape(of, _) => CType::Type(*of),
+            ctype => ctype.clone(),
+        }).collect();
+        own.promoted = ctx.promoted.clone();
+        let upvalues = unsafe { (*self.proto).upval_count };
+        let map: Vec<(Root, Loc)> = (0..slots).map(|slot| Root::Slot(slot as u16))
+            .chain((0..upvalues).map(Root::Upvalue))
+            .chain(ctx.values.roots().filter(|root| matches!(root, Root::Global(_))))
+            .map(|root| (root, Loc::root(root)))
+            .collect();
+        own.values = ctx.closing(0).view(&map);
+        own
     }
 
     /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
@@ -4674,26 +6135,47 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             self.jctx.frame_grew(outermost as usize, unsafe { (*outermost).frame_size.get() });
         }
         #[cfg(feature = "tracing")]
-        let (_line, _entry, _after) = (self.traced_line(owner), entry.tostring(owner), continuation.rest.pc());
+        let (_line, _entry, _after, _site) = (self.traced_line(owner), entry.tostring(owner), continuation.rest.pc(), entry.inline.last().expect("an inlined call's frame").site());
         let continuation = Rc::new(continuation);
         let pointer = Rc::as_ptr(&continuation);
         self.continuations.push(continuation);
         let caller = self.proto;
         self.set_current(callee as LProto<'_, '_>);
         self.versions.entry(self.proto).or_insert_with(|| HashMap::default());
-        let version = self.version(owner, 0, Rc::new(entry));
-        self.set_current(caller);
+        // Its frame's cells its entry's facts are about: the JIT fills them as the frame is
+        // entered. See Note [Upvalue cells].
+        let own = (1u32 << UPVALUE_CELLS) - 1;
+        let cells = entry.filled_cells() & own << (entry.depth() * UPVALUE_CELLS);
+        // Its code from the call's block, its frame entered, and made already if it was passed a
+        // variable number of arguments. See Note [Inlined frames].
         let shift = self.new_block(self.blocks[block.0].pc);
-        let stack = unsafe { (*callee).max_stack };
-        self.blocks[shift.0].instructions.extend([Residual::Inline { a: a as u16, b: b as u16, stack, continuation: pointer }, Residual::Jump(version)]);
+        let mut entry = entry;
+        let frame = entry.inline.last_mut().expect("an inlined call's frame");
+        (frame.cells, frame.continuation) = (cells, pointer);
+        #[cfg(feature = "tracing")]
+        crate::tracing::instant("spec", "frame_entered", &[("site", frame.site().as_str().into())]);
+        if frame.b == 0 {
+            frame.made = Made::Yes;
+            #[cfg(feature = "tracing")]
+            crate::tracing::instant("spec", "frame_made", &[("site", frame.site().as_str().into())]);
+            self.blocks[shift.0].instructions.push(Residual::Inline { a: frame.a, b: 0, stack: frame.stack, cells: frame.cells, continuation: frame.continuation });
+        } else {
+            self.blocks[shift.0].instructions.push(Residual::Enter(frame.by() as u16));
+            for slot in frame.b as usize - 1..frame.stack as usize {
+                self.blocks[shift.0].instructions.push(Residual::ExecWindow(Rc::new(crate::generators::LoadNil::new(&[slot]))));
+            }
+        }
+        self.compile(owner, 0, Rc::new(entry), shift);
+        self.set_current(caller);
         #[cfg(feature = "tracing")]
         crate::tracing::instant("spec", "inline", &[
+            ("site", _site.as_str().into()),
             ("line", _line.into()),
             ("callee", (unsafe { (*callee).line_defined } as u64).into()),
             ("after", _after.into()),
             ("call_block", block.0.into()),
             ("shift", shift.0.into()),
-            ("entry", version.0.into()),
+            ("entry", shift.0.into()),
             ("context", _entry.as_str().into()),
         ]);
         shift
@@ -4714,6 +6196,26 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The call it continues, laid out just before it, inlined from now on: this return,
             // from its frame, continues as any other. See Note [Inlined calls].
+            #[cfg(feature = "tracing")]
+            if let Some(call) = &inline {
+                let refused = if vm.compiled(call.block) {
+                    Some("compiled")
+                } else if !matches!(vm.blocks[call.block.0].instructions.get(call.off), Some(Residual::LuaCall { .. })) {
+                    Some("relaid")
+                } else if !inlines(&call.calling, unsafe { &*vm.proto }, unsafe { &*call.callee }, a) {
+                    Some("policy")
+                } else {
+                    None
+                };
+                if let Some(reason) = refused {
+                    crate::tracing::instant("spec", "inline_refused", &[
+                        ("line", vm.traced_line(owner).into()),
+                        ("callee", (unsafe { (*call.callee).line_defined } as u64).into()),
+                        ("call_block", call.block.0.into()),
+                        ("reason", reason.into()),
+                    ]);
+                }
+            }
             if let Some(call) = &inline
                 && !vm.compiled(call.block)
                 && let Some(&Residual::LuaCall { entry: CallEntry::Block(entry), .. }) = vm.blocks[call.block.0].instructions.get(call.off)
@@ -4725,19 +6227,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let mut decided = entry.clone();
                 decided.inline = Vec::new();
                 vm.inlined.entry((vm.proto, call.pc, call.callee as LProto<'_, '_>)).or_default().push(decided);
-                let continuation = vm.continuation(&call.calling, &ctx, &captured, &rest, a, c);
+                let continuation = vm.continuation(&call.calling, &ctx, &captured, &rest, &after, a, c);
                 let shift = vm.inline_call(owner, state, call.block, call.callee, a, call.b, entry, continuation);
                 vm.blocks[call.block.0].instructions[call.off] = Residual::Jump(shift);
             }
-            // In place, as for a call thunk. See Note [Thunk patching].
-            let block = if !appends || vm.compiled(block_id) {
-                let block = vm.new_block(vm.blocks[block_id.0].pc);
-                vm.jump_thunk(block_id, thunk_pc, block);
-                block
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, vm.blocks[block_id.0].pc, appends);
             let (a16, c16) = (a as u16, c as u16);
             let returned = state.returned;
             let results = (returned & !0xffff_ffff == crate::vm::RETURNED && identities < MAX_VERSIONS)
@@ -4819,15 +6313,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     fn make_tail_call_thunk(&self, block_id: BlockId, site: Rc<TailSite>, identities: usize, appends: bool) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
-            // In place, as for a call thunk. See Note [Thunk patching].
-            let block = if !appends || vm.compiled(block_id) {
-                let block = vm.new_block(vm.blocks[block_id.0].pc);
-                vm.jump_thunk(block_id, thunk_pc, block);
-                block
-            } else {
-                vm.blocks[block_id.0].instructions.truncate(thunk_pc);
-                block_id
-            };
+            let block = vm.reopen(block_id, thunk_pc, vm.blocks[block_id.0].pc, appends);
             let TailSite { ref calling, pc, a, b, closes, vararg, effects } = *site;
             let (a16, b16) = (a as u16, b as u16);
             let next = |vm: &Specializer| Residual::Thunk(vm.make_tail_call_thunk(block, site.clone(), identities + 1, false));
@@ -4886,7 +6372,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// nil, in a table whose metatable has an `__index` table goes on down the chain; any other key
     /// a load can't find, or a store's table lacks, continues the generator without it, in
     /// `fail_ctx`. See Notes [Field types] and [Table metatables].
-    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
+    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // Each forcing patches the thunk where it was forced, in `block_id`.
             let mut block_id = block_id;
@@ -4911,9 +6397,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
             if !usable {
                 let fail_block = vm.new_block(pc.0);
-                if let Some((succ_next, succ_ty, _)) = vm.compile_one(owner, pc.next_false(), fail_ctx.clone(), thunk_coro, ResumeArg::Failed, fail_block) {
-                    vm.compile(owner, succ_next, succ_ty, fail_block);
-                }
+                let compiled = vm.compile_one(owner, pc.next_false(), fail_ctx.clone(), thunk_coro, ResumeArg::Failed, fail_block);
+                vm.go_on(owner, compiled);
                 vm.jump_thunk(block_id, thunk_pc, fail_block);
                 return;
             }
@@ -4926,14 +6411,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let ctx_mut = Rc::make_mut(&mut ctx);
             {
                 let hkey = &mut ctx_mut.hkeys[href.0 as usize];
-                hkey.known_type = Some(Kind::Of(found));
+                hkey.known_type = Some(CType::Type(found));
                 hkey.chain = None;
                 // Initialize the hkey after discovery with a cleared hazard for the index
                 hkey.clear_checks();
                 hkey.check(idx);
             }
             // A chain it had before goes.
-            ctx_mut.fix_chains();
+            ctx_mut.fix_shaped_chains();
             let kbits = LCanon::constant(&ctx_mut.hkeys[href.0 as usize].key).boxed().bits();
             // The receiver's shape now has this hash key.
             if place == Place::Register {
@@ -4946,26 +6431,27 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
             let at = (index as u64) << 8 | href.0 as u64;
-            let href_init = Residual::ExecWindow(match (place, receiver) {
+            // A table lacking the key it's chained for expects to: its init's hot path is the
+            // miss.
+            let miss = chained && entry.is_none() && place == Place::Register && receiver == LType::Table;
+            let href_init = if miss {
+                // Safety: the key is a constant's, which outlives the code using it.
+                let hash = std::hash::BuildHasher::hash_one(&crate::vm::InternedHasher::default(), unsafe { LCanon::from_bits(kbits) });
+                Residual::Exec(href_init_miss(idx, at, kbits, hash))
+            } else { Residual::ExecWindow(match (place, receiver) {
                 (Place::Register, LType::Table) => Rc::new(HrefInit::new(at, kbits, &[idx])) as Rc<dyn Window>,
                 (Place::Register, LType::Userdata) => Rc::new(HrefInitIndex::new(at, kbits, &[idx])),
                 (Place::Register, _) => unreachable!("a hash key of a {receiver}"),
-                (place, _) => Rc::new(HrefInitAt::new(at, kbits, place.bits(), &[])),
-            });
-            // In place, unless the thunk's JIT code can only be patched to a
-            // jump. See Note [Thunk patching].
-            if !appends || vm.compiled(block_id) {
-                let old_block = block_id;
-                block_id = vm.new_block(pc.0);
-                vm.jump_thunk(old_block, thunk_pc, block_id);
-                vm.blocks[block_id.0].instructions.push(href_init);
-            } else {
-                vm.blocks[block_id.0].instructions[thunk_pc] = href_init;
-            }
+                (Place::Metatable(link), _) => Rc::new(HrefInitAt::<true>::new(at, kbits, link.0, &[])),
+                (Place::Index(link), _) => Rc::new(HrefInitAt::<false>::new(at, kbits, link.0, &[])),
+            }) };
+            block_id = vm.reopen(block_id, thunk_pc, pc.0, appends);
+            vm.blocks[block_id.0].instructions.push(href_init);
             let typed = vm.new_block(pc.0);
             let missing_key = vm.new_block(pc.0);
-            vm.blocks[block_id.0].instructions.push(Residual::Select(
-                vec![("has_key", typed), ("missing_key", missing_key)]));
+            // A `MISS` init's exit 0 is missing the key.
+            let targets = if miss { vec![("missing_key", missing_key), ("has_key", typed)] } else { vec![("has_key", typed), ("missing_key", missing_key)] };
+            vm.blocks[block_id.0].instructions.push(Residual::Select(targets));
             if chained {
                 // Its own field is none or nil, which a guard checks where it has the key,
                 // and the chain goes on at its metatable's `__index`, then the key in the
@@ -4974,8 +6460,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // As the generator's constants, the intern arena outlives the code.
                 let index_key: LConstant<'static, 'static> = unsafe { core::mem::transmute(index_key) };
                 let own_key: LConstant<'static, 'static> = unsafe { core::mem::transmute(ctx_mut.hkeys[href.0 as usize].key.clone()) };
-                let link = ctx_mut.alloc_hkey(HashKey { place: Place::Metatable(href), known_type: Some(Kind::Mixed), ..HashKey::new(idx, index_key) });
-                let found_at = ctx_mut.alloc_hkey(HashKey { place: Place::Index(link), known_type: Some(Kind::Mixed), ..HashKey::new(idx, own_key) });
+                let link = ctx_mut.alloc_hkey(HashKey { place: Place::Metatable(href), known_type: Some(CType::Unknown), ..HashKey::new(idx, index_key) });
+                let found_at = ctx_mut.alloc_hkey(HashKey { place: Place::Index(link), known_type: Some(CType::Unknown), ..HashKey::new(idx, own_key) });
                 ctx_mut.hkeys[href.0 as usize].chain = Some(found_at);
                 let chain = vm.new_block(pc.0);
                 let link_thunk = vm.make_href_thunk(chain, thunk_coro.clone(), idx, link, pc, ctx.clone(), true, true, Some(found_at), fail_ctx.clone());
@@ -4999,9 +6485,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// thunk of the hash key after it (`next`), and its failure finding the field's type and
     /// guarding that in turn: a load's field found nil, or an `__index` no longer a table, is
     /// found again instead. See Notes [Field types] and [Table metatables].
-    fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, idx: usize, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) {
+    fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) {
         let mut typed_ctx = ctx.clone();
-        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(Kind::Of(expected));
+        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(CType::Type(expected));
+        // An integer found here is an origin, unless this guard was rebuilt from one already. See
+        // Note [Field types].
+        let rebuilt = self.decided.get(&self.proto).is_some_and(|decided| decided.contains_key(&pc));
+        let origin = (expected == LType::Integer && !rebuilt).then(|| {
+            let offset = self.blocks[block.0].instructions.len();
+            let (coro, ctx, fail_ctx) = (thunk_coro.clone(), ctx.clone(), fail_ctx.clone());
+            let rebuild = move |vm: &mut Specializer, _owner: &mut Owner, _how: ResumeArg| {
+                vm.blocks[block.0].instructions.truncate(offset);
+                let guard = vm.make_field_guard_thunk(block, coro, idx, href, pc, ctx, chains, next, fail_ctx);
+                vm.blocks[block.0].instructions.push(Residual::Thunk(guard));
+                vm.cuts.insert(block, offset + 1);
+            };
+            Rc::new(TLCell::new(OriginState { rebuild: Some(Box::new(rebuild)), block, offset, pc, used: false }))
+        });
+        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].origins = FieldOrigins(origin.map(|origin| Rc::new(TLCell::new(vec![origin]))));
         let pass = match next {
             Some(next) => {
                 let pass = self.new_block(pc.0);
@@ -5009,12 +6510,22 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 self.blocks[pass.0].instructions.push(Residual::Thunk(thunk));
                 pass
             },
-            None => self.subblock(owner, pc.next_true(), typed_ctx, thunk_coro.clone(), ResumeArg::HashRef(href, Kind::Of(expected))),
+            None => self.subblock(owner, pc.next_true(), typed_ctx, thunk_coro.clone(), ResumeArg::HashRef(href, CType::Type(expected))),
         };
-        let fail = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+        let fail = self.make_field_guard_thunk(block, thunk_coro, idx, href, pc, ctx, chains, next, fail_ctx);
+        self.blocks[block.0].instructions.push(Residual::GuardWitness { href, expected });
+        self.blocks[block.0].instructions.push(Residual::Thunk(fail));
+        self.blocks[block.0].instructions.push(Residual::Jump(pass));
+    }
+
+    /// The thunk finding `href`'s field's type, in `block`, and guarding that (`guard_witness`):
+    /// a guard's failure, or a guard rebuilt from an origin. A load's field found nil, or an
+    /// `__index`'s hash key, is found again instead. See Note [Field types].
+    fn make_field_guard_thunk(&self, block: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
             let found = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() }.unbox().typeof_();
-            debug!("field of {href:?} found {found}, not {expected}");
+            debug!("field of {href:?} found {found}");
             let again = vm.new_block(pc.0);
             vm.jump_thunk(block, thunk_pc, again);
             if (chains && found == LType::Nil) || next.is_some() {
@@ -5023,13 +6534,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 return;
             }
             vm.guard_witness(owner, again, thunk_coro.clone(), idx, href, found, pc, ctx.clone(), chains, next, fail_ctx.clone());
-        })));
-        self.blocks[block.0].instructions.push(Residual::GuardWitness { href, expected });
-        self.blocks[block.0].instructions.push(Residual::Thunk(fail));
-        self.blocks[block.0].instructions.push(Residual::Jump(pass));
+        })))
     }
 
-    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId, chains: bool) {
+    fn make_epoch_check(&mut self, owner: &mut Owner, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, tab: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, success_block: BlockId, chains: bool) {
         // In order to assert that an href is still valid, we need to check that the witnessed
         // epoch is still the same: if so, all of its keys still have the same type as the
         // cached hashkey, and no additional hashkeys were inserted (which may otherwise cause
@@ -5047,11 +6555,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // witness epoch and jump back to the success block.
             let check_block = vm.new_block(pc.0);
             vm.jump_thunk(block_id, thunk_pc, check_block);
-            let expected = thunk_ctx.hkeys[href.0 as usize].known_type.expect("a live hash key");
+            let expected = thunk_ctx.hkeys[href.0 as usize].known_type.clone().expect("a live hash key");
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false, chains, None, thunk_ctx.clone());
             // A field of no stable type has nothing to check it still has: its
             // hash key is found again. See Note [Field types].
-            let Kind::Of(expected) = expected else {
+            let CType::Type(expected) = expected else {
                 vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
                 return;
             };
@@ -5077,15 +6585,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
     }
 
-    pub fn compile_one<C>(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<C>, mut arg: ResumeArg, block_id: BlockId) -> Option<(Pc, Rc<Context>, ResumeArg)>
-    where C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin + 'static
+    /// Compile what generator `coro` yields from `pc`, resumed with `arg`, in `block_id` and the
+    /// blocks it goes on in.
+    pub fn compile_one(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<dyn NativeGen>, mut arg: ResumeArg, mut block_id: BlockId) -> Compiled
     {
         // Where the constant being loaded was, for its fact's origin.
         let mut loading: Option<Origin> = None;
         loop {
-            let mut state = Pin::new(&mut coro).resume(arg);
+            let mut state = Pin::new(&mut *coro).resume(arg);
             arg = ResumeArg::Start;
-            'machine: loop { match state {
+            'machine: loop {
+            match state {
                 CoroutineState::Yielded(YieldOp::TypeofK(k)) => {
                     let proto = self.proto;
                     arg = ResumeArg::Type(constant_ctype(unsafe { &(&(*proto).constants.items)[k] }));
@@ -5132,7 +6642,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // left the witness at the old epoch (`Retype::Unknown`).
                     let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
                     if let Some(ty) = *ty {
-                        hkey.known_type = Some(Kind::Of(ty));
+                        // An integer field made a double: the code that found it an integer goes.
+                        // See Note [Field types].
+                        if let (Some(CType::Type(LType::Integer)), LType::Double, Some(origins)) = (&hkey.known_type, ty, hkey.origins.0.take()) {
+                            let origins = owner.ro(&origins).clone();
+                            let mut by_proto: Vec<(LProto<'src, 'intern>, Vec<Origin>)> = Vec::new();
+                            for origin in origins.into_iter().filter(|origin| owner.ro(origin).rebuild.is_some()) {
+                                let of = self.blocks[owner.ro(&origin).block.0].proto as LProto<'src, 'intern>;
+                                match by_proto.iter_mut().find(|(known, _)| *known == of) {
+                                    Some((_, set)) => set.push(origin),
+                                    None => by_proto.push((of, vec![origin])),
+                                }
+                            }
+                            for (of, set) in by_proto {
+                                self.contractions.push((of, set, ResumeArg::Failed));
+                            }
+                        }
+                        let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
+                        hkey.known_type = Some(CType::Type(ty));
+                        hkey.origins = FieldOrigins::default();
                     }
                     // If we updated an href, then we also need to set optimization hazards for any
                     // potentially aliased ones. We also need to invalidate this stack slot as
@@ -5146,14 +6674,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let constant = unsafe { &(&(*proto).constants.items)[k] };
                     arg = if matches!(constant, crate::chunk::Constant::String(s) if s.as_bytes() == name) { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
-                CoroutineState::Yielded(YieldOp::HashKey(place, key, chains)) => {
+                CoroutineState::Yielded(ref yielded @ (YieldOp::HashKey(..) | YieldOp::HashKeyNamed(..))) => {
                     let proto = self.proto;
-                    // The constant key.
-                    let k_const = ((key & 0x100) != 0).then_some(key & 0xff);
+                    // The key: a constant, or one known by its value.
+                    let (place, chains, named) = match yielded {
+                        YieldOp::HashKey(place, key, chains) => (*place, *chains, ((key & 0x100) != 0).then(|| unsafe { (&(*proto).constants.items)[key & 0xff].clone() })),
+                        YieldOp::HashKeyNamed(place, key, chains) => (*place, *chains, Some(key.clone())),
+                        _ => unreachable!(),
+                    };
                     // Only cache string keys
-                    let Some(k_val) = k_const
-                        .map(|k| unsafe { &(&(*proto).constants.items)[k] })
-                        .filter(|k_val| matches!(k_val, crate::chunk::Constant::String(_)))
+                    let Some(k_val) = named.as_ref().filter(|k_val| matches!(k_val, crate::chunk::Constant::String(_)))
                     else {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
@@ -5170,7 +6700,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         debug!("using cached href {:?}", cached);
                         let chain = ctx.chain_of(cached);
                         let tail = *chain.last().unwrap();
-                        let tail_type = ctx.hkeys[tail.0 as usize].known_type.expect("a live hash key");
+                        let tail_type = ctx.hkeys[tail.0 as usize].known_type.clone().expect("a live hash key");
                         // A store sets the register's own field, never one down its
                         // chain. See Note [Table metatables].
                         if !chains && chain.len() > 1 {
@@ -5180,7 +6710,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                         // A load never finds nil, or a field of no stable type, through a
                         // hash key: it finds it again, down the chain or not at all.
-                        if chains && !matches!(tail_type, Kind::Of(t) if t != LType::Nil) {
+                        if chains && (!matches!(tail_type, CType::Number | CType::Type(_)) || tail_type == CType::Type(LType::Nil)) {
                             let refind = self.make_href_thunk(block_id, coro.clone(), place, cached, pc, ctx.clone(), true, true, None, ctx.clone());
                             self.end_block(block_id);
                             self.blocks[block_id.0].instructions.push(Residual::Thunk(refind));
@@ -5224,12 +6754,23 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // captured by the generator: we only ever store the generator in the
                     // LClosure they came from, which is 'src 'lifetime, and so this is safe.
                     let k_val: &LConstant<'static, 'static> = unsafe { core::mem::transmute(k_val) };
-                    // Try to find an orphaned HashKey slot to re-use
+                    // At the field's index for its slot, which every path through the code
+                    // gives it, if no other hash key is there; else at a free one, or a new one.
+                    // See Note [Field types].
                     let href;
+                    let fixed = self.key_index(&ctx, place, k_val);
                     let orphan = ctx.hkeys.iter().enumerate().position(|(_, hkey)| hkey.orphan());
-                    if let Some(i) = orphan {
+                    if let Some(i) = fixed.filter(|&i| ctx.hkeys.get(i).is_none_or(|hkey| hkey.orphan())) {
                         href = HashRef(i as u8);
-                        Rc::make_mut(&mut ctx).hkeys[i] = HashKey::new(place, k_val.clone());
+                        let ctx = Rc::make_mut(&mut ctx);
+                        while ctx.hkeys.len() <= i {
+                            ctx.hkeys.push(HashKey { idx: OUTER, ..HashKey::new(OUTER, k_val.clone()) });
+                        }
+                        ctx.hkeys[i] = HashKey::new(place, k_val.clone());
+                    } else if let Some(i) = orphan {
+                        href = HashRef(i as u8);
+                        let ctx = Rc::make_mut(&mut ctx);
+                        ctx.hkeys[i] = HashKey::new(place, k_val.clone());
                     } else {
                         warn!("allocating new hkey for {:?} {:?}", place, &k_val);
                         let hr: u8 = ctx.hkeys.len().try_into().expect("too many hrefs");
@@ -5300,15 +6841,42 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(thunk);
                     return None;
                 },
-                CoroutineState::Yielded(YieldOp::OptimisticExec(op)) => {
+                CoroutineState::Yielded(YieldOp::Created(slot)) => {
+                    Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Unwatched);
+                },
+                CoroutineState::Yielded(YieldOp::Quotient(slot, of, by)) => {
+                    Rc::make_mut(&mut ctx).values.link(Loc::root(Root::Slot(slot as u16)), Label::Quotient(by), Loc::root(Root::Slot(of as u16)));
+                },
+                CoroutineState::Yielded(YieldOp::QuotientOf(slot)) => {
+                    arg = ctx.quotient(slot).map_or(ResumeArg::Failed, |(of, by)| ResumeArg::Quotient(of, by));
+                },
+                // A slot holding what a move into it would: the move is nothing.
+                CoroutineState::Yielded(YieldOp::HoldsValue(dest, src)) => {
+                    let holds = dest == src || ctx.values.members(Loc::root(Root::Slot(src as u16))).contains(&Root::Slot(dest as u16));
+                    arg = if holds { ResumeArg::Matched } else { ResumeArg::Failed };
+                },
+                // The closure an inlined call whose frame isn't made calls, if known. See Note
+                // [Inlined frames].
+                CoroutineState::Yielded(YieldOp::Reach(root)) => {
+                    arg = ResumeArg::Reach(ctx.reach(Loc::root(root)));
+                },
+                CoroutineState::Yielded(yielded @ (YieldOp::OptimisticExec(_) | YieldOp::OptimisticEmit(_))) => {
+                    if let YieldOp::OptimisticExec(op) = &yielded && op.closure() {
+                        self.observe(owner, &mut block_id, &mut ctx, pc.0, "OptimisticExec");
+                    }
+                    let (operands, accesses, residual): (SmallVec<[usize; 4]>, _, _) = match yielded {
+                        YieldOp::OptimisticExec(op) => (op.operands().into(), op.accesses(), Residual::ExecWindow(op)),
+                        YieldOp::OptimisticEmit(op) => (op.operands().into(), op.accesses(), Residual::Emit(op)),
+                        _ => unreachable!(),
+                    };
                     // Its outputs are written whichever path it takes. See Note [Optimistic ops].
-                    for (&slot, access) in op.operands().iter().zip(op.accesses()) {
+                    for (&slot, access) in operands.iter().zip(accesses) {
                         if access.writes() {
                             Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
                         }
                     }
                     self.end_block(block_id);
-                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op));
+                    self.blocks[block_id.0].instructions.push(residual);
                     let hot = self.subblock(owner, pc.next_true(), ctx.clone(), coro.clone(), ResumeArg::Matched);
                     let cold = self.new_block(pc.0);
                     // Its overflow rebuilds it from where its encoding was asked. See Note
@@ -5331,7 +6899,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Promote(slot)) => match ctx.constant(slot) {
                     Some(value) if self.promotes(pc.0, value) => {
                         ctx.rely(owner, slot);
-                        Rc::make_mut(&mut ctx).green(pc.0, value);
+                        Rc::make_mut(&mut ctx).promote(pc.0, value);
                         pc = pc.next_true();
                         arg = ResumeArg::Integer(value);
                     }
@@ -5339,7 +6907,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     }
-                    None if self.promoted.get(&(self.proto, pc.0)).is_some_and(|values| values.len() >= PROMOTE_GREENS) => {
+                    None if self.promoted.get(&(self.proto, pc.0)).is_some_and(|values| values.len() >= PROMOTE_SITE_VALUES) => {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     }
@@ -5356,9 +6924,99 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         pc = pc.next_false();
                         arg = ResumeArg::Failed;
                     } else {
+                        // Its thunk lays out the guard.
+                        if test.closure() {
+                            self.observe(owner, &mut block_id, &mut ctx, pc.0, "GuardDynamic");
+                        }
                         let thunk = Residual::Thunk(self.make_dynamic_thunk(block_id, coro.clone(), test, pc, ctx.clone()));
                         self.end_block(block_id);
                         self.blocks[block_id.0].instructions.push(thunk);
+                        return None;
+                    }
+                },
+                CoroutineState::Yielded(YieldOp::Watching(slot, _)) if ctx.values.fact(Loc::root(Root::Slot(slot as u16)), WATCHED).is_some() => {
+                    pc = pc.next_true();
+                    arg = ResumeArg::Matched;
+                },
+                CoroutineState::Yielded(YieldOp::Watching(slot, freezes)) => {
+                    if freezes {
+                        Rc::make_mut(&mut ctx).effect(Effect::Watch);
+                        // See Note [Call effects].
+                        self.join_effects(owner, Effects::WATCH);
+                    }
+                    let thunk = self.make_watch_thunk(block_id, coro.clone(), slot, pc, ctx.clone(), true, freezes);
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                    return None;
+                },
+                CoroutineState::Yielded(YieldOp::FrozenElement(table, key)) => {
+                    arg = self.frozen_element(owner, &ctx, table, key).unwrap_or(ResumeArg::Failed);
+                },
+                CoroutineState::Yielded(YieldOp::Discovered(slot, bits, ctype, constant)) => {
+                    let ctx = Rc::make_mut(&mut ctx);
+                    ctx.set_types(owner, vec![(slot, ctype)]);
+                    let at = Loc::root(Root::Slot(slot as u16));
+                    if let Some(value) = constant {
+                        ctx.values.learn(at, Known::Constant { value, origins: None });
+                    }
+                    ctx.values.learn(at, Known::Value(bits));
+                },
+                CoroutineState::Yielded(YieldOp::KnownInteger(slot)) => {
+                    arg = match ctx.constant(slot) {
+                        Some(value) => {
+                            ctx.rely(owner, slot);
+                            ResumeArg::Integer(value)
+                        }
+                        None => ResumeArg::Failed,
+                    };
+                },
+                CoroutineState::Yielded(YieldOp::ValueOf(slot)) => {
+                    arg = match ctx.values.fact(Loc::root(Root::Slot(slot as u16)), VALUE) {
+                        Some(&Known::Value(bits)) => ResumeArg::Boxed(bits),
+                        _ => ResumeArg::Failed,
+                    };
+                },
+                // A table known unwatched is checked no more. See Note [Watched tables].
+                CoroutineState::Yielded(YieldOp::Trip(Some(slot))) if ctx.values.fact(Loc::root(Root::Slot(slot as u16)), UNWATCHED).is_some() => {
+                    pc = pc.next_true();
+                    arg = ResumeArg::Matched;
+                },
+                CoroutineState::Yielded(YieldOp::Trip(of)) => {
+                    // Its cold way, the table watched, goes on knowing no element. See Note
+                    // [Watched tables].
+                    let check: Rc<dyn Window> = match of {
+                        Some(slot) => Rc::new(TripCheck::new(&[slot])),
+                        None => Rc::new(TripCheckGlobal::new(&[])),
+                    };
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(Residual::ExecWindow(check));
+                    let mut passed = (*ctx).clone();
+                    if let Some(slot) = of {
+                        passed.values.learn(Loc::root(Root::Slot(slot as u16)), Known::Unwatched);
+                    }
+                    let hot = self.subblock(owner, pc.next_true(), Rc::new(passed), coro.clone(), ResumeArg::Matched);
+                    let cold = self.new_block(pc.0);
+                    let mut unwatched = (*ctx).clone();
+                    unwatched.effect(Effect::Trip);
+                    let side = self.make_side_thunk(cold, coro.clone(), pc.next_false(), Rc::new(unwatched), ResumeArg::Matched);
+                    self.blocks[cold.0].instructions.extend([Residual::Tripped(of), Residual::Thunk(side)]);
+                    self.blocks[block_id.0].instructions.push(Residual::Branch { hot, cold });
+                    return None;
+                },
+                CoroutineState::Yielded(YieldOp::Learn(slot)) => {
+                    let thunk = self.make_learn_thunk(block_id, coro.clone(), slot, pc, ctx.clone());
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
+                    return None;
+                },
+                CoroutineState::Yielded(YieldOp::LearnKind(slot)) => {
+                    if ctx.kind(Root::Slot(slot as u16)).is_some() {
+                        pc = pc.next_true();
+                        arg = ResumeArg::Matched;
+                    } else {
+                        let thunk = self.make_learn_kind_thunk(block_id, coro.clone(), slot, pc, ctx.clone());
+                        self.end_block(block_id);
+                        self.blocks[block_id.0].instructions.push(Residual::Thunk(thunk));
                         return None;
                     }
                 },
@@ -5397,9 +7055,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         },
                         None => Rc::make_mut(&mut ctx).effect(Effect::WriteAny),
                     }
+                    if func.frame {
+                        self.observe(owner, &mut block_id, &mut ctx, pc.0, func.name);
+                    }
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
+                    if w.closure() {
+                        self.observe(owner, &mut block_id, &mut ctx, pc.0, w.name());
+                    }
                     for (&slot, access) in w.operands().iter().zip(w.accesses()) {
                         if access.writes() {
                             Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
@@ -5407,7 +7071,16 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(w));
                 },
+                CoroutineState::Yielded(YieldOp::Emit(op)) => {
+                    for (&slot, access) in op.operands().iter().zip(op.accesses()) {
+                        if access.writes() {
+                            Rc::make_mut(&mut ctx).effect(Effect::Write(slot));
+                        }
+                    }
+                    self.blocks[block_id.0].instructions.push(Residual::Emit(op));
+                },
                 CoroutineState::Yielded(YieldOp::NativeCall { nf, a, b, c }) => {
+                    self.observe(owner, &mut block_id, &mut ctx, pc.0, "NativeCall");
                     self.blocks[block_id.0].instructions.push(Residual::NativeCall { nf, a: a as u16, b: b as u16, c: c as u16 });
                     // A native may allocate (a table, a string).
                     self.blocks[block_id.0].allocates = true;
@@ -5437,10 +7110,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Copy(dest, src)) => {
                     // A copy's class tells more than its slots' type only of a value that can
-                    // have fields or a kind. See Note [Value classes] in `classes`.
+                    // have fields or a kind, or is a known constant. See Note [Value classes].
                     let plain = matches!(ctx.slot(src), CType::Number | CType::Type(LType::Nil | LType::Bool | LType::String | LType::Integer | LType::Double));
-                    if dest != src && !plain {
+                    if dest != src && (!plain || ctx.constant(src).is_some()) {
                         Rc::make_mut(&mut ctx).values.assign(Root::Slot(dest as u16), Loc::root(Root::Slot(src as u16)));
+                    }
+                    // A copy of a table is checked where the table is.
+                    if dest != src {
+                        for hkey in &mut Rc::make_mut(&mut ctx).hkeys {
+                            if hkey.checked(src) {
+                                hkey.check(dest);
+                            } else if let Some(checked) = hkey.hazards.get_mut(dest) {
+                                *checked = false;
+                            }
+                        }
                     }
                 },
                 CoroutineState::Yielded(YieldOp::UpvalueHolds(upvalue, slot)) => {
@@ -5469,6 +7152,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let loaded = ctx.values.same(Loc { root: Root::Slot(slot as u16), path: &path }, Loc::root(Root::Slot(table as u16)));
                     arg = if loaded { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
+                // The running closure's own upvalue, which a guard can read the table of;
+                // through the slot, a kind found out is the upvalue's too (`learn_kind`).
                 CoroutineState::Yielded(YieldOp::Subject(slot)) => {
                     arg = ResumeArg::Subject(ctx.holds(slot).map_or(Root::Slot(slot as u16), Root::Upvalue));
                 },
@@ -5482,16 +7167,25 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 },
                 CoroutineState::Yielded(YieldOp::FieldType(slot, href)) => {
-                    let known = ctx.hkeys[href.0 as usize].known_type.expect("a live hash key");
+                    let known = ctx.hkeys[href.0 as usize].known_type.clone().expect("a live hash key");
                     // A nil field's load is its `__index`'s, of any type. See Note [Table
                     // metatables].
                     let known = match known {
-                        Kind::Of(LType::Nil) => Kind::Mixed,
+                        CType::Type(LType::Nil) => CType::Unknown,
                         known => known,
                     };
-                    Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.ctype())]);
-                    if let Kind::Of(known) = known {
-                        (pc, arg) = navigate(pc, &CType::Unknown, &CType::Type(known));
+                    Rc::make_mut(&mut ctx).set_types(owner, vec![(slot, known.clone())]);
+                    // The slot holds the field's value, and the field's array kind is its. See
+                    // Note [Field facts].
+                    // Only for a value that can be a table or a function: what a slot holding any
+                    // other learns, its type tells already.
+                    let object = matches!(known, CType::Unknown | CType::Type(LType::Table | LType::Userdata | LType::Closure));
+                    if object && let Some((table, name)) = ctx.field_of(href) {
+                        Rc::make_mut(&mut ctx).loaded(slot, Root::Slot(table), &[Label::Field(name)]);
+                    }
+                    // A number's encoding is found where it's used. See Note [Field types].
+                    if known != CType::Unknown {
+                        (pc, arg) = navigate(pc, &CType::Unknown, &known);
                     } else {
                         // Record the type on the hash key too, unless the load overwrote
                         // the table's register and dropped its hash keys.
@@ -5502,15 +7196,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         return None;
                     }
                 },
-                CoroutineState::Yielded(YieldOp::UpvalueKnown(upvalue)) => {
-                    // A native's fact is of its code, and its value is the one cell it was
-                    // made with. A Lua function's is only of its prototype (what its
-                    // identity guard compares), which closure isn't known: that, like any
-                    // other value, is only known as what a slot still holds.
-                    arg = match (ctx.upvalue(upvalue), ctx.held(upvalue)) {
-                        (Some(CType::NativeFunction(nf)), _) => ResumeArg::Boxed(LBoxed::box_lvalue(LValue::NClosure(*nf)).bits()),
-                        (_, Some(slot)) => ResumeArg::Integer(slot as i32),
-                        _ => ResumeArg::Failed,
+                CoroutineState::Yielded(YieldOp::UpvalueCell(upvalue)) => {
+                    arg = match ctx.upvalue_cell(upvalue) {
+                        Some(cell) => ResumeArg::Cell(cell, ctx.cell_filled(upvalue)),
+                        None => ResumeArg::Failed,
                     };
                 },
                 CoroutineState::Yielded(YieldOp::LoadUpvalue(slot, upvalue)) => {
@@ -5527,12 +7216,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             });
                             self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckNative::new(nf.get_ptr() as usize, &[slot]))));
                         },
-                        Some(CType::LuaFunction(lclos)) => {
-                            windowed!(CheckLua, [proto: usize], [], |owner, state, base| (value) {
+                        Some(CType::LuaFunction(proto)) => {
+                            windowed!(reads CheckLua, [proto: usize], [], |owner, state, base| (value) {
                                 let LValue::LClosure(clos) = value.unbox() else { panic!("fragile information: a Lua function was assumed, {:?} found", value) };
                                 assert_eq!(clos.ro(owner).prototype as usize, proto, "fragile information: another Lua function was assumed");
                             });
-                            let proto = lclos.ro(owner).prototype as usize;
+                            let proto = *proto as usize;
                             self.blocks[block_id.0].instructions.push(Residual::ExecWindow(Rc::new(CheckLua::new(proto, &[slot]))));
                         },
                         Some(CType::Type(ty)) => {
@@ -5587,21 +7276,18 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // needs a continuation for it to unwind to. See Note [Errors].
                             let native = matches!(&ctx.types[a], CType::NativeFunction(nf) if !nf.is_protected_call());
                             // A native with a generator is compiled by it, as an opcode is. See Note
-                            // [Native generators] in `library`.
+                            // [Native generators].
                             if native && !resumes && let CType::NativeFunction(nf) = &ctx.types[a] && let Some(generator) = nf.generator() {
-                                let coro = Box::new(generator(nf.native(), a, b, c));
-                                return self.compile_one(owner, pc, ctx, coro, ResumeArg::Start, block_id);
+                                coro = generator(nf.native(), a, b, c);
+                                arg = ResumeArg::Start;
+                                break 'machine;
                             }
                             if native && let CType::NativeFunction(nf) = &ctx.types[a] {
                                 // A native runs as a window op if we have one, and we have all of its
                                 // arguments of the type it assumes. It gives one result, even with
                                 // C = 0.
                                 // See Note [Native windows].
-                                let window = native_window(&ctx, a, b, c)
-                                    .filter(|(end, op)| (a + 1..*end).all(|slot| op.args.accepts(&ctx.types[slot])))
-                                    .map(|(_, op)| op);
-
-                                if let Some(op) = window {
+                                if let Some(op) = windowed_call(&ctx, a, b, c) {
                                     Rc::make_mut(&mut ctx).effect(Effect::Write(a));
                                     self.blocks[block_id.0].instructions.push(Residual::ExecWindow(op.window));
                                     if c == 0 {
@@ -5610,12 +7296,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     result = Some(op.result);
                                     pure = true;
                                 } else {
+                                    let (call, is_pure) = (nf.native(), nf.is_pure());
+                                    self.observe(owner, &mut block_id, &mut ctx, pc.0, "NativeCall");
                                     self.blocks[block_id.0].instructions.push(Residual::NativeCall {
-                                        nf: nf.native(), a: a as u16, b: b as u16, c: c as u16
+                                        nf: call, a: a as u16, b: b as u16, c: c as u16
                                     });
                                     // A native may allocate (a table, a string).
                                     self.blocks[block_id.0].allocates = true;
-                                    pure = nf.is_pure();
+                                    pure = is_pure;
                                     // See Note [Call effects].
                                     if !pure {
                                         self.join_effects(owner, Effects::OPAQUE);
@@ -5632,16 +7320,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // For a Lua callee's continuation, which applies only what the
                             // callee's effects falsify: the context before the call, but for
                             // the callee's frame, from `a` on. See Note [Call effects].
-                            let before = (!native).then(|| {
-                                let mut before = (*ctx).clone();
-                                for idx in a..before.types.len() {
-                                    before.effect(Effect::Write(idx));
-                                }
-                                let frame = (a..before.types.len()).map(|idx| (idx, CType::Unknown)).collect();
-                                before.set_types(owner, frame);
-                                let captured: Rc<[usize]> = captured.iter().copied().filter(|&slot| slot < a).collect();
-                                (Rc::new(before), captured)
-                            });
+                            let before = (!native).then(|| before_call(owner, &ctx, &captured, a));
                             if !pure {
                                 // An unknown call may invalidate any fragile information.
                                 // See Note [Fragile information].
@@ -5675,7 +7354,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     pc = pc.next_true();
                                     break 'machine;
                                 }
-                                return Some((pc.0 + 1, ctx, ResumeArg::Start));
+                                return Some((pc.0 + 1, ctx, ResumeArg::Start, block_id));
                             }
                             // In a version of the call's point, for the context at the call. See
                             // Note [Call sites].
@@ -5694,11 +7373,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                     #[cfg(feature = "tracing")]
                                     {
                                         let context = calling.tostring(owner);
+                                        let inline = self.traced_inline(&calling);
                                         crate::tracing::instant("spec", "block", &[
                                             ("block", call_block.0.into()),
                                             ("line", self.traced_line(owner).into()),
                                             ("pc", pc.0.into()),
                                             ("context", context.as_str().into()),
+                                            ("inline", inline.as_str().into()),
                                         ]);
                                     }
                                     self.end_block(block_id);
@@ -5746,10 +7427,21 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::Cache(&*cache as *const GlobalCache);
                     self.global_caches.push(cache);
                 },
+                CoroutineState::Yielded(YieldOp::LoadGlobal(slot, k)) => {
+                    let proto = self.proto;
+                    if let crate::chunk::Constant::String(name) = unsafe { &(&(*proto).constants.items)[k] } {
+                        Rc::make_mut(&mut ctx).loaded(slot, Root::Global(name_hash(name.as_bytes())), &[]);
+                    }
+                },
                 CoroutineState::Yielded(YieldOp::SetKeyHazards(k)) => {
                     let proto = self.proto;
                     let key: &LConstant<'static, 'static> = unsafe { core::mem::transmute(&(&(*proto).constants.items)[k]) };
                     Rc::make_mut(&mut ctx).set_key_hazards(key);
+                    // The global, and any field of its name, may hold another value now. See Note
+                    // [Field facts].
+                    if let crate::chunk::Constant::String(name) = key {
+                        Rc::make_mut(&mut ctx).forget_named(Some(name_hash(name.as_bytes())));
+                    }
                     // A store into the environment's hash part. See Note [Call effects].
                     self.join_effects(owner, Effects::HASH);
                 },
@@ -5760,7 +7452,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::Clobber(from)) => {
                     let clobbered = (from..ctx.types.len()).map(|idx| (idx, CType::Unknown)).collect();
-                    Rc::make_mut(&mut ctx).set_types(owner, clobbered)
+                    Rc::make_mut(&mut ctx).set_types(owner, clobbered);
                 },
                 CoroutineState::Yielded(YieldOp::WidenConstant(slot)) => {
                     if ctx.types.get(slot) == Some(&CType::Type(LType::Integer)) {
@@ -5838,7 +7530,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     return None;
                 },
                 CoroutineState::Complete(r) => {
-                    return Some((pc.0 + 1, ctx, r));
+                    return Some((pc.0 + 1, ctx, r, block_id));
                 }
             } break 'machine; }
         }
@@ -5846,6 +7538,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     pub fn run(&mut self, gc: GcCtx<'_>, owner: &mut Owner, mut id: BlockId, mut state: RunState<'src, 'intern>) -> (RunState<'src, 'intern>, FVec<LBoxed<'src, 'intern>>) {
         let mut off: usize = 0;
+        // The block the loop last ran, and how many times over the edge from it to the next counts.
+        // See Note [Edge counts].
+        #[cfg(feature = "jit")]
+        let (mut from, mut count_by) = (id, 1);
         debug!("run");
         // Republish on entry: `state` was moved into this frame (the caller's pointer is now
         // stale) and a JIT block can call a native before the first safepoint. See Note
@@ -5868,18 +7564,33 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             #[cfg(feature = "jit")]
             if off == 0 && state.gas > 0 {
+                let recent = self.jctx.edges.count(from, id, count_by);
+                // Only an edge where a region should start compiles one: a loop's back edge, into
+                // a function or back into one, or after JIT code exits. See Note [Edge counts].
+                let starts = count_by > 1 || {
+                    let (source, target) = (&self.blocks[from.0], &self.blocks[id.0]);
+                    source.proto != target.proto || target.pc <= source.pc
+                };
+                (from, count_by) = (id, 1);
+                let block = &mut self.blocks[id.0];
+                // Counted down as the block is entered, to 1, for whether it ran: 0 is a block
+                // forced to compile.
                 let hot = block.jit_info.hotness.get();
-                if hot > 0 {
+                if hot > 1 {
                     block.jit_info.hotness.set(hot - 1);
-                } else {
+                }
+                if block.jit_info.entry.is_some() || hot == 0 || (starts && recent >= crate::jit::HOT_EDGE) {
+                    count_by = crate::jit::EXIT_COUNT;
                     if block.jit_info.entry.is_none() {
                         debug!("jit compile {id:?}");
                         // As many inlined calls deep as the running frame's code is: the entries
                         // the interpreter has for them, the callstack's last. See Note [Inlined
                         // calls].
                         let depth = state.callstack.iter().rev().take_while(|entry| entry.returns_to().is_none()).count();
-                        let offset = state.callstack.len().checked_sub(depth).filter(|_| depth > 0).map_or(0, |outer| state.base - state.callstack[outer].frame);
-                        self.jit_compile(id, owner, depth, offset);
+                        let offset = state.callstack.len().checked_sub(depth).filter(|_| depth > 0).map_or(state.shifted, |outer| state.base - state.callstack[outer].frame);
+                        // A forced region, or every block's with `immediate_jit`, has every block it
+                        // reaches. See Note [Region selection].
+                        self.jit_compile(id, owner, depth, offset, hot != 0 && !cfg!(feature = "immediate_jit"));
                     }
 
                     let mut jit_entry = self.blocks[id.0].jit_info.entry.unwrap();
@@ -5894,7 +7605,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                     let next_off = (ret >> 32) as i32 as isize;
                     let next_id = (ret & 0xFFFFFFFF) as usize;
-                    self.proto = state.clos.ro(owner).prototype;
 
                     #[cfg(feature = "tracing")]
                     self.trace_bailout(owner, &state, next_off, next_id);
@@ -5906,6 +7616,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     } else if next_off == -1 {
                         debug!("jit bail 1 from {next_id}");
                         state.trap = false;
+                        self.trip_pending(owner, &mut state);
                         id = BlockId(next_id as usize);
                         off = state.current_off as usize;
                         // Fallthrough to continue post-trap in the interpreter
@@ -5939,6 +7650,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     }
                 }
             }
+            // See `BLOCK_COUNTS`.
+            #[cfg(feature = "block_counts")]
+            if off == 0 {
+                crate::jit::BLOCK_COUNTS[1][id.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // An error JIT code exited for. See Note [Errors].
             if state.error.is_some() {
                 (id, off) = (self.unwind(owner, &mut state), 0);
@@ -5951,10 +7667,20 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             if state.gas == 0 {
                 let res = &self.blocks[id.0].instructions[off];
                 println!("out of gas at {id:?} {off} {res:?}");
-                println!("out of gas run state: base={:?}", state.base);
+                let base_ptr = unsafe { state.vals.stack_ptr.as_non_null_ptr().add(state.base).as_ptr() } as u64;
+                println!("out of gas run state: base={:?}, JIT code's base {:+} slots from it", state.base, (state.gas_base_ptr as i64 - base_ptr as i64) / 8);
                 println!("out of gas return stack: {:?}", state.callstack);
                 state.gas -= 1;
+            } else if state.gas < 0 && state.gas > -200 {
+                // What runs after, to where a run that goes wrong does.
+                let res = &self.blocks[id.0].instructions[off];
+                let end = (state.base + 12).min(state.vals.len());
+                println!("after gas at {id:?} {off} {res:?}");
+                println!("after gas frame at {}: {:?}", state.base, &state.vals[state.base..end]);
+                state.gas -= 1;
             }
+            // See `Block::proto`.
+            self.proto = self.blocks[id.0].proto as LProto<'src, 'intern>;
             // Borrowed, not cloned: an arm that needs `self` mutably (a thunk forcing, a call
             // finding its callee's version) first copies out what it uses, so no residual is
             // replaced while borrowed.
@@ -6038,6 +7764,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     w.interp(owner, &mut state);
                 },
+                Residual::Emit(op) => {
+                    off += 1;
+                    crate::emitted::interp(&**op, &mut state);
+                },
                 Residual::GuardDynamic(w) => {
                     w.interp(owner, &mut state);
                     off += if state.select == 1 { 2 } else { 1 };
@@ -6072,7 +7802,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // What the tail caller did, the callee's return must tell. See Note
                     // [Tail calls].
                     unsafe { (*callee_effects).set((*callee_effects).get().join((*effects).get())) };
-                    state.tail_call(owner, a as usize, b as usize, closes, vararg);
+                    state.tail_call(owner, a as usize, b as usize, closes, vararg, None);
                     let callee = state.clos.clone();
                     self.set_current(callee.ro(owner).prototype);
                     let block = match entry {
@@ -6094,6 +7824,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     off += 1;
                     gc.publish(&state, &*self);
                     state.call_native(nf, a, b, c, owner);
+                    self.trip_pending(owner, &mut state);
                 },
                 &Residual::Call { a, b, c } => {
                     off += 1;
@@ -6120,6 +7851,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // Past the `Arrive`: the native put its results in place.
                         // See Note [Returns].
                         off += 1;
+                        self.trip_pending(owner, &mut state);
                         // FIXME(metatables): __call
                     } else {
                         // See Note [Errors].
@@ -6127,20 +7859,46 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         state.raise(LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::string(format!("attempt to call a {name} value").as_bytes()))));
                     }
                 },
-                &Residual::Jump(target) => {
+                &Residual::Jump(target) | &Residual::PatchableJump(target) => {
                     id = target;
                     off = 0;
                 },
-                &Residual::Inline { a, b, stack, continuation } => {
+                &Residual::Uninline { entry, .. } => {
+                    off += 1;
+                    state.uninline(owner, Location(id, off).pack());
+                    id = entry;
+                    off = 0;
+                    continue;
+                },
+                &Residual::Inline { a, b, stack, continuation, .. } => {
                     off += 1;
                     let callee = state.vals[state.base + a as usize];
                     state.shift_frame::<true>(owner, callee, a as usize, b as usize, stack, true, continuation as u64);
                     self.set_current(state.clos.ro(owner).prototype);
                 },
+                &Residual::Enter(by) => {
+                    off += 1;
+                    state.base += by as usize;
+                    state.shifted += by as usize;
+                },
+                &Residual::Leave(by) => {
+                    off += 1;
+                    state.base -= by as usize;
+                    state.shifted -= by as usize;
+                },
                 &Residual::InlineReturn { a, b, closes, moves, .. } => {
                     off += 1;
                     state.unshift_frame::<true>(owner, moves.then_some((a as usize, b as usize)), closes);
                     self.set_current(state.clos.ro(owner).prototype);
+                },
+                &Residual::Tripped(of) => {
+                    let table = match of {
+                        Some(slot) => state.vals[state.base + slot],
+                        None => LBoxed::box_lvalue(LValue::Table(state._G.clone())),
+                    };
+                    let LValue::Table(tab) = table.unbox() else { unreachable!("a store into a table") };
+                    self.trip(owner, &mut state, tab);
+                    off += 1;
                 },
                 Residual::Thunk(thunk) => {
                     debug!("thunk {:?}", thunk);
@@ -6215,6 +7973,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             state.witness_base = witness_frame;
             state.witness_top = witness_top;
         }
+        // A protected call is made from a frame made. See Note [Inlined frames].
+        state.shifted = 0;
         // `c - 1` results, or both with C = 0, the top just past them.
         let results = [LBoxed::from_bool(false), error];
         let wanted = if handler.c == 0 { 2 } else { handler.c as usize - 1 };
@@ -6316,76 +8076,122 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             reverse_versions.insert(v.0, k);
         }
 
-        let g = graph!(strict di id!("t"); subgraph!("s",
-            self.blocks.iter().enumerate().flat_map(|(id, residuals)| {
-                let block_id = id;
-                let mut instructions = Vec::new();
-                let mut edges = vec![];
-
-                fn safe_str(s: impl Into<String>) -> String {
-                    let s = s.into().replace("<", "\\<");
-                    let s = s.replace(">", "\\>");
-                    s
-                }
-
-                for (off, res) in residuals.instructions.iter().enumerate() {
-                    let inst_label = res.to_string();
-                    instructions.push(inst_label);
-                    match res {
-                        Residual::Jump(target) => {
-                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0))));
+        fn safe_str(s: impl Into<String>) -> String {
+            let s = s.into().replace("<", "\\<");
+            s.replace(">", "\\>")
+        }
+        // A side exit never taken: a block that is only a thunk never forced.
+        let untaken = |block: BlockId| matches!(self.blocks[block.0].instructions.as_slice(), [Residual::Thunk(_)]);
+        // Each block's edges, labelled, and the block its code goes straight on into: a jump's,
+        // or a branch's hot block where its cold one was never taken.
+        let mut edges: Vec<Vec<(usize, Option<&'static str>)>> = Vec::new();
+        let mut natives: Vec<Vec<String>> = Vec::new();
+        let mut straight: Vec<Option<usize>> = Vec::new();
+        for residuals in &self.blocks {
+            let (mut out, mut calls) = (Vec::new(), Vec::new());
+            for (off, res) in residuals.instructions.iter().enumerate() {
+                match res {
+                    Residual::Jump(target) | Residual::PatchableJump(target) => out.push((target.0, None)),
+                    Residual::NativeCall { nf, .. } => calls.push(format!("\"{:p}\"", nf)),
+                    Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::GuardWitness { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
+                        if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
+                            out.push((target.0, Some("pass")));
                         }
-                        Residual::NativeCall { nf, a, b, c }  => {
-                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(format!("\"{:p}\"", nf)); attr!("label", "ncall"))));
-                        },
-                        Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::GuardDynamic(_) | Residual::HashGuard { .. } | Residual::GuardWitness { .. } | Residual::NativeGuard { .. } | Residual::LuaGuard { .. } => {
-                            if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 2) {
-                                edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "pass"))));
-                            }
-                            if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 1) {
-                                edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(target.0); attr!("label", "fail"))));
-                            }
-                        },
-                        Residual::Select(targets) => {
-                            for (name, target) in targets {
-                                edges.push(Stmt::Edge(
-                                    edge!(node_id!(block_id) => node_id!(target.0); attr!("label", name))));
-                            }
-                        },
-                        Residual::Branch { hot, cold } => {
-                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(hot.0); attr!("label", "hot"))));
-                            edges.push(Stmt::Edge(edge!(node_id!(block_id) => node_id!(cold.0); attr!("label", "cold"))));
-                        },
-                        _ => {}
+                        if let Some(Residual::Jump(target)) = residuals.instructions.get(off + 1) {
+                            out.push((target.0, Some("fail")));
+                        }
+                    },
+                    Residual::Select(targets) => out.extend(targets.iter().map(|(name, target)| (target.0, Some(*name)))),
+                    Residual::Branch { hot, cold } => {
+                        out.push((hot.0, Some("hot")));
+                        if !untaken(*cold) {
+                            out.push((cold.0, Some("cold")));
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            straight.push(match residuals.instructions.last() {
+                Some(Residual::Jump(target) | Residual::PatchableJump(target)) => Some(target.0),
+                Some(Residual::Branch { hot, cold }) if untaken(*cold) => Some(hot.0),
+                _ => None,
+            });
+            edges.push(out);
+            natives.push(calls);
+        }
+        // Blocks drawn as the code before them goes on: the only block reaching them goes straight
+        // into them. Untaken side exits aren't drawn at all.
+        let mut sources: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); self.blocks.len()];
+        for (from, out) in edges.iter().enumerate() {
+            for &(to, _) in out {
+                sources[to].insert(from);
+            }
+        }
+        let hidden = |block: usize| untaken(BlockId(block)) && sources[block].is_empty();
+        let absorbed: Vec<bool> = (0..self.blocks.len()).map(|block| {
+            sources[block].len() == 1 && sources[block].iter().all(|&from| from != block && straight[from] == Some(block))
+        }).collect();
+        let header = |block: usize| {
+            let context = reverse_versions.get(&block).map_or(String::new(), |(subpc, ctx)| {
+                format!("PC: {:?}\\n{}", subpc, ctx.tostring(owner)).replace("{", "(").replace("}", ")")
+            });
+            #[cfg(feature = "graph")]
+            let entered = format!(" x{}", self.blocks[block].entered);
+            #[cfg(not(feature = "graph"))]
+            let entered = "";
+            (format!("{block}{entered}"), context)
+        };
+        let mut drawn = vec![false; self.blocks.len()];
+        let mut stmts = Vec::new();
+        // Heads first, then any cycle of blocks each the only way into the next.
+        let order: Vec<usize> = (0..self.blocks.len()).filter(|&b| !absorbed[b]).chain((0..self.blocks.len()).filter(|&b| absorbed[b])).collect();
+        for head in order {
+            if drawn[head] || hidden(head) {
+                continue;
+            }
+            let mut chain = vec![head];
+            drawn[head] = true;
+            while let Some(next) = straight[*chain.last().unwrap()].filter(|&next| absorbed[next] && !drawn[next]) {
+                drawn[next] = true;
+                chain.push(next);
+            }
+            let (name, context) = header(head);
+            let mut rows: Vec<String> = Vec::new();
+            if !context.is_empty() {
+                rows.push(context);
+            }
+            for (i, &block) in chain.iter().enumerate() {
+                if i > 0 {
+                    let (name, context) = header(block);
+                    rows.push(format!("→ {name}"));
+                    if !context.is_empty() {
+                        rows.push(context);
                     }
                 }
-                debug!("graphviz edges: {:?}", edges);
-
-                let context_str = if let Some((subpc, ctx)) = reverse_versions.get(&block_id) {
-                    format!("PC: {:?}\\n{} |", subpc, ctx.tostring(owner))
-                } else {
-                    "".to_string()
-                };
-                let context_str = context_str.replace("{", "(");
-                let context_str = context_str.replace("}", ")");
-
-                //let label = safe_str(format!("\"{} | {{ {} {} }}\"", block_id, context_str, instructions));
-                #[cfg(feature = "graph")]
-                let entered = format!(" x{}", residuals.entered);
-                #[cfg(not(feature = "graph"))]
-                let entered = "";
-                let label = safe_str(format!("\"{}{} | {{ {} {} }}\"", block_id, entered, context_str, instructions.drain(..).intersperse("| ".to_string()).collect::<String>()));
-
-                let mut stmts = vec![Stmt::Node(node!(block_id;
-                    attr!("id", block_id),
-                    attr!("shape", "record"),
-                    attr!("label", label)
-                ))];
-                stmts.extend(edges);
-                stmts
-            }).collect::<Vec<_>>()
-          )
-        );
+                let instructions = &self.blocks[block].instructions;
+                // The jump into the next block of the chain is the chain going on.
+                let shown = if i + 1 < chain.len() && matches!(instructions.last(), Some(Residual::Jump(_) | Residual::PatchableJump(_))) { instructions.len() - 1 } else { instructions.len() };
+                rows.extend(instructions[..shown].iter().map(|res| res.to_string()));
+            }
+            let label = safe_str(format!("\"{} | {{ {} }}\"", name, rows.join("| ")));
+            stmts.push(Stmt::Node(node!(head; attr!("id", head), attr!("shape", "record"), attr!("label", label))));
+            for (i, &block) in chain.iter().enumerate() {
+                for &(to, label) in &edges[block] {
+                    // Into the chain's next block, or into an untaken side exit: not an edge.
+                    if (i + 1 < chain.len() && to == chain[i + 1] && straight[block] == Some(to)) || hidden(to) {
+                        continue;
+                    }
+                    stmts.push(Stmt::Edge(match label {
+                        Some(label) => edge!(node_id!(head) => node_id!(to); attr!("label", label)),
+                        None => edge!(node_id!(head) => node_id!(to)),
+                    }));
+                }
+                for native in &natives[block] {
+                    stmts.push(Stmt::Edge(edge!(node_id!(head) => node_id!(native); attr!("label", "ncall"))));
+                }
+            }
+        }
+        let g = graph!(strict di id!("t"); subgraph!("s", stmts));
 
         // The DOT source is written next to the rendered graph, to read as text.
         let dot_path = std::path::Path::new(filepath).with_extension("dot");

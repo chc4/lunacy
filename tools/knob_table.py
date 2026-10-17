@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""A table of `just hyperfines-knob` runs: per benchmark, the median time
-without the knob and with it, and the change, then the geometric mean of the
-changes.
+"""A table of `just hyperfines-knob` or `just hyperfines-feature` runs: per
+benchmark, the median time without the knob or feature and with it, and the
+change, then the geometric mean of the changes.
 
     tools/knob_table.py working/knob/*.json
 """
@@ -10,11 +10,17 @@ import math
 import sys
 from pathlib import Path
 
+import hyperfine_json
+
 
 def main(paths):
     rows, ratios = [], []
     for path in paths:
-        results = json.loads(Path(path).read_text())['results']
+        # A run that failed left no results.
+        text = Path(path).read_text()
+        if not text.strip():
+            continue
+        results = hyperfine_json.results(text, text=True)
         if len(results) != 2:
             continue
         base, knob = (r['median'] for r in results)

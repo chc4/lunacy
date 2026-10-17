@@ -7,9 +7,13 @@ events, and its JIT bailouts by reason and by where they are.
 
 (in the devshell, whose `trace_processor_shell` it runs; `just trace` runs it)
 """
+import os
 import shutil
 import sys
 from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import trace_sql
 
 def verify_trace(filename):
     try:
@@ -81,6 +85,7 @@ def verify_trace(filename):
             """)
             for row in qr:
                 print(f"{row.cnt:>10} | {str(row.reason):<30} | {row.source}:{row.line} block {row.block} at {row.off}")
+            inlined(filename)
         else:
             print("Trace loaded but seems empty of slices/tracks.")
 
@@ -94,6 +99,22 @@ def verify_trace(filename):
         except:
             pass
         sys.exit(1)
+
+def inlined(filename):
+    """The calls inlined: how many, in how many copies, and how many made their frames, and why."""
+    tp = trace_sql.connect(filename)
+    print("\n--- Inlined Calls ---")
+    totals = next(iter(tp.query("SELECT COUNT(*) AS calls, COALESCE(SUM(copies), 0) AS copies, "
+                                "COALESCE(SUM(made), 0) AS made, COALESCE(SUM(made > 0), 0) AS calls_made FROM inline_calls")))
+    print(f"{totals.calls} calls inlined in {totals.copies} copies; "
+          f"{totals.calls_made} calls made their frame, in {totals.made} copies")
+    print("\nPlaces code makes frames, by what observes them:")
+    for row in tp.query("SELECT by, COUNT(*) AS n FROM frames_made GROUP BY by ORDER BY n DESC LIMIT 10"):
+        print(f"{row.n:>10} | {row.by}")
+    print("\nThe calls with the most copies (caller line:pc -> callee line):")
+    for row in tp.query("SELECT line, pc, callee, copies, made FROM inline_calls ORDER BY copies DESC, line, pc LIMIT 10"):
+        print(f"{row.copies:>10} copies, {row.made:>4} made | {row.line}:{row.pc} -> {row.callee}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

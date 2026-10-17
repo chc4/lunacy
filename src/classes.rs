@@ -12,9 +12,10 @@ use std::hash::Hash;
 // a context knows of are partitioned into classes of equal values, and what is known is known of a
 // class.
 //
-// The places are roots, the frame's slots and the running function's own upvalues, and fields: a
-// labelled edge from a class to the class its field holds, as the closure a class's value is has
-// its upvalues, or a value loaded from a table's array part has the table it was loaded from. A
+// The places are roots, the frame's slots, the running function's own upvalues and the globals,
+// and fields: a labelled edge from a class to the class its field holds, as the closure a class's
+// value is has its upvalues, a table its hash fields, or a value loaded from a table's array part
+// has the table it was loaded from. A
 // field reached from a class holds the same value whatever place the class is reached from, so a
 // closure moved to another slot keeps what is known of its upvalues.
 //
@@ -54,6 +55,13 @@ use std::hash::Hash;
 pub enum Root {
     Slot(u16),
     Upvalue(u8),
+    /// The global of a name, by its hash.
+    Global(u64),
+    /// The value an inlined call passed its callee as argument n, which no code of the callee
+    /// writes.
+    Arg(u8),
+    /// A slot of a frame the frame is inlined into, by how many slots below its base it is.
+    Outer(u16),
 }
 
 /// The field a class's value has, which another class's value is.
@@ -63,6 +71,10 @@ pub enum Label {
     Upvalue(u8),
     /// The table whose array part it was loaded from.
     ElementOf,
+    /// The hash field of a name, by its hash, of the table it is.
+    Field(u64),
+    /// The integer it is the quotient of by a positive constant. See Note [Quotients].
+    Quotient(i32),
 }
 
 /// A place: a root, or a field reached from one along `path`.
@@ -440,14 +452,44 @@ impl<F: ClassFact> Classes<F> {
         self.normalize();
     }
 
+    /// Whether a field of a label `of` says is known.
+    pub fn has_label(&self, of: impl Fn(Label) -> bool) -> bool {
+        self.fields.iter().any(|&(_, label, _)| of(label))
+    }
+
+    /// The roots something is known of the value of.
+    pub fn roots(&self) -> impl Iterator<Item = Root> + '_ {
+        self.roots.iter().map(|&(root, _)| root)
+    }
+
     /// Whether anything is known of the value `root` holds.
     pub fn has(&self, root: Root) -> bool {
         self.root_class(root).is_some()
     }
 
+    /// The labels of the fields of the value `loc` holds that are known.
+    pub fn labels(&self, loc: Loc) -> Vec<Label> {
+        self.find(loc).map_or_else(Vec::new, |class| self.fields.iter().filter(|&&(c, _, _)| c == class).map(|&(_, label, _)| label).collect())
+    }
+
     /// Whether field `label` of the value `loc` holds is known.
     pub fn has_field(&self, loc: Loc, label: Label) -> bool {
         self.find(loc).is_some_and(|class| self.field(class, label).is_some())
+    }
+
+    /// Each root holding a value whose field `label` holds what `loc` does, with the label.
+    pub fn parents(&self, loc: Loc) -> Vec<(Root, Label)> {
+        let Some(class) = self.find(loc) else { return Vec::new() };
+        self.fields.iter()
+            .filter(|&&(_, _, target)| self.target_class(target) == Some(class))
+            .flat_map(|&(parent, label, _)| self.roots.iter().filter(move |&&(_, c)| c == parent).map(move |&(root, _)| (root, label)))
+            .collect()
+    }
+
+    /// Whether the last field `loc` is reached by is open onto a slot.
+    pub fn open_field(&self, loc: Loc) -> bool {
+        let Some((&label, parent)) = loc.path.split_last() else { return false };
+        self.find(Loc { root: loc.root, path: parent }).is_some_and(|class| matches!(self.field(class, label), Some(Target::Open(_))))
     }
 
     /// Every fact known, of every class.
@@ -627,6 +669,16 @@ impl<F: ClassFact> Classes<F> {
             let side = above.root_class(root).map_or(Side::Root(root), Side::Class);
             roots.push((root, intern(&mut pairs, (Mine::Class(class), side))));
         }
+        // A slot a field is open to is that field, though nothing else is known of it: paired
+        // with what `above` has there, it stays equal to the field where `above` has them equal.
+        for &(_, _, target) in &self.fields {
+            if let Target::Open(slot) = target && self.root_class(Root::Slot(slot)).is_none() && !roots.iter().any(|&(root, _)| root == Root::Slot(slot)) {
+                let root = Root::Slot(slot);
+                let side = above.root_class(root).map_or(Side::Root(root), Side::Class);
+                roots.push((root, intern(&mut pairs, (Mine::Root(root), side))));
+            }
+        }
+        roots.sort_by_key(|&(root, _)| root);
         let mut fields = Vec::new();
         let mut i = 0;
         while i < pairs.len() {
@@ -636,8 +688,14 @@ impl<F: ClassFact> Classes<F> {
             };
             if let Side::Class(a) = side {
                 for &(_, label, theirs) in above.fields.iter().filter(|&&(c, _, _)| c == a) {
-                    if self.field(class, label).is_none() && let Some(t) = above.target_class(theirs) {
-                        let pair = intern(&mut pairs, (Mine::Field(class, label), Side::Class(t)));
+                    if self.field(class, label).is_none() {
+                        // Open to a slot nothing else is known of: that slot's value.
+                        let side = match (theirs, above.target_class(theirs)) {
+                            (_, Some(t)) => Side::Class(t),
+                            (Target::Open(k), None) => Side::Root(Root::Slot(k)),
+                            _ => continue,
+                        };
+                        let pair = intern(&mut pairs, (Mine::Field(class, label), side));
                         fields.push((i, label, PairTarget::Pair(pair)));
                     }
                 }
@@ -876,8 +934,8 @@ mod tests {
         }
     }
 
-    const ROOTS: [Root; 6] = [Root::Slot(0), Root::Slot(1), Root::Slot(2), Root::Slot(3), Root::Upvalue(0), Root::Upvalue(1)];
-    const LABELS: [Label; 3] = [Label::Upvalue(0), Label::Upvalue(1), Label::ElementOf];
+    const ROOTS: [Root; 9] = [Root::Slot(0), Root::Slot(1), Root::Slot(2), Root::Slot(3), Root::Upvalue(0), Root::Upvalue(1), Root::Global(7), Root::Arg(0), Root::Outer(1)];
+    const LABELS: [Label; 4] = [Label::Upvalue(0), Label::Upvalue(1), Label::ElementOf, Label::Field(9)];
     const FACTS: [Fact; 5] = [Fact::Type(Ty::Int), Fact::Type(Ty::Float), Fact::Type(Ty::Number), Fact::Constant(1), Fact::Constant(2)];
 
     /// What a field of a value in the reference holds.

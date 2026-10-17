@@ -5,6 +5,7 @@
 
 use smallvec::SmallVec;
 
+use crate::emitted::Emitted;
 use crate::trace::Slots;
 use crate::window::{Access, Window, WINDOW};
 
@@ -115,6 +116,8 @@ pub enum Emit {
     Move { dst: Loc, src: Loc },
     /// Run the op with its operands at `w[skip..]`.
     Op { skip: usize },
+    /// Run the emitted op on the registers placed for its operands. See Note [Emitted ops].
+    Emitted,
 }
 
 /// A register half by name, for dumps: `w3` boxed, `x3` unboxed.
@@ -136,6 +139,7 @@ impl std::fmt::Display for Emit {
             Emit::Store { slot, reg, unboxed } => write!(f, "[{slot}] <- {}", Loc { reg, unboxed }),
             Emit::Move { dst, src } => write!(f, "{dst} <- {src}"),
             Emit::Op { skip } => write!(f, "op at w{skip}"),
+            Emit::Emitted => write!(f, "emitted op"),
         }
     }
 }
@@ -146,7 +150,7 @@ impl Emit {
             Emit::Load { .. } | Emit::Store { .. } => MEMORY_COST,
             Emit::Move { dst, src } if dst.unboxed != src.unboxed => CONVERT_COST,
             Emit::Move { .. } => MOVE_COST,
-            Emit::Op { .. } => 0,
+            Emit::Op { .. } | Emit::Emitted => 0,
         }
     }
 }
@@ -273,7 +277,7 @@ impl Cache {
     }
 }
 
-/// An op placed at one `SKIP`: what it emits and the cache it leaves.
+/// An op placed on its operands' registers: what it emits and the cache it leaves.
 struct Plan {
     cost: u32,
     /// Cached values its run overwrites.
@@ -352,24 +356,71 @@ impl WindowAlloc {
         let plan = skips
             .into_iter()
             .filter(|&skip| skip + slots.len() <= self.width)
-            .map(|skip| self.plan(slots, accesses, op.op.doubles(), skip))
+            .map(|skip| self.plan(slots, accesses, op.op.doubles(), &op.run(skip), Some(skip)))
             .min_by_key(|plan| (plan.cost, plan.overwritten, plan.skip))?;
         self.cache = plan.after;
         Some(plan.emits)
     }
 
-    /// Make the window hold `want` in each register it names, before `op`,
-    /// leaving the others as they are: store the dirty values overwritten that
-    /// survive nowhere else and that `op` doesn't rewrite, then fill the named
-    /// registers as one parallel move (a slot loaded into several registers is
-    /// loaded once and copied). See Note [Window allocation].
-    pub fn reconcile(&mut self, want: &Placement, framed: &Framed, skip: usize) -> SmallVec<[Emit; 16]> {
+    /// Registers for an emitted op's operands from the window as it is, with nothing planned:
+    /// each input where it is, or in a free register, its output in an input's register it
+    /// overwrites, else a free one, else one no input is in. See Note [Emitted ops].
+    pub fn free_regs(&self, op: &Framed) -> SmallVec<[usize; WINDOW]> {
+        let (slots, accesses) = (op.slots(), op.op.accesses());
+        let now = &self.cache;
+        let mut regs: SmallVec<[usize; WINDOW]> = SmallVec::new();
+        let mut taken: SmallVec<[usize; WINDOW]> = SmallVec::new();
+        let free = |taken: &[usize]| {
+            (0..self.width)
+                .filter(|reg| !taken.contains(reg))
+                .min_by_key(|&reg| match now.regs[reg] {
+                    None => 0,
+                    Some(slot) if !now.dirty.contains(&slot) => 1,
+                    Some(_) => 2,
+                })
+                .expect("a register for an emitted op's operand")
+        };
+        for (i, (&slot, access)) in slots.iter().zip(accesses).enumerate() {
+            let reg = match access {
+                Access::Write => match (0..i).find(|&j| accesses[j].reads() && slots[j] == slot) {
+                    Some(j) => regs[j],
+                    None => free(&taken),
+                },
+                _ => match (0..i).find(|&j| accesses[j].reads() && slots[j] == slot) {
+                    Some(j) => regs[j],
+                    None => now.position(slot).filter(|reg| !taken.contains(reg)).unwrap_or_else(|| free(&taken)),
+                },
+            };
+            regs.push(reg);
+            taken.push(reg);
+        }
+        regs
+    }
+
+    /// The next op of the run, an emitted op, its operands in `regs`: bring its inputs there and
+    /// run it. See Note [Emitted ops].
+    pub fn emitted(&mut self, op: &Framed, regs: &[usize]) -> SmallVec<[Emit; 16]> {
+        debug_assert!(
+            op.slots().iter().enumerate().all(|(i, &slot)| (0..i).all(|j| op.slots()[j] != slot || bit(op.op.doubles(), i) == bit(op.op.doubles(), j))),
+            "an emitted op taking a slot in two forms"
+        );
+        let plan = self.plan(op.slots(), op.op.accesses(), op.op.doubles(), regs, None);
+        self.cache = plan.after;
+        plan.emits
+    }
+
+    /// Make the window hold `want` in each register it names, before `op`, its operands in
+    /// `regs`, leaving the others as they are: store the dirty values overwritten that survive
+    /// nowhere else and that `op` doesn't rewrite, then fill the named registers as one parallel
+    /// move (a slot loaded into several registers is loaded once and copied). See Note [Window
+    /// allocation].
+    pub fn reconcile(&mut self, want: &Placement, framed: &Framed, regs: &[usize]) -> SmallVec<[Emit; 16]> {
         let op = framed.op;
         let rewritten = |slot: usize| framed.slots().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a.writes());
         let now = &self.cache;
-        // Each wanted value in the form its op reads it in, if in its run, else
-        // in the one it has.
-        let form = |reg: usize, slot: usize| match reg.checked_sub(skip).filter(|&i| i < op.arity() && op.accesses()[i].reads()) {
+        // Each wanted value in the form its op reads it in, if in one of its operands' registers,
+        // else in the one it has.
+        let form = |reg: usize, slot: usize| match regs.iter().zip(op.accesses()).position(|(&r, a)| r == reg && a.reads()) {
             Some(i) => bit(op.doubles(), i),
             None if now.regs[reg] == Some(slot) => bit(now.unboxed, reg),
             None => now.source(slot, false).is_some_and(|src| src.unboxed),
@@ -435,6 +486,13 @@ impl WindowAlloc {
         emits
     }
 
+    /// Store the dirty values of `slots`, which their registers keep, clean.
+    pub fn clean(&mut self, slots: &Slots) -> SmallVec<[Emit; WINDOW]> {
+        let stores = self.cache.dirty.iter().filter(|&&slot| slots.contains(slot)).map(|&slot| self.cache.store(slot)).collect();
+        self.cache.dirty.retain(|slot| !slots.contains(*slot));
+        stores
+    }
+
     /// Drop `slots` from the window without storing them: their values are dead.
     pub fn forget(&mut self, slots: &Slots) {
         for reg in 0..WINDOW {
@@ -452,52 +510,62 @@ impl WindowAlloc {
         stores
     }
 
-    /// Place the op with operand slots `slots` at `skip`.
-    fn plan(&self, slots: &[usize], accesses: &[Access], doubles: u8, skip: usize) -> Plan {
+    /// Place the op with operand slots `slots` on registers `regs`, one for each operand: a
+    /// window op's run at `skip`, or an emitted op's registers with none.
+    fn plan(&self, slots: &[usize], accesses: &[Access], doubles: u8, regs: &[usize], skip: Option<usize>) -> Plan {
         let now = &self.cache;
-        let span = skip..skip + slots.len();
+        let written = |reg: usize| regs.iter().zip(accesses).any(|(&r, a)| r == reg && a.writes());
         let mut emits = SmallVec::new();
 
-        // Values the span overwrites; a dirty one that survives nowhere else is
-        // stored first.
+        // Values its registers overwrite; a dirty one is stored first unless it survives: in a
+        // register not the op's, or as an input in a register the op doesn't write, or rewritten
+        // by the op.
         let mut overwritten = 0;
-        for (i, reg) in span.clone().enumerate() {
+        for (i, &reg) in regs.iter().enumerate() {
             let Some(slot) = now.regs[reg] else { continue };
             if accesses[i].reads() && slots[i] == slot {
                 continue;
             }
+            if regs[..i].contains(&reg) {
+                continue;
+            }
             overwritten += 1;
-            let elsewhere = (0..self.width).any(|r| !span.contains(&r) && now.regs[r] == Some(slot));
-            let survives = elsewhere || slots.contains(&slot);
+            let elsewhere = (0..self.width).any(|r| !regs.contains(&r) && now.regs[r] == Some(slot));
+            let input = slots.iter().zip(accesses).zip(regs).any(|((&s, a), &r)| s == slot && a.reads() && !written(r));
+            let rewritten = slots.iter().zip(accesses).any(|(&s, a)| s == slot && a.writes());
+            let survives = elsewhere || input || rewritten;
             let stored = emits.iter().any(|e| matches!(e, Emit::Store { slot: s, .. } if *s == slot));
             if now.dirty.contains(&slot) && !survives && !stored {
                 emits.push(Emit::Store { slot, reg, unboxed: bit(now.unboxed, reg) });
             }
         }
 
-        // Inputs into the span in the forms the op takes them, as one parallel
-        // move; a repeated input copies its first use afterwards.
+        // Inputs into their registers in the forms the op takes them, as one parallel move; a
+        // repeated input in another register copies its first use afterwards.
         let mut moves: SmallVec<[(Loc, Source); 8]> = SmallVec::new();
         let mut copies: SmallVec<[(Loc, Loc); WINDOW]> = SmallVec::new();
         for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
-            let dst = Loc { reg: skip + i, unboxed: bit(doubles, i) };
+            let dst = Loc { reg: regs[i], unboxed: bit(doubles, i) };
             if access == Access::Write || now.holds(dst.reg, slot, dst.unboxed) {
                 continue;
             }
             match (0..i).find(|&j| accesses[j].reads() && slots[j] == slot) {
-                Some(first) => copies.push((dst, Loc { reg: skip + first, unboxed: bit(doubles, first) })),
+                Some(first) if regs[first] == regs[i] => {}
+                Some(first) => copies.push((dst, Loc { reg: regs[first], unboxed: bit(doubles, first) })),
                 None => moves.push((dst, now.source(slot, dst.unboxed).map_or(Source::Memory(slot), Source::Reg))),
             }
         }
         parallel_move(&mut moves, &mut emits);
         emits.extend(copies.into_iter().map(|(dst, src)| Emit::Move { dst, src }));
-        emits.push(Emit::Op { skip });
+        emits.push(skip.map_or(Emit::Emitted, |skip| Emit::Op { skip }));
 
-        // The cache it leaves: inputs in the span, then each output replacing
-        // every older copy of its slot, each in its form.
+        // The cache it leaves: inputs in their registers, the others the op writes emptied, then
+        // each output replacing every older copy of its slot, each in its form.
         let mut after = now.clone();
         for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
-            after.set(skip + i, (access == Access::Read).then_some(slot), bit(doubles, i));
+            if access.reads() {
+                after.set(regs[i], Some(slot), bit(doubles, i));
+            }
         }
         for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
             if access.writes() {
@@ -506,7 +574,7 @@ impl WindowAlloc {
                         after.set(reg, None, false);
                     }
                 }
-                after.set(skip + i, Some(slot), bit(doubles, i));
+                after.set(regs[i], Some(slot), bit(doubles, i));
                 if !after.dirty.contains(&slot) {
                     after.dirty.push(slot);
                 }
@@ -521,7 +589,7 @@ impl WindowAlloc {
             assert!(after.regs.contains(&Some(*slot)), "dirty slot {slot} dropped without a store");
         }
         let cost = emits.iter().map(|&emit| emit.cost()).sum();
-        Plan { cost, overwritten, skip, emits, after }
+        Plan { cost, overwritten, skip: skip.unwrap_or(0), emits, after }
     }
 }
 
@@ -577,27 +645,94 @@ pub const RENAME_STORE: usize = 255;
 pub const RENAME: usize = 254;
 
 /// Whether `op` is a `Move`, `R(to) := R(from)`, which the window can do as a rename.
-fn is_move(op: &dyn Window) -> bool {
-    op.name() == "Move" && op.accesses() == [Access::Read, Access::Write]
+fn is_move(op: Op) -> bool {
+    matches!(op, Op::Window(_)) && op.name() == "Move" && op.accesses() == [Access::Read, Access::Write]
+}
+
+/// An op on the window: a window op, which runs at a run of it, or an emitted op, whose operands'
+/// registers the allocator picks. See Note [Emitted ops].
+#[derive(Debug, Clone, Copy)]
+pub enum Op<'a> {
+    Window(&'a dyn Window),
+    Emitted(&'a dyn Emitted),
+}
+
+impl<'a> Op<'a> {
+    pub fn name(self) -> &'static str {
+        match self {
+            Op::Window(w) => w.name(),
+            Op::Emitted(e) => e.name(),
+        }
+    }
+
+    pub fn operands(self) -> &'a [usize] {
+        match self {
+            Op::Window(w) => w.operands(),
+            Op::Emitted(e) => e.operands(),
+        }
+    }
+
+    pub fn accesses(self) -> &'static [Access] {
+        match self {
+            Op::Window(w) => w.accesses(),
+            Op::Emitted(e) => e.accesses(),
+        }
+    }
+
+    pub fn doubles(self) -> u8 {
+        match self {
+            Op::Window(w) => w.doubles(),
+            Op::Emitted(e) => e.doubles(),
+        }
+    }
+
+    /// Whether it may leave the trace to code reading any slot from the stack: an op that selects,
+    /// takes its exit 1, or has a cold path.
+    fn blind(self) -> bool {
+        match self {
+            Op::Window(w) => w.selects() || w.exit1().is_some() || (0..WINDOW).any(|skip| w.cold(skip).is_some()),
+            Op::Emitted(e) => e.selects(),
+        }
+    }
 }
 
 /// An op as the window sees it: its operands' slots counted from the base of the frame of the
 /// code the window is of, which the op's own frame is `offset` slots past when the op is code
-/// inlined into it. See Note [Inlined calls] in `specialize`.
+/// inlined into it. See Note [Inlined calls].
 #[derive(Debug)]
 pub struct Framed<'a> {
-    pub op: &'a dyn Window,
+    pub op: Op<'a>,
     slots: SmallVec<[usize; WINDOW]>,
 }
 
 impl<'a> Framed<'a> {
     pub fn new(op: &'a dyn Window, offset: usize) -> Self {
-        Framed { op, slots: op.operands().iter().map(|&slot| slot + offset).collect() }
+        Framed { op: Op::Window(op), slots: op.operands().iter().map(|&slot| slot.wrapping_add(offset)).collect() }
+    }
+
+    pub fn emitted(op: &'a dyn Emitted, offset: usize) -> Self {
+        Framed { op: Op::Emitted(op), slots: op.operands().iter().map(|&slot| slot.wrapping_add(offset)).collect() }
     }
 
     /// The operands' slots, as the window names them.
     pub fn slots(&self) -> &[usize] {
         &self.slots
+    }
+
+    /// Its operands' registers at a run of the window at `skip`.
+    pub fn run(&self, skip: usize) -> SmallVec<[usize; WINDOW]> {
+        (skip..skip + self.slots.len()).collect()
+    }
+
+    /// An emitted op's operands' registers, as `place_free` placed them in `want`, its output in
+    /// `out`.
+    pub fn placed(&self, want: &Placement, out: usize) -> SmallVec<[usize; WINDOW]> {
+        self.slots.iter().zip(self.op.accesses())
+            .map(|(&slot, access)| match access {
+                Access::Write => out,
+                _ => want.iter().position(|&s| s == Some(slot)).expect("an emitted op's input placed"),
+            })
+            .collect()
     }
 }
 
@@ -611,9 +746,12 @@ pub enum Step<'a> {
     Read(usize),
     /// A residual that flushes the window.
     Flush,
+    /// Slots whose dirty values are stored, kept in their registers: an op's memory may be their
+    /// stack homes. See Note [Window memory].
+    Store(Slots),
     /// Slots whose values die, which the window drops without storing them: an inlined callee's
     /// frame past its arguments, its caller's dead temporaries, which it nils. See Note [Inlined
-    /// calls] in `specialize`.
+    /// calls].
     Kill(Slots),
     /// A jump to the block starting at step `start`, earlier in the trace:
     /// an edge into it, reading its entry window.
@@ -674,7 +812,7 @@ impl Ahead {
         for (step, s) in steps.iter().enumerate() {
             match s {
                 Step::Op(op, _) => {
-                    if op.op.selects() || op.op.exit1().is_some() || (0..WINDOW).any(|skip| op.op.cold(skip).is_some()) {
+                    if op.op.blind() {
                         ahead.blind.push(step);
                     }
                     // Its reads before its writes, whatever order its operands are declared in.
@@ -698,6 +836,7 @@ impl Ahead {
                 }
                 Step::Leave => ahead.blind.push(step),
                 Step::Flush => ahead.flushes.push(step),
+                Step::Store(slots) => slots.iter().for_each(|slot| ahead.events[slot].push((step, true))),
                 Step::Kill(slots) => slots.iter().for_each(|slot| ahead.events[slot].push((step, false))),
                 Step::Back(start) => ahead.backs.push((step, *start)),
                 Step::Start(_) => {}
@@ -892,11 +1031,24 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 plan.skips[step] = if store { RENAME_STORE } else { RENAME };
             }
             Step::Op(op, usable) => {
-                let (want, skip) = place(&alloc, &ahead, step, op, usable);
+                // An emitted op's `skip` is its output's register. See Note [Emitted ops].
+                let (want, skip, regs) = match op.op {
+                    Op::Window(_) => {
+                        let (want, skip) = place(&alloc, &ahead, step, op, usable);
+                        (want, skip, op.run(skip))
+                    }
+                    Op::Emitted(_) => {
+                        let (want, out) = place_free(&alloc, &ahead, step, op);
+                        (want, out, op.placed(&want, out))
+                    }
+                };
                 #[cfg(feature = "tracing")]
                 let (before, worth) = (format!("{}", alloc.cache()), worths(&ahead, alloc.cache(), step));
-                let mut emits = alloc.reconcile(&want, op, skip);
-                emits.extend(alloc.op(op, [skip]).expect("a placed op runs at its SKIP"));
+                let mut emits = alloc.reconcile(&want, op, &regs);
+                emits.extend(match op.op {
+                    Op::Window(_) => alloc.op(op, [skip]).expect("a placed op runs at its SKIP"),
+                    Op::Emitted(_) => alloc.emitted(op, &regs),
+                });
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("alloc", "op", &[
                     ("trace", trace.into()),
@@ -916,6 +1068,9 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("alloc", "flush", &[("trace", trace.into()), ("step", step.into()), ("window", format!("{}", alloc.cache()).as_str().into())]);
                 alloc.flush();
+            }
+            Step::Store(slots) => {
+                alloc.clean(slots);
             }
             Step::Kill(slots) => alloc.forget(slots),
             Step::Exit { hot, .. } => {
@@ -993,6 +1148,78 @@ fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed, usable: &
         want[reg] = Some(slot);
     }
     (want, skip)
+}
+
+/// Where the emitted op at `step` runs, and the window it wants: each input in the register
+/// caching it, or one free, its output in the register of an input it overwrites, of its slot's
+/// old value, of an input no longer worth keeping, a free one, or that of the value worth least,
+/// and the values worth most of the others, as many as fit in the registers left. Its output's
+/// register is returned in place of a `SKIP`. See Notes [Trace allocation] and [Emitted ops].
+fn place_free(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> (Placement, usize) {
+    let (slots, accesses) = (op.slots(), op.op.accesses());
+    let now = alloc.cache();
+    let width = alloc.width;
+    let worth = |slot: usize| ahead.worth(slot, step, now.dirty.contains(&slot));
+    let mut want: Placement = [None; WINDOW];
+    // A free register: empty, else holding a value worth nothing, else the one worth least.
+    let free = |want: &Placement, taken: &[usize]| {
+        (0..width)
+            .filter(|reg| want[*reg].is_none() && !taken.contains(reg))
+            .min_by_key(|&reg| match now.regs[reg] {
+                None => (0, (false, 0)),
+                Some(slot) if slots.contains(&slot) => (3, (false, 0)),
+                Some(slot) => match worth(slot) {
+                    None => (1, (false, usize::from(now.dirty.contains(&slot)))),
+                    Some((exit, far)) => (2, (!exit, usize::MAX - far)),
+                },
+            })
+            .expect("a register for an emitted op's operand")
+    };
+    for (&slot, _) in slots.iter().zip(accesses).filter(|(_, a)| a.reads()) {
+        if want.contains(&Some(slot)) {
+            continue;
+        }
+        let reg = now.position(slot).filter(|&reg| want[reg].is_none()).unwrap_or_else(|| free(&want, &[]));
+        want[reg] = Some(slot);
+    }
+    let inputs: SmallVec<[usize; WINDOW]> = (0..width).filter(|&reg| want[reg].is_some()).collect();
+    let dead = |slot: usize| !now.dirty.contains(&slot) || ahead.dead(slot, step);
+    let mut taken: SmallVec<[usize; WINDOW]> = inputs.clone();
+    // An op with no output, as a compare, takes no register for one.
+    let output = slots.iter().zip(accesses).find(|(_, a)| **a == Access::Write).map(|(&slot, _)| slot);
+    let out = output.map_or(0, |out_slot| {
+        inputs.iter().copied().find(|&reg| want[reg] == Some(out_slot))
+            .or_else(|| now.position(out_slot).filter(|&reg| want[reg].is_none()))
+            .or_else(|| inputs.iter().copied().find(|&reg| want[reg].is_some_and(|slot| worth(slot).is_none() && dead(slot))))
+            .unwrap_or_else(|| free(&want, &[]))
+    });
+    if output.is_some() && !taken.contains(&out) {
+        taken.push(out);
+    }
+    // The values worth most of the others, each in its register if the op doesn't take it, else
+    // in a free one, as many as fit.
+    let mut kept: SmallVec<[((bool, usize), usize); WINDOW]> = now
+        .slots()
+        .filter(|(_, slot)| !slots.contains(slot))
+        .filter_map(|(_, slot)| Some((worth(slot)?, slot)))
+        .collect();
+    kept.sort_unstable();
+    for &(_, slot) in &kept {
+        if taken.len() >= width {
+            break;
+        }
+        let at = (0..width).find(|&reg| now.regs[reg] == Some(slot) && !taken.contains(&reg));
+        let reg = match at {
+            Some(reg) => reg,
+            None => match (0..width).find(|&reg| !taken.contains(&reg) && want[reg].is_none() && now.regs[reg].is_none()) {
+                Some(reg) => reg,
+                None => continue,
+            },
+        };
+        want[reg] = Some(slot);
+        taken.push(reg);
+    }
+    (want, out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1099,6 +1326,38 @@ mod tests {
         fn on_stack<'src, 'intern>(&self, owner: &mut crate::Owner, state: &mut crate::vm::RunState<'src, 'intern>) { self.0.on_stack(owner, state) }
     }
 
+    /// A test emitted op, of a window op's operands, accesses and forms. See Note [Emitted ops].
+    #[derive(Debug)]
+    struct TestEmitted(Box<dyn Window>, u8);
+
+    impl Emitted for TestEmitted {
+        fn name(&self) -> &'static str { self.0.name() }
+        fn label(&self) -> String { self.0.name().into() }
+        fn operands(&self) -> &[usize] { self.0.operands() }
+        fn accesses(&self) -> &'static [Access] { self.0.accesses() }
+        fn doubles(&self) -> u8 { self.1 }
+        fn captures(&self) -> SmallVec<[u64; 2]> { SmallVec::new() }
+        fn selects(&self) -> bool { false }
+        fn emit(&self, _: &mut crate::emitted::Assembler, _: &[u8], _: &crate::emitted::Exits) {}
+        fn cold(&self) -> Option<crate::emitted::Cold> { None }
+        fn with_operands(&self, _: &[usize]) -> std::rc::Rc<dyn Emitted> { unreachable!() }
+    }
+
+    /// A test op as a window op, or as an emitted op.
+    enum Built {
+        Window(Box<dyn Window>),
+        Emitted(Box<dyn Emitted>),
+    }
+
+    impl Built {
+        fn framed(&self) -> Framed<'_> {
+            match self {
+                Built::Window(w) => Framed::new(&**w, 0),
+                Built::Emitted(e) => Framed::emitted(&**e, 0),
+            }
+        }
+    }
+
     /// An op of a test run: its input slots, then its output slot.
     #[derive(Debug, Clone, Copy)]
     enum TestOp {
@@ -1157,7 +1416,7 @@ mod tests {
                 }
             }
         }
-        fn exec(&mut self, emit: Emit, op: Option<&dyn Window>) {
+        fn exec(&mut self, emit: Emit, op: Option<Op>, regs: &[usize]) {
             match emit {
                 Emit::Load { reg, slot, unboxed } => {
                     *self.half(Loc { reg, unboxed }) = Some((slot, Self::version(&self.memory, slot)));
@@ -1170,22 +1429,44 @@ mod tests {
                 Emit::Move { dst, src } => {
                     *self.half(dst) = *self.half(src);
                 }
-                Emit::Op { skip } => {
+                Emit::Op { .. } | Emit::Emitted => {
                     let op = op.expect("an op");
+                    let reg = |i: usize| match emit {
+                        Emit::Op { skip } => skip + i,
+                        _ => regs[i],
+                    };
                     let operands = op.operands().iter().zip(op.accesses()).enumerate();
                     for (i, (&slot, _)) in operands.clone().filter(|(_, (_, a))| a.reads()) {
                         let current = Self::version(&self.current, slot);
-                        let loc = Loc { reg: skip + i, unboxed: bit(op.doubles(), i) };
-                        assert_eq!(*self.half(loc), Some((slot, current)), "input {i} of {op:?}");
+                        let loc = Loc { reg: reg(i), unboxed: bit(op.doubles(), i) };
+                        assert_eq!(*self.half(loc), Some((slot, current)), "input {i} of {} on {regs:?}", op.name());
                     }
                     for (i, (&slot, _)) in operands.filter(|(_, (_, a))| a.writes()) {
                         let version = Self::version(&self.current, slot) + 1;
                         self.current.insert(slot, version);
-                        *self.half(Loc { reg: skip + i, unboxed: bit(op.doubles(), i) }) = Some((slot, version));
+                        *self.half(Loc { reg: reg(i), unboxed: bit(op.doubles(), i) }) = Some((slot, version));
                     }
                 }
             }
         }
+    }
+
+    /// The ops of a run, the `i`th taking the operands of `doubles(i)` unboxed, its arithmetic and
+    /// gets emitted ops if `emitted`.
+    fn built(ops: &[TestOp], doubles: impl Fn(usize) -> u8, emitted: bool) -> Vec<Built> {
+        windows(ops, &doubles)
+            .into_iter()
+            .zip(ops)
+            .enumerate()
+            .map(|(i, (w, op))| match op {
+                TestOp::Bin(..) | TestOp::BinFirst(..) | TestOp::Get(..) | TestOp::Set(..) if emitted => {
+                    // An emitted op takes each of its operands in one form.
+                    let mask = if doubles(i) & ((1 << w.arity()) - 1) != 0 { (1 << w.arity()) - 1 } else { 0 };
+                    Built::Emitted(Box::new(TestEmitted(w, mask)))
+                }
+                _ => Built::Window(w),
+            })
+            .collect()
     }
 
     /// The ops of a run, the `i`th taking the operands of `doubles(i)` unboxed.
@@ -1212,34 +1493,67 @@ mod tests {
     }
 
     /// Allocate a run streaming and execute it in a window of `width` registers.
-    fn run(width: usize, ops: &[TestOp], doubles: impl Fn(usize) -> u8) {
-        let windows = windows(ops, doubles);
+    fn run(width: usize, ops: &[TestOp], doubles: impl Fn(usize) -> u8, emitted: bool) {
+        let built = built(ops, doubles, emitted);
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
-        for w in &windows {
-            for emit in alloc.op(&Framed::new(&**w, 0), 0..WINDOW).unwrap() {
-                machine.exec(emit, Some(&**w));
+        for b in &built {
+            let framed = b.framed();
+            match b {
+                Built::Window(_) => {
+                    for emit in alloc.op(&framed, 0..WINDOW).unwrap() {
+                        machine.exec(emit, Some(framed.op), &[]);
+                    }
+                }
+                Built::Emitted(_) => {
+                    let regs = alloc.free_regs(&framed);
+                    for emit in alloc.emitted(&framed, &regs) {
+                        machine.exec(emit, Some(framed.op), &regs);
+                    }
+                }
             }
         }
         finish(alloc, machine, ops)
     }
 
+    /// Run the op `framed` at `step` of `plan`, as code generation does: the window reconciled
+    /// with the one planned before it, then the op on its planned registers.
+    fn planned(alloc: &mut WindowAlloc, machine: &mut Machine, plan: &TracePlan, step: usize, framed: &Framed) {
+        let want = plan.windows[step];
+        let regs = match framed.op {
+            Op::Window(_) => framed.run(plan.skips[step]),
+            Op::Emitted(_) => framed.placed(&want, plan.skips[step]),
+        };
+        for emit in alloc.reconcile(&want, framed, &regs) {
+            machine.exec(emit, None, &[]);
+        }
+        let emits = match framed.op {
+            Op::Window(_) => alloc.op(framed, [plan.skips[step]]).unwrap(),
+            Op::Emitted(_) => alloc.emitted(framed, &regs),
+        };
+        for emit in emits {
+            machine.exec(emit, Some(framed.op), &regs);
+        }
+    }
+
+    /// The `SKIP`s a test op can run at: any, or for an emitted op none.
+    fn usable(b: &Built) -> SmallVec<[usize; WINDOW]> {
+        match b {
+            Built::Window(_) => (0..WINDOW).collect(),
+            Built::Emitted(_) => SmallVec::new(),
+        }
+    }
+
     /// Plan a run as a trace of one block, then execute it as planned in a
     /// window of `width` registers.
-    fn run_planned(width: usize, ops: &[TestOp], doubles: impl Fn(usize) -> u8) {
-        let windows = windows(ops, doubles);
-        let steps: Vec<Step> =
-            std::iter::once(Step::Start(None)).chain(windows.iter().map(|w| Step::Op(Framed::new(&**w, 0), (0..WINDOW).collect()))).collect();
+    fn run_planned(width: usize, ops: &[TestOp], doubles: impl Fn(usize) -> u8, emitted: bool) {
+        let built = built(ops, doubles, emitted);
+        let steps: Vec<Step> = std::iter::once(Step::Start(None)).chain(built.iter().map(|b| Step::Op(b.framed(), usable(b)))).collect();
         let plan = plan_trace(&steps, width, &Cache::default(), 0);
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
-        for (i, w) in windows.iter().enumerate() {
-            for emit in alloc.reconcile(&plan.windows[i + 1], &Framed::new(&**w, 0), plan.skips[i + 1]) {
-                machine.exec(emit, None);
-            }
-            for emit in alloc.op(&Framed::new(&**w, 0), [plan.skips[i + 1]]).unwrap() {
-                machine.exec(emit, Some(&**w));
-            }
+        for (i, b) in built.iter().enumerate() {
+            planned(&mut alloc, &mut machine, &plan, i + 1, &b.framed());
         }
         finish(alloc, machine, ops)
     }
@@ -1247,7 +1561,7 @@ mod tests {
     /// Flush the window and check the stack holds every slot's latest version.
     fn finish(mut alloc: WindowAlloc, mut machine: Machine, ops: &[TestOp]) {
         for emit in alloc.flush() {
-            machine.exec(emit, None);
+            machine.exec(emit, None, &[]);
         }
         assert!(alloc.is_empty());
         for (&slot, &version) in &machine.current {
@@ -1322,9 +1636,11 @@ mod tests {
                     })
                     .collect();
                 let width = ops.iter().map(arity).max().unwrap().max(4);
-                for doubles in [|_| 0, |i| if i % 2 == 0 { 0b101 } else { 0b110 }] {
-                    run(width, &ops, doubles);
-                    run_planned(width, &ops, doubles);
+                for doubles in [|_| 0, |i| if i % 2 == 0 { 0b101 } else { 0b110 }, |_| 0b111] {
+                    for emitted in [false, true] {
+                        run(width, &ops, doubles, emitted);
+                        run_planned(width, &ops, doubles, emitted);
+                    }
                 }
             }
         }
@@ -1390,8 +1706,9 @@ mod tests {
                 }
             }
             let masks: Vec<u8> = ops.iter().map(|_| rng.below(16) as u8 * u8::from(rng.below(2) == 0)).collect();
-            let windows = windows(&ops, |i| masks[i]);
-            let mut next_op = windows.iter();
+            let emitted = rng.below(2) == 0;
+            let built = built(&ops, |i| masks[i], emitted);
+            let mut next_op = built.iter();
             let some_slots = |rng: &mut Rng| {
                 let mut slots = Slots::default();
                 (0..rng.below(4)).for_each(|_| slots.insert(rng.below(6)));
@@ -1399,7 +1716,10 @@ mod tests {
             };
             let steps: Vec<Step> = std::iter::once(Step::Start(None))
                 .chain(kinds.iter().map(|&(kind, arg)| match kind {
-                    0 => Step::Op(Framed::new(&**next_op.next().unwrap(), 0), (0..WINDOW).collect()),
+                    0 => {
+                        let b = next_op.next().unwrap();
+                        Step::Op(b.framed(), usable(b))
+                    }
                     1 => Step::Start(None),
                     2 => Step::Flush,
                     3 => Step::Exit { hot: rng.below(2) == 0, reads: some_slots(&mut rng) },
@@ -1425,7 +1745,7 @@ mod tests {
             };
             let hint = some_window(&mut rng);
             // A failure names its trace: its ops, its steps' kinds, and the window it starts from.
-            let case = format!("{ops:?}, steps {kinds:?}, from {hint}");
+            let case = format!("{ops:?}{}, steps {kinds:?}, from {hint}", if emitted { " emitted" } else { "" });
             let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let plan = plan_trace(&steps, width, &hint, 0);
                 let mut machine = Machine::default();
@@ -1441,7 +1761,7 @@ mod tests {
                             let from = if rise.is_some() { Cache::default() } else { alloc.cache().clone() };
                             let entry = Cache::entry(plan.windows[step], plan.unboxed[step], &from, &plan.dirty[step]);
                             for emit in alloc.transfer(&entry) {
-                                machine.exec(emit, None);
+                                machine.exec(emit, None, &[]);
                             }
                             entries.insert(step, entry.clone());
                             alloc = WindowAlloc { width, cache: entry };
@@ -1452,25 +1772,18 @@ mod tests {
                             let (src, dst) = (op.slots()[0], op.slots()[1]);
                             let loc = alloc.cache().loc(alloc.cache().position(src).expect("a renamed value in a register"));
                             for emit in alloc.rename(src, dst, plan.skips[step] == RENAME_STORE) {
-                                machine.exec(emit, None);
+                                machine.exec(emit, None, &[]);
                             }
                             let version = Machine::version(&machine.current, dst) + 1;
                             machine.current.insert(dst, version);
                             *machine.half(loc) = Some((dst, version));
                         }
-                        Step::Op(op, _) => {
-                            for emit in alloc.reconcile(&plan.windows[step], op, plan.skips[step]) {
-                                machine.exec(emit, None);
-                            }
-                            for emit in alloc.op(op, [plan.skips[step]]).unwrap() {
-                                machine.exec(emit, Some(op.op));
-                            }
-                        }
+                        Step::Op(op, _) => planned(&mut alloc, &mut machine, &plan, step, op),
                         // Leaving through a thunk, which stores the window.
                         Step::Leave => {
                             let mut taken = machine.clone();
                             for emit in alloc.stores() {
-                                taken.exec(emit, None);
+                                taken.exec(emit, None, &[]);
                             }
                             for (&slot, &version) in &taken.current {
                                 assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the thunk at step {step} of {ops:?}");
@@ -1478,14 +1791,14 @@ mod tests {
                         }
                         Step::Flush => {
                             for emit in alloc.flush() {
-                                machine.exec(emit, None);
+                                machine.exec(emit, None, &[]);
                             }
                         }
                         Step::Back(start) => {
                             let entry = &entries[start];
                             let mut taken = machine.clone();
                             for emit in alloc.transfer(entry) {
-                                taken.exec(emit, None);
+                                taken.exec(emit, None, &[]);
                             }
                             taken.check(entry, &format!("back edge at step {step} of {ops:?}"));
                             for (&slot, &version) in taken.current.iter().filter(|(slot, _)| !entry.dirty.contains(slot)) {
@@ -1495,7 +1808,7 @@ mod tests {
                         Step::Exit { .. } => {
                             let mut taken = machine.clone();
                             for emit in alloc.stores() {
-                                taken.exec(emit, None);
+                                taken.exec(emit, None, &[]);
                             }
                             for (&slot, &version) in &taken.current {
                                 assert_eq!(Machine::version(&taken.memory, slot), version, "slot {slot} stale at the exit at step {step} of {ops:?}");
@@ -1508,19 +1821,19 @@ mod tests {
                             let entry = Cache::entry(trivial.windows[0], trivial.unboxed[0], alloc.cache(), &trivial.dirty[0]);
                             let mut linked = machine.clone();
                             for emit in alloc.transfer(&entry) {
-                                linked.exec(emit, None);
+                                linked.exec(emit, None, &[]);
                             }
                             let thunk = WindowAlloc { width, cache: entry };
                             let mut exited = linked.clone();
                             for emit in thunk.stores() {
-                                exited.exec(emit, None);
+                                exited.exec(emit, None, &[]);
                             }
                             for (&slot, &version) in &exited.current {
                                 assert_eq!(Machine::version(&exited.memory, slot), version, "slot {slot} stale at the thunk after step {step} of {ops:?}");
                             }
                             let target = some_window(&mut rng);
                             for emit in thunk.transfer(&target) {
-                                linked.exec(emit, None);
+                                linked.exec(emit, None, &[]);
                             }
                             linked.check(&target, &format!("link after step {step} of {ops:?}"));
                             for (&slot, &version) in linked.current.iter().filter(|(slot, _)| !target.dirty.contains(slot)) {
@@ -1529,6 +1842,7 @@ mod tests {
                         }
                         Step::Read(_) => {}
                         Step::Kill(_) => unreachable!("a test trace kills no slot"),
+                        Step::Store(_) => unreachable!("a test trace stores no slot"),
                     }
                 }
                 finish(alloc, machine, &ops);
@@ -1576,7 +1890,7 @@ mod tests {
                 let emits = WindowAlloc::entering(from.clone()).transfer(to);
                 assert!(from != to || emits.is_empty(), "{from:?} to itself: {emits:?}");
                 for emit in emits {
-                    machine.exec(emit, None);
+                    machine.exec(emit, None, &[]);
                 }
                 machine.check(to, &format!("{from} to {to}"));
                 for slot in (0..SLOTS).filter(|slot| !to.dirty.contains(slot)) {
@@ -1633,7 +1947,7 @@ mod tests {
             }
             let before = machine.clone();
             for emit in emits {
-                machine.exec(emit, None);
+                machine.exec(emit, None, &[]);
             }
             for &(dst, src) in case {
                 let want = match src {

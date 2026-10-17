@@ -35,6 +35,7 @@ pub mod classes;
 pub mod specialize;
 pub mod generators;
 pub mod window;
+pub mod emitted;
 #[cfg(feature = "jit")]
 pub mod window_alloc;
 #[cfg(feature = "jit")]
@@ -51,7 +52,7 @@ pub mod patterns;
 
 pub use vm::Vm;
 /// Marker branding the per-thread cell owner. `Owner` is unique per thread — a second
-/// `Owner::new` panics — which is what pins one VM per thread; see Note [Scoped heap] in `gc`.
+/// `Owner::new` panics — which is what pins one VM per thread; see Note [Scoped heap].
 pub struct TlcOwner;
 /// The cell owner handle, threaded through every read or write of a GC-managed [`TLCell`].
 pub type Owner = qcell::TLCellOwner<TlcOwner>;

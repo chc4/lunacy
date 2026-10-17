@@ -67,9 +67,9 @@ thread_local! {
 // computing it as the native does (`bit1`, `bit2`). A call taking every result
 // (C = 0) gets exactly the one, and a call taking its arguments up to the top
 // (B = 0) has a fixed arity when the specializer knows the top. See Note [Known
-// top] in `specialize`.
+// top].
 
-/// An error with the message `message`. See Note [Errors] in `specialize`.
+/// An error with the message `message`. See Note [Errors].
 fn error_value<'s, 'i>(message: String) -> LBoxed<'s, 'i> {
     string(message.into_bytes())
 }
@@ -88,7 +88,7 @@ pub(crate) fn type_name(v: LBoxed) -> &'static [u8] {
 }
 
 /// A capture of a match in `src`: its bytes, or its position. See Note
-/// [Patterns] in `patterns`.
+/// [Patterns].
 fn capture<'s, 'i>(src: &[u8], capture: Capture) -> LBoxed<'s, 'i> {
     match capture {
         Capture::Bytes(range) => string(src[range].to_vec()),
@@ -139,6 +139,9 @@ macro_rules! native {
     };
     (pure |$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::pure(native!(@fn $owner, $args, $body)))
+    };
+    (generator: $generator:expr, |$owner:ident, $args:ident| $body:expr) => {
+        LValue::NClosure(NClosure::generated(native!(@fn $owner, $args, $body), $generator))
     };
     (|$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::new(native!(@fn $owner, $args, $body)))
@@ -296,7 +299,7 @@ pub fn math_natives<'s, 'i>() -> Vec<(&'static str, LValue<'s, 'i>)> {
             let r = random();
             // A whole number from a range, in the integer encoding where an i32
             // holds it: the code using it computes on an integer. See Note
-            // [Narrowing] in `specialize`.
+            // [Narrowing].
             vec![match args.len() {
                 0 => LBoxed::from_double(r),
                 1 => LBoxed::from_number((r * number(args[0]).floor()).floor() + 1.0),
@@ -412,8 +415,7 @@ fn math1<const OP: u8>(x: f64) -> f64 {
 
 /// `math1::<OP>`'s result, a double like every number a native computes, but
 /// floor's and ceil's: a whole number, in the integer encoding where an i32
-/// holds it, so the code using it computes on an integer. See Note [Narrowing]
-/// in `specialize`.
+/// holds it, so the code using it computes on an integer. See Note [Narrowing].
 #[inline(always)]
 fn math1_boxed<'s, 'i, const OP: u8>(x: f64) -> LBoxed<'s, 'i> {
     match OP {
@@ -497,14 +499,14 @@ fn bit2<const OP: u8>(x: i32, y: i32) -> i32 {
 
 /// A bit op's window op's argument: in the integer encoding (`INT`), read as it
 /// is, or a number of either encoding the specializer checked, decoded with the
-/// pinned tag. See Note [Integers] in `specialize` and Note [Pinned tag] in `window`.
+/// pinned tag. See Note [Integers] and Note [Pinned tag].
 #[inline(always)]
 unsafe fn bit_arg<const INT: bool>(v: LBoxed, tag: u64) -> i32 {
     if INT { unsafe { v.as_int() } } else { to_bit(unsafe { v.as_number_tagged(tag) }) }
 }
 
 // A bit op's result is an i32, so it is in the integer encoding. See Note
-// [Integers] in `specialize`.
+// [Integers].
 crate::window::windowed!(BitUnary, [], [OP: u8, X: bool], |owner, state, base, tag| (x, out r) {
     *r = LBoxed::from_int_tagged(bit1::<OP>(bit_arg::<X>(x, tag)), tag);
 });
@@ -608,9 +610,16 @@ crate::window::windowed!(ByteRange, [], [N: usize], |owner, state, base, tag| (s
 crate::window::windowed!(WholeOfInt, [], [], |owner, state, base| (x, out r) {
     *r = x;
 });
+// `math.floor` of an integer's quotient by a positive constant `by`, from the integer: the floored
+// division, a shift for a power of two. See Note [Quotients].
+crate::window::windowed!(FloorDivK, [by: i32], [], |owner, state, base, tag| (x, out r) {
+    *r = LBoxed::from_int_tagged(x.as_int().div_euclid(by), tag);
+});
+crate::window::windowed!(FloorShiftK, [shift: u32], [], |owner, state, base, tag| (x, out r) {
+    *r = LBoxed::from_int_tagged(x.as_int() >> shift, tag);
+});
 // `OP` of a double, in the integer encoding where an i32 holds the result: a cold path for one it
-// doesn't, which is a double. As an integer op whose result doesn't fit. See Note [Optimistic ops]
-// in `specialize`.
+// doesn't, which is a double. As an integer op whose result doesn't fit. See Note [Optimistic ops].
 crate::window::windowed!(WholeOptimistic, [], [OP: u8], |owner, state, base, tag| (x, out r) {
     let whole = math1::<OP>(unsafe { x.as_number_tagged(tag) });
     if crate::lboxed::is_integer(whole) {
@@ -640,7 +649,7 @@ fn abs_boxed<'s, 'i>(x: LBoxed<'s, 'i>) -> LBoxed<'s, 'i> {
 
 // `math.abs` of an integer, an integer: a cold path for the one whose absolute value an i32
 // doesn't hold, which is a double. As an integer op whose result doesn't fit. See Note
-// [Optimistic ops] in `specialize`.
+// [Optimistic ops].
 crate::window::windowed!(AbsOptimistic, [], [], |owner, state, base, tag| (x, out r) {
     match unsafe { x.as_int() }.checked_abs() {
         Some(n) => { *r = LBoxed::from_int_tagged(n, tag); false },
@@ -658,7 +667,7 @@ crate::window::windowed!(AbsIntDouble, [], [], |owner, state, base| (x, out r) {
 /// `math.abs`'s generator: for a call of one number keeping one result, of an integer its result
 /// in the encoding an integer op's is, decided the first time it runs, and rebuilt to compute in
 /// doubles once one doesn't fit; of a double, a double; any other call is the native's. See Notes
-/// [Native generators] and [Optimistic ops] in `specialize`.
+/// [Native generators] and [Optimistic ops].
 fn abs_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
@@ -689,7 +698,7 @@ fn abs_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box
     })
 }
 
-// `assert`'s condition: exit 0 if it holds, 1 if not. See Note [Optimistic ops] in `specialize`.
+// `assert`'s condition: exit 0 if it holds, 1 if not. See Note [Optimistic ops].
 crate::window::windowed!(select AssertHolds, [], [], |owner, state, base| (condition) {
     if condition.truthy() { 0 } else { 1 }
 });
@@ -710,7 +719,7 @@ pub(crate) fn assert_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c:
 /// `math.floor`'s and `math.ceil`'s generator (`OP`): for a call of one number keeping one
 /// result, its result in the encoding an integer op's is, decided the first time it runs, and
 /// rebuilt to compute in doubles once one doesn't fit; any other call is the native's. See Notes
-/// [Native generators] and [Optimistic ops] in `specialize`.
+/// [Native generators] and [Optimistic ops].
 fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
@@ -721,6 +730,20 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
                 return ResumeArg::Start;
             }
             if (yield YieldOp::Guard(a + 1, LType::Double)) == ResumeArg::Matched {
+                // An integer's quotient by a positive constant, floored from the integer. See
+                // Note [Quotients].
+                if OP == FLOOR && let ResumeArg::Quotient(of, by) = (yield YieldOp::QuotientOf(a + 1)) {
+                    let op: std::rc::Rc<dyn crate::window::Window> = if by & (by - 1) == 0 {
+                        std::rc::Rc::new(FloorShiftK::new(by.trailing_zeros(), &[of, a]))
+                    } else {
+                        std::rc::Rc::new(FloorDivK::new(by, &[of, a]))
+                    };
+                    yield YieldOp::ExecWindow(op);
+                    yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
+                    // The call's frame above its result is dead.
+                    yield YieldOp::Clobber(a + 1);
+                    return ResumeArg::Start;
+                }
                 let fits = Fits(std::rc::Rc::new(move |state: &crate::vm::RunState| {
                     crate::lboxed::is_integer(math1::<OP>(unsafe { checked_number(state.vals[state.base + a + 1]) }))
                 }));
@@ -728,6 +751,8 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
                     let fit = yield YieldOp::OptimisticExec(std::rc::Rc::new(WholeOptimistic::<OP>::new(&[a + 1, a])));
                     let ty = if fit == ResumeArg::Matched { LType::Integer } else { LType::Double };
                     yield YieldOp::SetCTypes(vec![(a, CType::Type(ty))]);
+                    // The call's frame above its result is dead.
+                    yield YieldOp::Clobber(a + 1);
                     return ResumeArg::Start;
                 }
                 yield YieldOp::Decided(false);
@@ -735,6 +760,85 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
                 yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Double))]);
                 return ResumeArg::Start;
             }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
+/// `jit.learn`'s generator: for `learn(t)` of a table, keeping a result or none, what the context
+/// can know of `t`'s fields is learned once, when the code first runs, before any code needs it:
+/// a hash key for each string key it then has, with its field's type, and each field holding a
+/// table, its array part's kind, each guarded as a load of it would guard it, the call's own slot
+/// the field loaded into, as it is dead until the result is moved there. Returns `t`; any other
+/// call is the native's, which does too.
+#[cfg(feature = "magic")]
+fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 2 && c <= 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
+            if let ResumeArg::Keys(keys) = (yield YieldOp::Learn(a + 1)) {
+                for i in 0..keys.len() {
+                    if let ResumeArg::HashRef(href, kind) = (yield YieldOp::HashKeyNamed(a + 1, keys[i].clone(), true)) {
+                        yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::GetTableHref::new(href.0, &[a])));
+                        yield YieldOp::FieldType(a, href);
+                        if kind == CType::Type(LType::Table) {
+                            yield YieldOp::LearnKind(a);
+                        }
+                    }
+                }
+            }
+            if c == 2 {
+                let ResumeArg::Type(ctype) = (yield YieldOp::Typeof(a + 1)) else { unreachable!() };
+                yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::Move::new(&[a + 1, a])));
+                yield YieldOp::SetCTypes(vec![(a, ctype)]);
+                yield YieldOp::Copy(a, a + 1);
+            }
+            return ResumeArg::Start;
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
+/// `jit.frozen`'s generator: for `frozen(t)` of a table keeping one result, a watch site, which
+/// freezes it first: code past it knows which table it is while it stays frozen. Any other call is
+/// the native's. See Note [Frozen tables].
+#[cfg(feature = "magic")]
+fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 2 && c == 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched
+            && (yield YieldOp::Watching(a + 1, true)) == ResumeArg::Matched
+        {
+            yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::Move::new(&[a + 1, a])));
+            yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Table))]);
+            yield YieldOp::Copy(a, a + 1);
+            return ResumeArg::Start;
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
+/// `jit.tripped`'s generator: for `tripped(t)` of a table keeping one result, a watch site: code
+/// past it knows `t` is still watched, as it was when the code was first run, its result `false`
+/// with no test, until a store into `t` trips its watchpoint; any other call is the native's. See
+/// Note [Watched tables].
+#[cfg(feature = "magic")]
+fn tripped_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    crate::window::windowed!(Untripped, [], [], |owner, state, base| (out r) {
+        *r = LBoxed::from_bool(false);
+    });
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        if b == 2 && c == 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched
+            && (yield YieldOp::Watching(a + 1, false)) == ResumeArg::Matched
+        {
+            yield YieldOp::ExecWindow(std::rc::Rc::new(Untripped::new(&[a])));
+            yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Bool))]);
+            yield YieldOp::Clobber(a + 1);
+            return ResumeArg::Start;
         }
         yield YieldOp::NativeCall { nf, a, b, c };
         ResumeArg::Start
@@ -772,7 +876,8 @@ crate::window::windowed!(VersionsK, [n: i32], [], |owner, state, base| (out r) {
 
 /// `jit.promote`'s generator: for `promote(v)` keeping one result, of an integer (a whole double
 /// narrowed), `v` promoted, its value moved into the result's slot; any other call is the
-/// native's, which returns its argument. See Note [Green values] in `specialize`.
+/// native's, which returns its argument. See Note [Promoted values].
+#[cfg(feature = "magic")]
 fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp, PROMOTE_VALUES};
     Box::new(#[coroutine] move |_: ResumeArg| {
@@ -783,6 +888,7 @@ fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) ->
                     if let ResumeArg::Integer(_) = (yield YieldOp::Promote(a + 1)) {
                         yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::Move::new(&[a + 1, a])));
                         yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
+                        yield YieldOp::Copy(a, a + 1);
                         return ResumeArg::Start;
                     }
                 }
@@ -826,7 +932,7 @@ fn module<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, L
 }
 
 /// A library's table, `cached` if caches hold its entries' addresses. See Note
-/// [Global caches] in `specialize`.
+/// [Global caches].
 fn module_table<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, LValue<'s, 'i>)>, cached: bool) -> LValue<'s, 'i> {
     let mut t = Table::new(0, entries.len());
     t.cached = cached;
@@ -861,8 +967,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         vec![parsed.map_or(LBoxed::NIL, LBoxed::from_double)]
     });
 
-    // Indexing a string reads it, through caches. See Note [String methods] in
-    // `specialize`.
+    // Indexing a string reads it, through caches. See Note [String methods].
     let string_lib = module_table(intern, vec![
         ("lower", native!(pure |owner, args| vec![string(arg_bytes(&args, 0).to_ascii_lowercase())])),
         ("upper", native!(pure |owner, args| vec![string(arg_bytes(&args, 0).to_ascii_uppercase())])),
@@ -886,7 +991,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             vec![string(out)]
         })),
         ("format", native!(pure |owner, args| vec![string(format(&arg_bytes(&args, 0), args.get(1..).unwrap_or(&[])))])),
-        // See Note [Patterns] in `patterns`.
+        // See Note [Patterns].
         ("find", native!(pure |owner, args| {
             let (s, p) = (arg_bytes(&args, 0), arg_bytes(&args, 1));
             let init = init(s.len(), arg(&args, 2));
@@ -948,11 +1053,13 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
             cached: false,
             kind: 0,
             metatable: None,
+            watched: false,
         };
         vec![LBoxed::box_lvalue(LValue::Table(Tc::new(t)))]
     });
     let table_clear = native!(|owner, args| {
         let t = table(arg(&args, 0));
+        t.trip(owner);
         let t = t.rw(owner);
         t.array.clear();
         t.kind = 0;
@@ -969,6 +1076,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         // moves every element up one, down to the position.
         ("insert", native!(|owner, args| {
             let mut t = table(arg(&args, 0));
+            t.trip(owner);
             let value = arg(&args, args.len() - 1);
             let end = t.ro(owner).array.len() as i64 + 1;
             let pos = if args.len() == 2 { end } else { number(arg(&args, 1)) as i64 };
@@ -990,6 +1098,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         })),
         ("remove", native!(|owner, args| {
             let t = table(arg(&args, 0));
+            t.trip(owner);
             let tab = t.rw(owner);
             let at = if args.len() > 1 { number(arg(&args, 1)) as usize } else { tab.array.len() };
             if (1..=tab.array.len()).contains(&at) {
@@ -1051,6 +1160,29 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         let j = number_or(arg(&args, 2), array.len() as f64) as i64;
         (i..=j).map(|k| if k >= 1 { array.get(k as usize - 1).copied().unwrap_or(LBoxed::NIL) } else { LBoxed::NIL }).collect()
     });
+    // Lua's `next(t, k)`: the entry after key `k`'s, or the first, for nil; nil past the last.
+    let next = native!(pure |owner, args| {
+        match table(arg(&args, 0)).ro(owner).next(arg(&args, 1)) {
+            Ok(Some((key, value))) => vec![key, value],
+            Ok(None) => vec![LBoxed::NIL],
+            Err(()) => return Err(error_value("invalid key to 'next'".into())),
+        }
+    });
+    // Lua's `select(n, ...)`: its arguments from the `n`th, or with "#" how many.
+    let select = native!(pure |owner, args| {
+        let rest = &args[1.min(args.len())..];
+        match arg(&args, 0).unbox() {
+            LValue::OwnedString(_) | LValue::InternedString(_) if &*arg_bytes(&args, 0) == b"#" => vec![LBoxed::from_int(rest.len() as i32)],
+            _ => {
+                let n = number(arg(&args, 0)) as i64;
+                let from = if n < 0 { rest.len() as i64 + n } else { n - 1 };
+                if from < 0 {
+                    return Err(error_value("bad argument #1 to 'select' (index out of range)".into()));
+                }
+                rest.get(from as usize..).unwrap_or(&[]).to_vec()
+            }
+        }
+    });
     // Lua 5.1's `newproxy`: a new userdata with no metatable, with a new empty
     // one (`true`), or sharing a userdata's, which it must have.
     let newproxy = native!(pure |owner, args| {
@@ -1066,11 +1198,12 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         }
     });
     // Lua's `setmetatable(t, mt)` on a table: its metatable changes, which moves it
-    // to a new epoch. See Note [Table metatables] in `specialize`.
+    // to a new epoch. See Note [Table metatables].
     let setmetatable = native!(|owner, args| {
         let Some(t) = arg(&args, 0).as_table() else {
             return Err(error_value(format!("bad argument #1 to 'setmetatable' (table expected, got {})", String::from_utf8_lossy(type_name(arg(&args, 0))))));
         };
+        t.trip(owner);
         let metatable = match arg(&args, 1).unbox() {
             LValue::Nil => None,
             LValue::Table(mt) => Some(mt),
@@ -1089,7 +1222,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     });
     // Lua's `getmetatable`: a table's or a userdata's metatable, or its
     // `__metatable` field if it has one. A string has none here: its fields are the
-    // string library's directly. See Note [String methods] in `specialize`.
+    // string library's directly. See Note [String methods].
     let getmetatable = native!(pure |owner, args| {
         let metatable = match arg(&args, 0).unbox() {
             LValue::Table(t) => t.ro(owner).metatable.clone(),
@@ -1106,18 +1239,18 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     });
     // A call of `pcall` is a protected call of its first argument, which the specializer
     // lays out at the call site; this runs only for a call site that doesn't
-    // specialize. See Note [Errors] in `specialize`.
+    // specialize. See Note [Errors].
     let pcall = LValue::NClosure(NClosure::protected_call(native!(@fn owner, args, {
         let _ = &args;
         return Err(error_value("not implemented: pcall from a call site that isn't specialized".into()))
     })));
-    // Its argument, whatever it is, is the error. See Note [Errors] in `specialize`.
+    // Its argument, whatever it is, is the error. See Note [Errors].
     let error = native!(pure |owner, args| return Err(arg(&args, 0)));
 
     let require = native!(pure |owner, args| {
         let name = arg_bytes(&args, 0);
         let found = MODULES.with_borrow(|modules| modules.iter().find(|(m, _)| m.as_bytes() == name).map(|(_, v)| *v));
-        let Some(module) = found else { panic!("require: no built-in module {:?}", String::from_utf8_lossy(&name)) };
+        let Some(module) = found else { return Err(error_value(format!("module '{}' not found", String::from_utf8_lossy(&name)))) };
         // SAFETY: the value is alive, held by the global table; see `MODULES`.
         vec![unsafe { std::mem::transmute::<LBoxed<'static, 'static>, LBoxed<'_, '_>>(module) }]
     });
@@ -1127,28 +1260,40 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         // SAFETY: only the lifetimes change; see `MODULES`.
         unsafe { std::mem::transmute::<LBoxed<'s, 'i>, LBoxed<'static, 'static>>(boxed) }
     };
-    // `jit.promote(v)`: `v`, and the code after it specialized to its value. See Note [Green
-    // values] in `specialize`. A global only: `require("jit")` is LuaJIT's, which code
-    // probes for. `jit.versions()` (feature `magic`): how many versions the code it is in has
-    // (`versions_generator`), for tests.
-    #[allow(unused_mut)]
-    let mut jit_entries = vec![
-        ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
-    ];
+    // `jit.promote(v)`: `v`, and the code after it specialized to its value. See Note [Promoted
+    // values]. A global only: `require("jit")` is LuaJIT's, which code
+    // probes for. A magic JIT intrinsic (feature `magic`): without it there is no `jit`, as
+    // in a Lua other than LuaJIT, and code probing for it runs without. `jit.versions()`: how many
+    // versions the code it is in has (`versions_generator`), for tests.
     #[cfg(feature = "magic")]
-    jit_entries.push(("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])));
-    let jit_lib = module(intern, jit_entries);
+    let jit_lib = module(intern, vec![
+        ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
+        ("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])),
+        ("learn", native!(pure generator: learn_generator, |owner, args| vec![arg(&args, 0)])),
+        // `jit.frozen(t)`: `t`, frozen; `jit.tripped(t)`: whether a store into it tripped its
+        // watchpoint since, for tests. See Notes [Frozen tables] and [Watched tables].
+        ("frozen", native!(generator: frozen_generator, |owner, args| {
+            let t = table(arg(&args, 0));
+            t.rw(owner).watched = true;
+            vec![arg(&args, 0)]
+        })),
+        ("tripped", native!(pure generator: tripped_generator, |owner, args| {
+            vec![LBoxed::from_bool(!table(arg(&args, 0)).ro(owner).watched)]
+        })),
+    ]);
 
     MODULES.with_borrow_mut(|modules| {
         *modules = vec![("bit", erase(&bit_lib)), ("table.new", erase(&table_new)), ("table.clear", erase(&table_clear))];
     });
 
-    vec![
+    let mut globals = vec![
         (InternString::intern(intern, "type"), type_),
         (InternString::intern(intern, "tostring"), tostring),
         (InternString::intern(intern, "tonumber"), tonumber),
         (InternString::intern(intern, "require"), require),
         (InternString::intern(intern, "unpack"), unpack),
+        (InternString::intern(intern, "next"), next),
+        (InternString::intern(intern, "select"), select),
         (InternString::intern(intern, "error"), error),
         (InternString::intern(intern, "pcall"), pcall),
         (InternString::intern(intern, "setmetatable"), setmetatable),
@@ -1158,6 +1303,8 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "table"), table_lib),
         (InternString::intern(intern, "io"), io_lib),
         (InternString::intern(intern, "bit"), bit_lib),
-        (InternString::intern(intern, "jit"), jit_lib),
-    ]
+    ];
+    #[cfg(feature = "magic")]
+    globals.push((InternString::intern(intern, "jit"), jit_lib));
+    globals
 }

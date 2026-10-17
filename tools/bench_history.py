@@ -40,6 +40,8 @@ import subprocess
 import sys
 from collections import defaultdict
 
+import hyperfine_json
+
 HISTORY = 'bench/history.jsonl'
 SIZES = 'bench/jit_sizes.jsonl'
 # A section of committed code in an annotated disassembly, and its bytes.
@@ -64,11 +66,40 @@ def git(*args):
 
 
 def head_state():
-    """This checkout's HEAD, and whether what builds it differs from it."""
+    """This checkout's HEAD, and whether what builds it differs from it: as of the benches
+    built up front, when $LUNACY_BENCH_STATE names the file `state` wrote then, as the source
+    can change while they run."""
+    if os.environ.get('LUNACY_BENCH_STATE'):
+        with open(os.environ['LUNACY_BENCH_STATE']) as f:
+            head, dirty = f.read().split()
+        return head, dirty == 'dirty'
     head = git('rev-parse', 'HEAD')
     paths = [p for p in BUILD_PATHS if os.path.exists(p)]
     dirty = subprocess.run(['git', 'diff', '--quiet', 'HEAD', '--', *paths]).returncode != 0
     return head, dirty
+
+
+def merge(args):
+    """Take another checkout's history (or size history, with --sizes) into this one's: the
+    records of both, each once, in the order they were made."""
+    path = SIZES if args.sizes else HISTORY
+    records, seen = [], set()
+    for source in [path, *args.files]:
+        for record in load(source):
+            key = json.dumps(record, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                records.append(record)
+    records.sort(key=lambda record: record['date'])
+    with open(path, 'w') as f:
+        for record in records:
+            f.write(json.dumps(record, sort_keys=True) + '\n')
+    print(f'{path}: {len(records)} records')
+
+
+def print_state(args):
+    head, dirty = head_state()
+    print(head, 'dirty' if dirty else 'clean')
 
 
 def commit_info(rev):
@@ -90,7 +121,7 @@ def load(path=HISTORY):
 def record(args):
     head, dirty = head_state()
     ref = commit_info(args.ref)[0] if args.ref else None
-    results = json.load(open(args.json))['results']
+    results = hyperfine_json.results(args.json)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
     lines = []
     # (commit, dirty, build) -> padding -> its times, of a run over paddings.
@@ -190,13 +221,23 @@ def sizes_vs(args):
         print(f"{bench + ' ' + arg:24} {cells[0]} {cells[1]} {change:>8}")
 
 
+def times_vs_revision(name):
+    """The key `series` has a revision's results under: `dirty` HEAD's newest dirty
+    result, `<commit>-dirty` that commit's, else the commit's clean ones."""
+    if name == 'dirty':
+        return name
+    if name.endswith('-dirty'):
+        return commit_info(name[:-len('-dirty')])[0] + '-dirty'
+    return commit_info(name)[0]
+
+
 def times_vs(args):
     """Each benchmark's pooled time for revision `base` and for `head`, as `build`,
     fastest change first: their medians and its change, at how many paddings
     `head`'s median is the lower, whether their quartile boxes are apart; and the
-    changes' geometric mean. `head` `dirty` is HEAD's newest dirty result."""
-    base = commit_info(args.base)[0]
-    head = 'dirty' if args.head == 'dirty' else commit_info(args.head)[0]
+    changes' geometric mean. `head` `dirty` is HEAD's newest dirty result, and
+    either `<commit>-dirty` that commit's."""
+    base, head = times_vs_revision(args.base), times_vs_revision(args.head)
     data, _ = series()
     rows = []
     for key, builds in data.items():
@@ -217,13 +258,34 @@ def times_vs(args):
         print(f"geometric mean of {len(rows)}: {geomean * 100:+.2f}%")
 
 
+def builds_vs(args):
+    """Each benchmark's median for revision `rev` (as `vs` names one) on each of
+    `builds`, and each later build's time over the first's, the benchmarks the
+    first is slowest against the second first; and each ratio's geometric mean."""
+    rev = times_vs_revision(args.rev)
+    builds = args.builds.split(',')
+    data, _ = series()
+    rows = []
+    for (bench, arg), by_build in data.items():
+        medians = [box(by_build[b][rev])['median'] if rev in by_build.get(b, {}) else None for b in builds]
+        if None not in medians:
+            rows.append((bench + ' ' + arg, medians))
+    rows.sort(key=lambda r: -r[1][0] / r[1][1])
+    print(f"{'benchmark':24}" + ''.join(f"{b[:12]:>13}" for b in builds) + ''.join(f"{(b[:9] + '/' + builds[0][:6]):>17}" for b in builds[1:]))
+    for name, medians in rows:
+        print(f"{name:24}" + ''.join(f"{m:13.4f}" for m in medians) + ''.join(f"{medians[0] / m:17.2f}" for m in medians[1:]))
+    if rows:
+        print(f"{'geometric mean':24}" + ' ' * 13 * len(builds)
+              + ''.join(f"{statistics.geometric_mean([r[1][0] / r[1][i] for r in rows]):17.2f}" for i in range(1, len(builds))))
+
+
 def attach_times(args):
     """Add each hyperfine export's runs' times to the results recorded from it,
     which have its benchmark, argument, build and mean."""
     lines = load()
     attached = 0
     for path in args.json:
-        for r in json.load(open(path))['results']:
+        for r in hyperfine_json.results(path):
             build = r['command'][len('ref '):] if r['command'].startswith('ref ') else r['command']
             for line in lines:
                 if 'times' not in line and line['build'] == build and line['mean'] == r['mean'] \
@@ -278,14 +340,16 @@ def pool(a, b):
 
 def series():
     """(benchmark, arg) -> build -> commit -> all its clean results pooled, and
-    the newest dirty result of HEAD, keyed 'dirty' (each dirty result may be of
-    other changes); and the commits' info."""
+    the newest dirty result of HEAD, keyed 'dirty', and of each commit, keyed
+    '<commit>-dirty' (each dirty result may be of other changes); and the
+    commits' info."""
     head, _ = head_state()
     out = defaultdict(lambda: defaultdict(dict))
     commits = {}
     for r in load():
         key = (r['benchmark'], r['arg'])
         if r['dirty']:
+            out[key][r['build']][r['commit'] + '-dirty'] = r
             if r['commit'] == head:
                 out[key][r['build']]['dirty'] = r
             continue
@@ -522,6 +586,12 @@ def main():
     r.add_argument('--arg', required=True, help="the benchmark's argument (`times`)")
     r.add_argument('--ref', help="the revision `ref `-prefixed commands were built from")
     r.set_defaults(func=record)
+    st = sub.add_parser('state', help="print this checkout's HEAD and whether it's dirty, for $LUNACY_BENCH_STATE")
+    st.set_defaults(func=print_state)
+    m = sub.add_parser('merge', help="take other checkouts' history files into this one's")
+    m.add_argument('files', nargs='+')
+    m.add_argument('--sizes', action='store_true', help='the size history, not the times')
+    m.set_defaults(func=merge)
     p = sub.add_parser('report', help='print each benchmark and build, flagging regressions')
     p.add_argument('--strict', action='store_true', help='exit 1 on a regression')
     p.set_defaults(func=report)
@@ -534,6 +604,10 @@ def main():
     v = sub.add_parser('sizes-vs', help="this checkout's JIT code sizes against a revision's")
     v.add_argument('ref')
     v.set_defaults(func=sizes_vs)
+    bv = sub.add_parser('builds', help="one revision's times on several builds, against the first")
+    bv.add_argument('rev')
+    bv.add_argument('--builds', default='unsafe,luajit -joff,luajit')
+    bv.set_defaults(func=builds_vs)
     w = sub.add_parser('vs', help="one revision's times against another's, every run of each pooled")
     w.add_argument('base')
     w.add_argument('head')
