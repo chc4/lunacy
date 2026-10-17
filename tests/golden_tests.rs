@@ -79,10 +79,16 @@ fn run_timed(path: &Path, lua_baseline: bool) {
         unsafe { std::env::set_var("LUNACY_GAS", gas.to_string()) };
     }
     // `LUNACY_GOLDEN_EFFECT_SEED`: each test run once to count the specializer's yields, then again
-    // with an effect applied at one the seed and its name choose (`LUNACY_GOLDEN_EFFECT_AT` instead
-    // names it): code knowing less must give the same output. See Note [Conservative information].
+    // with an effect applied at one the seed and its name choose, and which effect
+    // (`LUNACY_GOLDEN_EFFECT_AT`, `yield:effect`, instead names them): code knowing less must give
+    // the same output. See Note [Conservative information].
     #[cfg(feature = "conservative_information")]
-    let at = match (std::env::var("LUNACY_GOLDEN_EFFECT_SEED").ok(), std::env::var("LUNACY_GOLDEN_EFFECT_AT").ok().and_then(|s| s.parse::<u64>().ok())) {
+    let named = std::env::var("LUNACY_GOLDEN_EFFECT_AT").ok().and_then(|s| {
+        let (at, effect) = s.split_once(':').unwrap_or((&s, "0"));
+        Some((at.parse::<u64>().ok()?, effect.parse::<usize>().ok()?))
+    });
+    #[cfg(feature = "conservative_information")]
+    let at = match (std::env::var("LUNACY_GOLDEN_EFFECT_SEED").ok(), named) {
         (_, Some(at)) if !lua_baseline => Some(at),
         (Some(seed), None) if !lua_baseline => {
             let owned = path.to_path_buf();
@@ -93,15 +99,16 @@ fn run_timed(path: &Path, lua_baseline: bool) {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::hash::DefaultHasher::new();
             (seed, path).hash(&mut hasher);
-            (ticks > 0).then(|| 1 + hasher.finish() % ticks)
+            let bits = hasher.finish();
+            (ticks > 0).then(|| (1 + bits % ticks, (bits >> 32) as usize % lunacy::specialize::conservative::EFFECTS.len()))
         },
         _ => None,
     };
     #[cfg(feature = "conservative_information")]
-    if let Some(at) = at {
-        println!("{} with an effect at yield {at}", path.display());
+    if let Some((at, effect)) = at {
+        println!("{} with effect {effect} at yield {at} (LUNACY_GOLDEN_EFFECT_AT={at}:{effect})", path.display());
     }
-    // `LUNACY_GOLDEN_EFFECT_EVERY`: the test run with an effect at each of its yields in turn, and
+    // `LUNACY_GOLDEN_EFFECT_EVERY`: the test run with each effect at each of its yields in turn, and
     // how many of those runs fail, to see how likely a random one is to.
     #[cfg(feature = "conservative_information")]
     if std::env::var_os("LUNACY_GOLDEN_EFFECT_EVERY").is_some() && !lua_baseline {
@@ -110,15 +117,16 @@ fn run_timed(path: &Path, lua_baseline: bool) {
             run_test_file(&owned, lua_baseline);
             lunacy::specialize::conservative::TICKS.with(|ticks| ticks.get())
         }).join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        let failed: Vec<u64> = (1..=ticks).filter(|&at| {
+        let effects = lunacy::specialize::conservative::EFFECTS.len();
+        let failed: Vec<String> = (1..=ticks).flat_map(|at| (0..effects).map(move |effect| (at, effect))).filter(|&(at, effect)| {
             let owned = path.to_path_buf();
             std::thread::spawn(move || {
-                lunacy::specialize::conservative::AT.with(|cell| cell.set(Some(at)));
+                lunacy::specialize::conservative::AT.with(|cell| cell.set(Some((at, effect))));
                 run_test_file(&owned, lua_baseline);
             }).join().is_err()
-        }).collect();
-        println!("{}: {} of {ticks} yields fail with an effect at them: {:?}", path.display(), failed.len(), &failed[..failed.len().min(20)]);
-        assert!(failed.is_empty(), "{} fails with an effect at {} of {ticks} yields", path.display(), failed.len());
+        }).map(|(at, effect)| format!("{at}:{effect}")).collect();
+        println!("{}: {} of {} effects at its {ticks} yields fail: {:?}", path.display(), failed.len(), ticks as usize * effects, &failed[..failed.len().min(20)]);
+        assert!(failed.is_empty(), "{} fails with {} of the effects at its yields", path.display(), failed.len());
         return;
     }
     let owned = path.to_path_buf();

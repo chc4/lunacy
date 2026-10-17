@@ -2871,24 +2871,23 @@ pub mod conservative {
     thread_local! {
         /// The yields handled so far.
         pub static TICKS: Cell<u64> = const { Cell::new(0) };
-        /// The yield an effect is applied at, if any.
-        pub static AT: Cell<Option<u64>> = const { Cell::new(None) };
+        /// The yield an effect is applied at, and which of `EFFECTS`, if any.
+        pub static AT: Cell<Option<(u64, usize)>> = const { Cell::new(None) };
         /// The effect chosen at it, applied before the next instruction compiled.
         static PENDING: Cell<Option<super::Effect>> = const { Cell::new(None) };
     }
 
     /// The effects a context can be made to forget by, whatever it holds.
-    const EFFECTS: [super::Effect; 5] = [super::Effect::Opaque, super::Effect::WriteAny, super::Effect::AnyUpvalue, super::Effect::ArrayStore(None), super::Effect::Trip];
+    pub const EFFECTS: [super::Effect; 5] = [super::Effect::Opaque, super::Effect::WriteAny, super::Effect::AnyUpvalue, super::Effect::ArrayStore(None), super::Effect::Trip];
 
-    /// Count a yield, choosing the effect at the chosen one: by the yield's count, so a run is
-    /// repeated by the count alone.
+    /// Count a yield, and at the chosen one, hold its effect to apply.
     pub(super) fn tick() {
         let tick = TICKS.with(|ticks| {
             ticks.set(ticks.get() + 1);
             ticks.get()
         });
-        if AT.with(Cell::get) == Some(tick) {
-            PENDING.with(|pending| pending.set(Some(EFFECTS[tick as usize % EFFECTS.len()])));
+        if let Some((at, effect)) = AT.with(Cell::get) && at == tick {
+            PENDING.with(|pending| pending.set(Some(EFFECTS[effect % EFFECTS.len()])));
         }
     }
 
@@ -4883,6 +4882,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             #[cfg(feature = "conservative_information")]
             {
                 ctx = conservative::forget(ctx);
+                #[cfg(feature = "tracing")]
+                crate::tracing::instant("spec", "tick", &[
+                    ("line", self.traced_line(owner).into()),
+                    ("pc", pc.into()),
+                    ("tick", conservative::TICKS.with(|ticks| ticks.get()).into()),
+                ]);
             }
             let charged = seal(&ctx).map(|seal| (seal, block_id, self.blocks[block_id.0].instructions.len()));
             let compiled = match (self.decode(pc, &inst), inst.0.Opcode()) {
