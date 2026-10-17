@@ -1474,6 +1474,10 @@ fn name_hash(name: &[u8]) -> u64 {
 // A store's check passed, or the table just made, the code after it knows the table unwatched, and
 // checks it no more until a watch may have made it watched. A watch is an effect too, which no table's being unwatched
 // survives, so a callee's reaches its caller as its other effects do (Note [Call effects]).
+//
+// Watching is the `watchpoints` feature's, which `jit.frozen` and `jit.tripped` need. Without it no
+// table is ever watched, so a store checks nothing and no code learns a table unwatched: the fact
+// would only tell versions apart.
 
 // Note [Frozen tables]
 // ~~~~~~~~~~~~~~~~~~~~~
@@ -7176,8 +7180,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(thunk);
                     return None;
                 },
-                CoroutineState::Yielded(YieldOp::Created(slot)) => {
-                    Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(slot as u16)), Known::Unwatched);
+                CoroutineState::Yielded(YieldOp::Created(_slot)) => {
+                    #[cfg(feature = "watchpoints")]
+                    Rc::make_mut(&mut ctx).values.learn(Loc::root(Root::Slot(_slot as u16)), Known::Unwatched);
                 },
                 CoroutineState::Yielded(YieldOp::Quotient(slot, of, by)) => {
                     Rc::make_mut(&mut ctx).values.link(Loc::root(Root::Slot(slot as u16)), Label::Quotient(by), Loc::root(Root::Slot(of as u16)));
@@ -7311,11 +7316,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         _ => ResumeArg::Failed,
                     };
                 },
-                // A table known unwatched is checked no more. See Note [Watched tables].
+                // A table known unwatched is checked no more, and without watchpoints none is
+                // watched. See Note [Watched tables].
+                #[cfg(not(feature = "watchpoints"))]
+                CoroutineState::Yielded(YieldOp::Trip(_)) => {
+                    pc = pc.next_true();
+                    arg = ResumeArg::Matched;
+                },
+                #[cfg(feature = "watchpoints")]
                 CoroutineState::Yielded(YieldOp::Trip(Some(slot))) if ctx.values.fact(Loc::root(Root::Slot(slot as u16)), UNWATCHED).is_some() => {
                     pc = pc.next_true();
                     arg = ResumeArg::Matched;
                 },
+                #[cfg(feature = "watchpoints")]
                 CoroutineState::Yielded(YieldOp::Trip(of)) => {
                     // Its cold way, the table watched, goes on knowing no element. See Note
                     // [Watched tables].

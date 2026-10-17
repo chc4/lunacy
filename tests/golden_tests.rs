@@ -93,6 +93,11 @@ fn run_timed(path: &Path, lua_baseline: bool) {
 
 fn run_test_file(path: &Path, lua_baseline: bool) {
     let content = fs::read_to_string(path).unwrap();
+    // `-- FEATURE: watchpoints`: a test of what only that cargo feature has, skipped without it.
+    let needs = content.lines().filter_map(|l| l.strip_prefix("-- FEATURE: ")).collect::<Vec<_>>();
+    if !lua_baseline && needs.iter().any(|&feature| feature == "watchpoints" && !cfg!(feature = "watchpoints")) {
+        return;
+    }
     let expected: Vec<String> = content
         .lines()
         .filter(|l| l.starts_with("-- EXPECT: "))

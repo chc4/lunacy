@@ -42,6 +42,8 @@ test:
     {{SHARED}} cargo test --features "gc_sanitize"
     # Interpreter GC stress test
     {{SHARED}} cargo test --features "gc_stress gc_sanitize"
+    # The watchpoint tests, which need their feature (Note [Watched tables])
+    LUNACY_GOLDEN=watch,frozen,frozen_alias,unwatched {{SHARED}} cargo test --features "gc_sanitize watchpoints" --test golden_tests test_golden
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     {{SHARED}} cargo test --test gc_reset_frees
     # The golden tests with random gas, a new seed each time, which a failure prints to

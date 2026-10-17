@@ -1,3 +1,4 @@
+-- FEATURE: watchpoints
 -- `jit.frozen(t)` watches a table, and `jit.tripped(t)`, a watch site, is
 -- compiled knowing the table is still watched, `false` with no test, until a
 -- store into it trips its watchpoint, which unpublishes the site: from then on

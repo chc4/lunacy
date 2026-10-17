@@ -20,6 +20,7 @@ check_windows = []
 unreachable = []
 gas = []
 magic = [] # Magic JIT intrinsics
+watchpoints = ["magic"] # Watched and frozen tables (jit.frozen, jit.tripped): every store checks its table (Note [Watched tables])
 perf = [] # Create perf JIT map file
 block_counts = ["jit"] # Count each block's executions, in JIT code and the interpreter, to block_counts.txt
 tracing = [] # Write a Perfetto trace (Fuchsia trace format) of the run to lunacy.fxt

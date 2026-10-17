@@ -1274,21 +1274,28 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     // in a Lua other than LuaJIT, and code probing for it runs without. `jit.versions()`: how many
     // versions the code it is in has (`versions_generator`), for tests.
     #[cfg(feature = "magic")]
-    let jit_lib = module(intern, vec![
-        ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
-        ("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])),
-        ("learn", native!(pure generator: learn_generator, |owner, args| vec![arg(&args, 0)])),
+    let jit_lib = {
+        #[allow(unused_mut)]
+        let mut natives = vec![
+            ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
+            ("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])),
+            ("learn", native!(pure generator: learn_generator, |owner, args| vec![arg(&args, 0)])),
+        ];
         // `jit.frozen(t)`: `t`, frozen; `jit.tripped(t)`: whether a store into it tripped its
         // watchpoint since, for tests. See Notes [Frozen tables] and [Watched tables].
-        ("frozen", native!(generator: frozen_generator, |owner, args| {
-            let t = table(arg(&args, 0));
-            t.rw(owner).watched = true;
-            vec![arg(&args, 0)]
-        })),
-        ("tripped", native!(pure generator: tripped_generator, |owner, args| {
-            vec![LBoxed::from_bool(!table(arg(&args, 0)).ro(owner).watched)]
-        })),
-    ]);
+        #[cfg(feature = "watchpoints")]
+        natives.extend([
+            ("frozen", native!(generator: frozen_generator, |owner, args| {
+                let t = table(arg(&args, 0));
+                t.rw(owner).watched = true;
+                vec![arg(&args, 0)]
+            })),
+            ("tripped", native!(pure generator: tripped_generator, |owner, args| {
+                vec![LBoxed::from_bool(!table(arg(&args, 0)).ro(owner).watched)]
+            })),
+        ]);
+        module(intern, natives)
+    };
 
     MODULES.with_borrow_mut(|modules| {
         *modules = vec![("bit", erase(&bit_lib)), ("table.new", erase(&table_new)), ("table.clear", erase(&table_clear))];
