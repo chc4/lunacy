@@ -2849,6 +2849,70 @@ pub struct OriginState {
     used: bool,
 }
 
+// Note [Conservative information]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// What a context knows is conservative: joins, version limits and call effects all make it forget,
+// and forgetting is always correct, as code knowing less only checks more. So code must never take
+// what isn't known for its opposite: a field not known open isn't known closed. Feature
+// `conservative_information` tests it. It counts each yield the specializer handles, and after the
+// one the test chooses applies an effect: to the context before the next instruction compiled, as
+// an instruction's own yields rely on its context staying what it was, or to the context of the
+// next version or subblock made, whichever comes first, as one may be entered knowing less than
+// the code leading to it (a join at the version limit, a guard that can't make one of its own).
+// The context forgets what the effect would falsify. A run whose output changes relies on
+// knowledge the effect took.
+
+/// Yields the specializer has handled on this thread, and the one an effect is applied at. See Note
+/// [Conservative information].
+#[cfg(feature = "conservative_information")]
+pub mod conservative {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The yields handled so far.
+        pub static TICKS: Cell<u64> = const { Cell::new(0) };
+        /// The yield an effect is applied at, if any.
+        pub static AT: Cell<Option<u64>> = const { Cell::new(None) };
+        /// The effect chosen at it, applied before the next instruction compiled.
+        static PENDING: Cell<Option<super::Effect>> = const { Cell::new(None) };
+    }
+
+    /// The effects a context can be made to forget by, whatever it holds.
+    const EFFECTS: [super::Effect; 5] = [super::Effect::Opaque, super::Effect::WriteAny, super::Effect::AnyUpvalue, super::Effect::ArrayStore(None), super::Effect::Trip];
+
+    /// Count a yield, choosing the effect at the chosen one: by the yield's count, so a run is
+    /// repeated by the count alone.
+    pub(super) fn tick() {
+        let tick = TICKS.with(|ticks| {
+            ticks.set(ticks.get() + 1);
+            ticks.get()
+        });
+        if AT.with(Cell::get) == Some(tick) {
+            PENDING.with(|pending| pending.set(Some(EFFECTS[tick as usize % EFFECTS.len()])));
+        }
+    }
+
+    /// The effect chosen, once: applied between instructions, as an instruction's own yields rely
+    /// on its context staying what it was, or to the context of the next block made, as a version
+    /// or a subblock may be entered knowing less than what led to it.
+    pub(super) fn pending() -> Option<super::Effect> {
+        PENDING.with(Cell::take)
+    }
+
+    /// `ctx`, less what the effect chosen falsifies, if it is still to be applied. Only what it
+    /// knows: its inlined calls' frames stay as they were, as no code they run had the effect.
+    pub(super) fn forget(ctx: std::rc::Rc<super::Context>) -> std::rc::Rc<super::Context> {
+        let mut ctx = ctx;
+        if let Some(effect) = pending() {
+            let known = std::rc::Rc::make_mut(&mut ctx);
+            let inline = known.inline.clone();
+            known.effect(effect);
+            known.inline = inline;
+        }
+        ctx
+    }
+}
+
 /// What fragile information an operation may falsify. See Note [Fragile
 /// information].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3974,6 +4038,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     pub fn subblock(&mut self, owner: &mut Owner, pc: SubPc, ctx: Rc<Context>, coro: Box<dyn NativeGen>, arg: ResumeArg) -> BlockId {
+        #[cfg(feature = "conservative_information")]
+        let ctx = conservative::forget(ctx);
         let ctx = Context::canonical_free(ctx);
         if let Some(((_, ectx), &exists)) = self.versions.get(&self.proto).unwrap().get_key_value(&(pc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
@@ -4013,6 +4079,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The block a jump to `pc` in `ctx` enters: a version for `ctx`, or one
     /// accepting it, compiled if need be. See Note [Version compatibility].
     pub fn version(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>) -> BlockId {
+        #[cfg(feature = "conservative_information")]
+        let ctx = conservative::forget(ctx);
         let ctx = Context::canonical_free(ctx);
         #[cfg(feature = "tracing")]
         let requested = ctx.clone();
@@ -4810,6 +4878,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ("by", format!("{:?}", inst.0.Opcode()).as_str().into()),
                 ]);
                 (block_id, ctx) = self.make_frames(block_id, pc, &ctx);
+            }
+            // See Note [Conservative information].
+            #[cfg(feature = "conservative_information")]
+            {
+                ctx = conservative::forget(ctx);
             }
             let charged = seal(&ctx).map(|seal| (seal, block_id, self.blocks[block_id.0].instructions.len()));
             let compiled = match (self.decode(pc, &inst), inst.0.Opcode()) {
@@ -6934,6 +7007,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut state = Pin::new(&mut *coro).resume(arg);
             arg = ResumeArg::Start;
             'machine: loop {
+            // See Note [Conservative information].
+            #[cfg(feature = "conservative_information")]
+            if matches!(state, CoroutineState::Yielded(_)) {
+                conservative::tick();
+            }
             match state {
                 CoroutineState::Yielded(YieldOp::TypeofK(k)) => {
                     let proto = self.proto;

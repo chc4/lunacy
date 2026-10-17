@@ -49,6 +49,8 @@ test:
     # The golden tests with random gas, a new seed each time, which a failure prints to
     # rerun it with (`just golden-gas <seed>`)
     just golden-gas
+    # The golden tests with an effect at a random yield (`just golden-conservative <seed>`)
+    just golden-conservative
 
 # Copy&patch window stencils (src/window.rs) as the JIT will use them: built
 # in release, so the stencils checked are the ones the JIT copies (a build
@@ -195,6 +197,25 @@ golden-gas seed='':
     LUNACY_GOLDEN_GAS_SEED=$seed {{SHARED}} cargo test --features "gc_sanitize gas" --test golden_tests test_golden -- --nocapture > working/golden-gas.log 2>&1 || status=$?
     grep -E "panicked|ran past|test result|mismatch" -B1 working/golden-gas.log | grep -v "^--" | tail -n 20
     exit $status
+
+# The golden tests with an effect applied at a random yield of the specializer's, a new seed each
+# time, which a failure prints to rerun it with (`just golden-conservative <seed>`): code that
+# forgets what it knows must give the same output. See Note [Conservative information].
+golden-conservative seed='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seed="{{seed}}"
+    [ -n "$seed" ] || seed=$RANDOM$RANDOM
+    echo "seed $seed"
+    status=0
+    LUNACY_GOLDEN_EFFECT_SEED=$seed {{SHARED}} cargo test --features "gc_sanitize conservative_information" --test golden_tests test_golden -- --nocapture > working/golden-conservative.log 2>&1 || status=$?
+    grep -E "panicked|ran past|test result|mismatch" -B1 working/golden-conservative.log | grep -v "^--" | tail -n 20
+    exit $status
+
+# Golden tests `names`, each run with an effect at each of its specializer's yields in turn,
+# failing with how many of those runs fail. See Note [Conservative information].
+golden-conservative-every +names:
+    LUNACY_GOLDEN={{replace(names, " ", ",")}} LUNACY_GOLDEN_EFFECT_EVERY=1 {{SHARED}} cargo test --features "gc_sanitize conservative_information" --test golden_tests test_golden -- --nocapture 2>&1 | grep -E "yields fail|panicked|test result"
 
 # Golden tests, each against its expected output, under the default build,
 # immediate_jit, no_dynamic_guards and both (tools/golden_builds.py).

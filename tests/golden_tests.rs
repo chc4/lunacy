@@ -78,9 +78,54 @@ fn run_timed(path: &Path, lua_baseline: bool) {
         // Read when the run starts, on the test's thread; nothing else runs meanwhile.
         unsafe { std::env::set_var("LUNACY_GAS", gas.to_string()) };
     }
+    // `LUNACY_GOLDEN_EFFECT_SEED`: each test run once to count the specializer's yields, then again
+    // with an effect applied at one the seed and its name choose (`LUNACY_GOLDEN_EFFECT_AT` instead
+    // names it): code knowing less must give the same output. See Note [Conservative information].
+    #[cfg(feature = "conservative_information")]
+    let at = match (std::env::var("LUNACY_GOLDEN_EFFECT_SEED").ok(), std::env::var("LUNACY_GOLDEN_EFFECT_AT").ok().and_then(|s| s.parse::<u64>().ok())) {
+        (_, Some(at)) if !lua_baseline => Some(at),
+        (Some(seed), None) if !lua_baseline => {
+            let owned = path.to_path_buf();
+            let ticks = std::thread::spawn(move || {
+                run_test_file(&owned, lua_baseline);
+                lunacy::specialize::conservative::TICKS.with(|ticks| ticks.get())
+            }).join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::hash::DefaultHasher::new();
+            (seed, path).hash(&mut hasher);
+            (ticks > 0).then(|| 1 + hasher.finish() % ticks)
+        },
+        _ => None,
+    };
+    #[cfg(feature = "conservative_information")]
+    if let Some(at) = at {
+        println!("{} with an effect at yield {at}", path.display());
+    }
+    // `LUNACY_GOLDEN_EFFECT_EVERY`: the test run with an effect at each of its yields in turn, and
+    // how many of those runs fail, to see how likely a random one is to.
+    #[cfg(feature = "conservative_information")]
+    if std::env::var_os("LUNACY_GOLDEN_EFFECT_EVERY").is_some() && !lua_baseline {
+        let owned = path.to_path_buf();
+        let ticks = std::thread::spawn(move || {
+            run_test_file(&owned, lua_baseline);
+            lunacy::specialize::conservative::TICKS.with(|ticks| ticks.get())
+        }).join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let failed: Vec<u64> = (1..=ticks).filter(|&at| {
+            let owned = path.to_path_buf();
+            std::thread::spawn(move || {
+                lunacy::specialize::conservative::AT.with(|cell| cell.set(Some(at)));
+                run_test_file(&owned, lua_baseline);
+            }).join().is_err()
+        }).collect();
+        println!("{}: {} of {ticks} yields fail with an effect at them: {:?}", path.display(), failed.len(), &failed[..failed.len().min(20)]);
+        assert!(failed.is_empty(), "{} fails with an effect at {} of {ticks} yields", path.display(), failed.len());
+        return;
+    }
     let owned = path.to_path_buf();
     let (done, finished) = std::sync::mpsc::channel();
     let test = std::thread::spawn(move || {
+        #[cfg(feature = "conservative_information")]
+        lunacy::specialize::conservative::AT.with(|cell| cell.set(at));
         run_test_file(&owned, lua_baseline);
         let _ = done.send(());
     });

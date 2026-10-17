@@ -20,6 +20,9 @@ check_windows = []
 unreachable = []
 gas = []
 magic = [] # Magic JIT intrinsics
+# Count each yield the specializer handles, and apply an effect at the one `conservative::AT`
+# says, to test that code forgetting what it knows stays correct (Note [Conservative information])
+conservative_information = []
 watchpoints = ["magic"] # Watched and frozen tables (jit.frozen, jit.tripped): every store checks its table (Note [Watched tables])
 perf = [] # Create perf JIT map file
 block_counts = ["jit"] # Count each block's executions, in JIT code and the interpreter, to block_counts.txt
