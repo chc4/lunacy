@@ -1,6 +1,9 @@
 /target
 # What the Justfile's recipes make: bytecode, reports, profiles, dumps, charts.
 /working
+# The benches' timing and JIT size histories, kept per checkout.
+/bench/history.jsonl
+/bench/jit_sizes.jsonl
 # The golden tests' bytecode, left behind by a test that crashed.
 lua_tests/*.bin
 Cargo.lock
