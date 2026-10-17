@@ -22,32 +22,25 @@ use std::hash::Hash;
 // A write to a place moves it to a class of its own, which nothing is known of, and leaves the
 // rest of its old class as it was: facts follow values, and nothing else is falsified. A class no
 // place reaches any more is forgotten, and so is one nothing is known of (no facts, no fields, and
-// only one place holding it), as that is what a place no class names means. An upvalue captured
-// while its slot is open is that slot, not a copy of its value: its field names the slot itself
-// (`Target::Open`), so a write to the slot is one to the upvalue, until the slot is closed and the
-// field holds the value it then had.
+// only one place holding it), as that is what a place no class names means.
 //
-// Fields are forgotten, so that no field is known open onto a slot doesn't say no cell is open onto
-// it. What does is held of each slot apart (`captures`): that every closure whose cell is open onto
-// it is the value of a class with a field known open onto it. A new frame's slots are known so, as
-// no cell is open onto them, a capture adds its field, and a close leaves no cell open. A slot is
-// known so no longer once a field open onto it is forgotten or overwritten, as its closure may still
-// share the cell, nor after a call making a closure of one of its upvalues (`Effects::CAPTURE`),
-// which may be a cell open onto the slot, unless no field is open onto it, as only this frame's code
-// opens one. What is known of it is checked by the fields themselves: a join knows a slot so where
-// both do and each side's every field open onto it is paired with the other's, and a version
-// knowing a slot so accepts a context knowing it so whose every field open onto it is the image of
-// one of the version's.
+// A closure's upvalue is a cell, which other closures may share. Classes are of places known equal,
+// so another class may hold the same closure without the context knowing it does. A field therefore
+// says only what its cell is known to be:
 //
-// A class is of places known equal, not of a closure: another class may hold a closure sharing a
-// cell without the context knowing it does, and have learned its upvalue as a value. So a write to
-// a slot is one to the open fields alone only where it is known so and no field is open onto it, as
-// then no closure shares its cell; one to any other may be one to any closure's cell, and forgets
-// every closure's upvalue field but the open ones and the sealed ones, which are closed. A slot known
-// so with one field open onto it is closed into a sealed field (`Target::Sealed`): its cell is
-// reachable only through that closure, until a closure is made of the closure's upvalue. A root
-// mapped from a sealed field into another frame (`view`) is sealed there too; a field open onto a
-// slot isn't sealed in the view, as its cell is still open.
+//   * An open field (`Target::Open`) is a cell open onto a slot of the frame, and holds whatever
+//     the slot does.
+//   * A sealed field (`Target::Sealed`) is a closed cell. No slot is one, so a write to a slot
+//     leaves it as it is.
+//   * Any other field holds the value its cell had when it was learned, and its cell may be open
+//     onto a slot.
+//
+// A slot is uncaptured where no cell is open onto it. A new frame's slots are, a close leaves the
+// slots it closes so, and a capture makes its slot not. A write to an uncaptured slot changes no
+// field. A write to any other slot may change the cell of every field neither open nor sealed, so
+// it forgets them. A close makes each field open onto a slot it closes a sealed field holding the
+// slot's value. Another frame's view holds an open field as a value, as its cell is still open
+// onto a slot that isn't the other frame's, and a sealed one as a sealed root.
 //
 // The classes are kept in a canonical form, numbered in the order they are first reached from the
 // roots in order and then along fields in label order, with nothing kept that tells nothing. Two
@@ -194,16 +187,15 @@ pub struct Classes<F> {
     facts: Vec<(u32, Vec<F>)>,
     /// The roots that are sealed cells, in order.
     sealed: Vec<Root>,
-    /// For each slot, whether every closure whose cell is open onto it is the value of a class with
-    /// a field open onto it; a slot past the end isn't known so.
-    captures: Vec<bool>,
+    /// For each slot, whether it is uncaptured; a slot past the end may not be.
+    uncaptured: Vec<bool>,
     /// How many classes there are, numbered from 0.
     classes: u32,
 }
 
 impl<F> Default for Classes<F> {
     fn default() -> Self {
-        Classes { roots: Vec::new(), fields: Vec::new(), facts: Vec::new(), sealed: Vec::new(), captures: Vec::new(), classes: 0 }
+        Classes { roots: Vec::new(), fields: Vec::new(), facts: Vec::new(), sealed: Vec::new(), uncaptured: Vec::new(), classes: 0 }
     }
 }
 
@@ -246,39 +238,14 @@ impl<F: ClassFact> Classes<F> {
 
     fn set_field(&mut self, class: u32, label: Label, target: Target) {
         match self.fields.iter().position(|&(c, l, _)| c == class && l == label) {
-            Some(i) => {
-                let old = std::mem::replace(&mut self.fields[i].2, target);
-                if old != target {
-                    self.lost(old);
-                }
-            },
+            Some(i) => self.fields[i].2 = target,
             None => self.fields.push((class, label, target)),
         }
     }
 
-    /// Keep only the fields `keep` says to, each forgotten one `lost`.
-    fn keep_fields(&mut self, mut keep: impl FnMut(&(u32, Label, Target)) -> bool) {
-        let mut lost = Vec::new();
-        self.fields.retain(|field| keep(field) || {
-            lost.push(field.2);
-            false
-        });
-        for target in lost {
-            self.lost(target);
-        }
-    }
-
-    /// A field holding `target` is forgotten: if it was open onto a slot, its closure may still
-    /// share the cell.
-    fn lost(&mut self, target: Target) {
-        if let Target::Open(slot) = target && let Some(known) = self.captures.get_mut(slot as usize) {
-            *known = false;
-        }
-    }
-
-    /// Whether every closure whose cell is open onto `slot` is known.
-    fn captures_known(&self, slot: u16) -> bool {
-        self.captures.get(slot as usize).copied().unwrap_or(false)
+    /// Whether no cell is open onto `slot`. See Note [Value classes].
+    fn is_uncaptured(&self, slot: u16) -> bool {
+        self.uncaptured.get(slot as usize).copied().unwrap_or(false)
     }
 
     /// The class `loc` holds, made if nothing was known of it.
@@ -361,17 +328,11 @@ impl<F: ClassFact> Classes<F> {
         self.normalize();
     }
 
-    /// `dst` is written: if it is a slot a closure may share the cell of, so may be a cell of any
-    /// closure whose field isn't known open or sealed. See Note [Value classes].
+    /// `dst` is written. See Note [Value classes].
     fn written(&mut self, dst: Root) {
-        if let Root::Slot(slot) = dst && !self.uncaptured_slot(slot) {
+        if let Root::Slot(slot) = dst && !self.is_uncaptured(slot) {
             self.forget_cells();
         }
-    }
-
-    /// Whether no closure shares a cell open onto `slot`: every one is known, and none is.
-    fn uncaptured_slot(&self, slot: u16) -> bool {
-        self.captures_known(slot) && !self.fields.iter().any(|&(_, _, target)| target == Target::Open(slot))
     }
 
     /// Every slot may be written.
@@ -381,29 +342,9 @@ impl<F: ClassFact> Classes<F> {
         self.normalize();
     }
 
-    /// Forget each closure's upvalue field but the open ones, which follow their slot, and the
-    /// sealed ones, which are closed.
+    /// Forget each closure's upvalue field that is neither open nor sealed.
     fn forget_cells(&mut self) {
-        self.keep_fields(|&(_, label, target)| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_) | Target::Sealed(_)));
-    }
-
-    /// A call made a closure of an upvalue, which may be a cell open onto any slot one is open onto.
-    pub fn called(&mut self) {
-        let open: Vec<Target> = self.fields.iter().map(|&(_, _, target)| target).collect();
-        for target in open {
-            self.lost(target);
-        }
-    }
-
-    /// A closure was made of an upvalue, which may be a sealed cell: two closures share it now.
-    pub fn unseal(&mut self) {
-        for field in &mut self.fields {
-            if let Target::Sealed(class) = field.2 {
-                field.2 = Target::Class(class);
-            }
-        }
-        self.sealed.clear();
-        self.normalize();
+        self.fields.retain(|&(_, label, target)| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_) | Target::Sealed(_)));
     }
 
     /// The last field `loc` is reached by, if it holds a class, is a sealed cell.
@@ -419,8 +360,8 @@ impl<F: ClassFact> Classes<F> {
     }
 
     /// The first `slots` slots are a new frame's, which no cell is open onto.
-    pub fn uncaptured(&mut self, slots: usize) {
-        self.captures = vec![true; slots];
+    pub fn enter(&mut self, slots: usize) {
+        self.uncaptured = vec![true; slots];
     }
 
     /// The value `loc` holds is known as `fact`, in place of what was known of its key.
@@ -461,34 +402,29 @@ impl<F: ClassFact> Classes<F> {
     pub fn alias(&mut self, from: Loc, label: Label, slot: u16) {
         let class = self.ensure(from);
         self.set_field(class, label, Target::Open(slot));
+        if let Some(uncaptured) = self.uncaptured.get_mut(slot as usize) {
+            *uncaptured = false;
+        }
         self.normalize();
     }
 
-    /// The slots from `from` on are closed: a field that was one holds the value it had.
+    /// The slots from `from` on are closed: a field that was open onto one is a sealed cell
+    /// holding the value it had.
     pub fn close(&mut self, from: u16) {
-        self.closed_from(from, true);
+        self.hold_open(from, true);
+        for uncaptured in self.uncaptured.iter_mut().skip(from as usize) {
+            *uncaptured = true;
+        }
     }
 
-    /// The slots from `from` on are closed, as `close`, a field holding the value it had, sealed
-    /// only if `seals` and it is the one cell open onto its slot.
-    fn closed_from(&mut self, from: u16, seals: bool) {
-        let open: Vec<(usize, u16)> = self.fields.iter().enumerate()
-            .filter_map(|(i, &(_, _, target))| match target {
-                Target::Open(slot) if slot >= from => Some((i, slot)),
-                _ => None,
-            })
-            .collect();
-        // Sealed only where every closure sharing the cell is known, and is this field's: one
-        // field known open onto the slot doesn't say no other is, as fields are forgotten.
-        let sole: Vec<bool> = open.iter().map(|&(i, slot)| {
-            seals && self.captures_known(slot) && open.iter().all(|&(j, other)| j == i || other != slot)
-        }).collect();
-        for (&(i, slot), sole) in open.iter().zip(sole) {
-            let class = self.ensure(Loc::root(Root::Slot(slot)));
-            self.fields[i].2 = if sole { Target::Sealed(class) } else { Target::Class(class) };
-        }
-        for known in self.captures.iter_mut().skip(from as usize) {
-            *known = true;
+    /// Each field open onto a slot from `from` on holds the value the slot has, in a sealed cell if
+    /// `sealed`.
+    fn hold_open(&mut self, from: u16, sealed: bool) {
+        for i in 0..self.fields.len() {
+            if let Target::Open(slot) = self.fields[i].2 && slot >= from {
+                let class = self.ensure(Loc::root(Root::Slot(slot)));
+                self.fields[i].2 = if sealed { Target::Sealed(class) } else { Target::Class(class) };
+            }
         }
         self.normalize();
     }
@@ -522,24 +458,23 @@ impl<F: ClassFact> Classes<F> {
 
     /// Keep only the fields `keep` says to.
     pub fn retain_fields(&mut self, mut keep: impl FnMut(Label, Target) -> bool) {
-        self.keep_fields(|&(_, label, target)| keep(label, target));
+        self.fields.retain(|&(_, label, target)| keep(label, target));
         self.normalize();
     }
 
     /// The classes another frame sees, its root `r` holding what `loc` does here for each
-    /// `(r, loc)` of `map`: its other roots hold values nothing is known of, and a field open here
-    /// holds the value it now has, as its slot isn't one of the other frame's. It isn't sealed: its
-    /// cell is still open, and a set of it is one of the slot here.
+    /// `(r, loc)` of `map`; its other roots hold values nothing is known of. See Note [Value
+    /// classes].
     pub fn view(&self, map: &[(Root, Loc)]) -> Self {
         let mut seen = self.clone();
-        seen.closed_from(0, false);
+        seen.hold_open(0, false);
         let mut roots: Vec<(Root, u32)> = map.iter().filter_map(|&(root, loc)| seen.find(loc).map(|class| (root, class))).collect();
         roots.sort();
         roots.dedup_by_key(|&mut (root, _)| root);
         let mut sealed: Vec<Root> = map.iter().filter(|&&(_, loc)| seen.sealed_field(loc)).map(|&(root, _)| root).collect();
         sealed.sort();
         sealed.dedup();
-        let mut view = Classes { roots, fields: seen.fields, facts: seen.facts, sealed, captures: Vec::new(), classes: seen.classes };
+        let mut view = Classes { roots, fields: seen.fields, facts: seen.facts, sealed, uncaptured: Vec::new(), classes: seen.classes };
         view.normalize();
         view
     }
@@ -570,7 +505,7 @@ impl<F: ClassFact> Classes<F> {
                     self.set_field(parent, label, if sealed { Target::Sealed(class + offset) } else { Target::Class(class + offset) });
                 },
                 None => if let Some(parent) = self.find(Loc { root: place.root, path: parent }) {
-                    self.keep_fields(|&(c, l, _)| c != parent || l != label);
+                    self.fields.retain(|&(c, l, _)| c != parent || l != label);
                 },
             }
         }
@@ -642,7 +577,7 @@ impl<F: ClassFact> Classes<F> {
     /// Forget field `label` of the value `loc` holds.
     pub fn unlink(&mut self, loc: Loc, label: Label) {
         if let Some(class) = self.find(loc) {
-            self.keep_fields(|&(c, l, _)| c != class || l != label);
+            self.fields.retain(|&(c, l, _)| c != class || l != label);
             self.normalize();
         }
     }
@@ -713,9 +648,7 @@ impl<F: ClassFact> Classes<F> {
             }
         }
         joined.sealed = self.sealed.iter().filter(|root| other.sealed(**root)).copied().collect();
-        joined.captures = self.captures.iter().zip(&other.captures).map(|(&a, &b)| a && b).collect();
-        // Each side's fields open onto a slot that a joined class has too.
-        let mut kept: (Vec<(u32, Label)>, Vec<(u32, Label)>) = (Vec::new(), Vec::new());
+        joined.uncaptured = self.uncaptured.iter().zip(&other.uncaptured).map(|(&a, &b)| a && b).collect();
         while let Some((a, b, class)) = work.pop() {
             let mine = self.facts.iter().find(|(c, _)| *c == a).map_or(&[][..], |(_, f)| f.as_slice());
             let theirs = other.facts.iter().find(|(c, _)| *c == b).map_or(&[][..], |(_, f)| f.as_slice());
@@ -730,23 +663,10 @@ impl<F: ClassFact> Classes<F> {
                 let target = match (mine, theirs) {
                     (Target::Sealed(x), Target::Sealed(y)) => Target::Sealed(pair(&mut joined, &mut work, x, y)),
                     (Target::Class(x) | Target::Sealed(x), Target::Class(y) | Target::Sealed(y)) => Target::Class(pair(&mut joined, &mut work, x, y)),
-                    (Target::Open(x), Target::Open(y)) if x == y => {
-                        kept.0.push((a, label));
-                        kept.1.push((b, label));
-                        Target::Open(x)
-                    },
+                    (Target::Open(x), Target::Open(y)) if x == y => Target::Open(x),
                     _ => continue,
                 };
                 joined.fields.push((class, label, target));
-            }
-        }
-        // A closure sharing a slot's cell on either side is a joined class's only if its field
-        // open onto the slot is one of the joined.
-        for (side, kept) in [(self, &kept.0), (other, &kept.1)] {
-            for &(class, label, target) in &side.fields {
-                if !kept.contains(&(class, label)) {
-                    joined.lost(target);
-                }
             }
         }
         joined.normalize();
@@ -756,6 +676,9 @@ impl<F: ClassFact> Classes<F> {
     /// Whether code relying on what `self` knows can run in `other`: `other` knows at least as
     /// much.
     pub fn accepts(&self, other: &Self) -> bool {
+        if (0..self.uncaptured.len() as u16).any(|slot| self.is_uncaptured(slot) && !other.is_uncaptured(slot)) {
+            return false;
+        }
         let mut mapped: HashMap<u32, u32> = HashMap::new();
         let mut work: Vec<(u32, u32)> = Vec::new();
         let mut map = |work: &mut Vec<(u32, u32)>, mine: u32, theirs: u32| match mapped.get(&mine) {
@@ -796,13 +719,7 @@ impl<F: ClassFact> Classes<F> {
                 }
             }
         }
-        // Every closure sharing the cell of a slot `self` knows them all of is one `self` knows:
-        // each field `other` has open onto the slot is one of a class of `self`'s mapped to its.
-        (0..self.captures.len() as u16).filter(|&slot| self.captures_known(slot)).all(|slot| {
-            other.captures_known(slot) && other.fields.iter().filter(|&&(_, _, t)| t == Target::Open(slot)).all(|&(theirs, label, _)| {
-                self.fields.iter().any(|&(mine, l, t)| l == label && t == Target::Open(slot) && mapped.get(&mine) == Some(&theirs))
-            })
-        })
+        true
     }
 
     /// Each class paired with what `above` has at each place it is: a class reaching places
@@ -919,18 +836,9 @@ impl<F: ClassFact> Classes<F> {
             })).collect(),
             facts: Vec::new(),
             sealed: self.sealed.iter().filter(|root| above.sealed(**root)).copied().collect(),
-            captures: self.captures.iter().zip(&above.captures).map(|(&a, &b)| a && b).collect(),
+            uncaptured: self.uncaptured.iter().zip(&above.uncaptured).map(|(&a, &b)| a && b).collect(),
             classes: pairs.pairs.len() as u32,
         };
-        // A field open onto a slot here that a part of its class holds as a value isn't the part's
-        // open field.
-        for &(pair, label, target) in &pairs.fields {
-            if let (Mine::Class(class), PairTarget::Pair(_) | PairTarget::Sealed(_)) = (pairs.pairs[pair].0, target)
-                && let Some(field @ Target::Open(_)) = self.field(class, label)
-            {
-                lowered.lost(field);
-            }
-        }
         for (pair, &(mine, _)) in pairs.pairs.iter().enumerate() {
             let Mine::Class(class) = mine else { continue };
             if let Some((_, facts)) = self.facts.iter().find(|(c, _)| *c == class) {
@@ -954,7 +862,7 @@ impl<F: ClassFact> Classes<F> {
                 }
             }
             let fields_before = self.fields.len();
-            self.keep_fields(|&(class, _, _)| reached[class as usize]);
+            self.fields.retain(|&(class, _, _)| reached[class as usize]);
             self.facts.retain(|&(class, _)| reached[class as usize]);
             // What tells nothing.
             let mut held = vec![0u32; self.classes as usize];
@@ -1072,7 +980,7 @@ mod tests {
     /// A new frame's classes, of four slots no closure has captured.
     fn frame() -> C {
         let mut c = C::default();
-        c.uncaptured(4);
+        c.enter(4);
         c
     }
 
@@ -1123,47 +1031,22 @@ mod tests {
         values: HashMap<Root, u32>,
         facts: HashMap<u32, Vec<Fact>>,
         fields: HashMap<(u32, Label), RefField>,
-        /// For each slot, whether every closure whose cell is open onto it has a reached field open
-        /// onto it.
-        captures: Vec<bool>,
-        /// The reached fields open onto a slot, as last seen.
-        open: Vec<((u32, Label), u16)>,
+        /// For each slot, whether no cell is open onto it.
+        uncaptured: Vec<bool>,
         next: u32,
     }
 
     impl Reference {
         /// A new frame's, as `frame`.
         fn frame() -> Self {
-            Reference { captures: vec![true; 4], ..Default::default() }
+            Reference { uncaptured: vec![true; 4], ..Default::default() }
         }
-        /// `root` is written: a slot a closure may share the cell of may be any closure's cell
-        /// whose upvalue field isn't open or sealed.
+        /// `root` is written: a slot a cell may be open onto may be any closure's cell whose
+        /// upvalue field isn't open or sealed.
         fn written(&mut self, root: Root) {
-            let shared = |r: &Self, s: u16| !r.captures.get(s as usize).copied().unwrap_or(false) || r.open_fields().iter().any(|&(_, o)| o == s);
-            if let Root::Slot(s) = root && shared(self, s) {
+            if let Root::Slot(s) = root && !self.uncaptured.get(s as usize).copied().unwrap_or(false) {
                 self.fields.retain(|&(_, label), field| !matches!(label, Label::Upvalue(_)) || !matches!(field, RefField::Value(_)));
             }
-        }
-        /// The reached fields open onto a slot.
-        fn open_fields(&self) -> Vec<((u32, Label), u16)> {
-            let reached = self.reached();
-            let mut open: Vec<((u32, Label), u16)> = self.fields.iter().filter_map(|(&(owner, label), &f)| match f {
-                RefField::Open(s) if reached.contains(&owner) => Some(((owner, label), s)),
-                _ => None,
-            }).collect();
-            open.sort();
-            open
-        }
-        /// A slot every closure sharing the cell of which was known isn't once one of its open
-        /// fields is no longer reached, or holds another.
-        fn forgotten(&mut self) {
-            let open = self.open_fields();
-            for &(field, s) in &self.open {
-                if !open.contains(&(field, s)) {
-                    self.captures[s as usize] = false;
-                }
-            }
-            self.open = open;
         }
         fn fresh(&mut self) -> u32 {
             self.next += 1;
@@ -1283,6 +1166,7 @@ mod tests {
                     let s = rng.below(4) as u16;
                     let from = r.ensure(root, &[]);
                     r.fields.insert((from, label), RefField::Open(s));
+                    r.uncaptured[s as usize] = false;
                     c.alias(Loc::root(root), label, s);
                 }
             },
@@ -1292,24 +1176,16 @@ mod tests {
                     RefField::Open(s) if s >= from => Some((k, s)),
                     _ => None,
                 }).collect();
-                // A slot every closure sharing the cell of which is known, and is one field's, is
-                // sealed in it.
-                let reached = r.open_fields();
-                let sole: Vec<bool> = open.iter().map(|&(k, s)| {
-                    r.captures[s as usize] && reached.iter().all(|&(field, other)| field == k || other != s)
-                }).collect();
-                for ((k, s), sole) in open.into_iter().zip(sole) {
+                for (k, s) in open {
                     let v = r.ensure(Root::Slot(s), &[]);
-                    r.fields.insert(k, if sole { RefField::Sealed(v) } else { RefField::Value(v) });
+                    r.fields.insert(k, RefField::Sealed(v));
                 }
-                r.forgotten();
-                for known in r.captures.iter_mut().skip(from as usize) {
-                    *known = true;
+                for uncaptured in r.uncaptured.iter_mut().skip(from as usize) {
+                    *uncaptured = true;
                 }
                 c.close(from);
             },
         }
-        r.forgotten();
     }
 
     /// The places checked: each root, and each field one label from it.
@@ -1417,8 +1293,7 @@ mod tests {
                 c.learn(Loc { root: *root, path }, fact.clone());
             }
         }
-        // What it knows of each slot's captures is the reference's.
-        c.captures = r.captures.clone();
+        c.uncaptured = r.uncaptured.clone();
         c
     }
 
@@ -1442,9 +1317,9 @@ mod tests {
             for root in ROOTS {
                 c.write(root);
             }
-            // Which cells are open onto a slot it still knows as it did, or not at all.
+            // Writes leave which slots are uncaptured as it was.
             let mut fresh = frame();
-            fresh.captures = c.captures.clone();
+            fresh.uncaptured = c.uncaptured.clone();
             assert_eq!(c, fresh);
         }
     }
@@ -1488,18 +1363,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_sole_capture_is_sealed() {
+    fn every_closed_capture_is_sealed() {
         let field = [Label::Upvalue(0)];
-        let mut sole = frame();
-        sole.alias(slot(0), Label::Upvalue(0), 2);
-        sole.close(2);
-        assert!(sole.sealed_field(Loc { root: Root::Slot(0), path: &field }));
         let mut shared = frame();
         shared.alias(slot(0), Label::Upvalue(0), 2);
         shared.alias(slot(1), Label::Upvalue(0), 2);
         shared.close(2);
-        assert!(!shared.sealed_field(Loc { root: Root::Slot(0), path: &field }), "two closures share the cell");
-        assert!(!shared.sealed_field(Loc { root: Root::Slot(1), path: &field }), "two closures share the cell");
+        assert!(shared.sealed_field(Loc { root: Root::Slot(0), path: &field }));
+        assert!(shared.sealed_field(Loc { root: Root::Slot(1), path: &field }));
     }
 
     #[test]
@@ -1577,7 +1448,7 @@ mod tests {
         let other = ROOTS[rng.below(ROOTS.len() as u64) as usize];
         if rng.below(2) == 0 {
             // An assignment into a slot not every cell of which is known forgets cells.
-            let forgets = matches!(root, Root::Slot(s) if !c.uncaptured_slot(s));
+            let forgets = matches!(root, Root::Slot(s) if !c.is_uncaptured(s));
             if forgets || root == other || !c.members(Loc::root(root)).eq(&[root]) || !c.facts(Loc::root(root)).is_empty() || c.find(Loc::root(root)).is_some() {
                 return false;
             }
@@ -1611,38 +1482,37 @@ mod tests {
         }
     }
 
-    /// Two closures on one side, one closure in two slots and another on the other: as many
-    /// fields open onto the slot on each, but the joined classes have only one side's.
+    /// A slot is uncaptured where both sides of a join say so, and code relying on it runs only
+    /// where it is.
     #[test]
-    fn a_join_knows_every_closure_sharing_a_cell_only_if_each_side_does() {
-        let mut two = frame();
-        two.alias(slot(0), Label::Upvalue(0), 3);
-        two.alias(slot(1), Label::Upvalue(0), 3);
-        let mut moved = frame();
-        moved.alias(slot(0), Label::Upvalue(0), 3);
-        moved.assign(Root::Slot(1), slot(0));
-        moved.alias(slot(2), Label::Upvalue(0), 3);
-        assert!(two.captures_known(3) && moved.captures_known(3));
-        assert!(!two.join(&moved).captures_known(3));
-        assert!(!moved.join(&two).captures_known(3));
-        assert!(two.join(&two).captures_known(3));
+    fn uncaptured_is_knowledge() {
+        let free = frame();
+        let mut captured = frame();
+        captured.alias(slot(0), Label::Upvalue(0), 3);
+        captured.write(Root::Slot(0));
+        assert!(free.is_uncaptured(3) && !captured.is_uncaptured(3));
+        assert!(!free.join(&captured).is_uncaptured(3));
+        assert!(captured.accepts(&free));
+        assert!(!free.accepts(&captured));
+        captured.close(3);
+        assert!(captured.is_uncaptured(3));
     }
 
-    /// Code knowing every closure sharing a cell can't run where another shares it, though the
-    /// two have as many fields open onto the slot.
+    /// A slot a closure captured, written, forgets every upvalue another closure's class learned:
+    /// that class may hold the same closure.
     #[test]
-    fn knowing_every_closure_sharing_a_cell_accepts_no_other() {
-        let mut two = frame();
-        two.alias(slot(0), Label::Upvalue(0), 3);
-        two.alias(slot(1), Label::Upvalue(0), 3);
-        let mut moved = frame();
-        moved.alias(slot(0), Label::Upvalue(0), 3);
-        moved.assign(Root::Slot(1), slot(0));
-        moved.alias(slot(2), Label::Upvalue(0), 3);
-        assert!(!two.accepts(&moved));
-        let mut more = two.clone();
-        more.learn(slot(2), Fact::Constant(1));
-        assert!(two.accepts(&more));
+    fn a_write_to_a_captured_slot_forgets_learned_upvalues() {
+        let field = [Label::Upvalue(0)];
+        let learned = Loc { root: Root::Slot(1), path: &field };
+        let mut c = frame();
+        c.alias(slot(0), Label::Upvalue(0), 3);
+        c.learn(learned, Fact::Type(Ty::Int));
+        c.write(Root::Slot(3));
+        assert_eq!(c.fact(learned, 0), None);
+        let mut free = frame();
+        free.learn(learned, Fact::Type(Ty::Int));
+        free.write(Root::Slot(3));
+        assert_eq!(free.fact(learned, 0), Some(&Fact::Type(Ty::Int)), "no cell is open onto an uncaptured slot");
     }
 
     #[test]

@@ -1903,7 +1903,7 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
         .collect();
     entry.values = seen.view(&map);
     // Its frame is new: no closure has captured its slots.
-    entry.values.uncaptured(entry.types.len());
+    entry.values.enter(entry.types.len());
     // Its upvalues are its closure's.
     for (n, path) in fields.iter().enumerate() {
         let field = Loc { root: Root::Outer(1), path };
@@ -1920,7 +1920,7 @@ fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>
     let slots = proto.max_stack as usize;
     let mut entry = Context::new(slots);
     // Its frame is new: no closure has captured its slots. See Note [Value classes].
-    entry.values.uncaptured(slots);
+    entry.values.enter(slots);
     let passed = if b != 0 { Some(b - 1) } else { caller.top.map(|top| top.saturating_sub(a + 1)) };
     let Some(passed) = passed.filter(|_| proto.is_vararg == 0) else { return entry };
     for param in 0..(proto.param_count as usize).min(slots) {
@@ -2697,22 +2697,16 @@ impl std::fmt::Display for Kind {
 // closure's class. Only a closure's prototype is known (what its identity guard compares), not
 // the closure, so what is known of its upvalues is known of their values, not of its cells.
 //
-// A set of the running function's upvalue j makes it hold the value stored, and forgets every
-// closure's upvalue fields but those open into the frame: cells are shared, and any of them may be
-// j's, but none open into the frame is one of the running function's own. Setting another
-// closure's upvalue is a call, whose effects say whether it set any (Note [Call effects]).
+// A set of the running function's upvalue j makes it hold the value stored. Any closure field that
+// isn't open onto a slot of the frame may name the same cell, sealed ones included, so each is
+// forgotten. Callers see the set as an effect (Note [Call effects]). A sealed j is a closed cell,
+// which is no slot, so they forget only their upvalues and their closures' fields that aren't open,
+// and the closure called keeps its field sealed. Any other j may be open onto a slot a closure
+// captured, so they forget those slots too.
 //
-// A closure made here knows its cells. One it captured from a slot is that slot while it is open
-// (an open field), so a write to the slot is one to the upvalue, until a CLOSE or the frame's end
-// closes it: from then on it holds the value the slot had, with the slot's type. One it captured
-// from the running function's upvalue holds that upvalue's value. A slot only one closure captured
-// is closed into a sealed cell, which only that closure's code reaches: inlined, its sets of the
-// cell are of no slot and no other cell, but another place may hold the closure without the
-// context knowing it does, so they forget every upvalue the frames know that isn't open into one
-// (`Effects::CELL`); the field of the closure called stays sealed. A closure made of the sealed
-// cell shares it, and unseals every sealed cell (`Effects::CAPTURE`). A set of some unknown upvalue
-// may be the closure's, and forgets it. Which closures captured a slot is held of the slot (Note
-// [Value classes]).
+// A closure made here knows its cells. One it captured from a slot is that slot while it is open,
+// and from the close on is a sealed cell holding the value the slot had, with the slot's type. One
+// it captured from the running function's upvalue holds that upvalue's value.
 //
 // Fields carry facts across inlined calls (Note [Inlined calls]). The callee enters with its own
 // upvalue n holding what the closure's field n does, and its return gives the closure's fields
@@ -2942,9 +2936,6 @@ pub enum Effect {
     Trip,
     /// A table is watched: no table is known not to be. See Note [Watched tables].
     Watch,
-    /// A closure is made of one of the running function's upvalues: its cell may be one open onto
-    /// a caller's slot, which the closure then shares. See Note [Value classes].
-    CaptureUpvalue,
 }
 
 // Note [Call effects]
@@ -2982,12 +2973,10 @@ impl Effects {
     pub const HASH: Effects = Effects(1 << 9);
     /// Some table is watched.
     pub const WATCH: Effects = Effects(1 << 11);
-    /// A closure was made of an upvalue. See Note [Value classes].
-    pub const CAPTURE: Effects = Effects(1 << 12);
     /// A sealed cell is set. See Note [Upvalue paths].
-    pub const CELL: Effects = Effects(1 << 13);
+    pub const CELL: Effects = Effects(1 << 12);
     /// Code the specializer never saw ran: every other effect too.
-    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::WATCH.0 | Self::CAPTURE.0 | Self::CELL.0 | Self::OPAQUE_BIT);
+    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::WATCH.0 | Self::CELL.0 | Self::OPAQUE_BIT);
     /// The representations stored into some table's array part, as `LType::bit`s.
     const ARRAYS: u16 = {
         let mut bits = 0;
@@ -3017,7 +3006,6 @@ impl Effects {
             Effect::ArrayStore(Some(stored)) => Effects(stored.bit() as u16),
             // Its callers' code is replaced as it trips. See Note [Watched tables].
             Effect::Trip => Effects::NONE,
-            Effect::CaptureUpvalue => Effects::CAPTURE,
             Effect::Watch => Effects::WATCH,
         }
     }
@@ -3026,12 +3014,6 @@ impl Effects {
     /// effects may have falsified. `captured` are the caller's slots below the
     /// call's its closures captured, which a set upvalue may be.
     fn apply(self, owner: &mut Owner, ctx: &mut Context, captured: &[usize]) {
-        // A closure the call made of a cell open onto a slot shares it, and of a sealed cell
-        // unseals it. See Note [Value classes].
-        if self.0 & Self::CAPTURE.0 != 0 {
-            ctx.values.called();
-            ctx.values.unseal();
-        }
         // See Note [Upvalue paths].
         if self.0 & Self::CELL.0 != 0 {
             ctx.values.retain_roots(|root| !matches!(root, Root::Upvalue(_)));
@@ -3161,24 +3143,23 @@ impl Context {
 
     /// Drop what `effect` may falsify. See Notes [Fragile information] and [Upvalue paths].
     fn effect(&mut self, effect: Effect) {
-        // A set of an upvalue may be of a caller's slot. See Note [Inlined calls].
-        if matches!(effect, Effect::SetUpvalue(_) | Effect::AnyUpvalue) {
-            self.values.retain_roots(|root| !matches!(root, Root::Outer(_)));
-        }
-        // A set of a sealed cell is of no slot and no other cell, but of every place holding the
-        // closure. See Note [Upvalue paths].
+        // See Note [Upvalue paths].
         if let Effect::SetUpvalue(j) = effect && self.values.sealed(Root::Upvalue(j as u8)) {
             self.values.write(Root::Upvalue(j as u8));
             self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
             self.inlined(Effects::CELL);
             return;
         }
+        // A set of an upvalue may be of a caller's slot. See Note [Inlined calls].
+        if matches!(effect, Effect::SetUpvalue(_) | Effect::AnyUpvalue) {
+            self.values.retain_roots(|root| !matches!(root, Root::Outer(_)));
+        }
         match effect {
             Effect::Write(slot) => self.values.write(Root::Slot(slot as u16)),
             Effect::WriteAny => self.values.write_any(),
             Effect::SetUpvalue(j) => {
                 self.values.write(Root::Upvalue(j as u8));
-                self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_) | Target::Sealed(_)));
+                self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
             },
             Effect::AnyUpvalue => {
                 self.values.retain_roots(|root| !matches!(root, Root::Upvalue(_)));
@@ -3187,7 +3168,6 @@ impl Context {
             // Code it doesn't see writes any table, upvalue or global, but no slot of the frame:
             // what slots the call does write are written apart. See Note [Fragile information].
             Effect::Opaque => {
-                self.values.called();
                 self.values.retain_fields(|_, _| false);
                 self.values.retain_roots(|root| matches!(root, Root::Slot(_)));
                 self.values.retain_facts(|fact| matches!(fact, Known::Constant { .. }));
@@ -3200,8 +3180,6 @@ impl Context {
             }),
             Effect::Trip => self.values.retain_facts(Known::survives_trip),
             Effect::Watch => self.values.retain_facts(|fact| !matches!(fact, Known::Unwatched)),
-            // It may share a sealed cell. A caller's slot's cell only its caller forgets.
-            Effect::CaptureUpvalue => self.values.unseal(),
         }
         self.inlined(Effects::of(effect));
     }
@@ -7583,20 +7561,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 CoroutineState::Yielded(YieldOp::Captures(closure, upvalues)) => {
                     // See Note [Upvalue paths].
                     let ctx = Rc::make_mut(&mut ctx);
-                    let mut shares = false;
                     for (n, (from, index)) in upvalues.into_iter().enumerate() {
                         let at = Loc::root(Root::Slot(closure as u16));
                         if from == Opcode::MOVE {
                             ctx.values.alias(at, Label::Upvalue(n as u8), index as u16);
                         } else {
                             ctx.values.link(at, Label::Upvalue(n as u8), Loc::root(Root::Upvalue(index as u8)));
-                            shares = true;
                         }
-                    }
-                    // See Note [Value classes].
-                    if shares {
-                        ctx.effect(Effect::CaptureUpvalue);
-                        self.join_effects(owner, Effects::CAPTURE);
                     }
                 },
                 CoroutineState::Yielded(YieldOp::Close(from)) => {
