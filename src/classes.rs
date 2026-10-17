@@ -39,12 +39,15 @@ use std::hash::Hash;
 // knowing a slot so accepts a context knowing it so whose every field open onto it is the image of
 // one of the version's.
 //
-// A write to a slot known so is one to the open fields alone, which follow their slot; one to any
-// other may be one to any closure's cell, so it forgets every closure's upvalue field but the open
-// ones and the sealed ones, which are closed. A slot known so with one field open onto it is closed
-// into a sealed field (`Target::Sealed`): its cell is reachable only through that closure, so only
-// the closure sets it. A root mapped from a sealed field into another frame (`view`) is sealed there
-// too; a field open onto a slot isn't sealed in the view, as its cell is still open.
+// A class is of places known equal, not of a closure: another class may hold a closure sharing a
+// cell without the context knowing it does, and have learned its upvalue as a value. So a write to
+// a slot is one to the open fields alone only where it is known so and no field is open onto it, as
+// then no closure shares its cell; one to any other may be one to any closure's cell, and forgets
+// every closure's upvalue field but the open ones and the sealed ones, which are closed. A slot known
+// so with one field open onto it is closed into a sealed field (`Target::Sealed`): its cell is
+// reachable only through that closure, until a closure is made of the closure's upvalue. A root
+// mapped from a sealed field into another frame (`view`) is sealed there too; a field open onto a
+// slot isn't sealed in the view, as its cell is still open.
 //
 // The classes are kept in a canonical form, numbered in the order they are first reached from the
 // roots in order and then along fields in label order, with nothing kept that tells nothing. Two
@@ -358,12 +361,17 @@ impl<F: ClassFact> Classes<F> {
         self.normalize();
     }
 
-    /// `dst` is written: if it is a slot not every cell open onto which is known, so may be a cell
-    /// of any closure whose field isn't known open or sealed.
+    /// `dst` is written: if it is a slot a closure may share the cell of, so may be a cell of any
+    /// closure whose field isn't known open or sealed. See Note [Value classes].
     fn written(&mut self, dst: Root) {
-        if let Root::Slot(slot) = dst && !self.captures_known(slot) {
+        if let Root::Slot(slot) = dst && !self.uncaptured_slot(slot) {
             self.forget_cells();
         }
+    }
+
+    /// Whether no closure shares a cell open onto `slot`: every one is known, and none is.
+    fn uncaptured_slot(&self, slot: u16) -> bool {
+        self.captures_known(slot) && !self.fields.iter().any(|&(_, _, target)| target == Target::Open(slot))
     }
 
     /// Every slot may be written.
@@ -384,6 +392,29 @@ impl<F: ClassFact> Classes<F> {
         let open: Vec<Target> = self.fields.iter().map(|&(_, _, target)| target).collect();
         for target in open {
             self.lost(target);
+        }
+    }
+
+    /// A closure was made of an upvalue, which may be a sealed cell: two closures share it now.
+    pub fn unseal(&mut self) {
+        for field in &mut self.fields {
+            if let Target::Sealed(class) = field.2 {
+                field.2 = Target::Class(class);
+            }
+        }
+        self.sealed.clear();
+        self.normalize();
+    }
+
+    /// The last field `loc` is reached by, if it holds a class, is a sealed cell.
+    pub fn seal_field(&mut self, loc: Loc) {
+        let Some((&label, parent)) = loc.path.split_last() else { return };
+        if let Some(class) = self.find(Loc { root: loc.root, path: parent })
+            && let Some(i) = self.fields.iter().position(|&(c, l, _)| c == class && l == label)
+            && let Target::Class(target) = self.fields[i].2
+        {
+            self.fields[i].2 = Target::Sealed(target);
+            self.normalize();
         }
     }
 
@@ -1105,10 +1136,11 @@ mod tests {
         fn frame() -> Self {
             Reference { captures: vec![true; 4], ..Default::default() }
         }
-        /// `root` is written: a slot not every cell open onto which is known may be any closure's
-        /// cell whose upvalue field isn't open or sealed.
+        /// `root` is written: a slot a closure may share the cell of may be any closure's cell
+        /// whose upvalue field isn't open or sealed.
         fn written(&mut self, root: Root) {
-            if let Root::Slot(s) = root && !self.captures.get(s as usize).copied().unwrap_or(false) {
+            let shared = |r: &Self, s: u16| !r.captures.get(s as usize).copied().unwrap_or(false) || r.open_fields().iter().any(|&(_, o)| o == s);
+            if let Root::Slot(s) = root && shared(self, s) {
                 self.fields.retain(|&(_, label), field| !matches!(label, Label::Upvalue(_)) || !matches!(field, RefField::Value(_)));
             }
         }
@@ -1545,7 +1577,7 @@ mod tests {
         let other = ROOTS[rng.below(ROOTS.len() as u64) as usize];
         if rng.below(2) == 0 {
             // An assignment into a slot not every cell of which is known forgets cells.
-            let forgets = matches!(root, Root::Slot(s) if !c.captures_known(s));
+            let forgets = matches!(root, Root::Slot(s) if !c.uncaptured_slot(s));
             if forgets || root == other || !c.members(Loc::root(root)).eq(&[root]) || !c.facts(Loc::root(root)).is_empty() || c.find(Loc::root(root)).is_some() {
                 return false;
             }

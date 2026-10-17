@@ -2707,9 +2707,12 @@ impl std::fmt::Display for Kind {
 // closes it: from then on it holds the value the slot had, with the slot's type. One it captured
 // from the running function's upvalue holds that upvalue's value. A slot only one closure captured
 // is closed into a sealed cell, which only that closure's code reaches: inlined, its sets of the
-// cell are of that cell alone, and falsify nothing else; a set of some unknown upvalue may be the
-// closure's, and forgets it. How many closures captured a slot is held of the slot, not counted
-// from the fields known, which are forgotten (Note [Value classes]).
+// cell are of no slot and no other cell, but another place may hold the closure without the
+// context knowing it does, so they forget every upvalue the frames know that isn't open into one
+// (`Effects::CELL`); the field of the closure called stays sealed. A closure made of the sealed
+// cell shares it, and unseals every sealed cell (`Effects::CAPTURE`). A set of some unknown upvalue
+// may be the closure's, and forgets it. Which closures captured a slot is held of the slot (Note
+// [Value classes]).
 //
 // Fields carry facts across inlined calls (Note [Inlined calls]). The callee enters with its own
 // upvalue n holding what the closure's field n does, and its return gives the closure's fields
@@ -2981,8 +2984,10 @@ impl Effects {
     pub const WATCH: Effects = Effects(1 << 11);
     /// A closure was made of an upvalue. See Note [Value classes].
     pub const CAPTURE: Effects = Effects(1 << 12);
+    /// A sealed cell is set. See Note [Upvalue paths].
+    pub const CELL: Effects = Effects(1 << 13);
     /// Code the specializer never saw ran: every other effect too.
-    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::WATCH.0 | Self::CAPTURE.0 | Self::OPAQUE_BIT);
+    pub const OPAQUE: Effects = Effects(Self::ARRAYS | Self::UPVALUE.0 | Self::HASH.0 | Self::WATCH.0 | Self::CAPTURE.0 | Self::CELL.0 | Self::OPAQUE_BIT);
     /// The representations stored into some table's array part, as `LType::bit`s.
     const ARRAYS: u16 = {
         let mut bits = 0;
@@ -3021,9 +3026,16 @@ impl Effects {
     /// effects may have falsified. `captured` are the caller's slots below the
     /// call's its closures captured, which a set upvalue may be.
     fn apply(self, owner: &mut Owner, ctx: &mut Context, captured: &[usize]) {
-        // A closure the call made of a cell open onto a slot shares it. See Note [Value classes].
+        // A closure the call made of a cell open onto a slot shares it, and of a sealed cell
+        // unseals it. See Note [Value classes].
         if self.0 & Self::CAPTURE.0 != 0 {
             ctx.values.called();
+            ctx.values.unseal();
+        }
+        // See Note [Upvalue paths].
+        if self.0 & Self::CELL.0 != 0 {
+            ctx.values.retain_roots(|root| !matches!(root, Root::Upvalue(_)));
+            ctx.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
         }
         if self.0 & Self::OPAQUE_BIT != 0 {
             ctx.effect(Effect::Opaque);
@@ -3044,6 +3056,8 @@ impl Effects {
         for stored in Self::REPRESENTATIONS.into_iter().filter(|stored| self.0 & stored.bit() as u16 != 0) {
             ctx.effect(Effect::ArrayStore(Some(stored)));
         }
+        // What the call did, the code `ctx` is of did too, for its own caller to see.
+        ctx.inlined(self);
     }
 }
 
@@ -3151,9 +3165,12 @@ impl Context {
         if matches!(effect, Effect::SetUpvalue(_) | Effect::AnyUpvalue) {
             self.values.retain_roots(|root| !matches!(root, Root::Outer(_)));
         }
-        // A set of a sealed cell is of that cell alone. See Note [Upvalue paths].
+        // A set of a sealed cell is of no slot and no other cell, but of every place holding the
+        // closure. See Note [Upvalue paths].
         if let Effect::SetUpvalue(j) = effect && self.values.sealed(Root::Upvalue(j as u8)) {
             self.values.write(Root::Upvalue(j as u8));
+            self.values.retain_fields(|label, target| !matches!(label, Label::Upvalue(_)) || matches!(target, Target::Open(_)));
+            self.inlined(Effects::CELL);
             return;
         }
         match effect {
@@ -3183,8 +3200,8 @@ impl Context {
             }),
             Effect::Trip => self.values.retain_facts(Known::survives_trip),
             Effect::Watch => self.values.retain_facts(|fact| !matches!(fact, Known::Unwatched)),
-            // Of a caller's cell, not this frame's: only its caller forgets.
-            Effect::CaptureUpvalue => {},
+            // It may share a sealed cell. A caller's slot's cell only its caller forgets.
+            Effect::CaptureUpvalue => self.values.unseal(),
         }
         self.inlined(Effects::of(effect));
     }
@@ -5936,12 +5953,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         }
         // A chain of the caller's whose hash keys didn't all come back goes.
         known.fix_shaped_chains();
+        // The fields of the closure called that are sealed cells stay so. See Note [Upvalue paths].
+        let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
+        let values = &known.values;
+        let sealed: Vec<[Label; 1]> = continuation.closure.iter()
+            .flat_map(|&closure| fields.iter().filter(move |path| values.sealed_field(Loc { root: closure, path: &path[..] })).copied())
+            .collect();
         effects.apply(owner, &mut known, &continuation.captured);
         // See Note [Upvalue paths].
         let (call, c) = (continuation.a as usize, continuation.c as usize);
         let returned = (b != 0).then(|| b - 1);
         let count = if c == 0 { returned.unwrap_or(0) } else { c - 1 };
-        let fields: Vec<[Label; 1]> = (0..unsafe { (*self.proto).upval_count }).map(|n| [Label::Upvalue(n)]).collect();
         // A field open onto a slot stays open: what it holds is the slot's. Any other holds what the
         // callee's upvalue does, until a write to a slot a cell may be open onto. See Note [Value
         // classes].
@@ -5964,6 +5986,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }))
             .collect();
         known.values.overlay(&ctx.closing(0), &map);
+        for path in &sealed {
+            known.values.seal_field(Loc { root: continuation.closure.expect("a closure"), path });
+        }
         // What it learned of the values it was passed, the caller's places holding them learn:
         // the same values, of which the caller knows the rest. See Note [Inlined calls].
         for &(n, root) in &continuation.args {
