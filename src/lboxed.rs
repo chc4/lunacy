@@ -60,14 +60,17 @@ pub(crate) struct NClosureCell {
     /// Whether a call of it is a protected call of its first argument
     /// (`pcall`). See Note [Errors].
     pub(crate) protects: bool,
+    /// The argument that is its only result, if it declares one. See Note
+    /// [Library natives].
+    pub(crate) returns: Option<u8>,
 }
 
 impl NClosureCell {
     /// Leak a headered cell for `native`. `NClosure` holds the returned pointer
     /// for its whole life, so boxing a native only reads it; the cell is `'static`
     /// and outside the GC, so `Mark` needn't trace it.
-    pub(crate) fn leak(native: NativeFunc, window: Option<crate::vm::NativeWindow>, generator: Option<crate::specialize::NativeGenerator>, pure: bool, protects: bool) -> &'static NClosureCell {
-        Box::leak(Box::new(NClosureCell { kind: LBoxed::KIND_NCLOSURE, native, window, generator, pure, protects }))
+    pub(crate) fn leak(native: NativeFunc, window: Option<crate::vm::NativeWindow>, generator: Option<crate::specialize::NativeGenerator>, pure: bool, protects: bool, returns: Option<u8>) -> &'static NClosureCell {
+        Box::leak(Box::new(NClosureCell { kind: LBoxed::KIND_NCLOSURE, native, window, generator, pure, protects, returns }))
     }
 }
 

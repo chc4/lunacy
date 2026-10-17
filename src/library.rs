@@ -30,6 +30,11 @@ use crate::patterns::{self, Capture};
 // make new ones, but write none the program could already see, so a call to one
 // has no effects the specializer tracks.
 //
+// A native can declare that its only result is one of its arguments
+// (`setmetatable`'s table). A call to it then knows its result's type from the
+// argument's, and a return of it in tail position knows what it returns (Note
+// [Call continuations]).
+//
 // What a native can't be, as it keeps state between calls (`string.gmatch`'s
 // iterator) or calls a function (`string.gsub`'s replacement, `table.sort`'s
 // order), is written in Lua (src/library.lua), which the VM runs before each
@@ -139,6 +144,9 @@ macro_rules! native {
     };
     (pure |$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::pure(native!(@fn $owner, $args, $body)))
+    };
+    (returns: $arg:expr, |$owner:ident, $args:ident| $body:expr) => {
+        LValue::NClosure(NClosure::returning(native!(@fn $owner, $args, $body), $arg))
     };
     (generator: $generator:expr, |$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::generated(native!(@fn $owner, $args, $body), $generator))
@@ -1199,7 +1207,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     });
     // Lua's `setmetatable(t, mt)` on a table: its metatable changes, which moves it
     // to a new epoch. See Note [Table metatables].
-    let setmetatable = native!(|owner, args| {
+    let setmetatable = native!(returns: 0, |owner, args| {
         let Some(t) = arg(&args, 0).as_table() else {
             return Err(error_value(format!("bad argument #1 to 'setmetatable' (table expected, got {})", String::from_utf8_lossy(type_name(arg(&args, 0))))));
         };

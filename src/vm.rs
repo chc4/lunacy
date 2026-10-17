@@ -1393,19 +1393,29 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: NativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(native, None, None, false, false) }
+        NClosure { cell: NClosureCell::leak(native, None, None, false, false, None) }
+    }
+
+    /// A native whose only result is its argument `arg`. See Note [Library natives].
+    pub fn returning(native: NativeFunc, arg: u8) -> Self {
+        NClosure { cell: NClosureCell::leak(native, None, None, false, false, Some(arg)) }
+    }
+
+    /// The argument that is its only result, if it declares one. See Note [Library natives].
+    pub fn returns(&self) -> Option<usize> {
+        self.cell.returns.map(usize::from)
     }
 
     /// A pure native. See Note [Library natives].
     pub fn pure(native: PureNativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, false) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, false, None) }
     }
 
     /// `pcall`, whose call is laid out as a protected call of its first
     /// argument, `native` running only for a call site that doesn't specialize.
     /// See Note [Errors].
     pub fn protected_call(native: PureNativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, true) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, true, None) }
     }
 
     /// Whether a call of it is a protected call of its first argument. See
@@ -1416,19 +1426,19 @@ impl NClosure {
 
     /// A pure native that runs as a window op where `window` gives one.
     pub fn pure_windowed(native: PureNativeFunc, window: NativeWindow) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), Some(window), None, true, false) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), Some(window), None, true, false, None) }
     }
 
     /// A pure native whose call is compiled by `generator`, as an opcode's is. See Note [Native
     /// generators].
     pub fn pure_generated(native: PureNativeFunc, generator: crate::specialize::NativeGenerator) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), None, Some(generator), true, false) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, Some(generator), true, false, None) }
     }
 
     /// A native whose call is compiled by `generator`, as an opcode's is. See Note [Native
     /// generators].
     pub fn generated(native: NativeFunc, generator: crate::specialize::NativeGenerator) -> Self {
-        NClosure { cell: NClosureCell::leak(native, None, Some(generator), false, false) }
+        NClosure { cell: NClosureCell::leak(native, None, Some(generator), false, false, None) }
     }
 
     /// The generator a call to this native is compiled by, if it has one.
@@ -2116,21 +2126,31 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
-    /// Make the running frame, an inlined call's, the frame of a call returning to `ret`. See Note
-    /// [Sealed inlined calls].
-    pub fn uninline(&mut self, owner: &Owner, ret: PackedLocation) {
+    /// Make the running frame, an inlined call's, the frame of a call returning to `ret`, its
+    /// `witnesses` moved as `own_frame` moves them. See Note [Sealed inlined calls].
+    pub fn uninline(&mut self, owner: &Owner, ret: PackedLocation, witnesses: &[(u8, u8)]) {
         let entry = self.callstack.last_mut().expect("an inlined call's entry");
         debug_assert!(matches!(entry.ret, Return::Inlined(_)), "a call's frame made a call's again");
         entry.ret = Return::To(Location::unpack(ret));
-        self.own_frame(owner);
+        self.own_frame(owner, witnesses);
     }
 
     /// Give the running frame what a call's frame has that an inlined call's doesn't: the stack its
-    /// function's frame size long, and hash witnesses of its own. See Note [Sealed inlined calls].
-    pub fn own_frame(&mut self, owner: &Owner) {
+    /// function's frame size long, and hash witnesses of its own, each `(from, to)` of the region
+    /// it had moved to `to` of its own. See Note [Sealed inlined calls].
+    pub fn own_frame(&mut self, owner: &Owner, witnesses: &[(u8, u8)]) {
         let frame = unsafe { (*self.clos.ro(owner).prototype).frame_size.get() };
         self.lengthen_nilled(self.base + frame);
-        self.witness_base = self.witness_top;
+        let (had, own) = (self.witness_base, self.witness_top);
+        let len = witnesses.iter().map(|&(_, to)| to as usize + 1).max().unwrap_or(0);
+        if self.hash_witnesses.len() < own + len {
+            self.hash_witnesses.grow(own + len);
+        }
+        for &(from, to) in witnesses {
+            self.hash_witnesses[own + to as usize] = self.hash_witnesses[had + from as usize];
+        }
+        self.witness_base = own;
+        self.witness_top = own + len;
     }
 
     /// The frame of an inlined call of R(A), `callee`, with CALL's B, of a callee whose `max_stack`
