@@ -6180,6 +6180,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let mut theirs = hkey.clone();
                 theirs.idx = owner;
                 theirs.clear_checks();
+                // A check through the parameter holds through every slot of the caller's holding
+                // the table it was passed.
+                if hkey.checked(hkey.idx) {
+                    for slot in (0..caller.types.len()).filter(|&slot| slot == owner || caller.values.same(Loc::root(Root::Slot(slot as u16)), Loc::root(Root::Slot(owner as u16)))) {
+                        theirs.check(slot);
+                    }
+                }
                 gained.push((owner, HashRef(i as u8)));
                 theirs
             },
