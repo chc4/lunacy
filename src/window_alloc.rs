@@ -1216,15 +1216,16 @@ fn renames(alloc: &WindowAlloc, op: &Framed) -> Option<bool> {
 }
 
 /// The values `now` holds worth keeping in registers past step `at`, but those an op reading
-/// `reads` takes as inputs, each by its slot worth most, least worth first: a value's worth is
-/// the most of the slots naming it but those the op rewrites, `writes`.
+/// `reads` takes as inputs, each by its slot worth most, those worth most first and a dirty one
+/// before a clean one worth as much: a value's worth is the most of the slots naming it but those
+/// the op rewrites, `writes`.
 fn kept_values(ahead: &Ahead, now: &Cache, at: usize, reads: &[usize], writes: &[usize]) -> SmallVec<[((bool, usize), usize); WINDOW]> {
     let mut kept: SmallVec<[((bool, usize), usize); WINDOW]> = now
         .values()
         .filter(|(_, names)| !names.iter().any(|slot| reads.contains(slot)))
         .filter_map(|(_, names)| names.iter().copied().filter(|slot| !writes.contains(slot)).filter_map(|slot| Some((ahead.worth(slot, at, now.dirty.contains(&slot))?, slot))).min())
         .collect();
-    kept.sort_unstable();
+    kept.sort_unstable_by_key(|&(worth, slot)| (worth, !now.dirty.contains(&slot), slot));
     kept
 }
 
@@ -1286,16 +1287,17 @@ fn place_free(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> (
     let worth = |value: u32| now.named(value).filter_map(|slot| ahead.worth(slot, step, now.dirty.contains(&slot))).min();
     let dirty = |value: u32| now.named(value).any(|slot| now.dirty.contains(&slot));
     let mut want: Placement = [None; WINDOW];
-    // A free register: empty, else holding a value worth nothing, else the one worth least.
+    // A free register: empty, else holding a value worth nothing, else the one worth least, a clean
+    // one before a dirty one worth as much.
     let free = |want: &Placement, taken: &[usize]| {
         (0..width)
             .filter(|reg| want[*reg].is_none() && !taken.contains(reg))
             .min_by_key(|&reg| match now.regs[reg] {
-                None => (0, (false, 0)),
-                Some(value) if now.named(value).any(|slot| slots.contains(&slot)) => (3, (false, 0)),
+                None => (0, (false, 0), false),
+                Some(value) if now.named(value).any(|slot| slots.contains(&slot)) => (3, (false, 0), false),
                 Some(value) => match worth(value) {
-                    None => (1, (false, usize::from(dirty(value)))),
-                    Some((exit, far)) => (2, (!exit, usize::MAX - far)),
+                    None => (1, (false, 0), dirty(value)),
+                    Some((exit, far)) => (2, (!exit, usize::MAX - far), dirty(value)),
                 },
             })
             .expect("a register for an emitted op's operand")
