@@ -672,6 +672,19 @@ flamegraph benchmark times='10' ref='' freq='997' features='unsafe perf':
         (cd $dir && {{SAMPLED}} cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "{{features}}" --bin bench -o $svg -- $bin {{times}})
     fi
 
+# Each of `profiles` (perf.data files, as `flamegraph` records them) by what spent its cycles
+# (tools/perf_components.py): JIT code, the specializer, the JIT compiler, the collector and
+# allocator, the rest of the runtime; with two, the difference.
+perf-components +profiles:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    reports=()
+    for profile in {{profiles}}; do
+        perf report -i $profile --no-children -g none --no-inline --sort dso,sym --stdio -n --percent-limit 0 2>/dev/null > $profile.components.txt
+        reports+=($profile.components.txt)
+    done
+    python3 tools/perf_components.py "${reports[@]}"
+
 # `flamegraph` of revision `ref` (as for `hyperfine-vs`) and of this checkout on
 # one benchmark, kept side by side in working/: flamegraph-<benchmark>-<ref>.svg
 # and perf-<benchmark>-<ref>.data, flamegraph-<benchmark>.svg and
