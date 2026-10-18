@@ -1054,8 +1054,10 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
                 },
                 _ => unreachable!(),
             };
-        })));
+        })).writing(&[]));
         yield YieldOp::SetTypes(vec![(a, LType::Table)]);
+        // See Note [Call effects].
+        yield YieldOp::Effect(Effect::ArrayStore(None));
         arg
     }
 }
