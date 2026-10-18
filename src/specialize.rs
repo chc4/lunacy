@@ -1880,7 +1880,7 @@ fn standalone(ctx: &Context, upvalues: u8) -> Context {
 fn renumbered(own: &Context, known: &[HashKey<'static, 'static>], map: &[(u8, u8)], len: usize) -> Context {
     let to = |href: HashRef| map.iter().find(|&&(from, _)| from == href.0).map(|&(_, to)| HashRef(to));
     let mut mine = own.clone();
-    mine.hkeys = (0..len).map(|_| HashKey::free()).collect();
+    mine.hkeys = (0..len).map(|_| HashKey::free()).collect::<Vec<_>>().into();
     for &(from, at) in map {
         let mut hkey = known[from as usize].clone();
         hkey.place = match hkey.place {
@@ -1889,7 +1889,7 @@ fn renumbered(own: &Context, known: &[HashKey<'static, 'static>], map: &[(u8, u8
             Place::Index(href) => Place::Index(to(href).expect("a moved key's table's key moved")),
         };
         hkey.chain = hkey.chain.map(|href| to(href).expect("a moved key's chain moved"));
-        mine.hkeys[at as usize] = hkey;
+        Rc::make_mut(&mut mine.hkeys)[at as usize] = hkey;
     }
     for ctype in mine.types.iter_mut() {
         if let CType::Shape(of, hrefs) = ctype {
@@ -1989,7 +1989,7 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
             hkey.idx = shifted(hkey.idx).unwrap_or(OUTER);
         }
         hkey
-    }).collect();
+    }).collect::<Vec<_>>().into();
     for slot in args.clone() {
         if let CType::Shape(of, hrefs) = caller.slot(slot) && entry.types[slot - a - 1] == CType::Type(of) {
             entry.types[slot - a - 1] = CType::Shape(of, hrefs);
@@ -2643,7 +2643,7 @@ const HARD_MAX_VERSIONS: usize = 16;
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Context {
     pub types: SmallVec<[CType; 8]>,
-    pub hkeys: Vec<HashKey<'static, 'static>>,
+    pub hkeys: Rc<Vec<HashKey<'static, 'static>>>,
     /// The frame's top, as a slot, when the instruction before left it at one
     /// the specializer knows. See Note [Known top].
     pub top: Option<usize>,
@@ -3210,7 +3210,7 @@ impl Context {
     pub fn new(slots: usize) -> Self {
         Self {
             types: smallvec::smallvec![CType::Unknown; slots],
-            hkeys: vec![],
+            hkeys: Rc::default(),
             top: None,
             values: Values::default(),
             inline: Vec::new(),
@@ -3238,11 +3238,11 @@ impl Context {
 
     /// Make its free hash key indexes all alike, and drop those past its last hash key.
     fn canonicalize_free(&mut self) {
-        for hkey in self.hkeys.iter_mut().filter(|hkey| hkey.orphan()) {
+        for hkey in Rc::make_mut(&mut self.hkeys).iter_mut().filter(|hkey| hkey.orphan()) {
             *hkey = HashKey::free();
         }
         while self.hkeys.last().is_some_and(|hkey| hkey.orphan()) {
-            self.hkeys.pop();
+            Rc::make_mut(&mut self.hkeys).pop();
         }
     }
 
@@ -3733,7 +3733,7 @@ impl Context {
                 (mine, theirs) => mine.or_else(|| theirs.cloned()),
             };
         });
-        for (i, mine) in self.hkeys.iter_mut().enumerate() {
+        for (i, mine) in Rc::make_mut(&mut self.hkeys).iter_mut().enumerate() {
             match other.hkeys.get(i) {
                 _ if dropped.contains(&HashRef(i as u8)) => {
                     mine.known_type = None;
@@ -3799,7 +3799,7 @@ impl Context {
                     CType::Shape(_, kept) => kept.clone(),
                     _ => SmallVec::new(),
                 };
-                for (kidx, key) in self.hkeys.iter_mut().enumerate() {
+                for (kidx, key) in Rc::make_mut(&mut self.hkeys).iter_mut().enumerate() {
                     if key.idx != idx || kept.contains(&HashRef(kidx as u8)) { continue; }
                     // Try to migrate
                     let mut migrated = false;
@@ -3826,7 +3826,7 @@ impl Context {
                 // entirely). See Note [Field types].
                 dropped = self.fix_chains();
                 while self.hkeys.last().is_some_and(|hkey| hkey.idx == idx && !kept.contains(&HashRef((self.hkeys.len() - 1) as u8))) {
-                    self.hkeys.pop();
+                    Rc::make_mut(&mut self.hkeys).pop();
                 }
             }
             self.types[idx] = ty;
@@ -3873,8 +3873,8 @@ impl Context {
                     _ => false,
                 };
                 if !whole {
-                    self.hkeys[i].known_type = None;
-                    self.hkeys[i].clear_checks();
+                    Rc::make_mut(&mut self.hkeys)[i].known_type = None;
+                    Rc::make_mut(&mut self.hkeys)[i].clear_checks();
                     if self.hkeys[i].place == Place::Register {
                         dropped.push(HashRef(i as u8));
                     }
@@ -3903,10 +3903,10 @@ impl Context {
                     continue;
                 }
                 match reached[i] {
-                    Some(idx) => self.hkeys[i].idx = idx,
+                    Some(idx) => Rc::make_mut(&mut self.hkeys)[i].idx = idx,
                     None => {
-                        self.hkeys[i].known_type = None;
-                        self.hkeys[i].clear_checks();
+                        Rc::make_mut(&mut self.hkeys)[i].known_type = None;
+                        Rc::make_mut(&mut self.hkeys)[i].clear_checks();
                         changed = true;
                     },
                 }
@@ -3922,12 +3922,12 @@ impl Context {
         let hkey: HashKey<'_, '_> = hkey;
         match self.hkeys.iter().position(|hkey| hkey.orphan()) {
             Some(i) => {
-                self.hkeys[i] = hkey;
+                Rc::make_mut(&mut self.hkeys)[i] = hkey;
                 HashRef(i as u8)
             },
             None => {
                 let hr: u8 = self.hkeys.len().try_into().expect("too many hrefs");
-                self.hkeys.push(hkey);
+                Rc::make_mut(&mut self.hkeys).push(hkey);
                 HashRef(hr)
             },
         }
@@ -3966,8 +3966,10 @@ impl Context {
     /// stack slot.
     /// Make every hash key of `key` check the epoch again.
     pub fn set_key_hazards(&mut self, key: &LConstant<'static, 'static>) {
-        for hkey in self.hkeys.iter_mut().filter(|hkey| hkey.key == *key) {
-            hkey.clear_checks();
+        if self.hkeys.iter().any(|hkey| hkey.key == *key) {
+            for hkey in Rc::make_mut(&mut self.hkeys).iter_mut().filter(|hkey| hkey.key == *key) {
+                hkey.clear_checks();
+            }
         }
     }
 
@@ -3993,7 +3995,7 @@ impl Context {
             invalidate = invalidate.drain(..).filter(|i| self.hkeys[*i].idx != keep).collect();
         }
         for invalid in invalidate {
-            self.hkeys[invalid as usize].clear_checks();
+            Rc::make_mut(&mut self.hkeys)[invalid as usize].clear_checks();
         }
     }
 }
@@ -5905,7 +5907,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // guard found, and past a function's identity guard below, which
             // function. See Note [Fragile information].
             if let Some(href) = field {
-                forced_mut.hkeys[href.0 as usize].known_type = Some(CType::Type(found_field));
+                Rc::make_mut(&mut forced_mut.hkeys)[href.0 as usize].known_type = Some(CType::Type(found_field));
             }
             let holds = forced_mut.holds(idx);
             if let Some(upvalue) = &holds {
@@ -6075,7 +6077,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 free.clear_checks();
                 free
             },
-        }).collect();
+        }).collect::<Vec<_>>().into();
         // A callee's version knowing fewer hash keys than the caller had (Note [Version
         // compatibility]) leaves fewer: the caller's past them are free, as the callee may have
         // put its own there.
@@ -6083,7 +6085,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let mut free = caller.hkeys[i].clone();
             free.known_type = None;
             free.clear_checks();
-            known.hkeys.push(free);
+            Rc::make_mut(&mut known.hkeys).push(free);
         }
         // A shape keeps the caller's hash keys that came back as they were, and gains its slot's.
         let unchanged = |href: &HashRef| {
@@ -7043,7 +7045,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let receiver = state.vals[state.base + idx].unbox().typeof_();
             let ctx_mut = Rc::make_mut(&mut ctx);
             {
-                let hkey = &mut ctx_mut.hkeys[href.0 as usize];
+                let hkey = &mut Rc::make_mut(&mut ctx_mut.hkeys)[href.0 as usize];
                 hkey.known_type = Some(CType::Type(found));
                 hkey.chain = None;
                 // Initialize the hkey after discovery with a cleared hazard for the index
@@ -7095,7 +7097,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let own_key: LConstant<'static, 'static> = unsafe { core::mem::transmute(ctx_mut.hkeys[href.0 as usize].key.clone()) };
                 let link = ctx_mut.alloc_hkey(HashKey { place: Place::Metatable(href), known_type: Some(CType::Unknown), ..HashKey::new(idx, index_key) });
                 let found_at = ctx_mut.alloc_hkey(HashKey { place: Place::Index(link), known_type: Some(CType::Unknown), ..HashKey::new(idx, own_key) });
-                ctx_mut.hkeys[href.0 as usize].chain = Some(found_at);
+                Rc::make_mut(&mut ctx_mut.hkeys)[href.0 as usize].chain = Some(found_at);
                 let chain = vm.new_block(pc.0);
                 let link_thunk = vm.make_href_thunk(chain, thunk_coro.clone(), idx, link, pc, ctx.clone(), true, true, Some(found_at), fail_ctx.clone());
                 vm.blocks[chain.0].instructions.push(Residual::Thunk(link_thunk));
@@ -7120,7 +7122,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// found again instead. See Notes [Field types] and [Table metatables].
     fn guard_witness(&mut self, owner: &mut Owner, block: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, expected: LType, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) {
         let mut typed_ctx = ctx.clone();
-        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].known_type = Some(CType::Type(expected));
+        Rc::make_mut(&mut Rc::make_mut(&mut typed_ctx).hkeys)[href.0 as usize].known_type = Some(CType::Type(expected));
         // An integer found here is an origin, unless this guard was rebuilt from one already. See
         // Note [Field types].
         let rebuilt = self.decided.get(&self.proto).is_some_and(|decided| decided.contains_key(&pc));
@@ -7135,7 +7137,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             };
             Rc::new(TLCell::new(OriginState { rebuild: Some(Box::new(rebuild)), block, offset, pc, used: false }))
         });
-        Rc::make_mut(&mut typed_ctx).hkeys[href.0 as usize].origins = FieldOrigins(origin.map(|origin| Rc::new(TLCell::new(vec![origin]))));
+        Rc::make_mut(&mut Rc::make_mut(&mut typed_ctx).hkeys)[href.0 as usize].origins = FieldOrigins(origin.map(|origin| Rc::new(TLCell::new(vec![origin]))));
         let pass = match next {
             Some(next) => {
                 let pass = self.new_block(pc.0);
@@ -7285,7 +7287,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // type and we just didn't know, and if there is a runtime mismatch
                     // the next access's epoch check and `HashGuard` find it, as the store
                     // left the witness at the old epoch (`Retype::Unknown`).
-                    let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
+                    let hkey = &mut Rc::make_mut(&mut Rc::make_mut(&mut ctx).hkeys)[href.0 as usize];
                     if let Some(ty) = *ty {
                         // An integer field made a double: the code that found it an integer goes.
                         // See Note [Field types].
@@ -7303,7 +7305,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                 self.contractions.push((of, set, ResumeArg::Failed));
                             }
                         }
-                        let hkey = &mut Rc::make_mut(&mut ctx).hkeys[href.0 as usize];
+                        let hkey = &mut Rc::make_mut(&mut Rc::make_mut(&mut ctx).hkeys)[href.0 as usize];
                         hkey.known_type = Some(CType::Type(ty));
                         hkey.origins = FieldOrigins::default();
                     }
@@ -7376,7 +7378,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         // until something may invalidate it again.
                         let mut holds_ctx = ctx.clone();
                         for h in &chain {
-                            Rc::make_mut(&mut holds_ctx).hkeys[h.0 as usize].check(place);
+                            Rc::make_mut(&mut Rc::make_mut(&mut holds_ctx).hkeys)[h.0 as usize].check(place);
                         }
                         let holds_block = self.subblock(owner, pc.next_true(), holds_ctx.clone(), coro.clone(), arg);
                         if chain.len() == 1 {
@@ -7409,13 +7411,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         href = HashRef(i as u8);
                         let ctx = Rc::make_mut(&mut ctx);
                         while ctx.hkeys.len() <= i {
-                            ctx.hkeys.push(HashKey { idx: OUTER, ..HashKey::new(OUTER, k_val.clone()) });
+                            Rc::make_mut(&mut ctx.hkeys).push(HashKey { idx: OUTER, ..HashKey::new(OUTER, k_val.clone()) });
                         }
-                        ctx.hkeys[i] = HashKey::new(place, k_val.clone());
+                        Rc::make_mut(&mut ctx.hkeys)[i] = HashKey::new(place, k_val.clone());
                     } else if let Some(i) = orphan {
                         href = HashRef(i as u8);
                         let ctx = Rc::make_mut(&mut ctx);
-                        ctx.hkeys[i] = HashKey::new(place, k_val.clone());
+                        Rc::make_mut(&mut ctx.hkeys)[i] = HashKey::new(place, k_val.clone());
                     } else {
                         warn!("allocating new hkey for {:?} {:?}", place, &k_val);
                         let hr: u8 = ctx.hkeys.len().try_into().expect("too many hrefs");
@@ -7423,7 +7425,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let hkey = HashKey::new(place, k_val.clone());
                         #[cfg(debug_assertions)]
                         assert_eq!(ctx.hkeys.iter().filter(|exist| **exist == hkey).next(), None);
-                        Rc::make_mut(&mut ctx).hkeys.push(hkey);
+                        Rc::make_mut(&mut Rc::make_mut(&mut ctx).hkeys).push(hkey);
                     }
                     let thunk_coro = coro.clone();
                     let thunk_ctx = ctx.clone();
@@ -7775,8 +7777,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         Rc::make_mut(&mut ctx).values.assign(Root::Slot(dest as u16), Loc::root(Root::Slot(src as u16)));
                     }
                     // A copy of a table is checked where the table is.
-                    if dest != src {
-                        for hkey in &mut Rc::make_mut(&mut ctx).hkeys {
+                    if dest != src && ctx.hkeys.iter().any(|hkey| hkey.checked(src) != hkey.checked(dest)) {
+                        for hkey in Rc::make_mut(&mut Rc::make_mut(&mut ctx).hkeys) {
                             if hkey.checked(src) {
                                 hkey.check(dest);
                             } else {
@@ -8957,7 +8959,7 @@ mod sealed_tests {
         let context = |hkeys: Vec<HashKey<'static, 'static>>| {
             let mut ctx = Context::new(1);
             ctx.types[0] = CType::Type(LType::Table);
-            ctx.hkeys = hkeys;
+            ctx.hkeys = hkeys.into();
             ctx
         };
         // The outgoing code checked access through slot 0 for its second key, moved to index 0.
@@ -8977,7 +8979,7 @@ mod sealed_tests {
         // An inlined callee's code: two tables with shapes over its keys, an integer slot equal to
         // another and to its upvalue, an argument, its closure below its frame, and a global.
         let mut ctx = Context::new(4);
-        ctx.hkeys = vec![hkey(0, 1.0), hkey(2, 2.0), hkey(0, 3.0), HashKey { idx: OUTER, ..hkey(0, 4.0) }];
+        ctx.hkeys = Rc::new(vec![hkey(0, 1.0), hkey(2, 2.0), hkey(0, 3.0), HashKey { idx: OUTER, ..hkey(0, 4.0) }]);
         ctx.types[0] = CType::Shape(LType::Table, smallvec::smallvec![HashRef(0), HashRef(2)]);
         ctx.types[1] = CType::Type(LType::Integer);
         ctx.types[2] = CType::Shape(LType::Table, smallvec::smallvec![HashRef(1)]);
