@@ -2556,7 +2556,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         // A block with code, entered with its window, or a cold
                                         // edge's exit, which stores the window. See Note [Region
                                         // selection].
-                                        None => Event::Exit(self.jctx.blocks.get(&target).map_or_else(Slots::default, |block| slots_of(block.window.regs()))),
+                                        None => Event::Exit(self.jctx.blocks.get(&target).map_or_else(Slots::default, |block| slots_of(&block.window.regs()))),
                                     });
                                 }
                             }
@@ -2640,7 +2640,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // What a block the trace leaves into reads first: its entry window's
         // slots, or those live into it; none for a side exit that never ran.
         let reads = |from: BlockId, target: BlockId, hot: bool| match self.jctx.blocks.get(&target) {
-            Some(done) => slots_of(done.window.regs()),
+            Some(done) => slots_of(&done.window.regs()),
             None if !hot && !cfg!(feature = "immediate_jit") && self.jctx.edges.recent(from, target) == 0 => Slots::default(),
             // A cold edge's exit stores the window. See Note [Region selection].
             None => match index.get(&target) {

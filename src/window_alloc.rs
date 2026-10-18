@@ -11,8 +11,12 @@ use crate::window::{Access, Window, WINDOW};
 
 // Note [Window allocation]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
-// Each register caches at most one slot's current value, and a cached slot is
-// dirty while its stack home is stale. Allocation has two passes over a
+// Each register holds at most one value, which any number of slots may name: a
+// `Move` makes its destination name its source's value, with no code. A named
+// slot is dirty while its stack home is stale, and is stored from whichever
+// register holds its value. A block's entry window names one slot in each
+// register, as any edge into it may bring the slots' values apart, so values are
+// shared only within a trace. Allocation has two passes over a
 // compiled region, trace by trace (see Note [Trace register allocation]):
 //
 // * Planning placements, one trace at a time ([`plan_trace`], Note [Trace
@@ -165,8 +169,8 @@ fn occupied(regs: &Placement) -> u8 {
     (0..WINDOW).filter(|&reg| regs[reg].is_some()).fold(0, |mask, reg| mask | 1 << reg)
 }
 
-/// The slot whose current value each window register should hold, if any. See
-/// Note [Window allocation].
+/// For each window register, a slot whose current value it should hold, if any. See Note
+/// [Window allocation].
 pub type Placement = [Option<usize>; WINDOW];
 
 /// A `Placement` in a byte per register, to keep per block: a Lua frame has at
@@ -187,31 +191,55 @@ impl Packed {
     }
 }
 
-/// Which slot each window register caches, and which of them are dirty: the
-/// window between residuals, and a block's window on entry.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Which value each window register holds, which slots name those values, and which of those
+/// slots are dirty: the window between residuals, and a block's window on entry. See Note
+/// [Window allocation].
+#[derive(Debug, Clone, Default)]
 pub struct Cache {
-    /// The slot whose current value each register holds.
-    regs: [Option<usize>; WINDOW],
+    /// The value each register holds, by an id of this window's.
+    regs: [Option<u32>; WINDOW],
     /// The registers holding theirs unboxed, bit `reg` for register `reg`: only
     /// registers holding a value. See Note [Unboxed doubles].
     unboxed: u8,
-    /// Cached slots whose stack home is stale.
+    /// Each slot whose current value a register holds, and that value. Several slots may name one.
+    names: SmallVec<[(usize, u32); WINDOW]>,
+    /// Named slots whose stack home is stale.
     dirty: SmallVec<[usize; WINDOW]>,
+    /// The id of the next value.
+    next: u32,
 }
 
-/// Each register caching a slot, as `w1=[5]` (or `x1=[5]` unboxed), marked `*`
-/// if dirty.
+/// Two windows are one if their registers hold values named by the same slots, in the same
+/// forms, with the same slots dirty, whatever their ids.
+impl PartialEq for Cache {
+    fn eq(&self, other: &Cache) -> bool {
+        let shape = |cache: &Cache| {
+            let regs: Vec<Vec<usize>> = (0..WINDOW).map(|reg| {
+                let mut names: Vec<usize> = cache.regs[reg].map_or_else(Vec::new, |value| cache.named(value).collect());
+                names.sort_unstable();
+                names
+            }).collect();
+            let mut dirty = cache.dirty.to_vec();
+            dirty.sort_unstable();
+            (regs, cache.unboxed, dirty)
+        };
+        shape(self) == shape(other)
+    }
+}
+
+impl Eq for Cache {}
+
+/// Each register holding a value, as `w1=[5,7]` (or `x1=[5]` unboxed), the slots naming it each
+/// marked `*` if dirty.
 impl std::fmt::Display for Cache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut sep = "";
         write!(f, "{{")?;
-        for (reg, slot) in self.regs.iter().enumerate() {
-            if let Some(slot) = slot {
-                let dirty = if self.dirty.contains(slot) { "*" } else { "" };
-                write!(f, "{sep}{}=[{slot}]{dirty}", self.loc(reg))?;
-                sep = " ";
-            }
+        for reg in 0..WINDOW {
+            let Some(value) = self.regs[reg] else { continue };
+            let names: Vec<String> = self.named(value).map(|slot| format!("{slot}{}", if self.dirty.contains(&slot) { "*" } else { "" })).collect();
+            write!(f, "{sep}{}=[{}]", self.loc(reg), names.join(","))?;
+            sep = " ";
         }
         write!(f, "}}")
     }
@@ -223,15 +251,15 @@ impl Cache {
     /// block, or planned dirty in `dirty`. A clean value marked dirty is only
     /// stored again, so any slot can be.
     pub fn entry(regs: Placement, unboxed: u8, from: &Cache, dirty: &Slots) -> Cache {
-        let mut dirty: SmallVec<[usize; WINDOW]> = regs.iter().flatten().copied().filter(|slot| from.dirty.contains(slot) || dirty.contains(*slot)).collect();
-        dirty.sort_unstable();
-        dirty.dedup();
-        Cache { regs, unboxed: unboxed & occupied(&regs), dirty }
+        let mut entry = Cache::default();
+        entry.hold(&regs, |reg, _| bit(unboxed, reg));
+        entry.dirty = entry.names.iter().map(|&(slot, _)| slot).filter(|&slot| from.dirty.contains(&slot) || dirty.contains(slot)).collect();
+        entry
     }
 
-    /// The slot each register caches.
-    pub fn regs(&self) -> &Placement {
-        &self.regs
+    /// For each register, a slot naming the value it holds.
+    pub fn regs(&self) -> Placement {
+        self.regs.map(|value| value.and_then(|value| self.named(value).next()))
     }
 
     /// The registers holding theirs unboxed.
@@ -244,19 +272,42 @@ impl Cache {
         Loc { reg, unboxed: bit(self.unboxed, reg) }
     }
 
-    fn position(&self, slot: usize) -> Option<usize> {
-        self.regs.iter().position(|&s| s == Some(slot))
+    /// The value `slot` names, if a register holds it.
+    fn value(&self, slot: usize) -> Option<u32> {
+        self.names.iter().find(|&&(s, _)| s == slot).map(|&(_, value)| value)
     }
 
-    /// A register caching `slot`, one in the form `unboxed` says if any is.
+    /// The slots naming `value`.
+    fn named(&self, value: u32) -> impl Iterator<Item = usize> + '_ {
+        self.names.iter().filter(move |&&(_, v)| v == value).map(|&(slot, _)| slot)
+    }
+
+    /// Whether `reg` holds the value `slot` names.
+    fn has(&self, reg: usize, slot: usize) -> bool {
+        self.value(slot).is_some_and(|value| self.regs[reg] == Some(value))
+    }
+
+    /// A new value's id.
+    fn fresh(&mut self) -> u32 {
+        self.next += 1;
+        self.next - 1
+    }
+
+    fn position(&self, slot: usize) -> Option<usize> {
+        let value = self.value(slot)?;
+        self.regs.iter().position(|&v| v == Some(value))
+    }
+
+    /// A register holding `slot`'s value, one in the form `unboxed` says if any is.
     fn source(&self, slot: usize, unboxed: bool) -> Option<Loc> {
-        let regs = || (0..WINDOW).filter(|&reg| self.regs[reg] == Some(slot));
+        let value = self.value(slot)?;
+        let regs = || (0..WINDOW).filter(move |&reg| self.regs[reg] == Some(value));
         regs().find(|&reg| bit(self.unboxed, reg) == unboxed).or_else(|| regs().next()).map(|reg| self.loc(reg))
     }
 
-    /// Whether `reg` holds `slot` in the form `unboxed` says.
+    /// Whether `reg` holds `slot`'s value in the form `unboxed` says.
     fn holds(&self, reg: usize, slot: usize, unboxed: bool) -> bool {
-        self.regs[reg] == Some(slot) && bit(self.unboxed, reg) == unboxed
+        self.has(reg, slot) && bit(self.unboxed, reg) == unboxed
     }
 
     /// The store bringing dirty `slot`'s stack home up to date.
@@ -265,15 +316,78 @@ impl Cache {
         Emit::Store { slot, reg, unboxed: bit(self.unboxed, reg) }
     }
 
-    /// Set `reg` to hold `slot`, if any, in the form `unboxed` says.
+    /// Set `reg` to hold `slot`'s value, if any, in the form `unboxed` says: the value a register
+    /// holds, else one the slot's stack home holds.
     fn set(&mut self, reg: usize, slot: Option<usize>, unboxed: bool) {
-        self.regs[reg] = slot;
-        self.unboxed = (self.unboxed & !(1 << reg)) | (u8::from(unboxed && slot.is_some()) << reg);
+        let mut want = [None; WINDOW];
+        want[reg] = slot;
+        if slot.is_none() {
+            self.regs[reg] = None;
+            self.unboxed &= !(1 << reg);
+            self.prune();
+            return;
+        }
+        self.hold(&want, |_, _| unboxed);
     }
 
-    /// Each slot it caches, once, in the first register caching it.
+    /// Set each register `want` names a slot for to hold that slot's value, in the form `form`
+    /// says, all at once: a value a register holds now, else one the slot's stack home holds.
+    fn hold(&mut self, want: &Placement, form: impl Fn(usize, usize) -> bool) {
+        let values: [Option<u32>; WINDOW] = want.map(|slot| slot.map(|slot| match self.value(slot) {
+            Some(value) => value,
+            None => {
+                let value = self.fresh();
+                self.names.push((slot, value));
+                value
+            },
+        }));
+        for reg in 0..WINDOW {
+            if let (Some(value), Some(slot)) = (values[reg], want[reg]) {
+                self.regs[reg] = Some(value);
+                self.unboxed = (self.unboxed & !(1 << reg)) | (u8::from(form(reg, slot)) << reg);
+            }
+        }
+        self.prune();
+    }
+
+    /// `reg` holds a new value of `slot`'s, in the form `unboxed` says: what `slot` named before
+    /// keeps its other names.
+    fn write(&mut self, reg: usize, slot: usize, unboxed: bool) {
+        self.names.retain(|name| name.0 != slot);
+        let value = self.fresh();
+        self.names.push((slot, value));
+        self.regs[reg] = Some(value);
+        self.unboxed = (self.unboxed & !(1 << reg)) | (u8::from(unboxed) << reg);
+        if !self.dirty.contains(&slot) {
+            self.dirty.push(slot);
+        }
+        self.prune();
+    }
+
+    /// Forget what no register holds, and its names, and empty a register holding what no slot
+    /// names.
+    fn prune(&mut self) {
+        let regs = self.regs;
+        self.names.retain(|name| regs.contains(&Some(name.1)));
+        for reg in 0..WINDOW {
+            if self.regs[reg].is_some_and(|value| !self.names.iter().any(|&(_, v)| v == value)) {
+                self.regs[reg] = None;
+                self.unboxed &= !(1 << reg);
+            }
+        }
+    }
+
+    /// Each slot it names a value of, once, with the first register holding the value.
     fn slots(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        (0..WINDOW).filter_map(|reg| self.regs[reg].filter(|&slot| self.position(slot) == Some(reg)).map(|slot| (reg, slot)))
+        self.names.iter().filter_map(|&(slot, value)| self.regs.iter().position(|&v| v == Some(value)).map(|reg| (reg, slot)))
+    }
+
+    /// Each value it holds, once: the first register holding it, and the slots naming it.
+    fn values(&self) -> impl Iterator<Item = (usize, SmallVec<[usize; WINDOW]>)> + '_ {
+        (0..WINDOW).filter_map(|reg| {
+            let value = self.regs[reg]?;
+            (self.regs.iter().position(|&v| v == Some(value)) == Some(reg)).then(|| (reg, self.named(value).collect()))
+        })
     }
 }
 
@@ -332,10 +446,10 @@ impl WindowAlloc {
             .collect();
         let mut moves: SmallVec<[(Loc, Source); 8]> = SmallVec::new();
         let mut copies: SmallVec<[(Loc, Loc); WINDOW]> = SmallVec::new();
-        for (reg, &slot) in to.regs.iter().enumerate() {
-            let Some(slot) = slot else { continue };
+        for (reg, slot) in to.regs().iter().enumerate() {
+            let Some(slot) = *slot else { continue };
             let dst = to.loc(reg);
-            let src = if now.regs[reg] == Some(slot) { Some(now.loc(reg)) } else { now.source(slot, dst.unboxed) };
+            let src = if now.has(reg, slot) { Some(now.loc(reg)) } else { now.source(slot, dst.unboxed) };
             fill(&mut moves, &mut copies, dst, slot, src);
         }
         parallel_move(&mut moves, &mut emits);
@@ -375,7 +489,7 @@ impl WindowAlloc {
                 .filter(|reg| !taken.contains(reg))
                 .min_by_key(|&reg| match now.regs[reg] {
                     None => 0,
-                    Some(slot) if !now.dirty.contains(&slot) => 1,
+                    Some(value) if now.named(value).all(|slot| !now.dirty.contains(&slot)) => 1,
                     Some(_) => 2,
                 })
                 .expect("a register for an emitted op's operand")
@@ -409,11 +523,11 @@ impl WindowAlloc {
         plan.emits
     }
 
-    /// Make the window hold `want` in each register it names, before `op`, its operands in
-    /// `regs`, leaving the others as they are: store the dirty values overwritten that survive
-    /// nowhere else and that `op` doesn't rewrite, then fill the named registers as one parallel
-    /// move (a slot loaded into several registers is loaded once and copied). See Note [Window
-    /// allocation].
+    /// Make the window hold, in each register `want` names a slot for, that slot's value, before
+    /// `op`, its operands in `regs`, leaving the others as they are: store each dirty slot whose
+    /// value survives nowhere and that `op` doesn't rewrite, then fill the named registers as one
+    /// parallel move (a slot loaded into several registers is loaded once and copied). See Note
+    /// [Window allocation].
     pub fn reconcile(&mut self, want: &Placement, framed: &Framed, regs: &[usize]) -> SmallVec<[Emit; 16]> {
         let op = framed.op;
         let rewritten = |slot: usize| framed.slots().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a.writes());
@@ -422,19 +536,15 @@ impl WindowAlloc {
         // else in the one it has.
         let form = |reg: usize, slot: usize| match regs.iter().zip(op.accesses()).position(|(&r, a)| r == reg && a.reads()) {
             Some(i) => bit(op.doubles(), i),
-            None if now.regs[reg] == Some(slot) => bit(now.unboxed, reg),
+            None if now.has(reg, slot) => bit(now.unboxed, reg),
             None => now.source(slot, false).is_some_and(|src| src.unboxed),
         };
         let mut after = now.clone();
-        for (reg, slot) in want.iter().enumerate() {
-            if let Some(slot) = *slot {
-                after.set(reg, Some(slot), form(reg, slot));
-            }
-        }
+        after.hold(want, form);
         let mut emits: SmallVec<[Emit; 16]> = now
             .dirty
             .iter()
-            .filter(|slot| !after.regs.contains(&Some(**slot)) && !rewritten(**slot))
+            .filter(|&&slot| now.value(slot).is_some_and(|value| !after.regs.contains(&Some(value))) && !rewritten(slot))
             .map(|&slot| now.store(slot))
             .collect();
         let mut moves: SmallVec<[(Loc, Source); 8]> = SmallVec::new();
@@ -449,12 +559,13 @@ impl WindowAlloc {
         }
         parallel_move(&mut moves, &mut emits);
         emits.extend(copies.into_iter().map(|(dst, src)| Emit::Move { dst, src }));
-        after.dirty.retain(|slot| after.regs.contains(&Some(*slot)));
+        let named: SmallVec<[usize; WINDOW]> = after.names.iter().map(|&(slot, _)| slot).collect();
+        after.dirty.retain(|slot| named.contains(slot));
         self.cache = after;
         emits
     }
 
-    /// A register caching `slot`'s current value, if any.
+    /// A register holding `slot`'s current value, if any.
     pub fn register_of(&self, slot: usize) -> Option<usize> {
         self.cache.position(slot)
     }
@@ -465,24 +576,24 @@ impl WindowAlloc {
         self.cache.dirty.iter().map(|&slot| self.cache.store(slot)).collect()
     }
 
-    /// A `Move` from `src`, which a register holds, to `dst`, as a rename: that register holds
-    /// `dst`'s value from then on, dirty, and no register `src`'s, which is stored first if
-    /// `store`. No code but the store.
+    /// A `Move` from `src`, whose value a register holds, to `dst`: `dst` names that value from
+    /// then on, dirty, `src` still naming it too, and `src` is stored first if `store`. No code but
+    /// the store.
     pub fn rename(&mut self, src: usize, dst: usize, store: bool) -> SmallVec<[Emit; 16]> {
-        let reg = self.cache.position(src).expect("a renamed value in a register");
+        let value = self.cache.value(src).expect("a renamed value in a register");
         let mut emits = SmallVec::new();
-        if store {
+        if store && self.cache.dirty.contains(&src) {
             emits.push(self.cache.store(src));
+            self.cache.dirty.retain(|slot| *slot != src);
         }
-        let unboxed = bit(self.cache.unboxed, reg);
-        for r in 0..WINDOW {
-            if self.cache.regs[r].is_some_and(|slot| slot == src || slot == dst) {
-                self.cache.set(r, None, false);
+        if src != dst {
+            self.cache.names.retain(|name| name.0 != dst);
+            self.cache.names.push((dst, value));
+            if !self.cache.dirty.contains(&dst) {
+                self.cache.dirty.push(dst);
             }
+            self.cache.prune();
         }
-        self.cache.dirty.retain(|slot| *slot != src && *slot != dst);
-        self.cache.set(reg, Some(dst), unboxed);
-        self.cache.dirty.push(dst);
         emits
     }
 
@@ -495,12 +606,9 @@ impl WindowAlloc {
 
     /// Drop `slots` from the window without storing them: their values are dead.
     pub fn forget(&mut self, slots: &Slots) {
-        for reg in 0..WINDOW {
-            if self.cache.regs[reg].is_some_and(|slot| slots.contains(slot)) {
-                self.cache.set(reg, None, false);
-            }
-        }
+        self.cache.names.retain(|name| !slots.contains(name.0));
         self.cache.dirty.retain(|slot| !slots.contains(*slot));
+        self.cache.prune();
     }
 
     /// End the run: flush every dirty register and empty the window.
@@ -514,29 +622,40 @@ impl WindowAlloc {
     /// window op's run at `skip`, or an emitted op's registers with none.
     fn plan(&self, slots: &[usize], accesses: &[Access], doubles: u8, regs: &[usize], skip: Option<usize>) -> Plan {
         let now = &self.cache;
-        let written = |reg: usize| regs.iter().zip(accesses).any(|(&r, a)| r == reg && a.writes());
-        let mut emits = SmallVec::new();
+        let rewritten = |slot: usize| slots.iter().zip(accesses).any(|(&s, a)| s == slot && a.writes());
 
-        // Values its registers overwrite; a dirty one is stored first unless it survives: in a
-        // register not the op's, or as an input in a register the op doesn't write, or rewritten
-        // by the op.
+        // The cache it leaves: its inputs' values in their registers, in the forms it takes them,
+        // then each output a new value of its slot.
+        let mut after = now.clone();
+        let mut inputs = [None; WINDOW];
+        for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
+            if access.reads() {
+                inputs[regs[i]] = Some(slot);
+            }
+        }
+        after.hold(&inputs, |reg, _| regs.iter().position(|&r| r == reg).is_some_and(|i| bit(doubles, i)));
+        for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
+            if access.writes() {
+                after.write(regs[i], slot, bit(doubles, i));
+            }
+        }
+
+        // A value it displaces that no other register keeps: each of its dirty names the op
+        // doesn't rewrite is stored first.
+        let mut emits = SmallVec::new();
         let mut overwritten = 0;
-        for (i, &reg) in regs.iter().enumerate() {
-            let Some(slot) = now.regs[reg] else { continue };
-            if accesses[i].reads() && slots[i] == slot {
+        for reg in regs.iter().copied().filter(|&reg| now.regs[reg].is_some()) {
+            let value = now.regs[reg].unwrap();
+            if after.regs[reg] != Some(value) {
+                overwritten += 1;
+            }
+            if after.regs.contains(&Some(value)) || now.regs.iter().position(|&v| v == Some(value)) != Some(reg) {
                 continue;
             }
-            if regs[..i].contains(&reg) {
-                continue;
-            }
-            overwritten += 1;
-            let elsewhere = (0..self.width).any(|r| !regs.contains(&r) && now.regs[r] == Some(slot));
-            let input = slots.iter().zip(accesses).zip(regs).any(|((&s, a), &r)| s == slot && a.reads() && !written(r));
-            let rewritten = slots.iter().zip(accesses).any(|(&s, a)| s == slot && a.writes());
-            let survives = elsewhere || input || rewritten;
-            let stored = emits.iter().any(|e| matches!(e, Emit::Store { slot: s, .. } if *s == slot));
-            if now.dirty.contains(&slot) && !survives && !stored {
-                emits.push(Emit::Store { slot, reg, unboxed: bit(now.unboxed, reg) });
+            for slot in now.named(value).filter(|slot| now.dirty.contains(slot) && !rewritten(*slot)) {
+                if !emits.iter().any(|e| matches!(e, Emit::Store { slot: s, .. } if *s == slot)) {
+                    emits.push(Emit::Store { slot, reg, unboxed: bit(now.unboxed, reg) });
+                }
             }
         }
 
@@ -559,34 +678,14 @@ impl WindowAlloc {
         emits.extend(copies.into_iter().map(|(dst, src)| Emit::Move { dst, src }));
         emits.push(skip.map_or(Emit::Emitted, |skip| Emit::Op { skip }));
 
-        // The cache it leaves: inputs in their registers, the others the op writes emptied, then
-        // each output replacing every older copy of its slot, each in its form.
-        let mut after = now.clone();
-        for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
-            if access.reads() {
-                after.set(regs[i], Some(slot), bit(doubles, i));
-            }
-        }
-        for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
-            if access.writes() {
-                for reg in 0..WINDOW {
-                    if after.regs[reg] == Some(slot) {
-                        after.set(reg, None, false);
-                    }
-                }
-                after.set(regs[i], Some(slot), bit(doubles, i));
-                if !after.dirty.contains(&slot) {
-                    after.dirty.push(slot);
-                }
-            }
-        }
         for emit in &emits {
             if let Emit::Store { slot, .. } = emit {
                 after.dirty.retain(|s| s != slot);
             }
         }
+        let named: SmallVec<[usize; WINDOW]> = after.names.iter().map(|&(slot, _)| slot).collect();
         for slot in &after.dirty {
-            assert!(after.regs.contains(&Some(*slot)), "dirty slot {slot} dropped without a store");
+            assert!(named.contains(slot), "dirty slot {slot} dropped without a store");
         }
         let cost = emits.iter().map(|&emit| emit.cost()).sum();
         Plan { cost, overwritten, skip: skip.unwrap_or(0), emits, after }
@@ -948,11 +1047,19 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 let worth = |slot: usize| ahead.worth(slot, step, now.dirty.contains(&slot));
                 let mut regs = [None; WINDOW];
                 let mut dirty = Slots::default();
+                // A block's entry window names one slot in each register: another naming the same
+                // value goes in a free register, or is left, stored on the edge if dirty.
+                let put = |regs: &mut Placement, slot: usize, at: Option<usize>| match at.filter(|&reg| regs[reg].is_none()).or_else(|| (0..width).find(|&reg| regs[reg].is_none())) {
+                    Some(reg) => {
+                        regs[reg] = Some(slot);
+                        true
+                    },
+                    None => false,
+                };
                 match rise {
                     _ if trivial => {
                         for (reg, slot) in now.slots() {
-                            regs[reg] = Some(slot);
-                            if now.dirty.contains(&slot) {
+                            if put(&mut regs, slot, Some(reg)) && now.dirty.contains(&slot) {
                                 dirty.insert(slot);
                             }
                         }
@@ -968,24 +1075,20 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                         values.truncate(width);
                         for &(_, slot) in &values {
                             if let Some(reg) = now.position(slot) {
-                                regs[reg] = Some(slot);
+                                put(&mut regs, slot, Some(reg));
                             }
                         }
                         for &(_, slot) in &values {
                             if now.position(slot).is_none() {
-                                let reg = (0..width).find(|&reg| regs[reg].is_none()).expect("a free register");
-                                regs[reg] = Some(slot);
+                                put(&mut regs, slot, None);
                             }
                         }
                         regs.iter().flatten().filter(|&&slot| writes.contains(slot)).for_each(|&slot| dirty.insert(slot));
                     }
                     None => {
                         for (reg, slot) in now.slots() {
-                            if worth(slot).is_some() {
-                                regs[reg] = Some(slot);
-                                if now.dirty.contains(&slot) {
-                                    dirty.insert(slot);
-                                }
+                            if worth(slot).is_some() && put(&mut regs, slot, Some(reg)) && now.dirty.contains(&slot) {
+                                dirty.insert(slot);
                             }
                         }
                     }
@@ -1000,7 +1103,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                     let form = if trivial { bit(now.unboxed, reg) } else { ahead.next_form(slot, step).unwrap_or(has) };
                     unboxed |= u8::from(form) << reg;
                 }
-                let entry = Cache { regs, unboxed, dirty: dirty.iter().collect() };
+                let entry = Cache::entry(regs, unboxed, &Cache::default(), &dirty);
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("alloc", "start", &[
                     ("trace", trace.into()),
@@ -1016,7 +1119,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 plan.unboxed[step] = unboxed;
                 plan.dirty[step] = dirty;
             }
-            Step::Op(op, usable) if let Some(store) = renames(&alloc, &ahead, step, op) => {
+            Step::Op(op, usable) if let Some(store) = renames(&alloc, op) => {
                 let emits = alloc.rename(op.slots()[0], op.slots()[1], store);
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("alloc", "op", &[
@@ -1027,7 +1130,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                     ("after", format!("{}", alloc.cache()).as_str().into()),
                 ]);
                 let _ = (emits, usable);
-                plan.windows[step] = *alloc.cache().regs();
+                plan.windows[step] = alloc.cache().regs();
                 plan.skips[step] = if store { RENAME_STORE } else { RENAME };
             }
             Step::Op(op, usable) => {
@@ -1090,19 +1193,28 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
     plan
 }
 
-/// Whether the op at `step` is a `Move` the window does as a rename, and if so whether its
-/// source's value is stored first: its source in a register that no read of it after pays for
-/// keeping, stored unless dead.
-fn renames(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> Option<bool> {
+/// Whether the op is a `Move` the window does as a rename, and if so whether its source is stored
+/// first: one whose source a register holds, which the destination names too from then on.
+fn renames(alloc: &WindowAlloc, op: &Framed) -> Option<bool> {
     if !is_move(op.op) {
         return None;
     }
     let (src, dst) = (op.slots()[0], op.slots()[1]);
     alloc.cache().position(src)?;
-    if src == dst || ahead.pays(src, step, false).is_some() {
-        return None;
-    }
-    Some(alloc.cache().dirty.contains(&src) && !ahead.dead(src, step))
+    (src != dst).then_some(false)
+}
+
+/// The values `now` holds worth keeping in registers past step `at`, but those an op reading
+/// `reads` takes as inputs, each by its slot worth most, least worth first: a value's worth is
+/// the most of the slots naming it but those the op rewrites, `writes`.
+fn kept_values(ahead: &Ahead, now: &Cache, at: usize, reads: &[usize], writes: &[usize]) -> SmallVec<[((bool, usize), usize); WINDOW]> {
+    let mut kept: SmallVec<[((bool, usize), usize); WINDOW]> = now
+        .values()
+        .filter(|(_, names)| !names.iter().any(|slot| reads.contains(slot)))
+        .filter_map(|(_, names)| names.iter().copied().filter(|slot| !writes.contains(slot)).filter_map(|slot| Some((ahead.worth(slot, at, now.dirty.contains(&slot))?, slot))).min())
+        .collect();
+    kept.sort_unstable();
+    kept
 }
 
 /// Where the op at `step` runs, and the window it wants: its inputs in its
@@ -1112,19 +1224,16 @@ fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed, usable: &
     let (slots, accesses) = (op.slots(), op.op.accesses());
     let now = alloc.cache();
     let width = alloc.width;
-    let mut kept: SmallVec<[((bool, usize), usize); WINDOW]> = now
-        .slots()
-        .filter(|(_, slot)| !slots.contains(slot))
-        .filter_map(|(_, slot)| Some((ahead.worth(slot, step, now.dirty.contains(&slot))?, slot)))
-        .collect();
-    kept.sort_unstable();
+    let reads: SmallVec<[usize; WINDOW]> = slots.iter().zip(accesses).filter(|(_, a)| a.reads()).map(|(&slot, _)| slot).collect();
+    let writes: SmallVec<[usize; WINDOW]> = slots.iter().zip(accesses).filter(|(_, a)| a.writes()).map(|(&slot, _)| slot).collect();
+    let mut kept = kept_values(ahead, now, step, &reads, &writes);
     kept.truncate(width - slots.len());
-    // A kept value stays in a register outside the run caching it, if any.
-    let outside = |slot: usize, run: &std::ops::Range<usize>| (0..width).find(|reg| !run.contains(reg) && now.regs[*reg] == Some(slot));
+    // A kept value stays in a register outside the run holding it, if any.
+    let outside = |slot: usize, run: &std::ops::Range<usize>| (0..width).find(|reg| !run.contains(reg) && now.has(*reg, slot));
     let inputs = |skip: usize| (skip..).zip(slots.iter().zip(accesses)).filter(|(_, (_, a))| a.reads()).map(|(reg, (&slot, _))| (reg, slot));
     let moves = |skip: usize| {
         let run = skip..skip + slots.len();
-        let misplaced = inputs(skip).filter(|&(reg, slot)| now.regs[reg] != Some(slot) && now.position(slot).is_some()).count();
+        let misplaced = inputs(skip).filter(|&(reg, slot)| !now.has(reg, slot) && now.position(slot).is_some()).count();
         misplaced + kept.iter().filter(|&&(_, slot)| outside(slot, &run).is_none()).count()
     };
     let skip = usable.iter().copied().filter(|&skip| skip + slots.len() <= width).min_by_key(|&skip| (moves(skip), skip)).expect("a usable SKIP");
@@ -1140,10 +1249,11 @@ fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed, usable: &
     }
     // A kept value only in the run moves out, to an empty register if there
     // is one, else over a clean value, else over a dirty one, which is stored.
+    let dirty = |reg: usize| now.regs[reg].map(|value| 1 + usize::from(now.named(value).any(|slot| now.dirty.contains(&slot))));
     for &(_, slot) in kept.iter().filter(|&&(_, slot)| outside(slot, &run).is_none()) {
         let reg = (0..width)
             .filter(|&reg| !run.contains(&reg) && want[reg].is_none())
-            .min_by_key(|&reg| (now.regs[reg].map(|s| 1 + usize::from(now.dirty.contains(&s))), reg))
+            .min_by_key(|&reg| (dirty(reg), reg))
             .expect("room outside the run");
         want[reg] = Some(slot);
     }
@@ -1151,7 +1261,7 @@ fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed, usable: &
 }
 
 /// Where the emitted op at `step` runs, and the window it wants: each input in the register
-/// caching it, or one free, its output in the register of an input it overwrites, of its slot's
+/// holding it, or one free, its output in the register of an input it overwrites, of its slot's
 /// old value, of an input no longer worth keeping, a free one, or that of the value worth least,
 /// and the values worth most of the others, as many as fit in the registers left. Its output's
 /// register is returned in place of a `SKIP`. See Notes [Trace allocation] and [Emitted ops].
@@ -1159,7 +1269,11 @@ fn place_free(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> (
     let (slots, accesses) = (op.slots(), op.op.accesses());
     let now = alloc.cache();
     let width = alloc.width;
-    let worth = |slot: usize| ahead.worth(slot, step, now.dirty.contains(&slot));
+    let reads: SmallVec<[usize; WINDOW]> = slots.iter().zip(accesses).filter(|(_, a)| a.reads()).map(|(&slot, _)| slot).collect();
+    let writes: SmallVec<[usize; WINDOW]> = slots.iter().zip(accesses).filter(|(_, a)| a.writes()).map(|(&slot, _)| slot).collect();
+    // A value's worth: the most of the slots naming it.
+    let worth = |value: u32| now.named(value).filter_map(|slot| ahead.worth(slot, step, now.dirty.contains(&slot))).min();
+    let dirty = |value: u32| now.named(value).any(|slot| now.dirty.contains(&slot));
     let mut want: Placement = [None; WINDOW];
     // A free register: empty, else holding a value worth nothing, else the one worth least.
     let free = |want: &Placement, taken: &[usize]| {
@@ -1167,15 +1281,15 @@ fn place_free(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> (
             .filter(|reg| want[*reg].is_none() && !taken.contains(reg))
             .min_by_key(|&reg| match now.regs[reg] {
                 None => (0, (false, 0)),
-                Some(slot) if slots.contains(&slot) => (3, (false, 0)),
-                Some(slot) => match worth(slot) {
-                    None => (1, (false, usize::from(now.dirty.contains(&slot)))),
+                Some(value) if now.named(value).any(|slot| slots.contains(&slot)) => (3, (false, 0)),
+                Some(value) => match worth(value) {
+                    None => (1, (false, usize::from(dirty(value)))),
                     Some((exit, far)) => (2, (!exit, usize::MAX - far)),
                 },
             })
             .expect("a register for an emitted op's operand")
     };
-    for (&slot, _) in slots.iter().zip(accesses).filter(|(_, a)| a.reads()) {
+    for &slot in &reads {
         if want.contains(&Some(slot)) {
             continue;
         }
@@ -1186,11 +1300,11 @@ fn place_free(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> (
     let dead = |slot: usize| !now.dirty.contains(&slot) || ahead.dead(slot, step);
     let mut taken: SmallVec<[usize; WINDOW]> = inputs.clone();
     // An op with no output, as a compare, takes no register for one.
-    let output = slots.iter().zip(accesses).find(|(_, a)| **a == Access::Write).map(|(&slot, _)| slot);
+    let output = writes.first().copied();
     let out = output.map_or(0, |out_slot| {
         inputs.iter().copied().find(|&reg| want[reg] == Some(out_slot))
             .or_else(|| now.position(out_slot).filter(|&reg| want[reg].is_none()))
-            .or_else(|| inputs.iter().copied().find(|&reg| want[reg].is_some_and(|slot| worth(slot).is_none() && dead(slot))))
+            .or_else(|| inputs.iter().copied().find(|&reg| want[reg].is_some_and(|slot| ahead.worth(slot, step, now.dirty.contains(&slot)).is_none() && dead(slot))))
             .unwrap_or_else(|| free(&want, &[]))
     });
     if output.is_some() && !taken.contains(&out) {
@@ -1198,17 +1312,11 @@ fn place_free(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> (
     }
     // The values worth most of the others, each in its register if the op doesn't take it, else
     // in a free one, as many as fit.
-    let mut kept: SmallVec<[((bool, usize), usize); WINDOW]> = now
-        .slots()
-        .filter(|(_, slot)| !slots.contains(slot))
-        .filter_map(|(_, slot)| Some((worth(slot)?, slot)))
-        .collect();
-    kept.sort_unstable();
-    for &(_, slot) in &kept {
+    for &(_, slot) in &kept_values(ahead, now, step, &reads, &writes) {
         if taken.len() >= width {
             break;
         }
-        let at = (0..width).find(|&reg| now.regs[reg] == Some(slot) && !taken.contains(&reg));
+        let at = (0..width).find(|&reg| now.has(reg, slot) && !taken.contains(&reg));
         let reg = match at {
             Some(reg) => reg,
             None => match (0..width).find(|&reg| !taken.contains(&reg) && want[reg].is_none() && now.regs[reg].is_none()) {
@@ -1379,51 +1487,55 @@ mod tests {
         Move(usize, usize),
     }
 
-    /// Executes allocator output on symbolic values (slot, version), each
-    /// register's halves apart, checking that every op reads the current
-    /// version of its inputs in the forms it takes them, every store writes a
-    /// current version, and after the run the stack holds every slot's latest
-    /// version.
+    /// Executes allocator output on symbolic values, each register's halves apart, checking that
+    /// every op reads its inputs' current values in the forms it takes them, every store writes a
+    /// slot's current value, and after the run the stack holds every slot's. A value is an id: a
+    /// slot never written holds its own, a write makes a new one, and a rename gives its
+    /// destination its source's.
     #[derive(Debug, Default, Clone)]
     struct Machine {
-        memory: HashMap<usize, u32>,
-        current: HashMap<usize, u32>,
-        regs: [Option<(usize, u32)>; WINDOW + 1],
-        xregs: [Option<(usize, u32)>; WINDOW + 1],
+        memory: HashMap<usize, u64>,
+        current: HashMap<usize, u64>,
+        regs: [Option<u64>; WINDOW + 1],
+        xregs: [Option<u64>; WINDOW + 1],
+        next: u64,
     }
 
     impl Machine {
-        fn version(map: &HashMap<usize, u32>, slot: usize) -> u32 {
-            map.get(&slot).copied().unwrap_or(0)
+        fn version(map: &HashMap<usize, u64>, slot: usize) -> u64 {
+            map.get(&slot).copied().unwrap_or(slot as u64)
         }
-        fn half(&mut self, loc: Loc) -> &mut Option<(usize, u32)> {
+        /// A value no slot has had.
+        fn fresh(&mut self) -> u64 {
+            self.next += 1;
+            1 << 32 | self.next
+        }
+        fn half(&mut self, loc: Loc) -> &mut Option<u64> {
             if loc.unboxed { &mut self.xregs[loc.reg] } else { &mut self.regs[loc.reg] }
         }
-        /// The window `cache` holds, its slots at their current versions.
+        /// The window `cache` holds, each register its slots' current value.
         fn holding(&mut self, cache: &Cache) {
-            for (reg, slot) in cache.regs.iter().enumerate() {
-                let value = slot.map(|slot| (slot, Self::version(&self.current, slot)));
+            for (reg, slot) in cache.regs().iter().enumerate() {
+                let value = slot.map(|slot| Self::version(&self.current, slot));
                 *self.half(cache.loc(reg)) = value;
             }
         }
-        /// Whether every register of `cache` holds its slot's current value in
-        /// its form.
+        /// Whether every register of `cache` holds the current value of each slot naming its value,
+        /// in its form.
         fn check(&mut self, cache: &Cache, what: &str) {
-            for (reg, slot) in cache.regs.iter().enumerate() {
-                if let Some(slot) = *slot {
-                    let current = Self::version(&self.current, slot);
-                    assert_eq!(*self.half(cache.loc(reg)), Some((slot, current)), "{what}: register {reg} of {cache}");
-                }
+            for (reg, slot) in cache.slots() {
+                let current = Self::version(&self.current, slot);
+                assert_eq!(*self.half(cache.loc(reg)), Some(current), "{what}: slot {slot} in register {reg} of {cache}");
             }
         }
         fn exec(&mut self, emit: Emit, op: Option<Op>, regs: &[usize]) {
             match emit {
                 Emit::Load { reg, slot, unboxed } => {
-                    *self.half(Loc { reg, unboxed }) = Some((slot, Self::version(&self.memory, slot)));
+                    *self.half(Loc { reg, unboxed }) = Some(Self::version(&self.memory, slot));
                 }
                 Emit::Store { slot, reg, unboxed } => {
                     let current = Self::version(&self.current, slot);
-                    assert_eq!(*self.half(Loc { reg, unboxed }), Some((slot, current)), "store of a stale value");
+                    assert_eq!(*self.half(Loc { reg, unboxed }), Some(current), "store of a stale value to {slot}");
                     self.memory.insert(slot, current);
                 }
                 Emit::Move { dst, src } => {
@@ -1439,12 +1551,12 @@ mod tests {
                     for (i, (&slot, _)) in operands.clone().filter(|(_, (_, a))| a.reads()) {
                         let current = Self::version(&self.current, slot);
                         let loc = Loc { reg: reg(i), unboxed: bit(op.doubles(), i) };
-                        assert_eq!(*self.half(loc), Some((slot, current)), "input {i} of {} on {regs:?}", op.name());
+                        assert_eq!(*self.half(loc), Some(current), "input {i} of {} on {regs:?}", op.name());
                     }
                     for (i, (&slot, _)) in operands.filter(|(_, (_, a))| a.writes()) {
-                        let version = Self::version(&self.current, slot) + 1;
-                        self.current.insert(slot, version);
-                        *self.half(Loc { reg: reg(i), unboxed: bit(op.doubles(), i) }) = Some((slot, version));
+                        let value = self.fresh();
+                        self.current.insert(slot, value);
+                        *self.half(Loc { reg: reg(i), unboxed: bit(op.doubles(), i) }) = Some(value);
                     }
                 }
             }
@@ -1750,7 +1862,8 @@ mod tests {
                 let plan = plan_trace(&steps, width, &hint, 0);
                 let mut machine = Machine::default();
                 for &slot in &hint.dirty {
-                    machine.current.insert(slot, 1);
+                    let value = machine.fresh();
+                    machine.current.insert(slot, value);
                 }
                 machine.holding(&hint);
                 let mut alloc = WindowAlloc { width, cache: hint };
@@ -1770,13 +1883,11 @@ mod tests {
                         // destination's new value.
                         Step::Op(op, _) if plan.skips[step] >= RENAME => {
                             let (src, dst) = (op.slots()[0], op.slots()[1]);
-                            let loc = alloc.cache().loc(alloc.cache().position(src).expect("a renamed value in a register"));
                             for emit in alloc.rename(src, dst, plan.skips[step] == RENAME_STORE) {
                                 machine.exec(emit, None, &[]);
                             }
-                            let version = Machine::version(&machine.current, dst) + 1;
-                            machine.current.insert(dst, version);
-                            *machine.half(loc) = Some((dst, version));
+                            let value = Machine::version(&machine.current, src);
+                            machine.current.insert(dst, value);
                         }
                         Step::Op(op, _) => planned(&mut alloc, &mut machine, &plan, step, op),
                         // Leaving through a thunk, which stores the window.
@@ -1876,7 +1987,10 @@ mod tests {
             for mask in 0..1u32 << cached.len() {
                 let dirty: SmallVec<[usize; WINDOW]> = cached.iter().enumerate().filter(|(i, _)| mask & 1 << i != 0).map(|(_, &slot)| slot).collect();
                 for unboxed in [0, 0b111, 0b010] {
-                    caches.push(Cache { regs, unboxed: unboxed & occupied(&regs), dirty: dirty.clone() });
+                    let mut cache = Cache::default();
+                    cache.hold(&regs, |reg, _| bit(unboxed, reg));
+                    cache.dirty = dirty.clone();
+                    caches.push(cache);
                 }
             }
         }
@@ -1884,7 +1998,8 @@ mod tests {
             for to in &caches {
                 let mut machine = Machine::default();
                 for &slot in &from.dirty {
-                    machine.current.insert(slot, 1);
+                    let value = machine.fresh();
+                    machine.current.insert(slot, value);
                 }
                 machine.holding(from);
                 let emits = WindowAlloc::entering(from.clone()).transfer(to);
@@ -1914,13 +2029,31 @@ mod tests {
         for steps in [vec![Step::Start(None)], vec![Step::Start(rise())], vec![Step::Start(None), Step::Exit { hot: true, reads: Slots::default() }]] {
             let plan = plan_trace(&steps, WINDOW, &hint, 0);
             assert!(plan.trivial);
-            assert_eq!(plan.windows[0], hint.regs);
+            assert_eq!(plan.windows[0], hint.regs());
             assert_eq!(plan.unboxed[0], hint.unboxed);
             assert_eq!(plan.dirty[0].iter().collect::<Vec<_>>(), vec![2]);
             if steps.len() > 1 {
                 assert_eq!(plan.exits[1].as_ref(), Some(&hint));
             }
         }
+    }
+
+    /// A move renamed: both slots name the value one register holds, each dirty, and the stores
+    /// a snapshot or a flush takes store each of them from that register.
+    #[test]
+    fn renamed_slots_share_a_register() {
+        let mut alloc = WindowAlloc::default();
+        let get = Get::new(&[0, 1]);
+        alloc.op(&Framed::new(&get, 0), [0]).unwrap();
+        let reg = alloc.register_of(1).unwrap();
+        assert!(alloc.rename(1, 2, false).is_empty(), "a rename is no code");
+        assert_eq!(alloc.register_of(2), Some(reg));
+        let mut stores: Vec<(usize, usize)> = alloc.stores().into_iter().map(|emit| match emit {
+            Emit::Store { slot, reg, .. } => (slot, reg),
+            emit => unreachable!("{emit}"),
+        }).collect();
+        stores.sort_unstable();
+        assert_eq!(stores, vec![(1, reg), (2, reg)]);
     }
 
     /// Cycles are broken through the scratch of a half: between general
@@ -1942,8 +2075,8 @@ mod tests {
             assert_eq!(emits.iter().filter(|e| matches!(e, Emit::Move { dst: Loc { reg: SCRATCH, .. }, .. })).count(), 1, "{case:?}");
             let mut machine = Machine::default();
             for reg in 0..WINDOW {
-                machine.regs[reg] = Some((reg, 0));
-                machine.xregs[reg] = Some((reg, 1));
+                machine.regs[reg] = Some(100 + reg as u64);
+                machine.xregs[reg] = Some(200 + reg as u64);
             }
             let before = machine.clone();
             for emit in emits {
@@ -1952,7 +2085,7 @@ mod tests {
             for &(dst, src) in case {
                 let want = match src {
                     Source::Reg(src) => *before.clone().half(src),
-                    Source::Memory(slot) => Some((slot, 0)),
+                    Source::Memory(slot) => Some(slot as u64),
                 };
                 assert_eq!(*machine.half(dst), want, "{case:?}");
             }
