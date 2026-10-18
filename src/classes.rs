@@ -42,10 +42,12 @@ use std::hash::Hash;
 // slot's value. Another frame's view holds an open field as a value, as its cell is still open
 // onto a slot that isn't the other frame's, and a sealed one as a sealed root.
 //
-// The classes are kept in a canonical form, numbered in the order they are first reached from the
-// roots in order and then along fields in label order, with nothing kept that tells nothing. Two
+// The classes are settled into a canonical form, numbered in the order they are first reached from
+// the roots in order and then along fields in label order, with nothing kept that tells nothing. Two
 // contexts knowing the same equalities and facts are then equal and hash equal, as a version's key
-// needs.
+// needs. A change leaves them unsettled, which a query of a place still answers rightly, as it
+// follows only what its root reaches; they are settled once, before they are compared, hashed, or
+// asked what they know as a whole, so the changes compiling an instruction makes cost one.
 //
 // A version relying on what one context knows accepts another (`accepts`) if the other knows at
 // least as much: every two places equal in the first are equal in the other, every fact of a class
@@ -176,9 +178,32 @@ struct Pairs {
     fields: Vec<(usize, Label, PairTarget)>,
 }
 
+/// Whether a change left classes unsettled: settled classes alone compare and hash, and comparing
+/// or hashing unsettled ones panics. See Note [Value classes].
+#[derive(Debug, Clone, Copy)]
+struct Unsettled(bool);
+
+impl PartialEq for Unsettled {
+    fn eq(&self, other: &Self) -> bool {
+        assert!(!self.0 && !other.0, "unsettled classes compared");
+        true
+    }
+}
+
+impl Eq for Unsettled {}
+
+impl std::hash::Hash for Unsettled {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {
+        assert!(!self.0, "unsettled classes hashed");
+    }
+}
+
 /// The classes of a context's places. See Note [Value classes].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Classes<F> {
+    /// First, so that comparing or hashing unsettled classes panics before anything else is
+    /// looked at.
+    unsettled: Unsettled,
     /// Each root a class holds, by root.
     roots: Vec<(Root, u32)>,
     /// Each field a class's value has, by class and label.
@@ -195,7 +220,7 @@ pub struct Classes<F> {
 
 impl<F> Default for Classes<F> {
     fn default() -> Self {
-        Classes { roots: Vec::new(), fields: Vec::new(), facts: Vec::new(), sealed: Vec::new(), uncaptured: Vec::new(), classes: 0 }
+        Classes { roots: Vec::new(), fields: Vec::new(), facts: Vec::new(), sealed: Vec::new(), uncaptured: Vec::new(), classes: 0, unsettled: Unsettled(false) }
     }
 }
 
@@ -318,14 +343,14 @@ impl<F: ClassFact> Classes<F> {
         self.written(dst);
         let class = self.ensure(src);
         self.bind(dst, class);
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// `dst` holds a value nothing is known of.
     pub fn write(&mut self, dst: Root) {
         self.written(dst);
         self.roots.retain(|&(r, _)| r != dst);
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// `dst` is written. See Note [Value classes].
@@ -339,7 +364,7 @@ impl<F: ClassFact> Classes<F> {
     pub fn write_any(&mut self) {
         self.forget_cells();
         self.roots.retain(|&(root, _)| !matches!(root, Root::Slot(_)));
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// Forget each closure's upvalue field that is neither open nor sealed.
@@ -355,7 +380,7 @@ impl<F: ClassFact> Classes<F> {
             && let Target::Class(target) = self.fields[i].2
         {
             self.fields[i].2 = Target::Sealed(target);
-            self.normalize();
+            self.unsettled = Unsettled(true);
         }
     }
 
@@ -375,7 +400,7 @@ impl<F: ClassFact> Classes<F> {
             },
             None => self.facts.push((class, vec![fact])),
         }
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// Nothing is known of `key` of the value `loc` holds.
@@ -386,7 +411,7 @@ impl<F: ClassFact> Classes<F> {
                     facts.retain(|fact| fact.key() != key);
                 }
             }
-            self.normalize();
+            self.unsettled = Unsettled(true);
         }
     }
 
@@ -395,7 +420,7 @@ impl<F: ClassFact> Classes<F> {
         let target = self.ensure(to);
         let class = self.ensure(from);
         self.set_field(class, label, Target::Class(target));
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// The value `from` holds has field `label`, which is slot `slot` while the slot is open.
@@ -405,7 +430,7 @@ impl<F: ClassFact> Classes<F> {
         if let Some(uncaptured) = self.uncaptured.get_mut(slot as usize) {
             *uncaptured = false;
         }
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// The slots from `from` on are closed: a field that was open onto one is a sealed cell
@@ -426,7 +451,7 @@ impl<F: ClassFact> Classes<F> {
                 self.fields[i].2 = if sealed { Target::Sealed(class) } else { Target::Class(class) };
             }
         }
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// Whether `root` is a sealed cell. See Note [Value classes].
@@ -445,7 +470,7 @@ impl<F: ClassFact> Classes<F> {
         let target = self.ensure(to);
         let class = self.ensure(from);
         self.set_field(class, label, Target::Sealed(target));
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// Keep only the facts `keep` says to.
@@ -453,13 +478,13 @@ impl<F: ClassFact> Classes<F> {
         for (_, facts) in &mut self.facts {
             facts.retain(|fact| keep(fact));
         }
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// Keep only the fields `keep` says to.
     pub fn retain_fields(&mut self, mut keep: impl FnMut(Label, Target) -> bool) {
         self.fields.retain(|&(_, label, target)| keep(label, target));
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// The classes another frame sees, its root `r` holding what `loc` does here for each
@@ -474,7 +499,7 @@ impl<F: ClassFact> Classes<F> {
         let mut sealed: Vec<Root> = map.iter().filter(|&&(_, loc)| seen.sealed_field(loc)).map(|&(root, _)| root).collect();
         sealed.sort();
         sealed.dedup();
-        let mut view = Classes { roots, fields: seen.fields, facts: seen.facts, sealed, uncaptured: Vec::new(), classes: seen.classes };
+        let mut view = Classes { roots, fields: seen.fields, facts: seen.facts, sealed, uncaptured: Vec::new(), classes: seen.classes, unsettled: Unsettled(true) };
         view.normalize();
         view
     }
@@ -509,27 +534,30 @@ impl<F: ClassFact> Classes<F> {
                 },
             }
         }
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// Keep only the roots `keep` says to; the others hold values nothing is known of.
     pub fn retain_roots(&mut self, mut keep: impl FnMut(Root) -> bool) {
         self.roots.retain(|&(root, _)| keep(root));
-        self.normalize();
+        self.unsettled = Unsettled(true);
     }
 
     /// Whether a field of a label `of` says is known.
     pub fn has_label(&self, of: impl Fn(Label) -> bool) -> bool {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         self.fields.iter().any(|&(_, label, _)| of(label))
     }
 
     /// The roots something is known of the value of.
     pub fn roots(&self) -> impl Iterator<Item = Root> + '_ {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         self.roots.iter().map(|&(root, _)| root)
     }
 
     /// Whether anything is known of the value `root` holds.
     pub fn has(&self, root: Root) -> bool {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         self.root_class(root).is_some()
     }
 
@@ -545,6 +573,7 @@ impl<F: ClassFact> Classes<F> {
 
     /// Each root holding a value whose field `label` holds what `loc` does, with the label.
     pub fn parents(&self, loc: Loc) -> Vec<(Root, Label)> {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         let Some(class) = self.find(loc) else { return Vec::new() };
         self.fields.iter()
             .filter(|&&(_, _, target)| self.target_class(target) == Some(class))
@@ -560,11 +589,13 @@ impl<F: ClassFact> Classes<F> {
 
     /// Every fact known, of every class.
     pub fn all_facts(&self) -> impl Iterator<Item = &F> {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         self.facts.iter().flat_map(|(_, facts)| facts.iter())
     }
 
     /// The slots an open field is, in order.
     pub fn open_slots(&self) -> Vec<u16> {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         let mut slots: Vec<u16> = self.fields.iter().filter_map(|&(_, _, t)| match t {
             Target::Open(slot) => Some(slot),
             Target::Class(_) | Target::Sealed(_) => None,
@@ -578,12 +609,13 @@ impl<F: ClassFact> Classes<F> {
     pub fn unlink(&mut self, loc: Loc, label: Label) {
         if let Some(class) = self.find(loc) {
             self.fields.retain(|&(c, l, _)| c != class || l != label);
-            self.normalize();
+            self.unsettled = Unsettled(true);
         }
     }
 
     /// Each root with each fact of the value it holds.
     pub fn rooted(&self) -> impl Iterator<Item = (Root, &F)> {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         self.roots.iter().flat_map(move |&(root, class)| {
             self.facts.iter().filter(move |(c, _)| *c == class).flat_map(move |(_, facts)| facts.iter().map(move |fact| (root, fact)))
         })
@@ -592,6 +624,7 @@ impl<F: ClassFact> Classes<F> {
     /// Change each fact in place, given the roots holding its value; what tells it apart (`Eq`)
     /// must stay as it was.
     pub fn for_each_fact_mut(&mut self, mut f: impl FnMut(&[Root], &mut F)) {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         for (class, facts) in &mut self.facts {
             let members: Vec<Root> = self.roots.iter().filter(|&&(_, c)| c == *class).map(|&(r, _)| r).collect();
             for fact in facts {
@@ -602,22 +635,26 @@ impl<F: ClassFact> Classes<F> {
 
     /// How much is known: each root's facts, and each equality and field.
     pub fn size(&self) -> usize {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         self.rooted().count() + self.roots.len() + self.fields.len()
     }
 
     /// Whether nothing is known.
     pub fn is_empty(&self) -> bool {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         self.roots.is_empty()
     }
 
     /// How many roots hold a value with a fact of `key`.
     pub fn count(&self, key: F::Key) -> usize {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         self.rooted().filter(|(_, fact)| fact.key() == key).count()
     }
 
     /// How many equalities and fields are known: each root holding a value another place holds,
     /// and each field.
     pub fn equalities(&self) -> usize {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         let shared = self.roots.iter().filter(|&&(root, class)| {
             self.roots.iter().any(|&(other, c)| c == class && other != root) || self.fields.iter().any(|&(_, _, t)| t.closed() == Some(class))
         }).count();
@@ -626,11 +663,13 @@ impl<F: ClassFact> Classes<F> {
 
     /// Whether any key's facts are known.
     pub fn knows(&self, key: F::Key) -> bool {
+        assert!(!self.unsettled.0, "unsettled classes asked what they know as a whole");
         self.facts.iter().any(|(_, facts)| facts.iter().any(|fact| fact.key() == key))
     }
 
     /// What both `self` and `other` know.
     pub fn join(&self, other: &Self) -> Self {
+        assert!(!self.unsettled.0 && !other.unsettled.0, "unsettled classes asked what they know as a whole");
         let mut joined = Classes::default();
         let mut pairs: HashMap<(u32, u32), u32> = HashMap::new();
         let mut work: Vec<(u32, u32, u32)> = Vec::new();
@@ -676,6 +715,7 @@ impl<F: ClassFact> Classes<F> {
     /// Whether code relying on what `self` knows can run in `other`: `other` knows at least as
     /// much.
     pub fn accepts(&self, other: &Self) -> bool {
+        assert!(!self.unsettled.0 && !other.unsettled.0, "unsettled classes asked what they know as a whole");
         if (0..self.uncaptured.len() as u16).any(|slot| self.is_uncaptured(slot) && !other.is_uncaptured(slot)) {
             return false;
         }
@@ -728,6 +768,7 @@ impl<F: ClassFact> Classes<F> {
     /// pair too, so places equal here and in `above` through it stay equal. See Note [Value
     /// classes].
     fn pairs(&self, above: &Self) -> Pairs {
+        assert!(!self.unsettled.0 && !above.unsettled.0, "unsettled classes asked what they know as a whole");
         let mut index: HashMap<(Mine, Side), usize> = HashMap::new();
         let mut pairs: Vec<(Mine, Side)> = Vec::new();
         let mut intern = |pairs: &mut Vec<(Mine, Side)>, pair: (Mine, Side)| *index.entry(pair).or_insert_with(|| {
@@ -838,6 +879,7 @@ impl<F: ClassFact> Classes<F> {
             sealed: self.sealed.iter().filter(|root| above.sealed(**root)).copied().collect(),
             uncaptured: self.uncaptured.iter().zip(&above.uncaptured).map(|(&a, &b)| a && b).collect(),
             classes: pairs.pairs.len() as u32,
+            unsettled: Unsettled(true),
         };
         for (pair, &(mine, _)) in pairs.pairs.iter().enumerate() {
             let Mine::Class(class) = mine else { continue };
@@ -847,6 +889,18 @@ impl<F: ClassFact> Classes<F> {
         }
         lowered.normalize();
         *self = lowered;
+    }
+
+    /// Settle them, if a change left them unsettled. See Note [Value classes].
+    pub fn settle(&mut self) {
+        if self.unsettled.0 {
+            self.normalize();
+        }
+    }
+
+    /// Whether a change left them unsettled. See Note [Value classes].
+    pub fn unsettled(&self) -> bool {
+        self.unsettled.0
     }
 
     /// Forget what tells nothing and what nothing reaches, and number the classes in the order
@@ -928,6 +982,7 @@ impl<F: ClassFact> Classes<F> {
             .collect();
         self.facts.sort_by_key(|&(class, _)| class);
         self.classes = order.len() as u32;
+        self.unsettled = Unsettled(false);
     }
 }
 
@@ -1215,6 +1270,7 @@ mod tests {
         for _ in 0..steps {
             step(rng, &mut c, &mut r);
         }
+        c.settle();
         (c, r)
     }
 
@@ -1294,6 +1350,7 @@ mod tests {
             }
         }
         c.uncaptured = r.uncaptured.clone();
+        c.settle();
         c
     }
 
@@ -1317,6 +1374,7 @@ mod tests {
             for root in ROOTS {
                 c.write(root);
             }
+            c.settle();
             // Writes leave which slots are uncaptured as it was.
             let mut fresh = frame();
             fresh.uncaptured = c.uncaptured.clone();
@@ -1408,6 +1466,8 @@ mod tests {
         sealed.close(2);
         let mut open = frame();
         open.link(slot(0), Label::Upvalue(0), slot(2));
+        sealed.settle();
+        open.settle();
         assert!(open.accepts(&sealed), "code relying on less runs where the cell is sealed");
         assert!(!sealed.accepts(&open), "code relying on the seal needs it");
         let joined = sealed.join(&open);
@@ -1473,10 +1533,12 @@ mod tests {
             if !(0..8).any(|_| add(&mut rng, &mut b)) {
                 continue;
             }
+            b.settle();
             assert!(a.accepts(&b), "{a:?} doesn't accept more, {b:?}");
             assert!(!b.accepts(&a), "{b:?} accepts less, {a:?}");
             let mut c = b.clone();
             if (0..8).any(|_| add(&mut rng, &mut c)) {
+                c.settle();
                 assert!(a.accepts(&c), "accepting isn't transitive: {a:?}, {b:?}, {c:?}");
             }
         }
@@ -1490,6 +1552,7 @@ mod tests {
         let mut captured = frame();
         captured.alias(slot(0), Label::Upvalue(0), 3);
         captured.write(Root::Slot(0));
+        captured.settle();
         assert!(free.is_uncaptured(3) && !captured.is_uncaptured(3));
         assert!(!free.join(&captured).is_uncaptured(3));
         assert!(captured.accepts(&free));
@@ -1525,11 +1588,14 @@ mod tests {
             let key = rng.below(2) as u8;
             let mut lowered = before.clone();
             lowered.lower_facts(key, &above);
+            lowered.settle();
             let mut again = lowered.clone();
             again.lower_facts(key, &above);
+            again.settle();
             assert_eq!(again, lowered, "lowering twice is lowering once");
             let mut towards_itself = before.clone();
             towards_itself.lower_facts(key, &before);
+            towards_itself.settle();
             assert_eq!(towards_itself, before, "lowering towards itself forgets nothing");
             for (root, path) in &places {
                 let at = Loc { root: *root, path };

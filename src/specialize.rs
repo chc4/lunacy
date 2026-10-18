@@ -493,6 +493,26 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 }
 
 
+/// Settle what `ctx` knows, copying it only if a change left it unsettled. See Note [Value
+/// classes].
+fn settle(ctx: &mut Rc<Context>) {
+    if ctx.values.unsettled() {
+        Rc::make_mut(ctx).values.settle();
+    }
+}
+
+/// Whether what a generator yielded only changes the context, or asks of a place, so its context
+/// can stay unsettled. See Note [Value classes].
+fn changes_only(state: &CoroutineState<YieldOp, ResumeArg>) -> bool {
+    match state {
+        CoroutineState::Yielded(YieldOp::Exec(func)) => !func.frame,
+        CoroutineState::Yielded(YieldOp::ExecWindow(w)) => !w.closure(),
+        CoroutineState::Yielded(op) => matches!(op, YieldOp::Emit(_) | YieldOp::Effect(_) | YieldOp::SetTypes(_)
+            | YieldOp::SetCTypes(_) | YieldOp::Copy(..) | YieldOp::Clobber(_) | YieldOp::Created(_) | YieldOp::Quotient(..)),
+        CoroutineState::Complete(_) => false,
+    }
+}
+
 /// Where compiling an instruction went on to, if it went on: the next instruction, in what context,
 /// what its generator returned, and the block it goes on in.
 pub type Compiled = Option<(Pc, Rc<Context>, ResumeArg, BlockId)>;
@@ -1490,7 +1510,7 @@ fn name_hash(name: &[u8]) -> u64 {
 // back from what is known of it.
 
 /// Where a Lua call's returns go on, and how the code after it is compiled: as
-/// `make_continuation_thunk` takes it. See Note [Watched tables].
+/// `make_continuation_thunk` takes it, its context settled. See Note [Watched tables].
 #[derive(Clone)]
 struct ContinuationSite {
     ctx: Rc<Context>,
@@ -1820,6 +1840,7 @@ fn before_call(owner: &mut Owner, ctx: &Context, captured: &[usize], a: usize) -
     let frame = (a..before.types.len()).map(|idx| (idx, CType::Unknown)).collect();
     before.set_types(owner, frame);
     let captured: Rc<[usize]> = captured.iter().copied().filter(|&slot| slot < a).collect();
+    before.values.settle();
     (Rc::new(before), captured)
 }
 
@@ -1912,6 +1933,7 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
         }
     }
     entry.inline = caller.inline.iter().cloned().chain([frame]).collect();
+    entry.values.settle();
     entry
 }
 /// The context a call in `caller`, of R(A) with operand B, enters the callee
@@ -1933,6 +1955,7 @@ fn entry_context<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>
             }
         };
     }
+    entry.values.settle();
     entry
 }
 
@@ -2914,6 +2937,7 @@ pub mod conservative {
             let inline = known.inline.clone();
             known.effect(effect);
             known.inline = inline;
+            known.values.settle();
         }
         ctx
     }
@@ -3098,7 +3122,8 @@ impl Context {
     /// The context with its free hash key indexes all alike, and none past its last hash key:
     /// contexts knowing the same hash keys are then equal, whatever was at their free indexes
     /// before. See Note [Version compatibility].
-    fn canonical_free(ctx: Rc<Context>) -> Rc<Context> {
+    fn canonical_free(mut ctx: Rc<Context>) -> Rc<Context> {
+        settle(&mut ctx);
         if ctx.free_canonical() {
             return ctx;
         }
@@ -3518,6 +3543,7 @@ impl Context {
         for (root, fact) in &rooted {
             rest.forget(Loc::root(*root), fact.key());
         }
+        rest.settle();
         KEYS.iter().all(|&key| {
             let mut lowered = rest.clone();
             lowered.lower_facts(key, &other.values);
@@ -4043,7 +4069,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Create a new block at a Lua bytecode PC
-    pub fn block(&mut self, owner: &mut Owner, entry: Pc, ctx: Rc<Context>) -> BlockId {
+    pub fn block(&mut self, owner: &mut Owner, entry: Pc, mut ctx: Rc<Context>) -> BlockId {
+        settle(&mut ctx);
         let mut pc = entry;
 
         let block_id = self.new_block(entry);
@@ -4127,7 +4154,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// fragile facts; `new`, compiled, under `MAX_VERSIONS`; `accepting`, one
     /// accepting it; `joined`, one accepting the join of it and every version;
     /// `joined-new`, that join compiled.
-    fn choose_version(&mut self, owner: &mut Owner, pc: Pc, ctx: Rc<Context>) -> (BlockId, &'static str, Option<Rc<Context>>) {
+    fn choose_version(&mut self, owner: &mut Owner, pc: Pc, mut ctx: Rc<Context>) -> (BlockId, &'static str, Option<Rc<Context>>) {
+        settle(&mut ctx);
         let subpc = SubPc::new(pc);
         // A sealed call past its budget makes no new inlined version, and revives no dead one. See
         // Note [Sealed inlined calls].
@@ -4472,6 +4500,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         for &(root, key) in &conflicting {
             lowered.values.forget(Loc::root(root), key);
         }
+        lowered.values.settle();
         Rc::new(lowered)
     }
 
@@ -4816,7 +4845,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The version of `pc` for exactly `ctx`, if there is one.
     pub fn find(&mut self, owner: &mut Owner, pc: SubPc, ctx: &Rc<Context>) -> Option<BlockId>
     {
-        self.versions.get(&self.proto).unwrap().get(&(pc, ctx.clone())).cloned()
+        let mut ctx = ctx.clone();
+        settle(&mut ctx);
+        self.versions.get(&self.proto).unwrap().get(&(pc, ctx)).cloned()
     }
 
     /// Make the frames of the inlined calls code in `ctx` is in that aren't, ending `block`: the
@@ -4825,6 +4856,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// Make the frames of the inlined calls `ctx` is in, before a residual observing them, `by`.
     /// See Note [Inlined frames].
     fn observe(&mut self, owner: &Owner, block: &mut BlockId, ctx: &mut Rc<Context>, pc: Pc, by: &str) {
+        settle(ctx);
         if ctx.inline.iter().all(|frame| frame.made == Made::Yes) {
             return;
         }
@@ -4870,6 +4902,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     pub fn compile(&mut self, owner: &mut Owner, mut pc: Pc, mut ctx: Rc<Context>, mut block_id: BlockId) -> Rc<Context> {
         debug_assert_eq!(ctx.types.len(), unsafe { (*self.proto).max_stack } as usize, "a context of another function's frame");
         loop {
+            // Each instruction starts from what the last one left, settled. See Note [Value
+            // classes].
+            settle(&mut ctx);
             let inst = unsafe { self.proto.as_ref().unwrap().instructions.items[pc].clone() };
             // Only a call uses the top the instruction before left. See Note [Known top].
             if ctx.top.is_some() && !matches!(inst.0.Opcode(), Opcode::CALL | Opcode::TAILCALL) {
@@ -5144,6 +5179,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let live = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(pc).unwrap_or(usize::MAX);
         let mut jumping = ctx.clone();
         forget_dead(owner, &mut jumping, live, None);
+        jumping.values.settle();
         // A jump may keep a register it wrote (`GetBlockKeeping`).
         assert!(entered.accepts(&jumping) || entered.accepts(ctx), "a jump in {} to a version for {}", jumping.tostring(owner), entered.tostring(owner));
         target
@@ -5170,6 +5206,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// `jumping`, keeping what is known of register `kept`, which the jumping instruction wrote.
     /// See Note [Jumped-to contexts].
     fn jumping_keeping(&self, owner: &mut Owner, mut ctx: Rc<Context>, dest_pc: Pc, kept: Option<usize>) -> Rc<Context> {
+        settle(&mut ctx);
         let in_scope = unsafe { self.proto.as_ref().unwrap() }.locals_in_scope(dest_pc);
         if let Some(in_scope) = in_scope.filter(|&in_scope| forgets(&ctx, in_scope)) {
             forget_dead(owner, Rc::make_mut(&mut ctx), in_scope, kept);
@@ -5238,7 +5275,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// The thunk a `GuardDynamic` yield ends its block in. See Note [Dynamic guards].
-    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, test: Rc<dyn Window>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_dynamic_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, test: Rc<dyn Window>, pc: SubPc, mut thunk_ctx: Rc<Context>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             test.interp(owner, state);
             let passed = state.select == 1;
@@ -5268,7 +5307,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `Promote` of `slot` ends its block in: forced, it guards the
     /// slot equal to the integer it holds, and continues past the guard with
     /// that value promoted, the guard's other way promoting again. See Note [Promoted values].
-    fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_promote_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, mut thunk_ctx: Rc<Context>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Integer(value) = state.vals[state.base + slot].unbox() else { unreachable!("a promote's argument is an integer") };
             if !vm.promotes(pc.0, value) {
@@ -5294,7 +5335,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// place when first taken. See Note [Dynamic guards].
     /// The thunk a `Narrow` of `slot`, a double, ends its block in. See Note
     /// [Narrowing].
-    fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_narrow_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, mut thunk_ctx: Rc<Context>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let value = state.vals[state.base + slot];
             let whole = value.representation() == LType::Double && value.as_number().is_some_and(crate::lboxed::is_integer);
@@ -5400,7 +5443,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk an optimistic integer op's `Encoding` ends its block in: forced, it lays out the
     /// op as the integer one, from an origin its first overflow rebuilds it from, if its result
     /// fits for its operands' values, and else as the double one. See Note [Optimistic ops].
-    fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
+    fn make_encoding_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, mut thunk_ctx: Rc<Context>, fits: Fits) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let at = vm.reopen(block_id, thunk_pc, pc.0, true);
             let fit = (fits.0)(state);
@@ -5426,7 +5471,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// An optimistic op's cold way, as `make_side_thunk`'s, which the first time it's taken also
     /// queues where the op's encoding was asked, if anywhere, to be rebuilt computing it in the
     /// double encoding. See Note [Optimistic ops].
-    fn make_overflow_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, asked: Option<Origin>) -> ThunkRef {
+    fn make_overflow_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, mut thunk_ctx: Rc<Context>, asked: Option<Origin>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Failed);
             vm.jump_thunk(block_id, thunk_pc, side);
@@ -5441,7 +5488,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })))
     }
 
-    fn make_learn_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_learn_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, mut thunk_ctx: Rc<Context>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table") };
             let mut keys: Vec<LConstant<'static, 'static>> = tab.ro(owner).hash.keys().filter_map(|key| match key.boxed().unbox() {
@@ -5461,7 +5510,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `LearnKind` of `slot` ends its block in: forced on a table whose array part is of
     /// one kind, a guard of it, past which the context knows it; else the code after it, knowing
     /// nothing more. See `jit.learn` in `library`.
-    fn make_learn_kind_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_learn_kind_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, mut thunk_ctx: Rc<Context>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let LValue::Table(tab) = state.vals[state.base + slot].unbox() else { unreachable!("jit.learn of a table's field") };
             let kind = tab.ro(owner).kind;
@@ -5553,7 +5604,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// if `watches`, it is one of the table's watch sites, the code after it knowing the table is
     /// still watched; else, as the site a trip puts back, the code after it knowing nothing. See
     /// Note [Watched tables].
-    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, thunk_ctx: Rc<Context>, watches: bool, freezes: bool) -> ThunkRef {
+    fn make_watch_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, pc: SubPc, mut thunk_ctx: Rc<Context>, watches: bool, freezes: bool) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let boxed = state.vals[state.base + slot];
             let LValue::Table(tab) = boxed.unbox() else { unreachable!("a watch site of a table") };
@@ -5622,7 +5675,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Some(ResumeArg::Element(element.bits(), value.ctypeof_(owner), constant))
     }
 
-    fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
+    fn make_side_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, mut thunk_ctx: Rc<Context>, arg: ResumeArg) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let side = vm.subblock(owner, pc, thunk_ctx.clone(), thunk_coro.clone(), arg.clone());
             vm.jump_thunk(block_id, thunk_pc, side);
@@ -5632,7 +5687,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk a `Versions` ends its block in: forced, it lays out the code after with the
     /// count, at a point of its own: at the call's, the version found would be the one the
     /// thunk is in. See `jit.versions` in `library`.
-    fn make_versions_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, thunk_ctx: Rc<Context>) -> ThunkRef {
+    fn make_versions_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, pc: SubPc, mut thunk_ctx: Rc<Context>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let count = vm.versions_entering(owner, block_id);
             let rest = vm.subblock(owner, pc.next_true(), thunk_ctx.clone(), thunk_coro.clone(), ResumeArg::Integer(count as i32));
@@ -5686,6 +5743,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// thunks this one is in guards `identities` of them already, `MAX_VERSIONS`
     /// (Note [Call sites]).
     fn make_discovery_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, expected: CType, field: Option<HashRef>, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, identities: usize) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
 
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // Each forcing stitches the thunk where it was forced, in `block_id`: one
@@ -5819,7 +5878,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk an inlined callee's RETURN A B ends its block in: run, it lays out the return to
     /// the code after the call its frame's entry continues, and a jump to it. See Note [Inlined
     /// calls].
-    fn make_inline_return_thunk(&self, block_id: BlockId, ctx: Rc<Context>, a: usize, b: u16, closes: bool) -> ThunkRef {
+    fn make_inline_return_thunk(&self, block_id: BlockId, mut ctx: Rc<Context>, a: usize, b: u16, closes: bool) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let Some(&CallstackEntry { ret: Return::Inlined(continuation), .. }) = state.callstack.last() else {
                 unreachable!("an inlined call's return outside its frame")
@@ -6011,6 +6072,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 };
             }
         }
+        known.values.settle();
         (known, effects)
     }
 
@@ -6067,7 +6129,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         (block, made, continuation, after)
     }
 
-    fn make_call_thunk(&self, block_id: BlockId, calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_call_thunk(&self, block_id: BlockId, mut calling: Rc<Context>, pc: SubPc, a: usize, b: usize, c: usize, after: After, continuation: Option<(Rc<Context>, Rc<[usize]>, Rest)>, identities: usize, appends: bool) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut calling);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let block = vm.reopen(block_id, thunk_pc, vm.blocks[block_id.0].pc, appends);
             // Any call but one inlined observes the frames of the inlined calls it is in, made
@@ -6119,7 +6183,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         let call = InlineCall { block, off, pc, callee: proto as LProto<'static, 'static>, calling: calling.clone(), b };
                         layout.push(Residual::Thunk(vm.make_continuation_thunk(block, ctx.clone(), captured.clone(), rest.clone(), a, c, after.clone(), Some(Rc::new(call)), 0, true)));
                         // Where its returns go on. See Note [Watched tables].
-                        vm.continuation_sites.insert(Location(block, off + 1), ContinuationSite { ctx: ctx.clone(), captured: captured.clone(), rest: rest.clone(), a, c, after: after.clone() });
+                        vm.continuation_sites.insert(Location(block, off + 1), ContinuationSite { ctx: { let mut ctx = ctx.clone(); settle(&mut ctx); ctx }, captured: captured.clone(), rest: rest.clone(), a, c, after: after.clone() });
                         vm.blocks[block.0].instructions.extend(layout);
                         return;
                     }
@@ -6538,6 +6602,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let off = self.blocks[block.0].instructions.len();
         let thunk = self.make_continuation_thunk(block, caller.clone(), captured.clone(), rest.clone(), a, c, after.clone(), None, 0, true);
         self.blocks[block.0].instructions.push(Residual::Thunk(thunk));
+        let mut caller = caller;
+        settle(&mut caller);
         self.continuation_sites.insert(Location(block, off), ContinuationSite { ctx: caller, captured, rest, a, c, after });
         block
     }
@@ -6585,7 +6651,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The block an inlined call of R(A) with B, of `callee`, made in `block`, moves to the
     /// callee's frame in, then goes on to its version for `entry`, its returns continuing
     /// `continuation`. See Note [Inlined calls].
-    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, entry: Context, continuation: Continuation) -> BlockId {
+    fn inline_call(&mut self, owner: &mut Owner, state: &mut RunState<'_, '_>, block: BlockId, callee: LProto<'static, 'static>, a: usize, b: usize, mut entry: Context, continuation: Continuation) -> BlockId {
+        entry.values.settle();
         // The outermost function's frame holds the callee's.
         let outermost = entry.inline.first().expect("an inlined call's frame").proto;
         if unsafe { (*outermost).frame_size.grow(inline_offset(&entry) + (*callee).max_stack as usize) } {
@@ -6651,7 +6718,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// (`identities`). Past that, or for a return that doesn't know what it
     /// returns, the results, and `after` (as `After::block`). See Notes [Call continuations] and
     /// [Call effects].
-    fn make_continuation_thunk(&self, block_id: BlockId, ctx: Rc<Context>, captured: Rc<[usize]>, rest: Rest, a: usize, c: usize, after: After, inline: Option<Rc<InlineCall>>, identities: usize, appends: bool) -> ThunkRef {
+    fn make_continuation_thunk(&self, block_id: BlockId, mut ctx: Rc<Context>, captured: Rc<[usize]>, rest: Rest, a: usize, c: usize, after: After, inline: Option<Rc<InlineCall>>, identities: usize, appends: bool) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // The call it continues, laid out just before it, inlined from now on: this return,
             // from its frame, continues as any other. See Note [Inlined calls].
@@ -6836,7 +6905,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// nil, in a table whose metatable has an `__index` table goes on down the chain; any other key
     /// a load can't find, or a store's table lacks, continues the generator without it, in
     /// `fail_ctx`. See Notes [Field types] and [Table metatables].
-    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, pc: SubPc, thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
+    fn make_href_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, chains: bool, next: Option<HashRef>, mut fail_ctx: Rc<Context>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
+        settle(&mut fail_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             // Each forcing stitches the thunk where it was forced, in `block_id`.
             let mut block_id = block_id;
@@ -6985,7 +7057,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// The thunk finding `href`'s field's type, in `block`, and guarding that (`guard_witness`):
     /// a guard's failure, or a guard rebuilt from an origin. A load's field found nil, or an
     /// `__index`'s hash key, is found again instead. See Note [Field types].
-    fn make_field_guard_thunk(&self, block: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, pc: SubPc, ctx: Rc<Context>, chains: bool, next: Option<HashRef>, fail_ctx: Rc<Context>) -> ThunkRef {
+    fn make_field_guard_thunk(&self, block: BlockId, thunk_coro: Box<dyn NativeGen>, idx: usize, href: HashRef, pc: SubPc, mut ctx: Rc<Context>, chains: bool, next: Option<HashRef>, mut fail_ctx: Rc<Context>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut ctx);
+        settle(&mut fail_ctx);
         ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
             let found = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() }.unbox().typeof_();
@@ -7063,6 +7138,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             #[cfg(feature = "conservative_information")]
             if matches!(state, CoroutineState::Yielded(_)) {
                 conservative::tick();
+            }
+            // See Note [Value classes].
+            if !changes_only(&state) {
+                settle(&mut ctx);
             }
             match state {
                 CoroutineState::Yielded(YieldOp::TypeofK(k)) => {
@@ -7754,6 +7833,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // native's call have no effects. See Note [Library natives].
                             let mut result = None;
                             let mut pure = false;
+                            settle(&mut ctx);
                             let calling = ctx.clone();
                             // A protected call's is laid out by the call thunk, which
                             // needs a continuation for it to unwind to. See Note [Errors].
@@ -8811,6 +8891,7 @@ mod sealed_tests {
         ctx.values.assign(Root::Arg(0), slot(1));
         ctx.values.learn(Loc::root(Root::Outer(1)), Known::Type(CType::Type(LType::Closure)));
         ctx.values.learn(Loc::root(Root::Global(7)), Known::Type(CType::Type(LType::Table)));
+        ctx.values.settle();
 
         // The destination knows the third key at 0 and the first at 1, but not the second.
         let wanted = [hkey(0, 3.0), hkey(0, 1.0)];
