@@ -2369,18 +2369,22 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // dropped as a contraction is. An origin needn't introduce a fact: an integer op is rebuilt to compute in the
 // double encoding once its result doesn't fit (Note [Optimistic ops]).
 //
-// Rebuilding replaces code, and the blocks only that code reached are then unreachable: nothing
-// that runs (the code running, a frame returning, a handler, a rebuilt block) reaches them. JIT code is entered only
+// Rebuilding replaces code, and the blocks only that code reached are then unreachable: no other
+// code jumps to them, and nothing that runs (the code running, a frame returning, a handler)
+// reaches them. JIT code is entered only
 // as its block is, so it keeps alive only what it reaches when its block is reached. Versions are
 // no roots, as only code that runs finds one again: versions reaching each other, as a caller's and
 // the callee's it calls, are reached or not together. An unreachable one is forgotten, as a
 // contraction's are, once its point has all the versions it can have and needs the room for one
 // more, the oldest first, one for each new version: until then a path reaching one again, as a
 // thunk forced into code that finds it, takes it as it is, with its JIT code. A peel makes its
-// versions in the order it learns its facts, so the newest knows the most. What the replaced code
-// reached that only what is running reaches (the code running, a frame returning, a handler) may
-// stop being reached as soon as it moves on, so it is checked again each time a thunk is forced,
-// until nothing that runs reaches it.
+// versions in the order it learns its facts, so the newest knows the most.
+//
+// Edges are removed only by rebuilding. So a block of the replaced code that other code jumps to
+// stays reached until a later rebuild cuts that code off, whose replaced code reaches the block
+// again. One only what is running reaches gains no edge but from a lookup finding its version, and
+// may stop being reached as soon as what runs moves on, so it is checked again each time a thunk is
+// forced, from what is running alone, until nothing reaches it.
 //
 // An origin's rebuild is kept for its point in the function: code compiled there again, as a
 // rebuild of an origin before it in the same code compiles it again, takes the same answer
@@ -3906,8 +3910,6 @@ pub struct Specializer<'src, 'intern> {
     /// The targets of the code each rebuild replaced, whose blocks only it reaches are yet to be
     /// forgotten. See Note [Contraction].
     trimming: Vec<Vec<BlockId>>,
-    /// The rebuilt blocks. See Note [Contraction].
-    rebuilt: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>,
     /// The blocks code rebuilds replaced reached that only what is running still reaches. See Note
     /// [Contraction].
     deferred: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>,
@@ -3968,7 +3970,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             cuts: Default::default(),
             rebuilding: Default::default(),
             trimming: Vec::new(),
-            rebuilt: Default::default(),
             deferred: Default::default(),
             decided: Default::default(),
             promoted: Default::default(),
@@ -4147,14 +4148,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let versions = self.versions.get(&self.proto).unwrap();
         if let Some(((_, ectx), &exists)) = versions.get_key_value(&(subpc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
-            self.unreachable.remove(&exists);
+            self.found(exists);
             return (exists, "exact", None);
         }
         let ctx = self.contractible(owner, subpc, ctx);
         let versions = self.versions.get(&self.proto).unwrap();
         if let Some(((_, ectx), &exists)) = versions.get_key_value(&(subpc, ctx.clone())) {
             ectx.clone().adopt(owner, &ctx);
-            self.unreachable.remove(&exists);
+            self.found(exists);
             return (exists, "exact", None);
         }
         if self.versions_at(owner, subpc, &ctx) >= MAX_VERSIONS {
@@ -4168,7 +4169,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 .map(|((_, ectx), block)| (ectx.clone(), *block));
             if let Some((ectx, block)) = nearest {
                 ectx.adopt(owner, &ctx);
-                self.unreachable.remove(&block);
+                self.found(block);
                 return (block, "accepting", None);
             }
             self.evict(owner, subpc, &ctx);
@@ -4217,7 +4218,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // The nearest version knowing the same, if one accepts it.
             if let Some((ectx, block)) = compatible.iter().filter(|(ectx, _)| ectx.values == lowered.values && ectx.accepts(&lowered)).min_by_key(|(ectx, block)| (ectx.distance(&lowered), block.0)) {
                 ectx.adopt(owner, &lowered);
-                self.unreachable.remove(block);
+                self.found(*block);
                 return (*block, "fragile", None);
             }
             Rc::new(lowered)
@@ -4234,7 +4235,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         };
         if let Some((ectx, block)) = accepting(&ctx) {
             ectx.adopt(owner, &ctx);
-            self.unreachable.remove(&block);
+            self.found(block);
             return (block, "accepting", None);
         }
         let mut joined = (*ctx).clone();
@@ -4245,7 +4246,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.contract_joined(owner, subpc, &existing, &joined);
         if let Some((ectx, block)) = accepting(&joined) {
             ectx.adopt(owner, &joined);
-            self.unreachable.remove(&block);
+            self.found(block);
             return (block, "joined", Some(joined));
         }
         if existing.len() >= HARD_MAX_VERSIONS {
@@ -4257,6 +4258,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// How many versions the running function has at `pc` at the same point as `ctx`: for its
     /// inlined call, or for its calls, past its promoted values. See Notes [Inlined calls] and [Promoted
     /// values].
+    /// A lookup found `block`'s version: code jumps to it again. See Note [Contraction].
+    fn found(&mut self, block: BlockId) {
+        self.unreachable.remove(&block);
+        self.deferred.remove(&block);
+    }
+
     fn versions_at(&self, owner: &Owner, pc: SubPc, ctx: &Context) -> usize {
         self.versions.get(&self.proto).map_or(0, |versions| versions.keys().filter(|(at, ectx)| *at == pc && ectx.same_point(ctx)).count())
     }
@@ -4556,7 +4563,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             for origin in live {
                 let (block, offset) = (owner.ro(&origin).block, owner.ro(&origin).offset);
                 self.trimming.push(Self::targets(&self.blocks[block.0].instructions[offset..]).collect());
-                self.rebuilt.insert(block);
                 self.decided.entry(proto).or_default().insert(owner.ro(&origin).pc, how.clone());
                 let rebuild = owner.rw(&origin).rebuild.take().unwrap();
                 rebuild(self, owner, how.clone());
@@ -4593,10 +4599,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     }
 
     /// Forget the versions of the blocks only code rebuilds replaced reached, which nothing that runs
-    /// reaches any more. Those only what is running reaches (the code running, a frame returning, a
-    /// protected call's handler) are deferred, to check again at the next. A block's JIT code keeps
-    /// alive only what it reaches when it is reached itself: every way into JIT code is an edge of
-    /// the blocks. See Note [Contraction].
+    /// reaches any more, and defer those only what is running reaches, to check again at the next.
+    /// A block's JIT code keeps alive only what it reaches when it is reached itself: every way into
+    /// JIT code is an edge of the blocks. See Note [Contraction].
     fn trim(&mut self, owner: &Owner, state: &RunState<'src, 'intern>, at: Location) {
         type Blocks = std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>;
         // Where what runs goes on from: the code running and a frame returning from where they are.
@@ -4604,40 +4609,50 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .chain(state.callstack.iter().filter_map(|entry| entry.returns_to()).map(|ret| (ret.0, ret.1)))
             .chain(state.handlers.iter().map(|handler| (handler.after, 0)))
             .collect();
-        // The deferred blocks, and what the code rebuilds replaced since reached.
-        let mut reached = std::mem::take(&mut self.deferred);
+        // What the code rebuilds replaced since reached.
+        let mut reached = Blocks::default();
         let mut work: Vec<BlockId> = std::mem::take(&mut self.trimming).into_iter().flatten().collect();
-        let mut walked = Blocks::default();
         while let Some(block) = work.pop() {
-            if walked.insert(block) {
-                reached.insert(block);
+            if reached.insert(block) {
                 work.extend(Self::targets(&self.blocks[block.0].instructions));
             }
         }
+        // Of it, what code outside it jumps to, and what that reaches, stays: only a later rebuild
+        // can cut it off, whose replaced code reaches it again.
+        if !reached.is_empty() {
+            let mut work: Vec<BlockId> = (0..self.blocks.len()).map(BlockId)
+                .filter(|block| !reached.contains(block))
+                .flat_map(|block| Self::targets(self.runnable(block, 0)).filter(|target| reached.contains(target)).collect::<Vec<_>>())
+                .collect();
+            let mut entered = Blocks::default();
+            while let Some(block) = work.pop() {
+                if entered.insert(block) {
+                    work.extend(Self::targets(self.runnable(block, 0)).filter(|target| reached.contains(target)));
+                }
+            }
+            reached.retain(|block| !entered.contains(block));
+        }
+        reached.extend(std::mem::take(&mut self.deferred));
         if reached.is_empty() {
             return;
         }
-        // What the rebuilt blocks reach, then what only what is running does, entering each block
-        // where it does (`runnable`).
+        // No other code jumps into what is left, so what is running reaches of it only from the
+        // blocks it runs in, entering each where it does (`runnable`).
+        let mut deferred = Blocks::default();
         let mut entered: std::collections::HashSet<(BlockId, usize), rustc_hash::FxBuildHasher> = Default::default();
-        let mut live_from = |roots: &mut dyn Iterator<Item = (BlockId, usize)>| {
-            let mut live = Blocks::default();
-            let mut work: Vec<(BlockId, usize)> = roots.collect();
-            while let Some((block, from)) = work.pop() {
-                if entered.insert((block, from)) {
-                    live.insert(block);
-                    work.extend(Self::targets(self.runnable(block, from)).map(|target| (target, 0)));
+        let mut work = running.clone();
+        while let Some((block, from)) = work.pop() {
+            if entered.insert((block, from)) {
+                if reached.contains(&block) {
+                    deferred.insert(block);
                 }
+                work.extend(Self::targets(self.runnable(block, from)).filter(|target| reached.contains(target)).map(|target| (target, 0)));
             }
-            live
-        };
-        let rooted = live_from(&mut self.rebuilt.iter().map(|&block| (block, 0)));
-        let by_running = live_from(&mut running.iter().copied());
-        let deferred: Blocks = reached.iter().copied().filter(|block| !rooted.contains(block) && by_running.contains(block)).collect();
+        }
         let mut _dropped: Vec<usize> = Vec::new();
         for versions in self.versions.values() {
             for block in versions.values() {
-                if reached.contains(block) && !rooted.contains(block) && !by_running.contains(block) && self.unreachable.insert(*block) {
+                if reached.contains(block) && !deferred.contains(block) && self.unreachable.insert(*block) {
                     _dropped.push(block.0);
                 }
             }
@@ -6470,7 +6485,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         static TRIMS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUNACY_NO_GIVE_UP_TRIM").is_none());
         if *TRIMS {
             self.trimming.push(vec![inlined]);
-            self.rebuilt.insert(site.block);
         }
         let before = (Rc::new(continuation.caller.clone()), continuation.captured.clone(), continuation.rest.clone());
         let thunk = self.make_call_thunk(site.block, site.calling.clone(), site.pc, continuation.a as usize, site.b, continuation.c as usize, continuation.after.clone(), Some(before), 0, true);
@@ -6549,7 +6563,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let reused = best.is_some();
         let (block, map) = match best {
             Some((_, block, map)) => {
-                self.unreachable.remove(&block);
+                self.found(block);
                 (block, map)
             }
             None => (self.version(owner, pc, Rc::new(renumbered(&own, &ctx.hkeys, &[], 0))), Vec::new()),
