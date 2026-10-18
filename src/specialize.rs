@@ -3472,7 +3472,10 @@ impl Context {
 
     /// Whether a trip falsifies something it knows. See Note [Watched tables].
     fn trips(&self) -> bool {
-        self.values.all_facts().any(|fact| !fact.survives_trip())
+        // A call site's context is kept as it was made, maybe unsettled.
+        let mut values = self.values.clone();
+        values.settle();
+        values.all_facts().any(|fact| !fact.survives_trip())
     }
 
     /// The slot of the table, and the name, of the field hash key `href` names: a string key of a
