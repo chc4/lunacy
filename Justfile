@@ -42,8 +42,7 @@ test:
     {{SHARED}} cargo test --features "gc_sanitize"
     # Interpreter GC stress test
     {{SHARED}} cargo test --features "gc_stress gc_sanitize"
-    # The watchpoint tests, which need their feature (Note [Watched tables])
-    LUNACY_GOLDEN=watch,frozen,frozen_alias,unwatched {{SHARED}} cargo test --features "gc_sanitize watchpoints" --test golden_tests test_golden
+    just golden-watchpoints
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     {{SHARED}} cargo test --test gc_reset_frees
     # The golden tests with random gas, a new seed each time, which a failure prints to
@@ -180,6 +179,10 @@ golden-versions-rev ref +names:
 # The named golden tests (lua_tests/<name>.lua), each against its expected
 # output, in one debug build with `test`'s golden suite's features: quicker than
 # the whole suite while iterating.
+# The watchpoint tests, which need their feature (Note [Watched tables]).
+golden-watchpoints:
+    LUNACY_GOLDEN=watch,frozen,frozen_alias,unwatched {{SHARED}} cargo test --features "gc_sanitize watchpoints" --test golden_tests test_golden
+
 golden +names:
     LUNACY_GOLDEN={{replace(names, " ", ",")}} {{SHARED}} cargo test --features gc_sanitize --test golden_tests test_golden
 

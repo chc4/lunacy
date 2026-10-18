@@ -237,7 +237,7 @@ impl Clone for Box<dyn NativeGen> {
 
 /// A native's generator for its call CALL A B C, given the native itself, for a call of it the
 /// generator lays out as any native's (`YieldOp::NativeCall`).
-pub type NativeGenerator = fn(crate::vm::NativeFunc, usize, usize, usize) -> Box<dyn NativeGen>;
+pub type NativeGenerator = fn(crate::vm::NClosure, usize, usize, usize) -> Box<dyn NativeGen>;
 
 #[derive(Clone, Debug)]
 pub enum YieldOp {
@@ -304,7 +304,7 @@ pub enum YieldOp {
                     // with the double type to compute it in the double encoding instead, else with
                     // the integer one. See Note [Optimistic ops]
     Clobber(usize), // Inform the executor that every STACK[idx] from idx up is of unknown type
-    NativeCall { nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize }, // Emit a call of a pure native, its results from STACK[a] on of unknown type. See Note [Native generators].
+    NativeCall { nf: crate::vm::NClosure, a: usize, b: usize, c: usize }, // Emit a call of a native, its results from STACK[a] on of unknown type. See Note [Native generators].
     ArrayKind(usize), // Resumed with the kind of STACK[idx]'s array part as a Type if the context
                       // knows it, else Failed. See Note [Array kinds]
     IsElementOf(usize, usize), // Resumed with Matched if STACK[a] was loaded from STACK[b]'s array
@@ -6132,7 +6132,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     // and the code after the call is a version. See Note [Native generators].
                     if let (Some(generator), After::Version(..)) = (nf.generator(), &after) {
                         vm.blocks[block.0].instructions.extend(layout);
-                        let compiled = vm.compile_one(owner, pc, calling.clone(), generator(nf.native(), a, b, c), ResumeArg::Start, block);
+                        let compiled = vm.compile_one(owner, pc, calling.clone(), generator(nf, a, b, c), ResumeArg::Start, block);
                         if let Some((next, ctx, _, block)) = compiled {
                             let ctx = vm.jumping(owner, ctx, next);
                             let version = After::Version(next, ctx).block(vm, owner);
@@ -7547,9 +7547,14 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 CoroutineState::Yielded(YieldOp::NativeCall { nf, a, b, c }) => {
                     self.observe(owner, &mut block_id, &mut ctx, pc.0, "NativeCall");
-                    self.blocks[block_id.0].instructions.push(Residual::NativeCall { nf, a: a as u16, b: b as u16, c: c as u16 });
+                    self.blocks[block_id.0].instructions.push(Residual::NativeCall { nf: nf.native(), a: a as u16, b: b as u16, c: c as u16 });
                     // A native may allocate (a table, a string).
                     self.blocks[block_id.0].allocates = true;
+                    // See Note [Call effects].
+                    if !nf.is_pure() {
+                        Effects::OPAQUE.apply(owner, Rc::make_mut(&mut ctx), &captured_slots(unsafe { &*self.proto }));
+                        self.join_effects(owner, Effects::OPAQUE);
+                    }
                     // Its results, and its frame above them, overwrote every register from `a` on.
                     let clobbered: Vec<(usize, CType)> = (a..ctx.types.len()).map(|idx| (idx, CType::Unknown)).collect();
                     for &(idx, _) in &clobbered {
@@ -7744,7 +7749,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // A native with a generator is compiled by it, as an opcode is. See Note
                             // [Native generators].
                             if native && !resumes && let CType::NativeFunction(nf) = &ctx.types[a] && let Some(generator) = nf.generator() {
-                                coro = generator(nf.native(), a, b, c);
+                                coro = generator(*nf, a, b, c);
                                 arg = ResumeArg::Start;
                                 break 'machine;
                             }

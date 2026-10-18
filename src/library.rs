@@ -584,7 +584,8 @@ fn bitn_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
 // at the call's pc, as an opcode is by its own, and the code after the call is compiled from the
 // context it ends in. So a native's call can guard its arguments, lay out ops whose results' types
 // hold past a dynamic guard, and fall back to a call of the native itself (`YieldOp::NativeCall`)
-// where none of that applies, all as an opcode's code does. Only a pure native has one.
+// where none of that applies, all as an opcode's code does. That call has the effects any call of
+// the native has (Note [Call effects]).
 
 /// A string argument's bytes, which the code running the op has guarded it is.
 #[inline(always)]
@@ -676,7 +677,7 @@ crate::window::windowed!(AbsIntDouble, [], [], |owner, state, base| (x, out r) {
 /// in the encoding an integer op's is, decided the first time it runs, and rebuilt to compute in
 /// doubles once one doesn't fit; of a double, a double; any other call is the native's. See Notes
 /// [Native generators] and [Optimistic ops].
-fn abs_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn abs_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c == 2 {
@@ -713,7 +714,7 @@ crate::window::windowed!(select AssertHolds, [], [], |owner, state, base| (condi
 
 /// `assert`'s generator: for a call keeping no results, its condition tested, the native called
 /// only where it fails, to raise; any other call is the native's. See Note [Native generators].
-pub(crate) fn assert_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+pub(crate) fn assert_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b >= 2 && c == 1 && (yield YieldOp::OptimisticExec(std::rc::Rc::new(AssertHolds::new(&[a + 1])))) == ResumeArg::Matched {
@@ -728,7 +729,7 @@ pub(crate) fn assert_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c:
 /// result, its result in the encoding an integer op's is, decided the first time it runs, and
 /// rebuilt to compute in doubles once one doesn't fit; any other call is the native's. See Notes
 /// [Native generators] and [Optimistic ops].
-fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn whole_generator<const OP: u8>(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c == 2 {
@@ -781,7 +782,7 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
 /// the field loaded into, as it is dead until the result is moved there. Returns `t`; any other
 /// call is the native's, which does too.
 #[cfg(feature = "magic")]
-fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn learn_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c <= 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
@@ -813,7 +814,7 @@ fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> B
 /// freezes it first: code past it knows which table it is while it stays frozen. Any other call is
 /// the native's. See Note [Frozen tables].
 #[cfg(feature = "magic")]
-fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn frozen_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c == 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched
@@ -834,7 +835,7 @@ fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> 
 /// with no test, until a store into `t` trips its watchpoint; any other call is the native's. See
 /// Note [Watched tables].
 #[cfg(feature = "magic")]
-fn tripped_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn tripped_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     crate::window::windowed!(Untripped, [], [], |owner, state, base| (out r) {
         *r = LBoxed::from_bool(false);
@@ -862,7 +863,7 @@ fn tripped_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) ->
 /// be contracted. A test asserts with it that the code it is in isn't duplicated. Any other
 /// call, as one the interpreter runs, is the native's, which returns 0.
 #[cfg(feature = "magic")]
-fn versions_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn versions_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 1 && c == 2 {
@@ -886,7 +887,7 @@ crate::window::windowed!(VersionsK, [n: i32], [], |owner, state, base| (out r) {
 /// narrowed), `v` promoted, its value moved into the result's slot; any other call is the
 /// native's, which returns its argument. See Note [Promoted values].
 #[cfg(feature = "magic")]
-fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn promote_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp, PROMOTE_VALUES};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c == 2 {
@@ -907,7 +908,7 @@ fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) ->
     })
 }
 
-fn byte_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn byte_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     use crate::window::Window;
     Box::new(#[coroutine] move |_: ResumeArg| {
