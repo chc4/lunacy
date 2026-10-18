@@ -1047,22 +1047,35 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 let worth = |slot: usize| ahead.worth(slot, step, now.dirty.contains(&slot));
                 let mut regs = [None; WINDOW];
                 let mut dirty = Slots::default();
-                // A block's entry window names one slot in each register: another naming the same
-                // value goes in a free register, or is left, stored on the edge if dirty.
-                let put = |regs: &mut Placement, slot: usize, at: Option<usize>| match at.filter(|&reg| regs[reg].is_none()).or_else(|| (0..width).find(|&reg| regs[reg].is_none())) {
+                // A block's entry window names one slot in each register: each value stays in its
+                // register under the first of its slots kept, and then each other slot naming one
+                // goes in a register left free, or is left, stored on the edge if dirty.
+                let put = |regs: &mut Placement, slot: usize, at: Option<usize>| match at.map_or_else(|| (0..width).find(|&reg| regs[reg].is_none()), |reg| regs[reg].is_none().then_some(reg)) {
                     Some(reg) => {
                         regs[reg] = Some(slot);
                         true
                     },
                     None => false,
                 };
+                let place = |regs: &mut Placement, dirty: &mut Slots, names: &[(usize, usize)]| {
+                    let mut aliases: SmallVec<[usize; 16]> = SmallVec::new();
+                    for &(reg, slot) in names {
+                        if !put(regs, slot, Some(reg)) {
+                            aliases.push(slot);
+                        } else if now.dirty.contains(&slot) {
+                            dirty.insert(slot);
+                        }
+                    }
+                    for slot in aliases {
+                        if put(regs, slot, None) && now.dirty.contains(&slot) {
+                            dirty.insert(slot);
+                        }
+                    }
+                };
                 match rise {
                     _ if trivial => {
-                        for (reg, slot) in now.slots() {
-                            if put(&mut regs, slot, Some(reg)) && now.dirty.contains(&slot) {
-                                dirty.insert(slot);
-                            }
-                        }
+                        let names: SmallVec<[(usize, usize); 16]> = now.slots().collect();
+                        place(&mut regs, &mut dirty, &names);
                     }
                     Some(Rise { reads, writes }) => {
                         // The values worth most, those the trace brings in
@@ -1073,11 +1086,9 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                         let mut values: SmallVec<[((bool, usize), usize); 16]> = brought.chain(fresh).filter_map(|slot| Some((worth(slot)?, slot))).collect();
                         values.sort_unstable();
                         values.truncate(width);
-                        for &(_, slot) in &values {
-                            if let Some(reg) = now.position(slot) {
-                                put(&mut regs, slot, Some(reg));
-                            }
-                        }
+                        let names: SmallVec<[(usize, usize); 16]> = values.iter().filter_map(|&(_, slot)| Some((now.position(slot)?, slot))).collect();
+                        // Its dirty slots are those it writes.
+                        place(&mut regs, &mut Slots::default(), &names);
                         for &(_, slot) in &values {
                             if now.position(slot).is_none() {
                                 put(&mut regs, slot, None);
@@ -1086,11 +1097,11 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                         regs.iter().flatten().filter(|&&slot| writes.contains(slot)).for_each(|&slot| dirty.insert(slot));
                     }
                     None => {
-                        for (reg, slot) in now.slots() {
-                            if worth(slot).is_some() && put(&mut regs, slot, Some(reg)) && now.dirty.contains(&slot) {
-                                dirty.insert(slot);
-                            }
-                        }
+                        // The slots worth most first.
+                        let mut worths: SmallVec<[((bool, usize), (usize, usize)); 16]> = now.slots().filter_map(|name| Some((worth(name.1)?, name))).collect();
+                        worths.sort_unstable();
+                        let names: SmallVec<[(usize, usize); 16]> = worths.into_iter().map(|(_, name)| name).collect();
+                        place(&mut regs, &mut dirty, &names);
                     }
                 }
                 // Each value in the form its next read wants, else the one it
