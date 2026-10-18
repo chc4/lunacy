@@ -2377,9 +2377,10 @@ fn forget_dead(owner: &mut Owner, ctx: &mut Context, live: usize, kept: Option<u
 // contraction's are, once its point has all the versions it can have and needs the room for one
 // more, the oldest first, one for each new version: until then a path reaching one again, as a
 // thunk forced into code that finds it, takes it as it is, with its JIT code. A peel makes its
-// versions in the order it learns its facts, so the newest knows the most. While code is
-// still running in what the replaced code reached, it may reach any of it, so that rebuild's are
-// tried again each time a thunk is forced, until none is.
+// versions in the order it learns its facts, so the newest knows the most. What the replaced code
+// reached that only what is running reaches (the code running, a frame returning, a handler) may
+// stop being reached as soon as it moves on, so it is checked again each time a thunk is forced,
+// until nothing that runs reaches it.
 //
 // An origin's rebuild is kept for its point in the function: code compiled there again, as a
 // rebuild of an origin before it in the same code compiles it again, takes the same answer
@@ -3907,6 +3908,9 @@ pub struct Specializer<'src, 'intern> {
     trimming: Vec<Vec<BlockId>>,
     /// The rebuilt blocks. See Note [Contraction].
     rebuilt: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>,
+    /// The blocks code rebuilds replaced reached that only what is running still reaches. See Note
+    /// [Contraction].
+    deferred: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>,
     /// The versions the trimming found unreachable, forgotten once their point needs the room.
     /// See Note [Contraction].
     unreachable: std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>,
@@ -3965,6 +3969,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             rebuilding: Default::default(),
             trimming: Vec::new(),
             rebuilt: Default::default(),
+            deferred: Default::default(),
             decided: Default::default(),
             promoted: Default::default(),
             key_indexes: Default::default(),
@@ -4468,7 +4473,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
     /// one was introduced. The versions their facts reach are forgotten, and each
     /// origin rebuilt without its fact. See Note [Contraction].
     fn contract(&mut self, owner: &mut Owner, state: &RunState<'src, 'intern>, at: Location) {
-        if !self.trimming.is_empty() || !self.contractions.is_empty() {
+        if !self.trimming.is_empty() || !self.deferred.is_empty() || !self.contractions.is_empty() {
             self.rebuild_queued(owner, state, &at);
             self.trim(owner, state, at);
         }
@@ -4587,12 +4592,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         })
     }
 
-    /// Forget the versions of the blocks only code rebuilds replaced reached, of each rebuild whose
-    /// replaced code nothing running is in any more: those reachable from the targets of that code
-    /// which nothing that runs reaches (the code running or a frame returning, a protected call's
-    /// handler, a rebuilt block). The others are tried again later. A block's JIT code keeps alive
-    /// only what it reaches when it is reached itself: every way into JIT code is an edge of the
-    /// blocks. See Note [Contraction].
+    /// Forget the versions of the blocks only code rebuilds replaced reached, which nothing that runs
+    /// reaches any more. Those only what is running reaches (the code running, a frame returning, a
+    /// protected call's handler) are deferred, to check again at the next. A block's JIT code keeps
+    /// alive only what it reaches when it is reached itself: every way into JIT code is an edge of
+    /// the blocks. See Note [Contraction].
     fn trim(&mut self, owner: &Owner, state: &RunState<'src, 'intern>, at: Location) {
         type Blocks = std::collections::HashSet<BlockId, rustc_hash::FxBuildHasher>;
         // Where what runs goes on from: the code running and a frame returning from where they are.
@@ -4600,28 +4604,24 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .chain(state.callstack.iter().filter_map(|entry| entry.returns_to()).map(|ret| (ret.0, ret.1)))
             .chain(state.handlers.iter().map(|handler| (handler.after, 0)))
             .collect();
-        let mut reached = Blocks::default();
-        for targets in std::mem::take(&mut self.trimming) {
-            let mut reach = Blocks::default();
-            let mut work = targets.clone();
-            while let Some(block) = work.pop() {
-                if reach.insert(block) {
-                    work.extend(Self::targets(&self.blocks[block.0].instructions));
-                }
-            }
-            if running.iter().any(|(block, _)| reach.contains(block)) {
-                self.trimming.push(targets);
-            } else {
-                reached.extend(reach);
+        // The deferred blocks, and what the code rebuilds replaced since reached.
+        let mut reached = std::mem::take(&mut self.deferred);
+        let mut work: Vec<BlockId> = std::mem::take(&mut self.trimming).into_iter().flatten().collect();
+        let mut walked = Blocks::default();
+        while let Some(block) = work.pop() {
+            if walked.insert(block) {
+                reached.insert(block);
+                work.extend(Self::targets(&self.blocks[block.0].instructions));
             }
         }
         if reached.is_empty() {
             return;
         }
-        // What runs reaches, entering each block where it does (`runnable`).
-        let live_from = |roots: &mut dyn Iterator<Item = (BlockId, usize)>| {
+        // What the rebuilt blocks reach, then what only what is running does, entering each block
+        // where it does (`runnable`).
+        let mut entered: std::collections::HashSet<(BlockId, usize), rustc_hash::FxBuildHasher> = Default::default();
+        let mut live_from = |roots: &mut dyn Iterator<Item = (BlockId, usize)>| {
             let mut live = Blocks::default();
-            let mut entered: std::collections::HashSet<(BlockId, usize), rustc_hash::FxBuildHasher> = Default::default();
             let mut work: Vec<(BlockId, usize)> = roots.collect();
             while let Some((block, from)) = work.pop() {
                 if entered.insert((block, from)) {
@@ -4631,15 +4631,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             }
             live
         };
-        let live = live_from(&mut running.iter().copied().chain(self.rebuilt.iter().map(|&block| (block, 0))));
-        #[cfg(feature = "tracing")]
-        let _kept_by = format!("running {}, rebuilt {}",
-            live_from(&mut running.iter().copied()).iter().filter(|block| reached.contains(block)).count(),
-            live_from(&mut self.rebuilt.iter().map(|&block| (block, 0))).iter().filter(|block| reached.contains(block)).count());
+        let rooted = live_from(&mut self.rebuilt.iter().map(|&block| (block, 0)));
+        let by_running = live_from(&mut running.iter().copied());
+        let deferred: Blocks = reached.iter().copied().filter(|block| !rooted.contains(block) && by_running.contains(block)).collect();
         let mut _dropped: Vec<usize> = Vec::new();
         for versions in self.versions.values() {
             for block in versions.values() {
-                if reached.contains(block) && !live.contains(block) && self.unreachable.insert(*block) {
+                if reached.contains(block) && !rooted.contains(block) && !by_running.contains(block) && self.unreachable.insert(*block) {
                     _dropped.push(block.0);
                 }
             }
@@ -4650,10 +4648,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ("line", self.traced_line(owner).into()),
             ("reached", reached.len().into()),
             ("dropped", Self::ids(_dropped.iter().copied()).as_str().into()),
-            ("waiting", self.trimming.len().into()),
-            ("kept_by", _kept_by.as_str().into()),
+            ("deferred", deferred.len().into()),
             ("at", at.0.0.into()),
         ]);
+        self.deferred = deferred;
         let _ = owner;
     }
 
