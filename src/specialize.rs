@@ -372,6 +372,108 @@ pub enum YieldOp {
     CollectGarbage,
 }
 
+/// A set of slots, as bits: the first 64 inline, as a hash key is cloned with every context.
+/// Sets with the same slots are equal, however many words they have.
+#[derive(Debug, Clone, Default)]
+pub struct SlotSet(SmallVec<[u64; 1]>);
+
+impl SlotSet {
+    /// The words up to the last one with a slot in it.
+    fn words(&self) -> &[u64] {
+        let len = self.0.iter().rposition(|&word| word != 0).map_or(0, |last| last + 1);
+        &self.0[..len]
+    }
+
+    pub fn contains(&self, slot: usize) -> bool {
+        self.0.get(slot / 64).is_some_and(|word| word & 1 << (slot % 64) != 0)
+    }
+
+    pub fn insert(&mut self, slot: usize) {
+        if self.0.len() <= slot / 64 {
+            self.0.resize(slot / 64 + 1, 0);
+        }
+        self.0[slot / 64] |= 1 << (slot % 64);
+    }
+
+    pub fn remove(&mut self, slot: usize) {
+        if let Some(word) = self.0.get_mut(slot / 64) {
+            *word &= !(1 << (slot % 64));
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Keep only the slots `other` has too.
+    pub fn intersect_with(&mut self, other: &SlotSet) {
+        for (i, word) in self.0.iter_mut().enumerate() {
+            *word &= other.0.get(i).copied().unwrap_or(0);
+        }
+    }
+
+    /// Whether `other` has every slot this has.
+    pub fn is_subset(&self, other: &SlotSet) -> bool {
+        self.0.iter().enumerate().all(|(i, &word)| word & !other.0.get(i).copied().unwrap_or(0) == 0)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().flat_map(|(i, &word)| (0..64).filter(move |bit| word & 1 << bit != 0).map(move |bit| i * 64 + bit))
+    }
+}
+
+impl FromIterator<usize> for SlotSet {
+    fn from_iter<I: IntoIterator<Item = usize>>(slots: I) -> Self {
+        let mut set = SlotSet::default();
+        for slot in slots {
+            set.insert(slot);
+        }
+        set
+    }
+}
+
+impl PartialEq for SlotSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.words() == other.words()
+    }
+}
+
+impl Eq for SlotSet {}
+
+impl std::hash::Hash for SlotSet {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.words().hash(state)
+    }
+}
+
+#[cfg(test)]
+mod slot_set_tests {
+    use super::SlotSet;
+    use std::hash::{BuildHasher, Hash};
+
+    fn hash(set: &SlotSet) -> u64 {
+        rustc_hash::FxBuildHasher.hash_one(set)
+    }
+
+    #[test]
+    fn a_slot_set_is_its_slots() {
+        let mut far: SlotSet = [3, 70, 130].into_iter().collect();
+        assert!(far.contains(3) && far.contains(70) && far.contains(130) && !far.contains(4) && !far.contains(200));
+        assert_eq!(far.iter().collect::<Vec<_>>(), vec![3, 70, 130]);
+        far.remove(70);
+        far.remove(130);
+        let near: SlotSet = [3].into_iter().collect();
+        assert_eq!(far, near, "emptied words count for nothing");
+        assert_eq!(hash(&far), hash(&near));
+        assert!(near.is_subset(&far) && SlotSet::default().is_subset(&near) && !near.is_subset(&SlotSet::default()));
+        let mut both: SlotSet = [3, 9, 100].into_iter().collect();
+        both.intersect_with(&[9, 100, 101].into_iter().collect());
+        assert_eq!(both, [9, 100].into_iter().collect());
+        both.clear();
+        assert_eq!(both, SlotSet::default());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HashKey<'src, 'intern> {
     /// The slot of the table the key is in.
@@ -381,9 +483,9 @@ pub struct HashKey<'src, 'intern> {
     /// stable; `None` if the index is free. A shape or a function's identity
     /// describes a register, not a field. See Note [Field types].
     pub known_type: Option<CType>,
-    /// Per slot: whether access through that slot is already checked for
-    /// aliasing, so it needs no epoch check.
-    pub hazards: SmallVec<[bool; 8]>,
+    /// The slots access through which is already checked for aliasing, so it needs no epoch
+    /// check.
+    pub hazards: SlotSet,
     /// Where the table its field is in comes from: `idx`'s register, or down
     /// that register's table's `__index` chain. See Note [Table metatables].
     pub place: Place,
@@ -436,7 +538,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
         }
         let lv: LValue = (&self.key).into();
         // The slots accesses through which are checked, if any.
-        let checked: Vec<String> = self.hazards.iter().enumerate().filter(|(_, checked)| **checked).map(|(slot, _)| slot.to_string()).collect();
+        let checked: Vec<String> = self.hazards.iter().map(|slot| slot.to_string()).collect();
         format!("hkey({}, {}{})",
             String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
             self.known_type.as_ref().map_or("free".to_string(), |t| t.to_string()),
@@ -450,20 +552,17 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 
     /// Whether access through slot `at` needs no epoch check.
     fn checked(&self, at: usize) -> bool {
-        self.hazards.get(at) == Some(&true)
+        self.hazards.contains(at)
     }
 
     /// Record that access through slot `at` needs no epoch check.
     fn check(&mut self, at: usize) {
-        if self.hazards.len() <= at {
-            self.hazards.resize(at + 1, false);
-        }
-        self.hazards[at] = true;
+        self.hazards.insert(at);
     }
 
     /// Make every access check the epoch again.
     fn clear_checks(&mut self) {
-        self.hazards.iter_mut().for_each(|checked| *checked = false);
+        self.hazards.clear();
     }
 
     /// Whether this index is free for a new hash key. See Note [Field types].
@@ -474,7 +573,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     /// A free index, as every free index is: what the hash key there was tells nothing. See
     /// Note [Version compatibility].
     fn free() -> Self {
-        HashKey { idx: OUTER, key: crate::chunk::Constant::Nil, known_type: None, hazards: SmallVec::new(), place: Place::Register, chain: None, origins: FieldOrigins::default() }
+        HashKey { idx: OUTER, key: crate::chunk::Constant::Nil, known_type: None, hazards: SlotSet::default(), place: Place::Register, chain: None, origins: FieldOrigins::default() }
     }
 
     /// Whether blocks compiled knowing `self` are correct for a context with
@@ -488,7 +587,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
                 (Some(mine), Some(theirs)) => mine.accepts(theirs),
                 (mine, theirs) => mine == theirs,
             }
-            && self.hazards.iter().enumerate().all(|(slot, &checked)| !checked || other.hazards.get(slot) == Some(&true))
+            && self.hazards.is_subset(&other.hazards)
     }
 }
 
@@ -1885,7 +1984,7 @@ fn inline_entry<C>(caller: &Context, proto: &crate::chunk::FunctionBlock<'_, C>,
     let slots = entry.types.len();
     entry.hkeys = caller.hkeys.iter().map(|hkey| {
         let mut hkey = hkey.clone();
-        hkey.hazards = (0..slots).map(|slot| args.contains(&(a + 1 + slot)) && hkey.checked(a + 1 + slot)).collect();
+        hkey.hazards = (0..slots).filter(|&slot| args.contains(&(a + 1 + slot)) && hkey.checked(a + 1 + slot)).collect();
         if !hkey.orphan() {
             hkey.idx = shifted(hkey.idx).unwrap_or(OUTER);
         }
@@ -3651,9 +3750,7 @@ impl Context {
                     } else if mine.origins.0.is_none() {
                         mine.origins = theirs.origins.clone();
                     }
-                    for (slot, checked) in mine.hazards.iter_mut().enumerate() {
-                        *checked &= theirs.hazards.get(slot) == Some(&true);
-                    }
+                    mine.hazards.intersect_with(&theirs.hazards);
                 },
                 _ => {
                     mine.known_type = None;
@@ -7682,8 +7779,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         for hkey in &mut Rc::make_mut(&mut ctx).hkeys {
                             if hkey.checked(src) {
                                 hkey.check(dest);
-                            } else if let Some(checked) = hkey.hazards.get_mut(dest) {
-                                *checked = false;
+                            } else {
+                                hkey.hazards.remove(dest);
                             }
                         }
                     }
@@ -8856,7 +8953,7 @@ mod sealed_tests {
 
     #[test]
     fn a_destination_checking_less_for_aliasing_accepts_but_not_more() {
-        let checked = |hkey: HashKey<'static, 'static>| HashKey { hazards: smallvec::smallvec![true], ..hkey };
+        let checked = |hkey: HashKey<'static, 'static>| HashKey { hazards: [0].into_iter().collect(), ..hkey };
         let context = |hkeys: Vec<HashKey<'static, 'static>>| {
             let mut ctx = Context::new(1);
             ctx.types[0] = CType::Type(LType::Table);
