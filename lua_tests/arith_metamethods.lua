@@ -46,6 +46,21 @@ local function replaced(n)
 end
 print(replaced(800))
 
+-- A handler replaced by another function, the field's type kept, through the metatable's hash key
+-- and through a key the store doesn't know.
+local smt = {__add = function(a, b) return 1 end}
+local so = setmetatable({}, smt)
+local function swapped(n, key)
+  local s = 0
+  for i = 1, n do
+    s = s + (so + i)
+    if i == n / 4 then smt.__add = function(a, b) return 2 end end
+    if i == n / 2 then smt[key] = function(a, b) return 3 end end
+  end
+  return s
+end
+print(swapped(800, "__add"))
+
 -- A field found through `__index` before an `__add` of the same table.
 local class = {k = 7}
 local cmt = {__index = class, __add = function(a, b) return a.k + b end}
@@ -66,6 +81,7 @@ print(ok, string.find(err, "attempt to perform arithmetic on", 1, true) ~= nil)
 -- EXPECT: 20300
 -- EXPECT: 20900
 -- EXPECT: 481199
+-- EXPECT: 1800
 -- EXPECT: 22900
 -- EXPECT: false	true
 -- EXPECT: false	true
