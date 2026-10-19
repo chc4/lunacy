@@ -25,12 +25,6 @@ use crate::window::Access;
 // running state. Operands of one slot are all of one form, as the window holds a slot's value in
 // one place.
 //
-// Its cold path may call a function out of line (`Record::call`), through one routine shared by
-// every cold path that saves every register the window holds a value in that the call may
-// clobber, and go on at the exit the function returns.
-// So a slow path, a write barrier or a lookup the hot path couldn't finish, costs the hot path
-// nothing.
-//
 // The interpreter runs the same instructions: a standalone function, assembled once for each op
 // and its constants, loads its inputs from an array into registers, the state into r12, runs the
 // op's code, and stores its outputs to another. The interpreter unboxes and boxes the values on
@@ -70,74 +64,6 @@ impl Record {
     pub fn exit(&self, ops: &mut Assembler, exit: usize) {
         dynasm!(ops ; .arch x64 ; jmp QWORD [r10 + (exit * 8) as i32]);
     }
-
-    /// Go on at the exit rax holds, 0 or 1.
-    pub fn exit_by(&self, ops: &mut Assembler) {
-        dynasm!(ops ; .arch x64 ; jmp QWORD [r10 + rax * 8]);
-    }
-
-    /// Call `f`, a `sysv64` function of the running state and `args`, through `cold_call`, which
-    /// keeps every register the window holds a value in: its result is in rax after, and the
-    /// record's address in r10 again. See Note [Emitted ops].
-    pub fn call(&self, ops: &mut Assembler, f: usize, args: &[Arg]) {
-        assert!(args.len() < COLD_CALL, "more arguments than `cold_call` passes");
-        for (i, &arg) in args.iter().enumerate() {
-            let at = COLD_ARGS + 8 * (i as i32 + 1);
-            match arg {
-                Arg::Reg(reg) => dynasm!(ops ; .arch x64 ; mov QWORD [r12 + at], Rq(reg)),
-                Arg::Capture(capture) => {
-                    self.capture(ops, capture, 0);
-                    dynasm!(ops ; .arch x64 ; mov QWORD [r12 + at], rax);
-                }
-            }
-        }
-        dynasm!(ops
-            ; .arch x64
-            ; mov rax, QWORD f as i64
-            ; mov QWORD [r12 + COLD_ARGS], rax
-            ; mov rax, QWORD cold_call as *const () as i64
-            ; call rax
-        );
-    }
-}
-
-/// An argument of a cold path's call out of line (`Record::call`).
-#[derive(Debug, Clone, Copy)]
-pub enum Arg {
-    /// A register's value.
-    Reg(u8),
-    /// A capture's value, from the record, by the capture's index.
-    Capture(usize),
-}
-
-/// How many words `RunState::cold_call` holds: the function, then its arguments after the state.
-pub const COLD_CALL: usize = 5;
-
-/// Where in the running state `cold_call`'s function and arguments are.
-const COLD_ARGS: i32 = core::mem::offset_of!(RunState<'static, 'static>, cold_call) as i32;
-
-/// Call the function in the running state's `cold_call` on the state, in rdi, and the arguments
-/// there, keeping every general register the window holds a value in that the call may clobber,
-/// r10, the record's address, and the XMM registers the window holds doubles in. Called with the
-/// stack 16-aligned, as JIT code runs. See Notes [Emitted ops] and [Stencil alignment].
-#[unsafe(naked)]
-unsafe extern "sysv64" fn cold_call() {
-    core::arch::naked_asm!(
-        "push rdi", "push rsi", "push rdx", "push rcx", "push r8", "push r9", "push r11", "push r10",
-        // The return address and eight pushes leave it 8 past aligned: the XMM registers, then 8.
-        "sub rsp, 72",
-        "vmovq [rsp], xmm0", "vmovq [rsp + 8], xmm1", "vmovq [rsp + 16], xmm2", "vmovq [rsp + 24], xmm3",
-        "vmovq [rsp + 32], xmm4", "vmovq [rsp + 40], xmm5", "vmovq [rsp + 48], xmm6", "vmovq [rsp + 56], xmm7",
-        "mov rdi, r12",
-        "mov rsi, [r12 + {args} + 8]", "mov rdx, [r12 + {args} + 16]", "mov rcx, [r12 + {args} + 24]", "mov r8, [r12 + {args} + 32]",
-        "call [r12 + {args}]",
-        "vmovq xmm0, [rsp]", "vmovq xmm1, [rsp + 8]", "vmovq xmm2, [rsp + 16]", "vmovq xmm3, [rsp + 24]",
-        "vmovq xmm4, [rsp + 32]", "vmovq xmm5, [rsp + 40]", "vmovq xmm6, [rsp + 48]", "vmovq xmm7, [rsp + 56]",
-        "add rsp, 72",
-        "pop r10", "pop r11", "pop r9", "pop r8", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
-        "ret",
-        args = const core::mem::offset_of!(RunState<'static, 'static>, cold_call),
-    );
 }
 
 /// The running frame's witnesses are at r10 after `witnesses`; hash key `href`'s witness's `field`,
@@ -203,8 +129,7 @@ impl std::fmt::Display for dyn Emitted {
 
 /// Declare an emitted op, as `windowed!` declares a window op:
 ///
-/// `emitted!([select] Name, [captures], [const params], |ops, exits| (operands) { code } [cold |record| { code }])`, or
-/// `rejoin |record| { code }` for a cold path that goes on at exit 0, so the op selects nothing
+/// `emitted!([select] Name, [captures], [const params], |ops, exits| (operands) { code } [cold |record| { code }])`
 ///
 /// Its captures are its constants, by name and type; its const parameters are the type's. Its
 /// operands are declared as a window op's: each by name, read unless `out`, boxed unless `f64`,
@@ -225,9 +150,6 @@ macro_rules! emitted {
     };
     ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block cold |$record:ident| $cold:block) => {
         $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, true, [|$record| $cold]] [] $($operands)*);
-    };
-    ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block rejoin |$record:ident| $cold:block) => {
-        $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, false, [|$record| $cold]] [] $($operands)*);
     };
     ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block) => {
         $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, false, []] [] $($operands)*);

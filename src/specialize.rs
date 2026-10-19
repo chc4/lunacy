@@ -710,7 +710,7 @@ fn hash_field(field: usize) -> i32 {
     crate::generators::table_field(core::mem::offset_of!(Table<'static, 'static>, hash) + field)
 }
 
-/// Go to the cold path unless the table in rax has the key `key` at entry `index`, through r10.
+/// Take exit 1 unless the table in rax has the key `key` at entry `index`, through r10.
 /// See Note [Hash part layout].
 fn emit_entry_check(ops: &mut crate::emitted::Assembler, exits: &crate::emitted::Exits, index: usize, key: u64) {
     use crate::hash_part::Entry;
@@ -718,23 +718,23 @@ fn emit_entry_check(ops: &mut crate::emitted::Assembler, exits: &crate::emitted:
     let at = index.checked_mul(core::mem::size_of::<Entry<'static, 'static>>())
         .and_then(|at| i32::try_from(at + core::mem::size_of::<Entry<'static, 'static>>()).ok().map(|_| at as i32));
     let (Some(at), Ok(len)) = (at, i32::try_from(index)) else {
-        dynasm!(ops ; .arch x64 ; jmp =>exits.cold);
+        dynasm!(ops ; .arch x64 ; jmp =>exits.exit1);
         return;
     };
     let key_at = at + core::mem::offset_of!(Entry<'static, 'static>, key) as i32;
     dynasm!(ops
         ; .arch x64
         ; cmp QWORD [BYTE rax + byte(hash_field(core::mem::offset_of!(HashPart<'static, 'static>, len)))], len
-        ; jbe =>exits.cold
+        ; jbe =>exits.exit1
         ; mov r10, QWORD [BYTE rax + byte(hash_field(core::mem::offset_of!(HashPart<'static, 'static>, entries)))]
         ; cmp DWORD [r10 + key_at], key as u32 as i32
-        ; jne =>exits.cold
+        ; jne =>exits.exit1
         ; cmp DWORD [r10 + key_at + 4], (key >> 32) as u32 as i32
-        ; jne =>exits.cold
+        ; jne =>exits.exit1
     );
 }
 
-/// Go to the cold path unless the table in rax's hash part has an empty slot where a key of hash
+/// Take exit 1 unless the table in rax's hash part has an empty slot where a key of hash
 /// `hash` is first looked for, which it lacks then, through r10. See Note [Hash part layout].
 fn emit_absence_check(ops: &mut crate::emitted::Assembler, exits: &crate::emitted::Exits, hash: u64) {
     use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
@@ -746,7 +746,7 @@ fn emit_absence_check(ops: &mut crate::emitted::Assembler, exits: &crate::emitte
         ; shl r10, 2
         ; add r10, QWORD [BYTE rax + byte(hash_field(core::mem::offset_of!(HashPart<'static, 'static>, indices)))]
         ; cmp DWORD [r10], 0
-        ; jne =>exits.cold
+        ; jne =>exits.exit1
     );
 }
 
@@ -756,7 +756,7 @@ fn byte(disp: i32) -> i8 {
 }
 
 /// Write the running frame's witness of `href` for the table in rax: at entry `index`, its value
-/// there or none, and the table's epoch. To the cold path, before writing anything, if the frame's
+/// there or none, and the table's epoch. Exit 1, before writing anything, if the frame's
 /// witnesses have no place for it. Through r10. See Note [Hash witnesses].
 fn emit_witness_write(ops: &mut crate::emitted::Assembler, exits: &crate::emitted::Exits, href: u8, index: usize, valued: bool) {
     use crate::hash_part::Entry;
@@ -772,7 +772,7 @@ fn emit_witness_write(ops: &mut crate::emitted::Assembler, exits: &crate::emitte
         ; mov r10, QWORD r12 => RunState.witness_base
         ; add r10, href as i32 + 1
         ; cmp r10, QWORD [r12 + len]
-        ; ja =>exits.cold
+        ; ja =>exits.exit1
         ; cmp r10, QWORD r12 => RunState.witness_top
         ; jbe >topped
         ; mov QWORD r12 => RunState.witness_top, r10
@@ -799,29 +799,16 @@ fn emit_witness_write(ops: &mut crate::emitted::Assembler, exits: &crate::emitte
     }
 }
 
-/// `href_init_slow` from an emitted op's cold path, on the table whose boxed value is `table`.
-extern "sysv64" fn href_init_cold(state: *mut RunState<'static, 'static>, table: u64, at: u64, key: u64) -> u64 {
-    // SAFETY: the running state, and the op's table, alive in its register.
-    let (state, table) = unsafe { (&mut *state, LBoxed::from_bits(table)) };
-    let LValue::Table(tab) = table.unbox() else { unreachable!("a hash key's table") };
-    href_init_slow(unsafe { crate::forge_owner() }, state, tab, at as u8, (at >> 8) as usize, key) as u64
-}
-
-// Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
-// `index` has the key `key` and the frame's witness for `href` has its place, populating the
-// witness; its cold path finds the key wherever it is (`href_init_slow`). Exit 0 if the table has
-// the key, where the field's type is guarded (`GuardWitness`), and 1 if not. See Notes [Hash
-// witnesses], [Field types] and [Hash part layout].
-crate::emitted::emitted!(HrefInit, [at: u64, key: u64], [], |ops, exits| (table) {
+// Initialize a hash key: `at` is `index << 8 | href`. Exit 0 if the table's entry at `index` has
+// the key `key` and the frame's witness for `href` has its place, populating the witness, where
+// the field's type is guarded (`GuardWitness`); else exit 1, to its slow way on (`href_init_exec`).
+// See Notes [Hash witnesses], [Field types], [Hash part layout] and [Optimistic ops].
+crate::emitted::emitted!(select HrefInit, [at: u64, key: u64], [], |ops, exits| (table) {
     use dynasmrt::{dynasm, DynasmApi};
     let (href, index) = (at as u8, (at >> 8) as usize);
     dynasm!(ops ; .arch x64 ; mov rax, Rq(table));
     emit_entry_check(ops, exits, index, key);
     emit_witness_write(ops, exits, href, index, true);
-} cold |record| {
-    use crate::emitted::Arg;
-    record.call(ops, href_init_cold as *const () as usize, &[Arg::Reg(table), Arg::Capture(at), Arg::Capture(key)]);
-    record.exit_by(ops);
 });
 
 // `HrefInit` for a hash key of a userdata, in its `__index` table: exit 0 if that has the key,
@@ -851,26 +838,29 @@ fn table_at<'src, 'intern, const META: bool>(owner: &Owner, state: &RunState<'sr
     }
 }
 
-/// `HrefInitAt`'s cold path, from its emitted code.
-extern "sysv64" fn href_init_at_cold<const META: bool>(state: *mut RunState<'static, 'static>, at: u64, key: u64, link: u64) -> u64 {
-    // SAFETY: the running state.
-    let state = unsafe { &mut *state };
-    let owner = unsafe { crate::forge_owner() };
-    match table_at::<META>(owner, state, link as u8) {
-        Some(tab) => href_init_slow(owner, state, tab, at as u8, (at >> 8) as usize, key) as u64,
-        None => 1,
-    }
+/// The slow way on of a hash key's init (`HrefInit`, `HrefInitAt`), when its exit 1 is taken: the
+/// key wherever it is in the table at `place` from R(`idx`), selecting 0 if it has it, populating
+/// the witness, and 1 if not, or if there's no table there. See Note [Optimistic ops].
+fn href_init_exec(place: Place, idx: usize, at: u64, key: u64) -> ResidualExec {
+    ResidualExec::new("href_init_slow", Rc::new(move |owner, state| {
+        let tab = match place {
+            Place::Register => state.vals[state.base + idx].as_table(),
+            Place::Metatable(link) => table_at::<true>(owner, state, link.0),
+            Place::Index(link) => table_at::<false>(owner, state, link.0),
+        };
+        state.select = match tab {
+            Some(tab) => href_init_slow(owner, state, tab, at as u8, (at >> 8) as usize, key),
+            None => 1,
+        };
+    }))
 }
 
 // `HrefInit` for a hash key at a place down its register's `__index` chain, the table found
-// from the hash key `link`'s witness as `table_at` says: its hot path, `HrefInit`'s, on that
-// table, and its cold path finding the key wherever it is. Exit 0 if the table has the key,
-// populating the witness, and 1 if not, or if there's no table there. See Note [Table
-// metatables].
-crate::emitted::emitted!(HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |ops, exits| () {
+// from the hash key `link`'s witness as `table_at` says: `HrefInit` on that table, exit 1 too if
+// there's no table there. See Note [Table metatables].
+crate::emitted::emitted!(select HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |ops, exits| () {
     use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
     let (href, index) = (at as u8, (at >> 8) as usize);
-    // No table there is a miss, which the cold path finds again.
     use crate::emitted::witness_at;
     crate::emitted::witnesses(ops);
     if META {
@@ -881,7 +871,7 @@ crate::emitted::emitted!(HrefInitAt, [at: u64, key: u64, link: u8], [META: bool]
             ; mov rax, QWORD [r10 + witness_at(link, core::mem::offset_of!(HashWitness, table))]
             ; mov rax, QWORD [BYTE rax + metatable]
             ; test rax, rax
-            ; jz =>exits.cold
+            ; jz =>exits.exit1
         );
     } else {
         dynasm!(ops
@@ -890,60 +880,54 @@ crate::emitted::emitted!(HrefInitAt, [at: u64, key: u64, link: u8], [META: bool]
             ; mov rax, QWORD [rax]
             ; mov r10, QWORD LBoxed::NOT_CELL_MASK as i64
             ; test rax, r10
-            ; jnz =>exits.cold
+            ; jnz =>exits.exit1
             ; cmp BYTE [rax], LBoxed::KIND_TABLE as i8
-            ; jne =>exits.cold
+            ; jne =>exits.exit1
         );
     }
     emit_entry_check(ops, exits, index, key);
     emit_witness_write(ops, exits, href, index, true);
-} cold |record| {
-    use crate::emitted::Arg;
-    record.call(ops, href_init_at_cold::<META> as *const () as usize, &[Arg::Capture(at), Arg::Capture(key), Arg::Capture(link)]);
-    record.exit_by(ops);
 });
 
-/// `HrefMiss`'s cold path, from its emitted code: the table's boxed value is `table`.
-extern "sysv64" fn href_miss_cold(state: *mut RunState<'static, 'static>, table: u64, at: u64, key: u64) -> u64 {
-    // SAFETY: the running state, and the op's table, alive in its register.
-    let (state, table) = unsafe { (&mut *state, LBoxed::from_bits(table)) };
-    let owner = unsafe { crate::forge_owner() };
-    let (href, index) = (at as u8, (at >> 8) as usize);
-    let LValue::Table(tab) = table.unbox() else { unreachable!("a hash key's table") };
-    let address = tab.0.to_addr();
-    let lacks = {
-        let tab = tab.ro(owner);
-        tab.hash.find(HashPart::hash(&unsafe { LCanon::from_bits(key) }), |k| k.boxed().bits() == key).is_none().then_some(tab.epoch)
-    };
-    match lacks {
-        Some(epoch) => {
-            let hidx = state.witness_base + href as usize;
-            state.hash_witnesses.grow(hidx + 1);
-            state.witness_top = state.witness_top.max(hidx + 1);
-            state.hash_witnesses[hidx] = HashWitness { epoch, index, value: core::ptr::null_mut(), table: address };
-            0
-        },
-        // It has the key after all: its witness, wherever the key is.
-        None => 1 - href_init_slow(owner, state, tab, href, index, key) as u64,
-    }
+/// `HrefMiss`'s slow way on, when its exit 1 is taken: the whole table in R(`idx`) probed for the
+/// key, selecting 0 if it lacks it, populating the witness with no value, and 1 if it has it after
+/// all, with its witness. See Note [Optimistic ops].
+fn href_miss_exec(idx: usize, at: u64, key: u64) -> ResidualExec {
+    ResidualExec::new("href_miss_slow", Rc::new(move |owner, state| {
+        let (href, index) = (at as u8, (at >> 8) as usize);
+        let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!("a hash key's table") };
+        let address = tab.0.to_addr();
+        let lacks = {
+            let tab = tab.ro(owner);
+            // Safety: the key is a constant's, which outlives the code using it.
+            tab.hash.find(HashPart::hash(&unsafe { LCanon::from_bits(key) }), |k| k.boxed().bits() == key).is_none().then_some(tab.epoch)
+        };
+        state.select = match lacks {
+            Some(epoch) => {
+                let hidx = state.witness_base + href as usize;
+                state.hash_witnesses.grow(hidx + 1);
+                state.witness_top = state.witness_top.max(hidx + 1);
+                state.hash_witnesses[hidx] = HashWitness { epoch, index, value: core::ptr::null_mut(), table: address };
+                0
+            },
+            // It has the key after all: its witness, wherever the key is.
+            None => 1 - href_init_slow(owner, state, tab, href, index, key),
+        };
+    }))
 }
 
 // `HrefInit` for a key the table in its register was found without, as an object lacks a method
-// its class has: its hot path finds the slot the key is first looked for at empty, by `hash`, the
-// table's hash of it, worked out as the op is made, and populates the witness with no value, for
-// the `__index` chain after it. Its cold path probes the whole table. Exit 0 is missing the key, 1
-// having it. See Notes [Table metatables], [Hash witnesses] and [Hash part layout].
-crate::emitted::emitted!(HrefMiss, [at: u64, key: u64, hash: u64], [], |ops, exits| (table) {
+// its class has: exit 0 if the slot the key is first looked for, by `hash`, the table's hash of
+// it, worked out as the op is made, is empty, populating the witness with no value, for the
+// `__index` chain after it; else exit 1, to its slow way on (`href_miss_exec`). See Notes [Table
+// metatables], [Hash witnesses], [Hash part layout] and [Optimistic ops].
+crate::emitted::emitted!(select HrefMiss, [at: u64, key: u64, hash: u64], [], |ops, exits| (table) {
     use dynasmrt::{dynasm, DynasmApi};
     let (href, index) = (at as u8, (at >> 8) as usize);
     dynasm!(ops ; .arch x64 ; mov rax, Rq(table));
     emit_absence_check(ops, exits, hash);
     dynasm!(ops ; .arch x64 ; mov rax, Rq(table));
     emit_witness_write(ops, exits, href, index, false);
-} cold |record| {
-    use crate::emitted::Arg;
-    record.call(ops, href_miss_cold as *const () as usize, &[Arg::Reg(table), Arg::Capture(at), Arg::Capture(key)]);
-    record.exit_by(ops);
 });
 
 /// `HrefInit`'s cold path: the key isn't at `index`, or the witness's place isn't there yet,
@@ -7208,16 +7192,17 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // A table lacking the key it's chained for expects to: its init's hot path is the
             // miss.
             let miss = chained && entry.is_none() && place == Place::Register && receiver == LType::Table;
-            let href_init = if miss {
+            // An emitted init's exit 1 is its slow way on, which selects as the init would.
+            let (href_init, slow) = if miss {
                 // Safety: the key is a constant's, which outlives the code using it.
                 let hash = HashPart::hash(&unsafe { LCanon::from_bits(kbits) });
-                Residual::Emit(Rc::new(HrefMiss::new(at, kbits, hash, &[idx])))
+                (Residual::Emit(Rc::new(HrefMiss::new(at, kbits, hash, &[idx]))), Some(href_miss_exec(idx, at, kbits)))
             } else { match (place, receiver) {
-                (Place::Register, LType::Table) => Residual::Emit(Rc::new(HrefInit::new(at, kbits, &[idx]))),
-                (Place::Register, LType::Userdata) => Residual::ExecWindow(Rc::new(HrefInitIndex::new(at, kbits, &[idx]))),
+                (Place::Register, LType::Table) => (Residual::Emit(Rc::new(HrefInit::new(at, kbits, &[idx]))), Some(href_init_exec(place, idx, at, kbits))),
+                (Place::Register, LType::Userdata) => (Residual::ExecWindow(Rc::new(HrefInitIndex::new(at, kbits, &[idx]))), None),
                 (Place::Register, _) => unreachable!("a hash key of a {receiver}"),
-                (Place::Metatable(link), _) => Residual::Emit(Rc::new(HrefInitAt::<true>::new(at, kbits, link.0, &[]))),
-                (Place::Index(link), _) => Residual::Emit(Rc::new(HrefInitAt::<false>::new(at, kbits, link.0, &[]))),
+                (Place::Metatable(link), _) => (Residual::Emit(Rc::new(HrefInitAt::<true>::new(at, kbits, link.0, &[]))), Some(href_init_exec(place, idx, at, kbits))),
+                (Place::Index(link), _) => (Residual::Emit(Rc::new(HrefInitAt::<false>::new(at, kbits, link.0, &[]))), Some(href_init_exec(place, idx, at, kbits))),
             } };
             block_id = vm.reopen(block_id, thunk_pc, pc.0, appends);
             vm.blocks[block_id.0].instructions.push(href_init);
@@ -7225,6 +7210,15 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let missing_key = vm.new_block(pc.0);
             // A `MISS` init's exit 0 is missing the key.
             let targets = if miss { vec![("missing_key", missing_key), ("has_key", typed)] } else { vec![("has_key", typed), ("missing_key", missing_key)] };
+            let targets = match slow {
+                Some(slow) => {
+                    let slow_block = vm.new_block(pc.0);
+                    vm.blocks[slow_block.0].instructions.push(Residual::Exec(slow));
+                    vm.blocks[slow_block.0].instructions.push(Residual::Select(targets.clone()));
+                    vec![targets[0], ("slow", slow_block)]
+                }
+                None => targets,
+            };
             vm.blocks[block_id.0].instructions.push(Residual::Select(targets));
             if chained {
                 // Its own field is none or nil, which a guard checks where it has the key,

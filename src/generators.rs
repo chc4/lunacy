@@ -648,12 +648,13 @@ pub(crate) fn table_field(field: usize) -> i32 {
     (core::mem::offset_of!(crate::gc::GcInner<qcell::TLCell<crate::TlcOwner, Table<'static, 'static>>>, val) + field) as i32
 }
 
-/// A field store's write barrier, in a collection cycle, from its cold path: `table` is the
-/// table's boxed value. See Note [Write barriers].
-extern "sysv64" fn field_barrier(_: *mut RunState<'static, 'static>, table: u64) {
-    // SAFETY: the store's table, alive in its register.
-    let LValue::Table(tab) = unsafe { LBoxed::from_bits(table) }.unbox() else { unreachable!("a store's table") };
-    tab.barrier_slow();
+/// A field store's write barrier into the table in R(`a`), in a collection cycle, on the store's
+/// exit 1. See Notes [Write barriers] and [Optimistic ops].
+fn field_barrier(a: usize) -> ResidualExec {
+    ResidualExec::new("field_barrier", Rc::new(move |_, state| {
+        let LValue::Table(tab) = state.vals[state.base + a].unbox() else { unreachable!("a store's table") };
+        tab.barrier_slow();
+    }))
 }
 
 /// Store `value()`'s value, which it leaves in rax, through the witness of `href`, moving the table
@@ -690,8 +691,8 @@ fn store_witnessed(ops: &mut crate::emitted::Assembler, retype: Retype, href: u8
     );
 }
 
-/// The write barrier's test, last in a store: in a collection cycle, the cold path. See Note
-/// [Write barriers].
+/// The write barrier's test, last in a store: in a collection cycle, exit 1. See Note [Write
+/// barriers].
 fn barrier_test(ops: &mut crate::emitted::Assembler, exits: &crate::emitted::Exits) {
     use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
     let flag = crate::gc::gc_in_progress_offset().to_le_bytes();
@@ -700,7 +701,7 @@ fn barrier_test(ops: &mut crate::emitted::Assembler, exits: &crate::emitted::Exi
     dynasm!(ops
         ; .arch x64
         ; .bytes cmp
-        ; jne =>exits.cold
+        ; jne =>exits.exit1
     );
 }
 
@@ -949,10 +950,10 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     retype => retype,
                 };
                 // Through its hash key's witness, the table moving to a new epoch as `RETYPE` says,
-                // and its write barrier last. With `DOUBLE`, an integer is stored as a double: into
-                // a field that has held both, which then holds doubles. See Notes [Hash witnesses],
-                // [Widening] and [Write barriers].
-                crate::emitted::emitted!(FieldStore, [href: u8], [RETYPE: Retype, DOUBLE: bool], |ops, exits| (table, value) {
+                // and its write barrier's test last, taking exit 1 in a collection cycle. With
+                // `DOUBLE`, an integer is stored as a double: into a field that has held both, which
+                // then holds doubles. See Notes [Hash witnesses], [Widening] and [Write barriers].
+                crate::emitted::emitted!(select FieldStore, [href: u8], [RETYPE: Retype, DOUBLE: bool], |ops, exits| (table, value) {
                     use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
                     store_witnessed(ops, RETYPE, href, table, |ops| {
                         dynasm!(ops ; .arch x64 ; mov rax, Rq(value));
@@ -972,26 +973,22 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                         }
                     });
                     barrier_test(ops, exits);
-                } rejoin |record| {
-                    record.call(ops, field_barrier as *const () as usize, &[crate::emitted::Arg::Reg(table)]);
-                    record.exit(ops, 0);
                 });
                 // `FieldStore` of a constant's bits, which live as long as its prototype.
-                crate::emitted::emitted!(FieldStoreK, [href: u8, value: u64], [RETYPE: Retype], |ops, exits| (table) {
+                crate::emitted::emitted!(select FieldStoreK, [href: u8, value: u64], [RETYPE: Retype], |ops, exits| (table) {
                     use dynasmrt::{dynasm, DynasmApi};
                     store_witnessed(ops, RETYPE, href, table, |ops| dynasm!(ops ; .arch x64 ; mov rax, QWORD value as i64));
                     barrier_test(ops, exits);
-                } rejoin |record| {
-                    record.call(ops, field_barrier as *const () as usize, &[crate::emitted::Arg::Reg(table)]);
-                    record.exit(ops, 0);
                 });
-                if c & 0x100 == 0 {
-                    arg = yield YieldOp::Emit(match retype {
+                // The barrier on the store's exit 1, laid out once it's taken. See Note [Optimistic
+                // ops].
+                let stored = if c & 0x100 == 0 {
+                    yield YieldOp::OptimisticEmit(match retype {
                         Retype::Same => Rc::new(FieldStore::<{ Retype::Same }, false>::new(hb.0, &[a, c])) as Rc<dyn crate::emitted::Emitted>,
                         Retype::Known if to_double => Rc::new(FieldStore::<{ Retype::Known }, true>::new(hb.0, &[a, c])),
                         Retype::Known => Rc::new(FieldStore::<{ Retype::Known }, false>::new(hb.0, &[a, c])),
                         Retype::Unknown => Rc::new(FieldStore::<{ Retype::Unknown }, false>::new(hb.0, &[a, c])),
-                    });
+                    })
                 } else {
                     let value = match whole {
                         Some(k) => LBoxed::from_int(k).bits(),
@@ -1000,11 +997,14 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                             bits
                         }
                     };
-                    arg = yield YieldOp::Emit(match retype {
+                    yield YieldOp::OptimisticEmit(match retype {
                         Retype::Same => Rc::new(FieldStoreK::<{ Retype::Same }>::new(hb.0, value, &[a])) as Rc<dyn crate::emitted::Emitted>,
                         Retype::Known => Rc::new(FieldStoreK::<{ Retype::Known }>::new(hb.0, value, &[a])),
                         Retype::Unknown => unreachable!("a constant of unknown type"),
-                    });
+                    })
+                };
+                if stored != ResumeArg::Matched {
+                    yield YieldOp::Exec(field_barrier(a));
                 }
                 arg = match retype {
                     Retype::Same => yield YieldOp::SetHazards(Some(a), Some(hb)),
