@@ -25,8 +25,9 @@ use crate::window::Access;
 // running state. Operands of one slot are all of one form, as the window holds a slot's value in
 // one place.
 //
-// Its cold path may call a function out of line (`Record::call`), saving every register the
-// window holds a value in that the call may clobber, and go on at the exit the function returns.
+// Its cold path may call a function out of line (`Record::call`), through one routine shared by
+// every cold path that saves every register the window holds a value in that the call may
+// clobber, and go on at the exit the function returns.
 // So a slow path, a write barrier or a lookup the hot path couldn't finish, costs the hot path
 // nothing.
 //
@@ -75,81 +76,88 @@ impl Record {
         dynasm!(ops ; .arch x64 ; jmp QWORD [r10 + rax * 8]);
     }
 
-    /// Call `f`, a `sysv64` function, on `args`, keeping every register the window holds a value in:
-    /// its result is in rax after, and the record's address in r10 again. See Note [Emitted ops].
+    /// Call `f`, a `sysv64` function of the running state and `args`, through `cold_call`, which
+    /// keeps every register the window holds a value in: its result is in rax after, and the
+    /// record's address in r10 again. See Note [Emitted ops].
     pub fn call(&self, ops: &mut Assembler, f: usize, args: &[Arg]) {
-        assert!(args.len() <= ARGS.len(), "more arguments than registers");
-        for &reg in &SAVED {
-            dynasm!(ops ; .arch x64 ; push Rq(reg));
-        }
-        // Past the registers, the XMM registers and the stack's alignment: code runs with the stack as
-        // just after a call.
-        let spill = (8 * XMMS + 8) as i32;
-        dynasm!(ops ; .arch x64 ; sub rsp, spill);
-        for xmm in 0..XMMS as u8 {
-            dynasm!(ops ; .arch x64 ; vmovq QWORD [rsp + 8 * xmm as i32], Rx(xmm));
-        }
-        // Where a saved register is: the registers pushed last are nearest.
-        let saved = |reg: u8| SAVED.iter().position(|&r| r == reg).map(|at| spill + (8 * (SAVED.len() - 1 - at)) as i32);
-        for (&arg, &into) in args.iter().zip(&ARGS) {
+        assert!(args.len() < COLD_CALL, "more arguments than `cold_call` passes");
+        for (i, &arg) in args.iter().enumerate() {
+            let at = COLD_ARGS + 8 * (i as i32 + 1);
             match arg {
-                Arg::State => dynasm!(ops ; .arch x64 ; mov Rq(into), r12),
-                Arg::Reg(reg) => match saved(reg) {
-                    Some(at) => dynasm!(ops ; .arch x64 ; mov Rq(into), QWORD [rsp + at]),
-                    None => dynasm!(ops ; .arch x64 ; mov Rq(into), Rq(reg)),
-                },
-                Arg::Capture(capture) => self.capture(ops, capture, into),
+                Arg::Reg(reg) => dynasm!(ops ; .arch x64 ; mov QWORD [r12 + at], Rq(reg)),
+                Arg::Capture(capture) => {
+                    self.capture(ops, capture, 0);
+                    dynasm!(ops ; .arch x64 ; mov QWORD [r12 + at], rax);
+                }
             }
         }
         dynasm!(ops
             ; .arch x64
             ; mov rax, QWORD f as i64
+            ; mov QWORD [r12 + COLD_ARGS], rax
+            ; mov rax, QWORD cold_call as *const () as i64
             ; call rax
         );
-        for xmm in 0..XMMS as u8 {
-            dynasm!(ops ; .arch x64 ; vmovq Rx(xmm), QWORD [rsp + 8 * xmm as i32]);
-        }
-        dynasm!(ops ; .arch x64 ; add rsp, spill);
-        for &reg in SAVED.iter().rev() {
-            dynasm!(ops ; .arch x64 ; pop Rq(reg));
-        }
     }
-}
-
-/// Load the address of the running frame's witness of hash key `href` into general register
-/// `into`, through r10. See Note [Hash witnesses].
-pub fn witness(ops: &mut Assembler, href: u8, into: u8) {
-    let data = (core::mem::offset_of!(RunState<'static, 'static>, hash_witnesses) + crate::vm::Witnesses::DATA) as i32;
-    let base = core::mem::offset_of!(RunState<'static, 'static>, witness_base) as i32;
-    let size = core::mem::size_of::<crate::vm::HashWitness>() as i32;
-    dynasm!(ops
-        ; .arch x64
-        ; imul r10, QWORD [r12 + base], size
-        ; add r10, QWORD [r12 + data]
-        ; lea Rq(into), [r10 + href as i32 * size]
-    );
 }
 
 /// An argument of a cold path's call out of line (`Record::call`).
 #[derive(Debug, Clone, Copy)]
 pub enum Arg {
-    /// The running state.
-    State,
-    /// A register's value, as it was when the call began.
+    /// A register's value.
     Reg(u8),
     /// A capture's value, from the record, by the capture's index.
     Capture(usize),
 }
 
-/// The registers a call's arguments go in, in order.
-const ARGS: [u8; 6] = [7 /* rdi */, 6 /* rsi */, 2 /* rdx */, 1 /* rcx */, 8 /* r8 */, 9 /* r9 */];
+/// How many words `RunState::cold_call` holds: the function, then its arguments after the state.
+pub const COLD_CALL: usize = 5;
 
-/// The general registers a call may clobber that the window, or a cold path, holds a value in: the
-/// window's but r15, and r10, the record's address.
-const SAVED: [u8; 8] = [7 /* rdi */, 6 /* rsi */, 2 /* rdx */, 1 /* rcx */, 8 /* r8 */, 9 /* r9 */, 11 /* r11 */, 10 /* r10 */];
+/// Where in the running state `cold_call`'s function and arguments are.
+const COLD_ARGS: i32 = core::mem::offset_of!(RunState<'static, 'static>, cold_call) as i32;
 
-/// The XMM registers the window holds unboxed doubles in.
-const XMMS: usize = crate::window::WINDOW;
+/// Call the function in the running state's `cold_call` on the state, in rdi, and the arguments
+/// there, keeping every general register the window holds a value in that the call may clobber,
+/// r10, the record's address, and the XMM registers the window holds doubles in. Called with the
+/// stack 16-aligned, as JIT code runs. See Notes [Emitted ops] and [Stencil alignment].
+#[unsafe(naked)]
+unsafe extern "sysv64" fn cold_call() {
+    core::arch::naked_asm!(
+        "push rdi", "push rsi", "push rdx", "push rcx", "push r8", "push r9", "push r11", "push r10",
+        // The return address and eight pushes leave it 8 past aligned: the XMM registers, then 8.
+        "sub rsp, 72",
+        "vmovq [rsp], xmm0", "vmovq [rsp + 8], xmm1", "vmovq [rsp + 16], xmm2", "vmovq [rsp + 24], xmm3",
+        "vmovq [rsp + 32], xmm4", "vmovq [rsp + 40], xmm5", "vmovq [rsp + 48], xmm6", "vmovq [rsp + 56], xmm7",
+        "mov rdi, r12",
+        "mov rsi, [r12 + {args} + 8]", "mov rdx, [r12 + {args} + 16]", "mov rcx, [r12 + {args} + 24]", "mov r8, [r12 + {args} + 32]",
+        "call [r12 + {args}]",
+        "vmovq xmm0, [rsp]", "vmovq xmm1, [rsp + 8]", "vmovq xmm2, [rsp + 16]", "vmovq xmm3, [rsp + 24]",
+        "vmovq xmm4, [rsp + 32]", "vmovq xmm5, [rsp + 40]", "vmovq xmm6, [rsp + 48]", "vmovq xmm7, [rsp + 56]",
+        "add rsp, 72",
+        "pop r10", "pop r11", "pop r9", "pop r8", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
+        "ret",
+        args = const core::mem::offset_of!(RunState<'static, 'static>, cold_call),
+    );
+}
+
+/// The running frame's witnesses are at r10 after `witnesses`; hash key `href`'s witness's `field`,
+/// an offset in `HashWitness`, is this far past. See Note [Hash witnesses].
+pub fn witness_at(href: u8, field: usize) -> i32 {
+    href as i32 * core::mem::size_of::<crate::vm::HashWitness>() as i32 + field as i32
+}
+
+/// Load the address of the running frame's first witness into r10. See Note [Hash witnesses].
+pub fn witnesses(ops: &mut Assembler) {
+    let data = (core::mem::offset_of!(RunState<'static, 'static>, hash_witnesses) + crate::vm::Witnesses::DATA) as i32;
+    const SHIFT: i8 = core::mem::size_of::<crate::vm::HashWitness>().trailing_zeros() as i8;
+    const { assert!(1 << SHIFT == core::mem::size_of::<crate::vm::HashWitness>()) };
+    dynasm!(ops
+        ; .arch x64
+        ; mov r10, QWORD r12 => RunState.witness_base
+        ; shl r10, SHIFT
+        ; add r10, QWORD [r12 + data]
+    );
+}
 
 /// An op the JIT lays out as its own instructions, as `emitted!` declares one. See Note [Emitted
 /// ops].
@@ -353,13 +361,12 @@ fn standalone(op: &dyn Emitted) -> Standing {
     }
     assert!(xmms < 8, "a standalone's XMM registers past the window's");
     // r14 is callee-saved, and the pinned tag in JIT code, and r12 the state. See Note [Pinned
-    // tag]. The stack is left as JIT code has it, as just after a call.
+    // tag]. The stack is left 16-aligned, as JIT code has it. See Note [Stencil alignment].
     dynasm!(ops
         ; .arch x64
         ; push r14
         ; push rdx
         ; push r12
-        ; sub rsp, 8
         ; mov r14, QWORD LBoxed::NUMBER_TAG as i64
         ; mov r12, rcx
     );
@@ -397,7 +404,6 @@ fn standalone(op: &dyn Emitted) -> Standing {
         }
         dynasm!(ops
             ; .arch x64
-            ; add rsp, 8
             ; pop r12
             ; add rsp, 8
             ; pop r14
@@ -408,7 +414,7 @@ fn standalone(op: &dyn Emitted) -> Standing {
     dynasm!(ops ; .arch x64 ; =>exits.cold);
     match op.cold() {
         Some(cold) => {
-            dynasm!(ops ; .arch x64 ; mov r10, QWORD [rsp + 16]);
+            dynasm!(ops ; .arch x64 ; mov r10, QWORD [rsp + 8]);
             cold(&mut ops, &regs, &Record);
         }
         None => dynasm!(ops ; .arch x64 ; ud2),

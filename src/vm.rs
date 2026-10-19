@@ -1833,6 +1833,9 @@ pub struct RunState<'src, 'intern> {
     /// The record of the site whose window op's cold stencil is running. See
     /// Note [Cold stencils].
     pub cold_site: *const u64,
+    /// An emitted op's cold path's call out of line: the function, then its arguments after the
+    /// state. See Note [Emitted ops].
+    pub cold_call: [u64; crate::emitted::COLD_CALL],
     /// The last return's `RETURNED | effects << EFFECTS_SHIFT | id`, `id`
     /// naming what it returned and `effects` its function's, which
     /// the continuation of the call it returned from guards on. See Note [Call
@@ -2828,6 +2831,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 base,
                 top,
                 cold_site: core::ptr::null(),
+                cold_call: [0; crate::emitted::COLD_CALL],
                 returned: 0,
                 returned_at: 0,
                 resume: 0,

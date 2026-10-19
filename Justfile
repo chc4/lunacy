@@ -645,6 +645,13 @@ gdb-benchmark benchmark:
     {{SHARED}} cargo build --release --bin bench
     gdb --args ./target/release/bench working/{{benchmark}}.bin
 
+# The release build of `benchmark` under gdb, unattended: where it stops, its instructions and
+# registers there, and the backtrace.
+gdb-crash benchmark:
+    just _luac {{benchmark}}
+    {{SHARED}} cargo build --release --bin bench
+    gdb -batch -ex run -ex 'x/12i $pc-24' -ex 'info registers' -ex bt --args ./target/release/bench working/{{benchmark}}.bin
+
 # Profile a benchmark, built with the `flamegraph` profile (the unsafe build with
 # frame pointers) and unwound through frame pointers, as perf's default DWARF
 # unwinding can't unwind JIT code, which has no unwind tables (`tools/unwound.py`

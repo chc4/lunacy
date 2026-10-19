@@ -724,9 +724,9 @@ fn emit_entry_check(ops: &mut crate::emitted::Assembler, exits: &crate::emitted:
     let key_at = at + core::mem::offset_of!(Entry<'static, 'static>, key) as i32;
     dynasm!(ops
         ; .arch x64
-        ; cmp QWORD [rax + hash_field(core::mem::offset_of!(HashPart<'static, 'static>, len))], len
+        ; cmp QWORD [BYTE rax + byte(hash_field(core::mem::offset_of!(HashPart<'static, 'static>, len)))], len
         ; jbe =>exits.cold
-        ; mov r10, QWORD [rax + hash_field(core::mem::offset_of!(HashPart<'static, 'static>, entries))]
+        ; mov r10, QWORD [BYTE rax + byte(hash_field(core::mem::offset_of!(HashPart<'static, 'static>, entries)))]
         ; cmp DWORD [r10 + key_at], key as u32 as i32
         ; jne =>exits.cold
         ; cmp DWORD [r10 + key_at + 4], (key >> 32) as u32 as i32
@@ -741,13 +741,18 @@ fn emit_absence_check(ops: &mut crate::emitted::Assembler, exits: &crate::emitte
     // The mask is below 2^31: its slots are u32 positions.
     dynasm!(ops
         ; .arch x64
-        ; mov r10, QWORD [rax + hash_field(core::mem::offset_of!(HashPart<'static, 'static>, mask))]
+        ; mov r10, QWORD [BYTE rax + byte(hash_field(core::mem::offset_of!(HashPart<'static, 'static>, mask)))]
         ; and r10, (hash & 0x7fff_ffff) as i32
         ; shl r10, 2
-        ; add r10, QWORD [rax + hash_field(core::mem::offset_of!(HashPart<'static, 'static>, indices))]
+        ; add r10, QWORD [BYTE rax + byte(hash_field(core::mem::offset_of!(HashPart<'static, 'static>, indices)))]
         ; cmp DWORD [r10], 0
         ; jne =>exits.cold
     );
+}
+
+/// `disp`, a displacement an instruction encodes in a byte. See Note [Hash part layout].
+fn byte(disp: i32) -> i8 {
+    i8::try_from(disp).unwrap_or_else(|_| panic!("a displacement of {disp} past a byte"))
 }
 
 /// Write the running frame's witness of `href` for the table in rax: at entry `index`, its value
@@ -756,42 +761,41 @@ fn emit_absence_check(ops: &mut crate::emitted::Assembler, exits: &crate::emitte
 fn emit_witness_write(ops: &mut crate::emitted::Assembler, exits: &crate::emitted::Exits, href: u8, index: usize, valued: bool) {
     use crate::hash_part::Entry;
     use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
-    let state = |field: usize| field as i32;
-    let base = state(core::mem::offset_of!(RunState<'static, 'static>, witness_base));
-    let top = state(core::mem::offset_of!(RunState<'static, 'static>, witness_top));
-    let len = state(core::mem::offset_of!(RunState<'static, 'static>, hash_witnesses) + crate::vm::Witnesses::LEN);
-    let witness = |field: usize| field as i32;
+    let size = core::mem::size_of::<HashWitness>();
+    let data = (core::mem::offset_of!(RunState<'static, 'static>, hash_witnesses) + crate::vm::Witnesses::DATA) as i32;
+    let len = (core::mem::offset_of!(RunState<'static, 'static>, hash_witnesses) + crate::vm::Witnesses::LEN) as i32;
+    // r10 is past the witness, so its fields are just below.
+    let field = |field: usize| byte(field as i32 - size as i32);
+    let epoch = byte(crate::generators::table_field(core::mem::offset_of!(Table<'static, 'static>, epoch)));
     dynasm!(ops
         ; .arch x64
-        ; mov r10, QWORD [r12 + base]
+        ; mov r10, QWORD r12 => RunState.witness_base
         ; add r10, href as i32 + 1
         ; cmp r10, QWORD [r12 + len]
         ; ja =>exits.cold
-        ; cmp r10, QWORD [r12 + top]
+        ; cmp r10, QWORD r12 => RunState.witness_top
         ; jbe >topped
-        ; mov QWORD [r12 + top], r10
+        ; mov QWORD r12 => RunState.witness_top, r10
         ; topped:
-    );
-    crate::emitted::witness(ops, href, 10);
-    dynasm!(ops
-        ; .arch x64
-        ; mov QWORD [r10 + witness(core::mem::offset_of!(HashWitness, table))], rax
-        ; mov rax, QWORD [rax + crate::generators::table_field(core::mem::offset_of!(Table<'static, 'static>, epoch))]
-        ; mov QWORD [r10 + witness(core::mem::offset_of!(HashWitness, epoch))], rax
-        ; mov QWORD [r10 + witness(core::mem::offset_of!(HashWitness, index))], index as i32
+        ; shl r10, size.trailing_zeros() as i8
+        ; add r10, QWORD [r12 + data]
+        ; mov QWORD [BYTE r10 + field(core::mem::offset_of!(HashWitness, table))], rax
+        ; mov rax, QWORD [BYTE rax + epoch]
+        ; mov QWORD [BYTE r10 + field(core::mem::offset_of!(HashWitness, epoch))], rax
+        ; mov QWORD [BYTE r10 + field(core::mem::offset_of!(HashWitness, index))], index as i32
     );
     if valued {
         // Its entry check found the offset fits.
         let value = (index * core::mem::size_of::<Entry<'static, 'static>>() + core::mem::offset_of!(Entry<'static, 'static>, value)) as i32;
         dynasm!(ops
             ; .arch x64
-            ; mov rax, QWORD [r10 + witness(core::mem::offset_of!(HashWitness, table))]
-            ; mov rax, QWORD [rax + hash_field(core::mem::offset_of!(HashPart<'static, 'static>, entries))]
+            ; mov rax, QWORD [BYTE r10 + field(core::mem::offset_of!(HashWitness, table))]
+            ; mov rax, QWORD [BYTE rax + byte(hash_field(core::mem::offset_of!(HashPart<'static, 'static>, entries)))]
             ; add rax, value
-            ; mov QWORD [r10 + witness(core::mem::offset_of!(HashWitness, value))], rax
+            ; mov QWORD [BYTE r10 + field(core::mem::offset_of!(HashWitness, value))], rax
         );
     } else {
-        dynasm!(ops ; .arch x64 ; mov QWORD [r10 + witness(core::mem::offset_of!(HashWitness, value))], 0);
+        dynasm!(ops ; .arch x64 ; mov QWORD [BYTE r10 + field(core::mem::offset_of!(HashWitness, value))], 0);
     }
 }
 
@@ -816,7 +820,7 @@ crate::emitted::emitted!(HrefInit, [at: u64, key: u64], [], |ops, exits| (table)
     emit_witness_write(ops, exits, href, index, true);
 } cold |record| {
     use crate::emitted::Arg;
-    record.call(ops, href_init_cold as *const () as usize, &[Arg::State, Arg::Reg(table), Arg::Capture(at), Arg::Capture(key)]);
+    record.call(ops, href_init_cold as *const () as usize, &[Arg::Reg(table), Arg::Capture(at), Arg::Capture(key)]);
     record.exit_by(ops);
 });
 
@@ -867,21 +871,22 @@ crate::emitted::emitted!(HrefInitAt, [at: u64, key: u64, link: u8], [META: bool]
     use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
     let (href, index) = (at as u8, (at >> 8) as usize);
     // No table there is a miss, which the cold path finds again.
-    crate::emitted::witness(ops, link, 10);
+    use crate::emitted::witness_at;
+    crate::emitted::witnesses(ops);
     if META {
         // An absent metatable is null.
-        let metatable = crate::generators::table_field(core::mem::offset_of!(Table<'static, 'static>, metatable));
+        let metatable = byte(crate::generators::table_field(core::mem::offset_of!(Table<'static, 'static>, metatable)));
         dynasm!(ops
             ; .arch x64
-            ; mov rax, QWORD [r10 + core::mem::offset_of!(HashWitness, table) as i32]
-            ; mov rax, QWORD [rax + metatable]
+            ; mov rax, QWORD [r10 + witness_at(link, core::mem::offset_of!(HashWitness, table))]
+            ; mov rax, QWORD [BYTE rax + metatable]
             ; test rax, rax
             ; jz =>exits.cold
         );
     } else {
         dynasm!(ops
             ; .arch x64
-            ; mov rax, QWORD [r10 + core::mem::offset_of!(HashWitness, value) as i32]
+            ; mov rax, QWORD [r10 + witness_at(link, core::mem::offset_of!(HashWitness, value))]
             ; mov rax, QWORD [rax]
             ; mov r10, QWORD LBoxed::NOT_CELL_MASK as i64
             ; test rax, r10
@@ -894,7 +899,7 @@ crate::emitted::emitted!(HrefInitAt, [at: u64, key: u64, link: u8], [META: bool]
     emit_witness_write(ops, exits, href, index, true);
 } cold |record| {
     use crate::emitted::Arg;
-    record.call(ops, href_init_at_cold::<META> as *const () as usize, &[Arg::State, Arg::Capture(at), Arg::Capture(key), Arg::Capture(link)]);
+    record.call(ops, href_init_at_cold::<META> as *const () as usize, &[Arg::Capture(at), Arg::Capture(key), Arg::Capture(link)]);
     record.exit_by(ops);
 });
 
@@ -937,7 +942,7 @@ crate::emitted::emitted!(HrefMiss, [at: u64, key: u64, hash: u64], [], |ops, exi
     emit_witness_write(ops, exits, href, index, false);
 } cold |record| {
     use crate::emitted::Arg;
-    record.call(ops, href_miss_cold as *const () as usize, &[Arg::State, Arg::Reg(table), Arg::Capture(at), Arg::Capture(key)]);
+    record.call(ops, href_miss_cold as *const () as usize, &[Arg::Reg(table), Arg::Capture(at), Arg::Capture(key)]);
     record.exit_by(ops);
 });
 

@@ -250,11 +250,11 @@ extern "rust-cold" fn index_value<'src, 'intern>(owner: &mut Owner, state: &mut 
 // table. See Note [Hash witnesses].
 crate::emitted::emitted!(FieldLoad, [href: u8], [], |ops, exits| (out dest) {
     use dynasmrt::{dynasm, DynasmApi};
-    let value = core::mem::offset_of!(HashWitness, value) as i32;
-    crate::emitted::witness(ops, href, dest);
+    use crate::emitted::witness_at;
+    crate::emitted::witnesses(ops);
     dynasm!(ops
         ; .arch x64
-        ; mov Rq(dest), QWORD [Rq(dest) + value]
+        ; mov Rq(dest), QWORD [r10 + witness_at(href, core::mem::offset_of!(HashWitness, value))]
         ; mov Rq(dest), QWORD [Rq(dest)]
     );
 });
@@ -650,43 +650,44 @@ pub(crate) fn table_field(field: usize) -> i32 {
 
 /// A field store's write barrier, in a collection cycle, from its cold path: `table` is the
 /// table's boxed value. See Note [Write barriers].
-extern "sysv64" fn field_barrier(table: u64) {
+extern "sysv64" fn field_barrier(_: *mut RunState<'static, 'static>, table: u64) {
     // SAFETY: the store's table, alive in its register.
     let LValue::Table(tab) = unsafe { LBoxed::from_bits(table) }.unbox() else { unreachable!("a store's table") };
     tab.barrier_slow();
 }
 
-/// Store rax through the witness of `href`, through r10. See Note [Hash witnesses].
-fn store_witnessed(ops: &mut crate::emitted::Assembler, href: u8) {
+/// Store `value()`'s value, which it leaves in rax, through the witness of `href`, moving the table
+/// in general register `table` to a new epoch as `retype` says, through r10, rax and xmm15. See
+/// Note [Hash witnesses] and `Retype`.
+fn store_witnessed(ops: &mut crate::emitted::Assembler, retype: Retype, href: u8, table: u8, value: impl FnOnce(&mut crate::emitted::Assembler)) {
     use dynasmrt::{dynasm, DynasmApi};
-    let value = core::mem::offset_of!(HashWitness, value) as i32;
-    crate::emitted::witness(ops, href, 10);
-    dynasm!(ops
-        ; .arch x64
-        ; mov r10, QWORD [r10 + value]
-        ; mov QWORD [r10], rax
-    );
-}
-
-/// Move the table in general register `table` to a new epoch as a store's `Retype` says, through
-/// r10 and rax.
-fn retype_epoch(ops: &mut crate::emitted::Assembler, retype: Retype, href: u8, table: u8) {
-    use dynasmrt::{dynasm, DynasmApi};
+    use crate::emitted::witness_at;
     let epoch = table_field(core::mem::offset_of!(Table<'static, 'static>, epoch));
-    let witnessed = core::mem::offset_of!(HashWitness, epoch) as i32;
+    value(ops);
     match retype {
-        Retype::Same => {}
-        Retype::Unknown => dynasm!(ops ; .arch x64 ; inc QWORD [Rq(table) + epoch]),
+        Retype::Same => crate::emitted::witnesses(ops),
+        Retype::Unknown => {
+            crate::emitted::witnesses(ops);
+            dynasm!(ops ; .arch x64 ; inc QWORD [Rq(table) + epoch]);
+        }
+        // The value waits in xmm15 while rax takes the epoch to the witness.
         Retype::Known => {
+            dynasm!(ops ; .arch x64 ; vmovq xmm15, rax);
+            crate::emitted::witnesses(ops);
             dynasm!(ops
                 ; .arch x64
                 ; inc QWORD [Rq(table) + epoch]
                 ; mov rax, QWORD [Rq(table) + epoch]
+                ; mov QWORD [r10 + witness_at(href, core::mem::offset_of!(HashWitness, epoch))], rax
+                ; vmovq rax, xmm15
             );
-            crate::emitted::witness(ops, href, 10);
-            dynasm!(ops ; .arch x64 ; mov QWORD [r10 + witnessed], rax);
         }
     }
+    dynasm!(ops
+        ; .arch x64
+        ; mov r10, QWORD [r10 + witness_at(href, core::mem::offset_of!(HashWitness, value))]
+        ; mov QWORD [r10], rax
+    );
 }
 
 /// The write barrier's test, last in a store: in a collection cycle, the cold path. See Note
@@ -953,23 +954,23 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // [Widening] and [Write barriers].
                 crate::emitted::emitted!(FieldStore, [href: u8], [RETYPE: Retype, DOUBLE: bool], |ops, exits| (table, value) {
                     use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
-                    dynasm!(ops ; .arch x64 ; mov rax, Rq(value));
-                    if DOUBLE {
-                        dynasm!(ops
-                            ; .arch x64
-                            ; and rax, r14
-                            ; cmp rax, r14
-                            ; mov rax, Rq(value)
-                            ; jne >stored
-                            ; cvtsi2sd xmm15, Rd(value)
-                            ; vmovq rax, xmm15
-                            ; mov r10, QWORD LBoxed::DOUBLE_ENCODE_OFFSET as i64
-                            ; add rax, r10
-                            ; stored:
-                        );
-                    }
-                    store_witnessed(ops, href);
-                    retype_epoch(ops, RETYPE, href, table);
+                    store_witnessed(ops, RETYPE, href, table, |ops| {
+                        dynasm!(ops ; .arch x64 ; mov rax, Rq(value));
+                        if DOUBLE {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; and rax, r14
+                                ; cmp rax, r14
+                                ; mov rax, Rq(value)
+                                ; jne >stored
+                                ; cvtsi2sd xmm15, Rd(value)
+                                ; vmovq rax, xmm15
+                                ; mov r10, QWORD LBoxed::DOUBLE_ENCODE_OFFSET as i64
+                                ; add rax, r10
+                                ; stored:
+                            );
+                        }
+                    });
                     barrier_test(ops, exits);
                 } rejoin |record| {
                     record.call(ops, field_barrier as *const () as usize, &[crate::emitted::Arg::Reg(table)]);
@@ -978,9 +979,7 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // `FieldStore` of a constant's bits, which live as long as its prototype.
                 crate::emitted::emitted!(FieldStoreK, [href: u8, value: u64], [RETYPE: Retype], |ops, exits| (table) {
                     use dynasmrt::{dynasm, DynasmApi};
-                    dynasm!(ops ; .arch x64 ; mov rax, QWORD value as i64);
-                    store_witnessed(ops, href);
-                    retype_epoch(ops, RETYPE, href, table);
+                    store_witnessed(ops, RETYPE, href, table, |ops| dynasm!(ops ; .arch x64 ; mov rax, QWORD value as i64));
                     barrier_test(ops, exits);
                 } rejoin |record| {
                     record.call(ops, field_barrier as *const () as usize, &[crate::emitted::Arg::Reg(table)]);
