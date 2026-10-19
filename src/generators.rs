@@ -246,19 +246,23 @@ extern "rust-cold" fn index_value<'src, 'intern>(owner: &mut Owner, state: &mut 
     LBoxed::box_lvalue(receiver.unbox().gettable(owner, Cow::Owned(key.unbox()), state.intern))
 }
 
-// A field through its hash key's witness.
-windowed!(GetTableHref, [href: u8], [], |owner, state, base| (out dest) {
-    // Written by the frame's `href_init` already. See Note [Hash
-    // witnesses].
-    let witness = state.hash_witnesses[state.witness_base + href as usize];
-    debug!("gettable_href with {:?}", &witness);
-    // The witness holds for the table (its epoch, or no hazard
-    // since), so its value's address does. See Note [Hash witnesses].
-    let val1 = *witness.value.cast::<LBoxed<'_, '_>>();
-
-    debug!("gettable_href fetched {val1:?}");
-    *dest = val1;
+// A field through its hash key's witness, which its `href_init` wrote, and which holds for the
+// table. See Note [Hash witnesses].
+crate::emitted::emitted!(FieldLoad, [href: u8], [], |ops, exits| (out dest) {
+    use dynasmrt::{dynasm, DynasmApi};
+    let value = core::mem::offset_of!(HashWitness, value) as i32;
+    crate::emitted::witness(ops, href, dest);
+    dynasm!(ops
+        ; .arch x64
+        ; mov Rq(dest), QWORD [Rq(dest) + value]
+        ; mov Rq(dest), QWORD [Rq(dest)]
+    );
 });
+
+/// The field hash key `href` names, into R(`dest`). See Note [Hash witnesses].
+pub(crate) fn field_load(href: u8, dest: usize) -> Rc<dyn crate::emitted::Emitted> {
+    Rc::new(FieldLoad::new(href, &[dest]))
+}
 
 // GETGLOBAL and SETGLOBAL through a global's cache, at `cache`. See Note
 // [Global caches].
@@ -469,7 +473,7 @@ pub fn emit_gettable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
         // Object shape specialization
         arg = yield YieldOp::HashKey(b, c, true);
         if let ResumeArg::HashRef(hc, _) = arg {
-            arg = yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(hc.0, &[a])));
+            arg = yield YieldOp::Emit(field_load(hc.0, a));
             // Its type: the hash key's, or found out. See Note [Field types].
             yield YieldOp::FieldType(a, hc);
         } else if !table {
@@ -638,62 +642,66 @@ fn retype(new_type: Option<LType>, htype: &CType) -> Retype {
     }
 }
 
-/// The representations a field of type `htype` may hold, as `LType::bit`s.
-fn holds_bits(htype: &CType) -> u8 {
-    match htype {
-        CType::Type(t) => t.bit(),
-        CType::Number => LType::Integer.bit() | LType::Double.bit(),
-        _ => u8::MAX,
-    }
+/// Where a table's `field`, an offset in `Table`, is from the table's boxed value: its cell's
+/// address. See Note [Hash part layout].
+pub(crate) fn table_field(field: usize) -> i32 {
+    (core::mem::offset_of!(crate::gc::GcInner<qcell::TLCell<crate::TlcOwner, Table<'static, 'static>>>, val) + field) as i32
 }
 
-/// Store through `href`'s witness into `tab`, bumping the table's epoch if the
-/// field's type changes (see `Retype`), and leaving its write barrier to the
-/// caller, after it. `expected` is the representations the field holds, as `holds_bits`.
-fn store_field<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: &Tc<Table<'src, 'intern>>, value: LBoxed<'src, 'intern>, href: u8, expected: u8, retype: Retype) {
-    let hidx = state.witness_base + href as usize;
-    let witness = state.hash_witnesses[hidx];
-    debug!("settable_href with {:?} {:?}", &witness, expected);
-    // See Note [Hash witnesses].
-    let val1 = unsafe { &mut *witness.value.cast::<LBoxed<'src, 'intern>>() };
-    debug!("settable_href {:?} {:?}", &val1, expected);
-    #[cfg(debug_assertions)]
-    assert!(expected & val1.unbox().typeof_().bit() != 0);
-    *val1 = value;
+/// A field store's write barrier, in a collection cycle, from its cold path: `table` is the
+/// table's boxed value. See Note [Write barriers].
+extern "sysv64" fn field_barrier(table: u64) {
+    // SAFETY: the store's table, alive in its register.
+    let LValue::Table(tab) = unsafe { LBoxed::from_bits(table) }.unbox() else { unreachable!("a store's table") };
+    tab.barrier_slow();
+}
+
+/// Store rax through the witness of `href`, through r10. See Note [Hash witnesses].
+fn store_witnessed(ops: &mut crate::emitted::Assembler, href: u8) {
+    use dynasmrt::{dynasm, DynasmApi};
+    let value = core::mem::offset_of!(HashWitness, value) as i32;
+    crate::emitted::witness(ops, href, 10);
+    dynasm!(ops
+        ; .arch x64
+        ; mov r10, QWORD [r10 + value]
+        ; mov QWORD [r10], rax
+    );
+}
+
+/// Move the table in general register `table` to a new epoch as a store's `Retype` says, through
+/// r10 and rax.
+fn retype_epoch(ops: &mut crate::emitted::Assembler, retype: Retype, href: u8, table: u8) {
+    use dynasmrt::{dynasm, DynasmApi};
+    let epoch = table_field(core::mem::offset_of!(Table<'static, 'static>, epoch));
+    let witnessed = core::mem::offset_of!(HashWitness, epoch) as i32;
     match retype {
         Retype::Same => {}
+        Retype::Unknown => dynasm!(ops ; .arch x64 ; inc QWORD [Rq(table) + epoch]),
         Retype::Known => {
-            tab.rw(owner).epoch += 1;
-            state.hash_witnesses[hidx].epoch = tab.rw(owner).epoch;
+            dynasm!(ops
+                ; .arch x64
+                ; inc QWORD [Rq(table) + epoch]
+                ; mov rax, QWORD [Rq(table) + epoch]
+            );
+            crate::emitted::witness(ops, href, 10);
+            dynasm!(ops ; .arch x64 ; mov QWORD [r10 + witnessed], rax);
         }
-        Retype::Unknown => tab.rw(owner).epoch += 1,
     }
 }
 
-// Store through a hash key's witness into a register's table.
-// With `DOUBLE`, an integer value is stored as a double: into a field that has held both,
-// which then holds doubles. See Note [Widening].
-windowed!(writes SetTableHref, [href: u8, expected: u8], [RETYPE: Retype, DOUBLE: bool], |owner, state, base| (table, value) {
-    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    let value = if DOUBLE && value.is_int() { LBoxed::from_double(value.as_int() as f64) } else { value };
-    store_field(owner, state, &tab, value, href, expected, RETYPE);
-    // Last. See Note [Write barriers].
-    tab.barrier_pending()
-} rejoin {
-    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    tab.barrier_slow();
-});
-windowed!(writes SetTableHrefK, [href: u8, expected: u8, value: u64], [RETYPE: Retype], |owner, state, base| (table) {
-    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    // A constant's value lives as long as its prototype.
-    let value = LBoxed::from_bits(value);
-    store_field(owner, state, &tab, value, href, expected, RETYPE);
-    // Last. See Note [Write barriers].
-    tab.barrier_pending()
-} rejoin {
-    let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    tab.barrier_slow();
-});
+/// The write barrier's test, last in a store: in a collection cycle, the cold path. See Note
+/// [Write barriers].
+fn barrier_test(ops: &mut crate::emitted::Assembler, exits: &crate::emitted::Exits) {
+    use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+    let flag = crate::gc::gc_in_progress_offset().to_le_bytes();
+    // `cmp byte fs:[flag], 0`, its address absolute through a SIB byte, not RIP-relative.
+    let cmp = [0x64, 0x80, 0x3c, 0x25, flag[0], flag[1], flag[2], flag[3], 0];
+    dynasm!(ops
+        ; .arch x64
+        ; .bytes cmp
+        ; jne =>exits.cold
+    );
+}
 
 pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
@@ -939,13 +947,51 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     Retype::Same if index => Retype::Known,
                     retype => retype,
                 };
-                let expected = holds_bits(&htype);
+                // Through its hash key's witness, the table moving to a new epoch as `RETYPE` says,
+                // and its write barrier last. With `DOUBLE`, an integer is stored as a double: into
+                // a field that has held both, which then holds doubles. See Notes [Hash witnesses],
+                // [Widening] and [Write barriers].
+                crate::emitted::emitted!(FieldStore, [href: u8], [RETYPE: Retype, DOUBLE: bool], |ops, exits| (table, value) {
+                    use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+                    dynasm!(ops ; .arch x64 ; mov rax, Rq(value));
+                    if DOUBLE {
+                        dynasm!(ops
+                            ; .arch x64
+                            ; and rax, r14
+                            ; cmp rax, r14
+                            ; mov rax, Rq(value)
+                            ; jne >stored
+                            ; cvtsi2sd xmm15, Rd(value)
+                            ; vmovq rax, xmm15
+                            ; mov r10, QWORD LBoxed::DOUBLE_ENCODE_OFFSET as i64
+                            ; add rax, r10
+                            ; stored:
+                        );
+                    }
+                    store_witnessed(ops, href);
+                    retype_epoch(ops, RETYPE, href, table);
+                    barrier_test(ops, exits);
+                } rejoin |record| {
+                    record.call(ops, field_barrier as *const () as usize, &[crate::emitted::Arg::Reg(table)]);
+                    record.exit(ops, 0);
+                });
+                // `FieldStore` of a constant's bits, which live as long as its prototype.
+                crate::emitted::emitted!(FieldStoreK, [href: u8, value: u64], [RETYPE: Retype], |ops, exits| (table) {
+                    use dynasmrt::{dynasm, DynasmApi};
+                    dynasm!(ops ; .arch x64 ; mov rax, QWORD value as i64);
+                    store_witnessed(ops, href);
+                    retype_epoch(ops, RETYPE, href, table);
+                    barrier_test(ops, exits);
+                } rejoin |record| {
+                    record.call(ops, field_barrier as *const () as usize, &[crate::emitted::Arg::Reg(table)]);
+                    record.exit(ops, 0);
+                });
                 if c & 0x100 == 0 {
-                    arg = yield YieldOp::ExecWindow(match retype {
-                        Retype::Same => Rc::new(SetTableHref::<{ Retype::Same }, false>::new(hb.0, expected, &[a, c])) as Rc<dyn Window>,
-                        Retype::Known if to_double => Rc::new(SetTableHref::<{ Retype::Known }, true>::new(hb.0, expected, &[a, c])),
-                        Retype::Known => Rc::new(SetTableHref::<{ Retype::Known }, false>::new(hb.0, expected, &[a, c])),
-                        Retype::Unknown => Rc::new(SetTableHref::<{ Retype::Unknown }, false>::new(hb.0, expected, &[a, c])),
+                    arg = yield YieldOp::Emit(match retype {
+                        Retype::Same => Rc::new(FieldStore::<{ Retype::Same }, false>::new(hb.0, &[a, c])) as Rc<dyn crate::emitted::Emitted>,
+                        Retype::Known if to_double => Rc::new(FieldStore::<{ Retype::Known }, true>::new(hb.0, &[a, c])),
+                        Retype::Known => Rc::new(FieldStore::<{ Retype::Known }, false>::new(hb.0, &[a, c])),
+                        Retype::Unknown => Rc::new(FieldStore::<{ Retype::Unknown }, false>::new(hb.0, &[a, c])),
                     });
                 } else {
                     let value = match whole {
@@ -955,9 +1001,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                             bits
                         }
                     };
-                    arg = yield YieldOp::ExecWindow(match retype {
-                        Retype::Same => Rc::new(SetTableHrefK::<{ Retype::Same }>::new(hb.0, expected, value, &[a])) as Rc<dyn Window>,
-                        Retype::Known => Rc::new(SetTableHrefK::<{ Retype::Known }>::new(hb.0, expected, value, &[a])),
+                    arg = yield YieldOp::Emit(match retype {
+                        Retype::Same => Rc::new(FieldStoreK::<{ Retype::Same }>::new(hb.0, value, &[a])) as Rc<dyn crate::emitted::Emitted>,
+                        Retype::Known => Rc::new(FieldStoreK::<{ Retype::Known }>::new(hb.0, value, &[a])),
                         Retype::Unknown => unreachable!("a constant of unknown type"),
                     });
                 }

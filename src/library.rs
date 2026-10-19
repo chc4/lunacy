@@ -788,7 +788,7 @@ fn learn_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate:
             if let ResumeArg::Keys(keys) = (yield YieldOp::Learn(a + 1)) {
                 for i in 0..keys.len() {
                     if let ResumeArg::HashRef(href, kind) = (yield YieldOp::HashKeyNamed(a + 1, keys[i].clone(), true)) {
-                        yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::GetTableHref::new(href.0, &[a])));
+                        yield YieldOp::Emit(crate::generators::field_load(href.0, a));
                         yield YieldOp::FieldType(a, href);
                         if kind == CType::Type(LType::Table) {
                             yield YieldOp::LearnKind(a);

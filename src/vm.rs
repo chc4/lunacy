@@ -1764,18 +1764,22 @@ impl Default for HashWitness {
 
 /// The hash witnesses of every frame. See Note [Hash witnesses].
 pub struct Witnesses {
-    /// The address of the first witness, for JIT code (`Witnesses::DATA`).
+    /// The address of the first witness, and how many there are, for JIT code
+    /// (`Witnesses::DATA`, `Witnesses::LEN`).
     data: *mut HashWitness,
+    len: usize,
     vec: FVec<HashWitness>,
 }
 
 impl Witnesses {
     /// Where in a `Witnesses` the first witness's address is.
     pub const DATA: usize = core::mem::offset_of!(Witnesses, data);
+    /// Where in a `Witnesses` their count is.
+    pub const LEN: usize = core::mem::offset_of!(Witnesses, len);
 
     pub fn new() -> Self {
         let mut vec: FVec<HashWitness> = vec![].into();
-        Witnesses { data: vec.as_mut_ptr(), vec }
+        Witnesses { data: vec.as_mut_ptr(), len: 0, vec }
     }
 
     pub fn len(&self) -> usize {
@@ -1786,7 +1790,7 @@ impl Witnesses {
     pub fn grow(&mut self, len: usize) {
         if self.vec.len() < len {
             self.vec.resize_with(len, HashWitness::default);
-            self.data = self.vec.as_mut_ptr();
+            (self.data, self.len) = (self.vec.as_mut_ptr(), self.vec.len());
         }
     }
 }

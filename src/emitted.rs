@@ -21,13 +21,20 @@ use crate::window::Access;
 // shuffle brings them into a run. It declares its operands as a window op does, each boxed in a
 // window register or a double unboxed in its paired XMM register (Note [Unboxed doubles]), and
 // its code appends instructions given each operand's machine register. Besides its operands'
-// registers it may use rax, r10 and xmm15, which hold nothing across an op. Operands of one slot
-// are all of one form, as the window holds a slot's value in one place.
+// registers it may use rax, r10 and xmm15, which hold nothing across an op, and r12 holds the
+// running state. Operands of one slot are all of one form, as the window holds a slot's value in
+// one place.
+//
+// Its cold path may call a function out of line (`Record::call`), saving every register the
+// window holds a value in that the call may clobber, and go on at the exit the function returns.
+// So a slow path, a write barrier or a lookup the hot path couldn't finish, costs the hot path
+// nothing.
 //
 // The interpreter runs the same instructions: a standalone function, assembled once for each op
-// and its constants, loads its inputs from an array into registers, runs the op's code, and
-// stores its outputs to another. The interpreter unboxes and boxes the values on the way, as the
-// JIT's window does at the stack, so either runs the op on the same unboxed values.
+// and its constants, loads its inputs from an array into registers, the state into r12, runs the
+// op's code, and stores its outputs to another. The interpreter unboxes and boxes the values on
+// the way, as the JIT's window does at the stack, so either runs the op on the same unboxed
+// values.
 
 /// The assembler emitted ops append their code to.
 pub type Assembler = dynasmrt::VecAssembler<dynasmrt::x64::X64Relocation>;
@@ -62,7 +69,87 @@ impl Record {
     pub fn exit(&self, ops: &mut Assembler, exit: usize) {
         dynasm!(ops ; .arch x64 ; jmp QWORD [r10 + (exit * 8) as i32]);
     }
+
+    /// Go on at the exit rax holds, 0 or 1.
+    pub fn exit_by(&self, ops: &mut Assembler) {
+        dynasm!(ops ; .arch x64 ; jmp QWORD [r10 + rax * 8]);
+    }
+
+    /// Call `f`, a `sysv64` function, on `args`, keeping every register the window holds a value in:
+    /// its result is in rax after, and the record's address in r10 again. See Note [Emitted ops].
+    pub fn call(&self, ops: &mut Assembler, f: usize, args: &[Arg]) {
+        assert!(args.len() <= ARGS.len(), "more arguments than registers");
+        for &reg in &SAVED {
+            dynasm!(ops ; .arch x64 ; push Rq(reg));
+        }
+        // Past the registers, the XMM registers and the stack's alignment: code runs with the stack as
+        // just after a call.
+        let spill = (8 * XMMS + 8) as i32;
+        dynasm!(ops ; .arch x64 ; sub rsp, spill);
+        for xmm in 0..XMMS as u8 {
+            dynasm!(ops ; .arch x64 ; vmovq QWORD [rsp + 8 * xmm as i32], Rx(xmm));
+        }
+        // Where a saved register is: the registers pushed last are nearest.
+        let saved = |reg: u8| SAVED.iter().position(|&r| r == reg).map(|at| spill + (8 * (SAVED.len() - 1 - at)) as i32);
+        for (&arg, &into) in args.iter().zip(&ARGS) {
+            match arg {
+                Arg::State => dynasm!(ops ; .arch x64 ; mov Rq(into), r12),
+                Arg::Reg(reg) => match saved(reg) {
+                    Some(at) => dynasm!(ops ; .arch x64 ; mov Rq(into), QWORD [rsp + at]),
+                    None => dynasm!(ops ; .arch x64 ; mov Rq(into), Rq(reg)),
+                },
+                Arg::Capture(capture) => self.capture(ops, capture, into),
+            }
+        }
+        dynasm!(ops
+            ; .arch x64
+            ; mov rax, QWORD f as i64
+            ; call rax
+        );
+        for xmm in 0..XMMS as u8 {
+            dynasm!(ops ; .arch x64 ; vmovq Rx(xmm), QWORD [rsp + 8 * xmm as i32]);
+        }
+        dynasm!(ops ; .arch x64 ; add rsp, spill);
+        for &reg in SAVED.iter().rev() {
+            dynasm!(ops ; .arch x64 ; pop Rq(reg));
+        }
+    }
 }
+
+/// Load the address of the running frame's witness of hash key `href` into general register
+/// `into`, through r10. See Note [Hash witnesses].
+pub fn witness(ops: &mut Assembler, href: u8, into: u8) {
+    let data = (core::mem::offset_of!(RunState<'static, 'static>, hash_witnesses) + crate::vm::Witnesses::DATA) as i32;
+    let base = core::mem::offset_of!(RunState<'static, 'static>, witness_base) as i32;
+    let size = core::mem::size_of::<crate::vm::HashWitness>() as i32;
+    dynasm!(ops
+        ; .arch x64
+        ; imul r10, QWORD [r12 + base], size
+        ; add r10, QWORD [r12 + data]
+        ; lea Rq(into), [r10 + href as i32 * size]
+    );
+}
+
+/// An argument of a cold path's call out of line (`Record::call`).
+#[derive(Debug, Clone, Copy)]
+pub enum Arg {
+    /// The running state.
+    State,
+    /// A register's value, as it was when the call began.
+    Reg(u8),
+    /// A capture's value, from the record, by the capture's index.
+    Capture(usize),
+}
+
+/// The registers a call's arguments go in, in order.
+const ARGS: [u8; 6] = [7 /* rdi */, 6 /* rsi */, 2 /* rdx */, 1 /* rcx */, 8 /* r8 */, 9 /* r9 */];
+
+/// The general registers a call may clobber that the window, or a cold path, holds a value in: the
+/// window's but r15, and r10, the record's address.
+const SAVED: [u8; 8] = [7 /* rdi */, 6 /* rsi */, 2 /* rdx */, 1 /* rcx */, 8 /* r8 */, 9 /* r9 */, 11 /* r11 */, 10 /* r10 */];
+
+/// The XMM registers the window holds unboxed doubles in.
+const XMMS: usize = crate::window::WINDOW;
 
 /// An op the JIT lays out as its own instructions, as `emitted!` declares one. See Note [Emitted
 /// ops].
@@ -108,7 +195,8 @@ impl std::fmt::Display for dyn Emitted {
 
 /// Declare an emitted op, as `windowed!` declares a window op:
 ///
-/// `emitted!([select] Name, [captures], [const params], |ops, exits| (operands) { code } [cold |record| { code }])`
+/// `emitted!([select] Name, [captures], [const params], |ops, exits| (operands) { code } [cold |record| { code }])`, or
+/// `rejoin |record| { code }` for a cold path that goes on at exit 0, so the op selects nothing
 ///
 /// Its captures are its constants, by name and type; its const parameters are the type's. Its
 /// operands are declared as a window op's: each by name, read unless `out`, boxed unless `f64`,
@@ -129,6 +217,9 @@ macro_rules! emitted {
     };
     ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block cold |$record:ident| $cold:block) => {
         $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, true, [|$record| $cold]] [] $($operands)*);
+    };
+    ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block rejoin |$record:ident| $cold:block) => {
+        $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, false, [|$record| $cold]] [] $($operands)*);
     };
     ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block) => {
         $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, false, []] [] $($operands)*);
@@ -169,7 +260,7 @@ macro_rules! emitted {
         #[derive(Debug, Clone)]
         struct $name<$(const $cp: $cpt),*> {
             $($cap: $cty,)*
-            operands: [usize; [$(stringify!($op)),*].len()],
+            operands: [usize; <[&str]>::len(&[$(stringify!($op)),*])],
         }
 
         impl<$(const $cp: $cpt),*> $name<$($cp),*> {
@@ -225,8 +316,8 @@ macro_rules! emitted {
 pub(crate) use emitted;
 
 /// A standalone's signature: the inputs, in the order the op declares them; where its outputs
-/// go, likewise; and its site's record. It returns the exit it took.
-type Standalone = unsafe extern "sysv64" fn(*const u64, *mut u64, *const u8) -> u64;
+/// go, likewise; its site's record; and the running state. It returns the exit it took.
+type Standalone = unsafe extern "sysv64" fn(*const u64, *mut u64, *const u8, *mut RunState<'static, 'static>) -> u64;
 
 /// The general registers a standalone loads boxed inputs into: none the call passes pointers in,
 /// nor an op's scratch.
@@ -261,12 +352,16 @@ fn standalone(op: &dyn Emitted) -> Standing {
         }
     }
     assert!(xmms < 8, "a standalone's XMM registers past the window's");
-    // r14 is callee-saved, and the pinned tag in JIT code. See Note [Pinned tag].
+    // r14 is callee-saved, and the pinned tag in JIT code, and r12 the state. See Note [Pinned
+    // tag]. The stack is left as JIT code has it, as just after a call.
     dynasm!(ops
         ; .arch x64
         ; push r14
         ; push rdx
+        ; push r12
+        ; sub rsp, 8
         ; mov r14, QWORD LBoxed::NUMBER_TAG as i64
+        ; mov r12, rcx
     );
     let mut input = 0;
     for (i, access) in op.accesses().iter().enumerate() {
@@ -303,6 +398,8 @@ fn standalone(op: &dyn Emitted) -> Standing {
         dynasm!(ops
             ; .arch x64
             ; add rsp, 8
+            ; pop r12
+            ; add rsp, 8
             ; pop r14
             ; mov eax, exit
             ; ret
@@ -311,7 +408,7 @@ fn standalone(op: &dyn Emitted) -> Standing {
     dynasm!(ops ; .arch x64 ; =>exits.cold);
     match op.cold() {
         Some(cold) => {
-            dynasm!(ops ; .arch x64 ; mov r10, QWORD [rsp]);
+            dynasm!(ops ; .arch x64 ; mov r10, QWORD [rsp + 16]);
             cold(&mut ops, &regs, &Record);
         }
         None => dynasm!(ops ; .arch x64 ; ud2),
@@ -354,7 +451,8 @@ pub fn interp(op: &dyn Emitted, state: &mut RunState<'_, '_>) {
         }
         // SAFETY: the standalone reads as many inputs as the op has and writes as many outputs.
         let f: Standalone = unsafe { core::mem::transmute(standing.exec.as_ptr()) };
-        unsafe { f(inputs.as_ptr(), outputs.as_mut_ptr(), record.as_ptr()) }
+        let state: *mut RunState<'static, 'static> = (state as *mut RunState<'_, '_>).cast();
+        unsafe { f(inputs.as_ptr(), outputs.as_mut_ptr(), record.as_ptr(), state) }
     });
     if op.selects() {
         state.select = exit as usize;
@@ -413,7 +511,7 @@ mod tests {
         }
         let f: Standalone = unsafe { core::mem::transmute(standing.exec.as_ptr()) };
         let mut out = [0u64; 8];
-        let exit = unsafe { f(inputs.as_ptr(), out.as_mut_ptr(), record.as_ptr()) };
+        let exit = unsafe { f(inputs.as_ptr(), out.as_mut_ptr(), record.as_ptr(), core::ptr::null_mut()) };
         (out, exit)
     }
 

@@ -590,6 +590,16 @@ pub fn gc_in_progress() -> bool {
     GC_IN_PROGRESS.with(|flag| flag.get())
 }
 
+/// Where `GC_IN_PROGRESS` is from the thread pointer (`fs:0`), for JIT code reading it inline.
+/// It is a `const` thread-local of the executable, so the same for every thread.
+pub fn gc_in_progress_offset() -> i32 {
+    let flag = GC_IN_PROGRESS.with(|flag| flag as *const Cell<bool> as usize);
+    let thread: usize;
+    // SAFETY: on x86-64 Linux, `fs:0` holds the thread pointer itself.
+    unsafe { core::arch::asm!("mov {}, fs:0", out(reg) thread) };
+    (flag.wrapping_sub(thread) as isize).try_into().expect("a thread-local within 2 GB of the thread pointer")
+}
+
 /// Set the heap's phase, and `GC_IN_PROGRESS` with it. See Note [Write barriers].
 unsafe fn set_phase(heap: *mut Heap, phase: Phase) {
     let marking = matches!(phase, Phase::Mark);
