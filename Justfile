@@ -1154,6 +1154,16 @@ alloc-stats benchmark times='10' policies='streaming unidirectional':
     {{SHARED}} cargo build --release --features alloc_stats --bin bench
     for policy in {{policies}}; do LUNACY_TRACES=$policy ./target/release/bench working/{{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-$policy.txt; echo "target/alloc-stats-{{benchmark}}-$policy.txt"; done
 
+# `alloc-stats` of `benchmark` at revision `ref` and here, in
+# target/alloc-stats-<benchmark>-<ref>.txt and target/alloc-stats-<benchmark>-this.txt.
+alloc-stats-vs ref benchmark times='10':
+    just _luac {{benchmark}}
+    just _compare-worktree {{ref}}
+    cd target/compare/{{ref}} && {{SHARED}} cargo build --release --features alloc_stats --bin bench
+    {{SHARED}} cargo build --release --features alloc_stats --bin bench
+    target/compare/{{ref}}/target/release/bench working/{{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-{{ref}}.txt
+    ./target/release/bench working/{{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-this.txt
+
 # Revision `ref` checked out in a detached worktree, target/compare/<ref>, kept
 # for reruns, its submodules linked to this checkout's.
 _compare-worktree ref:
