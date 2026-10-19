@@ -1525,7 +1525,11 @@ fn emit_metamethod(event: &'static [u8], dest: usize, lhs: usize, rhs: usize) ->
     #[coroutine]
     move |mut arg: ResumeArg| {
         for operand in [lhs, rhs] {
-            if operand & 0x100 != 0 || (yield YieldOp::Guard(operand, LType::Table)) != ResumeArg::Matched {
+            // A table's or a userdata's metatable, which only they have.
+            if operand & 0x100 != 0 {
+                continue;
+            }
+            if (yield YieldOp::Guard(operand, LType::Table)) != ResumeArg::Matched && (yield YieldOp::Guard(operand, LType::Userdata)) != ResumeArg::Matched {
                 continue;
             }
             let ResumeArg::HashRef(handler, _) = (yield YieldOp::MetaKey(operand, event)) else { continue };

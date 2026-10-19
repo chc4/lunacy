@@ -42,6 +42,8 @@ pub enum Place {
     Metatable(HashRef),
     /// The table in hash key `h`'s field, through its witness: an `__index`.
     Index(HashRef),
+    /// The metatable of the hash key's register's userdata. See Note [Arithmetic metamethods].
+    UserdataMetatable,
 }
 
 impl Place {
@@ -51,6 +53,7 @@ impl Place {
             Place::Register => 0,
             Place::Metatable(h) => 1 << 8 | h.0 as u16,
             Place::Index(h) => 2 << 8 | h.0 as u16,
+            Place::UserdataMetatable => 3 << 8,
         }
     }
 
@@ -59,8 +62,14 @@ impl Place {
         match bits >> 8 {
             0 => Place::Register,
             1 => Place::Metatable(h),
-            _ => Place::Index(h),
+            2 => Place::Index(h),
+            _ => Place::UserdataMetatable,
         }
+    }
+
+    /// Whether the table is found from the hash key's own register, which its hash keys live with.
+    pub fn own_register(self) -> bool {
+        matches!(self, Place::Register | Place::UserdataMetatable)
     }
 }
 use crate::perf::PerfCounters;
@@ -2554,6 +2563,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             Place::Index(h) => {
                 let witness = self.hash_witnesses[self.witness_base + h.0 as usize];
                 unsafe { *witness.value.cast::<LBoxed<'src, 'intern>>() }.as_table()
+            },
+            Place::UserdataMetatable => match self.vals[self.base + slot].unbox() {
+                LValue::Userdata(u) => u.ro(owner).metatable().cloned(),
+                _ => None,
             },
         }
     }

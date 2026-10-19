@@ -773,13 +773,14 @@ fn witness_table<'src, 'intern>(owner: &Owner, state: &mut RunState<'src, 'inter
     state.hash_witnesses[hidx] = HashWitness { epoch: tab.ro(owner).epoch, index: 0, value: core::ptr::null_mut(), table: tab.0.to_addr() };
 }
 
-// `HrefInit` for a hash key of a userdata, in its `__index` table: exit 0 if that has the key,
-// populating the witness, and 1 if not, or if it has no `__index` table. See Note [Userdata
-// fields].
-windowed!(writes select HrefInitIndex, [at: u64, key: u64], [], |owner, state, base| (userdata) {
+// `HrefInit` for a hash key of a userdata, in its `__index` table, or with `META` its metatable:
+// exit 0 if that has the key, populating the witness, and 1 if not, or if there is no such table.
+// See Notes [Userdata fields] and [Arithmetic metamethods].
+windowed!(writes select HrefInitIndex, [at: u64, key: u64], [META: bool], |owner, state, base| (userdata) {
     let (href, index) = (at as u8, (at >> 8) as usize);
     let LValue::Userdata(u) = userdata.unbox() else { unreachable!() };
-    match u.ro(owner).index_table(owner, &state.index_key) {
+    let tab = if META { u.ro(owner).metatable().cloned() } else { u.ro(owner).index_table(owner, &state.index_key) };
+    match tab {
         Some(tab) => href_init_slow(owner, state, tab, href, index, key),
         None => 1,
     }
@@ -1867,6 +1868,7 @@ fn matched(wanted: &[HashKey<'static, 'static>], known: &[HashKey<'static, 'stat
             let resolved = |href: HashRef| map.iter().find(|&&(_, t)| t == href.0).map(|&(f, _)| HashRef(f));
             let place = match want.place {
                 Place::Register => Some(Place::Register),
+                Place::UserdataMetatable => Some(Place::UserdataMetatable),
                 Place::Metatable(href) => resolved(href).map(Place::Metatable),
                 Place::Index(href) => resolved(href).map(Place::Index),
             };
@@ -1919,6 +1921,7 @@ fn renumbered(own: &Context, known: &[HashKey<'static, 'static>], map: &[(u8, u8
         let mut hkey = known[from as usize].clone();
         hkey.place = match hkey.place {
             Place::Register => Place::Register,
+            Place::UserdataMetatable => Place::UserdataMetatable,
             Place::Metatable(href) => Place::Metatable(to(href).expect("a moved key's table's key moved")),
             Place::Index(href) => Place::Index(to(href).expect("a moved key's table's key moved")),
         };
@@ -2389,7 +2392,8 @@ pub(crate) fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, Re
 // Arithmetic on operands that aren't both numbers calls a metamethod, as Lua's does. The handler
 // is the left operand's metatable's field for the event, else the right one's. It is called with
 // both operands, and its first result is the instruction's. Unary minus calls its handler with its
-// operand twice. Without a handler it is Lua's error. Only a table's metatable is looked in.
+// operand twice. Without a handler it is Lua's error. Only a table's or a userdata's metatable is
+// looked in.
 //
 // The handler is found with a hash key, as a field down an `__index` chain is. A metatable is
 // found through a hash key of its table, whose witness records which table it is, so the
@@ -2398,6 +2402,12 @@ pub(crate) fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, Re
 // records the table and its epoch and can't miss. Each is checked as any other is, and if a check
 // fails the handler is found again through the table's keyless hash key. The handler's hash key
 // lives while the one it was found through does.
+//
+// A userdata's hash keys are into its `__index` table (Note [Userdata fields]), whose metatable
+// isn't the userdata's. Its handler's hash key is at the userdata's metatable instead, found from
+// its register: the metatable is fixed when the userdata is made, so nothing else needs to find
+// it. That hash key lives with the register, in its shape beside its fields, which a field's
+// lookup tells apart by place.
 //
 // The call needs the handler and its operands in consecutive slots, which no instruction reserves.
 // They go past the running function's registers, as Lua's own stack top is past its frame. The
@@ -3997,7 +4007,7 @@ impl Context {
                 }
             }
             for i in 0..len {
-                if self.hkeys[i].place == Place::Register || self.hkeys[i].orphan() {
+                if self.hkeys[i].place.own_register() || self.hkeys[i].orphan() {
                     continue;
                 }
                 match reached[i] {
@@ -7154,7 +7164,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             ctx_mut.fix_shaped_chains();
             let kbits = LCanon::constant(&ctx_mut.hkeys[href.0 as usize].key).boxed().bits();
             // The receiver's shape now has this hash key.
-            if place == Place::Register {
+            if place.own_register() {
                 if let CType::Shape(_, existing) = &mut ctx_mut.types[idx] {
                     if !existing.contains(&href) {
                         existing.push(href)
@@ -7173,7 +7183,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Residual::Exec(href_init_miss(idx, at, kbits, hash))
             } else { Residual::ExecWindow(match (place, receiver) {
                 (Place::Register, LType::Table) => Rc::new(HrefInit::new(at, kbits, &[idx])) as Rc<dyn Window>,
-                (Place::Register, LType::Userdata) => Rc::new(HrefInitIndex::new(at, kbits, &[idx])),
+                (Place::Register, LType::Userdata) => Rc::new(HrefInitIndex::<false>::new(at, kbits, &[idx])),
+                (Place::UserdataMetatable, _) => Rc::new(HrefInitIndex::<true>::new(at, kbits, &[idx])),
                 (Place::Register, _) => unreachable!("a hash key of a {receiver}"),
                 (Place::Metatable(link), _) => Rc::new(HrefInitAt::<true>::new(at, kbits, link.0, &[])),
                 (Place::Index(link), _) => Rc::new(HrefInitAt::<false>::new(at, kbits, link.0, &[])),
@@ -7368,6 +7379,31 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 _ => SmallVec::new(),
             };
             let live = |ctx: &Context, h: HashRef| !ctx.hkeys[h.0 as usize].orphan();
+            // A userdata's: at its metatable, found from the register. Found before, it is checked.
+            if matches!(ctx.types[slot], CType::Type(LType::Userdata) | CType::Shape(LType::Userdata, _)) {
+                let at = |h: &&HashRef| ctx.hkeys[h.0 as usize].place == Place::UserdataMetatable && ctx.hkeys[h.0 as usize].key == name;
+                if let Some(&handler) = shape.iter().find(at).filter(|_| !fresh) {
+                    let known = ctx.hkeys[handler.0 as usize].known_type.clone().expect("a live hash key");
+                    let mut holds = ctx.clone();
+                    Rc::make_mut(&mut Rc::make_mut(&mut holds).hkeys)[handler.0 as usize].check(slot);
+                    let after = vm.subblock(owner, pc.next_true(), holds, thunk_coro.clone(), ResumeArg::HashRef(handler, known));
+                    if !ctx.hkeys[handler.0 as usize].checked(slot) {
+                        let again = Residual::Thunk(vm.make_metamethod_thunk(block, thunk_coro.clone(), slot, event, pc, ctx.clone(), false, true));
+                        vm.blocks[block.0].instructions.push(Residual::EpochCheck { tab: slot, href: handler, place: Place::UserdataMetatable });
+                        vm.blocks[block.0].instructions.push(again);
+                    }
+                    vm.blocks[block.0].instructions.push(Residual::Jump(after));
+                    return;
+                }
+                // Reserved until its thunk finds it, as any hash key: a miss leaves the index free.
+                let handler = match shape.iter().find(at) {
+                    Some(&handler) => handler,
+                    None => Rc::make_mut(&mut ctx).alloc_hkey(HashKey { place: Place::UserdataMetatable, ..HashKey::new(slot, name) }),
+                };
+                let find = vm.make_href_thunk(block, thunk_coro.clone(), slot, handler, pc, ctx.clone(), true, false, None, ctx.clone());
+                vm.blocks[block.0].instructions.push(Residual::Thunk(find));
+                return;
+            }
             let in_metatable = |ctx: &Context, base: HashRef, key: Option<&LConstant>| (0..ctx.hkeys.len()).map(|i| HashRef(i as u8))
                 .find(|&h| live(ctx, h) && ctx.hkeys[h.0 as usize].place == Place::Metatable(base) && key.is_none_or(|key| &ctx.hkeys[h.0 as usize].key == key));
             let refind = |vm: &Specializer, ctx: &Rc<Context>| Residual::Thunk(vm.make_metamethod_thunk(block, thunk_coro.clone(), slot, event, pc, ctx.clone(), false, true));
@@ -7547,7 +7583,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         _ => panic!("HashKey should only be used on a table or a userdata"),
                     };
                     debug!("hashkey on existing {existing:?}");
-                    if let Some(cached) = existing.into_iter().find(|cached| &ctx.hkeys[cached.0 as usize].key == k_val) {
+                    // A field's: a shape also holds the hash keys of its userdata's metatable.
+                    if let Some(cached) = existing.into_iter().find(|cached| ctx.hkeys[cached.0 as usize].place == Place::Register && &ctx.hkeys[cached.0 as usize].key == k_val) {
                         debug!("using cached href {:?}", cached);
                         let chain = ctx.chain_of(cached);
                         let tail = *chain.last().unwrap();
