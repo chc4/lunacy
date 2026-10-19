@@ -645,13 +645,6 @@ gdb-benchmark benchmark:
     {{SHARED}} cargo build --release --bin bench
     gdb --args ./target/release/bench working/{{benchmark}}.bin
 
-# The release build of `benchmark` under gdb, unattended: where it stops, its instructions and
-# registers there, and the backtrace.
-gdb-crash benchmark:
-    just _luac {{benchmark}}
-    {{SHARED}} cargo build --release --bin bench
-    gdb -batch -ex run -ex 'x/12i $pc-24' -ex 'info registers' -ex bt --args ./target/release/bench working/{{benchmark}}.bin
-
 # Profile a benchmark, built with the `flamegraph` profile (the unsafe build with
 # frame pointers) and unwound through frame pointers, as perf's default DWARF
 # unwinding can't unwind JIT code, which has no unwind tables (`tools/unwound.py`
@@ -1153,16 +1146,6 @@ alloc-stats benchmark times='10' policies='streaming unidirectional':
     just _luac {{benchmark}}
     {{SHARED}} cargo build --release --features alloc_stats --bin bench
     for policy in {{policies}}; do LUNACY_TRACES=$policy ./target/release/bench working/{{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-$policy.txt; echo "target/alloc-stats-{{benchmark}}-$policy.txt"; done
-
-# `alloc-stats` of `benchmark` at revision `ref` and here, in
-# target/alloc-stats-<benchmark>-<ref>.txt and target/alloc-stats-<benchmark>-this.txt.
-alloc-stats-vs ref benchmark times='10':
-    just _luac {{benchmark}}
-    just _compare-worktree {{ref}}
-    cd target/compare/{{ref}} && {{SHARED}} cargo build --release --features alloc_stats --bin bench
-    {{SHARED}} cargo build --release --features alloc_stats --bin bench
-    target/compare/{{ref}}/target/release/bench working/{{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-{{ref}}.txt
-    ./target/release/bench working/{{benchmark}}.bin {{times}} > /dev/null 2> target/alloc-stats-{{benchmark}}-this.txt
 
 # Revision `ref` checked out in a detached worktree, target/compare/<ref>, kept
 # for reruns, its submodules linked to this checkout's.

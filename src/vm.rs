@@ -17,7 +17,7 @@ use std::{error::Error, ops::Deref};
 use std::io::Write;
 
 use internment::ArenaIntern;
-use crate::hash_part::HashPart;
+use indexmap::IndexMap;
 
 use qcell::{LCell, LCellOwner};
 use crate::{TLCell, TlcOwner, Owner};
@@ -492,7 +492,7 @@ pub struct Table<'src, 'intern> {
     pub array: FVec<LBoxed<'src, 'intern>>,
     /// Inserted into and cleared only through `insert_hash` and `clear_hash`,
     /// which count its entries' moves if it's `cached`.
-    pub hash: HashPart<'src, 'intern>,
+    pub hash: IndexMap<LCanon<'src, 'intern>, LBoxed<'src, 'intern>, InternedHasher>,
     pub epoch: usize,
     /// Whether caches hold its entries' addresses, which moving its entries
     /// invalidates: the global environment's, and the strings' table's. See
@@ -570,7 +570,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
             }
             None => {
                 let at = match key.unbox() {
-                    LValue::OwnedString(g) => string_index(&self.hash, g.as_slice()),
+                    LValue::OwnedString(g) => self.hash.get_index_of(&StringBytes(g.as_slice())),
                     LValue::Integer(i) => self.hash.get_index_of(&LCanon::number(i as f64)),
                     LValue::Double(n) => self.hash.get_index_of(&LCanon::number(n.0)),
                     _ => self.hash.get_index_of(&LCanon(key)),
@@ -584,7 +584,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
             array: Vec::with_capacity(array).into(),
-            hash: HashPart::with_capacity(hash),
+            hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
             epoch: 0,
             cached: false,
             kind: 0,
@@ -765,8 +765,7 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// that's a string is interned, and this hashes as it does. See Note
     /// [Canonical values].
     pub fn get_string(&self, owner: &Owner, bytes: &[u8]) -> LBoxed<'src, 'intern> {
-        let hash = &self.ro(owner).hash;
-        string_index(hash, bytes).and_then(|at| hash.get_index(at)).map_or(LBoxed::NIL, |(_, value)| *value)
+        self.ro(owner).hash.get(&StringBytes(bytes)).copied().unwrap_or(LBoxed::NIL)
     }
 
     /// Look up a number key, which needs no intern arena to canonicalize.
@@ -978,10 +977,10 @@ impl Hash for StringBytes<'_> {
     }
 }
 
-/// The position of the string key of `bytes` in `hash`, which needs no intern arena: it hashes as
-/// the interned string does. See Note [Canonical values].
-fn string_index(hash: &HashPart<'_, '_>, bytes: &[u8]) -> Option<usize> {
-    hash.find(HashPart::hash(&StringBytes(bytes)), |key| matches!(key.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == bytes))
+impl<'src, 'intern> indexmap::Equivalent<LCanon<'src, 'intern>> for StringBytes<'_> {
+    fn equivalent(&self, key: &LCanon<'src, 'intern>) -> bool {
+        matches!(key.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == self.0)
+    }
 }
 
 /// An `LBoxed` in canonical form, giving owner-free `Hash`/`Eq`. See Note [Canonical values].
@@ -1764,22 +1763,18 @@ impl Default for HashWitness {
 
 /// The hash witnesses of every frame. See Note [Hash witnesses].
 pub struct Witnesses {
-    /// The address of the first witness, and how many there are, for JIT code
-    /// (`Witnesses::DATA`, `Witnesses::LEN`).
+    /// The address of the first witness, for JIT code (`Witnesses::DATA`).
     data: *mut HashWitness,
-    len: usize,
     vec: FVec<HashWitness>,
 }
 
 impl Witnesses {
     /// Where in a `Witnesses` the first witness's address is.
     pub const DATA: usize = core::mem::offset_of!(Witnesses, data);
-    /// Where in a `Witnesses` their count is.
-    pub const LEN: usize = core::mem::offset_of!(Witnesses, len);
 
     pub fn new() -> Self {
         let mut vec: FVec<HashWitness> = vec![].into();
-        Witnesses { data: vec.as_mut_ptr(), len: 0, vec }
+        Witnesses { data: vec.as_mut_ptr(), vec }
     }
 
     pub fn len(&self) -> usize {
@@ -1790,7 +1785,7 @@ impl Witnesses {
     pub fn grow(&mut self, len: usize) {
         if self.vec.len() < len {
             self.vec.resize_with(len, HashWitness::default);
-            (self.data, self.len) = (self.vec.as_mut_ptr(), self.vec.len());
+            self.data = self.vec.as_mut_ptr();
         }
     }
 }
@@ -1833,9 +1828,6 @@ pub struct RunState<'src, 'intern> {
     /// The record of the site whose window op's cold stencil is running. See
     /// Note [Cold stencils].
     pub cold_site: *const u64,
-    /// An emitted op's cold path's call out of line: the function, then its arguments after the
-    /// state. See Note [Emitted ops].
-    pub cold_call: [u64; crate::emitted::COLD_CALL],
     /// The last return's `RETURNED | effects << EFFECTS_SHIFT | id`, `id`
     /// naming what it returned and `effects` its function's, which
     /// the continuation of the call it returned from guards on. See Note [Call
@@ -2643,7 +2635,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let os = (InternString::intern(intern, "os"), LValue::Table(Tc::new(os_tab)));
         let _g = Tc::new(Table {
             array: vec![].into(),
-            hash: HashPart::from_iter(
+            hash: IndexMap::<_, _, InternedHasher>::from_iter(
                 vec![
                 (InternString::intern(intern, "_VERSION"), LValue::InternedString(intern_bytes(intern, b"Lua 5.1"))),
                 (InternString::intern(intern, "print"), LValue::NClosure(NClosure::pure(|seq, args, _returns, owner| {
@@ -2831,7 +2823,6 @@ impl<'src, 'intern> Vm<'src, 'intern> {
                 base,
                 top,
                 cold_site: core::ptr::null(),
-                cold_call: [0; crate::emitted::COLD_CALL],
                 returned: 0,
                 returned_at: 0,
                 resume: 0,

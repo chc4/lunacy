@@ -5,10 +5,11 @@
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 
+use indexmap::IndexMap;
 
 use crate::gc::Gc;
 use crate::lboxed::LBoxed;
-use crate::vm::{FVec, IStr, InternString, LType, LValue, NClosure, Table, Tc, Userdata};
+use crate::vm::{FVec, IStr, InternString, InternedHasher, LType, LValue, NClosure, Table, Tc, Userdata};
 use crate::vm::NativeOp;
 use crate::patterns::{self, Capture};
 
@@ -788,7 +789,7 @@ fn learn_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate:
             if let ResumeArg::Keys(keys) = (yield YieldOp::Learn(a + 1)) {
                 for i in 0..keys.len() {
                     if let ResumeArg::HashRef(href, kind) = (yield YieldOp::HashKeyNamed(a + 1, keys[i].clone(), true)) {
-                        yield YieldOp::Emit(crate::generators::field_load(href.0, a));
+                        yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::GetTableHref::new(href.0, &[a])));
                         yield YieldOp::FieldType(a, href);
                         if kind == CType::Type(LType::Table) {
                             yield YieldOp::LearnKind(a);
@@ -1056,7 +1057,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     let table_new = native!(pure |owner, args| {
         let t = Table {
             array: FVec::from(Vec::with_capacity(number_or(arg(&args, 0), 0.0) as usize)),
-            hash: crate::hash_part::HashPart::with_capacity(number_or(arg(&args, 1), 0.0) as usize),
+            hash: IndexMap::with_capacity_and_hasher(number_or(arg(&args, 1), 0.0) as usize, InternedHasher::default()),
             epoch: 0,
             cached: false,
             kind: 0,

@@ -21,21 +21,13 @@ use crate::window::Access;
 // shuffle brings them into a run. It declares its operands as a window op does, each boxed in a
 // window register or a double unboxed in its paired XMM register (Note [Unboxed doubles]), and
 // its code appends instructions given each operand's machine register. Besides its operands'
-// registers it may use rax, r10 and xmm15, which hold nothing across an op, and r12 holds the
-// running state. Operands of one slot are all of one form, as the window holds a slot's value in
-// one place.
-//
-// Its cold path may call a function out of line (`Record::call`), through one routine shared by
-// every cold path that saves every register the window holds a value in that the call may
-// clobber, and go on at the exit the function returns.
-// So a slow path, a write barrier or a lookup the hot path couldn't finish, costs the hot path
-// nothing.
+// registers it may use rax, r10 and xmm15, which hold nothing across an op. Operands of one slot
+// are all of one form, as the window holds a slot's value in one place.
 //
 // The interpreter runs the same instructions: a standalone function, assembled once for each op
-// and its constants, loads its inputs from an array into registers, the state into r12, runs the
-// op's code, and stores its outputs to another. The interpreter unboxes and boxes the values on
-// the way, as the JIT's window does at the stack, so either runs the op on the same unboxed
-// values.
+// and its constants, loads its inputs from an array into registers, runs the op's code, and
+// stores its outputs to another. The interpreter unboxes and boxes the values on the way, as the
+// JIT's window does at the stack, so either runs the op on the same unboxed values.
 
 /// The assembler emitted ops append their code to.
 pub type Assembler = dynasmrt::VecAssembler<dynasmrt::x64::X64Relocation>;
@@ -70,93 +62,6 @@ impl Record {
     pub fn exit(&self, ops: &mut Assembler, exit: usize) {
         dynasm!(ops ; .arch x64 ; jmp QWORD [r10 + (exit * 8) as i32]);
     }
-
-    /// Go on at the exit rax holds, 0 or 1.
-    pub fn exit_by(&self, ops: &mut Assembler) {
-        dynasm!(ops ; .arch x64 ; jmp QWORD [r10 + rax * 8]);
-    }
-
-    /// Call `f`, a `sysv64` function of the running state and `args`, through `cold_call`, which
-    /// keeps every register the window holds a value in: its result is in rax after, and the
-    /// record's address in r10 again. See Note [Emitted ops].
-    pub fn call(&self, ops: &mut Assembler, f: usize, args: &[Arg]) {
-        assert!(args.len() < COLD_CALL, "more arguments than `cold_call` passes");
-        for (i, &arg) in args.iter().enumerate() {
-            let at = COLD_ARGS + 8 * (i as i32 + 1);
-            match arg {
-                Arg::Reg(reg) => dynasm!(ops ; .arch x64 ; mov QWORD [r12 + at], Rq(reg)),
-                Arg::Capture(capture) => {
-                    self.capture(ops, capture, 0);
-                    dynasm!(ops ; .arch x64 ; mov QWORD [r12 + at], rax);
-                }
-            }
-        }
-        dynasm!(ops
-            ; .arch x64
-            ; mov rax, QWORD f as i64
-            ; mov QWORD [r12 + COLD_ARGS], rax
-            ; mov rax, QWORD cold_call as *const () as i64
-            ; call rax
-        );
-    }
-}
-
-/// An argument of a cold path's call out of line (`Record::call`).
-#[derive(Debug, Clone, Copy)]
-pub enum Arg {
-    /// A register's value.
-    Reg(u8),
-    /// A capture's value, from the record, by the capture's index.
-    Capture(usize),
-}
-
-/// How many words `RunState::cold_call` holds: the function, then its arguments after the state.
-pub const COLD_CALL: usize = 5;
-
-/// Where in the running state `cold_call`'s function and arguments are.
-const COLD_ARGS: i32 = core::mem::offset_of!(RunState<'static, 'static>, cold_call) as i32;
-
-/// Call the function in the running state's `cold_call` on the state, in rdi, and the arguments
-/// there, keeping every general register the window holds a value in that the call may clobber,
-/// r10, the record's address, and the XMM registers the window holds doubles in. Called with the
-/// stack 16-aligned, as JIT code runs. See Notes [Emitted ops] and [Stencil alignment].
-#[unsafe(naked)]
-unsafe extern "sysv64" fn cold_call() {
-    core::arch::naked_asm!(
-        "push rdi", "push rsi", "push rdx", "push rcx", "push r8", "push r9", "push r11", "push r10",
-        // The return address and eight pushes leave it 8 past aligned: the XMM registers, then 8.
-        "sub rsp, 72",
-        "vmovq [rsp], xmm0", "vmovq [rsp + 8], xmm1", "vmovq [rsp + 16], xmm2", "vmovq [rsp + 24], xmm3",
-        "vmovq [rsp + 32], xmm4", "vmovq [rsp + 40], xmm5", "vmovq [rsp + 48], xmm6", "vmovq [rsp + 56], xmm7",
-        "mov rdi, r12",
-        "mov rsi, [r12 + {args} + 8]", "mov rdx, [r12 + {args} + 16]", "mov rcx, [r12 + {args} + 24]", "mov r8, [r12 + {args} + 32]",
-        "call [r12 + {args}]",
-        "vmovq xmm0, [rsp]", "vmovq xmm1, [rsp + 8]", "vmovq xmm2, [rsp + 16]", "vmovq xmm3, [rsp + 24]",
-        "vmovq xmm4, [rsp + 32]", "vmovq xmm5, [rsp + 40]", "vmovq xmm6, [rsp + 48]", "vmovq xmm7, [rsp + 56]",
-        "add rsp, 72",
-        "pop r10", "pop r11", "pop r9", "pop r8", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
-        "ret",
-        args = const core::mem::offset_of!(RunState<'static, 'static>, cold_call),
-    );
-}
-
-/// The running frame's witnesses are at r10 after `witnesses`; hash key `href`'s witness's `field`,
-/// an offset in `HashWitness`, is this far past. See Note [Hash witnesses].
-pub fn witness_at(href: u8, field: usize) -> i32 {
-    href as i32 * core::mem::size_of::<crate::vm::HashWitness>() as i32 + field as i32
-}
-
-/// Load the address of the running frame's first witness into r10. See Note [Hash witnesses].
-pub fn witnesses(ops: &mut Assembler) {
-    let data = (core::mem::offset_of!(RunState<'static, 'static>, hash_witnesses) + crate::vm::Witnesses::DATA) as i32;
-    const SHIFT: i8 = core::mem::size_of::<crate::vm::HashWitness>().trailing_zeros() as i8;
-    const { assert!(1 << SHIFT == core::mem::size_of::<crate::vm::HashWitness>()) };
-    dynasm!(ops
-        ; .arch x64
-        ; mov r10, QWORD r12 => RunState.witness_base
-        ; shl r10, SHIFT
-        ; add r10, QWORD [r12 + data]
-    );
 }
 
 /// An op the JIT lays out as its own instructions, as `emitted!` declares one. See Note [Emitted
@@ -203,8 +108,7 @@ impl std::fmt::Display for dyn Emitted {
 
 /// Declare an emitted op, as `windowed!` declares a window op:
 ///
-/// `emitted!([select] Name, [captures], [const params], |ops, exits| (operands) { code } [cold |record| { code }])`, or
-/// `rejoin |record| { code }` for a cold path that goes on at exit 0, so the op selects nothing
+/// `emitted!([select] Name, [captures], [const params], |ops, exits| (operands) { code } [cold |record| { code }])`
 ///
 /// Its captures are its constants, by name and type; its const parameters are the type's. Its
 /// operands are declared as a window op's: each by name, read unless `out`, boxed unless `f64`,
@@ -225,9 +129,6 @@ macro_rules! emitted {
     };
     ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block cold |$record:ident| $cold:block) => {
         $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, true, [|$record| $cold]] [] $($operands)*);
-    };
-    ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block rejoin |$record:ident| $cold:block) => {
-        $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, false, [|$record| $cold]] [] $($operands)*);
     };
     ($name:ident, [$($cap:ident : $cty:ty),* $(,)?], [$($cp:ident : $cpt:ty),* $(,)?], |$ops:ident, $exits:ident| ($($operands:tt)*) $body:block) => {
         $crate::emitted::emitted!(@sort [$name, [$($cap : $cty),*], [$($cp : $cpt),*], |$ops, $exits| $body, false, []] [] $($operands)*);
@@ -268,7 +169,7 @@ macro_rules! emitted {
         #[derive(Debug, Clone)]
         struct $name<$(const $cp: $cpt),*> {
             $($cap: $cty,)*
-            operands: [usize; <[&str]>::len(&[$(stringify!($op)),*])],
+            operands: [usize; [$(stringify!($op)),*].len()],
         }
 
         impl<$(const $cp: $cpt),*> $name<$($cp),*> {
@@ -324,8 +225,8 @@ macro_rules! emitted {
 pub(crate) use emitted;
 
 /// A standalone's signature: the inputs, in the order the op declares them; where its outputs
-/// go, likewise; its site's record; and the running state. It returns the exit it took.
-type Standalone = unsafe extern "sysv64" fn(*const u64, *mut u64, *const u8, *mut RunState<'static, 'static>) -> u64;
+/// go, likewise; and its site's record. It returns the exit it took.
+type Standalone = unsafe extern "sysv64" fn(*const u64, *mut u64, *const u8) -> u64;
 
 /// The general registers a standalone loads boxed inputs into: none the call passes pointers in,
 /// nor an op's scratch.
@@ -360,15 +261,12 @@ fn standalone(op: &dyn Emitted) -> Standing {
         }
     }
     assert!(xmms < 8, "a standalone's XMM registers past the window's");
-    // r14 is callee-saved, and the pinned tag in JIT code, and r12 the state. See Note [Pinned
-    // tag]. The stack is left 16-aligned, as JIT code has it. See Note [Stencil alignment].
+    // r14 is callee-saved, and the pinned tag in JIT code. See Note [Pinned tag].
     dynasm!(ops
         ; .arch x64
         ; push r14
         ; push rdx
-        ; push r12
         ; mov r14, QWORD LBoxed::NUMBER_TAG as i64
-        ; mov r12, rcx
     );
     let mut input = 0;
     for (i, access) in op.accesses().iter().enumerate() {
@@ -404,7 +302,6 @@ fn standalone(op: &dyn Emitted) -> Standing {
         }
         dynasm!(ops
             ; .arch x64
-            ; pop r12
             ; add rsp, 8
             ; pop r14
             ; mov eax, exit
@@ -414,7 +311,7 @@ fn standalone(op: &dyn Emitted) -> Standing {
     dynasm!(ops ; .arch x64 ; =>exits.cold);
     match op.cold() {
         Some(cold) => {
-            dynasm!(ops ; .arch x64 ; mov r10, QWORD [rsp + 8]);
+            dynasm!(ops ; .arch x64 ; mov r10, QWORD [rsp]);
             cold(&mut ops, &regs, &Record);
         }
         None => dynasm!(ops ; .arch x64 ; ud2),
@@ -457,8 +354,7 @@ pub fn interp(op: &dyn Emitted, state: &mut RunState<'_, '_>) {
         }
         // SAFETY: the standalone reads as many inputs as the op has and writes as many outputs.
         let f: Standalone = unsafe { core::mem::transmute(standing.exec.as_ptr()) };
-        let state: *mut RunState<'static, 'static> = (state as *mut RunState<'_, '_>).cast();
-        unsafe { f(inputs.as_ptr(), outputs.as_mut_ptr(), record.as_ptr(), state) }
+        unsafe { f(inputs.as_ptr(), outputs.as_mut_ptr(), record.as_ptr()) }
     });
     if op.selects() {
         state.select = exit as usize;
@@ -517,7 +413,7 @@ mod tests {
         }
         let f: Standalone = unsafe { core::mem::transmute(standing.exec.as_ptr()) };
         let mut out = [0u64; 8];
-        let exit = unsafe { f(inputs.as_ptr(), out.as_mut_ptr(), record.as_ptr(), core::ptr::null_mut()) };
+        let exit = unsafe { f(inputs.as_ptr(), out.as_mut_ptr(), record.as_ptr()) };
         (out, exit)
     }
 

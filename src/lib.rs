@@ -27,7 +27,6 @@ pub mod chunk;
 pub mod stack;
 pub mod lboxed;
 pub mod vm;
-pub mod hash_part;
 pub mod perf;
 // The specializer (lazy basic-block versioning) runs every closure, driving
 // each instruction's generator (`generators`); the native code generator

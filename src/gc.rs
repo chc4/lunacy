@@ -9,6 +9,7 @@ use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
 use crate::vm::{Tc, LValue, LBoxed, LCanon, LClosure, NClosure, Table, Upvalue, Userdata};
 use crate::vm::FVec;
 use crate::{TLCell, TlcOwner, Owner};
+use indexmap::IndexMap;
 use crate::debug;
 
 pub trait Mark {
@@ -123,9 +124,9 @@ impl<'src, 'intern> Mark for Upvalue<'src, 'intern> {
     }
 }
 
-impl Mark for crate::hash_part::HashPart<'_, '_> {
+impl<K: Mark, V: Mark, S> Mark for IndexMap<K, V, S> {
     fn mark(&self, owner: &Owner) {
-        for (k, v) in self.iter() {
+        for (k, v) in self {
             k.mark(owner);
             v.mark(owner);
         }
@@ -588,16 +589,6 @@ thread_local! {
 #[inline(always)]
 pub fn gc_in_progress() -> bool {
     GC_IN_PROGRESS.with(|flag| flag.get())
-}
-
-/// Where `GC_IN_PROGRESS` is from the thread pointer (`fs:0`), for JIT code reading it inline.
-/// It is a `const` thread-local of the executable, so the same for every thread.
-pub fn gc_in_progress_offset() -> i32 {
-    let flag = GC_IN_PROGRESS.with(|flag| flag as *const Cell<bool> as usize);
-    let thread: usize;
-    // SAFETY: on x86-64 Linux, `fs:0` holds the thread pointer itself.
-    unsafe { core::arch::asm!("mov {}, fs:0", out(reg) thread) };
-    (flag.wrapping_sub(thread) as isize).try_into().expect("a thread-local within 2 GB of the thread pointer")
 }
 
 /// Set the heap's phase, and `GC_IN_PROGRESS` with it. See Note [Write barriers].
