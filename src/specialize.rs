@@ -337,6 +337,12 @@ pub enum YieldOp {
 
     HashKey(usize, usize, bool), // Looks up or allocates an HREF for STACK[idx][key]; down its `__index` chain if true (a load). See Note [Table metatables]
     HashKeyNamed(usize, LConstant<'static, 'static>, bool), // `HashKey` of a key known by its value
+    MetaKey(usize, &'static [u8]), // Resumed with HashRef: the hash key of metamethod NAME in the
+                                   // metatable of STACK[idx]'s table, and its field's type; else
+                                   // Failed, the table has none. See Note [Arithmetic metamethods]
+    Reserve(usize), // Resumed with Integer, once the code runs: the first of N slots past the running
+                    // function's registers, holding nothing yet. See Note [Arithmetic metamethods]
+    Release(usize), // The slots from STACK[idx] on, which `Reserve` gave, are no longer used
     HoldsValue(usize, usize), // Resumed with Matched if STACK[dest] holds STACK[src]'s value
                               // already, a move between them nothing
     Quotient(usize, usize, i32), // STACK[idx] was just computed as STACK[of] / by, of an integer by a
@@ -360,7 +366,7 @@ pub enum YieldOp {
                   // `jit.learn` in `library`
     LearnKind(usize), // Resumed with Matched once the context knows STACK[idx]'s table's array
                       // part's kind, found out at runtime, if it is of one; else Failed
-    IsKey(usize, &'static [u8]), // Whether CONSTANT[k] is the string of these bytes: Matched, else Failed
+    IsMetamethod(usize), // Whether CONSTANT[k] is a metamethod's name (`METAMETHODS`): Matched, else Failed
     UpdateHashRef(HashRef, Option<LType>), // Update the type of HREF to a new type, if known
     GlobalCache(usize), // Resumed with a Cache for global CONSTANT[k]. See
                         // Note [Global caches]
@@ -536,11 +542,18 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
         if self.orphan() {
             return "free".to_string();
         }
-        let lv: LValue = (&self.key).into();
+        // A keyless one witnesses its table. See Note [Arithmetic metamethods].
+        let name = match &self.key {
+            crate::chunk::Constant::Nil => "table".to_string(),
+            key => {
+                let lv: LValue = key.into();
+                String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).replace("\0", "")
+            },
+        };
         // The slots accesses through which are checked, if any.
         let checked: Vec<String> = self.hazards.iter().map(|slot| slot.to_string()).collect();
         format!("hkey({}, {}{})",
-            String::from_utf8_lossy(lv.as_string_nolock().unwrap().as_slice()).to_owned().replace("\0",""),
+            name,
             self.known_type.as_ref().map_or("free".to_string(), |t| t.to_string()),
             if checked.is_empty() { String::new() } else { format!(", checked {}", checked.join(" ")) })
     }
@@ -734,6 +747,31 @@ windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table)
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     href_init_slow(owner, state, tab, href, index, key)
 });
+
+// The witness of hash key `href` of its register's table, with no key: the table and its epoch,
+// which a hash key in the table's metatable is found through. It can't fail. See Note [Arithmetic
+// metamethods].
+// Its cold path makes the witness's place first.
+windowed!(writes HrefTable, [href: u8], [], |owner, state, base| (table) {
+    let hidx = state.witness_base + href as usize;
+    let placed = hidx < state.hash_witnesses.len();
+    if placed {
+        witness_table(owner, state, table, hidx);
+    }
+    !placed
+} rejoin {
+    let hidx = state.witness_base + href as usize;
+    state.hash_witnesses.grow(hidx + 1);
+    witness_table(owner, state, table, hidx);
+});
+
+/// Make witness `hidx`, of the table `table`, with no key: `HrefTable`'s.
+#[inline(always)]
+fn witness_table<'src, 'intern>(owner: &Owner, state: &mut RunState<'src, 'intern>, table: LBoxed<'src, 'intern>, hidx: usize) {
+    let LValue::Table(tab) = table.unbox() else { unreachable!("a metatable's table") };
+    state.witness_top = state.witness_top.max(hidx + 1);
+    state.hash_witnesses[hidx] = HashWitness { epoch: tab.ro(owner).epoch, index: 0, value: core::ptr::null_mut(), table: tab.0.to_addr() };
+}
 
 // `HrefInit` for a hash key of a userdata, in its `__index` table: exit 0 if that has the key,
 // populating the witness, and 1 if not, or if it has no `__index` table. See Note [Userdata
@@ -1926,6 +1964,20 @@ fn apart_below(ctx: &Context) -> crate::trace::Slots {
     apart
 }
 
+/// Whether `key` is `__index`, whose hash keys are a chain's. See Note [Table metatables].
+fn is_index_key(key: &LConstant<'_, '_>) -> bool {
+    matches!(key, crate::chunk::Constant::String(s) if s.as_bytes() == b"__index")
+}
+
+/// `ctx` with `slots` slots from `from`, past the running function's registers, holding nothing
+/// yet. See Note [Arithmetic metamethods].
+fn reserve(ctx: &mut Rc<Context>, from: usize, slots: usize) {
+    let ctx = Rc::make_mut(ctx);
+    debug_assert_eq!(ctx.types.len(), from, "slots reserved past a frame's registers");
+    ctx.types.resize(from + slots, CType::Unknown);
+    ctx.values.reserve(from, slots);
+}
+
 fn inline_offset(ctx: &Context) -> usize {
     ctx.inline.iter().map(|frame| frame.a as usize + 1).sum()
 }
@@ -2329,8 +2381,29 @@ pub(crate) fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, Re
 // Stores set the table's own field, so they never follow a chain.
 //
 // A table's epoch changes whenever what a lookup through it could find changes: a key inserted,
-// its metatable set, or its `__index` field stored to, whatever the value (a store usually keeps
+// its metatable set, or a metamethod's field stored to, whatever the value (a store usually keeps
 // the epoch when it keeps the field's type).
+
+// Note [Arithmetic metamethods]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Arithmetic on operands that aren't both numbers calls a metamethod, as Lua's does. The handler
+// is the left operand's metatable's field for the event, else the right one's. It is called with
+// both operands, and its first result is the instruction's. Unary minus calls its handler with its
+// operand twice. Without a handler it is Lua's error. Only a table's metatable is looked in.
+//
+// The handler is found with a hash key, as a field down an `__index` chain is. A metatable is
+// found through a hash key of its table, whose witness records which table it is, so the
+// handler's hash key is at the metatable of that one. A table already reaching its metatable for
+// a chain finds the handler at the same place. One that isn't uses a hash key with no key, which
+// records the table and its epoch and can't miss. Each is checked as any other is, and if a check
+// fails the handler is found again through the table's keyless hash key. The handler's hash key
+// lives while the one it was found through does.
+//
+// The call needs the handler and its operands in consecutive slots, which no instruction reserves.
+// They go past the running function's registers, as Lua's own stack top is past its frame. The
+// frame grows to hold them only when such a call is first laid out, as it grows for an inlined
+// callee's frame, and the context knows those slots only until the result is moved out. The call
+// is then a call inside an instruction (Note [Call continuations]), and inlines as any other.
 
 // Note [String methods]
 // ~~~~~~~~~~~~~~~~~~~~~~
@@ -3911,6 +3984,16 @@ impl Context {
                         reached[link.0 as usize] = Some(idx);
                     }
                     at = next;
+                }
+            }
+            // A metamethod's hash key lives while the hash key it finds its metatable through
+            // does. See Note [Arithmetic metamethods].
+            for i in 0..len {
+                let hkey = &self.hkeys[i];
+                if let Place::Metatable(h) = hkey.place && reached[i].is_none() && !hkey.orphan() && !is_index_key(&hkey.key)
+                    && let Some(base) = self.hkeys.get(h.0 as usize).filter(|base| base.place == Place::Register && !base.orphan())
+                {
+                    reached[i] = Some(base.idx);
                 }
             }
             for i in 0..len {
@@ -7238,6 +7321,111 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.blocks[block_id.0].instructions.push(Residual::Thunk(fail_thunk));
     }
 
+    /// The outermost function whose frame holds the running one's, and the slots its frame takes
+    /// with `slots` more past the running function's registers. See Note [Arithmetic metamethods].
+    fn reserved_end(&self, ctx: &Context, slots: usize) -> (LProto<'static, 'static>, usize) {
+        let outermost = ctx.inline.first().map_or(self.proto as LProto<'static, 'static>, |frame| frame.proto);
+        (outermost, inline_offset(ctx) + unsafe { (*self.proto).max_stack } as usize + slots)
+    }
+
+    /// The thunk a `Reserve` of `slots` ends its block in: forced, the frames of the function
+    /// holding the running one's have room for them, and the code after it knows them. See Note
+    /// [Arithmetic metamethods].
+    fn make_reserve_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slots: usize, pc: SubPc, mut thunk_ctx: Rc<Context>) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let (outermost, end) = vm.reserved_end(&thunk_ctx, slots);
+            if unsafe { (*outermost).frame_size.grow(end) } {
+                state.fit_frames(owner);
+                #[cfg(feature = "jit")]
+                vm.jctx.frame_grew(outermost as usize, unsafe { (*outermost).frame_size.get() });
+            }
+            let from = unsafe { (*vm.proto).max_stack } as usize;
+            let mut ctx = thunk_ctx.clone();
+            reserve(&mut ctx, from, slots);
+            let rest = vm.subblock(owner, pc.next_true(), ctx, thunk_coro.clone(), ResumeArg::Integer(from as i32));
+            vm.jump_thunk(block_id, thunk_pc, rest);
+        })))
+    }
+
+    /// The thunk a `MetaKey` of `event` for the table in `slot` ends its block in. Forced, the code
+    /// after it knows the event's hash key in the table's metatable, checked first unless nothing
+    /// could have changed it since. That is found through a hash key of the table that already
+    /// reaches its metatable, else, or if `fresh`, through the table's keyless hash key, its witness
+    /// made again. See Note [Arithmetic metamethods].
+    fn make_metamethod_thunk(&self, block_id: BlockId, thunk_coro: Box<dyn NativeGen>, slot: usize, event: &'static [u8], pc: SubPc, mut thunk_ctx: Rc<Context>, appends: bool, fresh: bool) -> ThunkRef {
+        // What it is forced in is settled. See Note [Value classes].
+        settle(&mut thunk_ctx);
+        ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
+            let block = vm.reopen(block_id, thunk_pc, pc.0, appends);
+            let name: LConstant<'_, '_> = crate::chunk::Constant::String(crate::vm::intern_bytes(state.intern, event));
+            // As the generator's constants, the intern arena outlives the code.
+            let name: LConstant<'static, 'static> = unsafe { core::mem::transmute(name) };
+            let mut ctx = thunk_ctx.clone();
+            let shape: SmallVec<[HashRef; 4]> = match &ctx.types[slot] {
+                CType::Shape(_, hrefs) => hrefs.clone(),
+                _ => SmallVec::new(),
+            };
+            let live = |ctx: &Context, h: HashRef| !ctx.hkeys[h.0 as usize].orphan();
+            let in_metatable = |ctx: &Context, base: HashRef, key: Option<&LConstant>| (0..ctx.hkeys.len()).map(|i| HashRef(i as u8))
+                .find(|&h| live(ctx, h) && ctx.hkeys[h.0 as usize].place == Place::Metatable(base) && key.is_none_or(|key| &ctx.hkeys[h.0 as usize].key == key));
+            let refind = |vm: &Specializer, ctx: &Rc<Context>| Residual::Thunk(vm.make_metamethod_thunk(block, thunk_coro.clone(), slot, event, pc, ctx.clone(), false, true));
+            // Found before: its hash keys checked, each one's table found through the one before.
+            let cached = (!fresh).then(|| shape.iter().find_map(|&base| in_metatable(&ctx, base, Some(&name)).map(|h| (base, h)))).flatten();
+            if let Some((base, handler)) = cached {
+                let known = ctx.hkeys[handler.0 as usize].known_type.clone().expect("a live hash key");
+                let mut holds = ctx.clone();
+                for h in [base, handler] {
+                    Rc::make_mut(&mut Rc::make_mut(&mut holds).hkeys)[h.0 as usize].check(slot);
+                }
+                let after = vm.subblock(owner, pc.next_true(), holds, thunk_coro.clone(), ResumeArg::HashRef(handler, known));
+                for h in [base, handler].into_iter().filter(|h| !ctx.hkeys[h.0 as usize].checked(slot)) {
+                    let again = refind(vm, &ctx);
+                    vm.blocks[block.0].instructions.push(Residual::EpochCheck { tab: slot, href: h, place: ctx.hkeys[h.0 as usize].place });
+                    vm.blocks[block.0].instructions.push(again);
+                }
+                vm.blocks[block.0].instructions.push(Residual::Jump(after));
+                return;
+            }
+            // Through a hash key already reaching the metatable, the place its other hash keys
+            // are at, checked; else through the table's keyless hash key, its witness made here.
+            let reaching = (!fresh).then(|| shape.iter().copied().find(|&base| in_metatable(&ctx, base, None).is_some())).flatten();
+            let base = match reaching {
+                Some(base) => {
+                    if !ctx.hkeys[base.0 as usize].checked(slot) {
+                        let again = refind(vm, &ctx);
+                        vm.blocks[block.0].instructions.push(Residual::EpochCheck { tab: slot, href: base, place: Place::Register });
+                        vm.blocks[block.0].instructions.push(again);
+                    }
+                    base
+                },
+                None => {
+                    let keyless = shape.iter().copied().find(|&h| ctx.hkeys[h.0 as usize].key == crate::chunk::Constant::Nil);
+                    let ctx = Rc::make_mut(&mut ctx);
+                    let base = keyless.unwrap_or_else(|| {
+                        let base = ctx.alloc_hkey(HashKey { known_type: Some(CType::Unknown), ..HashKey::new(slot, crate::chunk::Constant::Nil) });
+                        match &mut ctx.types[slot] {
+                            CType::Shape(_, hrefs) => hrefs.push(base),
+                            ty => *ty = CType::Shape(LType::Table, vec![base].into()),
+                        }
+                        base
+                    });
+                    Rc::make_mut(&mut ctx.hkeys)[base.0 as usize].check(slot);
+                    vm.blocks[block.0].instructions.push(Residual::ExecWindow(Rc::new(HrefTable::new(base.0, &[slot]))));
+                    base
+                },
+            };
+            let handler = match in_metatable(&ctx, base, Some(&name)) {
+                Some(handler) => handler,
+                // Reserved until its thunk finds it, as any hash key: a miss leaves the index free.
+                None => Rc::make_mut(&mut ctx).alloc_hkey(HashKey { place: Place::Metatable(base), ..HashKey::new(slot, name) }),
+            };
+            let find = vm.make_href_thunk(block, thunk_coro.clone(), slot, handler, pc, ctx.clone(), true, false, None, ctx.clone());
+            vm.blocks[block.0].instructions.push(Residual::Thunk(find));
+        })))
+    }
+
     /// Compile what generator `coro` yields from `pc`, resumed with `arg`, in `block_id` and the
     /// blocks it goes on in.
     pub fn compile_one(&mut self, owner: &mut Owner, mut pc: SubPc, mut ctx: Rc<Context>, mut coro: Box<dyn NativeGen>, mut arg: ResumeArg, mut block_id: BlockId) -> Compiled
@@ -7331,10 +7519,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     arg = ResumeArg::Failed;
                     continue 'machine;
                 },
-                CoroutineState::Yielded(YieldOp::IsKey(k, name)) => {
+                CoroutineState::Yielded(YieldOp::IsMetamethod(k)) => {
                     let proto = self.proto;
                     let constant = unsafe { &(&(*proto).constants.items)[k] };
-                    arg = if matches!(constant, crate::chunk::Constant::String(s) if s.as_bytes() == name) { ResumeArg::Matched } else { ResumeArg::Failed };
+                    let named = matches!(constant, crate::chunk::Constant::String(s) if crate::vm::METAMETHODS.contains(&s.as_bytes()));
+                    arg = if named { ResumeArg::Matched } else { ResumeArg::Failed };
                 },
                 CoroutineState::Yielded(ref yielded @ (YieldOp::HashKey(..) | YieldOp::HashKeyNamed(..))) => {
                     let proto = self.proto;
@@ -7448,6 +7637,36 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.end_block(block_id);
                     self.blocks[block_id.0].instructions.push(witness);
                     return None;
+                },
+                CoroutineState::Yielded(YieldOp::MetaKey(slot, event)) => {
+                    // Found as the code runs, which interns the event's name.
+                    let thunk = Residual::Thunk(self.make_metamethod_thunk(block_id, coro.clone(), slot, event, pc, ctx.clone(), true, false));
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(thunk);
+                    return None;
+                },
+                CoroutineState::Yielded(YieldOp::Reserve(slots)) => {
+                    let from = unsafe { (*self.proto).max_stack } as usize;
+                    // Room in the frame already: the slots are known now, as a thunk would find them.
+                    let (outermost, end) = self.reserved_end(&ctx, slots);
+                    if unsafe { (*outermost).frame_size.get() } >= end {
+                        reserve(&mut ctx, from, slots);
+                        pc = pc.next_true();
+                        arg = ResumeArg::Integer(from as i32);
+                        break 'machine;
+                    }
+                    let thunk = Residual::Thunk(self.make_reserve_thunk(block_id, coro.clone(), slots, pc, ctx.clone()));
+                    self.end_block(block_id);
+                    self.blocks[block_id.0].instructions.push(thunk);
+                    return None;
+                },
+                CoroutineState::Yielded(YieldOp::Release(from)) => {
+                    let ctx = Rc::make_mut(&mut ctx);
+                    for slot in from..ctx.types.len() {
+                        ctx.effect(Effect::Write(slot));
+                    }
+                    ctx.types.truncate(from);
+                    ctx.values.release(from);
                 },
                 CoroutineState::Yielded(YieldOp::GuardRk(rk, ref expected)) => {
                     let proto = self.proto;

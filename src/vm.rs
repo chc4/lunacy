@@ -924,6 +924,18 @@ pub use crate::lboxed::LBoxed;
 use crate::lboxed::NClosureCell;
 pub use crate::lboxed::IStr;
 
+/// The keys a metatable's lookups read, Lua 5.1's events. A store to one moves its table to a new
+/// epoch whatever it stores. See Note [Table metatables].
+pub const METAMETHODS: [&[u8]; 17] = [
+    b"__index", b"__newindex", b"__gc", b"__mode", b"__eq", b"__add", b"__sub", b"__mul", b"__div",
+    b"__mod", b"__pow", b"__unm", b"__len", b"__lt", b"__le", b"__concat", b"__call",
+];
+
+/// Whether `key` is one of the metamethods' names (`METAMETHODS`).
+pub fn is_metamethod(key: LBoxed<'_, '_>) -> bool {
+    matches!(key.unbox(), LValue::InternedString(s) if METAMETHODS.contains(&s.as_bytes()))
+}
+
 /// Intern raw bytes into the arena, returning the canonical handle. The bytes are
 /// owned by the record (`Cow::Owned`), so the arena frees a deduped duplicate; it
 /// dedups by content, so equal bytes always yield the same handle.

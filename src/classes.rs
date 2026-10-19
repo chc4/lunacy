@@ -389,6 +389,18 @@ impl<F: ClassFact> Classes<F> {
         self.uncaptured = vec![true; slots];
     }
 
+    /// The `slots` slots from `from`, which Lua code can't name, are new, and no cell is open onto
+    /// them. See Note [Arithmetic metamethods].
+    pub fn reserve(&mut self, from: usize, slots: usize) {
+        self.uncaptured.resize(from, false);
+        self.uncaptured.resize(from + slots, true);
+    }
+
+    /// The slots from `from` on, which `reserve` gave, are gone.
+    pub fn release(&mut self, from: usize) {
+        self.uncaptured.truncate(from);
+    }
+
     /// The value `loc` holds is known as `fact`, in place of what was known of its key.
     pub fn learn(&mut self, loc: Loc, fact: F) {
         let class = self.ensure(loc);
