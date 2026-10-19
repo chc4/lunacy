@@ -16,14 +16,19 @@ CPU := "2"
 # wait for it. Each command takes it, never a recipe calling another, which
 # would wait on itself; `cargo watch`, which never ends, doesn't.
 BENCH_LOCK := env_var_or_default("LUNACY_BENCH_LOCK", "/tmp/lunacy-bench.lock")
-# The prefix of a timed command: the lock, then pinned to `CPU`.
-TIMED := "flock " + BENCH_LOCK + " taskset -c " + CPU
-# The prefix of a sampled command: the lock.
-SAMPLED := "flock " + BENCH_LOCK
+# The most address space, in bytes, any one process a command starts may take (`prlimit`, which
+# its children inherit): a runaway run, or build, fails its allocation instead of exhausting the
+# machine's memory.
+MEM_CAP := env_var_or_default("LUNACY_MEM_CAP", "8589934592")
+CAP := "prlimit --as=" + MEM_CAP
+# The prefix of a timed command: the lock, then pinned to `CPU`, capped.
+TIMED := "flock " + BENCH_LOCK + " taskset -c " + CPU + " " + CAP
+# The prefix of a sampled command: the lock, capped.
+SAMPLED := "flock " + BENCH_LOCK + " " + CAP
 # The prefix of a build, test or other run that loads the machine without
 # measuring: the lock shared, so that any number run together, but none while a
-# timed or sampled run holds it, nor one while they do.
-SHARED := "flock -s " + BENCH_LOCK
+# timed or sampled run holds it, nor one while they do; capped.
+SHARED := "flock -s " + BENCH_LOCK + " " + CAP
 
 # Every test: `test`, then `test-stencils`.
 tests: test test-stencils
