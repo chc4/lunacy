@@ -2,6 +2,8 @@
 -- one version: a call whose argument is an integer one time and a string the next, and a
 -- generic for whose iterator gets an integer control value one time and a string the next.
 -- Run by the interpreter, then in JIT code.
+-- Its output counts versions, which an injected effect may rightly add to.
+-- FEATURE: !conservative_information
 
 local versions = jit and jit.versions or function() return 1 end
 
