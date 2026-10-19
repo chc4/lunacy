@@ -269,7 +269,7 @@ impl<F: ClassFact> Classes<F> {
     }
 
     /// Whether no cell is open onto `slot`. See Note [Value classes].
-    fn is_uncaptured(&self, slot: u16) -> bool {
+    pub fn is_uncaptured(&self, slot: u16) -> bool {
         self.uncaptured.get(slot as usize).copied().unwrap_or(false)
     }
 

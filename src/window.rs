@@ -323,8 +323,13 @@ pub trait Window: std::fmt::Debug {
         false
     }
     /// Whether it reads, or writes, upvalues' cells. See Note [Window memory].
-    fn cells(&self) -> Option<Access> {
+    fn cells(&self) -> Option<Cells<'_>> {
         None
+    }
+    /// It, knowing no cell it touches is open onto the slots `apart` below its frame. See Note
+    /// [Window memory].
+    fn with_apart(&self, _apart: crate::trace::Slots) -> std::rc::Rc<dyn Window> {
+        unreachable!("{} touches no cells", self.name())
     }
     /// The operands its stencils take and give as unboxed doubles, in their
     /// window registers' paired XMM registers: bit `i` for operand `i`. See
@@ -433,11 +438,21 @@ pub(crate) use bind_record;
 //
 // An upvalue's cell may be open onto a slot of a frame below the op's own, which JIT code inlining
 // that frame may hold in a register. So the window stores those slots before an op touching
-// upvalues, and forgets them after one setting an upvalue.
+// upvalues, and forgets them after one setting an upvalue. A cell is open only onto a slot a
+// closure captured, so the specializer gives such an op the slots below that no cell is open
+// onto, which the window leaves as they are.
 
 /// The owner of an op that touches no memory: nothing to reach the heap through. See Note
 /// [Window memory].
 pub struct NoMemory;
+
+/// What an op touching upvalues' cells does to them, and the slots of the frames below its own
+/// no cell is open onto, by their distance below its frame's base, less one. See Note [Window
+/// memory].
+pub struct Cells<'a> {
+    pub access: Access,
+    pub apart: &'a crate::trace::Slots,
+}
 
 /// Declare a window op, usable at any emit site (like `define_exec!`):
 ///
@@ -632,10 +647,19 @@ macro_rules! windowed {
     (@closure upvalues) => { true };
     (@closure sets_upvalues) => { true };
     (@closure $other:ident) => { false };
-    (@cells upvalues) => { Some($crate::window::Access::Read) };
-    (@cells cells) => { Some($crate::window::Access::Read) };
-    (@cells sets_upvalues) => { Some($crate::window::Access::Write) };
-    (@cells $other:ident) => { None };
+    (@cells upvalues, $op:expr) => { Some($crate::window::Cells { access: $crate::window::Access::Read, apart: &$op.apart }) };
+    (@cells cells, $op:expr) => { Some($crate::window::Cells { access: $crate::window::Access::Read, apart: &$op.apart }) };
+    (@cells sets_upvalues, $op:expr) => { Some($crate::window::Cells { access: $crate::window::Access::Write, apart: &$op.apart }) };
+    (@cells $other:ident, $op:expr) => { None };
+    // The slots below an op touching cells no cell is open onto, which only it has.
+    (@apart upvalues) => { $crate::trace::Slots };
+    (@apart cells) => { $crate::trace::Slots };
+    (@apart sets_upvalues) => { $crate::trace::Slots };
+    (@apart $other:ident) => { () };
+    (@with_apart upvalues, $op:expr, $apart:ident) => { std::rc::Rc::new(Self { apart: $apart, ..$op.clone() }) };
+    (@with_apart cells, $op:expr, $apart:ident) => { std::rc::Rc::new(Self { apart: $apart, ..$op.clone() }) };
+    (@with_apart sets_upvalues, $op:expr, $apart:ident) => { std::rc::Rc::new(Self { apart: $apart, ..$op.clone() }) };
+    (@with_apart $other:ident, $op:expr, $apart:ident) => { unreachable!("{} touches no cells", stringify!($other)) };
     (@cold_body []) => {
         { 0 }
     };
@@ -703,6 +727,7 @@ macro_rules! windowed {
         pub struct $name<$(const $cp: $cpt),*> {
             $(pub $cap: $cty,)*
             operands: ::smallvec::SmallVec<[usize; $crate::window::WINDOW]>,
+            apart: $crate::window::windowed!(@apart $mem),
         }
 
         #[allow(dead_code, unused_variables, unused_mut, unused_assignments, unused_unsafe)]
@@ -716,7 +741,7 @@ macro_rules! windowed {
                 let () = Self::FITS;
                 assert_eq!(operands.len(), Self::ARITY, "{}: wrong number of operands", stringify!($name));
                 $crate::window::check_operands(stringify!($name), operands, Self::ACCESSES);
-                Self { $($cap,)* operands: operands.into() }
+                Self { $($cap,)* operands: operands.into(), apart: Default::default() }
             }
 
             /// The body, shared by the interpreter and the stencil: its exit, or
@@ -841,7 +866,11 @@ macro_rules! windowed {
             fn operands(&self) -> &[usize] { &self.operands }
             fn accesses(&self) -> &'static [$crate::window::Access] { Self::ACCESSES }
             fn closure(&self) -> bool { $crate::window::windowed!(@closure $mem) }
-            fn cells(&self) -> Option<$crate::window::Access> { $crate::window::windowed!(@cells $mem) }
+            fn cells(&self) -> Option<$crate::window::Cells<'_>> { $crate::window::windowed!(@cells $mem, self) }
+            fn with_apart(&self, apart: $crate::trace::Slots) -> std::rc::Rc<dyn $crate::window::Window> {
+                let _ = &apart;
+                $crate::window::windowed!(@with_apart $mem, self, apart)
+            }
             fn with_operands(&self, operands: &[usize]) -> std::rc::Rc<dyn $crate::window::Window> {
                 $crate::window::check_operands(stringify!($name), operands, Self::ACCESSES);
                 std::rc::Rc::new(Self { operands: operands.into(), ..self.clone() })

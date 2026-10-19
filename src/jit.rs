@@ -1027,6 +1027,16 @@ fn slots_below(offset: usize) -> Slots {
     slots
 }
 
+/// The slots of the frames below the one the window names at `offset` a cell an op touches may be
+/// open onto: all but those `cells` has apart. See Note [Window memory].
+fn cell_homes(cells: &crate::window::Cells, offset: usize) -> Slots {
+    let mut slots = slots_below(offset);
+    for distance in cells.apart.iter().filter(|&distance| distance < offset) {
+        slots.remove(offset - 1 - distance);
+    }
+    slots
+}
+
 /// The slots, as the window names them at `offset`, from `end` on.
 fn slots_from(end: usize, offset: usize) -> Slots {
     let mut slots = Slots::default();
@@ -2517,8 +2527,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         match res {
                             Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[off].is_empty() => {
                                 // Upvalues' cells may be open onto them. See Note [Window memory].
-                                if w.cells().is_some() {
-                                    events.extend(slots_below(at).iter().map(Event::Read));
+                                if let Some(cells) = w.cells() {
+                                    events.extend(cell_homes(&cells, at).iter().map(Event::Read));
                                 }
                                 let operands = w.operands().iter().zip(w.accesses());
                                 events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot.wrapping_add(at))));
@@ -2677,13 +2687,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Residual::ExecWindow(_) | Residual::GuardDynamic(_) if !skips[b][off].is_empty() => {
                         let w = windows[b][off].as_ref().expect("a window op");
                         // See Note [Window memory].
-                        if w.cells().is_some() {
-                            steps.push(Step::Store(slots_below(at)));
+                        if let Some(cells) = w.cells() {
+                            steps.push(Step::Store(cell_homes(&cells, at)));
                         }
                         of[off] = Some(steps.len());
                         steps.push(Step::Op(Framed::new(&**w, at), skips[b][off].clone()));
-                        if w.cells() == Some(Access::Write) {
-                            steps.push(Step::Kill(slots_below(at)));
+                        if let Some(cells) = w.cells().filter(|cells| cells.access == Access::Write) {
+                            steps.push(Step::Kill(cell_homes(&cells, at)));
                         }
                     }
                     Residual::Emit(e) => {
@@ -4007,8 +4017,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let w = &w;
                     let stencils = &mut self.jctx.stencils;
                     // See Note [Window memory].
-                    if w.cells().is_some() {
-                        let stores = alloc.clean(&slots_below(offset.get()));
+                    if let Some(cells) = w.cells() {
+                        let stores = alloc.clean(&cell_homes(&cells, offset.get()));
                         window_dump!(self.jctx, "      cells: store {}", emits_line(&stores));
                         for emit in stores {
                             emit_window_move(ops, emit, offset.get());
@@ -4114,8 +4124,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     }
                     // Its sets of upvalues may have been of their stack homes.
-                    if w.cells() == Some(Access::Write) {
-                        alloc.forget(&slots_below(offset.get()));
+                    if let Some(cells) = w.cells().filter(|cells| cells.access == Access::Write) {
+                        alloc.forget(&cell_homes(&cells, offset.get()));
                     }
                     match (res, other, copied) {
                         // Its body ran on the stack, and selected: as an inline guard, a

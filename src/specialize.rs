@@ -1911,6 +1911,25 @@ fn cost(res: &Residual) -> usize {
 
 /// How many slots past the base of the outermost frame inlining it the frame of code of `ctx` is.
 /// See Note [Inlined calls].
+/// The slots of the frames `ctx` is inlined into no upvalue's cell is open onto, by their distance
+/// below its frame's base, less one: each caller's it knew uncaptured at its call, as no code of the
+/// call's frame captures one. See Note [Window memory].
+fn apart_below(ctx: &Context) -> crate::trace::Slots {
+    let mut apart = crate::trace::Slots::default();
+    let mut base = 0;
+    for frame in ctx.inline.iter().rev() {
+        // SAFETY: an inlined call's continuation lives as long as the code.
+        let caller = unsafe { &(*frame.continuation).caller };
+        base += frame.a as usize + 1;
+        for slot in (0..=frame.a as usize).filter(|&slot| caller.values.is_uncaptured(slot as u16)) {
+            if base - slot - 1 < MAX_INLINE_SLOTS {
+                apart.insert(base - slot - 1);
+            }
+        }
+    }
+    apart
+}
+
 fn inline_offset(ctx: &Context) -> usize {
     ctx.inline.iter().map(|frame| frame.a as usize + 1).sum()
 }
@@ -7717,6 +7736,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     self.blocks[block_id.0].instructions.push(Residual::Exec(func));
                 },
                 CoroutineState::Yielded(YieldOp::ExecWindow(w)) => {
+                    // See Note [Window memory].
+                    let w = match w.cells() {
+                        Some(_) if !ctx.inline.is_empty() => w.with_apart(apart_below(&ctx)),
+                        _ => w,
+                    };
                     if w.closure() {
                         self.observe(owner, &mut block_id, &mut ctx, pc.0, w.name());
                     }
