@@ -35,7 +35,7 @@
 //! RIP-relative reference in the body is reported so it can be re-targeted
 //! wherever the body lands: hole loads (repointed at the op's capture values),
 //! other continuation references (at the copy's fall-through point), and
-//! everything else — calls out of line (e.g. into `IndexMap`), GOT slots,
+//! everything else — calls out of line (e.g. into a table's hash part), GOT slots,
 //! rodata — at its original absolute address, which stays in rel32 range because
 //! JIT memory is mapped within ±2GiB of the binary. In the JIT these all become
 //! dynasm relocations patched at `finalize`; `assemble` does the same by hand.
@@ -2267,7 +2267,7 @@ mod tests {
         *(base as *mut [LBoxed; WINDOW]) = [w0, w1, w2, w3, w4, w5, w6, w7];
     });
 
-    // A stencil that calls out of line (as table get/set through `IndexMap`
+    // A stencil that calls out of line (as table get/set through the hash part
     // will): the call is a non-hole RIP-relative reference the copier must
     // re-target.
     #[inline(never)]
