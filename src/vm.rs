@@ -17,7 +17,7 @@ use std::{error::Error, ops::Deref};
 use std::io::Write;
 
 use internment::ArenaIntern;
-use indexmap::IndexMap;
+use crate::hash_part::HashPart;
 
 use qcell::{LCell, LCellOwner};
 use crate::{TLCell, TlcOwner, Owner};
@@ -492,7 +492,7 @@ pub struct Table<'src, 'intern> {
     pub array: FVec<LBoxed<'src, 'intern>>,
     /// Inserted into and cleared only through `insert_hash` and `clear_hash`,
     /// which count its entries' moves if it's `cached`.
-    pub hash: IndexMap<LCanon<'src, 'intern>, LBoxed<'src, 'intern>, InternedHasher>,
+    pub hash: HashPart<'src, 'intern>,
     pub epoch: usize,
     /// Whether caches hold its entries' addresses, which moving its entries
     /// invalidates: the global environment's, and the strings' table's. See
@@ -570,7 +570,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
             }
             None => {
                 let at = match key.unbox() {
-                    LValue::OwnedString(g) => self.hash.get_index_of(&StringBytes(g.as_slice())),
+                    LValue::OwnedString(g) => string_index(&self.hash, g.as_slice()),
                     LValue::Integer(i) => self.hash.get_index_of(&LCanon::number(i as f64)),
                     LValue::Double(n) => self.hash.get_index_of(&LCanon::number(n.0)),
                     _ => self.hash.get_index_of(&LCanon(key)),
@@ -584,7 +584,7 @@ impl<'src, 'intern> Table<'src, 'intern> {
     pub fn new(array: usize, hash: usize) -> Self {
         Self {
             array: Vec::with_capacity(array).into(),
-            hash: IndexMap::with_capacity_and_hasher(hash, InternedHasher::default()),
+            hash: HashPart::with_capacity(hash),
             epoch: 0,
             cached: false,
             kind: 0,
@@ -765,7 +765,8 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// that's a string is interned, and this hashes as it does. See Note
     /// [Canonical values].
     pub fn get_string(&self, owner: &Owner, bytes: &[u8]) -> LBoxed<'src, 'intern> {
-        self.ro(owner).hash.get(&StringBytes(bytes)).copied().unwrap_or(LBoxed::NIL)
+        let hash = &self.ro(owner).hash;
+        string_index(hash, bytes).and_then(|at| hash.get_index(at)).map_or(LBoxed::NIL, |(_, value)| *value)
     }
 
     /// Look up a number key, which needs no intern arena to canonicalize.
@@ -977,10 +978,10 @@ impl Hash for StringBytes<'_> {
     }
 }
 
-impl<'src, 'intern> indexmap::Equivalent<LCanon<'src, 'intern>> for StringBytes<'_> {
-    fn equivalent(&self, key: &LCanon<'src, 'intern>) -> bool {
-        matches!(key.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == self.0)
-    }
+/// The position of the string key of `bytes` in `hash`, which needs no intern arena: it hashes as
+/// the interned string does. See Note [Canonical values].
+fn string_index(hash: &HashPart<'_, '_>, bytes: &[u8]) -> Option<usize> {
+    hash.find(HashPart::hash(&StringBytes(bytes)), |key| matches!(key.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == bytes))
 }
 
 /// An `LBoxed` in canonical form, giving owner-free `Hash`/`Eq`. See Note [Canonical values].
@@ -2635,7 +2636,7 @@ impl<'src, 'intern> Vm<'src, 'intern> {
         let os = (InternString::intern(intern, "os"), LValue::Table(Tc::new(os_tab)));
         let _g = Tc::new(Table {
             array: vec![].into(),
-            hash: IndexMap::<_, _, InternedHasher>::from_iter(
+            hash: HashPart::from_iter(
                 vec![
                 (InternString::intern(intern, "_VERSION"), LValue::InternedString(intern_bytes(intern, b"Lua 5.1"))),
                 (InternString::intern(intern, "print"), LValue::NClosure(NClosure::pure(|seq, args, _returns, owner| {

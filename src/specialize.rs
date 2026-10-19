@@ -804,13 +804,12 @@ windowed!(writes HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |owner
 /// metatables] and [Hash witnesses].
 fn href_init_miss(idx: usize, at: u64, key: u64, hash: u64) -> ResidualExec {
     ResidualExec::new("href_init_miss", Rc::new(move |owner, state| {
-        use indexmap::map::RawEntryApiV1;
         let (href, index) = (at as u8, (at >> 8) as usize);
         let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
         let address = tab.0.to_addr();
         let lacks = {
             let tab = tab.ro(owner);
-            tab.hash.raw_entry_v1().index_from_hash(hash, |k| k.boxed().bits() == key).is_none().then_some(tab.epoch)
+            tab.hash.find(hash, |k| k.boxed().bits() == key).is_none().then_some(tab.epoch)
         };
         state.select = match lacks {
             Some(epoch) => {
@@ -880,7 +879,7 @@ impl GlobalCache {
     /// lacks it.
     pub(crate) fn refill(&self, owner: &mut Owner, env: &Tc<Table<'_, '_>>) -> Option<*mut LBoxed<'static, 'static>> {
         let key: &LCanon<'_, '_> = unsafe { core::mem::transmute(&self.key) };
-        let (_, _, value) = env.rw(owner).hash.get_full_mut(key)?;
+        let (_, value) = env.rw(owner).hash.get_full_mut(key)?;
         self.value.set((value as *mut LBoxed<'_, '_>).cast());
         self.moves.set(crate::vm::env_moves());
         Some(self.value.get())
@@ -7036,7 +7035,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             debug!("forcing href thunk for {idx} {href:?} {:?}", ctx.hkeys[href.0 as usize]);
             let key = LCanon::new((&ctx.hkeys[href.0 as usize].key).into(), state.intern);
             let tab = state.place_table(owner, idx, place);
-            let entry = tab.as_ref().and_then(|tab| tab.ro(owner).hash.get_full(&key).map(|(index, _, val)| (index, *val)));
+            let entry = tab.as_ref().and_then(|tab| { let hash = &tab.ro(owner).hash; hash.get_index_of(&key).map(|index| (index, *hash.get_index(index).unwrap().1)) });
             let nil = entry.is_none_or(|(_, val)| val.is_nil());
             // A nil field is no field: a load goes on down the chain. See Note [Table
             // metatables].

@@ -5,11 +5,10 @@
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 
-use indexmap::IndexMap;
 
 use crate::gc::Gc;
 use crate::lboxed::LBoxed;
-use crate::vm::{FVec, IStr, InternString, InternedHasher, LType, LValue, NClosure, Table, Tc, Userdata};
+use crate::vm::{FVec, IStr, InternString, LType, LValue, NClosure, Table, Tc, Userdata};
 use crate::vm::NativeOp;
 use crate::patterns::{self, Capture};
 
@@ -1057,7 +1056,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     let table_new = native!(pure |owner, args| {
         let t = Table {
             array: FVec::from(Vec::with_capacity(number_or(arg(&args, 0), 0.0) as usize)),
-            hash: IndexMap::with_capacity_and_hasher(number_or(arg(&args, 1), 0.0) as usize, InternedHasher::default()),
+            hash: crate::hash_part::HashPart::with_capacity(number_or(arg(&args, 1), 0.0) as usize),
             epoch: 0,
             cached: false,
             kind: 0,
