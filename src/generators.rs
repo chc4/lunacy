@@ -1512,24 +1512,38 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             Opcode::POW => b"__pow",
             _ => unreachable!("an arithmetic opcode: {opcode:?}"),
         };
-        let mut metamethod = emit_metamethod(event, dest, lhs, rhs);
+        let mut metamethod = emit_metamethod(Metamethod::Arith(event), dest, lhs, Some(rhs));
         drain!(metamethod, arg);
         ResumeArg::Start
     }
 }
 
-/// An arithmetic instruction of RK(`lhs`) and RK(`rhs`) that aren't both numbers: the handler of
-/// `event` of the left one's table, else the right one's, called on both, its result into
+/// The instruction a metamethod is called for. See Note [Arithmetic metamethods].
+#[derive(Clone, Copy)]
+enum Metamethod {
+    /// Arithmetic, of this event, whose handler a table or a userdata may have.
+    Arith(&'static [u8]),
+    /// LEN, whose handler only a userdata has: a table's length is its own.
+    Len,
+}
+
+/// An instruction of RK(`lhs`) and RK(`rhs`), or nil, that `kind` calls a metamethod for: the
+/// handler of the left one's metatable, else the right one's, called on both, its result into
 /// R(`dest`). With neither, the error Lua raises. See Note [Arithmetic metamethods].
-fn emit_metamethod(event: &'static [u8], dest: usize, lhs: usize, rhs: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+fn emit_metamethod(kind: Metamethod, dest: usize, lhs: usize, rhs: Option<usize>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
     #[coroutine]
     move |mut arg: ResumeArg| {
-        for operand in [lhs, rhs] {
-            // A table's or a userdata's metatable, which only they have.
+        let event: &'static [u8] = match kind {
+            Metamethod::Arith(event) => event,
+            Metamethod::Len => b"__len",
+        };
+        for operand in [Some(lhs), rhs].into_iter().flatten() {
+            // A metatable only a table or a userdata has.
             if operand & 0x100 != 0 {
                 continue;
             }
-            if (yield YieldOp::Guard(operand, LType::Table)) != ResumeArg::Matched && (yield YieldOp::Guard(operand, LType::Userdata)) != ResumeArg::Matched {
+            let table = matches!(kind, Metamethod::Arith(_)) && (yield YieldOp::Guard(operand, LType::Table)) == ResumeArg::Matched;
+            if !table && (yield YieldOp::Guard(operand, LType::Userdata)) != ResumeArg::Matched {
                 continue;
             }
             let ResumeArg::HashRef(handler, _) = (yield YieldOp::MetaKey(operand, event)) else { continue };
@@ -1538,7 +1552,12 @@ fn emit_metamethod(event: &'static [u8], dest: usize, lhs: usize, rhs: usize) ->
             let f = f as usize;
             yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(handler.0, &[f])));
             yield YieldOp::FieldType(f, handler);
-            for (to, from) in [(f + 1, lhs), (f + 2, rhs)] {
+            for (to, from) in [(f + 1, Some(lhs)), (f + 2, rhs)] {
+                let Some(from) = from else {
+                    yield YieldOp::ExecWindow(Rc::new(LoadNil::new(&[to])));
+                    yield YieldOp::SetCTypes(vec![(to, CType::Type(LType::Nil))]);
+                    continue;
+                };
                 if from & 0x100 != 0 {
                     let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(from & 0xff)) else { unreachable!() };
                     let ResumeArg::Type(t) = (yield YieldOp::TypeofRk(from)) else { unreachable!() };
@@ -1559,18 +1578,21 @@ fn emit_metamethod(event: &'static [u8], dest: usize, lhs: usize, rhs: usize) ->
             yield YieldOp::Release(f);
             return arg;
         }
-        arg = yield YieldOp::Exec(ResidualExec::new("arith_error", Rc::new(move |owner, state| {
+        arg = yield YieldOp::Exec(ResidualExec::new("metamethod_error", Rc::new(move |owner, state| {
             let value = |rk: usize| match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, rk as u16) {
                 Ok(k) => LBoxed::from(k),
                 Err(v) => *v,
             };
             // The operand named is the left one, unless it's a number.
-            let culprit = match value(lhs) {
-                v if v.as_number().is_some() => value(rhs),
-                v => v,
+            let culprit = match (value(lhs), rhs) {
+                (v, Some(rhs)) if v.as_number().is_some() => value(rhs),
+                (v, _) => v,
             };
             let name = String::from_utf8_lossy(crate::library::type_name(culprit));
-            let message = format!("attempt to perform arithmetic on a {name} value");
+            let message = match kind {
+                Metamethod::Arith(_) => format!("attempt to perform arithmetic on a {name} value"),
+                Metamethod::Len => format!("attempt to get length of a {name} value"),
+            };
             state.raise(LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::string(message.as_bytes()))));
         })));
         yield YieldOp::SetCTypes(vec![(dest, CType::Unknown)]);
@@ -1931,7 +1953,7 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         // A metamethod's, called on the operand twice, as Lua's is. See Note [Arithmetic
         // metamethods].
         let (ResumeArg::Matched | ResumeArg::MatchedConst(_)) = arg else {
-            let mut metamethod = emit_metamethod(b"__unm", a, b, b);
+            let mut metamethod = emit_metamethod(Metamethod::Arith(b"__unm"), a, b, Some(b));
             drain!(metamethod, arg);
             return ResumeArg::Start;
         };
@@ -1967,7 +1989,6 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         }
         arg = yield YieldOp::Guard(b, LType::Table);
         if ResumeArg::Matched == arg {
-            // TODO: __len metamethod
             arg = yield YieldOp::Exec(ResidualExec::new("len_tab", Rc::new(move |owner, state| {
                 let LValue::Table(b) = state.vals[state.base + b].unbox() else { unreachable!() };
                 let n = b.ro(owner).array.len();
@@ -1976,11 +1997,12 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
             // A length, an integer. See Note [Integers].
             yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
             return arg;
-        } else {
-            unimplemented!("__len metamethod")
         }
-
-        arg
+        // Any other's is a metamethod's, called with nil after it, as Lua's is. See Note
+        // [Arithmetic metamethods].
+        let mut metamethod = emit_metamethod(Metamethod::Len, a, b, None);
+        drain!(metamethod, arg);
+        ResumeArg::Start
     }
 }
 

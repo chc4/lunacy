@@ -2393,7 +2393,8 @@ pub(crate) fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, Re
 // is the left operand's metatable's field for the event, else the right one's. It is called with
 // both operands, and its first result is the instruction's. Unary minus calls its handler with its
 // operand twice. Without a handler it is Lua's error. Only a table's or a userdata's metatable is
-// looked in.
+// looked in. Length is a metamethod's only for a userdata, as a table's and a string's are their
+// own: its handler is called with the operand and nil.
 //
 // The handler is found with a hash key, as a field down an `__index` chain is. A metatable is
 // found through a hash key of its table, whose witness records which table it is, so the

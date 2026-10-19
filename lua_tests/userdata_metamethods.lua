@@ -33,7 +33,17 @@ print(sum(300, function(i) return bare - i end))
 -- No handler: an error.
 local ok, err = pcall(function() return newproxy(true) + 1 end)
 print(ok, string.find(err, "attempt to perform arithmetic on a userdata value", 1, true) ~= nil)
+
+-- A userdata's length is its handler's, called with it and nil; a table's is its own, whatever
+-- its metatable has.
+mt.__len = function(a, b) return (a == u and b == nil) and 4 or -1 end
+local t = setmetatable({1, 2}, {__len = function() return 9 end})
+print(sum(300, function(i) return #u + #t end))
+ok, err = pcall(function() return #newproxy(true) end)
+print(ok, string.find(err, "attempt to get length of a userdata value", 1, true) ~= nil)
 -- EXPECT: 136200
 -- EXPECT: 48141
 -- EXPECT: 2100
+-- EXPECT: false	true
+-- EXPECT: 1800
 -- EXPECT: false	true
