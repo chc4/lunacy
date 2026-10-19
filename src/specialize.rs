@@ -990,34 +990,30 @@ pub const UNKNOWN_RETURN: u32 = (1 << crate::vm::EFFECTS_SHIFT) - 1;
 
 // Note [Call continuations]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~
-// A call's continuation is specialized on what the callee returned (Chevalier-Boisvert & Feeley,
-// "Interprocedural Type Specialization of JavaScript Programs Without Type Analysis"), by guarding
-// on the return rather than on the types of the results. A `Ret`'s context at compile time says
-// what it returns: the types of its results, and, with B, how many. Those are interned into an id,
-// the same for every return of the same (`Specializer::returns`), or with B = 0, unknown
-// (`UNKNOWN_RETURN`). A return leaves JIT code with `RETURNED | effects << EFFECTS_SHIFT | id`, its
-// function's effects with the id (Note [Call effects]; the call's return value, where the call is
-// in JIT code), and sets `RunState::returned` to the same, from JIT code or the interpreter.
+// The code after a call to a Lua function is specialized on which return the callee took, rather
+// than on the types of the values it returned (Chevalier-Boisvert & Feeley, "Interprocedural Type
+// Specialization of JavaScript Programs Without Type Analysis"). A return's context says what it
+// returns: the types of its results, and how many when the count is fixed. Returns that say the
+// same share an id. A return also carries its function's effects (Note [Call effects]). Both reach
+// the caller whether the return ran in JIT code or in the interpreter.
 //
-// After a call to a Lua function (a `LuaCall`), the caller continues at a thunk, not an `Arrive`.
-// Forced just after a return, it lays out a guard on that return (`ReturnedFrom`), comparing the
-// call's return value (`returned` where the interpreter runs it, or where JIT code is entered at
-// the guard), the thunk for the next return on its failure, and on its success an `Arrive` knowing
-// the count (`Arrived`) and a jump to a version of the code after the call knowing the results'
-// types (and with C = 0, the top), and what of the caller's context before the call the callee's
-// effects keep. A return whose results aren't known (B = 0), or one past `MAX_VERSIONS`, continues
-// as a call without: `Arrive` and the version knowing nothing of the results or of the callee's
-// effects. That version is only found, and compiled, when a layout jumps to it (`After`): one
-// made up front would take one of the pc's versions whether or not anything ever enters it, and
-// once the pc has `MAX_VERSIONS`, accept the contexts its continuations reach it with, knowing
-// nothing of them. A native call doesn't return this way, and never reaches such a guard.
+// The caller learns each return as it first arrives. It guards on that return's id, and on a match
+// goes on in a version of the code after the call. That version knows the results' types and
+// count, and keeps what the callee's effects leave of the caller's context. Each new return adds a
+// guard, up to the version limit. A return whose results aren't known, or one past the limit, goes
+// on in a version knowing nothing of the results or of the callee's effects.
 //
-// A call inside an instruction (a generic for's of its iterator) continues where the call left its
-// generator: the code after it is the generator, suspended at the call, resumed in the context the
-// return gives, as the code after any other call is a version of the next pc (`Rest`). Such a call
-// is not inlined while its callee's returns can give the instruction contexts that differ only in
-// what the callee learned on rarer paths (`INLINE_RESUMES`): it continues straight after its
-// return.
+// That version is found only when a return first needs it. Made up front, it would take one of the
+// pc's versions whether or not anything enters it. At the pc's version limit it would also accept
+// the contexts the guarded returns reach it with, which would then know nothing of their results.
+//
+// A native call doesn't return this way. What is known of its results is known where it is called.
+//
+// A call inside an instruction, a generic for's call of its iterator, goes on in the rest of that
+// instruction rather than at the next pc. The instruction's generator is resumed in the context the
+// return gives. Such a call is inlined as any other is. The callee's effects, and a trip while the
+// call is paused, reach the generator only through that context, which is all it may rely on (Note
+// [Subblocks]).
 
 /// A TAILCALL's site: the context it is laid out from, its pc, A and B,
 /// whether its function closes upvalues and is vararg, and that function's
@@ -1263,7 +1259,7 @@ windowed!(frame Arrive, [ac: u64], [A: Count, C: Count], |owner, state, base| ()
 // compatibility]). A `SubPc` is a Lua bytecode PC plus the answers to the questions the
 // instruction's generator has asked so far, so a block can start partway through an instructions:
 // when a question can only be answered at runtime, the block ends in a thunk, and forcing it
-// compiles the rest of the generator from taht answer on in a new block (`subblock`).
+// compiles the rest of the generator from that answer on in a new block (`subblock`).
 //
 // An answer steps the `SubPc` the same way whether the specializer answers it immediately or a
 // thunk finds it out at runtime (`navigate`). This means that either case result in the same
