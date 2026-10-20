@@ -1956,8 +1956,8 @@ fn cost(res: &Residual) -> usize {
 /// The slots of the frames `ctx` is inlined into no upvalue's cell is open onto, by their distance
 /// below its frame's base, less one: each caller's it knew uncaptured at its call, as no code of the
 /// call's frame captures one. See Note [Window memory].
-fn apart_below(ctx: &Context) -> crate::trace::Slots {
-    let mut apart = crate::trace::Slots::default();
+fn apart_below(ctx: &Context) -> crate::window::Slots {
+    let mut apart = crate::window::Slots::default();
     let mut base = 0;
     for frame in ctx.inline.iter().rev() {
         // SAFETY: an inlined call's continuation lives as long as the code.

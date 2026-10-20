@@ -36,6 +36,8 @@ unit filter:
 # Run lunacy against the golden testcases
 [env("RUST_BACKTRACE","1")]
 test:
+    # The interpreter-only build, without the JIT, as `interpreter-compile` builds it, compiles
+    {{SHARED}} cargo check --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin bench --bin lunacy --target-dir ./target/interpreter
     # GC correctness tests
     {{SHARED}} cargo test "gc::" --features "gc_test,gc_sanitize" -- --test-threads 1
     # Normal interpreter tests

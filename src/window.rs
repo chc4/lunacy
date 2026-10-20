@@ -328,7 +328,7 @@ pub trait Window: std::fmt::Debug {
     }
     /// It, knowing no cell it touches is open onto the slots `apart` below its frame. See Note
     /// [Window memory].
-    fn with_apart(&self, _apart: crate::trace::Slots) -> std::rc::Rc<dyn Window> {
+    fn with_apart(&self, _apart: crate::window::Slots) -> std::rc::Rc<dyn Window> {
         unreachable!("{} touches no cells", self.name())
     }
     /// The operands its stencils take and give as unboxed doubles, in their
@@ -442,6 +442,46 @@ pub(crate) use bind_record;
 // closure captured, so the specializer gives such an op the slots below that no cell is open
 // onto, which the window leaves as they are.
 
+/// A set of stack slots. A Lua frame has at most 250.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Slots([u64; 4]);
+
+impl Slots {
+    pub fn insert(&mut self, slot: usize) {
+        assert!(slot < 256, "a frame slot below 256");
+        self.0[slot / 64] |= 1 << (slot % 64);
+    }
+
+    pub fn remove(&mut self, slot: usize) {
+        self.0[slot / 64] &= !(1 << (slot % 64));
+    }
+
+    pub fn contains(&self, slot: usize) -> bool {
+        slot < 256 && self.0[slot / 64] & (1 << (slot % 64)) != 0
+    }
+
+    pub fn union(&mut self, other: &Slots) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a |= b;
+        }
+    }
+
+    pub fn intersect(&mut self, other: &Slots) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a &= b;
+        }
+    }
+
+    /// Whether every slot in `other` is in `self`.
+    pub fn covers(&self, other: &Slots) -> bool {
+        self.0.iter().zip(other.0).all(|(a, b)| b & !a == 0)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..256).filter(|&slot| self.contains(slot))
+    }
+}
+
 /// The owner of an op that touches no memory: nothing to reach the heap through. See Note
 /// [Window memory].
 pub struct NoMemory;
@@ -451,7 +491,7 @@ pub struct NoMemory;
 /// memory].
 pub struct Cells<'a> {
     pub access: Access,
-    pub apart: &'a crate::trace::Slots,
+    pub apart: &'a crate::window::Slots,
 }
 
 /// Declare a window op, usable at any emit site (like `define_exec!`):
@@ -652,9 +692,9 @@ macro_rules! windowed {
     (@cells sets_upvalues, $op:expr) => { Some($crate::window::Cells { access: $crate::window::Access::Write, apart: &$op.apart }) };
     (@cells $other:ident, $op:expr) => { None };
     // The slots below an op touching cells no cell is open onto, which only it has.
-    (@apart upvalues) => { $crate::trace::Slots };
-    (@apart cells) => { $crate::trace::Slots };
-    (@apart sets_upvalues) => { $crate::trace::Slots };
+    (@apart upvalues) => { $crate::window::Slots };
+    (@apart cells) => { $crate::window::Slots };
+    (@apart sets_upvalues) => { $crate::window::Slots };
     (@apart $other:ident) => { () };
     (@with_apart upvalues, $op:expr, $apart:ident) => { std::rc::Rc::new(Self { apart: $apart, ..$op.clone() }) };
     (@with_apart cells, $op:expr, $apart:ident) => { std::rc::Rc::new(Self { apart: $apart, ..$op.clone() }) };
@@ -867,7 +907,7 @@ macro_rules! windowed {
             fn accesses(&self) -> &'static [$crate::window::Access] { Self::ACCESSES }
             fn closure(&self) -> bool { $crate::window::windowed!(@closure $mem) }
             fn cells(&self) -> Option<$crate::window::Cells<'_>> { $crate::window::windowed!(@cells $mem, self) }
-            fn with_apart(&self, apart: $crate::trace::Slots) -> std::rc::Rc<dyn $crate::window::Window> {
+            fn with_apart(&self, apart: $crate::window::Slots) -> std::rc::Rc<dyn $crate::window::Window> {
                 let _ = &apart;
                 $crate::window::windowed!(@with_apart $mem, self, apart)
             }
