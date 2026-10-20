@@ -1213,6 +1213,13 @@ bench-history:
     python3 tools/bench_history.py report
     python3 tools/bench_history.py plot
 
+# The library names each of `benchmarks` uses that lunacy's library lacks: globals, and members
+# of its tables such as `string.rep` (tools/library_gaps.py).
+library-gaps +benchmarks:
+    {{SHARED}} cargo build --release --bin lunacy
+    for b in {{benchmarks}}; do just _luac $b > /dev/null; done
+    python3 tools/library_gaps.py target/release/lunacy {{prepend("working/", append(".lua", benchmarks))}}
+
 # What stops each benchmark of lua_benchmarking that HYPERFINES doesn't run:
 # each run once at its scaling under LuaJIT and lunacy's release build (the
 # unsafe build's panics have no message), with how each ended and its error
