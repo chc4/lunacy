@@ -372,6 +372,8 @@ pub enum YieldOp {
     UpdateHashRef(HashRef, Option<LType>), // Update the type of HREF to a new type, if known
     GlobalCache(usize), // Resumed with a Cache for global CONSTANT[k]. See
                         // Note [Global caches]
+    Hint, // Resumed with Hint: the address of the cell of the specializer's for the instruction's
+          // site, as long-lived as its blocks, for an op to keep what it found between its runs
     SetKeyHazards(usize), // SetHazards, for the hash keys of CONSTANT[k] only
     SetHazards(Option<usize>, Option<HashRef>), // Set optimization hazards, potentially
                                         // scoped to only information that may alias with an href,
@@ -660,6 +662,7 @@ pub enum ResumeArg {
     Element(u64, CType, Option<i32>),
     /// See Note [Global caches].
     Cache(*const GlobalCache),
+    Hint(*const Cell<usize>),
     /// The end of a call's arguments, and the type its native's window op
     /// assumes they have.
     WindowArgs(usize, CType),
@@ -4121,6 +4124,9 @@ pub struct Specializer<'src, 'intern> {
     /// The global caches its blocks use, at stable addresses. See Note [Global
     /// caches].
     pub global_caches: Vec<Box<GlobalCache>>,
+    /// The cells ops keep what they found in between their runs (`YieldOp::Hint`), one for each
+    /// site, which every version of it shares.
+    hints: HashMap<(LProto<'src, 'intern>, Pc), Box<Cell<usize>>>,
     pub versions: std::collections::HashMap<
         LProto<'src, 'intern>,
         std::collections::HashMap<(SubPc, Rc<Context>), BlockId, rustc_hash::FxBuildHasher>, InternedHasher>,
@@ -4197,6 +4203,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Self {
             blocks: Vec::new(),
             global_caches: Vec::new(),
+            hints: HashMap::default(),
             versions: HashMap::default(),
             returns: Vec::new(),
             return_ids: HashMap::default(),
@@ -8373,6 +8380,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let cache = Box::new(GlobalCache::new(key));
                     arg = ResumeArg::Cache(&*cache as *const GlobalCache);
                     self.global_caches.push(cache);
+                },
+                CoroutineState::Yielded(YieldOp::Hint) => {
+                    let hint = self.hints.entry((self.proto, pc.0)).or_insert_with(|| Box::new(Cell::new(usize::MAX)));
+                    arg = ResumeArg::Hint(&**hint as *const Cell<usize>);
                 },
                 CoroutineState::Yielded(YieldOp::LoadGlobal(slot, k)) => {
                     let proto = self.proto;

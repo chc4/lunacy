@@ -566,6 +566,14 @@ impl<'src, 'intern> Table<'src, 'intern> {
     /// part's in order and then the hash part's, or none past the last; or `Err` for a key it
     /// doesn't hold. The keys it gives back are canonical, but for the array part's, integers.
     pub fn next(&self, key: LBoxed<'src, 'intern>) -> Result<Option<(LBoxed<'src, 'intern>, LBoxed<'src, 'intern>)>, ()> {
+        Ok(self.next_from(key, usize::MAX)?.map(|(key, value, _)| (key, value)))
+    }
+
+    /// `next`, where `key`'s entry may be at `hint` in the hash part, which saves finding it when it
+    /// is there: the entry, and where in the hash part it is, for the next step's hint (`usize::MAX`
+    /// for the array part's). A table's keys are unique, so the entry at `hint` holding `key` is
+    /// `key`'s, wherever the hint came from.
+    pub fn next_from(&self, key: LBoxed<'src, 'intern>, hint: usize) -> Result<Option<(LBoxed<'src, 'intern>, LBoxed<'src, 'intern>, usize)>, ()> {
         let in_array = match key.unbox() {
             LValue::Nil => Some(0),
             _ => key.as_number().and_then(array_slot).filter(|&slot| slot < self.array.len()).map(|slot| slot + 1),
@@ -573,21 +581,22 @@ impl<'src, 'intern> Table<'src, 'intern> {
         let from = match in_array {
             Some(from) => {
                 if let Some((i, value)) = self.array[from..].iter().enumerate().find(|(_, value)| !value.is_nil()) {
-                    return Ok(Some((LBoxed::from_int((from + i + 1) as i32), *value)));
+                    return Ok(Some((LBoxed::from_int((from + i + 1) as i32), *value, usize::MAX)));
                 }
                 0
             }
             None => {
-                let at = match key.unbox() {
-                    LValue::OwnedString(g) => self.hash.get_index_of(&StringBytes(g.as_slice())),
-                    LValue::Integer(i) => self.hash.get_index_of(&LCanon::number(i as f64)),
-                    LValue::Double(n) => self.hash.get_index_of(&LCanon::number(n.0)),
+                let at = match (self.hash.get_index(hint), key.unbox()) {
+                    (Some((held, _)), _) if held.boxed().bits() == key.bits() => Some(hint),
+                    (_, LValue::OwnedString(g)) => self.hash.get_index_of(&StringBytes(g.as_slice())),
+                    (_, LValue::Integer(i)) => self.hash.get_index_of(&LCanon::number(i as f64)),
+                    (_, LValue::Double(n)) => self.hash.get_index_of(&LCanon::number(n.0)),
                     _ => self.hash.get_index_of(&LCanon(key)),
                 };
                 at.ok_or(())? + 1
             }
         };
-        Ok((from..self.hash.len()).filter_map(|i| self.hash.get_index(i)).find(|(_, value)| !value.is_nil()).map(|(key, value)| (key.boxed(), *value)))
+        Ok((from..self.hash.len()).find_map(|i| self.hash.get_index(i).filter(|(_, value)| !value.is_nil()).map(|(key, value)| (key.boxed(), *value, i))))
     }
 
     pub fn new(array: usize, hash: usize) -> Self {

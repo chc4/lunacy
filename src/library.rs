@@ -989,25 +989,28 @@ fn pairs_generator<const IPAIRS: bool>(nf: NClosure, a: usize, b: usize, c: usiz
 
 // `next(t, k)`'s results to R(A) and R(A+1): the key and value of the entry after `k` in `t`, or
 // nil past the last. Exit 1 for a key `t` lacks, whose error the native's call raises, with R(A+1)
-// `t` again, as that call needs its arguments.
-crate::window::windowed!(reads select NextEntry, [], [], |owner, state, base| (t, k, out key, out value) {
+// `t` again, as that call needs its arguments. `hint`, a cell's address, holds where in the hash
+// part the entry the site last gave back is, which a loop's next step looks for `k` at first.
+crate::window::windowed!(reads select NextEntry, [hint: usize], [], |owner, state, base| (t, k, out key, out value) {
     let LValue::Table(tab) = t.unbox() else { unsafe { core::hint::unreachable_unchecked() } };
-    match tab.ro(owner).next(k) {
-        Ok(Some(entry)) => { (*key, *value) = entry; 0 },
+    let hint = unsafe { &*(hint as *const Cell<usize>) };
+    match tab.ro(owner).next_from(k, hint.get()) {
+        Ok(Some((found, held, at))) => { hint.set(at); (*key, *value) = (found, held); 0 },
         Ok(None) => { (*key, *value) = (LBoxed::NIL, LBoxed::NIL); 0 },
         Err(()) => { (*key, *value) = (k, t); 1 },
     }
 });
 
-/// `next`'s generator: for `next(t, k)` of a table keeping one or two results, `NextEntry`, the
-/// native called for a key the table lacks. Any other call is the native's.
+/// `next`'s generator: for `next(t, k)` of a table keeping one or two results, `NextEntry` with a
+/// hint of its own, the native called for a key the table lacks. Any other call is the native's.
 fn next_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         let n = c.wrapping_sub(1);
         if b == 3 && (1..=2).contains(&n) && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
+            let ResumeArg::Hint(hint) = (yield YieldOp::Hint) else { unreachable!() };
             // See Note [Optimistic ops].
-            if (yield YieldOp::OptimisticExec(std::rc::Rc::new(NextEntry::new(&[a + 1, a + 2, a, a + 1])))) == ResumeArg::Matched {
+            if (yield YieldOp::OptimisticExec(std::rc::Rc::new(NextEntry::new(hint as usize, &[a + 1, a + 2, a, a + 1])))) == ResumeArg::Matched {
                 yield YieldOp::SetCTypes(vec![(a, CType::Unknown), (a + 1, CType::Unknown)]);
                 return ResumeArg::Start;
             }
