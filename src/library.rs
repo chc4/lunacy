@@ -170,7 +170,25 @@ macro_rules! native {
     };
 }
 
+/// `pairs(t)` and `ipairs(t)`'s argument, which must be a table.
+fn iterated<'s, 'i>(args: &[LBoxed<'s, 'i>], name: &str) -> Result<LBoxed<'s, 'i>, LBoxed<'s, 'i>> {
+    let t = arg(args, 0);
+    match t.unbox() {
+        LValue::Table(_) => Ok(t),
+        _ => Err(error_value(format!("bad argument #1 to '{name}' (table expected, got {})", String::from_utf8_lossy(type_name(t))))),
+    }
+}
+
+/// The iterator `pairs` returns, `next`, or `ipairs`'s.
+fn iterator(ipairs: bool) -> NClosure {
+    let (next, ipairs_next) = ITERATORS.with(|iterators| iterators.get()).expect("the iterators, made with the globals");
+    if ipairs { ipairs_next } else { next }
+}
+
 thread_local! {
+    /// `next` and `ipairs`'s iterator, which `pairs` and `ipairs` return: made with the globals.
+    static ITERATORS: Cell<Option<(NClosure, NClosure)>> = const { Cell::new(None) };
+
     /// `math.random`'s state: xorshift64, which `math.randomseed` reseeds.
     static RANDOM: Cell<u64> = const { Cell::new(0x2545_f491_4f6c_dd1d) };
 }
@@ -586,6 +604,11 @@ fn bitn_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
 // hold past a dynamic guard, and fall back to a call of the native itself (`YieldOp::NativeCall`)
 // where none of that applies, all as an opcode's code does. That call has the effects any call of
 // the native has (Note [Call effects]).
+//
+// A call inside an instruction, a generic for's of its iterator, of a native the context knows is
+// compiled by the native's generator too, which the instruction drains before going on, as one
+// generator drains another. So `pairs` and `ipairs`, which return an iterator the context then
+// knows, make each step of their loop the iterator's ops rather than a call.
 
 /// A string argument's bytes, which the code running the op has guarded it is.
 #[inline(always)]
@@ -935,6 +958,109 @@ fn byte_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::
     })
 }
 
+/// `pairs`'s generator, or with `IPAIRS` `ipairs`'s: for a call of a table keeping up to three
+/// results, the iterator, a constant the code after it knows, the table, and the first control
+/// value. A generic for calling the iterator then compiles its call as the iterator's own (Note
+/// [Native generators]). Any other call is the native's.
+fn pairs_generator<const IPAIRS: bool>(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        let n = c.wrapping_sub(1);
+        if b == 2 && (1..=3).contains(&n) && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
+            let iterator = iterator(IPAIRS);
+            let bits = LBoxed::box_lvalue(LValue::NClosure(iterator)).bits();
+            yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::LoadK::new(bits, &[a])));
+            yield YieldOp::SetCTypes(vec![(a, CType::NativeFunction(iterator))]);
+            if n == 3 {
+                if IPAIRS {
+                    yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::LoadK::new(LBoxed::from_int(0).bits(), &[a + 2])));
+                    yield YieldOp::SetCTypes(vec![(a + 2, CType::Type(LType::Integer))]);
+                } else {
+                    yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::LoadNil::new(&[a + 2])));
+                    yield YieldOp::SetCTypes(vec![(a + 2, CType::Type(LType::Nil))]);
+                }
+            }
+            return ResumeArg::Start;
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
+// `next(t, k)`'s results to R(A) and R(A+1): the key and value of the entry after `k` in `t`, or
+// nil past the last. Exit 1 for a key `t` lacks, whose error the native's call raises, with R(A+1)
+// `t` again, as that call needs its arguments.
+crate::window::windowed!(reads select NextEntry, [], [], |owner, state, base| (t, k, out key, out value) {
+    let LValue::Table(tab) = t.unbox() else { unreachable!("a table, guarded") };
+    match tab.ro(owner).next(k) {
+        Ok(Some(entry)) => { (*key, *value) = entry; 0 },
+        Ok(None) => { (*key, *value) = (LBoxed::NIL, LBoxed::NIL); 0 },
+        Err(()) => { (*key, *value) = (k, t); 1 },
+    }
+});
+
+/// `next`'s generator: for `next(t, k)` of a table keeping one or two results, `NextEntry`, the
+/// native called for a key the table lacks. Any other call is the native's.
+fn next_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        let n = c.wrapping_sub(1);
+        if b == 3 && (1..=2).contains(&n) && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
+            // See Note [Optimistic ops].
+            if (yield YieldOp::OptimisticExec(std::rc::Rc::new(NextEntry::new(&[a + 1, a + 2, a, a + 1])))) == ResumeArg::Matched {
+                yield YieldOp::SetCTypes(vec![(a, CType::Unknown), (a + 1, CType::Unknown)]);
+                return ResumeArg::Start;
+            }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
+// `ipairs`'s iterator's results to R(A) and R(A+1) for `t` and the integer `i`: `i + 1` and
+// `t[i + 1]`, raw. Exit 1, with nil in both, where that's nil, past the last. An `i + 1` an i32
+// doesn't hold is past the last too, as no array is that long.
+crate::window::windowed!(reads select IpairsEntry, [], [], |owner, state, base, tag| (t, i, out key, out value) {
+    let LValue::Table(tab) = t.unbox() else { unreachable!("a table, guarded") };
+    let found = unsafe { i.as_int() }.checked_add(1).and_then(|at| {
+        let v = tab.ro(owner).array.get(at as usize - 1).copied().filter(|v| !v.is_nil())?;
+        Some((at, v))
+    });
+    match found {
+        Some((at, v)) => { (*key, *value) = (LBoxed::from_int_tagged(at, tag), v); 0 },
+        None => { (*key, *value) = (LBoxed::NIL, LBoxed::NIL); 1 },
+    }
+});
+
+/// `ipairs`'s iterator's generator: for a call of a table and an integer keeping one or two
+/// results, `IpairsEntry`, the key's type known on each of its ways, so a generic for's test of it
+/// is too, and the value an element of the table's array part. Any other call is the native's.
+fn ipairs_next_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        let n = c.wrapping_sub(1);
+        if b == 3 && (1..=2).contains(&n) {
+            yield YieldOp::Narrow(a + 2);
+            if (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched && (yield YieldOp::Guard(a + 2, LType::Integer)) == ResumeArg::Matched {
+                // Where the table is, asked before its value overwrites its slot.
+                let ResumeArg::Subject(table) = (yield YieldOp::Subject(a + 1)) else { unreachable!() };
+                // See Note [Optimistic ops].
+                if (yield YieldOp::OptimisticExec(std::rc::Rc::new(IpairsEntry::new(&[a + 1, a + 2, a, a + 1])))) == ResumeArg::Matched {
+                    yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
+                    // An element of the table's array part, its type the array's kind. See Note
+                    // [Array kinds].
+                    yield YieldOp::ArrayType(a + 1, table);
+                } else {
+                    yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Nil)), (a + 1, CType::Type(LType::Nil))]);
+                }
+                return ResumeArg::Start;
+            }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
 /// A table of `entries`, keyed by interned names.
 fn module<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>, entries: Vec<(&str, LValue<'s, 'i>)>) -> LValue<'s, 'i> {
     module_table(intern, entries, false)
@@ -1170,12 +1296,31 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (i..=j).map(|k| if k >= 1 { array.get(k as usize - 1).copied().unwrap_or(LBoxed::NIL) } else { LBoxed::NIL }).collect()
     });
     // Lua's `next(t, k)`: the entry after key `k`'s, or the first, for nil; nil past the last.
-    let next = native!(pure |owner, args| {
+    let next = native!(pure generator: next_generator, |owner, args| {
         match table(arg(&args, 0)).ro(owner).next(arg(&args, 1)) {
             Ok(Some((key, value))) => vec![key, value],
             Ok(None) => vec![LBoxed::NIL],
             Err(()) => return Err(error_value("invalid key to 'next'".into())),
         }
+    });
+    // `ipairs`'s iterator: `i + 1` and `t[i + 1]`, raw, or nothing past the last.
+    let ipairs_next = native!(pure generator: ipairs_next_generator, |owner, args| {
+        let i = number(arg(&args, 1)) + 1.0;
+        match table(arg(&args, 0)).get_number(owner, i) {
+            v if v.is_nil() => vec![],
+            v => vec![LBoxed::from_number(i), v],
+        }
+    });
+    let (LValue::NClosure(next_nf), LValue::NClosure(ipairs_nf)) = (&next, &ipairs_next) else { unreachable!("natives") };
+    ITERATORS.with(|iterators| iterators.set(Some((*next_nf, *ipairs_nf))));
+    // Lua's `pairs(t)` and `ipairs(t)`: an iterator, `t`, and its first control value.
+    let pairs = native!(pure generator: pairs_generator::<false>, |owner, args| {
+        let t = iterated(&args, "pairs")?;
+        vec![LBoxed::box_lvalue(LValue::NClosure(iterator(false))), t, LBoxed::NIL]
+    });
+    let ipairs = native!(pure generator: pairs_generator::<true>, |owner, args| {
+        let t = iterated(&args, "ipairs")?;
+        vec![LBoxed::box_lvalue(LValue::NClosure(iterator(true))), t, LBoxed::from_int(0)]
     });
     // Lua's `select(n, ...)`: its arguments from the `n`th, or with "#" how many.
     let select = native!(pure |owner, args| {
@@ -1309,6 +1454,8 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "require"), require),
         (InternString::intern(intern, "unpack"), unpack),
         (InternString::intern(intern, "next"), next),
+        (InternString::intern(intern, "pairs"), pairs),
+        (InternString::intern(intern, "ipairs"), ipairs),
         (InternString::intern(intern, "select"), select),
         (InternString::intern(intern, "error"), error),
         (InternString::intern(intern, "pcall"), pcall),

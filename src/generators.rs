@@ -2552,7 +2552,16 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
                 yield YieldOp::GuardCType(slot, args.clone());
             }
         }
-        yield YieldOp::CallResume(CallTarget::Dynamic(f, 3, c + 1));
+        // A native iterator the context knows compiles its call itself. See Note [Native
+        // generators].
+        let native = match (yield YieldOp::Typeof(f)) {
+            ResumeArg::Type(CType::NativeFunction(nf)) if !nf.is_protected_call() => nf.generator().map(|generator| generator(nf, f, 3, c + 1)),
+            _ => None,
+        };
+        match native {
+            Some(mut call) => { drain!(call, arg); }
+            None => arg = yield YieldOp::CallResume(CallTarget::Dynamic(f, 3, c + 1)),
+        }
         arg = yield YieldOp::Guard(f, LType::Nil);
         if arg == ResumeArg::Matched {
             arg = yield YieldOp::GetBlock(pc + 1);

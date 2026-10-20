@@ -229,7 +229,8 @@ impl<C: Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpi
     }
 }
 
-impl Clone for Box<dyn NativeGen> {
+// For any lifetime, as a coroutine holding one across a yield needs.
+impl<'a> Clone for Box<dyn NativeGen + 'a> {
     fn clone(&self) -> Self {
         (**self).clone_box()
     }
@@ -313,7 +314,8 @@ pub enum YieldOp {
                             // of the table in a root (as `Subject` answered before the load): its
                             // type is the array's kind, if known. See Note [Array kinds]
     Subject(usize), // Resumed with Subject: the upvalue STACK[idx] holds the value of, if the
-                    // context knows, else the slot. See Note [Upvalue paths]
+                    // context knows, else another place holding it, else the slot. See Note
+                    // [Upvalue paths]
     FieldType(usize, HashRef), // Inform the executor that STACK[idx]'s type is the same as an HREF's field.
                                // See Note [Field types]
     LoadGlobal(usize, usize), // STACK[idx] was just loaded with global CONSTANT[k]. See Note [Field facts]
@@ -8093,7 +8095,10 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 // The running closure's own upvalue, which a guard can read the table of;
                 // through the slot, a kind found out is the upvalue's too (`learn_kind`).
                 CoroutineState::Yielded(YieldOp::Subject(slot)) => {
-                    arg = ResumeArg::Subject(ctx.holds(slot).map_or(Root::Slot(slot as u16), Root::Upvalue));
+                    // Another place than the slot survives a load into the slot.
+                    let own = Root::Slot(slot as u16);
+                    let other = || ctx.values.members(Loc::root(own)).into_iter().find(|&root| root != own);
+                    arg = ResumeArg::Subject(ctx.holds(slot).map(Root::Upvalue).or_else(other).unwrap_or(own));
                 },
                 CoroutineState::Yielded(YieldOp::ArrayType(slot, table)) => {
                     let kind = ctx.kind(table);
