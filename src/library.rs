@@ -991,7 +991,7 @@ fn pairs_generator<const IPAIRS: bool>(nf: NClosure, a: usize, b: usize, c: usiz
 // nil past the last. Exit 1 for a key `t` lacks, whose error the native's call raises, with R(A+1)
 // `t` again, as that call needs its arguments.
 crate::window::windowed!(reads select NextEntry, [], [], |owner, state, base| (t, k, out key, out value) {
-    let LValue::Table(tab) = t.unbox() else { unreachable!("a table, guarded") };
+    let LValue::Table(tab) = t.unbox() else { unsafe { core::hint::unreachable_unchecked() } };
     match tab.ro(owner).next(k) {
         Ok(Some(entry)) => { (*key, *value) = entry; 0 },
         Ok(None) => { (*key, *value) = (LBoxed::NIL, LBoxed::NIL); 0 },
@@ -1021,7 +1021,7 @@ fn next_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::
 // `t[i + 1]`, raw. Exit 1, with nil in both, where that's nil, past the last. An `i + 1` an i32
 // doesn't hold is past the last too, as no array is that long.
 crate::window::windowed!(reads select IpairsEntry, [], [], |owner, state, base, tag| (t, i, out key, out value) {
-    let LValue::Table(tab) = t.unbox() else { unreachable!("a table, guarded") };
+    let LValue::Table(tab) = t.unbox() else { unsafe { core::hint::unreachable_unchecked() } };
     let found = unsafe { i.as_int() }.checked_add(1).and_then(|at| {
         let v = tab.ro(owner).array.get(at as usize - 1).copied().filter(|v| !v.is_nil())?;
         Some((at, v))
