@@ -782,6 +782,17 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// Look up a string key by its bytes, which needs no intern arena: a key
     /// that's a string is interned, and this hashes as it does. See Note
     /// [Canonical values].
+    /// `t[key]` without its metatable, as `get`, but finding a string key by its bytes, which needs
+    /// no intern arena.
+    pub fn get_raw(&self, owner: &Owner, key: LBoxed<'src, 'intern>) -> LBoxed<'src, 'intern> {
+        match key.unbox() {
+            LValue::OwnedString(s) => self.get_string(owner, s.as_slice()),
+            LValue::Integer(i) => self.get_number(owner, i as f64),
+            LValue::Double(n) => self.get_number(owner, n.0),
+            _ => self.ro(owner).hash.get(&LCanon(key)).copied().unwrap_or(LBoxed::NIL),
+        }
+    }
+
     pub fn get_string(&self, owner: &Owner, bytes: &[u8]) -> LBoxed<'src, 'intern> {
         self.ro(owner).hash.get(&StringBytes(bytes)).copied().unwrap_or(LBoxed::NIL)
     }

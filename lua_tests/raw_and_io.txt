@@ -1,0 +1,5 @@
+first line
+second line, a longer one
+
+fourth after a blank
+last, with no newline

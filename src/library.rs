@@ -36,9 +36,10 @@ use crate::patterns::{self, Capture};
 // [Call continuations]).
 //
 // What a native can't be, as it keeps state between calls (`string.gmatch`'s
-// iterator) or calls a function (`string.gsub`'s replacement, `table.sort`'s
-// order), is written in Lua (src/library.lua), which the VM runs before each
-// program, in its global environment.
+// iterator), calls a function (`string.gsub`'s replacement, `table.sort`'s
+// order), or stores a string it was given as a key (`rawset`), is written in Lua
+// (src/library.lua), which the VM runs before each program, in its global
+// environment.
 //
 // Natives are plain functions, with no intern arena and no global table, so the
 // strings they make are owned, not interned. `require` finds the built-in
@@ -170,6 +171,39 @@ macro_rules! native {
     };
 }
 
+/// What a file userdata is: the bytes of a file opened for reading, how far it has been read, and
+/// whether it's closed; or the process's standard output or error.
+enum File {
+    Read { bytes: Vec<u8>, at: Cell<usize>, closed: Cell<bool> },
+    Stdout,
+    Stderr,
+}
+
+/// A new file userdata of `file`, with the files' metatable.
+fn file<'s, 'i>(file: File) -> LBoxed<'s, 'i> {
+    let metatable = FILE_METATABLE.with(|m| m.get()).expect("the files' metatable, made with the globals");
+    // SAFETY: only the lifetimes change; `io.stdout` keeps the metatable alive.
+    let metatable = unsafe { std::mem::transmute::<LBoxed<'static, 'static>, LBoxed<'s, 'i>>(metatable) }.as_table();
+    LBoxed::box_lvalue(LValue::Userdata(Tc::new(Userdata::with_data(metatable, file))))
+}
+
+/// Run `f` on the file `v` is, as the method `name`'s first argument, or its error.
+fn with_file<'s, 'i, T>(owner: &crate::Owner, v: LBoxed<'s, 'i>, name: &str, f: impl FnOnce(&File) -> Result<T, LBoxed<'s, 'i>>) -> Result<T, LBoxed<'s, 'i>> {
+    let LValue::Userdata(u) = v.unbox() else { return Err(error_value(format!("bad argument #1 to '{name}' (FILE* expected)"))) };
+    match u.ro(owner).data::<File>() {
+        Some(File::Read { closed, .. }) if closed.get() => Err(error_value("attempt to use a closed file".into())),
+        Some(file) => f(file),
+        None => Err(error_value(format!("bad argument #1 to '{name}' (FILE* expected)"))),
+    }
+}
+
+/// Write `values` as `io.write` does, to `out`.
+fn write_values(out: &mut dyn std::io::Write, values: &[LBoxed<'_, '_>]) {
+    for &v in values {
+        out.write_all(&bytes(&v)).expect("writing output");
+    }
+}
+
 /// `pairs(t)` and `ipairs(t)`'s argument, which must be a table.
 fn iterated<'s, 'i>(args: &[LBoxed<'s, 'i>], name: &str) -> Result<LBoxed<'s, 'i>, LBoxed<'s, 'i>> {
     let t = arg(args, 0);
@@ -188,6 +222,10 @@ fn iterator(ipairs: bool) -> NClosure {
 thread_local! {
     /// `next` and `ipairs`'s iterator, which `pairs` and `ipairs` return: made with the globals.
     static ITERATORS: Cell<Option<(NClosure, NClosure)>> = const { Cell::new(None) };
+
+    /// The files' metatable, made with the globals, whose `__index` has their methods. Its
+    /// lifetimes are erased; `io.stdout`, which has it, keeps it alive.
+    static FILE_METATABLE: Cell<Option<LBoxed<'static, 'static>>> = const { Cell::new(None) };
 
     /// `math.random`'s state: xorshift64, which `math.randomseed` reseeds.
     static RANDOM: Cell<u64> = const { Cell::new(0x2545_f491_4f6c_dd1d) };
@@ -1264,14 +1302,85 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         })),
     ]);
 
+    // A file's methods, which read and close change it, so they aren't pure. `lines` is the
+    // prelude's.
+    let file_methods = module(intern, vec![
+        // `f:read(formats...)`: for each, "*a" the rest, "*l" the next line without its newline, or
+        // a count that many bytes at most; nil past the end, after which no format reads.
+        ("read", native!(|owner, args| {
+            with_file(owner, arg(&args, 0), "read", |file| {
+                let File::Read { bytes, at, .. } = file else { return Err(error_value("file not opened for reading".into())) };
+                let formats = if args.len() > 1 { args[1..].to_vec() } else { vec![string(b"*l".to_vec())] };
+                let mut results = vec![];
+                for format in formats {
+                    let rest = &bytes[at.get()..];
+                    let spec = String::from_utf8_lossy(&self::bytes(&format)).trim_start_matches('*').chars().next();
+                    let read = match format.as_number() {
+                        Some(n) => (n as usize > 0 || !rest.is_empty()).then(|| rest[..(n as usize).min(rest.len())].to_vec()).filter(|read| !read.is_empty() || n as usize == 0),
+                        None => match spec {
+                            Some('a') => Some(rest.to_vec()),
+                            Some('l') => (!rest.is_empty()).then(|| {
+                                let line = rest.iter().position(|&b| b == b'\n').map_or(rest, |end| &rest[..end]);
+                                line.to_vec()
+                            }),
+                            _ => return Err(error_value("bad argument #1 to 'read' (invalid format)".into())),
+                        },
+                    };
+                    let Some(read) = read else {
+                        results.push(LBoxed::NIL);
+                        break;
+                    };
+                    // A line's newline is read with it.
+                    let newline = spec == Some('l') && format.as_number().is_none() && at.get() + read.len() < bytes.len();
+                    at.set(at.get() + read.len() + usize::from(newline));
+                    results.push(string(read));
+                }
+                Ok(results)
+            })?
+        })),
+        ("close", native!(|owner, args| {
+            with_file(owner, arg(&args, 0), "close", |file| match file {
+                File::Read { closed, .. } => { closed.set(true); Ok(vec![LBoxed::from_bool(true)]) },
+                File::Stdout | File::Stderr => Ok(vec![LBoxed::NIL, string(b"cannot close standard file".to_vec())]),
+            })?
+        })),
+        // `f:write(values...)`: true, as Lua 5.1's, once written.
+        ("write", native!(|owner, args| {
+            with_file(owner, arg(&args, 0), "write", |file| match file {
+                File::Stdout => { write_values(&mut std::io::stdout().lock(), &args[1..]); Ok(vec![LBoxed::from_bool(true)]) },
+                File::Stderr => { write_values(&mut std::io::stderr().lock(), &args[1..]); Ok(vec![LBoxed::from_bool(true)]) },
+                File::Read { .. } => Ok(vec![LBoxed::NIL, string(b"file not opened for writing".to_vec())]),
+            })?
+        })),
+    ]);
+    let file_metatable = module(intern, vec![("__index", file_methods)]);
+    // SAFETY: only the lifetimes change; see `FILE_METATABLE`.
+    FILE_METATABLE.with(|m| m.set(Some(unsafe { std::mem::transmute::<LBoxed<'s, 'i>, LBoxed<'static, 'static>>(LBoxed::box_lvalue(file_metatable.clone())) })));
     let io_lib = module(intern, vec![
         ("write", native!(pure |owner, args| {
-            let mut out = std::io::stdout().lock();
-            for &v in args {
-                out.write_all(&bytes(&v)).expect("writing stdout");
-            }
+            write_values(&mut std::io::stdout().lock(), args);
             vec![]
         })),
+        // Lua's `io.open(path, mode)`: a file opened for reading, read whole as it opens. Writing
+        // isn't supported: any other mode, like a file that can't be read, is nil and why.
+        ("open", native!(pure |owner, args| {
+            let path = String::from_utf8_lossy(&arg_bytes(&args, 0)).into_owned();
+            let mode = if args.len() > 1 && !arg(&args, 1).is_nil() { arg_bytes(&args, 1).into_owned() } else { b"r".to_vec() };
+            if mode.iter().any(|&c| matches!(c, b'w' | b'a' | b'+')) {
+                vec![LBoxed::NIL, string(format!("{path}: writing files is not supported").into_bytes())]
+            } else {
+                match std::fs::read(&path) {
+                    Ok(bytes) => vec![file(File::Read { bytes, at: Cell::new(0), closed: Cell::new(false) })],
+                    Err(e) => {
+                        let code = e.raw_os_error().unwrap_or(0);
+                        let why = unsafe { std::ffi::CStr::from_ptr(libc::strerror(code)) }.to_string_lossy().into_owned();
+                        vec![LBoxed::NIL, string(format!("{path}: {why}").into_bytes()), LBoxed::from_int(code)]
+                    }
+                }
+            }
+        })),
+        ("stdout", file(File::Stdout).unbox()),
+        ("stderr", file(File::Stderr).unbox()),
         // The benchmarks' `io.write` that discards its output.
         ("write_devnull", native!(pure |owner, args| vec![])),
     ]);
@@ -1316,6 +1425,13 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     });
     let (LValue::NClosure(next_nf), LValue::NClosure(ipairs_nf)) = (&next, &ipairs_next) else { unreachable!("natives") };
     ITERATORS.with(|iterators| iterators.set(Some((*next_nf, *ipairs_nf))));
+    // Lua's `rawget(t, k)`: `t[k]`, not looked for in its metatable. `rawset` is the prelude's.
+    let rawget = native!(pure |owner, args| {
+        let LValue::Table(t) = arg(&args, 0).unbox() else {
+            return Err(error_value(format!("bad argument #1 to 'rawget' (table expected, got {})", String::from_utf8_lossy(type_name(arg(&args, 0))))));
+        };
+        vec![t.get_raw(owner, arg(&args, 1))]
+    });
     // Lua's `pairs(t)` and `ipairs(t)`: an iterator, `t`, and its first control value.
     let pairs = native!(pure generator: pairs_generator::<false>, |owner, args| {
         let t = iterated(&args, "pairs")?;
@@ -1457,6 +1573,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "require"), require),
         (InternString::intern(intern, "unpack"), unpack),
         (InternString::intern(intern, "next"), next),
+        (InternString::intern(intern, "rawget"), rawget),
         (InternString::intern(intern, "pairs"), pairs),
         (InternString::intern(intern, "ipairs"), ipairs),
         (InternString::intern(intern, "select"), select),

@@ -144,3 +144,37 @@ function table.sort(t, lt)
   auxsort(t, 1, #t, lt or less)
 end
 
+-- Lua's `rawset(t, k, v)`: a store, raw already, as no table here has a `__newindex`. Here as a
+-- native has no intern arena to make a string key with.
+function rawset(t, k, v)
+  if type(t) ~= "table" then
+    error("bad argument #1 to 'rawset' (table expected, got " .. type(t) .. ")")
+  end
+  t[k] = v
+  return t
+end
+
+-- A file's `lines()`, and Lua's `io.lines(path)`: each line of the file without its newline. A file
+-- `io.lines` opened is closed after its last line.
+local file_methods = getmetatable(io.stdout).__index
+local read = file_methods.read
+
+function file_methods.lines(f)
+  return function()
+    return read(f, "*l")
+  end
+end
+
+function io.lines(path)
+  local f, why = io.open(path, "r")
+  if not f then
+    error("bad argument #1 to 'lines' (" .. why .. ")")
+  end
+  return function()
+    local line = read(f, "*l")
+    if line == nil then
+      f:close()
+    end
+    return line
+  end
+end
