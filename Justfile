@@ -512,6 +512,8 @@ _luac-test name:
 # benchmarks/prelude.lua (`tools/bundle_bench.py`) in working/<benchmark>.lua.
 _luac benchmark:
     mkdir -p working
+    # The data benchmarks read, by a path from where they run, which some recipes run them in.
+    ln -sfn ../lua_benchmarking/benchdata working/benchdata
     python3 tools/bundle_bench.py {{benchmark}} > working/{{benchmark}}.lua
     luac5.1 -o working/{{benchmark}}.bin working/{{benchmark}}.lua
 
