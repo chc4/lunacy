@@ -11,12 +11,12 @@ use crate::window::{Access, Window, WINDOW};
 
 // Note [Window allocation]
 // ~~~~~~~~~~~~~~~~~~~~~~~~
-// Each register holds at most one value, which any number of slots may name: a
-// `Move` makes its destination name its source's value, with no code. A named
-// slot is dirty while its stack home is stale, and is stored from whichever
-// register holds its value. A block's entry window names one slot in each
-// register, as any edge into it may bring the slots' values apart, so values are
-// shared only within a trace. Allocation has two passes over a
+// A register holds at most one value, and any number of slots may name it. A
+// `Move` emits no code: its destination names its source's value. A named slot
+// is dirty while its stack home is stale, and is stored from whichever register
+// holds its value. A block's entry window names one slot per register, because
+// different edges into the block may bring those slots different values. So
+// slots share a value only within a trace. Allocation has two passes over a
 // compiled region, trace by trace (see Note [Trace register allocation]):
 //
 // * Planning placements, one trace at a time ([`plan_trace`], Note [Trace
@@ -169,8 +169,8 @@ fn occupied(regs: &Placement) -> u8 {
     (0..WINDOW).filter(|&reg| regs[reg].is_some()).fold(0, |mask, reg| mask | 1 << reg)
 }
 
-/// For each window register, a slot whose current value it should hold, if any. See Note
-/// [Window allocation].
+/// For each window register, the slot whose value it should hold, if any. See Note [Window
+/// allocation].
 pub type Placement = [Option<usize>; WINDOW];
 
 /// A `Placement` in a byte per register, to keep per block: a Lua frame has at
@@ -191,17 +191,16 @@ impl Packed {
     }
 }
 
-/// Which value each window register holds, which slots name those values, and which of those
-/// slots are dirty: the window between residuals, and a block's window on entry. See Note
-/// [Window allocation].
+/// The window: the value each register holds, the slots naming each value, and which of those
+/// slots are dirty. See Note [Window allocation].
 #[derive(Debug, Clone, Default)]
 pub struct Cache {
-    /// The value each register holds, by an id of this window's.
+    /// The value each register holds, by an id local to this window.
     regs: [Option<u32>; WINDOW],
     /// The registers holding theirs unboxed, bit `reg` for register `reg`: only
     /// registers holding a value. See Note [Unboxed doubles].
     unboxed: u8,
-    /// Each slot whose current value a register holds, and that value. Several slots may name one.
+    /// The value each named slot has. Several slots may name one value.
     names: SmallVec<[(usize, u32); WINDOW]>,
     /// Named slots whose stack home is stale.
     dirty: SmallVec<[usize; WINDOW]>,
@@ -209,8 +208,8 @@ pub struct Cache {
     next: u32,
 }
 
-/// Two windows are one if their registers hold values named by the same slots, in the same
-/// forms, with the same slots dirty, whatever their ids.
+/// Two windows are equal when each register's value has the same names, form and dirty slots.
+/// Value ids don't matter.
 impl PartialEq for Cache {
     fn eq(&self, other: &Cache) -> bool {
         let shape = |cache: &Cache| {
@@ -229,8 +228,8 @@ impl PartialEq for Cache {
 
 impl Eq for Cache {}
 
-/// Each register holding a value, as `w1=[5,7]` (or `x1=[5]` unboxed), the slots naming it each
-/// marked `*` if dirty.
+/// Each register holding a value, as `w1=[5,7]`, or `x1=[5]` when unboxed. A dirty slot is marked
+/// `*`.
 impl std::fmt::Display for Cache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut sep = "";
@@ -298,14 +297,14 @@ impl Cache {
         self.regs.iter().position(|&v| v == Some(value))
     }
 
-    /// A register holding `slot`'s value, one in the form `unboxed` says if any is.
+    /// A register holding `slot`'s value, preferring one in the form `unboxed` asks for.
     fn source(&self, slot: usize, unboxed: bool) -> Option<Loc> {
         let value = self.value(slot)?;
         let regs = || (0..WINDOW).filter(move |&reg| self.regs[reg] == Some(value));
         regs().find(|&reg| bit(self.unboxed, reg) == unboxed).or_else(|| regs().next()).map(|reg| self.loc(reg))
     }
 
-    /// Whether `reg` holds `slot`'s value in the form `unboxed` says.
+    /// Whether `reg` holds `slot`'s value in the form `unboxed` asks for.
     fn holds(&self, reg: usize, slot: usize, unboxed: bool) -> bool {
         self.has(reg, slot) && bit(self.unboxed, reg) == unboxed
     }
@@ -316,8 +315,8 @@ impl Cache {
         Emit::Store { slot, reg, unboxed: bit(self.unboxed, reg) }
     }
 
-    /// Set `reg` to hold `slot`'s value, if any, in the form `unboxed` says: the value a register
-    /// holds, else one the slot's stack home holds.
+    /// Make `reg` hold `slot`'s value in the form `unboxed` asks for, or nothing if `slot` is
+    /// `None`.
     fn set(&mut self, reg: usize, slot: Option<usize>, unboxed: bool) {
         let mut want = [None; WINDOW];
         want[reg] = slot;
@@ -330,8 +329,8 @@ impl Cache {
         self.hold(&want, |_, _| unboxed);
     }
 
-    /// Set each register `want` names a slot for to hold that slot's value, in the form `form`
-    /// says, all at once: a value a register holds now, else one the slot's stack home holds.
+    /// Make each register `want` names a slot for hold that slot's value, all at once, in the form
+    /// `form` gives.
     fn hold(&mut self, want: &Placement, form: impl Fn(usize, usize) -> bool) {
         let values: [Option<u32>; WINDOW] = want.map(|slot| slot.map(|slot| match self.value(slot) {
             Some(value) => value,
@@ -350,8 +349,7 @@ impl Cache {
         self.prune();
     }
 
-    /// `reg` holds a new value of `slot`'s, in the form `unboxed` says: what `slot` named before
-    /// keeps its other names.
+    /// `reg` holds a new value for `slot`, which becomes dirty. The old value keeps its other names.
     fn write(&mut self, reg: usize, slot: usize, unboxed: bool) {
         self.names.retain(|name| name.0 != slot);
         let value = self.fresh();
@@ -364,8 +362,7 @@ impl Cache {
         self.prune();
     }
 
-    /// Forget what no register holds, and its names, and empty a register holding what no slot
-    /// names.
+    /// Drop the names of values no register holds, and empty registers whose value has no name.
     fn prune(&mut self) {
         let regs = self.regs;
         self.names.retain(|name| regs.contains(&Some(name.1)));
@@ -377,12 +374,12 @@ impl Cache {
         }
     }
 
-    /// Each slot it names a value of, once, with the first register holding the value.
+    /// Each named slot, with the first register holding its value.
     fn slots(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.names.iter().filter_map(|&(slot, value)| self.regs.iter().position(|&v| v == Some(value)).map(|reg| (reg, slot)))
     }
 
-    /// Each value it holds, once: the first register holding it, and the slots naming it.
+    /// Each value held, with the first register holding it and the slots naming it.
     fn values(&self) -> impl Iterator<Item = (usize, SmallVec<[usize; WINDOW]>)> + '_ {
         (0..WINDOW).filter_map(|reg| {
             let value = self.regs[reg]?;
@@ -523,11 +520,9 @@ impl WindowAlloc {
         plan.emits
     }
 
-    /// Make the window hold, in each register `want` names a slot for, that slot's value, before
-    /// `op`, its operands in `regs`, leaving the others as they are: store each dirty slot whose
-    /// value survives nowhere and that `op` doesn't rewrite, then fill the named registers as one
-    /// parallel move (a slot loaded into several registers is loaded once and copied). See Note
-    /// [Window allocation].
+    /// Before `op` runs with its operands in `regs`, make each register `want` names a slot for hold
+    /// that slot's value. Other registers keep theirs. A dirty value about to be lost is stored
+    /// first, unless `op` rewrites its slot. See Note [Window allocation].
     pub fn reconcile(&mut self, want: &Placement, framed: &Framed, regs: &[usize]) -> SmallVec<[Emit; 16]> {
         let op = framed.op;
         let rewritten = |slot: usize| framed.slots().iter().zip(op.accesses()).any(|(&s, &a)| s == slot && a.writes());
@@ -576,9 +571,8 @@ impl WindowAlloc {
         self.cache.dirty.iter().map(|&slot| self.cache.store(slot)).collect()
     }
 
-    /// A `Move` from `src`, whose value a register holds, to `dst`: `dst` names that value from
-    /// then on, dirty, `src` still naming it too, and `src` is stored first if `store`. No code but
-    /// the store.
+    /// A `Move` from `src` to `dst` done as a rename: `dst` names the value of `src`'s register and
+    /// is dirty. The only code is a store of `src`, when `store` asks for one.
     pub fn rename(&mut self, src: usize, dst: usize, store: bool) -> SmallVec<[Emit; 16]> {
         let value = self.cache.value(src).expect("a renamed value in a register");
         let mut emits = SmallVec::new();
@@ -624,8 +618,7 @@ impl WindowAlloc {
         let now = &self.cache;
         let rewritten = |slot: usize| slots.iter().zip(accesses).any(|(&s, a)| s == slot && a.writes());
 
-        // The cache it leaves: its inputs' values in their registers, in the forms it takes them,
-        // then each output a new value of its slot.
+        // Its inputs stay in their registers, in the forms it reads them. Each output is a new value.
         let mut after = now.clone();
         let mut inputs = [None; WINDOW];
         for (i, (&slot, &access)) in slots.iter().zip(accesses).enumerate() {
@@ -640,8 +633,8 @@ impl WindowAlloc {
             }
         }
 
-        // A value it displaces that no other register keeps: each of its dirty names the op
-        // doesn't rewrite is stored first.
+        // A displaced value no other register keeps has its dirty names stored, unless the op
+        // rewrites them.
         let mut emits = SmallVec::new();
         let mut overwritten = 0;
         for reg in regs.iter().copied().filter(|&reg| now.regs[reg].is_some()) {
@@ -736,8 +729,6 @@ impl WindowAlloc {
 // dirty: any other value dirty on the way in is stored on that edge once,
 // rather than by the more frequent code whenever it drops it.
 
-/// A step of a trace, for [`plan_trace`]: its blocks' residuals, as planning
-/// sees them.
 /// The `SKIP` a plan places a `Move` renamed at (see `WindowAlloc::rename`): its source's value
 /// stored first, or not.
 pub const RENAME_STORE: usize = 255;
@@ -835,6 +826,8 @@ impl<'a> Framed<'a> {
     }
 }
 
+/// A step of a trace, for [`plan_trace`]: its blocks' residuals, as planning
+/// sees them.
 pub enum Step<'a> {
     /// A block's start, continuing the trace from the step before it, with
     /// its `Rise` if the edge into it enters more frequent code.
@@ -1047,9 +1040,9 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                 let worth = |slot: usize| ahead.worth(slot, step, now.dirty.contains(&slot));
                 let mut regs = [None; WINDOW];
                 let mut dirty = Slots::default();
-                // A block's entry window names one slot in each register: each value stays in its
-                // register under the first of its slots kept, and then each other slot naming one
-                // goes in a register left free, or is left, stored on the edge if dirty.
+                // An entry window names one slot per register. Each value keeps its register under
+                // its first slot, and its other names take free registers. A name left without one
+                // is stored on the edge if dirty.
                 let put = |regs: &mut Placement, slot: usize, at: Option<usize>| match at.map_or_else(|| (0..width).find(|&reg| regs[reg].is_none()), |reg| regs[reg].is_none().then_some(reg)) {
                     Some(reg) => {
                         regs[reg] = Some(slot);
@@ -1087,7 +1080,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                         values.sort_unstable();
                         values.truncate(width);
                         let names: SmallVec<[(usize, usize); 16]> = values.iter().filter_map(|&(_, slot)| Some((now.position(slot)?, slot))).collect();
-                        // Its dirty slots are those it writes.
+                        // Only the slots the entered code writes are dirty on entry.
                         place(&mut regs, &mut Slots::default(), &names);
                         for &(_, slot) in &values {
                             if now.position(slot).is_none() {
@@ -1097,7 +1090,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                         regs.iter().flatten().filter(|&&slot| writes.contains(slot)).for_each(|&slot| dirty.insert(slot));
                     }
                     None => {
-                        // The slots worth most first.
+                        // The slots worth most get registers first.
                         let mut worths: SmallVec<[((bool, usize), (usize, usize)); 16]> = now.slots().filter_map(|name| Some((worth(name.1)?, name))).collect();
                         worths.sort_unstable();
                         let names: SmallVec<[(usize, usize); 16]> = worths.into_iter().map(|(_, name)| name).collect();
@@ -1204,8 +1197,8 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
     plan
 }
 
-/// Whether the op is a `Move` the window does as a rename, and if so whether its source is stored
-/// first: one whose source a register holds, which the destination names too from then on.
+/// Whether the op is a `Move` done as a rename, and if so whether its source is stored first. A
+/// move is a rename when a register holds its source.
 fn renames(alloc: &WindowAlloc, op: &Framed) -> Option<bool> {
     if !is_move(op.op) {
         return None;
@@ -1215,10 +1208,9 @@ fn renames(alloc: &WindowAlloc, op: &Framed) -> Option<bool> {
     (src != dst).then_some(false)
 }
 
-/// The values `now` holds worth keeping in registers past step `at`, but those an op reading
-/// `reads` takes as inputs, each by its slot worth most, those worth most first and a dirty one
-/// before a clean one worth as much: a value's worth is the most of the slots naming it but those
-/// the op rewrites, `writes`.
+/// The values `now` holds that are worth keeping past step `at`, best first, leaving out the op's
+/// inputs `reads`. A value is worth what its best name is worth, ignoring the slots the op
+/// rewrites, `writes`. A dirty value goes before a clean one worth as much.
 fn kept_values(ahead: &Ahead, now: &Cache, at: usize, reads: &[usize], writes: &[usize]) -> SmallVec<[((bool, usize), usize); WINDOW]> {
     let mut kept: SmallVec<[((bool, usize), usize); WINDOW]> = now
         .values()
@@ -1240,7 +1232,7 @@ fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed, usable: &
     let writes: SmallVec<[usize; WINDOW]> = slots.iter().zip(accesses).filter(|(_, a)| a.writes()).map(|(&slot, _)| slot).collect();
     let mut kept = kept_values(ahead, now, step, &reads, &writes);
     kept.truncate(width - slots.len());
-    // A kept value stays in a register outside the run holding it, if any.
+    // A register outside the run that already holds a kept value.
     let outside = |slot: usize, run: &std::ops::Range<usize>| (0..width).find(|reg| !run.contains(reg) && now.has(*reg, slot));
     let inputs = |skip: usize| (skip..).zip(slots.iter().zip(accesses)).filter(|(_, (_, a))| a.reads()).map(|(reg, (&slot, _))| (reg, slot));
     let moves = |skip: usize| {
@@ -1272,23 +1264,22 @@ fn place(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed, usable: &
     (want, skip)
 }
 
-/// Where the emitted op at `step` runs, and the window it wants: each input in the register
-/// holding it, or one free, its output in the register of an input it overwrites, of its slot's
-/// old value, of an input no longer worth keeping, a free one, or that of the value worth least,
-/// and the values worth most of the others, as many as fit in the registers left. Its output's
-/// register is returned in place of a `SKIP`. See Notes [Trace allocation] and [Emitted ops].
+/// Where the emitted op at `step` runs, and the window it wants. Each input stays in its register
+/// or takes a free one. The output takes the register that is cheapest to give up, and the rest
+/// keep the values worth most. The output's register is returned in place of a `SKIP`. See Notes
+/// [Trace allocation] and [Emitted ops].
 fn place_free(alloc: &WindowAlloc, ahead: &Ahead, step: usize, op: &Framed) -> (Placement, usize) {
     let (slots, accesses) = (op.slots(), op.op.accesses());
     let now = alloc.cache();
     let width = alloc.width;
     let reads: SmallVec<[usize; WINDOW]> = slots.iter().zip(accesses).filter(|(_, a)| a.reads()).map(|(&slot, _)| slot).collect();
     let writes: SmallVec<[usize; WINDOW]> = slots.iter().zip(accesses).filter(|(_, a)| a.writes()).map(|(&slot, _)| slot).collect();
-    // A value's worth: the most of the slots naming it.
+    // A value is worth what its best name is worth.
     let worth = |value: u32| now.named(value).filter_map(|slot| ahead.worth(slot, step, now.dirty.contains(&slot))).min();
     let dirty = |value: u32| now.named(value).any(|slot| now.dirty.contains(&slot));
     let mut want: Placement = [None; WINDOW];
-    // A free register: empty, else holding a value worth nothing, else the one worth least, a clean
-    // one before a dirty one worth as much.
+    // The cheapest register to take: an empty one, then one holding a worthless value, then the
+    // least valuable. A clean value goes before a dirty one worth as much.
     let free = |want: &Placement, taken: &[usize]| {
         (0..width)
             .filter(|reg| want[*reg].is_none() && !taken.contains(reg))
@@ -1500,11 +1491,10 @@ mod tests {
         Move(usize, usize),
     }
 
-    /// Executes allocator output on symbolic values, each register's halves apart, checking that
-    /// every op reads its inputs' current values in the forms it takes them, every store writes a
-    /// slot's current value, and after the run the stack holds every slot's. A value is an id: a
-    /// slot never written holds its own, a write makes a new one, and a rename gives its
-    /// destination its source's.
+    /// Runs allocator output on symbolic values and checks it. Each op must read its inputs' current
+    /// values in the forms it takes, each store must write a slot's current value, and at the end
+    /// the stack must hold every slot's current value. A value is an id. A slot never written has
+    /// its own, a write makes a new one, and a rename copies its source's.
     #[derive(Debug, Default, Clone)]
     struct Machine {
         memory: HashMap<usize, u64>,
@@ -1526,15 +1516,15 @@ mod tests {
         fn half(&mut self, loc: Loc) -> &mut Option<u64> {
             if loc.unboxed { &mut self.xregs[loc.reg] } else { &mut self.regs[loc.reg] }
         }
-        /// The window `cache` holds, each register its slots' current value.
+        /// Load the registers with the window `cache` describes, each holding its slots' value.
         fn holding(&mut self, cache: &Cache) {
             for (reg, slot) in cache.regs().iter().enumerate() {
                 let value = slot.map(|slot| Self::version(&self.current, slot));
                 *self.half(cache.loc(reg)) = value;
             }
         }
-        /// Whether every register of `cache` holds the current value of each slot naming its value,
-        /// in its form.
+        /// Check that each register of `cache` holds the current value of every slot naming it, in its
+        /// form.
         fn check(&mut self, cache: &Cache, what: &str) {
             for (reg, slot) in cache.slots() {
                 let current = Self::version(&self.current, slot);
@@ -2051,8 +2041,8 @@ mod tests {
         }
     }
 
-    /// A move renamed: both slots name the value one register holds, each dirty, and the stores
-    /// a snapshot or a flush takes store each of them from that register.
+    /// A renamed move: both slots name one register's value and both are dirty. A snapshot or a flush
+    /// stores each of them from that register.
     #[test]
     fn renamed_slots_share_a_register() {
         let mut alloc = WindowAlloc::default();

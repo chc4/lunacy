@@ -4,9 +4,9 @@ recorded with call graphs (`perf record --call-graph fp`), the samples whose
 leaf frame matches `symbol`, counted by their caller's frame (JIT blocks by the
 Lua line their perf map names them with, as in tools/perf_jit_lines.py), side
 by side for each profile, with the difference between the first two. With
-`--callees`, the samples with `symbol` anywhere on their stack instead, counted
-by the function its outermost match called (inlined functions counted as
-calls), `(self)` where it is the leaf: where a function's inclusive time goes.
+`--callees`, it counts the samples with `symbol` anywhere on their stack, by
+what the outermost match called, to show where a function's inclusive time
+goes. Inlined functions count as calls, and `(self)` is time in the function.
 
     perf script -i A.data > a.txt; perf script -i B.data > b.txt
     tools/perf_callers.py SYMBOL a.txt b.txt [--top N] [--inner | --callees]
@@ -26,8 +26,8 @@ def name(sym):
 
 
 def callee(frames, symbol):
-    """The function the outermost function with `symbol` in it called on a
-    sample's stack (`frames`, leaf first), or None if there is none."""
+    """What the outermost frame matching `symbol` called, on a sample's stack
+    (`frames`, leaf first). `(self)` if the match is the leaf, None if none."""
     flat = [sym for frame in frames for sym in frame]
     for k in range(len(flat) - 1, -1, -1):
         if symbol in flat[k]:
@@ -38,8 +38,8 @@ def callee(frames, symbol):
 def callers(path, symbol, inner, below=False):
     """Per caller, the samples whose leaf frame has `symbol` in it. A frame is a
     machine frame: the functions inlined into it (`(inlined)` lines) and it.
-    With `inner`, per innermost function of the leaf frame instead; with
-    `below`, per callee of `symbol` anywhere on the stack."""
+    With `inner`, counted by the leaf frame's innermost function instead. With
+    `below`, counted by what `symbol` called, anywhere on the stack."""
     counts = Counter()
     frames, inlined = [], []
     for line in list(open(path, errors='replace')) + ['']:

@@ -16,18 +16,17 @@ CPU := "2"
 # wait for it. Each command takes it, never a recipe calling another, which
 # would wait on itself; `cargo watch`, which never ends, doesn't.
 BENCH_LOCK := env_var_or_default("LUNACY_BENCH_LOCK", "/tmp/lunacy-bench.lock")
-# The most address space, in bytes, any one process a command starts may take (`prlimit`, which
-# its children inherit): a runaway run, or build, fails its allocation instead of exhausting the
-# machine's memory.
+# The most address space, in bytes, that each process a command starts may use. A runaway run or
+# build fails to allocate instead of exhausting the machine's memory.
 MEM_CAP := env_var_or_default("LUNACY_MEM_CAP", "8589934592")
 CAP := "prlimit --as=" + MEM_CAP
-# The prefix of a timed command: the lock, then pinned to `CPU`, capped.
+# The prefix of a timed command: the lock, pinned to `CPU`, under the memory cap.
 TIMED := "flock " + BENCH_LOCK + " taskset -c " + CPU + " " + CAP
-# The prefix of a sampled command: the lock, capped.
+# The prefix of a sampled command: the lock, under the memory cap.
 SAMPLED := "flock " + BENCH_LOCK + " " + CAP
 # The prefix of a build, test or other run that loads the machine without
 # measuring: the lock shared, so that any number run together, but none while a
-# timed or sampled run holds it, nor one while they do; capped.
+# timed or sampled run holds it, nor one while they do. It is under the memory cap too.
 SHARED := "flock -s " + BENCH_LOCK + " " + CAP
 
 # Every test: `test`, then `test-stencils`.
@@ -1021,8 +1020,8 @@ perf-stat-uxn-slope long='uxn_loop' short='uxn_loop_short' iterations='983025' r
 # implementations whose names match `only` (a regex): each one's counts on `long` and `short` in
 # `out`/<implementation>.{long,short}.csv, and per iteration of the loop (tools/uxn_slope.py).
 # Compare runs, say with a knob set and without, with tools/uxn_slope.py over their `out`s. The
-# default events are counted over the whole run; more than the core counts at once are
-# multiplexed and scaled, and a slope of scaled counts moves several percent between runs.
+# default events are few enough for the core to count over the whole run. More events are
+# multiplexed and scaled, and then the slope moves by several percent between identical runs.
 perf-stat-uxn-slope-events out='working/uxn-slope' only='lunacy' long='uxn_loop' short='uxn_loop_short' iterations='983025' runs='5' events='cycles,instructions': unsafe-compile unsafe-magic-compile _raven
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1444,9 +1443,8 @@ hyperfines-full:
     for run in {{HYPERFINES}}; do just hyperfine-full ${run%:*} ${run#*:}; done
     python3 tools/bench_history.py report
 
-# Compare this checkout's unsafe build under each feature set in `sets`
-# (comma separated features, or `none`) on one benchmark: each built as
-# `unsafe-compile` builds it, with the set's features, into target/features/<set>.
+# Compare this checkout's unsafe build under each feature set in `sets` on one benchmark. A set
+# is comma separated features, or `none`. Each set builds into a target directory of its own.
 hyperfine-features benchmark times +sets:
     #!/usr/bin/env bash
     set -euo pipefail

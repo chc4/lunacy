@@ -3472,7 +3472,7 @@ impl Context {
 
     /// Whether a trip falsifies something it knows. See Note [Watched tables].
     fn trips(&self) -> bool {
-        // A call site's context is kept as it was made, maybe unsettled.
+        // A call site keeps its context as it was made, which may be unsettled.
         let mut values = self.values.clone();
         values.settle();
         values.all_facts().any(|fact| !fact.survives_trip())
@@ -6180,8 +6180,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let mut theirs = hkey.clone();
                 theirs.idx = owner;
                 theirs.clear_checks();
-                // A check through the parameter holds through every slot of the caller's holding
-                // the table it was passed.
+                // A check made through the parameter holds for every caller slot holding that table.
                 if hkey.checked(hkey.idx) {
                     for slot in (0..caller.types.len()).filter(|&slot| slot == owner || caller.values.same(Loc::root(Root::Slot(slot as u16)), Loc::root(Root::Slot(owner as u16)))) {
                         theirs.check(slot);
