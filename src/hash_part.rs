@@ -1,70 +1,57 @@
-//! A table's hash part: an insertion-ordered map JIT code reads by its layout. See Note [Hash
-//! part layout].
+//! A table's hash part: a map keeping its keys in insertion order. See Note [Hash part layout].
 
-use std::hash::{BuildHasher, Hash};
+use std::hash::BuildHasher;
 
 use crate::lboxed::LBoxed;
 use crate::vm::{InternedHasher, LCanon};
 
 // Note [Hash part layout]
 // ~~~~~~~~~~~~~~~~~~~~~~~
-// A table's hash part is a compact dict: its entries, each a key and its value, kept densely in
-// the order their keys were first inserted, and an index table over them. The index table has a
-// power-of-two count of slots, each 0 for an empty slot or an entry's position plus one. A key is
-// found by probing linearly from its hash masked to the slots, until a slot names the key's entry
-// or is empty: a key the table lacks ends at an empty slot. Keys are canonical (Note [Canonical
-// values]), so an entry is the key's when its key has the same bits.
+// A table's hash part stores its key-value pairs in the order their keys were first inserted, and
+// a hash table mapping each key to its pair's index. The hash table has a power-of-two count of
+// slots, each empty or holding a pair's index. It uses Robin Hood hashing, with no key further past
+// the slot its hash masks to than log2 of the slot count, so a lookup probes at most that many
+// slots after its first, and stops at an empty one. An insertion that would place a key further,
+// or fill more than seven eighths of the slots, doubles the hash table. Keys are canonical (Note [Canonical values]), so a pair is a key's when its key has the same
+// bits.
 //
-// No more than half the slots are used, so a probe ends soon, and the first slot probed is often
-// empty for a missing key. An entry keeps its position until the part is cleared, as no key is
-// removed: a key set to nil keeps its entry. The entries move only when an insertion outgrows
-// their room or the part is cleared, as the table's epoch tells (Note [Hash witnesses]).
+// No key is removed: a key set to nil keeps its pair, so a pair's index doesn't change until the
+// part is cleared. Inserting a key may reallocate the key-value storage, so it increments the
+// table's epoch, which invalidates any outstanding hash keys (Note [Hash witnesses]).
 //
-// An empty part's index table is a shared one of a single empty slot, so a probe needs no check
-// that there is one. JIT code reads every field at its offset, so the layout is fixed (`repr(C)`):
-// it checks a predicted entry's key, and a missing key's first slot, without a call.
+// An empty part's hash table is a shared one of a single empty slot, so a lookup needs no check
+// that there is one.
 
-/// A key and its value, as JIT code reads them. See Note [Hash part layout].
-#[repr(C)]
+/// A key and its value. See Note [Hash part layout].
 #[derive(Debug, Clone, Copy)]
-pub struct Entry<'src, 'intern> {
-    pub key: LCanon<'src, 'intern>,
-    pub value: LBoxed<'src, 'intern>,
+struct Pair<'src, 'intern> {
+    key: LCanon<'src, 'intern>,
+    value: LBoxed<'src, 'intern>,
 }
 
-/// The index table of every empty hash part: one empty slot, never written. See Note [Hash part
+/// The hash table of every empty hash part: one empty slot, never written. See Note [Hash part
 /// layout].
 static EMPTY: [u32; 1] = [0];
 
 /// A table's hash part. See Note [Hash part layout].
-#[repr(C)]
-pub struct HashPart<'src, 'intern> {
-    /// The entries, `len` of them in room for `cap`.
-    pub entries: *mut Entry<'src, 'intern>,
-    pub len: usize,
+pub struct HashPart<'src, 'intern, S = InternedHasher> {
+    /// The key-value pairs, `len` of them in room for `cap`.
+    pairs: *mut Pair<'src, 'intern>,
+    len: usize,
     cap: usize,
-    /// The index table, of `mask + 1` slots.
-    pub indices: *mut u32,
-    pub mask: usize,
+    /// The hash table, of `mask + 1` slots, each 0 for an empty slot or a pair's index plus one.
+    table: *mut u32,
+    mask: usize,
+    hasher: S,
 }
 
-impl<'src, 'intern> HashPart<'src, 'intern> {
-    pub fn new() -> Self {
-        HashPart { entries: std::ptr::NonNull::dangling().as_ptr(), len: 0, cap: 0, indices: EMPTY.as_ptr().cast_mut(), mask: 0 }
+impl<'src, 'intern, S> HashPart<'src, 'intern, S> {
+    pub fn with_hasher(hasher: S) -> Self {
+        HashPart { pairs: std::ptr::NonNull::dangling().as_ptr(), len: 0, cap: 0, table: EMPTY.as_ptr().cast_mut(), mask: 0, hasher }
     }
 
-    /// One with room for `capacity` entries before it grows.
-    pub fn with_capacity(capacity: usize) -> Self {
-        let mut part = Self::new();
-        if capacity > 0 {
-            part.grow_to(capacity.next_power_of_two());
-        }
-        part
-    }
-
-    /// The hash of a key, as every lookup and the JIT's checks compute it.
-    pub fn hash(key: &impl Hash) -> u64 {
-        InternedHasher::default().hash_one(key)
+    pub fn hasher(&self) -> &S {
+        &self.hasher
     }
 
     pub fn len(&self) -> usize {
@@ -75,162 +62,216 @@ impl<'src, 'intern> HashPart<'src, 'intern> {
         self.len == 0
     }
 
-    fn entries(&self) -> &[Entry<'src, 'intern>] {
-        // SAFETY: `entries` holds `len` initialized entries.
-        unsafe { std::slice::from_raw_parts(self.entries, self.len) }
+    fn pairs(&self) -> &[Pair<'src, 'intern>] {
+        // SAFETY: `pairs` holds `len` initialized pairs.
+        unsafe { std::slice::from_raw_parts(self.pairs, self.len) }
     }
 
-    fn entries_mut(&mut self) -> &mut [Entry<'src, 'intern>] {
-        // SAFETY: as `entries`, and borrowed uniquely through `self`.
-        unsafe { std::slice::from_raw_parts_mut(self.entries, self.len) }
+    fn pairs_mut(&mut self) -> &mut [Pair<'src, 'intern>] {
+        // SAFETY: as `pairs`, and borrowed uniquely through `self`.
+        unsafe { std::slice::from_raw_parts_mut(self.pairs, self.len) }
     }
 
     fn slots(&self) -> &[u32] {
-        // SAFETY: `indices` has `mask + 1` slots.
-        unsafe { std::slice::from_raw_parts(self.indices, self.mask + 1) }
+        // SAFETY: `table` has `mask + 1` slots.
+        unsafe { std::slice::from_raw_parts(self.table, self.mask + 1) }
     }
 
-    /// The position of the entry `is` says is the one wanted, among the keys of hash `hash`.
-    pub fn find(&self, hash: u64, is: impl Fn(&LCanon<'src, 'intern>) -> bool) -> Option<usize> {
-        let (slots, entries) = (self.slots(), self.entries());
-        let mut at = hash as usize & self.mask;
-        loop {
-            match slots[at] {
-                0 => return None,
-                slot if is(&entries[slot as usize - 1].key) => return Some(slot as usize - 1),
-                _ => at = (at + 1) & self.mask,
-            }
+    pub fn get_index(&self, at: usize) -> Option<(&LCanon<'src, 'intern>, &LBoxed<'src, 'intern>)> {
+        self.pairs().get(at).map(|pair| (&pair.key, &pair.value))
+    }
+
+    pub fn get_index_mut(&mut self, at: usize) -> Option<(&LCanon<'src, 'intern>, &mut LBoxed<'src, 'intern>)> {
+        self.pairs_mut().get_mut(at).map(|pair| (&pair.key, &mut pair.value))
+    }
+
+    /// Remove every pair, maintaining capacity.
+    pub fn clear(&mut self) {
+        self.len = 0;
+        if !std::ptr::eq(self.table, EMPTY.as_ptr()) {
+            // SAFETY: a hash table of its own, which this owns.
+            unsafe { std::slice::from_raw_parts_mut(self.table, self.mask + 1) }.fill(0);
         }
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&LCanon<'src, 'intern>, &LBoxed<'src, 'intern>)> {
+        self.pairs().iter().map(|pair| (&pair.key, &pair.value))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &LCanon<'src, 'intern>> {
+        self.pairs().iter().map(|pair| &pair.key)
+    }
+
+    /// Its pairs as the `Vec` holding them, leaving it none.
+    fn take_pairs(&mut self) -> Vec<Pair<'src, 'intern>> {
+        let pairs = std::mem::replace(&mut self.pairs, std::ptr::NonNull::dangling().as_ptr());
+        let cap = std::mem::replace(&mut self.cap, 0);
+        // SAFETY: the pairs were a `Vec` of `cap`, `len` of them initialized, or none.
+        if cap == 0 { Vec::new() } else { unsafe { Vec::from_raw_parts(pairs, self.len, cap) } }
+    }
+
+    /// Free its hash table, if it has one of its own, leaving it the empty one.
+    fn free_table(&mut self) {
+        let table = std::mem::replace(&mut self.table, EMPTY.as_ptr().cast_mut());
+        let slots = std::mem::replace(&mut self.mask, 0) + 1;
+        if !std::ptr::eq(table, EMPTY.as_ptr()) {
+            // SAFETY: a hash table of its own is a `Vec` of its slots.
+            drop(unsafe { Vec::from_raw_parts(table, slots, slots) });
+        }
+    }
+
+    /// Make room for `cap` pairs.
+    fn grow_pairs(&mut self, cap: usize) {
+        let mut pairs = self.take_pairs();
+        pairs.reserve_exact(cap - pairs.len());
+        let mut pairs = std::mem::ManuallyDrop::new(pairs);
+        (self.pairs, self.cap) = (pairs.as_mut_ptr(), pairs.capacity());
+    }
+}
+
+impl<'src, 'intern, S: BuildHasher + Default> HashPart<'src, 'intern, S> {
+    pub fn new() -> Self {
+        Self::with_hasher(S::default())
+    }
+
+    /// One with capacity for `capacity` pairs.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut part = Self::new();
+        if capacity > 0 {
+            part.grow_pairs(capacity.next_power_of_two());
+            part.rebuild((capacity + capacity / 7).next_power_of_two().max(4));
+        }
+        part
+    }
+}
+
+impl<'src, 'intern, S: BuildHasher> HashPart<'src, 'intern, S> {
+    /// The index of the pair whose key `is` accepts, among the keys of hash `hash` by `hasher`.
+    pub fn find(&self, hash: u64, is: impl Fn(&LCanon<'src, 'intern>) -> bool) -> Option<usize> {
+        let (slots, pairs) = (self.slots(), self.pairs());
+        let mut at = hash as usize & self.mask;
+        for _ in 0..=self.max_displacement() {
+            match slots[at] {
+                0 => return None,
+                slot if is(&pairs[slot as usize - 1].key) => return Some(slot as usize - 1),
+                _ => at = (at + 1) & self.mask,
+            }
+        }
+        None
+    }
+
     pub fn get_index_of(&self, key: &LCanon<'src, 'intern>) -> Option<usize> {
-        self.find(Self::hash(key), |k| k == key)
+        self.find(self.hasher.hash_one(key), |k| k == key)
     }
 
     pub fn get(&self, key: &LCanon<'src, 'intern>) -> Option<&LBoxed<'src, 'intern>> {
-        self.get_index_of(key).map(|at| &self.entries()[at].value)
+        self.get_index_of(key).map(|at| &self.pairs()[at].value)
     }
 
     pub fn contains_key(&self, key: &LCanon<'src, 'intern>) -> bool {
         self.get_index_of(key).is_some()
     }
 
-    /// The position of `key`'s entry, and its value.
+    /// The index of `key`'s pair, and its value.
     pub fn get_full_mut(&mut self, key: &LCanon<'src, 'intern>) -> Option<(usize, &mut LBoxed<'src, 'intern>)> {
         let at = self.get_index_of(key)?;
-        Some((at, &mut self.entries_mut()[at].value))
+        Some((at, &mut self.pairs_mut()[at].value))
     }
 
-    pub fn get_index(&self, at: usize) -> Option<(&LCanon<'src, 'intern>, &LBoxed<'src, 'intern>)> {
-        self.entries().get(at).map(|entry| (&entry.key, &entry.value))
-    }
-
-    pub fn get_index_mut(&mut self, at: usize) -> Option<(&LCanon<'src, 'intern>, &mut LBoxed<'src, 'intern>)> {
-        self.entries_mut().get_mut(at).map(|entry| (&entry.key, &mut entry.value))
-    }
-
-    /// Set `key`'s value, giving its old value, or append its entry if it has none.
+    /// Set `key`'s value, giving its old value, or append its pair if it has none.
     pub fn insert(&mut self, key: LCanon<'src, 'intern>, value: LBoxed<'src, 'intern>) -> Option<LBoxed<'src, 'intern>> {
-        let hash = Self::hash(&key);
+        let hash = self.hasher.hash_one(key);
         if let Some(at) = self.find(hash, |k| *k == key) {
-            return Some(std::mem::replace(&mut self.entries_mut()[at].value, value));
+            return Some(std::mem::replace(&mut self.pairs_mut()[at].value, value));
         }
         if self.len == self.cap {
-            self.grow_to((self.cap * 2).max(4));
+            self.grow_pairs((self.cap * 2).max(4));
         }
-        // SAFETY: there is room for one more entry.
-        unsafe { self.entries.add(self.len).write(Entry { key, value }) };
+        // SAFETY: there is room for one more pair.
+        unsafe { self.pairs.add(self.len).write(Pair { key, value }) };
         self.len += 1;
-        self.place(hash, self.len as u32);
+        let full = self.len * 8 > (self.mask + 1) * 7;
+        if std::ptr::eq(self.table, EMPTY.as_ptr()) || full || !self.place(hash, self.len as u32) {
+            self.rebuild(((self.mask + 1) * 2).max(4));
+        }
         None
     }
 
-    /// Point the first empty slot of `hash`'s probe at the entry `slot` names.
-    fn place(&mut self, hash: u64, slot: u32) {
-        // SAFETY: a part with an entry has an index table of its own.
-        let slots = unsafe { std::slice::from_raw_parts_mut(self.indices, self.mask + 1) };
-        let mut at = hash as usize & self.mask;
-        while slots[at] != 0 {
-            at = (at + 1) & self.mask;
+    /// How many slots past the one its hash masks to a key may be: log2 of the slot count.
+    fn max_displacement(&self) -> usize {
+        (self.mask + 1).trailing_zeros() as usize
+    }
+
+    /// The hash of the key of the pair `slot` names.
+    fn slot_hash(&self, slot: u32) -> u64 {
+        self.hasher.hash_one(self.pairs()[slot as usize - 1].key)
+    }
+
+    /// Put the pair `slot` names, of hash `hash`, into the hash table, taking the slot of any key
+    /// nearer its own and moving that key on. False if a key would be further than
+    /// `max_displacement` from its own slot, leaving the hash table to be rebuilt.
+    fn place(&mut self, hash: u64, mut slot: u32) -> bool {
+        debug_assert!(!std::ptr::eq(self.table, EMPTY.as_ptr()));
+        let (table, mask) = (self.table, self.mask);
+        let mut at = hash as usize & mask;
+        let mut displacement = 0;
+        while displacement <= self.max_displacement() {
+            // SAFETY: `at` is masked to the hash table's slots, and the table is its own.
+            let resident = unsafe { *table.add(at) };
+            if resident == 0 {
+                unsafe { *table.add(at) = slot };
+                return true;
+            }
+            let theirs = at.wrapping_sub(self.slot_hash(resident) as usize) & mask;
+            if theirs < displacement {
+                unsafe { *table.add(at) = slot };
+                (slot, displacement) = (resident, theirs);
+            }
+            at = (at + 1) & mask;
+            displacement += 1;
         }
-        slots[at] = slot;
+        false
     }
 
-    /// Make room for `cap` entries, a power of two, with an index table of twice as many slots.
-    fn grow_to(&mut self, cap: usize) {
-        debug_assert!(cap.is_power_of_two() && cap >= self.len);
-        let mut entries = self.take_entries();
-        entries.reserve_exact(cap - entries.len());
-        let mut entries = std::mem::ManuallyDrop::new(entries);
-        (self.entries, self.cap) = (entries.as_mut_ptr(), entries.capacity());
-        self.free_indices();
-        let mut indices = std::mem::ManuallyDrop::new(vec![0u32; cap * 2]);
-        (self.indices, self.mask) = (indices.as_mut_ptr(), cap * 2 - 1);
-        for slot in 1..=self.len {
-            let hash = Self::hash(&self.entries()[slot - 1].key);
-            self.place(hash, slot as u32);
+    /// Rebuild the hash table with `slots` slots, a power of two, doubling them until every key
+    /// fits within `max_displacement` of its own slot.
+    fn rebuild(&mut self, mut slots: usize) {
+        loop {
+            self.free_table();
+            let mut table = std::mem::ManuallyDrop::new(vec![0u32; slots]);
+            (self.table, self.mask) = (table.as_mut_ptr(), slots - 1);
+            if (1..=self.len as u32).all(|slot| self.place(self.slot_hash(slot), slot)) {
+                return;
+            }
+            slots *= 2;
         }
-    }
-
-    /// Its entries as the `Vec` holding them, leaving it none.
-    fn take_entries(&mut self) -> Vec<Entry<'src, 'intern>> {
-        // SAFETY: the entries were a `Vec` of `cap`, `len` of them initialized, or none.
-        let entries = if self.cap == 0 { Vec::new() } else { unsafe { Vec::from_raw_parts(self.entries, self.len, self.cap) } };
-        (self.entries, self.cap) = (std::ptr::NonNull::dangling().as_ptr(), 0);
-        entries
-    }
-
-    /// Free its index table, if it has one of its own.
-    fn free_indices(&mut self) {
-        if !std::ptr::eq(self.indices, EMPTY.as_ptr()) {
-            // SAFETY: an index table of its own is a `Vec` of `mask + 1` slots.
-            drop(unsafe { Vec::from_raw_parts(self.indices, self.mask + 1, self.mask + 1) });
-        }
-        (self.indices, self.mask) = (EMPTY.as_ptr().cast_mut(), 0);
-    }
-
-    /// Drop every entry, keeping their room.
-    pub fn clear(&mut self) {
-        self.len = 0;
-        if !std::ptr::eq(self.indices, EMPTY.as_ptr()) {
-            // SAFETY: an index table of its own, which this owns.
-            unsafe { std::slice::from_raw_parts_mut(self.indices, self.mask + 1) }.fill(0);
-        }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&LCanon<'src, 'intern>, &LBoxed<'src, 'intern>)> {
-        self.entries().iter().map(|entry| (&entry.key, &entry.value))
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = &LCanon<'src, 'intern>> {
-        self.entries().iter().map(|entry| &entry.key)
     }
 }
 
-impl Default for HashPart<'_, '_> {
+impl<S: BuildHasher + Default> Default for HashPart<'_, '_, S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for HashPart<'_, '_> {
+impl<S> Drop for HashPart<'_, '_, S> {
     fn drop(&mut self) {
-        drop(self.take_entries());
-        self.free_indices();
+        drop(self.take_pairs());
+        self.free_table();
     }
 }
 
-impl<'src, 'intern> FromIterator<(LCanon<'src, 'intern>, LBoxed<'src, 'intern>)> for HashPart<'src, 'intern> {
-    fn from_iter<I: IntoIterator<Item = (LCanon<'src, 'intern>, LBoxed<'src, 'intern>)>>(entries: I) -> Self {
+impl<'src, 'intern, S: BuildHasher + Default> FromIterator<(LCanon<'src, 'intern>, LBoxed<'src, 'intern>)> for HashPart<'src, 'intern, S> {
+    fn from_iter<I: IntoIterator<Item = (LCanon<'src, 'intern>, LBoxed<'src, 'intern>)>>(pairs: I) -> Self {
         let mut part = HashPart::new();
-        for (key, value) in entries {
+        for (key, value) in pairs {
             part.insert(key, value);
         }
         part
     }
 }
 
-impl std::fmt::Debug for HashPart<'_, '_> {
+impl<S> std::fmt::Debug for HashPart<'_, '_, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
@@ -241,6 +282,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    type Part = HashPart<'static, 'static>;
+
     fn number(n: f64) -> LCanon<'static, 'static> {
         LCanon::constant(&crate::chunk::Constant::Number(crate::vm::Number(n)))
     }
@@ -249,87 +292,91 @@ mod tests {
         LBoxed::from_int(n)
     }
 
-    /// Every key is found where it was put, in the order it was first put, against a reference.
-    fn agrees(part: &HashPart, reference: &HashMap<u64, i32>, order: &[u64]) {
+    /// Every key is found where it was put, in the order it was first put, against a reference,
+    /// and no key is further than `max_displacement` from its own slot.
+    fn agrees(part: &Part, reference: &HashMap<u64, i32>, order: &[u64]) {
         assert_eq!(part.len(), order.len());
         for (at, &bits) in order.iter().enumerate() {
             let key = unsafe { LCanon::from_bits(bits) };
-            assert_eq!(part.get_index_of(&key), Some(at), "{key:?}'s position");
+            assert_eq!(part.get_index_of(&key), Some(at), "{key:?}'s index");
             assert_eq!(part.get(&key).map(|v| v.bits()), Some(value(reference[&bits]).bits()));
             assert_eq!(part.get_index(at).map(|(k, _)| k.boxed().bits()), Some(bits));
         }
         assert_eq!(part.keys().map(|k| k.boxed().bits()).collect::<Vec<_>>(), order);
+        for (at, &slot) in part.slots().iter().enumerate().filter(|(_, slot)| **slot != 0) {
+            assert!(at.wrapping_sub(part.slot_hash(slot) as usize) & part.mask <= part.max_displacement());
+        }
     }
 
     #[test]
     fn an_empty_part_finds_nothing() {
-        let part = HashPart::new();
+        let part = Part::new();
         assert!(part.is_empty() && part.get(&number(1.5)).is_none() && part.get_index(0).is_none());
         assert_eq!(part.mask, 0);
-        assert_eq!(unsafe { *part.indices }, 0, "an empty part's one slot is empty");
+        assert_eq!(unsafe { *part.table }, 0, "an empty part's one slot is empty");
     }
 
     #[test]
-    fn keys_keep_their_order_and_positions_as_it_grows() {
-        let mut part = HashPart::new();
+    fn keys_keep_their_order_and_indices_as_it_grows() {
+        let mut part = Part::new();
         let (mut reference, mut order) = (HashMap::new(), Vec::new());
+        // Integers below 1, which a table keeps in its hash part.
         for i in 0..2000 {
-            let key = number(i as f64 + 0.5);
+            let key = number(-i as f64);
             assert!(part.insert(key, value(i)).is_none());
             reference.insert(key.boxed().bits(), i);
             order.push(key.boxed().bits());
-            assert!(part.len() * 2 <= part.mask + 1, "half its slots at most are used");
         }
         agrees(&part, &reference, &order);
     }
 
     #[test]
-    fn a_key_put_again_keeps_its_entry() {
-        let mut part = HashPart::new();
+    fn a_key_put_again_keeps_its_pair() {
+        let mut part = Part::new();
         for i in 0..100 {
             part.insert(number(i as f64 + 0.25), value(i));
         }
-        let entries = part.entries;
+        let pairs = part.pairs;
         for i in 0..100 {
             assert_eq!(part.insert(number(i as f64 + 0.25), value(-i)).map(|v| v.bits()), Some(value(i).bits()));
         }
-        assert_eq!(part.entries, entries, "no entry moved");
+        assert_eq!(part.pairs, pairs, "no pair moved");
         let order: Vec<u64> = (0..100).map(|i| number(i as f64 + 0.25).boxed().bits()).collect();
         let reference = order.iter().enumerate().map(|(i, &bits)| (bits, -(i as i32))).collect();
         agrees(&part, &reference, &order);
     }
 
-    /// Keys whose hashes share their low bits all probe from one slot, and each is still found,
-    /// as is a key missing among them.
+    /// Keys whose hashes share their low bits grow the hash table until they're each near their
+    /// own slot, and each is found, as is a key missing among them.
     #[test]
     fn colliding_keys_are_each_found() {
-        let mut part = HashPart::with_capacity(64);
+        let mut part = Part::with_capacity(64);
         let mask = part.mask as u64;
-        let first = HashPart::hash(&number(1.0)) & mask;
-        let colliding: Vec<LCanon> = (0..100_000).map(|i| number(i as f64)).filter(|k| HashPart::hash(k) & mask == first).take(20).collect();
+        let hash = |k: &LCanon| part.hasher().hash_one(k);
+        let first = hash(&number(1.0)) & mask;
+        let colliding: Vec<LCanon> = (0..100_000).map(|i| number(i as f64)).filter(|k| hash(k) & mask == first).take(20).collect();
+        let missing = (100_000..).map(|i| number(i as f64)).find(|k| hash(k) & mask == first).unwrap();
         assert_eq!(colliding.len(), 20);
         for (i, &key) in colliding.iter().enumerate() {
             part.insert(key, value(i as i32));
         }
-        assert_eq!(part.mask as u64, mask, "it fits without growing");
-        for (i, key) in colliding.iter().enumerate() {
-            assert_eq!(part.get_index_of(key), Some(i));
-        }
-        let missing = (100_000..).map(|i| number(i as f64)).find(|k| HashPart::hash(k) & mask == first).unwrap();
+        let order: Vec<u64> = colliding.iter().map(|k| k.boxed().bits()).collect();
+        let reference = order.iter().enumerate().map(|(i, &bits)| (bits, i as i32)).collect();
+        agrees(&part, &reference, &order);
         assert!(part.get(&missing).is_none());
     }
 
     #[test]
-    fn cleared_it_keeps_its_room_and_finds_nothing() {
-        let mut part = HashPart::with_capacity(8);
+    fn cleared_it_keeps_its_capacity_and_finds_nothing() {
+        let mut part = Part::with_capacity(8);
         for i in 0..8 {
             part.insert(number(i as f64 + 0.5), value(i));
         }
-        let (entries, mask) = (part.entries, part.mask);
+        let (pairs, mask) = (part.pairs, part.mask);
         part.clear();
         assert!(part.is_empty() && part.get(&number(0.5)).is_none());
         part.insert(number(9.5), value(9));
-        assert_eq!((part.entries, part.mask), (entries, mask));
+        assert_eq!((part.pairs, part.mask), (pairs, mask));
         assert_eq!(part.get_index_of(&number(9.5)), Some(0));
     }
 
@@ -337,7 +384,7 @@ mod tests {
     fn strings_are_found_by_their_bytes() {
         let arena = internment::Arena::new();
         let arena: &'static internment::Arena<crate::vm::IStr<'static>> = Box::leak(Box::new(arena));
-        let mut part = HashPart::new();
+        let mut part = Part::new();
         let keys: Vec<LCanon> = (0..300).map(|i| LCanon::new(LBoxed::interned(crate::vm::intern_bytes(arena, format!("k{i}").as_bytes())), arena)).collect();
         for (i, &key) in keys.iter().enumerate() {
             part.insert(key, value(i as i32));

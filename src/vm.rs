@@ -1022,7 +1022,7 @@ impl Hash for StringBytes<'_> {
 /// The position of the string key of `bytes` in `hash`, which needs no intern arena: it hashes as
 /// the interned string does. See Note [Canonical values].
 fn string_index(hash: &HashPart<'_, '_>, bytes: &[u8]) -> Option<usize> {
-    hash.find(HashPart::hash(&StringBytes(bytes)), |key| matches!(key.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == bytes))
+    hash.find(hash.hasher().hash_one(StringBytes(bytes)),|key| matches!(key.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == bytes))
 }
 
 /// An `LBoxed` in canonical form, giving owner-free `Hash`/`Eq`. See Note [Canonical values].
