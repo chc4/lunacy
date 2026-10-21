@@ -14,10 +14,11 @@ use crate::window::{Access, Window, WINDOW};
 // A register holds at most one value, and any number of slots may name it. A
 // `Move` emits no code: its destination names its source's value. A named slot
 // is dirty while its stack home is stale, and is stored from whichever register
-// holds its value. A block's entry window names one slot per register: every
-// edge into the block must deliver it, and the allocator can't tell whether two
-// slots are equal on an edge it doesn't plan. So slots share a register only
-// within a block. Allocation has two passes over a
+// holds its value. Every edge into a block must deliver its entry window, so the
+// window names only what every edge agrees on: one slot per register, and the
+// slots the block's context knows hold that slot's value. A version's context
+// knows two slots equal only if every jump it accepts does. Allocation has two
+// passes over a
 // compiled region, trace by trace (see Note [Trace register allocation]):
 //
 // * Planning placements, one trace at a time ([`plan_trace`], Note [Trace
@@ -174,6 +175,15 @@ fn occupied(regs: &Placement) -> u8 {
 /// allocation].
 pub type Placement = [Option<usize>; WINDOW];
 
+/// The class of each window slot's value in a block's context, if the context knows one. Slots of
+/// one class hold one value whenever the block is entered. See Note [Window allocation].
+pub type Equal = std::rc::Rc<[Option<u32>]>;
+
+/// Whether `equal` says slots `a` and `b` hold one value.
+fn same(equal: &[Option<u32>], a: usize, b: usize) -> bool {
+    a == b || equal.get(a).copied().flatten().is_some_and(|class| equal.get(b).copied().flatten() == Some(class))
+}
+
 /// A `Placement` in a byte per register, to keep per block: a Lua frame has at
 /// most 250 slots, so a slot fits in a byte, with `u8::MAX` for none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,13 +256,21 @@ impl std::fmt::Display for Cache {
 }
 
 impl Cache {
-    /// A block's entry window: `regs`, those of `unboxed` unboxed, each slot
-    /// dirty if it is dirty in `from`, the window of the first jump to the
-    /// block, or planned dirty in `dirty`. A clean value marked dirty is only
-    /// stored again, so any slot can be.
-    pub fn entry(regs: Placement, unboxed: u8, from: &Cache, dirty: &Slots) -> Cache {
+    /// A block's entry window: `regs`, those of `unboxed` unboxed, each register also naming the
+    /// slots `equal` says hold its slot's value. A slot is dirty if it is dirty in `from`, the
+    /// window of the first jump to the block, or planned dirty in `dirty`. A clean value marked
+    /// dirty is only stored again, so any slot can be.
+    pub fn entry(regs: Placement, unboxed: u8, from: &Cache, dirty: &Slots, equal: &[Option<u32>]) -> Cache {
         let mut entry = Cache::default();
         entry.hold(&regs, |reg, _| bit(unboxed, reg));
+        for reg in 0..WINDOW {
+            let (Some(slot), Some(value)) = (regs[reg], entry.regs[reg]) else { continue };
+            for other in 0..equal.len() {
+                if same(equal, slot, other) && entry.value(other).is_none() {
+                    entry.names.push((other, value));
+                }
+            }
+        }
         entry.dirty = entry.names.iter().map(|&(slot, _)| slot).filter(|&slot| from.dirty.contains(&slot) || dirty.contains(slot)).collect();
         entry
     }
@@ -831,8 +849,9 @@ impl<'a> Framed<'a> {
 /// sees them.
 pub enum Step<'a> {
     /// A block's start, continuing the trace from the step before it, with
-    /// its `Rise` if the edge into it enters more frequent code.
-    Start(Option<Rise>),
+    /// its `Rise` if the edge into it enters more frequent code, and the
+    /// classes of its slots' values.
+    Start(Option<Rise>, Equal),
     /// A window op, and the `SKIP`s it can run at.
     Op(Framed<'a>, SmallVec<[usize; WINDOW]>),
     /// An inline guard testing `slot` in its register, if the window has one.
@@ -932,7 +951,7 @@ impl Ahead {
                 Step::Store(slots) => slots.iter().for_each(|slot| ahead.events[slot].push((step, true))),
                 Step::Kill(slots) => slots.iter().for_each(|slot| ahead.events[slot].push((step, false))),
                 Step::Back(start) => ahead.backs.push((step, *start)),
-                Step::Start(_) => {}
+                Step::Start(..) => {}
             }
         }
         ahead
@@ -1024,7 +1043,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
     let _ = trace;
     assert!(width <= WINDOW);
     let mut ahead = Ahead::new(steps);
-    let trivial = steps.iter().all(|s| matches!(s, Step::Start(_) | Step::Back(_) | Step::Exit { .. } | Step::Leave));
+    let trivial = steps.iter().all(|s| matches!(s, Step::Start(..) | Step::Back(_) | Step::Exit { .. } | Step::Leave));
     let mut plan = TracePlan {
         windows: vec![[None; WINDOW]; steps.len()],
         skips: vec![0; steps.len()],
@@ -1036,7 +1055,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
     let mut alloc = WindowAlloc { width, cache: hint.clone() };
     for (step, s) in steps.iter().enumerate() {
         match s {
-            Step::Start(rise) => {
+            Step::Start(rise, equal) => {
                 let now = alloc.cache();
                 let worth = |slot: usize| ahead.worth(slot, step, now.dirty.contains(&slot));
                 let mut regs = [None; WINDOW];
@@ -1051,17 +1070,23 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                     },
                     None => false,
                 };
+                // A slot the context knows holds a placed slot's value is named in its register.
+                let implied = |regs: &Placement, slot: usize| regs.iter().flatten().any(|&placed| placed != slot && same(equal, placed, slot));
                 let place = |regs: &mut Placement, dirty: &mut Slots, names: &[(usize, usize)]| {
                     let mut aliases: SmallVec<[usize; 16]> = SmallVec::new();
                     for &(reg, slot) in names {
-                        if !put(regs, slot, Some(reg)) {
+                        if implied(regs, slot) {
+                            if now.dirty.contains(&slot) {
+                                dirty.insert(slot);
+                            }
+                        } else if !put(regs, slot, Some(reg)) {
                             aliases.push(slot);
                         } else if now.dirty.contains(&slot) {
                             dirty.insert(slot);
                         }
                     }
                     for slot in aliases {
-                        if put(regs, slot, None) && now.dirty.contains(&slot) {
+                        if (implied(regs, slot) || put(regs, slot, None)) && now.dirty.contains(&slot) {
                             dirty.insert(slot);
                         }
                     }
@@ -1079,16 +1104,24 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                         let fresh = reads.iter().filter(|&slot| now.position(slot).is_none() && ahead.pays(slot, step, false).is_some());
                         let mut values: SmallVec<[((bool, usize), usize); 16]> = brought.chain(fresh).filter_map(|slot| Some((worth(slot)?, slot))).collect();
                         values.sort_unstable();
+                        let mut kept: SmallVec<[usize; 16]> = SmallVec::new();
+                        values.retain(|&mut (_, slot)| {
+                            let new = !kept.iter().any(|&other| same(equal, other, slot));
+                            kept.push(slot);
+                            new
+                        });
                         values.truncate(width);
                         let names: SmallVec<[(usize, usize); 16]> = values.iter().filter_map(|&(_, slot)| Some((now.position(slot)?, slot))).collect();
                         // Only the slots the entered code writes are dirty on entry.
                         place(&mut regs, &mut Slots::default(), &names);
                         for &(_, slot) in &values {
-                            if now.position(slot).is_none() {
+                            if now.position(slot).is_none() && !implied(&regs, slot) {
                                 put(&mut regs, slot, None);
                             }
                         }
-                        regs.iter().flatten().filter(|&&slot| writes.contains(slot)).for_each(|&slot| dirty.insert(slot));
+                        for slot in writes.iter().filter(|&slot| regs.contains(&Some(slot)) || implied(&regs, slot)).collect::<SmallVec<[usize; 16]>>() {
+                            dirty.insert(slot);
+                        }
                     }
                     None => {
                         // The slots worth most get registers first.
@@ -1108,7 +1141,7 @@ pub fn plan_trace(steps: &[Step], width: usize, hint: &Cache, trace: u64) -> Tra
                     let form = if trivial { bit(now.unboxed, reg) } else { ahead.next_form(slot, step).unwrap_or(has) };
                     unboxed |= u8::from(form) << reg;
                 }
-                let entry = Cache::entry(regs, unboxed, &Cache::default(), &dirty);
+                let entry = Cache::entry(regs, unboxed, &Cache::default(), &dirty, equal);
                 #[cfg(feature = "tracing")]
                 crate::tracing::instant("alloc", "start", &[
                     ("trace", trace.into()),
@@ -1664,7 +1697,7 @@ mod tests {
     /// window of `width` registers.
     fn run_planned(width: usize, ops: &[TestOp], doubles: impl Fn(usize) -> u8, emitted: bool) {
         let built = built(ops, doubles, emitted);
-        let steps: Vec<Step> = std::iter::once(Step::Start(None)).chain(built.iter().map(|b| Step::Op(b.framed(), usable(b)))).collect();
+        let steps: Vec<Step> = std::iter::once(Step::Start(None, Equal::default())).chain(built.iter().map(|b| Step::Op(b.framed(), usable(b)))).collect();
         let plan = plan_trace(&steps, width, &Cache::default(), 0);
         let mut alloc = WindowAlloc::with_width(width);
         let mut machine = Machine::default();
@@ -1830,17 +1863,17 @@ mod tests {
                 (0..rng.below(4)).for_each(|_| slots.insert(rng.below(6)));
                 slots
             };
-            let steps: Vec<Step> = std::iter::once(Step::Start(None))
+            let steps: Vec<Step> = std::iter::once(Step::Start(None, Equal::default()))
                 .chain(kinds.iter().map(|&(kind, arg)| match kind {
                     0 => {
                         let b = next_op.next().unwrap();
                         Step::Op(b.framed(), usable(b))
                     }
-                    1 => Step::Start(None),
+                    1 => Step::Start(None, Equal::default()),
                     2 => Step::Flush,
                     3 => Step::Exit { hot: rng.below(2) == 0, reads: some_slots(&mut rng) },
                     4 => Step::Read(arg),
-                    5 => Step::Start(Some(Rise { reads: some_slots(&mut rng), writes: some_slots(&mut rng) })),
+                    5 => Step::Start(Some(Rise { reads: some_slots(&mut rng), writes: some_slots(&mut rng) }), Equal::default()),
                     7 => Step::Leave,
                     _ => Step::Back(arg),
                 }))
@@ -1874,9 +1907,9 @@ mod tests {
                 let mut entries = HashMap::new();
                 for (step, s) in steps.iter().enumerate() {
                     match s {
-                        Step::Start(rise) => {
+                        Step::Start(rise, equal) => {
                             let from = if rise.is_some() { Cache::default() } else { alloc.cache().clone() };
-                            let entry = Cache::entry(plan.windows[step], plan.unboxed[step], &from, &plan.dirty[step]);
+                            let entry = Cache::entry(plan.windows[step], plan.unboxed[step], &from, &plan.dirty[step], equal);
                             for emit in alloc.transfer(&entry) {
                                 machine.exec(emit, None, &[]);
                             }
@@ -1932,8 +1965,8 @@ mod tests {
                             // planned from the window the plan leaves here: its
                             // thunk's exit, and the thunk linked into a block
                             // entered with any window, lose no write.
-                            let trivial = plan_trace(&[Step::Start(None)], width, plan.exits[step].as_ref().unwrap(), 0);
-                            let entry = Cache::entry(trivial.windows[0], trivial.unboxed[0], alloc.cache(), &trivial.dirty[0]);
+                            let trivial = plan_trace(&[Step::Start(None, Equal::default())], width, plan.exits[step].as_ref().unwrap(), 0);
+                            let entry = Cache::entry(trivial.windows[0], trivial.unboxed[0], alloc.cache(), &trivial.dirty[0], &[]);
                             let mut linked = machine.clone();
                             for emit in alloc.transfer(&entry) {
                                 linked.exec(emit, None, &[]);
@@ -2030,7 +2063,7 @@ mod tests {
         hint.set(3, Some(2), false);
         hint.dirty.push(2);
         let rise = || Some(Rise { reads: Slots::default(), writes: Slots::default() });
-        for steps in [vec![Step::Start(None)], vec![Step::Start(rise())], vec![Step::Start(None), Step::Exit { hot: true, reads: Slots::default() }]] {
+        for steps in [vec![Step::Start(None, Equal::default())], vec![Step::Start(rise(), Equal::default())], vec![Step::Start(None, Equal::default()), Step::Exit { hot: true, reads: Slots::default() }]] {
             let plan = plan_trace(&steps, WINDOW, &hint, 0);
             assert!(plan.trivial);
             assert_eq!(plan.windows[0], hint.regs());
@@ -2058,6 +2091,28 @@ mod tests {
         }).collect();
         stores.sort_unstable();
         assert_eq!(stores, vec![(1, reg), (2, reg)]);
+    }
+
+    /// A block whose context knows two slots hold one value is entered with them in one register:
+    /// planning places one of them, and the entry window names both.
+    #[test]
+    fn equal_slots_share_an_entry_register() {
+        let (get, mov, bin) = (Get::new(&[0, 1]), Move::new(&[1, 2]), Bin::new(&[1, 2, 3]));
+        let all = || (0..WINDOW).collect();
+        let equal: Equal = [None, Some(0), Some(0)].into_iter().collect();
+        let steps = [
+            Step::Start(None, Equal::default()),
+            Step::Op(Framed::new(&get, 0), all()),
+            Step::Op(Framed::new(&mov, 0), all()),
+            Step::Start(None, equal.clone()),
+            Step::Op(Framed::new(&bin, 0), all()),
+        ];
+        let plan = plan_trace(&steps, WINDOW, &Cache::default(), 0);
+        assert!(plan.skips[2] >= RENAME, "the move is a rename");
+        assert_eq!(plan.windows[3].iter().flatten().filter(|&&slot| slot == 1 || slot == 2).count(), 1, "one register for both slots");
+        let entry = Cache::entry(plan.windows[3], plan.unboxed[3], &Cache::default(), &plan.dirty[3], &equal);
+        let reg = entry.position(1).expect("slot 1 in a register");
+        assert_eq!(entry.position(2), Some(reg), "slot 2 named in slot 1's register");
     }
 
     /// Cycles are broken through the scratch of a half: between general

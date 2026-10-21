@@ -72,7 +72,7 @@ pub struct Block {
     allocates: bool,
     /// A version of a pc's context, which jumps to it enter. See Note [Version
     /// compatibility].
-    context: Option<Rc<Context>>,
+    pub(crate) context: Option<Rc<Context>>,
     /// The upvalue cells holding their upvalue's value whenever the block is entered, by
     /// `cell` index: every cell where its context isn't known. See Note [Upvalue cells].
     pub cells: u32,
