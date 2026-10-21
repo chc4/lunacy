@@ -9,7 +9,6 @@ use std::sync::atomic::{Ordering, AtomicBool, AtomicPtr};
 use crate::vm::{Tc, LValue, LBoxed, LCanon, LClosure, NClosure, Table, Upvalue, Userdata};
 use crate::vm::FVec;
 use crate::{TLCell, TlcOwner, Owner};
-use indexmap::IndexMap;
 use crate::debug;
 
 pub trait Mark {
@@ -124,9 +123,9 @@ impl<'src, 'intern> Mark for Upvalue<'src, 'intern> {
     }
 }
 
-impl<K: Mark, V: Mark, S> Mark for IndexMap<K, V, S> {
+impl Mark for crate::hash_part::HashPart<'_, '_> {
     fn mark(&self, owner: &Owner) {
-        for (k, v) in self {
+        for (k, v) in self.iter() {
             k.mark(owner);
             v.mark(owner);
         }
