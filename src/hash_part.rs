@@ -3,6 +3,8 @@
 use std::hash::BuildHasher;
 
 use crate::lboxed::LBoxed;
+#[cfg(feature = "unreachable")]
+use crate::unreachable;
 use crate::vm::{InternedHasher, LCanon};
 
 // Note [Hash part layout]
@@ -151,11 +153,16 @@ impl<'src, 'intern, S: BuildHasher> HashPart<'src, 'intern, S> {
         let (slots, pairs) = (self.slots(), self.pairs());
         let mut at = hash as usize & self.mask;
         for _ in 0..=self.max_displacement() {
-            match slots[at] {
-                0 => return None,
-                slot if is(&pairs[slot as usize - 1].key) => return Some(slot as usize - 1),
-                _ => at = (at + 1) & self.mask,
+            // `at` is masked to the slots, and a slot holds the index of a pair there is.
+            let Some(&slot) = slots.get(at) else { unreachable!() };
+            if slot == 0 {
+                return None;
             }
+            let Some(pair) = pairs.get(slot as usize - 1) else { unreachable!() };
+            if is(&pair.key) {
+                return Some(slot as usize - 1);
+            }
+            at = (at + 1) & self.mask;
         }
         None
     }
