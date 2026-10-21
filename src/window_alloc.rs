@@ -14,9 +14,10 @@ use crate::window::{Access, Window, WINDOW};
 // A register holds at most one value, and any number of slots may name it. A
 // `Move` emits no code: its destination names its source's value. A named slot
 // is dirty while its stack home is stale, and is stored from whichever register
-// holds its value. A block's entry window names one slot per register, because
-// different edges into the block may bring those slots different values. So
-// slots share a value only within a trace. Allocation has two passes over a
+// holds its value. A block's entry window names one slot per register: every
+// edge into the block must deliver it, and the allocator can't tell whether two
+// slots are equal on an edge it doesn't plan. So slots share a register only
+// within a block. Allocation has two passes over a
 // compiled region, trace by trace (see Note [Trace register allocation]):
 //
 // * Planning placements, one trace at a time ([`plan_trace`], Note [Trace
